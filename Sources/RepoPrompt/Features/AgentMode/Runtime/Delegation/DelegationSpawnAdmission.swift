@@ -364,6 +364,10 @@ enum DelegationSpawnAdmission {
     private static func error(code: String, fields: [String: Value]) -> MCPError {
         var fields = fields
         fields["code"] = .string(code)
+        fields["retryable"] = .bool(false)
+        if fields["detail"] == nil {
+            fields["detail"] = .string("Scope admission was refused. Inspect scope_status and resolve the reported authority or placement check before retrying.")
+        }
         if fields["subreason"] == nil { fields["subreason"] = .string(code) }
         fields["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
         let encoder = JSONEncoder()

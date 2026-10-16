@@ -585,7 +585,8 @@ struct SessionAdminMCPToolService {
             "state": .string(expired ? DomainDelegationScopeState.expired.rawValue : record.state.rawValue),
             "kind": .string(record.grant.kind.label),
             "capabilities": capabilitiesValue(record.grant.capabilities),
-            "guardrails": guardrailsValue(record.grant.guardrails)
+            "unrestricted": .bool(record.grant.unrestricted),
+            "guardrails": record.grant.unrestricted ? .object([:]) : guardrailsValue(record.grant.guardrails)
         ]
         switch record.grant.kind {
         case let .session(target):

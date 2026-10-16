@@ -470,7 +470,16 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                 result = .object(["result": .string("not_applied")])
             }
         } catch {
-            result = .object(["result": .string("failed"), "detail": .string(error.localizedDescription)])
+            result = .object(SessionAdminReply.diagnostic(
+                code: "operation_failed", sessionIDs: pending.request.targetSessionIDs,
+                fields: [
+                    "result": .string("not_applied"), "subreason": .string("handler_threw"),
+                    "detail": .string(error.localizedDescription + " The handler returned no completion receipt. Inspect the targets and confirmation status before retrying."),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("confirmation_status"), "confirmation_id": .string(confirmationID.uuidString)
+                    ])])
+                ]
+            ))
         }
         recordApplied(pending.coverage?.adding(to: result) ?? result, confirmationID: confirmationID)
         prunePendingApplies()

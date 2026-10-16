@@ -164,7 +164,10 @@ struct AgentSessionAdminItemResult {
         var object = detail
         object["session_id"] = .string(sessionID.uuidString)
         object["status"] = .string(status.rawValue)
-        if let reason { object["reason"] = .string(reason) }
+        if let reason {
+            object["reason"] = .string(reason)
+            object = SessionAdminReply.diagnostic(code: reason, sessionIDs: [sessionID], fields: object)
+        }
         return .object(object)
     }
 }
@@ -189,7 +192,7 @@ enum AgentSessionAdminRendering {
         object["result"] = .string(mutationResult(
             statuses: items.map(\.status),
             requiresControl: !itemsRequiringControl.isEmpty,
-            committedChanges: extra[committedChangesKey] == .bool(true)
+            committedChanges: extra[committedChangesKey] == .bool(true) || extra["local_changes"] == .bool(true)
         ))
         object["op"] = .string(operation.adminOperationName)
         object["items"] = .array(items.map(\.value))
@@ -197,17 +200,14 @@ enum AgentSessionAdminRendering {
         if !itemsRequiringControl.isEmpty {
             object["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
         }
-        return .object(object)
+        return .object(addingBatchDiagnostic(object))
     }
 
-    /// Recompute only the organizing/release receipt family after the front door appends targets.
-    /// Structural replies have their own item/effect semantics and are not interpreted here.
+    /// Recompute any mutation batch after the front door appends refused targets.
+    /// Preview, undo and non-batch operation receipts retain their separate semantics.
     static func refreshingOrganizingResult(_ object: [String: Value]) -> [String: Value] {
-        let operations: Set = [
-            "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups",
-            "archive", "unarchive", "release", "retire"
-        ]
-        guard let operation = object["op"]?.stringValue, operations.contains(operation),
+        guard let outcome = object["result"]?.stringValue,
+              ["applied", "partial", "not_applied", "failed", "unchanged"].contains(outcome),
               let items = object["items"]?.arrayValue else { return object }
         let statuses = items.compactMap { item -> AgentSessionAdminItemResult.Status? in
             guard let status = item.objectValue?["status"]?.stringValue else { return nil }
@@ -218,22 +218,33 @@ enum AgentSessionAdminRendering {
         result["result"] = .string(mutationResult(
             statuses: statuses,
             requiresControl: !(object["requires_control"]?.arrayValue ?? []).isEmpty,
-            committedChanges: object[committedChangesKey] == .bool(true)
+            committedChanges: object[committedChangesKey] == .bool(true) || object["local_changes"] == .bool(true)
         ))
         result["changed_count"] = .int(statuses.count(where: { $0 == .changed }))
-        return result
+        return addingBatchDiagnostic(result)
     }
 
-    private static func mutationResult(
+    static func addingBatchDiagnostic(_ object: [String: Value]) -> [String: Value] {
+        guard let outcome = object["result"]?.stringValue, outcome == "partial" || outcome == "not_applied" else { return object }
+        let items = object["items"]?.arrayValue ?? []
+        let ids = items.compactMap { $0.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)) }
+            + (object["requires_control"]?.arrayValue ?? []).compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }
+        let firstFailure = items.compactMap(\.objectValue).first { ["failed", "skipped"].contains($0["status"]?.stringValue ?? "") }
+        let code = firstFailure?["code"]?.stringValue ?? (outcome == "partial" ? "batch_partial" : "no_change")
+        var fields = firstFailure?.filter { ["subreason", "detail", "next_call", "retryable"].contains($0.key) } ?? [:]
+        fields.merge(object, uniquingKeysWith: { _, supplied in supplied })
+        if outcome == "partial" { fields["retryable"] = .bool(false) }
+        return SessionAdminReply.diagnostic(code: code, sessionIDs: ids, fields: fields)
+    }
+
+    static func mutationResult(
         statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool
     ) -> String {
         let effects = committedChanges || statuses.contains(.changed)
         let failed = statuses.contains(.failed)
         let incomplete = failed || statuses.contains(.skipped) || requiresControl
         if effects { return incomplete ? "partial" : "applied" }
-        if failed { return "failed" }
-        if incomplete || statuses.isEmpty { return "not_applied" }
-        return "unchanged"
+        return "not_applied"
     }
 }
 

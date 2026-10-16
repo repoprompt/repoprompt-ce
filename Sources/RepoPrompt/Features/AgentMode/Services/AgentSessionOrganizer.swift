@@ -403,7 +403,17 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         let initial = locations(for: Set(sessionIDs), windows: liveWindows(), writableOnly: true)
         var seen: Set<UUID> = []
         for sessionID in sessionIDs where seen.insert(sessionID).inserted {
-            guard let location = initial[sessionID]?.location, location.stashedTabID != nil else { continue }
+            guard let location = initial[sessionID]?.location else {
+                let evidence = AgentSessionCarrierResolver.capture(windows: liveWindows(), sessionIDs: [sessionID])
+                let reason = evidence.replicatedSessionIDs.contains(sessionID) ? "replicated_binding"
+                    : evidence.ambiguousSessionIDs.contains(sessionID) ? "ambiguous_binding" : "archived_carrier_unavailable"
+                outcome.failures[sessionID] = .init(reason: reason)
+                continue
+            }
+            guard location.stashedTabID != nil else {
+                outcome.failures[sessionID] = .init(reason: "not_archived")
+                continue
+            }
             byWindow[location.window.windowID, default: (location.window, [])].1.append((sessionID, location))
         }
         for windowID in byWindow.keys.sorted() {
@@ -411,13 +421,23 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             let manager = window.workspaceManager
             let workspaceID = entries[0].1.workspaceID
             guard window.promptManager.flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
-            else { continue }
+            else {
+                for (id, _) in entries {
+                    outcome.failures[id] = .init(reason: "compose_flush_rejected")
+                }
+                continue
+            }
             // Flush callbacks and the preceding window's save can change a same-workspace carrier.
             // Reuse the indexed resolver for this region, never the pre-await locations as authority.
             let current = locations(for: Set(entries.map(\.0)), windows: liveWindows(), writableOnly: true)
             guard manager.activeWorkspaceID == workspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
-            else { continue }
+            else {
+                for (id, _) in entries {
+                    outcome.failures[id] = .init(reason: "workspace_changed")
+                }
+                continue
+            }
             let ephemeral = manager.workspaces[index].isEphemeral
             let stashes = manager.workspaces[index].stashedTabs
             var stashIndexByID: [UUID: Int] = [:]
@@ -443,7 +463,10 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
                     continue
                 }
                 var tab = stashes[stashIndex].tab
-                guard activeTabIDs.insert(tab.id).inserted else { continue }
+                guard activeTabIDs.insert(tab.id).inserted else {
+                    outcome.failures[sessionID] = .init(reason: "tab_id_conflict")
+                    continue
+                }
                 tab.lastModified = Date()
                 removedIndexes.insert(stashIndex)
                 tabs.append(tab)

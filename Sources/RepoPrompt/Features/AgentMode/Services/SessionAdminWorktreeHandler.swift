@@ -149,7 +149,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         let repoRoot = try SessionAdminArguments.string(args, "repo_root", op: "worktree_create")
         let branch = try SessionAdminArguments.string(args, "branch", op: "worktree_create")
         let baseRef = try SessionAdminArguments.string(args, "base_ref", op: "worktree_create")
-        let bindAfter = try SessionAdminArguments.bool(args, "bind", op: "worktree_create") ?? false
+        let bindAfter = try SessionAdminArguments.bool(args, "bind", op: "worktree_create") ?? true
         let mode = try Self.applyMode(args, op: "worktree_create")
         let target = lease.targetSessionID
         if batch.request.preview {
@@ -169,7 +169,12 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             records, creator: caller, operation: .adminWorktreeCreate, scopes: context.scopes, projector: context.projector
         )
         if let denial = evaluation.denial {
-            return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
+            let refusal = try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
+            guard var fields = refusal.objectValue else { return refusal }
+            fields["subreason"] = fields["guardrail"] ?? .string("usage_evidence_unavailable")
+            return .object(SessionAdminReply.diagnostic(
+                code: fields["code"]?.stringValue ?? "scope_denied", sessionIDs: [target], fields: fields
+            ))
         }
         // Reserved before the first suspension, right after the guardrail checks, so two concurrent
         // creations cannot both pass; the ownership record takes over once it exists.
@@ -197,16 +202,35 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             "result": .string("created"), "op": .string("worktree_create"),
             "session_id": .string(target.uuidString), "worktree": info.value,
             // Replayable by the front door's ledger: a retry with the same key never creates twice.
-            "changed_count": .int(1)
+            "changed_count": .int(1), "bound": .bool(false),
+            "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                "op": .string("worktree_bind"), "session_id": .string(target.uuidString),
+                "scope_id": .string(batch.scope.id.uuidString), "worktree": .string("@id:\(info.worktreeID)"),
+                "repo_root": .string(info.repoRootPath), "apply": .string("next_boundary")
+            ])])
         ]
         if bindAfter {
-            guard context.scopes.isCurrent(lease) else {
-                reply["binding"] = SessionAdminItemResult.revoked(target).value
-                return .object(reply)
+            let binding: SessionAdminItemResult = if context.scopes.isCurrent(lease) {
+                await bindOne(
+                    lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
+                )
+            } else {
+                .revoked(target)
             }
-            reply["binding"] = await bindOne(
-                lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
-            ).value
+            reply["binding"] = binding.value
+            let bindingCommitted = binding.fields[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
+            reply["bound"] = .bool(binding.result == "bound" || bindingCommitted)
+            if bindingCommitted { reply["next_call"] = binding.value.objectValue?["next_call"] }
+            if binding.result == "bound" { reply.removeValue(forKey: "next_call") }
+            if binding.status == "failed" || binding.status == "skipped" {
+                reply["result"] = .string("partial")
+                reply["detail"] = .string("The worktree was created and its ownership recorded, but binding completion failed. Use next_call to inspect or bind the existing worktree; retrying this creation key replays this receipt. " + (binding.value.objectValue?["detail"]?.stringValue ?? ""))
+                reply["affected"] = .object([
+                    "session_ids": .array([.string(target.uuidString)]), "worktree_ids": .array([.string(info.worktreeID)])
+                ])
+                reply = SessionAdminReply.diagnostic(code: binding.code ?? "bind_failed", sessionIDs: [target], fields: reply)
+                reply["subreason"] = binding.value.objectValue?["subreason"] ?? .string(binding.code ?? "bind_failed")
+            }
         }
         return .object(reply)
     }
@@ -254,15 +278,21 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         if mode == .nextBoundary, !host.isIdleForWorktreeTransition(sessionID: target) {
             return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
         }
+        var committed = false
         do {
-            let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot)
+            let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot, onCommitted: { committed = true })
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
         } catch SessionAdminHostError.authorityEnded {
             return .revoked(target)
+        } catch SessionAdminHostError.usageEvidenceUnavailable {
+            return SessionAdminItemResult(
+                sessionID: target, result: "not_applied", code: "scope_denied",
+                fields: ["subreason": .string("usage_evidence_unavailable")]
+            )
         } catch let SessionAdminHostError.guardrailExceeded(limit, current) {
             return SessionAdminItemResult(
                 sessionID: target, result: "not_applied", code: "scope_guardrail_exceeded",
-                fields: ["guardrail": .string("max_worktrees"), "limit": .int(limit), "current": .int(current)]
+                fields: ["subreason": .string("max_worktrees"), "guardrail": .string("max_worktrees"), "limit": .int(limit), "current": .int(current)]
             )
         } catch SessionAdminHostError.notIdle {
             if mode == .nextBoundary {
@@ -270,12 +300,28 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             }
             return SessionAdminItemResult(
                 sessionID: target, result: "not_applied", code: "target_busy",
-                fields: ["detail": .string("The target is busy. Retry with apply: next_boundary to bind at its next idle boundary.")]
+                fields: [
+                    "detail": .string("The target is busy. Use next_call to bind at its next idle boundary."),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("worktree_bind"), "scope_id": .string(scope.id.uuidString),
+                        "session_id": .string(target.uuidString), "worktree": .string(worktree), "apply": .string("next_boundary")
+                    ])])
+                ]
             )
         } catch {
             return SessionAdminItemResult(
                 sessionID: target, result: "not_applied", code: "bind_failed",
-                fields: ["detail": .string(error.localizedDescription)]
+                fields: [
+                    "detail": .string(error.localizedDescription + (
+                        committed
+                            ? " The binding committed, but completion failed. Inspect the current session before any further mutation."
+                            : " No binding commit was acknowledged. Inspect current session and scope state before choosing a recovery call."
+                    )),
+                    AgentSessionAdminRendering.committedChangesKey: .bool(committed),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("get"), "scope_id": .string(scope.id.uuidString), "session_id": .string(target.uuidString)
+                    ])])
+                ]
             )
         }
     }
@@ -287,7 +333,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         lease: DomainDelegationScopeLease,
         scope: DomainDelegationScopeRecord,
         worktree: String,
-        repoRoot: String?
+        repoRoot: String?,
+        onCommitted: @escaping @MainActor () -> Void = {}
     ) async throws -> SessionAdminWorktreeInfo {
         let context = context
         var reservations: [DelegationScopeReservation] = []
@@ -302,6 +349,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 reservations = try self.reserveBinding(desiredIDs, target: lease.targetSessionID, scope: scope)
             },
             bindingsCommitted: { desiredIDs in
+                onCommitted()
                 for worktreeID in desiredIDs {
                     self.ownership.clearReleased(worktreeID: worktreeID)
                 }
@@ -319,13 +367,20 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         for creator in Set(reactivated.compactMap(\.createdBySessionID)) {
             records += try DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: context.scopes, projector: context.projector)
         }
-        let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // A target can count toward overlapping creator scopes and their restricted ancestors,
+        // even when the authorizing scope itself is unrestricted.
+        records = records.flatMap { context.scopeChain(of: $0) }
+        let byID = Dictionary(
+            records.filter { !$0.grant.unrestricted && $0.grant.guardrails.maxWorktrees != nil }
+                .map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let bound = host.allBoundWorktrees()
         let retainedTargetIDs = host.retainedWorktreeIDsAfterReplacingBinding(sessionID: target)
         var admitted: [(UUID, Set<String>)] = []
         for record in byID.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
             guard let projected = context.projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
-                throw DelegationSpawnAdmission.error(for: .usageProofMissing)
+                throw SessionAdminHostError.usageEvidenceUnavailable
             }
             let members = Set(context.projector.members(of: record.grant))
             let owned = ownership.ownedUnreleasedWorktreeIDs(createdBy: members)
@@ -511,9 +566,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                   record.isActive && batch.request.operation.requiredScopeCapability.map(record.grant.capabilities.contains) == true
               })
         else { throw SessionAdminMCPToolService.unavailableError }
-        guard context.projector.usageEvidence(of: batch.scope.grant, spawnParentSessionID: nil) != nil else {
-            throw DelegationSpawnAdmission.error(for: .usageProofMissing)
-        }
+        // Listing has no capacity admission: per-row membership and final chain fences remain
+        // authoritative. Unrelated incomplete usage evidence must not veto a read.
         let members = context.projector.members(of: batch.scope.grant)
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
         let memberSet = Set(members)
