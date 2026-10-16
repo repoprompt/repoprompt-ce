@@ -181,7 +181,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         let chain = scopes.scopeChain(from: scope.id)
         return !chain.isEmpty && chain.allSatisfy { record in
             guard record.isActive, record.grant.capabilities.contains(capability) else { return false }
-            if case .allSessions = record.grant.kind {
+            if case .allSessions = record.grant.kind, !record.grant.unrestricted {
                 return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
             }
             return true

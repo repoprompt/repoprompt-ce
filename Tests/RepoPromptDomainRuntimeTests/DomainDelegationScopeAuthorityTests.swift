@@ -170,6 +170,60 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         }
     }
 
+    /// The user's global auto-approve (yolo) mode: one unrestricted grant holds every capability over
+    /// every session and never raises a card. Only the app's global setting may mint it.
+    func testUnrestrictedGlobalGrantHoldsEveryCapabilityOverAllSessionsWithoutCards() throws {
+        XCTAssertNil(DomainDelegationScopeAuthority.validate(
+            kind: .allSessions, capabilities: DomainDelegationScopeCapability.fullPreset,
+            guardrails: .init(), now: now, unrestricted: true
+        ))
+        XCTAssertEqual(
+            DomainDelegationScopeAuthority.validate(
+                kind: .allSessions, capabilities: DomainDelegationScopeCapability.fullPreset,
+                guardrails: .init(), now: now
+            ),
+            .capabilityNotPermittedForKind(.control),
+            "an ordinary all-sessions grant stays restricted"
+        )
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(
+                granteeSessionID: overseer, kind: .allSessions,
+                capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(), unrestricted: true
+            ),
+            scopeID: UUID(), now: now
+        ).get()
+        XCTAssertTrue(scope.grant.unrestricted)
+        for operation in [DomainAgentSessionTargetOperation.adminRetire, .adminRename] {
+            XCTAssertNil(
+                DomainDelegationScopeAuthority.confirmationRequirement(
+                    operation: operation, itemCount: 10_000, guardrails: scope.grant.guardrails, unrestricted: true
+                ),
+                "\(operation.rawValue) is never carded under global auto-approve"
+            )
+        }
+        XCTAssertEqual(
+            DomainDelegationScopeAuthority.confirmationRequirement(operation: .adminRetire, itemCount: 1, guardrails: .init()),
+            .destructive, "restricted grants keep their cards"
+        )
+    }
+
+    func testUnrestrictedFlagRoundTripsAndOlderGrantsDecodeAsRestricted() throws {
+        let grant = DomainDelegationScopeGrant(
+            id: UUID(), granteeSessionID: overseer, kind: .allSessions,
+            capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(),
+            origin: .user, grantedAt: now, unrestricted: true
+        )
+        let data = try JSONEncoder().encode(grant)
+        XCTAssertTrue(try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: data).unrestricted)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "unrestricted")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: legacy)
+        XCTAssertFalse(decoded.unrestricted, "grants saved before global mode never become unrestricted")
+        XCTAssertEqual(decoded.capabilities, grant.capabilities)
+    }
+
     func testPresetsMatchTheDesignDefaults() {
         XCTAssertFalse(DomainDelegationScopeCapability.manageTreePreset.contains(.destructive))
         XCTAssertEqual(DomainDelegationScopeCapability.manageTreePreset.count, 6)

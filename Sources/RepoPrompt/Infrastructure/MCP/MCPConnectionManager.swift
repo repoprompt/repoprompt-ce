@@ -3313,8 +3313,12 @@ actor ServerNetworkManager {
             )
         #endif
         let bootstrapState = await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint)
-        let oversightEnabled = await MainActor.run {
-            ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink)
+        // One main-actor read, before route revalidation: no new suspension after the fences below.
+        let (oversightEnabled, globalOverseer) = await MainActor.run {
+            (
+                ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
+                OverseerGlobalAutoApprove.isEnabled()
+            )
         }
         guard let revalidatedRouteToken = await (
             modelOnly
@@ -3338,6 +3342,8 @@ actor ServerNetworkManager {
         await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
             return nil
         }
+        // Global Overseer full access (read above) lists the full oversight surface for every eligible
+        // session from its first turn, as if activated; each operation still authorizes when it runs.
         let eligible = runState.taskLabelKind != .explore && bootstrapState != nil
         let transientlyIneligible: Bool = if runState.taskLabelKind != .explore, bootstrapState == nil {
             await AgentSessionLinkRuntimeBridge.shared
@@ -3345,7 +3351,7 @@ actor ServerNetworkManager {
         } else {
             false
         }
-        let activated = eligible && bootstrapState?.activation != nil
+        let activated = eligible && (bootstrapState?.activation != nil || (globalOverseer && oversightEnabled))
         var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,

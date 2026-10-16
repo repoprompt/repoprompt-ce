@@ -317,6 +317,10 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
     package let guardrails: DomainDelegationScopeGuardrails
     package let origin: DomainDelegationScopeOrigin
     package let grantedAt: Date
+    /// Minted only by the user's global auto-approve (Overseer yolo) setting: every capability over
+    /// every session, no `.allSessions` capability restriction, and no confirmation cards. Grants
+    /// saved before this flag existed decode as restricted.
+    package let unrestricted: Bool
 
     package init(
         id: UUID,
@@ -325,7 +329,8 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         capabilities: Set<DomainDelegationScopeCapability>,
         guardrails: DomainDelegationScopeGuardrails,
         origin: DomainDelegationScopeOrigin,
-        grantedAt: Date
+        grantedAt: Date,
+        unrestricted: Bool = false
     ) {
         self.id = id
         self.granteeSessionID = granteeSessionID
@@ -334,6 +339,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         self.guardrails = guardrails
         self.origin = origin
         self.grantedAt = grantedAt
+        self.unrestricted = unrestricted
     }
 
     package var parentScopeID: UUID? {
@@ -348,6 +354,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         case guardrails
         case origin
         case grantedAt = "granted_at"
+        case unrestricted
     }
 
     package init(from decoder: any Decoder) throws {
@@ -361,6 +368,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         guardrails = try container.decode(DomainDelegationScopeGuardrails.self, forKey: .guardrails)
         origin = try container.decode(DomainDelegationScopeOrigin.self, forKey: .origin)
         grantedAt = try container.decode(Date.self, forKey: .grantedAt)
+        unrestricted = try container.decodeIfPresent(Bool.self, forKey: .unrestricted) ?? false
     }
 
     package func encode(to encoder: any Encoder) throws {
@@ -372,6 +380,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         try container.encode(guardrails, forKey: .guardrails)
         try container.encode(origin, forKey: .origin)
         try container.encode(grantedAt, forKey: .grantedAt)
+        if unrestricted { try container.encode(true, forKey: .unrestricted) }
     }
 }
 

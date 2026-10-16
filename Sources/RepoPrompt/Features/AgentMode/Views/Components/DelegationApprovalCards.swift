@@ -145,7 +145,7 @@ struct DelegationActiveScopesSection: View {
                     .font(.headline)
                 if globalAutoApprove {
                     Label(
-                        "Auto-approving all Overseer access requests (Settings › Agent Permissions › Overseer).",
+                        "Overseer full access is on: no approvals or confirmation cards (Settings › Agent Permissions › Overseer).",
                         systemImage: "checkmark.shield"
                     )
                     .font(.caption)

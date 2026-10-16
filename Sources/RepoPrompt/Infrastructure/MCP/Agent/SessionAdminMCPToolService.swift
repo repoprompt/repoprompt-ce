@@ -36,7 +36,7 @@ struct SessionAdminMCPToolService {
     static let inventoryGuidance = "For cleanup or organizing, request observe together with the needed mutation capabilities, then use inventory to select targets when available. A workspace scope covers only that workspace; history is not a scope inventory."
 
     private static let lifecycleKeys: [String: Set<String>] = [
-        "request_scope": ["op", "kind", "workspace", "capabilities", "guardrails", "reason", "idempotency_key"],
+        "request_scope": ["op", "kind", "workspace", "session_id", "capabilities", "guardrails", "reason", "idempotency_key"],
         "scope_status": ["op", "scope_id", "request_id"],
         "release_scope": ["op", "scope_id", "request_id"],
         "confirmation_status": ["op", "confirmation_id"],
@@ -512,8 +512,10 @@ struct SessionAdminMCPToolService {
                 row["link_capability"] = .string(capability.rawValue)
             }
             if operation == .monitorCreateLane {
-                row["scope_capabilities"] = capabilitiesValue([.spawn])
-                row["guidance"] = .string("Requires overseer activation or an outbound link; scoped creation uses spawn and scope guardrails. This creates and links a lane without starting a turn unless message is supplied.")
+                // Authorized by overseer activation or a link, not by a scope capability. A live
+                // scope only adds its guardrails (session/depth/worktree limits) to the creation.
+                row["authority"] = .string("overseer_activation_or_link")
+                row["guidance"] = .string("Needs overseer activation (become_overseer) or a link; no scope or spawn capability is required. Any live scope only adds its limits. This creates and links a lane without starting a turn unless message is supplied. Just call it.")
             }
             rows.append(.object(row))
         }
@@ -525,8 +527,8 @@ struct SessionAdminMCPToolService {
         }
         rows.append(.object([
             "tool": .string("agent_run"), "op": .string("start"),
-            "scope_capabilities": capabilitiesValue([.spawn]),
-            "guidance": .string("Creates a child session. Scoped creation checks provenance and guardrails, not just spawn. Use session_admin fork to copy a member, or agent_session_link create_lane for a top-level managed lane.")
+            "authority": .string("routed_agent_caller"),
+            "guidance": .string("Creates a child session. Any routed Agent session may start one; no scope or spawn capability is required. Any live scope only adds its limits. Use session_admin fork to copy a member, or agent_session_link create_lane for a top-level managed lane.")
         ]))
         for operation in DomainAgentSessionTargetOperation.allCases where operation.rawValue.hasPrefix("agent_run.") {
             let op = String(operation.rawValue.dropFirst("agent_run.".count))

@@ -130,6 +130,36 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
+    func testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession() throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let unrelated = DomainAgentSessionTargetProvenance.known(targetSessionID: UUID(), parentSessionID: nil)
+        let caller = DomainAgentSessionCallerIdentity.agentSession(callerSessionID)
+        let operations: [DomainAgentSessionTargetOperation] = [.runSteer, .runCancel, .runRespond, .manageStop, .manageCleanup]
+
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        for operation in operations {
+            XCTAssertThrowsError(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): off keeps the direct-child and human-only rules"
+            )
+        }
+
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        for operation in operations {
+            XCTAssertNoThrow(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): global on removes the barrier, including session deletion"
+            )
+        }
+        XCTAssertThrowsError(
+            try AgentSessionTargetOperationGuard.require(
+                operation: .runSteer, caller: .unresolvedAgentRun, provenance: unrelated, reference: "x"
+            ),
+            "unresolved routing is not a caller and still fails closed"
+        )
+    }
+
     func testAgentOriginCallerCannotTargetItsOwnSession() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }

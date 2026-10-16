@@ -183,6 +183,14 @@ enum AgentSessionTargetOperationGuard {
         provenance: DomainAgentSessionTargetProvenance,
         reference: String
     ) throws {
+        // Global Overseer auto-approve: a routed Agent session may run every existing target
+        // operation on any other session, including ones that are otherwise direct-child or
+        // human-only. Unresolved routing and self-targeting still fail closed.
+        if case let .agentSession(callerSessionID) = caller, OverseerGlobalAutoApprove.isEnabled(),
+           provenance.targetSessionID != callerSessionID
+        {
+            return
+        }
         let decision = DomainAgentSessionOperationAuthorizer.authorize(
             operation: operation,
             caller: caller,
@@ -227,7 +235,7 @@ enum AgentSessionTargetOperationGuard {
         case .unresolvedAgentRun:
             throw denialError(sessionID: targetSessionID)
         case let .agentSession(callerSessionID):
-            if callerSessionID == targetSessionID { return }
+            if callerSessionID == targetSessionID || OverseerGlobalAutoApprove.isEnabled() { return }
             if await resolveTargetProvenance(targetSessionID).parentSessionID == callerSessionID { return }
             if let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
                endpoint.sessionID == callerSessionID,

@@ -68,7 +68,9 @@ enum DelegationSpawnAdmission {
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
     ) throws -> [DomainDelegationScopeRecord] {
-        let liveScopes = scopes.allLiveScopes()
+        // A global auto-approve grant has no guardrails to count against, so it is not a delegation
+        // that can bound or block a creation.
+        let liveScopes = scopes.allLiveScopes().filter { !$0.grant.unrestricted }
         // These creation surfaces already have their own caller authority. With no delegation
         // anywhere, missing scope provenance cannot hide a limit or revoke that authority.
         guard !liveScopes.isEmpty else { return [] }

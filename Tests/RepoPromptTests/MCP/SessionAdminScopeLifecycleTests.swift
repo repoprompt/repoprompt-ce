@@ -430,23 +430,119 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(third["result"], .string("pending_user_approval"))
         try fixture.runtime.deny(requestID: requestID(third))
 
-        // The global setting approves every requester exactly as requested, without widening.
+        // The global setting is global: any request is answered with one unrestricted grant that
+        // holds every capability over every session, however narrow the request was.
         globalEnabled = true
         fixture.endpoint = fixture.makeEndpoint(session: other)
         let global = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
         XCTAssertEqual(global["result"], .string("granted"))
         let globalScope = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.granteeSessionID == other })
-        XCTAssertEqual(globalScope.grant.capabilities, [.observe])
+        XCTAssertEqual(globalScope.grant.kind, .allSessions)
+        XCTAssertEqual(globalScope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertTrue(globalScope.grant.unrestricted)
         XCTAssertFalse(fixture.runtime.sessionWideApprovals.contains(other), "the global setting is not Grant all")
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertTrue(fixture.runtime.hasLiveScope(grantedTo: other), "still on: the global grant stays")
 
-        // Stopping a standing approval from Active delegations brings the card back.
+        // Turning the setting off withdraws every global grant at once.
         globalEnabled = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertFalse(fixture.runtime.hasLiveScope(grantedTo: other), "off means off")
+        // Stopping a standing approval from Active delegations brings the card back.
         fixture.endpoint = fixture.makeEndpoint(session: overseer)
         let again = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
         _ = try fixture.runtime.approve(requestID: requestID(again), grantAllForSession: true).get()
         fixture.runtime.endSessionWideApproval(sessionID: overseer)
         let afterStop = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
         XCTAssertEqual(afterStop["result"], .string("pending_user_approval"))
+    }
+
+    func testRequestScopeAcceptsSessionKindWithItsSessionID() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        let target = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let value = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("session"), "session_id": .string(target.uuidString),
+            "capabilities": .array([.string("observe"), .string("control")])
+        ])
+        XCTAssertEqual(value["result"], .string("pending_user_approval"))
+        let id = try XCTUnwrap(value["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertEqual(fixture.runtime.requests[id]?.kind, .session(targetSessionID: target))
+    }
+
+    func testDiscoveryCatalogDoesNotClaimLaneOrRunCreationNeedsSpawn() throws {
+        let rows = try XCTUnwrap(SessionAdminMCPToolService.operationCatalog().arrayValue).compactMap(\.objectValue)
+        func row(_ tool: String, _ op: String) throws -> [String: Value] {
+            try XCTUnwrap(rows.first { $0["tool"] == .string(tool) && $0["op"] == .string(op) }, "\(tool).\(op)")
+        }
+        for (tool, op) in [("agent_session_link", "create_lane"), ("agent_run", "start")] {
+            let entry = try row(tool, op)
+            // Creation is authorized by activation/a link (lanes) or routing (runs); a scope only adds
+            // limits. Listing spawn as required made agents refuse to try.
+            XCTAssertNil(entry["scope_capabilities"], "\(tool).\(op) requires no scope capability")
+            XCTAssertFalse(entry["guidance"]?.stringValue?.isEmpty ?? true)
+        }
+    }
+
+    func testGlobalAutoApproveAuthorizesEveryOperationWithoutRequestScopeOrCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        let unrelated = UUID()
+        let lane = UUID()
+        for id in [overseer, unrelated, lane] {
+            fixture.source.add(id, parent: nil)
+        }
+        var global = false
+        fixture.runtime.isGlobalAutoApproveEnabled = { global }
+        let handler = RecordingHandler([.adminRename, .adminRetire])
+        fixture.core.register(handler)
+        func perform(
+            _ operation: DomainAgentSessionTargetOperation, _ targets: [UUID], key: String? = nil
+        ) async throws -> AgentSessionAdministrationOutcome {
+            try await fixture.core.perform(.init(
+                operation: operation, caller: .agentSession(overseer), targetSessionIDs: targets, idempotencyKey: key
+            ))
+        }
+
+        guard case .denied(.unknownScope, _) = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("with the setting off and no grant, nothing is authorized")
+        }
+        XCTAssertTrue(fixture.runtime.allLiveScopes().isEmpty)
+
+        global = true
+        guard case .completed = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("global on: an unrelated session is managed without any request")
+        }
+        var many: [UUID] = []
+        for _ in 0 ..< 40 {
+            let id = UUID()
+            fixture.source.add(id, parent: nil)
+            many.append(id)
+        }
+        guard case .completed = try await perform(.adminRename, many, key: "bulk") else {
+            return XCTFail("global on: no bulk card")
+        }
+        guard case .completed = try await perform(.adminRetire, [lane], key: "retire") else {
+            return XCTFail("global on: no always-carded retire card")
+        }
+        XCTAssertEqual(handler.batches.count, 3)
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty, "no card was ever raised")
+        let scopes = fixture.runtime.allLiveScopes()
+        XCTAssertEqual(scopes.count, 1, "one standing global grant is minted once and reused")
+        let scope = try XCTUnwrap(scopes.first)
+        XCTAssertEqual(scope.grant.granteeSessionID, overseer)
+        XCTAssertEqual(scope.grant.kind, .allSessions)
+        XCTAssertEqual(scope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertTrue(scope.grant.unrestricted)
+        XCTAssertNil(scope.grant.guardrails.expiresAt)
+
+        global = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertTrue(fixture.runtime.allLiveScopes().isEmpty, "turning the setting off revokes the global grant")
+        guard case .denied = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("off means off")
+        }
     }
 
     func testScopeStatusDiscoversOperationsAndCurrentGrantsBeforeFailure() async throws {

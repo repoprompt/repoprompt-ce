@@ -8065,7 +8065,8 @@ final class AgentSessionLinkRuntimeBridge {
         basis: LaneCreationCallerBasis
     ) async -> Bool {
         guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
-        if case .linked = basis {
+        // Global Overseer full access: an eligible caller creates lanes without activation or a link.
+        if case .linked = basis, !OverseerGlobalAutoApprove.isEnabled() {
             guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
         }
         return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)

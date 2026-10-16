@@ -200,8 +200,8 @@ struct AgentPermissionsSettingsView: View {
                 .font(.headline)
             Toggle(isOn: $autoApproveDelegationRequests) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Auto-approve Overseer access requests")
-                    Text("When an Overseer asks for access to your sessions, it gets exactly what it asked for with no approval card. Grants still appear in Active delegations, where you can revoke them. Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
+                    Text("Overseer full access (no approvals)")
+                    Text("An Overseer can do everything to every session without asking: observe, organize, control, restructure, spawn, worktrees, retire, and delete sessions. No approval or confirmation cards appear. Its access shows in Active delegations. Turn this off to revoke it immediately.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -209,6 +209,10 @@ struct AgentPermissionsSettingsView: View {
             }
             .toggleStyle(.switch)
             .accessibilityIdentifier("agent-permissions-auto-approve-delegation")
+            .onChange(of: autoApproveDelegationRequests) { _, isOn in
+                // Off means off: withdraw every global grant now, not on the next agent call.
+                if !isOn { AgentSessionLinkRuntimeBridge.shared.delegationScopes.reconcileGlobalAutoApprove() }
+            }
         }
     }
 

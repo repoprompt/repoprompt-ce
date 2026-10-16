@@ -175,10 +175,16 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             return .denied(.callerNotAgentSession, sessionID: nil)
         }
         let scope: DomainDelegationScopeRecord
+        // Off means off: a global grant left from an earlier "on" never outlives the setting.
+        scopes.reconcileGlobalAutoApprove()
         if let scopeID = request.scopeID {
             // The authority checks grantee identity before disclosing anything about this scope.
             guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
             scope = record
+        } else if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) {
+            // Global auto-approve: the one unrestricted grant covers every operation and session, with
+            // no request, no scope choice and no card. Authorization below still runs against it.
+            scope = global
         } else {
             let live = scopes.liveScopes(grantedTo: callerSessionID)
             var required = request.operation.requiredScopeCapabilities(for: .idle)

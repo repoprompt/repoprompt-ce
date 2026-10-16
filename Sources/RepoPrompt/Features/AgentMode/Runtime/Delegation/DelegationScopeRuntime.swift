@@ -147,10 +147,8 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Global user setting (Settings › Agent Permissions), off by default. When on, every agent
     /// delegation request is approved as requested without a card. Deliberately not exposed through
     /// MCP `app_settings`, so an agent cannot enable it.
-    static let autoApproveAllRequestsKey = "agentMode.delegation.autoApproveAllRequests"
-    var isGlobalAutoApproveEnabled: @MainActor () -> Bool = {
-        UserDefaults.standard.bool(forKey: DelegationScopeRuntime.autoApproveAllRequestsKey)
-    }
+    static let autoApproveAllRequestsKey = OverseerGlobalAutoApprove.defaultsKey
+    var isGlobalAutoApproveEnabled: @MainActor () -> Bool = { OverseerGlobalAutoApprove.isEnabled() }
 
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
@@ -602,7 +600,10 @@ final class DelegationScopeRuntime: ObservableObject {
             kind: kind,
             capabilities: capabilities,
             guardrails: guardrails,
-            now: now()
+            now: now(),
+            // Global auto-approve answers any request with an unrestricted grant, so no capability is
+            // refused for its kind before that.
+            unrestricted: isGlobalAutoApproveEnabled()
         ) {
             return .failure(.invalid(denial))
         }
@@ -733,10 +734,67 @@ final class DelegationScopeRuntime: ObservableObject {
     @discardableResult
     func approveWithStandingConsent(requestID: UUID) -> Bool {
         guard let request = requests[requestID], request.state == .pending else { return false }
-        let sessionWide = sessionWideApprovals.contains(request.requesterSessionID)
-        guard sessionWide || isGlobalAutoApproveEnabled() else { return false }
-        if case .success = approve(requestID: requestID, grantAllForSession: sessionWide) { return true }
+        // Global is global: answer any request with the one unrestricted grant, however narrow.
+        if let global = ensureGlobalAutoApproveScope(for: request.requesterSessionID) {
+            settleGranted(requestID: requestID, record: global)
+            return true
+        }
+        guard sessionWideApprovals.contains(request.requesterSessionID) else { return false }
+        if case .success = approve(requestID: requestID, grantAllForSession: true) { return true }
         return false
+    }
+
+    /// The user's global auto-approve (Overseer yolo) grant for `grantee`: `.allSessions`, every
+    /// capability, unrestricted (no all-sessions capability limit, no confirmation cards), no expiry.
+    /// Minted once and reused; nil when the setting is off or authority is unavailable. It is an
+    /// ordinary recorded grant, so it shows in Active delegations and can be revoked.
+    @discardableResult
+    func ensureGlobalAutoApproveScope(for grantee: UUID) -> DomainDelegationScopeRecord? {
+        guard canUseAuthority, isGlobalAutoApproveEnabled(), !deletedSessionIDs.contains(grantee) else { return nil }
+        expireDueScopes()
+        if let existing = liveScopes(grantedTo: grantee).first(where: \.grant.unrestricted) { return existing }
+        let request = DomainDelegationScopeGrantRequest(
+            granteeSessionID: grantee,
+            kind: .allSessions,
+            capabilities: DomainDelegationScopeCapability.fullPreset,
+            guardrails: .init(),
+            unrestricted: true
+        )
+        guard case let .success(record) = authority.grant(request, scopeID: makeUUID(), now: now()) else { return nil }
+        didChange(grantees: [grantee], invalidated: [])
+        return record
+    }
+
+    /// Off means off: revoke every global grant once the setting is turned off. Called when the
+    /// setting changes and before each scoped administration decision.
+    func reconcileGlobalAutoApprove() {
+        guard canUseAuthority, !isGlobalAutoApproveEnabled() else { return }
+        let global = authority.liveRecords(now: now()).filter(\.grant.unrestricted)
+        guard !global.isEmpty else { return }
+        var changed: [DomainDelegationScopeRecord] = []
+        for record in global {
+            changed.append(contentsOf: authority.revoke(scopeID: record.id))
+        }
+        recordRevocations(changed)
+    }
+
+    /// Marks a pending request granted by an existing grant and runs the same notice and oversee
+    /// continuation as a card approval.
+    private func settleGranted(requestID: UUID, record: DomainDelegationScopeRecord) {
+        guard var request = requests[requestID], request.state == .pending else { return }
+        request.state = .granted(scopeID: record.id)
+        requests[requestID] = request
+        let continuation = overseeContinuations.removeValue(forKey: requestID)
+        if let continuation {
+            startOverseeContinuation(request: request, record: record, continuation: continuation)
+        }
+        enqueueDecision(
+            sessionID: request.requesterSessionID,
+            tabID: request.requesterTabID,
+            result: "granted",
+            identifier: record.id,
+            automaticContinuation: continuation != nil
+        )
     }
 
     /// User action from Active delegations: stop approving this session's requests automatically.

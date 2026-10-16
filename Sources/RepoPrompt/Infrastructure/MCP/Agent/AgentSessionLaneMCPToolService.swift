@@ -88,7 +88,7 @@ enum AgentSessionLaneMCPToolService {
             case .destinationUnavailable:
                 "No unambiguous active destination was available, or it changed before allocation. Call manage_workspaces with action=list, open the intended workspace in a window, then retry create_lane with its UUID in workspace if more than one destination remains. No lane was allocated."
             case .scopeDenied:
-                "The destination was resolved, but scoped spawn admission was refused. Call session_admin scope_status to inspect spawn authority and limits. If placement is unresolved, load or repair the affected sessions before retrying; granting more capabilities does not repair provenance. No lane was allocated."
+                "The destination was resolved, but a live delegation scope's limit (sessions, depth or worktrees) or an unprovable session placement refused this creation. Lane creation needs no spawn capability. Call session_admin scope_status to see the limiting scope; if placement is unresolved, load or repair the affected sessions before retrying. No lane was allocated."
             case .persistenceUnavailable, .saveFailed:
                 "Oversight storage is unavailable. Check the oversight dashboard's saving warning and retry after storage is available."
             case .hostUnavailable, .shuttingDown:
