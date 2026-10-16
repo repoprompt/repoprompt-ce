@@ -552,6 +552,32 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertNil(unresolved.objectValue?["matching_child_count"])
     }
 
+    func testListSessionsNoteResamplesFullAccess() async throws {
+        let original = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = original }
+        var fullAccess = false
+        OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+        let window = try await makeWindow(waitForInitialization: true)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let service = makeManageService(window: window, callerSessionID: callerSessionID)
+        for enabled in [false, true, false] {
+            fullAccess = enabled
+            let reply = try await service.execute(args: ["op": .string("list_sessions")])
+            let note = try XCTUnwrap(reply.objectValue?["note"]?.stringValue)
+            XCTAssertTrue(note.contains("not a workspace inventory"))
+            if enabled {
+                XCTAssertTrue(note.contains("Overseer full access: ON"))
+                XCTAssertTrue(note.contains("session_admin inventory"))
+                XCTAssertFalse(note.contains("request_scope"))
+                XCTAssertFalse(note.contains("scope card"))
+            } else {
+                XCTAssertTrue(note.contains("when no current grant covers"))
+                XCTAssertTrue(note.contains("standing consent"))
+                XCTAssertTrue(note.contains("session_admin request_scope"))
+            }
+        }
+    }
+
     func testListSessionsRejectsWorkspaceChangeAfterMetadataRead() async throws {
         let window = try await makeWindow(waitForInitialization: true)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }

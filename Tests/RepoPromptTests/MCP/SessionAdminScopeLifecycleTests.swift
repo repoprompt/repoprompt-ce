@@ -391,6 +391,62 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(try fixture.runtime.approve(requestID: global.id, grantAllForSession: true).get().grant.capabilities, DomainDelegationScopeCapability.allSessionsPermitted)
     }
 
+    func testRequestScopeReportsActualFullAccessGrantAndOffModeCardStillWorks() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        var enabled = true
+        fixture.runtime.isGlobalAutoApproveEnabled = { enabled }
+        let args: [String: Value] = [
+            "op": .string("request_scope"), "kind": .string("session"),
+            "session_id": .string(target.uuidString),
+            "capabilities": .array([.string("observe"), .string("control")])
+        ]
+        let granted = try await fixture.call(args)
+        XCTAssertEqual(granted["result"], .string("granted"))
+        let scope = try XCTUnwrap(granted["scope"]?.objectValue)
+        let record = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.unrestricted })
+        XCTAssertEqual(granted["scope_id"], .string(record.id.uuidString))
+        XCTAssertEqual(scope["scope_id"], granted["scope_id"])
+        XCTAssertEqual(scope["kind"], .string("all_sessions"))
+        XCTAssertEqual(scope["unrestricted"], .bool(true))
+        XCTAssertEqual(scope["capabilities"], .array(DomainDelegationScopeCapability.allCases.map { .string($0.rawValue) }))
+        XCTAssertTrue(granted["guidance"]?.stringValue?.contains("Overseer full access") == true)
+        XCTAssertFalse(granted["guidance"]?.stringValue?.contains("standing approval for this session") == true)
+        for key in ["kind", "capabilities", "guardrails"] {
+            XCTAssertEqual(granted[key], scope[key], "Legacy receipt fields must describe the actual covering grant")
+        }
+        XCTAssertEqual(granted["requested_scope"]?.objectValue?["kind"], .string("session"))
+        XCTAssertEqual(granted["requested_scope"]?.objectValue?["capabilities"], args["capabilities"])
+        enabled = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        let pending = try await fixture.call(args)
+        XCTAssertEqual(pending["result"], .string("pending_user_approval"))
+        let requestID = try XCTUnwrap(pending["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let ordinary = try fixture.runtime.approve(requestID: requestID).get()
+        let status = try await fixture.call(["op": .string("scope_status"), "request_id": .string(requestID.uuidString)])
+        XCTAssertEqual(status["scope"]?.objectValue?["scope_id"], .string(ordinary.id.uuidString))
+        XCTAssertFalse(ordinary.grant.unrestricted)
+    }
+
+    func testContinuityMetadataIsReservedForScopeStatus() async throws {
+        let fixture = Fixture()
+        fixture.runtime.isGlobalAutoApproveEnabled = { false }
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        let pending = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        let requestID = try XCTUnwrap(pending["request_id"])
+        let status = try await fixture.call(["op": .string("scope_status"), "request_id": requestID])
+        XCTAssertNotNil(status["continuity_save_state"])
+        XCTAssertNotNil(status["continuity_durable"])
+        let released = try await fixture.call(["op": .string("release_scope"), "request_id": requestID])
+        for result in [pending, released] {
+            XCTAssertNotNil(result["authority_available"])
+            for key in ["continuity_save_state", "continuity_durable", "continuity_detail", "continuity_operation_id", "unsettled_scope_ids"] {
+                XCTAssertNil(result[key], key)
+            }
+        }
+    }
+
     func testGrantAllForSessionAndGlobalSettingApproveLaterRequestsWithoutAnotherCard() async throws {
         let fixture = Fixture()
         let overseer = UUID()

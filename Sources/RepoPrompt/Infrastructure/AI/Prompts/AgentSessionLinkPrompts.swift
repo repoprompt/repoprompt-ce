@@ -66,7 +66,8 @@ enum AgentSessionLinkPrompts {
     /// Revision 7 combines Stop with lean compaction wording and just-in-time outcome receipts;
     /// revision 8 adds creator provenance and lane operations.
     /// Revision 9 teaches Grok's isolated runtime server name.
-    static let currentInventoryGuidanceRevision: UInt64 = 9
+    /// Revision 10 distinguishes full access from missing-scope approval without discarding standing consent.
+    static let currentInventoryGuidanceRevision: UInt64 = 10
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."
@@ -760,6 +761,7 @@ enum AgentSessionLinkPrompts {
         lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
+            MCPDomainSessionAdminToolDefinition.overseerPlaybook,
             "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
             "`send` delivers an attributed message to an `idle_for_send: true` target or queues one with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws your queued message. Use a new `idempotency_key` for each new delivery and reuse it only for the same retry.",
             "`compact` requests native context compaction of an `idle_for_send: true` target.",
