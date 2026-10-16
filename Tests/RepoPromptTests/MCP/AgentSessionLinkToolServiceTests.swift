@@ -1550,6 +1550,9 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ])])
         XCTAssertEqual(parsed.sessionIDs, [first, second])
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.object(["cursor": .string("c")])])]))
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.string("opaque")])])) { error in
+            XCTAssertTrue(String(describing: error).contains("{session_id, cursor}"), String(describing: error))
+        }
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets([:]))
     }
 

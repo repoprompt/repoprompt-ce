@@ -1558,6 +1558,13 @@ struct AgentSessionLinkMCPToolService {
 
         // `wait` cursors each name their session, so a cursors-only call needs no separate list.
         if single == nil, many == nil, case let .array(cursors)? = args["cursors"], !cursors.isEmpty {
+            // Cursors are opaque and do not name a session, so a bare cursor string cannot be routed.
+            guard cursors.allSatisfy({ $0.objectValue?["session_id"]?.stringValue != nil }) else {
+                throw MCPError.invalidParams(
+                    "wait cursors must be {session_id, cursor} objects (poll and wait return both per target), "
+                        + "or pass session_ids alongside them. A bare cursor string does not identify its session."
+                )
+            }
             many = cursors.map { $0.objectValue?["session_id"] ?? .null }
         }
         switch (single, many) {

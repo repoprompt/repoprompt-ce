@@ -119,11 +119,9 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                     "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
                     "current_groups": .array(current.map(Value.string)),
                     "detail": .string(detail),
-                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
-                        "op": .string("reorder_groups"), "workspace": .string(workspaceID.uuidString),
-                        "order": .array(current.map(Value.string)), "expected_order": .array(current.map(Value.string))
-                    ])])
-                ])))
+                    // Not runnable as-is: only the caller knows the order it wants.
+                    "next_step": .string("Call session_admin reorder_groups with workspace \(workspaceID.uuidString), expected_order set to current_groups exactly, and order set to those same names in the order you want.")
+                ]).filter { $0.key != "next_call" }))
             }
             guard request.arguments["order"] != nil else {
                 throw refusal("order_required", "reorder_groups needs order: the group names in their new order. current_groups is the present order; pass it as expected_order.")

@@ -209,6 +209,8 @@ enum SessionAdminReply {
             "next_call": .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
         ]
         if code == "target_busy" { result["retryable"] = .bool(true) }
+        // Nothing failed, so there is no recovery call to suggest.
+        if code == "no_change" { result.removeValue(forKey: "next_call") }
         if let sessionID = sessionIDs.first,
            ["replicated_binding", "ambiguous_binding", "archived_carrier_unavailable", "not_restorable", "not_archived", "compose_flush_rejected", "workspace_changed", "target_changed", "tab_id_conflict", "persistence_rejected", "persistence_unconfirmed"].contains(code)
         {
