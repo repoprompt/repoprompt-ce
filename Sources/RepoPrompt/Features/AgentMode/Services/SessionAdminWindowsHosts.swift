@@ -161,7 +161,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             }
             if case .added = outcome { return .linked }
             return .alreadyLinked
-        case .failed, .rejected:
+        case let .failed(failure):
+            return .refused(failure)
+        case .rejected:
             let message = outcome.failureMessage ?? "The link could not be created."
             // `.revoked` promises nothing was left behind; a compensation that could not be written
             // left a row queued for **Retry saving**, so it is reported as the failure it is.

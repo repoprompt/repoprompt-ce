@@ -486,6 +486,28 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertTrue(deleted.sessionIDs.isEmpty, "Direct spawn provenance does not authorize deletion")
     }
 
+    func testLoadingLiveCarrierCannotErasePersistedSpawnParentFromChildCount() async throws {
+        let window = try await makeWindow(waitForInitialization: true)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let child = UUID()
+        try await persistSession(id: child, workspace: workspace, parentSessionID: callerSessionID)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let loading = window.agentModeViewModel.session(for: tabID)
+        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: child, on: loading, updateWorkspaceMetadata: true))
+        loading.hasLoadedPersistedState = false
+        XCTAssertNil(loading.parentSessionID)
+        let service = makeManageService(window: window, callerSessionID: callerSessionID)
+        let reply = try await service.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(reply.objectValue?["matching_child_count"], .int(1))
+        let ids = try await sessionIDs(in: service.execute(args: ["op": .string("list_sessions")]))
+        XCTAssertEqual(ids, [child.uuidString])
+        loading.hasLoadedPersistedState = true
+        loading.parentSessionID = nil
+        let loadedReply = try await service.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(loadedReply.objectValue?["matching_child_count"], .int(0), "A hydrated carrier's nil remains authoritative; stale metadata grants no child access")
+    }
+
     func testListSessionsScopesDiscoveryToDirectChildrenAndFailsClosedWhenUnrouted() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }

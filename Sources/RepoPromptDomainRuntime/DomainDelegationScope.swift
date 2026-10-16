@@ -85,10 +85,13 @@ package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
 
     package func permits(scopeID: UUID, observer: UUID, target: UUID, at date: Date) -> Bool {
         guard let grant = lock.withLock({ grants[scopeID] }), grant.granteeSessionID == observer,
-              case let .session(approvedTarget) = grant.kind, approvedTarget == target,
               grant.capabilities.isSuperset(of: [.observe, .control, .restructure]),
               grant.guardrails.expiresAt.map({ $0 > date }) ?? true else { return false }
-        return true
+        switch grant.kind {
+        case let .session(approvedTarget): return approvedTarget == target
+        case .allSessions: return grant.unrestricted
+        case .tree, .workspace: return false
+        }
     }
 }
 

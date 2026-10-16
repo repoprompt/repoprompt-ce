@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 
 /// One `request_scope` awaiting (or past) the user's decision on its grant card.
@@ -176,10 +177,19 @@ final class DelegationScopeRuntime: ObservableObject {
     }
 
     private var decisions: [UUID: DecisionDelivery] = [:]
+    // One grant decision per scope, not one per request settled by that same standing grant.
+    // Request-specific continuation outcomes intentionally do not use this set.
+    private var announcedGrantDecisions: Set<UUID> = []
     let linkConsent = DomainDelegationScopeLinkConsent()
     var liveScopesDidChange: (@MainActor () -> Void)?
     var scopesDidInvalidate: (@MainActor (Set<UUID>) -> Void)?
     private var overseeContinuations: [UUID: @MainActor (DomainDelegationScopeRecord) async -> Void] = [:]
+    // Initial link/delivery receipts are task facts, not authority. Keep them with the bounded
+    // request ledger so an unchanged client key can inspect a partial result without redelivery.
+    private var overseeInitialRequests: Set<UUID> = []
+    private var overseeInitialOutcomes: [UUID: Value] = [:]
+    private var overseeInitialWaiters: [UUID: [UUID: CheckedContinuation<Value, Never>]] = [:]
+
     // Retain only process-local task identity, never consent. A short completed-task window
     // absorbs client retries without making a later deliberate repeat impossible.
     private var overseeContinuationTasks: [UUID: (scopeID: UUID, task: Task<Void, Never>, request: DelegationScopeRequest, digest: String, completedAt: Date?)] = [:]
@@ -360,10 +370,18 @@ final class DelegationScopeRuntime: ObservableObject {
         availability = .terminating
         linkConsent.replace([])
         overseeContinuations.removeAll()
+        overseeInitialRequests.removeAll()
         for running in overseeContinuationTasks.values {
             running.task.cancel()
         }
         overseeContinuationTasks.removeAll()
+        let waiters = overseeInitialWaiters
+        overseeInitialWaiters.removeAll()
+        for (id, pending) in waiters {
+            for waiter in pending.values {
+                waiter.resume(returning: overseeWaitInterrupted(requestID: id))
+            }
+        }
         revision &+= 1
         for grant in active {
             confirmations.invalidate(scopeID: grant.id)
@@ -544,6 +562,7 @@ final class DelegationScopeRuntime: ObservableObject {
             else { continue }
             request.state = .cancelled(reason: "The tab's session changed before approval.")
             overseeContinuations.removeValue(forKey: id)
+            overseeInitialRequests.remove(id)
             requests[id] = request
         }
     }
@@ -614,7 +633,7 @@ final class DelegationScopeRuntime: ObservableObject {
         }
         let key = idempotencyKey.map { "\(requesterSessionID.uuidString)|\($0)" }
         if let key, let existingID = requestIDByKey[key], let existing = requests[existingID],
-           !reusePendingOnly || existing.state == .pending
+           !reusePendingOnly || existing.state == .pending || overseeInitialOutcomes[existingID] != nil || overseeInitialRequests.contains(existingID)
         {
             return existing.matches(
                 kind: kind,
@@ -650,6 +669,54 @@ final class DelegationScopeRuntime: ObservableObject {
         if let key { requestIDByKey[key] = request.id }
         trimRequestRetention()
         return .success(request)
+    }
+
+    func beginOverseeInitialOutcome(requestID: UUID) {
+        guard requests[requestID]?.state == .pending else { return }
+        overseeInitialRequests.insert(requestID)
+    }
+
+    func overseeInitialOutcome(requestID: UUID) -> Value? {
+        overseeInitialOutcomes[requestID]
+    }
+
+    func completeOverseeInitialOutcome(requestID: UUID, value: Value) {
+        guard overseeInitialOutcomes[requestID] == nil else { return }
+        overseeInitialOutcomes[requestID] = value
+        overseeInitialRequests.remove(requestID)
+        let waiters = overseeInitialWaiters.removeValue(forKey: requestID) ?? [:]
+        for waiter in waiters.values {
+            waiter.resume(returning: value)
+        }
+    }
+
+    /// Waiting on the first committed outcome never joins the ongoing target-status watch.
+    /// Cancelling this tool's wait does not cancel the app-owned approved assignment.
+    func waitForOverseeInitialOutcome(requestID: UUID) async -> Value {
+        if let value = overseeInitialOutcomes[requestID] { return value }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if let value = overseeInitialOutcomes[requestID] { continuation.resume(returning: value) }
+                else if Task.isCancelled { continuation.resume(returning: overseeWaitInterrupted(requestID: requestID)) }
+                else { overseeInitialWaiters[requestID, default: [:]][waiterID] = continuation }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, let waiter = overseeInitialWaiters[requestID]?.removeValue(forKey: waiterID) else { return }
+                waiter.resume(returning: overseeWaitInterrupted(requestID: requestID))
+            }
+        }
+    }
+
+    private func overseeWaitInterrupted(requestID: UUID) -> Value {
+        .object([
+            "result": .string("partial"), "code": .string("continuation_pending"),
+            "subreason": .string("caller_wait_interrupted"), "request_id": .string(requestID.uuidString),
+            "detail": .string("The approved assignment may still be running. Retry the identical request to inspect its receipt; do not send a duplicate task."),
+            "next_call": .string("Retry the identical become_overseer request with the same idempotency_key."),
+            "retryable": .bool(true)
+        ])
     }
 
     /// Registers the already-requested exact-target task, not approval. Only the user's real
@@ -898,6 +965,7 @@ final class DelegationScopeRuntime: ObservableObject {
             )
         case let .failure(denial):
             overseeContinuations.removeValue(forKey: requestID)
+            overseeInitialRequests.remove(requestID)
             request.state = .denied(reason: "Approval failed validation (\(denial.diagnosticLabel)).")
             requests[requestID] = request
             enqueueDecision(
@@ -914,6 +982,7 @@ final class DelegationScopeRuntime: ObservableObject {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .denied(reason: reason)
         overseeContinuations.removeValue(forKey: requestID)
+        overseeInitialRequests.remove(requestID)
         requests[requestID] = request
         enqueueDecision(
             sessionID: request.requesterSessionID,
@@ -930,6 +999,7 @@ final class DelegationScopeRuntime: ObservableObject {
         if request.state == .pending {
             request.state = .cancelled(reason: "Withdrawn by the requesting session.")
             overseeContinuations.removeValue(forKey: id)
+            overseeInitialRequests.remove(id)
             requests[id] = request
         }
         return request
@@ -1028,6 +1098,7 @@ final class DelegationScopeRuntime: ObservableObject {
         guard !changed.isEmpty else { return }
         revokedScopeIDs.append(contentsOf: changed.map(\.id))
         let invalidated = Set(changed.map(\.id))
+        announcedGrantDecisions.subtract(invalidated)
         for (id, running) in overseeContinuationTasks where invalidated.contains(running.scopeID) {
             running.task.cancel()
             overseeContinuationTasks.removeValue(forKey: id)
@@ -1047,6 +1118,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// This is an app-owned decision notification, not target attention or an oversight grant.
     /// It never traverses the passive reducer, changes wake policy, or interrupts a running turn.
     private func enqueueDecision(sessionID: UUID, tabID: UUID?, result: String, identifier: UUID, automaticContinuation: Bool = false) {
+        if result == "granted", !announcedGrantDecisions.insert(identifier).inserted { return }
         let guidance = automaticContinuation
             ? "The app is automatically continuing the approved exact-target oversight request. Do not duplicate its link/message or ask the user for a filler turn; its result will resume you."
             : "Call session_admin scope_status to inspect current authority before continuing the user's existing work."
@@ -1246,8 +1318,12 @@ final class DelegationScopeRuntime: ObservableObject {
     private func trimRequestRetention() {
         while requestOrder.count > Self.maxRetainedRequests {
             // Never evict a pending request; drop the oldest decided one instead.
-            guard let index = requestOrder.firstIndex(where: { requests[$0]?.state != .pending }) else { return }
+            guard let index = requestOrder.firstIndex(where: {
+                requests[$0]?.state != .pending && !overseeInitialRequests.contains($0)
+                    && (overseeContinuationTasks[$0] == nil || overseeContinuationTasks[$0]?.completedAt != nil)
+            }) else { return }
             let id = requestOrder.remove(at: index)
+            overseeInitialOutcomes.removeValue(forKey: id)
             if let removed = requests.removeValue(forKey: id), let key = removed.idempotencyKey {
                 let scopedKey = "\(removed.requesterSessionID.uuidString)|\(key)"
                 if requestIDByKey[scopedKey] == id { requestIDByKey.removeValue(forKey: scopedKey) }
