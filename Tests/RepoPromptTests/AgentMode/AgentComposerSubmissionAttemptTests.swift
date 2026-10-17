@@ -434,12 +434,28 @@ extension AgentComposerSubmissionAttemptTests {
         )
         XCTAssertNotEqual(selected, baseline)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
-        XCTAssertEqual(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName, viewModel.selectedModelDisplayName)
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) \(ClaudeCodeEffortLevel.parse(session.selectedClaudeEffortRaw)?.displayName ?? String())"
+        )
+
+        // Claude keeps its manual effort separately from the Codex-oriented selection field.
+        session.selectedReasoningEffortRaw = nil
+        session.selectedClaudeEffortRaw = ClaudeCodeEffortLevel.high.rawValue
+        viewModel.syncStatusPillsUIState()
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) High"
+        )
+
         viewModel.selectedModelRaw = baseline.modelRaw
         XCTAssertEqual(session.selectedModelRaw, baseline.modelRaw)
         XCTAssertNil(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName)
         viewModel.selectedModelRaw = selected.modelRaw
-        XCTAssertEqual(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName, viewModel.selectedModelDisplayName)
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) \(ClaudeCodeEffortLevel.parse(session.selectedClaudeEffortRaw)?.displayName ?? String())"
+        )
         session.appendAutomationAudit(AgentAutomationTurnAudit(
             turnID: UUID(),
             createdAt: Date(),

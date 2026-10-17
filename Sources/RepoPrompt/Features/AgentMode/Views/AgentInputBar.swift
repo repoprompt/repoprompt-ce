@@ -774,38 +774,48 @@ struct AgentComposerView: View, Equatable {
 
     private var automaticRouterTargetChip: some View {
         let serviceName = props.automaticRouterServiceName
-        return HStack(spacing: 5) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            Text(serviceName.map { "Automatic · \($0)" } ?? "Automatic")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        return Button {
+            openAgentDecisionsSettings(section: .modelRouter)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                Text(serviceName.map { "Model Router · \($0)" } ?? "Model Router")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            }
+            .foregroundColor(.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.accentColor.opacity(0.10))
+            .cornerRadius(6)
         }
-        .foregroundColor(.accentColor)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.accentColor.opacity(0.10))
-        .cornerRadius(6)
-        .accessibilityElement(children: .combine)
+        .buttonStyle(.plain)
         .accessibilityLabel("Model Router")
-        .accessibilityValue(serviceName.map { "Automatic with \($0)" } ?? "Automatic")
-        .hoverTooltip("Model Router asks \(serviceName ?? "the selected service") to choose a model and reasoning effort for this new task.")
+        .accessibilityValue(serviceName.map { "Using \($0)" } ?? "On")
+        .hoverTooltip("Model Router asks \(serviceName ?? "the selected service") to choose a model and reasoning effort for this new task. Click to open Model Router settings.")
         .fixedSize(horizontal: true, vertical: false)
     }
 
     private func automaticEffortChip(serviceName: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: "gauge.open.with.lines.needle.33percent")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
-            Text("Auto Effort · \(serviceName)")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        Button {
+            openAgentDecisionsSettings(section: .autoEffort)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "gauge.open.with.lines.needle.33percent")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
+                Text("Auto Effort · \(serviceName)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            }
+            .foregroundColor(.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.accentColor.opacity(0.10))
+            .cornerRadius(6)
         }
-        .foregroundColor(.accentColor)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.accentColor.opacity(0.10))
-        .cornerRadius(6)
-        .accessibilityElement(children: .combine)
-        .hoverTooltip("Auto Effort uses \(serviceName) before eligible turns; otherwise, your current effort applies. This tag is informational.")
+        .buttonStyle(.plain)
+        .accessibilityLabel("Auto Effort")
+        .accessibilityValue("Using \(serviceName)")
+        .hoverTooltip("Auto Effort uses \(serviceName) before eligible turns; otherwise, your current effort applies. Click to open Auto Effort settings.")
         .fixedSize(horizontal: true, vertical: false)
     }
 
@@ -897,6 +907,17 @@ struct AgentComposerView: View, Equatable {
 
     private func openCLIProvidersSettings() {
         actions.openCLIProvidersSettings()
+    }
+
+    private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
+        NotificationCenter.default.post(
+            name: .showModelRouterSettingsTab,
+            object: nil,
+            userInfo: [
+                "windowID": windowID,
+                "agentDecisionsSection": section
+            ]
+        )
     }
 
     @ViewBuilder

@@ -45,7 +45,14 @@ extension AgentModeViewModel {
                                                  audit.router.application != .fallbackToManual,
                                                  audit.router.application != .failed
         {
-            inputBarModelDisplayName(rawModel: modelRaw, agentKind: session.selectedAgent)
+            routedModelDisplayName(
+                rawModel: modelRaw,
+                reasoningEffortRaw: session.selectedAgent.usesClaudeTooling
+                    ? session.selectedClaudeEffortRaw
+                    : session.selectedReasoningEffortRaw,
+                agentKind: session.selectedAgent,
+                showsEffort: !modelRouterSettingsStore.autoEffortEnabled()
+            )
         } else {
             nil
         }
@@ -57,6 +64,27 @@ extension AgentModeViewModel {
             routedModelDisplayName: routedModelDisplayName,
             usageBalancing: configuration.usageBalancing.enabled
         )
+    }
+
+    private func routedModelDisplayName(
+        rawModel: String,
+        reasoningEffortRaw: String?,
+        agentKind: AgentProviderKind,
+        showsEffort: Bool
+    ) -> String {
+        let modelName = inputBarModelDisplayName(rawModel: rawModel, agentKind: agentKind)
+        guard showsEffort,
+              let reasoningEffortRaw
+        else { return modelName }
+
+        let effortName: String? = if agentKind == .codexExec {
+            CodexReasoningEffort.parse(reasoningEffortRaw)?.displayName
+        } else if agentKind.usesClaudeTooling {
+            ClaudeCodeEffortLevel.parse(reasoningEffortRaw)?.displayName
+        } else {
+            reasoningEffortRaw
+        }
+        return effortName.map { "\(modelName) \($0)" } ?? modelName
     }
 
     func autoEffortPillProps() -> AgentAutoEffortPillProps {
