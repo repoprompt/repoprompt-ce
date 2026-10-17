@@ -56,6 +56,9 @@ enum AgentSessionCarrierResolver {
         var replicatedSessionIDs: Set<UUID> = []
         /// One exact bound payload owner; agreeing presentation replicas remain replicated.
         var uniqueRuntimeOwners: [UUID: RuntimeOwner] = [:]
+        /// Liveness states from the same per-window binding census that proved `uniqueRuntimeOwners`,
+        /// so a caller needing both never builds a second census in the same synchronous read.
+        var runtimeStatesByWindow: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
         var claimedWorkspaceIDs: [UUID: Set<UUID>] = [:]
         var sessionIDs: Set<UUID> = []
         fileprivate var fences: [WindowFence] = []
@@ -348,18 +351,25 @@ enum AgentSessionCarrierResolver {
             for row in result.rows where seenWindows.insert(ObjectIdentifier(row.window)).inserted {
                 owners.append(row.window)
             }
-            result.uniqueRuntimeOwners = runtimeOwners(in: result, windows: owners, sessionIDs: requestedIDs ?? result.sessionIDs)
+            let ownerIDs = requestedIDs ?? result.sessionIDs
+            // One binding census per window serves both the runtime owners and liveness states.
+            let censuses = owners.map { ($0, $0.agentModeViewModel.authoritativeLiveSessionCensus(for: ownerIDs)) }
+            result.uniqueRuntimeOwners = runtimeOwners(in: result, censuses: censuses)
+            result.runtimeStatesByWindow = Dictionary(
+                censuses.map { (ObjectIdentifier($0.0), $0.1.states) }, uniquingKeysWith: { first, _ in first }
+            )
         }
         return result
     }
 
     private static func runtimeOwners(
-        in snapshot: Snapshot, windows: [WindowState], sessionIDs: Set<UUID>
+        in snapshot: Snapshot,
+        censuses: [(window: WindowState, census: AgentModeViewModel.AuthoritativeLiveSessionCensus)]
     ) -> [UUID: RuntimeOwner] {
         var candidates: [UUID: (Observation, AgentTabSession)] = [:]
         var conflicts = snapshot.ambiguousSessionIDs
-        for window in windows {
-            for (id, result) in window.agentModeViewModel.authoritativeLiveSessions(for: sessionIDs) {
+        for (window, census) in censuses {
+            for (id, result) in census.sessions {
                 switch result {
                 case .failure:
                     conflicts.insert(id)

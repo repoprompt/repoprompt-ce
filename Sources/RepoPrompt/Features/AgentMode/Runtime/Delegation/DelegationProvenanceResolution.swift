@@ -91,7 +91,11 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             windows: windows, sessionIDs: sessionIDs, includeRuntimeOwners: includeRuntime
         )
         let ids = sessionIDs ?? carriers.sessionIDs
-        let runtime = includeRuntime ? windows.map { $0.agentModeViewModel.authoritativeLiveSessionStates(for: ids) } : []
+        // The carrier capture already took each window's binding census for runtime owners; reuse its
+        // states so one read builds one census per window.
+        let runtime = includeRuntime ? windows.map {
+            carriers.runtimeStatesByWindow[ObjectIdentifier($0)] ?? $0.agentModeViewModel.authoritativeLiveSessionStates(for: ids)
+        } : []
         var result = DelegationProvenanceSnapshot(records: [:], states: [:])
         for id in ids {
             let metadata = carriers.metadata[id] ?? []

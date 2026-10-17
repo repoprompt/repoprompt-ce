@@ -6097,20 +6097,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func authoritativeLiveSessionStates(for sessionIDs: Set<UUID>) -> [UUID: AuthoritativeLiveSessionState] {
-        guard !sessionIDs.isEmpty else { return [:] }
-        let snapshot = makePersistentBindingResolutionSnapshot(for: sessionIDs)
-        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
-            let state: AuthoritativeLiveSessionState
-            do {
-                if let session = try authoritativeLiveSession(for: sessionID, using: snapshot) {
-                    state = session.runState.isActive ? .running : .idle
-                } else {
-                    state = .notFound
-                }
-            } catch {
-                state = .ambiguous
+        authoritativeLiveSessionCensus(for: sessionIDs).states
+    }
+
+    /// Rich liveness values and their states observed from one binding census, for a read that needs
+    /// both (runtime owners and liveness accounting) without building a second census in the same turn.
+    struct AuthoritativeLiveSessionCensus {
+        let sessions: [UUID: Result<TabSession?, Error>]
+        /// Observed when the census is taken, never re-derived later from a mutated session.
+        let states: [UUID: AuthoritativeLiveSessionState]
+    }
+
+    func authoritativeLiveSessionCensus(for sessionIDs: Set<UUID>) -> AuthoritativeLiveSessionCensus {
+        let sessions = authoritativeLiveSessions(for: sessionIDs)
+        return AuthoritativeLiveSessionCensus(sessions: sessions, states: sessions.mapValues { result in
+            switch result {
+            case let .success(session?): session.runState.isActive ? .running : .idle
+            case .success(nil): .notFound
+            case .failure: .ambiguous
             }
-            return (sessionID, state)
         })
     }
 
