@@ -2520,9 +2520,9 @@ import XCTest
         }
     }
 
-    /// The custom-storage preference read seam: a persisted value from another test run never pins
-    /// this run's workspace store, while fixtures' in-sandbox values and every product launch are
-    /// unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    /// The custom-storage preference read seam: the value a test process inherited from a killed run
+    /// never pins this run's workspace store, while values the run's own fixtures set and every product
+    /// launch are unchanged. Test defaults use a volatile domain, so nothing is persisted.
     final class WorkspaceStoragePreferenceTests: XCTestCase {
         private func defaults(storing path: String?) -> UserDefaults {
             let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
@@ -2532,29 +2532,34 @@ import XCTest
             return defaults
         }
 
+        private let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"
+
         func testProductLaunchUsesTheStoredValue() {
-            let stored = "/Users/someone/RepoPrompt Workspaces"
-            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stored), environment: [:]), stored)
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stale), environment: [:]), stale)
             XCTAssertNil(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: nil), environment: [:]))
         }
 
-        func testTestRunIgnoresAnotherRunsPinnedStoreButKeepsItsOwnFixtureStore() throws {
-            let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent("storage-preference-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: sandbox) }
-            let environment = [WorkspaceStoragePreference.testSandboxEnvironmentKey: sandbox.path]
-            let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"
+        func testTestRunIgnoresOnlyTheInheritedValueAndHonorsItsOwnFixtures() {
+            let environment = [
+                WorkspaceStoragePreference.testSandboxEnvironmentKey: "/var/folders/x/T/rpce-local-tests-now/25bf8e1a2393f110",
+                WorkspaceStoragePreference.inheritedPreferenceEnvironmentKey: stale
+            ]
             XCTAssertNil(
                 WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stale), environment: environment),
-                "a store pinned by another (crashed) run is never adopted"
+                "the store a killed run left pinned is never adopted"
             )
-            let own = sandbox.appendingPathComponent("fixture/Workspaces").path
-            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: own), environment: environment), own)
-            // /var and /private/var name the same sandbox.
-            let resolvedOwn = sandbox.resolvingSymlinksInPath().appendingPathComponent("fixture/Workspaces").path
+            // A fixture's own storage, even outside the sandbox (FileManager's per-user temporary
+            // directory), is honored, and so is a later restore of a different value.
+            let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("fixture-\(UUID().uuidString)").path
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: fixture), environment: environment), fixture)
+            // Inherited but inside this run's own sandbox: honored.
+            let inside = "/var/folders/x/T/rpce-local-tests-now/25bf8e1a2393f110/Workspaces"
             XCTAssertEqual(
-                WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: resolvedOwn), environment: environment),
-                resolvedOwn
+                WorkspaceStoragePreference.customStoragePath(
+                    defaults: defaults(storing: inside),
+                    environment: environment.merging([WorkspaceStoragePreference.inheritedPreferenceEnvironmentKey: inside]) { $1 }
+                ),
+                inside
             )
         }
     }
