@@ -559,6 +559,13 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     destination.installGroups()
                     let mirror = try await destination.addReplica()
                     replica = mirror
+                    let carrierIDs = Set([destination.callerTab.activeAgentSessionID!, destination.targetTab.activeAgentSessionID!])
+                    for window in [destination.window, mirror] {
+                        XCTAssertEqual(
+                            Set(window.agentModeViewModel.ownerValidatedSessionIndex.keys), carrierIDs,
+                            "Every replica needs owner-valid placement metadata before membership can be proven"
+                        )
+                    }
                     let request = try caller.scopes.requestScope(
                         requesterSessionID: caller.callerTab.activeAgentSessionID!, requesterTabID: caller.callerTab.id,
                         kind: .workspace(workspaceID: destination.workspaceID), capabilities: [.observe, .organize],
@@ -1355,6 +1362,10 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     XCTAssertTrue(refreshed)
                     let canonical = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
                     _ = await window.workspaceManager.switchWorkspace(to: canonical, saveState: false, reason: "groupOrderAuthorityFixture")
+                    // The switch starts a disk session-list refresh for this owner. Let it settle before the
+                    // synthetic index below is installed, or its empty on-disk result replaces those entries
+                    // and every carrier correctly fails closed as unproven placement.
+                    await window.agentModeViewModel.test_waitForSessionListCacheRefresh()
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
                     XCTAssertTrue(window.workspaceManager.canCommitComposeTabPresentation(workspaceID: workspace.id))
                 } else if isolated {
