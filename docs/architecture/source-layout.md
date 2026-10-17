@@ -148,6 +148,8 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 
 ### Documented wiring exceptions outside Diagnostics
 
+- `App/SessionAdminWindowsHosts.swift` owns the concrete session-administration adapters over open windows, saved-session preparation, and target-owned workspace/worktree routing. The feature retains its host protocols and operation handlers; the app-level adapters compose them with `WindowStatesManager`, `WindowState`, and the UI view models. Keep these concrete window dependencies out of feature service implementations.
+
 - `Features/AgentMode/Services/BecomeOverseerMCPToolService.swift` owns the targeted activation → approval → saved-session/link/task product flow. Its MCP adapter in `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` wires this feature service; keeping the flow in Infrastructure would invert its dependencies on Agent Mode's runtime and message digest. This is a narrow composition exception, not a placement rule for other transport-only MCP services.
 
 - `App/AppLaunchConfiguration.swift` remains in `App` because it owns process arguments/environment interpretation for launch behavior. It still routes DEBUG-only Agent chat stress settings, but harness-specific configuration lives under `Features/Diagnostics/AgentMode/Stress`.
