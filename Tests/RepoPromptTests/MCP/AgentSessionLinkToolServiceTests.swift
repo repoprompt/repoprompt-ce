@@ -1129,6 +1129,40 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(devin, .string(BecomeOverseerMCPToolService.devinResult))
     }
 
+    /// `linkRequired` is a permission gate: with full access a missing link is established through the
+    /// ordinary delegated Add (sourced from the full-access grant) and the operation is authorized;
+    /// restricted mode keeps the indistinguishable denial, and turning full access off revokes the link
+    /// with its grant.
+    func testFullAccessEstablishesAMissingLinkAndTurningItOffRevokesIt() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let unlinked = makeCandidate(windowID: 3, displayName: "Unlinked lane")
+        fixture.host.candidates.append(unlinked)
+        let scopes = fixture.bridge.delegationScopes
+        final class Flag { var value = false }
+        let fullAccess = Flag()
+        scopes.isGlobalAutoApproveEnabled = { fullAccess.value }
+        let observer = fixture.observer.domainEndpoint
+        func poll() async -> Result<AgentSessionLinkRuntimeBridge.AuthorizedTarget, AgentSessionLinkRuntimeBridge.AuthorizationFailure> {
+            await fixture.bridge.authorizeTarget(operation: .monitorPoll, observerEndpoint: observer, targetSessionID: unlinked.sessionID)
+        }
+        guard case .failure(.denied) = await poll() else { return XCTFail("restricted mode: no link, no access") }
+
+        fullAccess.value = true
+        guard case let .success(authorized) = await poll() else {
+            return XCTFail("full access establishes the missing link and authorizes the operation")
+        }
+        let grant = try XCTUnwrap(scopes.allLiveScopes().first { $0.grant.unrestricted && $0.grant.granteeSessionID == observer.sessionID })
+        XCTAssertEqual(authorized.lease.sourceScopeID, grant.id, "the link is sourced from the full-access grant")
+
+        fullAccess.value = false
+        scopes.reconcileGlobalAutoApprove()
+        try await AsyncTestWait.waitUntil("the full-access link is revoked with its grant") {
+            await !fixture.authority.links(forObserver: observer.sessionID).items.contains { $0.targetSessionID == unlinked.sessionID }
+        }
+        guard case .failure(.denied) = await poll() else { return XCTFail("off means off: no link, no access") }
+    }
+
     func testBootstrapGuidanceResamplesFullAccessWithoutChangingAuthorization() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }

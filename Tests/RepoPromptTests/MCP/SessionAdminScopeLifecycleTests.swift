@@ -9739,12 +9739,21 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
         .sessionQuota: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
         .worktreeQuota: ["SessionAdminStructureTests.testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation"],
         .creatorPlacementForAccounting: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
-        .scopeAnchorMoveRestriction: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
-        .otherScopeMembershipMove: ["OverseerAuthorizationEngineTests.testFullAccessSkipsScopeMoveAccountingButKeepsLaneStructureChecks"],
+        .scopeAnchorMoveRestriction: [
+            "OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit",
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure"
+        ],
+        .otherScopeMembershipMove: [
+            "OverseerAuthorizationEngineTests.testFullAccessSkipsScopeMoveAccountingButKeepsLaneStructureChecks",
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure"
+        ],
         .restrictedScopeNarrowing: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
         .directChildOrCreatorOwnership: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
         .humanOnlyForAgent: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
-        .linkRequired: ["AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"],
+        .linkRequired: [
+            "AgentSessionLinkToolServiceTests.testFullAccessEstablishesAMissingLinkAndTurningItOffRevokesIt",
+            "AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"
+        ],
         .observerMustBeCaller: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"],
         .linkCapabilityCeiling: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"]
     ]
@@ -9854,6 +9863,59 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
             default:
                 XCTFail("unexpected membership outcome, fullAccess=\(fullAccess)")
             }
+        }
+    }
+
+    func testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), other = UUID(), otherMember = UUID(), outside = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(other, parent: nil)
+            fixture.provenance.add(otherMember, parent: other)
+            fixture.provenance.add(outside, parent: nil)
+            let mine = try fixture.grant(overseer)
+            try fixture.grant(other)
+            flag.value = fullAccess
+            let engine = fixture.runtime.authorization
+            let roots = fixture.runtime.liveTreeScopeRoots()
+            let chain = Set(fixture.runtime.scopeChain(from: mine.id).map(\.id))
+            func ancestry(_ id: UUID) -> DomainDelegationOrganizationalAncestry? {
+                fixture.projector.organizationalAncestry(of: id)
+            }
+            // `otherScopeMembershipMove`: moving another overseer's member changes its scope.
+            XCTAssertEqual(engine.reparentPlacementDenial(
+                source: otherMember, destination: member, sourceAncestry: ancestry(otherMember),
+                destinationAncestry: ancestry(member), liveTreeScopes: roots, callerScopeChain: chain
+            ), fullAccess ? nil : .affectsOtherScopes(count: 1))
+            // `organizationalStructure`: a cycle is refused in both modes.
+            XCTAssertEqual(engine.reparentPlacementDenial(
+                source: overseer, destination: member, sourceAncestry: ancestry(overseer),
+                destinationAncestry: ancestry(member), liveTreeScopes: roots, callerScopeChain: chain
+            ), .cycle)
+            // `scopeAnchorMoveRestriction`: adopting another scope's anchor; full access still refuses
+            // the structural cycle the domain rule would only have reached after the anchor check.
+            let anchors = fixture.runtime.liveScopeAnchors()
+            XCTAssertEqual(engine.adoptPlacementDenial(
+                adoptee: other, destination: member, adopteeAncestry: ancestry(other), destinationAncestry: ancestry(member),
+                adopteeSubtree: [other, otherMember], scopeAnchors: anchors, liveTreeScopes: roots, callerScope: mine.grant
+            ), fullAccess ? nil : .adopteeAnchorsScope)
+            XCTAssertEqual(engine.adoptPlacementDenial(
+                adoptee: other, destination: otherMember, adopteeAncestry: ancestry(other), destinationAncestry: ancestry(otherMember),
+                adopteeSubtree: [other, otherMember], scopeAnchors: anchors, liveTreeScopes: roots, callerScope: mine.grant
+            ), fullAccess ? .cycle : .adopteeAnchorsScope)
+            // Adoption stamps a scope consistent with placement; full access chooses its own grant
+            // for a destination outside the admitted scope instead of refusing.
+            XCTAssertEqual(
+                engine.adoptionStampScope(admitted: mine, callerSessionID: overseer, destination: member, projector: fixture.projector)?.id,
+                mine.id
+            )
+            let outsideStamp = engine.adoptionStampScope(
+                admitted: mine, callerSessionID: overseer, destination: outside, projector: fixture.projector
+            )
+            XCTAssertEqual(outsideStamp?.grant.unrestricted, fullAccess ? true : nil)
         }
     }
 
@@ -10150,8 +10212,16 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
             guard case .denied(.granteeMismatch, _) = authorize(.adminRename, scope: foreign.id) else {
                 return XCTFail("another session's scope never becomes the caller's authority")
             }
-            if case .authorized = authorize(.adminRename, scope: stale.id) {
-                XCTFail("a revoked scope_id is never replaced by an invented valid scope")
+            // The caller's own revoked scope is input that full access does not need: it authorizes with
+            // the full-access grant (valid placement). Restricted mode refuses the stale scope.
+            switch authorize(.adminRename, scope: stale.id) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode refuses a revoked scope_id")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied:
+                XCTAssertFalse(fullAccess, "full access is not narrowed by the caller's own stale scope")
+            default:
+                XCTFail("unexpected stale-scope outcome, fullAccess=\(fullAccess)")
             }
 
             // Canonical write ownership holds on both authorization passes.

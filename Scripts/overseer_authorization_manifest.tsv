@@ -1,8 +1,3 @@
 # Overseer permission-gate consultations outside OverseerAuthorizationEngine (path<TAB>gate<TAB>count).
-# Each row is a decision the engine owner deliberately delegates by gate name; shrink, never grow casually.
-Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/DelegationScopeRuntime.swift	allSessionsCapabilityCeiling	1
-Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/DelegationScopeRuntime.swift	scopeCoverage	2
-Sources/RepoPrompt/Features/AgentMode/Runtime/SessionLinks/AgentSessionLinkRuntimeBridge.swift	linkRequired	2
-Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift	humanOnlyForAgent	2
-Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionTargetOperationGuard.swift	directChildOrCreatorOwnership	2
-Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift	linkRequired	1
+# Empty by design: every permission decision is made inside OverseerAuthorizationEngine*.swift; callers
+# use its semantic decisions. A new row is a deliberate, reviewed delegation of one gate decision.

@@ -9,7 +9,7 @@ Swift sources, that:
    `waivesTargetOwnership(.gate, ...)`) is pinned by an exact manifest of (file, gate, count) rows, so
    a caller cannot quietly add, drop, or rename a gate decision;
 3. the restricted scope authority entry point is invoked only by the engine;
-4. the restricted operation authorizer is invoked only from pinned files;
+4. the restricted operation authorizer is invoked only by the engine;
 5. retired parallel policy names are gone.
 
 Comments are stripped before matching. `--self-test` plants one violation per rule in a temporary
@@ -44,14 +44,10 @@ SCOPE_AUTHORITY_ENTRY = re.compile(r"\.authorize\(\s*DomainDelegationScopeAuthor
 OPERATION_AUTHORIZER = re.compile(r"\bDomainAgentSessionOperationAuthorizer\.authorize\(")
 ENGINE_ONLY_ALGORITHMS = re.compile(
     r"\bDomainDelegationScopeLinkPolicy\.missingCapability\(|\badoptionGuardrailViolation\(|\.evaluateCreationGuardrails\(scopeID:"
+    r"|\bDomainDelegationScopePlacementPolicy\.(?:validateReparent|validateAdopt|depthViolation)\("
 )
 RETIRED = re.compile(r"\bOverseerPermissionPolicy\b|\b(?:scopes|delegationScopes|runtime)\.permissionPolicy\b")
 
-# Files allowed to call the restricted operation authorizer directly (its own module, and the
-# target-operation adapter whose decision the engine waives by gate).
-OPERATION_AUTHORIZER_FILES = {
-    "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionTargetOperationGuard.swift",
-}
 
 
 def strip_comments(text: str) -> str:
@@ -108,8 +104,8 @@ def check(root: Path) -> list[str]:
             errors.append(f"{rel}: read Overseer full access through OverseerAuthorizationEngine, not OverseerGlobalAutoApprove.isEnabled()")
         if SCOPE_AUTHORITY_ENTRY.search(text) and not is_engine(rel):
             errors.append(f"{rel}: only OverseerAuthorizationEngine may run the restricted scope authority")
-        if OPERATION_AUTHORIZER.search(text) and rel not in OPERATION_AUTHORIZER_FILES:
-            errors.append(f"{rel}: DomainAgentSessionOperationAuthorizer.authorize is pinned to the target-operation adapter")
+        if OPERATION_AUTHORIZER.search(text) and not is_engine(rel):
+            errors.append(f"{rel}: only OverseerAuthorizationEngine may run the restricted operation authorizer")
         if ENGINE_ONLY_ALGORITHMS.search(text) and not is_engine(rel):
             errors.append(f"{rel}: restricted permission algorithm outside OverseerAuthorizationEngine")
         if RETIRED.search(text):
@@ -155,7 +151,7 @@ def self_test() -> int:
             "may evaluate isGlobalAutoApproveEnabled",
             "not OverseerGlobalAutoApprove.isEnabled",
             "restricted scope authority",
-            "pinned to the target-operation adapter",
+            "restricted operation authorizer",
             "retired parallel policy name",
             "restricted permission algorithm outside",
             "gate .linkRequired consulted 1x, manifest pins 0x",

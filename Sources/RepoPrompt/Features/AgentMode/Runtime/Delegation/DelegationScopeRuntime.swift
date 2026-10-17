@@ -626,7 +626,7 @@ final class DelegationScopeRuntime: ObservableObject {
             now: now(),
             // Global auto-approve answers any request with an unrestricted grant, so no capability is
             // refused for its kind before that.
-            unrestricted: authorization.waives(.allSessionsCapabilityCeiling)
+            unrestricted: authorization.validatesScopeRequestsWithoutCeiling
         ) {
             return .failure(.invalid(denial))
         }
@@ -825,7 +825,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// ordinary recorded grant, so it shows in Active delegations and can be revoked.
     @discardableResult
     func ensureGlobalAutoApproveScope(for grantee: UUID) -> DomainDelegationScopeRecord? {
-        guard canUseAuthority, authorization.waives(.scopeCoverage), !deletedSessionIDs.contains(grantee) else { return nil }
+        guard canUseAuthority, authorization.issuesFullAccessGrant, !deletedSessionIDs.contains(grantee) else { return nil }
         expireDueScopes()
         if let existing = liveScopes(grantedTo: grantee).first(where: \.grant.unrestricted) { return existing }
         let request = DomainDelegationScopeGrantRequest(
@@ -843,7 +843,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Off means off: revoke every global grant once the setting is turned off. Called when the
     /// setting changes and before each scoped administration decision.
     func reconcileGlobalAutoApprove() {
-        guard canUseAuthority, !authorization.waives(.scopeCoverage) else { return }
+        guard canUseAuthority, !authorization.issuesFullAccessGrant else { return }
         let global = authority.liveRecords(now: now()).filter(\.grant.unrestricted)
         guard !global.isEmpty else { return }
         var changed: [DomainDelegationScopeRecord] = []

@@ -3294,10 +3294,9 @@ final class AgentSessionLinkRuntimeBridge {
         guard let observerSessionID else {
             return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
         }
-        let approved = delegationScopes.authorization.waives(.linkRequired) || delegationScopes.liveScopes(grantedTo: observerSessionID).contains {
-            $0.grant.kind == .session(targetSessionID: candidate.sessionID)
-                && delegationScopes.linkConsent.permits(scopeID: $0.id, observer: observerSessionID, target: candidate.sessionID, at: Date())
-        }
+        let approved = delegationScopes.authorization.permitsChildLinkTarget(
+            observerSessionID: observerSessionID, targetSessionID: candidate.sessionID
+        )
         return AgentSessionLinkEndpointEligibility.targetResolveFailure(
             for: candidate, observerSessionID: observerSessionID, permitsChildTarget: approved
         )
@@ -6522,6 +6521,12 @@ final class AgentSessionLinkRuntimeBridge {
         switch leaseResult {
         case let .success(value):
             lease = value
+        case .failure(.noActiveLink):
+            // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
+            guard let established = await establishFullAccessLink(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            ) else { return .failure(.denied) }
+            lease = established
         case let .failure(error):
             if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
                 if operation == .monitorSetModel {
@@ -6546,6 +6551,45 @@ final class AgentSessionLinkRuntimeBridge {
             return .failure(.denied)
         }
         return .success(AuthorizedTarget(lease: lease, candidate: candidate))
+    }
+
+    /// Full access (`OverseerAuthorizationEngine.fullAccessLinkSource`): a missing link is not a
+    /// permission barrier. Establishes the ordinary managed link through the delegated durable Add, with
+    /// the full-access grant as its source scope (turning full access off revokes the grant and, with it,
+    /// this link), then authorizes the operation normally. Transport integrity still applies: exactly one
+    /// live target endpoint, a live observer endpoint, no self-link, and every Add commit fence.
+    private func establishFullAccessLink(
+        operation: DomainAgentSessionTargetOperation,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) async -> DomainAgentSessionLinkLease? {
+        let engine = delegationScopes.authorization
+        guard let host, targetSessionID != observerEndpoint.sessionID,
+              let source = engine.fullAccessLinkSource(observerSessionID: observerEndpoint.sessionID)
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        let targets = candidates.filter { $0.sessionID == targetSessionID }
+        guard targets.count == 1, let target = targets.first,
+              candidates.contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return nil }
+        let sourceScopeID = source.id
+        switch await addDelegatedMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(
+                sourceScopeID: sourceScopeID,
+                isCurrent: { engine.isFullAccessLinkSourceCurrent(sourceScopeID) }
+            )
+        ) {
+        case .added, .alreadyLinked:
+            break
+        default:
+            return nil
+        }
+        guard case let .success(lease) = await authority.authorize(
+            operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+        ) else { return nil }
+        return lease
     }
 
     /// Tells "linked, but management was not granted" apart from "not linked" for one management
@@ -8183,7 +8227,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async -> Bool {
         guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
         // Global Overseer full access: an eligible caller creates lanes without activation or a link.
-        if case .linked = basis, !delegationScopes.authorization.waives(.linkRequired) {
+        if case .linked = basis, delegationScopes.authorization.laneCreatorRequiresActiveLink {
             guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
         }
         return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)

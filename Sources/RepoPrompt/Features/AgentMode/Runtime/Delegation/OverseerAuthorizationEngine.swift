@@ -145,6 +145,20 @@ final class OverseerAuthorizationEngine {
         return callerSessionID != targetSessionID
     }
 
+    // MARK: - Grant lifecycle (executed by `DelegationScopeRuntime`)
+
+    /// Scope requests are validated as if answered by the full-access grant: no all-sessions
+    /// capability ceiling (`allSessionsCapabilityCeiling`).
+    var validatesScopeRequestsWithoutCeiling: Bool {
+        waives(.allSessionsCapabilityCeiling)
+    }
+
+    /// The runtime mints and keeps the caller's full-access grant (`scopeCoverage`); when this is false
+    /// it revokes every full-access grant ("off means off").
+    var issuesFullAccessGrant: Bool {
+        waives(.scopeCoverage)
+    }
+
     // MARK: - Presentation
 
     /// The `become_overseer` next-turn guidance for the current mode.
@@ -181,9 +195,12 @@ final class OverseerAuthorizationEngine {
             // The authority checks grantee identity before disclosing anything about this scope.
             guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
             let explicit = authorize(request, scope: record, callerSessionID: callerSessionID, projector: projector)
+            // Full access is never narrowed by the caller's own restricted scope, live or stale (revoked,
+            // expired, regenerated): the full-access grant authorizes and becomes the placement. An
+            // unknown ID (above) and another session's scope stay identity/input refusals.
             guard waives(.restrictedScopeNarrowing), Self.explicitPassNarrows(explicit),
                   !record.grant.unrestricted,
-                  scopes.liveScopes(grantedTo: callerSessionID).contains(where: { $0.id == record.id }),
+                  record.grant.granteeSessionID == callerSessionID,
                   let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID)
             else { return explicit }
             return fullAccessFallback(

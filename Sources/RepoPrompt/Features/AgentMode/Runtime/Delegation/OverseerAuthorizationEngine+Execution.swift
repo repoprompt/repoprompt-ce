@@ -107,6 +107,101 @@ extension OverseerAuthorizationEngine {
         return nil
     }
 
+    // MARK: - Placement (reparent / adopt)
+
+    /// Re-parent placement. Structural refusals (`cycle`, `unresolved`) hold in both modes; moving the
+    /// subtree between other live scopes (`otherScopeMembershipMove`) is waived by full access.
+    func reparentPlacementDenial(
+        source: UUID,
+        destination: UUID,
+        sourceAncestry: DomainDelegationOrganizationalAncestry?,
+        destinationAncestry: DomainDelegationOrganizationalAncestry?,
+        liveTreeScopes: [DomainDelegationTreeScopeRoot],
+        callerScopeChain: Set<UUID>
+    ) -> DomainDelegationScopePlacementDenial? {
+        let denial = DomainDelegationScopePlacementPolicy.validateReparent(
+            source: source, destination: destination, sourceAncestry: sourceAncestry,
+            destinationAncestry: destinationAncestry, liveTreeScopes: liveTreeScopes, callerScopeChain: callerScopeChain
+        )
+        if case .affectsOtherScopes = denial, waives(.otherScopeMembershipMove) { return nil }
+        return denial
+    }
+
+    /// Adoption placement. Restricted mode runs the domain rule unchanged. Full access waives the
+    /// permission refusals (a nested scope may adopt, an adoptee may anchor another scope, other scopes'
+    /// membership may change) and keeps the structural core: an enumerable subtree, no cycle, and
+    /// resolvable, comparable ancestry. The domain rule checks permissions before structure, so the
+    /// structural core is evaluated on its own here rather than by skipping a returned denial.
+    func adoptPlacementDenial(
+        adoptee: UUID,
+        destination: UUID,
+        adopteeAncestry: DomainDelegationOrganizationalAncestry?,
+        destinationAncestry: DomainDelegationOrganizationalAncestry?,
+        adopteeSubtree: Set<UUID>?,
+        scopeAnchors: Set<UUID>,
+        liveTreeScopes: [DomainDelegationTreeScopeRoot],
+        callerScope: DomainDelegationScopeGrant
+    ) -> DomainDelegationScopePlacementDenial? {
+        guard waives(.restrictedScopeNarrowing), waives(.scopeAnchorMoveRestriction), waives(.otherScopeMembershipMove) else {
+            return DomainDelegationScopePlacementPolicy.validateAdopt(
+                adoptee: adoptee, destination: destination, adopteeAncestry: adopteeAncestry,
+                destinationAncestry: destinationAncestry, adopteeSubtree: adopteeSubtree, scopeAnchors: scopeAnchors,
+                liveTreeScopes: liveTreeScopes, callerScope: callerScope
+            )
+        }
+        guard adopteeSubtree != nil else { return .unresolved }
+        let structural = DomainDelegationScopePlacementPolicy.validateReparent(
+            source: adoptee, destination: destination, sourceAncestry: adopteeAncestry,
+            destinationAncestry: destinationAncestry, liveTreeScopes: liveTreeScopes, callerScopeChain: []
+        )
+        if case .affectsOtherScopes = structural { return nil }
+        return structural
+    }
+
+    enum PlacementDepthDenial: Equatable {
+        /// The destination ancestry or moved subtree cannot be resolved for a configured limit.
+        case unresolved
+        case exceeded(DomainDelegationScopeDenial)
+    }
+
+    /// `maxDepth` of every tree scope on the admitted chain after moving `sessionID`'s subtree under a
+    /// destination. Restricted mode only (`sessionQuota`); full access never refuses for depth.
+    func placementDepthDenial(
+        scope: DomainDelegationScopeRecord,
+        moving sessionID: UUID,
+        destinationAncestry: DomainDelegationOrganizationalAncestry?,
+        projector: any DelegationMembershipProjector
+    ) -> PlacementDepthDenial? {
+        guard let scopes, !waives(.sessionQuota) else { return nil }
+        let limits = scopes.scopeChain(from: scope.id).compactMap { record -> DomainDelegationTreeDepthLimit? in
+            guard case let .tree(root) = record.grant.kind, let maxDepth = record.grant.guardrails.maxDepth else { return nil }
+            return DomainDelegationTreeDepthLimit(rootSessionID: root, maxDepth: maxDepth)
+        }
+        guard !limits.isEmpty else { return nil }
+        guard let destinationAncestry,
+              let height = projector.organizationalSubtree(of: sessionID)?.map(\.depth).max()
+        else { return .unresolved }
+        return DomainDelegationScopePlacementPolicy.depthViolation(
+            destinationAncestry: destinationAncestry, movedSubtreeHeight: height, limits: limits
+        ).map(PlacementDepthDenial.exceeded)
+    }
+
+    /// The scope an adoption stamps onto the moved subtree. Normally the caller's admitted scope, which
+    /// must contain the destination so the stamp is consistent with placement. Full access never
+    /// refuses for that: when the destination is outside the admitted scope it stamps the caller's
+    /// full-access grant instead, which every session belongs to, so the metadata stays valid.
+    /// Restricted mode returns `nil` (the uniform denial).
+    func adoptionStampScope(
+        admitted scope: DomainDelegationScopeRecord,
+        callerSessionID: UUID,
+        destination: UUID,
+        projector: any DelegationMembershipProjector
+    ) -> DomainDelegationScopeRecord? {
+        if isPlacedMember(destination, ofChainFrom: scope, projector: projector) { return scope }
+        guard waives(.scopeMembership) else { return nil }
+        return scopes?.ensureGlobalAutoApproveScope(for: callerSessionID)
+    }
+
     // MARK: - Quotas
 
     /// `maxLiveSessions` / `maxWorktrees` against post-adopt membership: the scope's current usage

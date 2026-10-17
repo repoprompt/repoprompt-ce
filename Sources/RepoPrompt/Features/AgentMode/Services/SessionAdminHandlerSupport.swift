@@ -50,15 +50,6 @@ struct SessionAdminHandlerContext {
         }
     }
 
-    /// Requires `sessionID` to be placed in the chain, else the uniform denial. For placement writes
-    /// that stamp `batch.scope` (adoption), so a delegation stamp is never written where the
-    /// destination is not placed in that scope (durable placement consistency).
-    func requirePlacedMember(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
-        guard isPlacedMember(sessionID, ofChainFrom: batch.scope) else {
-            throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
-        }
-    }
-
     /// The batch is still authorized: every lease's scope generation is current.
     func isCurrent(_ batch: AgentSessionAdministrationAuthorizedBatch) -> Bool {
         batch.leases.allSatisfy(scopes.isCurrent)

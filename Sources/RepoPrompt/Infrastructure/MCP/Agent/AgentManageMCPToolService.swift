@@ -1286,8 +1286,8 @@ struct AgentManageMCPToolService {
                 throw CleanupAuthorityFailure(subreason: "caller_routing_unresolved")
             case let .agentSession(callerID):
                 guard sessionID != callerID else { throw CleanupAuthorityFailure(subreason: "self_target") }
-                guard OverseerAuthorizationEngine.current.waivesTargetOwnership(
-                    .humanOnlyForAgent, caller: currentCaller, targetSessionID: sessionID
+                guard OverseerAuthorizationEngine.current.authorizesAgentCleanup(
+                    caller: currentCaller, targetSessionID: sessionID
                 ) else {
                     throw CleanupAuthorityFailure(subreason: "human_only_operation")
                 }
@@ -1479,10 +1479,7 @@ struct AgentManageMCPToolService {
                 continue
             }
 
-            guard candidate.isMCPOriginated || {
-                if case .agentSession = cleanupCaller { return OverseerAuthorizationEngine.current.waives(.humanOnlyForAgent) }
-                return false
-            }() else {
+            guard candidate.isMCPOriginated || OverseerAuthorizationEngine.current.permitsAgentDeletingUnoriginatedSessions(caller: cleanupCaller) else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
