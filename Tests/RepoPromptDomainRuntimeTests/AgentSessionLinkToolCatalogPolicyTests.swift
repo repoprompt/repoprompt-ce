@@ -368,7 +368,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testPollAndWaitDescribeOpaqueCursorContinuation() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         XCTAssertTrue(definition.description.contains("cursor"))
-        XCTAssertTrue(definition.description.contains("wait on returned cursor(s)"))
+        XCTAssertTrue(definition.description.contains("pass returned `wait_cursor` strings in `cursors`, without session IDs"))
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertTrue(
