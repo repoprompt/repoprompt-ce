@@ -496,14 +496,20 @@ LOCAL_SIGNING_IDENTITY_SHA256=<64-hex-fingerprint> \
 The versioned registry is stored at
 `~/Library/Application Support/RepoPrompt CE/local-signing-identity-v1.json`
 with owner-only directory and file permissions. It records the exact
-certificate fingerprint and local secure-storage service generation. After a
+certificate fingerprint and signing compatibility generation. After a
 fingerprint is registered, a missing, expired, or private-keyless identity is a
 hard failure; the installer never silently adopts or mints a replacement.
-Packaging embeds the registered fingerprint and service generation in signed
+Packaging embeds the registered fingerprint and compatibility generation in signed
 bundle metadata, verifies the packaged leaf certificate, and prints both the
 fingerprint and extracted designated requirement before replacing the installed
 app. Repeated installs with the same registry therefore retain the same
-designated requirement and Keychain service.
+designated requirement. This continuity is for signing only: local self-signed
+builds use process-local, in-memory secure storage. Provider keys and secure
+permission changes must be re-entered after each launch. They do not read, write,
+delete, or migrate credentials in an earlier local Keychain service; those items
+remain untouched with their previous access conditions; this change does not
+protect secrets already stored by earlier local builds. Official Developer ID
+storage is unchanged.
 
 Rotation is deliberately explicit. To mint and register a new identity:
 
@@ -513,17 +519,12 @@ ROTATE_LOCAL_SIGNING_IDENTITY=1 \
 ```
 
 To rotate to another existing exact-name identity, combine rotation with
-`LOCAL_SIGNING_IDENTITY_SHA256`. Each local Keychain service name is scoped by
-both the registered certificate fingerprint and generation. First registration
-uses a high-entropy generation
-so deleting and recreating the registry cannot predictably reconnect to an old
-service; rotation increments the recorded generation instead of
-overwriting the prior service, and registry loss cannot route a different
-certificate into an earlier identity's service. Secrets in the prior
-local generation are not copied and are inaccessible to the newly signed app;
-the prior certificate and service remain available for rollback or manual
-re-entry. If app replacement or the atomic registry update fails, the installer
-restores the prior app and leaves the prior registry authoritative.
+`LOCAL_SIGNING_IDENTITY_SHA256`. The registry retains its fingerprint and
+generation metadata for compatibility with earlier installations; neither grants
+persistent secret access. Rotation does not copy or delete any earlier local
+Keychain items or remove the prior certificate. If app replacement or the atomic
+registry update fails, the installer restores the prior app and leaves the prior
+registry authoritative.
 
 This path is intentionally separate from public distribution. The resulting app
 is host-native, self-signed, not notarized, must not be uploaded to GitHub
