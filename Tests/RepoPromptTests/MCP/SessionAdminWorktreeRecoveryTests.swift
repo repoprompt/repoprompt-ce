@@ -321,6 +321,12 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             )
             window.promptManager.promptText = "Owner draft"
             replica.promptManager.promptText = "Replica draft"
+            // Draft publication is asynchronous. Capture the no-peer-mutation baseline only
+            // after fixture setup has reached both workspace projections.
+            try await AsyncTestWait.waitUntil("foreground drafts published") {
+                window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == foregroundTabID }?.promptText == "Owner draft"
+                    && replica.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == foregroundTabID }?.promptText == "Replica draft"
+            }
             let source = OpenWindowsDelegationProvenanceSource()
             XCTAssertEqual(source.resolutionState(for: sessionID), .replicated)
             XCTAssertEqual(source.censusSnapshot().states[sessionID], .replicated)

@@ -435,7 +435,9 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let refusal = AgentSessionLaneMCPToolService.render(.refused(.destinationUnavailable)).objectValue
         XCTAssertEqual(refusal?["result"], .string("destination_unavailable"))
         XCTAssertEqual(refusal?["subreason"], .string("destination_changed"))
-        XCTAssertEqual(refusal?["next_call"]?.objectValue?["tool"], .string("manage_workspaces"))
+        // Listing workspaces cannot repair a changed destination; do not advertise it as a fix.
+        XCTAssertNil(refusal?["next_call"])
+        XCTAssertTrue(refusal?["hint"]?.stringValue?.contains("Open the intended workspace") == true)
     }
 
     func testGrantAllIsExplicitRevocableAndNotAvailableThroughMCPArguments() async throws {
