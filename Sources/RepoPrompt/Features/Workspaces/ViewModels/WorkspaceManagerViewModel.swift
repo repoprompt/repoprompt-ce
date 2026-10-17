@@ -4775,7 +4775,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.promptViewModel.attachWorkspaceManager(self)
         self.fileManager.setWorkspaceManager(self)
 
-        if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
+        if let path = WorkspaceStoragePreference.customStoragePath() {
             globalCustomStorageURL = URL(fileURLWithPath: path)
         }
 

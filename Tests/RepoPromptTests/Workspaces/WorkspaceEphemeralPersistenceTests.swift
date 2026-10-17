@@ -2519,4 +2519,43 @@ import XCTest
             return value
         }
     }
+
+    /// The custom-storage preference read seam: a persisted value from another test run never pins
+    /// this run's workspace store, while fixtures' in-sandbox values and every product launch are
+    /// unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    final class WorkspaceStoragePreferenceTests: XCTestCase {
+        private func defaults(storing path: String?) -> UserDefaults {
+            let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
+            defaults.setVolatileDomain(
+                path.map { [WorkspaceStoragePreference.key: $0] } ?? [:], forName: UserDefaults.argumentDomain
+            )
+            return defaults
+        }
+
+        func testProductLaunchUsesTheStoredValue() {
+            let stored = "/Users/someone/RepoPrompt Workspaces"
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stored), environment: [:]), stored)
+            XCTAssertNil(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: nil), environment: [:]))
+        }
+
+        func testTestRunIgnoresAnotherRunsPinnedStoreButKeepsItsOwnFixtureStore() throws {
+            let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent("storage-preference-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: sandbox) }
+            let environment = [WorkspaceStoragePreference.testSandboxEnvironmentKey: sandbox.path]
+            let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"
+            XCTAssertNil(
+                WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stale), environment: environment),
+                "a store pinned by another (crashed) run is never adopted"
+            )
+            let own = sandbox.appendingPathComponent("fixture/Workspaces").path
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: own), environment: environment), own)
+            // /var and /private/var name the same sandbox.
+            let resolvedOwn = sandbox.resolvingSymlinksInPath().appendingPathComponent("fixture/Workspaces").path
+            XCTAssertEqual(
+                WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: resolvedOwn), environment: environment),
+                resolvedOwn
+            )
+        }
+    }
 #endif
