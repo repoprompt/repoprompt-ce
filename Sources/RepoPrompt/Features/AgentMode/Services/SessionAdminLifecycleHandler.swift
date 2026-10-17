@@ -181,7 +181,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         // The fork exists either way; only joining the scope needs live authority. An incomplete
         // first save cannot become a normal joined-scope success merely because placement can run.
         if creationFailure == nil, context.isStillAuthorized(lease, scope: batch.scope),
-           context.isMember(caller, ofChainFrom: batch.scope)
+           context.isPlacedMember(caller, ofChainFrom: batch.scope)
         {
             do {
                 let commit = try host.commitOrganizationalPlacement(

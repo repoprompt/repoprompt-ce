@@ -42,6 +42,9 @@ SETTING_INPUT = re.compile(r"\bisGlobalAutoApproveEnabled\(\)")
 SETTING_STORAGE = re.compile(r"\bOverseerGlobalAutoApprove\.isEnabled\(\)")
 SCOPE_AUTHORITY_ENTRY = re.compile(r"\.authorize\(\s*DomainDelegationScopeAuthorizationRequest\(")
 OPERATION_AUTHORIZER = re.compile(r"\bDomainAgentSessionOperationAuthorizer\.authorize\(")
+ENGINE_ONLY_ALGORITHMS = re.compile(
+    r"\bDomainDelegationScopeLinkPolicy\.missingCapability\(|\badoptionGuardrailViolation\(|\.evaluateCreationGuardrails\(scopeID:"
+)
 RETIRED = re.compile(r"\bOverseerPermissionPolicy\b|\b(?:scopes|delegationScopes|runtime)\.permissionPolicy\b")
 
 # Files allowed to call the restricted operation authorizer directly (its own module, and the
@@ -107,6 +110,8 @@ def check(root: Path) -> list[str]:
             errors.append(f"{rel}: only OverseerAuthorizationEngine may run the restricted scope authority")
         if OPERATION_AUTHORIZER.search(text) and rel not in OPERATION_AUTHORIZER_FILES:
             errors.append(f"{rel}: DomainAgentSessionOperationAuthorizer.authorize is pinned to the target-operation adapter")
+        if ENGINE_ONLY_ALGORITHMS.search(text) and not is_engine(rel):
+            errors.append(f"{rel}: restricted permission algorithm outside OverseerAuthorizationEngine")
         if RETIRED.search(text):
             errors.append(f"{rel}: retired parallel policy name; use OverseerAuthorizationEngine")
         if is_engine(rel):
@@ -140,6 +145,7 @@ def self_test() -> int:
                 "let e = OverseerPermissionPolicy.current",
                 "let e2 = scopes.permissionPolicy",
                 "let f = engine.waives(.linkRequired)",
+                "let h = DomainDelegationScopeLinkPolicy.missingCapability(linkCapabilities: m, grant: g)",
                 "// let g = engine.waives(.humanOnlyForAgent) stays ignored inside a comment",
             ]),
             encoding="utf-8",
@@ -151,6 +157,7 @@ def self_test() -> int:
             "restricted scope authority",
             "pinned to the target-operation adapter",
             "retired parallel policy name",
+            "restricted permission algorithm outside",
             "gate .linkRequired consulted 1x, manifest pins 0x",
             "gate .scopeCoverage consulted 0x, manifest pins 1x",
         ]

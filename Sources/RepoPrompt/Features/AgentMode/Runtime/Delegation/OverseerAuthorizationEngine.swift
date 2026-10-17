@@ -42,6 +42,10 @@ enum OverseerAuthorizationGate: String, CaseIterable {
     case humanOnlyForAgent
     /// A lane creator or child-target link needs an active link, activation, or exact grant.
     case linkRequired
+    /// A link created under a scope must be observed by the scope's own grantee.
+    case observerMustBeCaller
+    /// A link created under a scope may carry no capability the scope chain lacks.
+    case linkCapabilityCeiling
 
     // MARK: Integrity (enforced in both modes)
 
@@ -82,7 +86,8 @@ enum OverseerAuthorizationGate: String, CaseIterable {
         case .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
              .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
              .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing,
-             .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired:
+             .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired, .observerMustBeCaller,
+             .linkCapabilityCeiling:
             .permission
         case .callerIdentityAndRoute, .targetExistence, .selfTargetRule, .explicitScopeInput,
              .presentedConfirmationInput, .canonicalMutationOwner, .organizationalStructure,

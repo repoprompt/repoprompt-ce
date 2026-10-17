@@ -14,15 +14,14 @@ struct SessionAdminHandlerContext {
     /// Presentation-only session titles for card items.
     var displayName: @MainActor (UUID) -> String? = { _ in nil }
 
-    /// The write-time authority check for one target: the lease is current **and** the target is
-    /// still a member of the whole scope chain (placement may have changed since the lease).
+    /// The write-time checkpoint for one target (`OverseerAuthorizationEngine.checkpointTarget`).
     func isStillAuthorized(
         _ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord,
         requiresMutationOwner: Bool = true
     ) -> Bool {
-        !Task.isCancelled && scopes.isCurrent(lease)
-            && (!requiresMutationOwner || projector.pointResolutionState(for: lease.targetSessionID) != .replicated)
-            && isMember(lease.targetSessionID, ofChainFrom: scope)
+        scopes.authorization.checkpointTarget(
+            lease, scope: scope, projector: projector, requiresMutationOwner: requiresMutationOwner
+        )
     }
 
     /// The caller's scope and every ancestor scope.
@@ -30,22 +29,32 @@ struct SessionAdminHandlerContext {
         scopes.scopeChain(from: scope.id)
     }
 
-    func isMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
-        let chain = scopeChain(of: scope)
-        guard !chain.isEmpty else { return false }
-        return chain.allSatisfy { record in
-            guard let proof = projector.membershipProof(for: sessionID, in: record.grant) else { return false }
-            return DomainDelegationScopeAuthority.isValid(proof, for: record.grant, targetSessionID: sessionID)
-        }
+    /// Placement fact (never an authorization gate by itself): `sessionID` is placed in the chain.
+    func isPlacedMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.isPlacedMember(sessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    /// Permission: the operation may reach `sessionID` through `scope` (`scopeMembership`).
+    func permitsMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.permitsMember(sessionID, ofChainFrom: scope, projector: projector)
     }
 
     func memberships(of sessionID: UUID, inChainFrom scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeMembershipProof] {
         scopeChain(of: scope).compactMap { projector.membershipProof(for: sessionID, in: $0.grant) }
     }
 
-    /// Requires `sessionID` to be a member of the whole chain, else the uniform denial.
+    /// Requires the operation to be permitted to reach `sessionID`, else the uniform denial.
     func requireMember(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
-        guard isMember(sessionID, ofChainFrom: batch.scope) else {
+        guard permitsMember(sessionID, ofChainFrom: batch.scope) else {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+        }
+    }
+
+    /// Requires `sessionID` to be placed in the chain, else the uniform denial. For placement writes
+    /// that stamp `batch.scope` (adoption), so a delegation stamp is never written where the
+    /// destination is not placed in that scope (durable placement consistency).
+    func requirePlacedMember(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
+        guard isPlacedMember(sessionID, ofChainFrom: batch.scope) else {
             throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
         }
     }

@@ -384,61 +384,19 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         )
     }
 
+    /// Binding admission (`OverseerAuthorizationEngine.admitWorktreeBinding`) over this host's census.
     private func reserveBinding(
         _ desiredIDs: Set<String>, target: UUID, scope: DomainDelegationScopeRecord
     ) throws -> [DelegationScopeReservation] {
-        // Full access: no delegated `maxWorktrees` counts or reserves a binding.
-        guard !context.scopes.authorization.waives(.worktreeQuota) else { return [] }
-        let reactivated = desiredIDs.compactMap { ownership.record(worktreeID: $0) }
-            .filter { $0.releasedAt != nil && $0.createdBySessionID != nil }
-        var records = try context.scopeChain(of: scope)
-            + DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
-        for creator in Set(reactivated.compactMap(\.createdBySessionID)) {
-            records += try DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: context.scopes, projector: context.projector)
-        }
-        // A target can count toward overlapping creator scopes and their restricted ancestors,
-        // even when the authorizing scope itself is unrestricted.
-        records = records.flatMap { context.scopeChain(of: $0) }
-        let byID = Dictionary(
-            records.filter { !$0.grant.unrestricted && $0.grant.guardrails.maxWorktrees != nil }
-                .map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
+        try context.scopes.authorization.admitWorktreeBinding(
+            desiredIDs, target: target, scope: scope,
+            census: .init(
+                bound: host.allBoundWorktrees(),
+                retainedTargetIDs: host.retainedWorktreeIDsAfterReplacingBinding(sessionID: target),
+                ownership: ownership
+            ),
+            projector: context.projector
         )
-        let bound = host.allBoundWorktrees()
-        let retainedTargetIDs = host.retainedWorktreeIDsAfterReplacingBinding(sessionID: target)
-        var admitted: [(UUID, Set<String>)] = []
-        for record in byID.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            guard let projected = context.projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
-                throw SessionAdminHostError.usageEvidenceUnavailable
-            }
-            let members = Set(context.projector.members(of: record.grant))
-            let owned = ownership.ownedUnreleasedWorktreeIDs(createdBy: members)
-            let currentIDs = Set(bound.filter { !$0.value.isDisjoint(with: members) }.keys).union(owned)
-            let addedIDs = (members.contains(target) ? desiredIDs : [])
-                .union(reactivated.filter { $0.createdBySessionID.map(members.contains) ?? false }.map(\.worktreeID))
-            // Replace this target's selected-window contribution while retaining bindings in
-            // other windows, another member's bindings, and unreleased ownership rows.
-            let postIDs = Set(bound.filter { !$0.value.subtracting([target]).isDisjoint(with: members) }.keys)
-                .union(members.contains(target) ? retainedTargetIDs : [])
-                .union(owned).union(addedIDs)
-            let anonymous = max(0, projected.worktreeCount - projected.countedWorktreeIDs.count)
-            let postUsage = context.scopes.usageIncludingReservations(DomainDelegationScopeUsage(
-                scopeID: record.id, liveSessionCount: projected.liveSessionCount,
-                worktreeCount: postIDs.count + anonymous, countedWorktreeIDs: postIDs
-            ))
-            if let limit = record.grant.guardrails.maxWorktrees, postUsage.worktreeCount > limit {
-                let current = context.scopes.usageIncludingReservations(DomainDelegationScopeUsage(
-                    scopeID: record.id, liveSessionCount: projected.liveSessionCount,
-                    worktreeCount: currentIDs.count + anonymous, countedWorktreeIDs: currentIDs
-                )).worktreeCount
-                throw SessionAdminHostError.guardrailExceeded(limit: limit, current: current)
-            }
-            admitted.append((record.id, addedIDs))
-        }
-        // Every check and all reservations are synchronous, so no competing bind can pass between
-        // the census and the reservation. Identity reservations remain held independently by each
-        // admitted bind, even if another bind of the same identity later fails.
-        return admitted.map { context.scopes.reserve(scopeIDs: [$0.0], worktreeIDs: $0.1) }
     }
 
     /// One pending bind per target; a newer request replaces an older one.
@@ -616,15 +574,15 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard let currentScope = context.scopes.record(id: batch.scope.id),
               currentScope.generation == batch.scope.generation,
               !initialChain.isEmpty,
-              initialChain.allSatisfy({ record in
-                  record.isActive && batch.request.operation.requiredScopeCapability.map(record.grant.capabilities.contains) == true
-              })
+              batch.request.operation.requiredScopeCapability.map({
+                  context.scopes.authorization.scopeChainHolds($0, scope: currentScope)
+              }) == true
         else { throw SessionAdminMCPToolService.unavailableError }
         // Listing has no capacity admission: per-row membership and final chain fences remain
         // authoritative. Unrelated incomplete usage evidence must not veto a read.
         let focus = Set(batch.request.targetSessionIDs)
         let members = context.projector.members(of: batch.scope.grant)
-            .filter { context.isMember($0, ofChainFrom: batch.scope) }
+            .filter { context.isPlacedMember($0, ofChainFrom: batch.scope) }
             .filter { focus.isEmpty || focus.contains($0) }
         let memberSet = Set(members)
         let chainScopeIDs = Set(context.scopeChain(of: batch.scope).map(\.id))
@@ -693,7 +651,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
               zip(initialChain, currentChain).allSatisfy({ before, after in
                   before.id == after.id && before.generation == after.generation && after.isActive
               }),
-              members.allSatisfy({ context.isMember($0, ofChainFrom: batch.scope) })
+              members.allSatisfy({ context.isPlacedMember($0, ofChainFrom: batch.scope) })
         else { throw SessionAdminMCPToolService.unavailableError }
         let outcomes = deferredOutcomes.keys.filter(memberSet.contains)
             .sorted { $0.uuidString < $1.uuidString }

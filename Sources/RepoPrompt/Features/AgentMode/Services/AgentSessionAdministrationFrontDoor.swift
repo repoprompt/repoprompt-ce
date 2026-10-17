@@ -164,33 +164,20 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             backend: backend,
             links: links,
             isLeaseCurrent: isLeaseCurrent,
-            isMember: { [weak self] sessionID, scope in self?.isMember(sessionID, of: scope) ?? false },
+            // Release reaches a counterpart only when permitted (`scopeMembership`), never by placement alone.
+            isMember: { sessionID, scope in context.permitsMember(sessionID, ofChainFrom: scope) },
             holdsControl: holdsControl
         ))
     }
 
-    /// The scope is still the live generation it was and its whole chain holds `control`. Used when a
-    /// target admitted as idle is found running before a stop or stash.
+    /// `OverseerAuthorizationEngine.holdsControl`.
     func holdsControl(_ scope: DomainDelegationScopeRecord) -> Bool {
-        guard let live = scopes.record(id: scope.id), live.isActive, live.generation == scope.generation else {
-            return false
-        }
-        return chainHolds(.control, scope: live)
+        scopes.authorization.holdsControl(scope)
     }
 
+    /// `OverseerAuthorizationEngine.scopeChainHolds`.
     private func chainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
-        let chain = scopes.scopeChain(from: scope.id)
-        // Full access lifts capability limits only; the scope chain must still be live.
-        let fullAccess = scopes.authorization.waives(.scopeCapability)
-        return !chain.isEmpty && chain.allSatisfy { record in
-            guard record.isActive else { return false }
-            if fullAccess { return true }
-            guard record.grant.capabilities.contains(capability) else { return false }
-            if case .allSessions = record.grant.kind, !record.grant.unrestricted {
-                return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
-            }
-            return true
-        }
+        scopes.authorization.scopeChainHolds(capability, scope: scope)
     }
 
     // MARK: - AgentSessionAdministrationService

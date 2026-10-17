@@ -9722,7 +9722,8 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
         .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
         .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
         .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing,
-        .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired
+        .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired, .observerMustBeCaller,
+        .linkCapabilityCeiling
     ]
 
     /// Each permission gate is pinned to effect-level ON/OFF regressions (`Class.testMethod`).
@@ -9743,7 +9744,9 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
         .restrictedScopeNarrowing: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
         .directChildOrCreatorOwnership: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
         .humanOnlyForAgent: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
-        .linkRequired: ["AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"]
+        .linkRequired: ["AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"],
+        .observerMustBeCaller: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"],
+        .linkCapabilityCeiling: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"]
     ]
 
     /// The gate inventory is total and pinned: adding a gate, or reclassifying one, must update this
@@ -9850,6 +9853,52 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
                 XCTAssertFalse(fullAccess, "a named scope's membership never narrows full access")
             default:
                 XCTFail("unexpected membership outcome, fullAccess=\(fullAccess)")
+            }
+        }
+    }
+
+    func testFullAccessWaivesScopeLinkCeilingAndObserverRestriction() async throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), target = UUID(), sibling = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(target, parent: overseer)
+            fixture.provenance.add(sibling, parent: overseer)
+            let watchOnly = try fixture.grant(overseer, [.observe, .restructure])
+            let manage = try fixture.grant(overseer)
+            flag.value = fullAccess
+            func link(_ scope: UUID, observer: UUID? = nil) async throws -> [String: Value] {
+                var args: [String: Value] = [:]
+                if let observer { args["observer_session_id"] = .string(observer.uuidString) }
+                switch try await fixture.core.perform(.init(
+                    operation: .adminLink, caller: .agentSession(overseer), callerTabID: UUID(), scopeID: scope,
+                    targetSessionIDs: [target], arguments: args
+                )) {
+                case let .completed(value):
+                    return try XCTUnwrap(value.objectValue)
+                case let .denied(denial, sessionID):
+                    return try XCTUnwrap(SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID).objectValue)
+                default:
+                    XCTFail("unexpected link outcome")
+                    return [:]
+                }
+            }
+            // `linkCapabilityCeiling`: the named scope lacks `control`, so a managed link exceeds it.
+            let ceiling = try await link(watchOnly.id)
+            if fullAccess {
+                XCTAssertTrue(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: overseer, target: target)), "\(ceiling)")
+            } else {
+                XCTAssertEqual(ceiling["code"], .string("scope_capability_missing"))
+                XCTAssertTrue(fixture.structure.added.isEmpty)
+            }
+            // `observerMustBeCaller`: a link observed by another member.
+            let delegated = try await link(manage.id, observer: sibling)
+            if fullAccess {
+                XCTAssertTrue(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: sibling, target: target)), "\(delegated)")
+            } else {
+                XCTAssertEqual(delegated["code"], .string("observer_must_be_caller"))
+                XCTAssertFalse(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: sibling, target: target)))
             }
         }
     }

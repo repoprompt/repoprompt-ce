@@ -3,9 +3,6 @@
 Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/DelegationScopeRuntime.swift	allSessionsCapabilityCeiling	1
 Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/DelegationScopeRuntime.swift	scopeCoverage	2
 Sources/RepoPrompt/Features/AgentMode/Runtime/SessionLinks/AgentSessionLinkRuntimeBridge.swift	linkRequired	2
-Sources/RepoPrompt/Features/AgentMode/Services/AgentSessionAdministrationFrontDoor.swift	scopeCapability	1
-Sources/RepoPrompt/Features/AgentMode/Services/SessionAdminRestructureHandler.swift	sessionQuota	1
-Sources/RepoPrompt/Features/AgentMode/Services/SessionAdminWorktreeHandler.swift	worktreeQuota	1
 Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift	humanOnlyForAgent	2
 Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionTargetOperationGuard.swift	directChildOrCreatorOwnership	2
 Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift	linkRequired	1
