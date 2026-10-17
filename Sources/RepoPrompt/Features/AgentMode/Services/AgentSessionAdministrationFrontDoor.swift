@@ -63,6 +63,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             guard case var .object(object) = value else { return value }
             object["selection"] = self.value
             if !recordsComplete {
+                object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey)
                 // False means completeness is unproven, not that a specific omitted match is known.
                 // Never manufacture a positive selection proof from record coverage alone.
                 object["selection_complete"] = .bool(false)
@@ -157,35 +158,28 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         register(AgentSessionOrganizeOperationHandler(
             backend: backend,
             isLeaseCurrent: isLeaseCurrent,
-            holdsControl: holdsControl
+            holdsControl: holdsControl,
+            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false },
+            isGroupOrderLeaseCurrent: isReadLeaseCurrent
         ))
         register(AgentSessionReleaseOperationHandler(
             backend: backend,
             links: links,
             isLeaseCurrent: isLeaseCurrent,
-            isMember: { [weak self] sessionID, scope in self?.isMember(sessionID, of: scope) ?? false },
+            // Release reaches a counterpart only when permitted (`scopeMembership`), never by placement alone.
+            isMember: { sessionID, scope in context.permitsMember(sessionID, ofChainFrom: scope) },
             holdsControl: holdsControl
         ))
     }
 
-    /// The scope is still the live generation it was and its whole chain holds `control`. Used when a
-    /// target admitted as idle is found running before a stop or stash.
+    /// `OverseerAuthorizationEngine.holdsControl`.
     func holdsControl(_ scope: DomainDelegationScopeRecord) -> Bool {
-        guard let live = scopes.record(id: scope.id), live.isActive, live.generation == scope.generation else {
-            return false
-        }
-        return chainHolds(.control, scope: live)
+        scopes.authorization.holdsControl(scope)
     }
 
+    /// `OverseerAuthorizationEngine.scopeChainHolds`.
     private func chainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
-        let chain = scopes.scopeChain(from: scope.id)
-        return !chain.isEmpty && chain.allSatisfy { record in
-            guard record.isActive, record.grant.capabilities.contains(capability) else { return false }
-            if case .allSessions = record.grant.kind, !record.grant.unrestricted {
-                return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
-            }
-            return true
-        }
+        scopes.authorization.scopeChainHolds(capability, scope: scope)
     }
 
     // MARK: - AgentSessionAdministrationService
@@ -222,7 +216,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         // goes straight to the core, which owns every denial.
         guard handlers[request.operation] != nil,
               let callerSessionID = request.caller.agentSessionID,
-              let scope = selectScope(request, callerSessionID: callerSessionID)
+              let scope = scopes.authorization.scopeForAdministrationShaping(request)
         else { return try await core.perform(request) }
         // Cards left behind on a tab that no longer shows the caller can never be presented again;
         // release their pending slots before the call may need a new card.
@@ -264,7 +258,11 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         if !request.operation.isScopeLevel {
             // A filter enumerates sessions, so it needs a live scope holding `observe` and the
             // operation's own capability before anything is resolved.
-            if request.arguments["filter"] != nil, let denial = filterDenial(request.operation, scope: scope) {
+            let groupDiscovery = request.operation == .adminReorderGroups
+                && (request.arguments["order"] == nil || request.arguments["expected_order"] == nil)
+            if request.arguments["filter"] != nil || groupDiscovery,
+               let denial = filterDenial(request.operation, scope: scope)
+            {
                 return .denied(denial, sessionID: nil)
             }
             let shapingChain = scopes.scopeChain(from: scope.id)
@@ -612,17 +610,6 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         guard let object = value.objectValue else { return false }
         return (object["changed_count"]?.intValue ?? 0) > 0
             || object[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
-    }
-
-    private func selectScope(_ request: AgentSessionAdministrationRequest, callerSessionID: UUID) -> DomainDelegationScopeRecord? {
-        if let scopeID = request.scopeID {
-            guard let record = scopes.record(id: scopeID), record.isActive, record.grant.granteeSessionID == callerSessionID else {
-                return nil
-            }
-            return record
-        }
-        let live = scopes.liveScopes(grantedTo: callerSessionID)
-        return live.count == 1 ? live[0] : nil
     }
 
     func isMember(_ sessionID: UUID, of scope: DomainDelegationScopeRecord) -> Bool {

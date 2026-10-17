@@ -1261,6 +1261,7 @@ final class AgentSessionLinkRuntimeBridge {
                 }
             }
         }
+        await authority.installCapabilityElevation(delegationScopes.authorization.linkCapabilityElevation)
         return await authority.installScopeConsent(delegationScopes.linkConsent)
     }
 
@@ -3294,10 +3295,9 @@ final class AgentSessionLinkRuntimeBridge {
         guard let observerSessionID else {
             return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
         }
-        let approved = delegationScopes.isGlobalAutoApproveEnabled() || delegationScopes.liveScopes(grantedTo: observerSessionID).contains {
-            $0.grant.kind == .session(targetSessionID: candidate.sessionID)
-                && delegationScopes.linkConsent.permits(scopeID: $0.id, observer: observerSessionID, target: candidate.sessionID, at: Date())
-        }
+        let approved = delegationScopes.authorization.permitsChildLinkTarget(
+            observerSessionID: observerSessionID, targetSessionID: candidate.sessionID
+        )
         return AgentSessionLinkEndpointEligibility.targetResolveFailure(
             for: candidate, observerSessionID: observerSessionID, permitsChildTarget: approved
         )
@@ -6513,15 +6513,33 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
-        let leaseResult = await authority.authorize(
+        // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
+        delegationScopes.reconcileGlobalAutoApprove()
+        var leaseResult = await authority.authorize(
             operation: operation,
             observerEndpoint: observerEndpoint,
             targetSessionID: targetSessionID
         )
+        // Full access: a stored link capability is not a ceiling (`linkCapabilityCeiling`). Ensuring the
+        // observer's full-access grant elevates its links in the authority; the stored link is unchanged.
+        if case .failure(.capabilityDenied) = leaseResult,
+           delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: observerEndpoint.sessionID)
+        {
+            _ = await ensureScopedLinkConsent()
+            leaseResult = await authority.authorize(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            )
+        }
         let lease: DomainAgentSessionLinkLease
         switch leaseResult {
         case let .success(value):
             lease = value
+        case .failure(.noActiveLink):
+            // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
+            guard let established = await establishFullAccessLink(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            ) else { return .failure(.denied) }
+            lease = established
         case let .failure(error):
             if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
                 if operation == .monitorSetModel {
@@ -6546,6 +6564,45 @@ final class AgentSessionLinkRuntimeBridge {
             return .failure(.denied)
         }
         return .success(AuthorizedTarget(lease: lease, candidate: candidate))
+    }
+
+    /// Full access (`OverseerAuthorizationEngine.fullAccessLinkSource`): a missing link is not a
+    /// permission barrier. Establishes the ordinary managed link through the delegated durable Add, with
+    /// the full-access grant as its source scope (turning full access off revokes the grant and, with it,
+    /// this link), then authorizes the operation normally. Transport integrity still applies: exactly one
+    /// live target endpoint, a live observer endpoint, no self-link, and every Add commit fence.
+    private func establishFullAccessLink(
+        operation: DomainAgentSessionTargetOperation,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) async -> DomainAgentSessionLinkLease? {
+        let engine = delegationScopes.authorization
+        guard let host, targetSessionID != observerEndpoint.sessionID,
+              let source = engine.fullAccessLinkSource(observerSessionID: observerEndpoint.sessionID)
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        let targets = candidates.filter { $0.sessionID == targetSessionID }
+        guard targets.count == 1, let target = targets.first,
+              candidates.contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return nil }
+        let sourceScopeID = source.id
+        switch await addDelegatedMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(
+                sourceScopeID: sourceScopeID,
+                isCurrent: { engine.isFullAccessLinkSourceCurrent(sourceScopeID) }
+            )
+        ) {
+        case .added, .alreadyLinked:
+            break
+        default:
+            return nil
+        }
+        guard case let .success(lease) = await authority.authorize(
+            operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+        ) else { return nil }
+        return lease
     }
 
     /// Tells "linked, but management was not granted" apart from "not linked" for one management
@@ -6777,6 +6834,7 @@ final class AgentSessionLinkRuntimeBridge {
               grant.target == lease.target
         else { return false }
         return grant.capabilities.contains(.manage)
+            || delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: lease.observer.sessionID, issue: false)
     }
 
     /// Loads durable child metadata once for the batch, then publishes the resulting target
@@ -6842,6 +6900,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         localInputReleaseTasks[endpoint] = task
         return task
+    }
+
+    func resolveWaitCursorTargets(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        cursors: [String]
+    ) async -> Result<[UUID], DomainAgentSessionLinkError> {
+        await authority.resolveWaitCursorTargets(observerEndpoint: observerEndpoint, cursors: cursors)
     }
 
     /// Bounded, event-driven wait. The authority owns one-waiter admission and atomic multi-target
@@ -8183,7 +8248,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async -> Bool {
         guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
         // Global Overseer full access: an eligible caller creates lanes without activation or a link.
-        if case .linked = basis, !OverseerGlobalAutoApprove.isEnabled() {
+        if case .linked = basis, delegationScopes.authorization.laneCreatorRequiresActiveLink {
             guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
         }
         return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)
@@ -8449,7 +8514,7 @@ final class AgentSessionLinkRuntimeBridge {
         // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-        guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        guard delegationScopes.authorization.admitsAdditionalLane(admittedLaneCount: admittedCount)
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
@@ -8509,10 +8574,29 @@ final class AgentSessionLinkRuntimeBridge {
             receipt.refusalStage = "scope_admission"
             return receipt
         } catch let failure as AgentSessionLaneDestinationFailure {
-            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            let reason: AgentSessionLaneCreateReceipt.Reason = if case .admissionRejected = failure {
+                .workspaceAdmissionRejected
+            } else { .destinationUnavailable }
+            var receipt: AgentSessionLaneCreateReceipt
+            if case let .admissionRejected(admission) = failure, let retained = admission.retainedAdmission {
+                // Recovery has not proved removal of this exact provisional identity. Retain the
+                // request in the existing incomplete ledger, including when admission was cancelled.
+                receipt = await AgentSessionLaneCreateReceipt(
+                    result: .creationIncomplete, sessionID: retained.identity.sessionID,
+                    sessionName: request.sessionName, linked: false, reason: reason, firstTask: .none,
+                    laneCount: linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
+                )
+                receipt.workspaceName = workspaceName
+            } else {
+                receipt = .refused(reason)
+            }
             receipt.destinationFailure = failure
             receipt.refusalStage = "host_allocation"
             if case let .creationRejected(detail) = failure { receipt.refusalDetail = detail }
+            if case let .admissionRejected(admission) = failure {
+                receipt.refusalDetail = admission.detail
+                receipt.refusalStage = "workspace_admission"
+            }
             return receipt
         } catch {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)

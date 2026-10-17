@@ -90,6 +90,14 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+`wait` accepts returned `wait_cursor` strings directly in `cursors`, without a separate session ID
+list. Existing `{session_id, cursor}` records remain valid and may be mixed with strings. The link
+authority resolves each opaque string only within the current caller's exact outbound grants;
+the string supplies no authority. The normal capability, lease, consent, and cursor-generation
+checks still apply. Unknown, expired, or foreign handles cannot select another caller's target.
+Explicit `session_id` and `session_ids` calls remain supported, and supplied cursor targets must
+agree with that selection.
+
 ## Passive retained user-input excerpts
 
 Optional excerpts decorate only the status `<change>` rows already selected by the baseline
@@ -280,6 +288,63 @@ the user's card.
   `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
   and provider-context invalidation after that fence, before it publishes.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
+
+### Authorization ownership: Overseer full access versus restricted delegation
+
+`OverseerAuthorizationEngine` (`Runtime/Delegation/OverseerAuthorizationEngine*.swift`, one per
+`DelegationScopeRuntime`) is the single decision owner. It alone reads the master setting (the
+runtime's `isGlobalAutoApproveEnabled` input; production is the stored user setting) and never infers
+authority from arguments, prompt text, or the existence of a recorded grant. Callers resolve exact
+routing and execute what the engine admits.
+
+Every gate is typed and classified in `OverseerAuthorizationGate`:
+
+| Class | Gates | Full access |
+| --- | --- | --- |
+| Permission | `scopeCoverage`, `scopeCapability`, `allSessionsCapabilityCeiling`, `scopeMembership`, `confirmationRequirement`, `sessionQuota` (incl. `maxDepth`), `worktreeQuota`, `creatorPlacementForAccounting`, `scopeAnchorMoveRestriction`, `otherScopeMembershipMove`, `restrictedScopeNarrowing`, `creatorLaneQuota` (12 lanes per creator), `directChildOrCreatorOwnership`, `humanOnlyForAgent`, `linkRequired`, `observerMustBeCaller`, `linkCapabilityCeiling` | Waived |
+| Integrity | `callerIdentityAndRoute`, `targetExistence`, `selfTargetRule`, `explicitScopeInput` (unknown or another session's scope), `presentedConfirmationInput`, `canonicalMutationOwner` (one exact writer for the changed state), `organizationalStructure` (cycles, unresolvable/incomparable ancestry), `argumentsAndSelectors`, `idempotencyAndSingleApplication`, `transportIncarnation`, `operationalCapacity` (bounded in-flight tasks, ledgers, queues), `lifecycleAndCancellation`, `persistenceOutcome` | Enforced |
+
+Engine families: administration (`authorizeAdministration`: implicit full-access grant, explicit-scope
+pass then full-access fallback, independent card validation and single claim), creation
+(`+Creation`: guardrail scopes, joining counts, reservations, stamps, lane moves), execution
+checkpoints (`+Execution`: `checkpointTarget`, `permitsMember` vs the `isPlacedMember` placement
+fact, capability and link-ceiling checks, adoption/binding/depth quotas, reparent/adopt placement),
+and targets/links (`+Targets`: operation authorizer, worktree binding, cleanup, child-link
+eligibility, lane link requirement, catalog surface, full-access link source).
+
+Rules that keep it honest:
+
+- Agreeing workspace presentations remain replicated. Model, effort and worktree changes may use
+  their one independently proven bound payload owner without opening the target tab. Every bound
+  runtime counts, including a second one still loading; the selected owner must have current
+  metadata and restoration identity. Hosts pin that object and identity through preparation.
+  Presentation and organizational mutations retain their separate writer requirements.
+- A fully authorized group order, model or effort request that already matches current state
+  completes with `result: applied`, `state_satisfied: true`, and `changed_count: 0`. It is not a
+  refusal or a fabricated write. Failed, skipped, incomplete or control-blocked batches cannot
+  claim this result, and unchanged requests recheck current authority and expected-order input.
+- An explicit restricted `scope_id` the caller owns (live, revoked, or expired) never narrows full
+  access. A fully admitting live scope keeps its placement; otherwise the full-access grant authorizes
+  and is the placement, so no recovery call is needed. Unknown and foreign scope IDs stay
+  identity/input refusals that disclose nothing. A presented card is validated against the scope it
+  was issued for and claimed once.
+- Placement facts are never gates. Adoption stamps a scope consistent with placement; under full
+  access it stamps the full-access grant for a destination outside the admitted scope rather than
+  refusing.
+- Under full access a missing link is established through the delegated durable Add, sourced from
+  the full-access grant, so turning full access off revokes it with the grant. Existing user links
+  are never removed, downgraded, or upgraded.
+- A stored link capability is not a ceiling under full access. The engine issues revocable
+  `DomainAgentSessionLinkCapabilityElevation` evidence for the observer; the link authority reads it
+  at every fence (authorize, lease validation, managed disclosure, management send commit) and never
+  infers full access from grants or settings itself. The stored link is never upgraded. Every
+  restricted-mode engine evaluation revokes all elevations, and the setting's only writer (the
+  Settings toggle) reconciles on off, so an in-flight management lease fails its next fence.
+- `Scripts/overseer_authorization_guardrails.py` (self-tested, run by `make guardrails`) rejects raw
+  setting reads, the restricted scope authority, operation authorizer, placement/link/quota
+  algorithms, and gate consultations outside the engine files (`overseer_authorization_manifest.tsv`
+  is empty by design). `OverseerAuthorizationEngineTests` pins the classification and requires an
+  effect-level ON/OFF scenario for every permission gate.
 
 Scope/link/worktree continuity is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent). Persistence records user

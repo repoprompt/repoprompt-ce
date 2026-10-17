@@ -187,7 +187,8 @@ enum WindowStateCompositionFactory {
             // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.
             workspaceManager.installDomainCatalogRefresh(
                 request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
-                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() }
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge] in await bridge?.refreshForAgentAdmission() ?? false }
             )
         }
         domainWorkspacePresentationBridge?.start()

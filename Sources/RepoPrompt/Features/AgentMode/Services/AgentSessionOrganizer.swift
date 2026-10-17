@@ -49,6 +49,20 @@ struct AgentSessionUnarchiveOutcome {
     var failures: [UUID: Failure] = [:]
 }
 
+/// Exact group mirrors read for a reorder, including carriers whose rank will stay unchanged.
+struct AgentSessionGroupOrderEntry: Hashable {
+    let sessionID: UUID
+    let group: String
+    let order: Int?
+}
+
+struct AgentSessionGroupOrderWriteOutcome {
+    var changed: Set<UUID> = []
+    var failure: String?
+    var localChanges = false
+    var persistenceConfirmed = false
+}
+
 /// Records which targets a commit-time check last refused on run state. A stash evaluates its check
 /// more than once (before and after its preflight suspension); the last evaluation decides.
 @MainActor
@@ -95,6 +109,13 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     /// Writes group order values, only to sessions that are still grouped and active. Writes nothing
     /// else. Returns the sessions whose value changed.
     func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID>
+    /// Group order is a workspace presentation edit, not a session payload write. The backend
+    /// compares the captured mirrors and authority at commit, and acknowledges its one writer.
+    func commitGroupOrderValues(
+        _ values: [UUID: Int?], workspaceID: UUID,
+        expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
+        isAuthorized: @escaping @MainActor (UUID) -> Bool
+    ) async -> AgentSessionGroupOrderWriteOutcome
     /// Run state aggregated across every open window: `running` if any window runs the session,
     /// otherwise `unknown` if any lookup fails, otherwise `idle` (also for sessions with no live run).
     func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState
@@ -117,6 +138,22 @@ protocol AgentSessionOrganizingBackend: AnyObject {
 }
 
 extension AgentSessionOrganizingBackend {
+    func commitGroupOrderValues(
+        _ values: [UUID: Int?], workspaceID: UUID,
+        expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
+        isAuthorized: @escaping @MainActor (UUID) -> Bool
+    ) async -> AgentSessionGroupOrderWriteOutcome {
+        guard let entries = groupEntries(workspaceID: workspaceID),
+              Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }) == expected
+        else { return .init(failure: "group_state_changed") }
+        guard !Task.isCancelled, affectedSessionIDs.allSatisfy(isAuthorized) else {
+            return .init(failure: "scope_no_longer_current")
+        }
+        let changed = setGroupOrderValues(values)
+        return changed == Set(values.keys) ? .init(changed: changed)
+            : .init(changed: changed, failure: "workspace_writer_unavailable", localChanges: !changed.isEmpty)
+    }
+
     func rename(_ names: [UUID: String]) -> Set<UUID> {
         Set(names.compactMap { id, name in rename(id, to: name) ? id : nil })
     }
@@ -238,13 +275,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
 
     func groupEntries(workspaceID: UUID) -> [(sessionID: UUID, group: String, order: Int?)]? {
         guard let (window, workspace) = loadedWorkspace(workspaceID) else { return nil }
-        let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
-        return window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs).compactMap { row in
-            guard let sessionID = row.sessionID, let tab = tabsByID[row.tabID], let group = tab.sidebarGroup else {
-                return nil
-            }
-            return (sessionID, group, tab.sidebarGroupOrder)
-        }
+        return groupEntries(window: window, workspace: workspace)
     }
 
     func rename(_ sessionID: UUID, to name: String) -> Bool {
@@ -331,6 +362,156 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             }
             tab.sidebarGroupOrder = value
             return true
+        }
+    }
+
+    func commitGroupOrderValues(
+        _ values: [UUID: Int?], workspaceID: UUID,
+        expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
+        isAuthorized: @escaping @MainActor (UUID) -> Bool
+    ) async -> AgentSessionGroupOrderWriteOutcome {
+        guard !values.isEmpty else { return .init() }
+        let windows = liveWindows().filter { !$0.isPreparedSessionOwner }
+        var workspaceWindows = windows.filter { $0.workspaceManager.activeWorkspaceID == workspaceID }
+        guard let writer = workspaceWindows.sorted(by: { $0.windowID < $1.windowID }).first(where: {
+            $0.workspaceManager.canCommitComposeTabPresentation(workspaceID: workspaceID)
+        }) else { return .init(failure: "workspace_writer_unavailable") }
+        let manager = writer.workspaceManager
+        guard writer.promptManager.flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID) else {
+            return .init(failure: "compose_flush_rejected")
+        }
+        workspaceWindows = liveWindows().filter {
+            !$0.isPreparedSessionOwner && $0.workspaceManager.activeWorkspaceID == workspaceID
+        }
+        // Flushing can invoke synchronous subscribers. Re-read every replica and all authority
+        // after it, immediately before accepting the one workspace presentation mutation.
+        guard let writerWorkspace = manager.activeWorkspace,
+              manager.canCommitComposeTabPresentation(workspaceID: workspaceID),
+              workspaceWindows.allSatisfy({ window in
+                  guard !window.isClosing, window.workspaceManager.activeWorkspaceID == workspaceID,
+                        let workspace = window.workspaceManager.activeWorkspace,
+                        workspace.isEphemeral == writerWorkspace.isEphemeral,
+                        window.workspaceManager.workspaceFileURL(for: workspace) == manager.workspaceFileURL(for: writerWorkspace)
+                  else { return false }
+                  let entries = groupEntries(window: window, workspace: workspace)
+                  return Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }) == expected
+              })
+        else { return .init(failure: "group_state_changed") }
+        let proof = AgentSessionCarrierResolver.capture(windows: liveWindows(), sessionIDs: affectedSessionIDs)
+        guard proof.isCurrent(), proof.ambiguousSessionIDs.isDisjoint(with: affectedSessionIDs),
+              affectedSessionIDs.allSatisfy({ id in
+                  guard let row = proof.uniqueLocations[id] else { return false }
+                  return row.workspaceID == workspaceID && row.stashedTabID == nil
+              }),
+              Set(values.keys).isSubset(of: affectedSessionIDs)
+        else { return .init(failure: "workspace_writer_unavailable") }
+        let rows = proof.rows.filter { affectedSessionIDs.contains($0.sessionID) }
+        let writerRows = rows.filter { $0.window === writer }
+        guard Set(writerRows.map(\.sessionID)) == affectedSessionIDs,
+              let workspaceBefore = manager.activeWorkspace,
+              !Task.isCancelled, affectedSessionIDs.allSatisfy(isAuthorized)
+        else { return .init(failure: "scope_no_longer_current") }
+        let identities = rows.map { row in
+            (row, row.window.agentModeViewModel.agentSessionLifecycleIdentity(tabID: row.tab.id, expectedSessionID: row.sessionID))
+        }
+        let fileURL = manager.workspaceFileURL(for: workspaceBefore)
+        let tabOrders = Dictionary(uniqueKeysWithValues: workspaceWindows.map {
+            (ObjectIdentifier($0), $0.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
+        })
+        let sessionByTab = Dictionary(uniqueKeysWithValues: writerRows.map { ($0.tab.id, $0.sessionID) })
+        let writeTabIDs = Set(writerRows.filter { values.keys.contains($0.sessionID) }.map(\.tab.id))
+        let changedTabs = manager.updateComposeTabPresentation(workspaceID: workspaceID, tabIDs: writeTabIDs) { tabID, tab in
+            guard let sessionID = sessionByTab[tabID], let value = values[sessionID] else { return }
+            tab.sidebarGroupOrder = value
+        }
+        guard changedTabs == writeTabIDs else {
+            return .init(failure: "group_state_changed", localChanges: !changedTabs.isEmpty)
+        }
+        guard !writer.isClosing, manager.activeWorkspaceID == workspaceID, let published = manager.activeWorkspace else {
+            return .init(failure: "group_projection_changed", localChanges: true)
+        }
+        writer.promptManager.loadComposeTabsFromWorkspace(published)
+        manager.markWorkspaceDirty()
+        let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID)
+        let workingCommitted: Bool = if case let .rejected(rejection) = persistence { rejection.workingCommitted } else { false }
+        guard (persistence.acceptedForLifecycleAdmission && persistence.workspaceID == workspaceID) || workingCommitted else {
+            return .init(failure: "group_persistence_rejected", localChanges: true)
+        }
+        let durable = workspaceBefore.isEphemeral ? nil : await manager.durableWorkspaceForMutationReadback(workspaceID: workspaceID)
+        if !workspaceBefore.isEphemeral {
+            let durableTabs = Dictionary(grouping: durable?.composeTabs ?? [], by: \.id)
+            guard durable?.id == workspaceID, durable?.composeTabs.map(\.id) == workspaceBefore.composeTabs.map(\.id),
+                  writerRows.allSatisfy({ row in
+                      guard let tabs = durableTabs[row.tab.id], tabs.count == 1 else { return false }
+                      var expectedTab = row.tab
+                      if let value = values[row.sessionID] { expectedTab.sidebarGroupOrder = value }
+                      return tabs[0] == expectedTab
+                  }) else { return .init(failure: "group_persistence_unconfirmed", localChanges: true, persistenceConfirmed: workingCommitted) }
+        }
+        // A committed write is never rolled back because a later route or projection changed.
+        // Only the precise acknowledged rank difference is allowed in this new identity proof.
+        let transitions = Dictionary(uniqueKeysWithValues: writerRows.compactMap { row -> (UUID, AgentSessionCarrierResolver.AcknowledgedGroupOrder)? in
+            guard let after = values[row.sessionID], let group = row.tab.sidebarGroup else { return nil }
+            return (row.sessionID, .init(workspaceID: workspaceID, tabID: row.tab.id, group: group, before: row.tab.sidebarGroupOrder, after: after))
+        })
+        let persisted = !workspaceBefore.isEphemeral
+        func currentProjection() -> AgentSessionCarrierResolver.Snapshot? {
+            let current = AgentSessionCarrierResolver.capture(
+                windows: liveWindows(), sessionIDs: affectedSessionIDs, acknowledgedGroupOrders: transitions
+            )
+            guard current.isCurrent(), current.ambiguousSessionIDs.isDisjoint(with: affectedSessionIDs),
+                  current.rows.count == rows.count,
+                  identities.allSatisfy({ row, identity in
+                      guard !row.window.isClosing, row.window.workspaceManager.activeWorkspaceID == workspaceID,
+                            let workspace = row.window.workspaceManager.activeWorkspace,
+                            workspace.isEphemeral == workspaceBefore.isEphemeral,
+                            row.window.workspaceManager.workspaceFileURL(for: workspace) == fileURL,
+                            workspace.composeTabs.map(\.id) == tabOrders[ObjectIdentifier(row.window)],
+                            row.window.agentModeViewModel.agentSessionLifecycleIdentity(tabID: row.tab.id, expectedSessionID: row.sessionID) == identity,
+                            let fresh = current.rows.first(where: { $0.window === row.window && $0.sessionID == row.sessionID })
+                      else { return false }
+                      var expectedTab = row.tab
+                      if values.keys.contains(row.sessionID) { expectedTab.sidebarGroupOrder = fresh.tab.sidebarGroupOrder }
+                      return fresh.workspaceID == workspaceID && fresh.tab.id == row.tab.id && fresh.stashedTabID == nil
+                          && fresh.workspaceName == row.workspaceName && fresh.tab == expectedTab
+                          && fresh.entry == row.entry && fresh.hasCurrentMetadataOwner == row.hasCurrentMetadataOwner
+                  }) else { return nil }
+            return current
+        }
+        // Project fields only, after writer acknowledgement. Peers do not issue another save or
+        // replace whole workspace documents, and a new/changed carrier is never silently retargeted.
+        for peer in workspaceWindows where peer !== writer {
+            guard let current = currentProjection() else {
+                return .init(changed: Set(values.keys), failure: "group_projection_changed", localChanges: true, persistenceConfirmed: persisted)
+            }
+            let peerRows = current.rows.filter { $0.window === peer && values.keys.contains($0.sessionID) }
+            let peerSessionByTab = Dictionary(uniqueKeysWithValues: peerRows.map { ($0.tab.id, $0.sessionID) })
+            _ = peer.workspaceManager.updateComposeTabPresentation(workspaceID: workspaceID, tabIDs: Set(peerSessionByTab.keys)) { tabID, tab in
+                guard let sessionID = peerSessionByTab[tabID], let value = values[sessionID] else { return }
+                tab.sidebarGroupOrder = value
+            }
+            if let workspace = peer.workspaceManager.activeWorkspace {
+                peer.promptManager.loadComposeTabsFromWorkspace(workspace)
+            }
+        }
+        guard let settled = currentProjection(), settled.rows.allSatisfy({ row in
+            guard let value = values[row.sessionID] else { return true }
+            return row.tab.sidebarGroupOrder == value
+        }) else { return .init(changed: Set(values.keys), failure: "group_projection_changed", localChanges: true, persistenceConfirmed: persisted) }
+        guard !Task.isCancelled, affectedSessionIDs.allSatisfy(isAuthorized) else {
+            return .init(changed: Set(values.keys), failure: "scope_no_longer_current", localChanges: true, persistenceConfirmed: persisted)
+        }
+        return .init(
+            changed: Set(values.keys), failure: workingCommitted ? "group_save_incomplete" : nil,
+            localChanges: true, persistenceConfirmed: persisted
+        )
+    }
+
+    private func groupEntries(window: WindowState, workspace: WorkspaceModel) -> [(sessionID: UUID, group: String, order: Int?)] {
+        let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
+        return window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs).compactMap { row in
+            guard let sessionID = row.sessionID, let tab = tabsByID[row.tabID], let group = tab.sidebarGroup else { return nil }
+            return (sessionID, group, tab.sidebarGroupOrder)
         }
     }
 

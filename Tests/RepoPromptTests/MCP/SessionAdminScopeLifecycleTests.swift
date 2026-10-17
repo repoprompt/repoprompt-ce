@@ -347,6 +347,22 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
     @MainActor
     final class FakeProvenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
+        var resolutionStates: [UUID: DelegationSessionResolutionState] = [:]
+
+        func resolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+            resolutionStates[sessionID] ?? (sessions[sessionID] == nil ? .absent : .indexOnly)
+        }
+
+        func pointSnapshot(for sessionIDs: Set<UUID>) -> DelegationProvenanceSnapshot {
+            .init(
+                records: sessions.filter { sessionIDs.contains($0.key) },
+                states: Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, resolutionState(for: $0)) })
+            )
+        }
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            .init(records: sessions, states: sessions.mapValues { resolutionState(for: $0.sessionID) })
+        }
 
         func add(
             _ id: UUID,
@@ -419,7 +435,9 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let refusal = AgentSessionLaneMCPToolService.render(.refused(.destinationUnavailable)).objectValue
         XCTAssertEqual(refusal?["result"], .string("destination_unavailable"))
         XCTAssertEqual(refusal?["subreason"], .string("destination_changed"))
-        XCTAssertEqual(refusal?["next_call"]?.objectValue?["tool"], .string("manage_workspaces"))
+        // Listing workspaces cannot repair a changed destination; do not advertise it as a fix.
+        XCTAssertNil(refusal?["next_call"])
+        XCTAssertTrue(refusal?["hint"]?.stringValue?.contains("Open the intended workspace") == true)
     }
 
     func testGrantAllIsExplicitRevocableAndNotAvailableThroughMCPArguments() async throws {
@@ -648,7 +666,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         receipt.refusalStage = "host_allocation"
         let value = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
         XCTAssertEqual(value["subreason"], .string("lane_creation_rejected"))
-        XCTAssertEqual(value["retryable"], .bool(true))
+        XCTAssertEqual(value["retryable"], .bool(false))
+        XCTAssertNil(value["next_call"])
         XCTAssertTrue(value["detail"]?.stringValue?.contains("workspace_persistence_rejected") == true)
         XCTAssertFalse(value["hint"]?.stringValue?.contains("No unambiguous active destination") == true)
     }
@@ -1917,6 +1936,38 @@ final class SessionAdminStructureTests: XCTestCase {
                 XCTAssertNotNil(failure[key], key)
             }
         }
+        let satisfiedExtra: [String: Value] = [AgentSessionAdminRendering.stateSatisfiedKey: .bool(true)]
+        let unchanged = SessionAdminItemResult(sessionID: id, result: "unchanged")
+        let satisfied = try XCTUnwrap(SessionAdminReply.batch(
+            op: "set_model", items: [unchanged], extra: satisfiedExtra
+        ).objectValue)
+        XCTAssertEqual(satisfied["result"], .string("applied"))
+        XCTAssertEqual(satisfied["state_satisfied"], .bool(true))
+        XCTAssertEqual(satisfied["changed_count"], .int(0))
+        XCTAssertNil(satisfied["code"])
+        XCTAssertNil(satisfied["next_call"])
+        XCTAssertFalse(AgentSessionAdministrationFrontDoor.changedSomething(.object(satisfied)))
+        let incompleteBatches: [[SessionAdminItemResult]] = [
+            [],
+            [unchanged, .init(sessionID: other, result: "not_applied", code: "scope_revoked")],
+            [unchanged, .init(sessionID: other, result: "not_applied", code: "bind_failed")],
+            [unchanged, .init(sessionID: other, result: "unknown_outcome")]
+        ]
+        for batch in incompleteBatches {
+            let reply = try XCTUnwrap(SessionAdminReply.batch(op: "set_model", items: batch, extra: satisfiedExtra).objectValue)
+            XCTAssertEqual(reply["result"], .string("not_applied"))
+            XCTAssertNil(reply["state_satisfied"])
+        }
+        let requiringControl = try XCTUnwrap(SessionAdminReply.batch(
+            op: "set_model", items: [unchanged], requiresControl: [other], extra: satisfiedExtra
+        ).objectValue)
+        XCTAssertEqual(requiringControl["result"], .string("not_applied"))
+        XCTAssertNil(requiringControl["state_satisfied"])
+        var refreshed = satisfied
+        refreshed["requires_control"] = .array([.string(other.uuidString)])
+        refreshed = AgentSessionAdminRendering.refreshingOrganizingResult(refreshed)
+        XCTAssertEqual(refreshed["result"], .string("not_applied"))
+        XCTAssertNil(refreshed["state_satisfied"])
         for status in [AgentSessionAdminItemResult.Status.unchanged, .failed, .skipped] {
             XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
                 operation: .adminSetGroup, items: [.init(sessionID: id, status: status)], itemsRequiringControl: []
@@ -2017,8 +2068,9 @@ final class SessionAdminStructureTests: XCTestCase {
                 XCTAssertEqual(status["unrestricted"], .bool(true))
                 XCTAssertNil(status["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
             }
-            // A global caller still cannot hide the restricted scopes its target's bindings count toward.
-            // Create restrictions with the setting OFF, then exercise the actual ON/OFF front door.
+            // Restricted mode: a caller cannot hide the restricted scopes its target's bindings count toward.
+            // Full access overrides those delegated quotas (`OverseerAuthorizationEngine`). Create restrictions
+            // with the setting OFF, then exercise the actual ON/OFF front door.
             OverseerGlobalAutoApprove.isEnabled = { false }
             let ancestor = UUID()
             fixture.provenance.add(ancestor, parent: nil)
@@ -2033,25 +2085,41 @@ final class SessionAdminStructureTests: XCTestCase {
             OverseerGlobalAutoApprove.isEnabled = { enabled }
             let originalID: UUID? = if enabled { nil }
             else { try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { $0.grant.parentScopeID == nil }).id }
-            @MainActor func limitedBind() async throws -> [String: Value] {
+            @MainActor func limitedBind(_ worktree: String) async throws -> [String: Value] {
                 guard case let .completed(value) = try await door.perform(.init(
                     operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
-                    scopeID: originalID, targetSessionIDs: [target], arguments: ["worktree": .string("over-limit")]
-                )) else { XCTFail("A restricted-overlap refusal must be structured")
+                    scopeID: originalID, targetSessionIDs: [target], arguments: ["worktree": .string(worktree)]
+                )) else { XCTFail("A restricted-overlap outcome must be structured")
                     return [:]
                 }
                 return try XCTUnwrap(value.objectValue)
             }
-            let limitedReply = try await limitedBind()
-            XCTAssertEqual(limitedReply["result"], .string("not_applied"))
-            XCTAssertEqual(items(limitedReply)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+            let limitedReply = try await limitedBind("over-limit")
+            if enabled {
+                XCTAssertEqual(limitedReply["result"], .string("applied"), "a legacy maxWorktrees never refuses full access")
+            } else {
+                XCTAssertEqual(limitedReply["result"], .string("not_applied"))
+                XCTAssertEqual(items(limitedReply)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+            }
             fixture.provenance.censusConflicts = [UUID(): []]
-            let unproven = try await limitedBind()
-            XCTAssertEqual(unproven["result"], .string("not_applied"))
-            let item = try XCTUnwrap(items(unproven)[target.uuidString])
-            XCTAssertEqual(item["subreason"], .string("usage_evidence_unavailable"))
-            XCTAssertEqual(item["retryable"], .bool(false))
-            XCTAssertNotNil(item["next_call"])
+            let unproven = try await limitedBind("over-limit-unproven")
+            if enabled {
+                XCTAssertEqual(unproven["result"], .string("applied"), "full access needs no delegated capacity census")
+                // The caller's own explicitly named restricted scope does not narrow full access either:
+                // the core admits it, and the handler's delegated maxWorktrees no longer applies.
+                let named = try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { !$0.grant.unrestricted })
+                guard case let .completed(namedBind) = try await door.perform(.init(
+                    operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
+                    scopeID: named.id, targetSessionIDs: [target], arguments: ["worktree": .string("over-limit-named")]
+                )) else { return XCTFail("A named restricted scope bind must complete under full access") }
+                XCTAssertEqual(namedBind.objectValue?["result"], .string("applied"))
+            } else {
+                XCTAssertEqual(unproven["result"], .string("not_applied"))
+                let item = try XCTUnwrap(items(unproven)[target.uuidString])
+                XCTAssertEqual(item["subreason"], .string("usage_evidence_unavailable"))
+                XCTAssertEqual(item["retryable"], .bool(false))
+                XCTAssertNotNil(item["next_call"])
+            }
         }
     }
 
@@ -2064,9 +2132,27 @@ final class SessionAdminStructureTests: XCTestCase {
     final class Provenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
         var censusConflicts: [UUID: Set<UUID>] = [:]
+        /// Identity resolution overrides (for example `.replicated` agreeing carriers); every read path
+        /// (point state, point snapshot, census) reports the same state.
+        var resolutionStates: [UUID: DelegationSessionResolutionState] = [:]
+
+        func resolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+            resolutionStates[sessionID] ?? (sessions[sessionID] == nil ? .absent : .indexOnly)
+        }
+
+        func pointSnapshot(for sessionIDs: Set<UUID>) -> DelegationProvenanceSnapshot {
+            .init(
+                records: sessions.filter { sessionIDs.contains($0.key) },
+                states: Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, resolutionState(for: $0)) })
+            )
+        }
 
         func censusSnapshot() -> DelegationProvenanceSnapshot {
-            .init(records: sessions, states: sessions.mapValues { _ in .indexOnly }, placementConflicts: censusConflicts)
+            .init(
+                records: sessions,
+                states: Dictionary(uniqueKeysWithValues: sessions.keys.map { ($0, resolutionState(for: $0)) }),
+                placementConflicts: censusConflicts
+            )
         }
 
         func add(
@@ -4213,6 +4299,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var otherWindowRunStates: [UUID: DomainDelegationScopeTargetState] = [:]
         /// Runs inside each per-session stash, at its suspension point before the commit-time check.
         var onStashSuspension: (@MainActor (UUID) -> Void)?
+        var beforeGroupOrderCommit: (@MainActor () async -> Void)?
 
         func add(
             _ id: UUID, workspace: UUID, name: String, pinned: Bool = false, pinnedOrder: Int? = nil,
@@ -4294,6 +4381,21 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 changed.insert(id)
             }
             return changed
+        }
+
+        func commitGroupOrderValues(
+            _ values: [UUID: Int?], workspaceID: UUID,
+            expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
+            isAuthorized: @escaping @MainActor (UUID) -> Bool
+        ) async -> AgentSessionGroupOrderWriteOutcome {
+            await beforeGroupOrderCommit?()
+            guard !Task.isCancelled, affectedSessionIDs.allSatisfy(isAuthorized) else {
+                return .init(failure: "scope_no_longer_current")
+            }
+            let entries = groupEntries(workspaceID: workspaceID) ?? []
+            guard Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }) == expected
+            else { return .init(failure: "group_state_changed") }
+            return .init(changed: setGroupOrderValues(values))
         }
 
         func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState {
@@ -4674,6 +4776,331 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(shared["result"], .string("groups_outside_scope"))
         XCTAssertFalse(String(describing: shared).contains(outsider.uuidString))
         XCTAssertEqual(fixture.organizer.states[outsider]?.sidebarGroupOrder, 1)
+    }
+
+    func testReplicatedMutationRefusalRequiresAuthorizedTargetBeforeDisclosingWriterConflict() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        let fixture = Fixture()
+        let member = fixture.member("Member")
+        let outsider = fixture.outsider("Private")
+        let unknown = UUID()
+        for id in [member, outsider, unknown] {
+            fixture.provenance.resolutionStates[id] = .replicated
+        }
+        let noGrant = try await fixture.call([
+            "op": .string("rename"), "session_id": .string(member.uuidString), "name": .string("Changed")
+        ])
+        XCTAssertNotEqual(noGrant["code"], .string("mutation_owner_unavailable"))
+        try fixture.grant([.observe, .organize])
+        for id in [outsider, unknown] {
+            do {
+                let refused = try await fixture.call([
+                    "op": .string("rename"), "session_id": .string(id.uuidString), "name": .string("Changed")
+                ])
+                XCTAssertNotEqual(refused["code"], .string("mutation_owner_unavailable"))
+            } catch {
+                XCTAssertFalse(String(describing: error).contains("mutation_owner_unavailable"))
+                XCTAssertFalse(String(describing: error).contains("Private"))
+            }
+        }
+        let refused = try await fixture.call([
+            "op": .string("rename"), "session_id": .string(member.uuidString), "name": .string("Changed")
+        ])
+        XCTAssertEqual(refused["code"], .string("mutation_owner_unavailable"))
+        XCTAssertEqual(refused["subreason"], .string("replicated_binding"))
+        XCTAssertEqual(refused["retryable"], .bool(false))
+        XCTAssertNil(refused["next_call"])
+        XCTAssertEqual(fixture.organizer.states[member]?.name, "Member")
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRechecksAuthorityAndCapturedOrderAfterCommitSuspension() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        for change in ["revoke", "rank"] {
+            let fixture = Fixture()
+            let a = fixture.member("A", group: "Alpha")
+            let b = fixture.member("B", group: "Beta")
+            fixture.organizer.states[a]?.sidebarGroupOrder = 0
+            fixture.organizer.states[b]?.sidebarGroupOrder = 1
+            let scope = try fixture.grant([.observe, .organize])
+            fixture.organizer.beforeGroupOrderCommit = {
+                await Task.yield()
+                if change == "revoke" { fixture.runtime.revoke(scopeID: scope.id) }
+                else { fixture.organizer.states[a]?.sidebarGroupOrder = 9 }
+            }
+            let reply = try await fixture.call([
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+                "order": .array([.string("Beta"), .string("Alpha")]),
+                "expected_order": .array([.string("Alpha"), .string("Beta")])
+            ])
+            XCTAssertEqual(reply["changed_count"], .int(0), change)
+            XCTAssertTrue(fixture.organizer.written.isEmpty, change)
+            XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 1, change)
+            XCTAssertNil(reply["undo_token"], change)
+            let reasons = reply["items"]?.arrayValue?.compactMap { $0.objectValue?["reason"]?.stringValue } ?? []
+            XCTAssertEqual(Set(reasons), [change == "revoke" ? "scope_no_longer_current" : "group_state_changed"])
+            if change == "rank" { XCTAssertNil(reply["next_call"], "A changed workspace is not repaired by requesting scope") }
+        }
+    }
+
+    func testReorderGroupsMissingOrderReturnsExecutableAuthorizedRecovery() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = nil
+        fixture.organizer.states[b]?.sidebarGroupOrder = nil
+        let scope = try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "idempotency_key": .string("incomplete")
+        ])
+        XCTAssertEqual(reply["result"], .string("order_required"))
+        XCTAssertEqual(reply["current_groups"], .array([.string("Alpha"), .string("Beta")]))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        let next = try XCTUnwrap(reply["next_call"]?.objectValue)
+        XCTAssertEqual(next["tool"], .string("session_admin"))
+        let arguments = try XCTUnwrap(next["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["scope_id"], .string(scope.id.uuidString))
+        XCTAssertEqual(arguments["expected_order"], reply["current_order"])
+        XCTAssertEqual(arguments["order"], reply["current_order"])
+        XCTAssertNotEqual(arguments["idempotency_key"], .string("incomplete"))
+        XCTAssertNil(arguments["targets"], "derived carriers must be rederived at submission")
+        XCTAssertNil(arguments["confirmation_id"])
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
+        XCTAssertEqual(unchanged["group_order"], reply["current_order"])
+        XCTAssertEqual(items(unchanged), [a.uuidString: "unchanged", b.uuidString: "unchanged"])
+        XCTAssertNil(unchanged["code"])
+        XCTAssertNil(unchanged["next_call"])
+        XCTAssertNil(unchanged["undo_token"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty, "an identity permutation must not materialize ranks")
+        XCTAssertNil(fixture.organizer.states[a]?.sidebarGroupOrder)
+        XCTAssertNil(fixture.organizer.states[b]?.sidebarGroupOrder)
+
+        let repeated = try await fixture.call(arguments)
+        XCTAssertEqual(repeated["result"], .string("applied"))
+        XCTAssertEqual(repeated["changed_count"], .int(0))
+        XCTAssertNil(repeated["idempotent_replay"], "A satisfied order must be revalidated while no changes were committed")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 1
+        fixture.organizer.states[b]?.sidebarGroupOrder = 0
+        let stale = try await fixture.call(arguments)
+        XCTAssertEqual(stale["result"], .string("order_conflict"))
+        XCTAssertNil(stale["state_satisfied"])
+        XCTAssertNil(stale["idempotent_replay"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 1)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+    }
+
+    func testSatisfiedGroupOrderDoesNotHideUnloadedRequestedTarget() async throws {
+        let fixture = Fixture()
+        let member = fixture.member("Member", group: "Alpha")
+        let unloaded = UUID()
+        fixture.inventory.historyOnly = [DomainAgentSessionInventoryRecord(
+            sessionID: unloaded, name: "Unloaded", workspaceID: fixture.workspace, isLoaded: false,
+            parentSessionID: fixture.overseer, lastActivityAt: fixture.now
+        )]
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "targets": ids([member, unloaded]),
+            "order": .array([.string("Alpha")]), "expected_order": .array([.string("Alpha")])
+        ])
+        XCTAssertEqual(reply["result"], .string("not_applied"))
+        XCTAssertEqual(reply["changed_count"], .int(0))
+        XCTAssertEqual(items(reply), [member.uuidString: "unchanged", unloaded.uuidString: "skipped"])
+        XCTAssertEqual(reply["code"], .string("workspace_not_loaded"))
+        XCTAssertNil(reply["state_satisfied"])
+        XCTAssertNil(reply["undo_token"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsMissingExpectedOrderUsesRelativeOrderAndStillChecksCAS() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let x = fixture.outsider("X")
+        fixture.organizer.states[x]?.sidebarGroup = "Other"
+        fixture.organizer.states[x]?.sidebarGroupOrder = 1
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroupOrder = 2
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Beta"), .string("Alpha")])
+        ])
+        XCTAssertEqual(reply["current_order"], .array([.string("Alpha"), .string("Beta")]))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        let applied = try await fixture.call(arguments)
+        XCTAssertEqual(applied["result"], .string("applied"))
+        XCTAssertEqual(applied["group_order"], .array([.string("Beta"), .string("Alpha")]))
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+        fixture.organizer.written.removeAll()
+        var staleArguments = arguments
+        staleArguments["idempotency_key"] = .string("fresh-stale-expectation")
+        let stale = try await fixture.call(staleArguments)
+        XCTAssertEqual(stale["result"], .string("order_conflict"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertNil(stale["undo_token"])
+    }
+
+    func testReorderGroupsRecoveryWithExplicitTargetAndMalformedArguments() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        try fixture.grant()
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "session_id": .string(a.uuidString)
+        ]
+        let reply = try await fixture.call(input)
+        var arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["session_id"], input["session_id"])
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
+        for malformed: Value in [.null, .string("Alpha"), .array([.int(1)])] {
+            arguments = input
+            arguments["expected_order"] = malformed
+            do {
+                _ = try await fixture.call(arguments)
+                XCTFail("A malformed expectation must not become recovery")
+            } catch {
+                XCTAssertTrue(fixture.organizer.written.isEmpty)
+            }
+        }
+        arguments = input
+        arguments["order"] = .array([.string("Alpha"), .string("Alpha")])
+        let invalid = try await fixture.call(arguments)
+        XCTAssertEqual(invalid["result"], .string("invalid_order"))
+        XCTAssertEqual(invalid["subreason"], .string("order_set_mismatch"))
+    }
+
+    func testReorderGroupsRecoveryDoesNotDiscloseOutsideScopeGroups() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let outsider = fixture.outsider("X")
+        fixture.organizer.states[outsider]?.sidebarGroup = "Private"
+        try fixture.grant()
+        for explicit in [false, true] {
+            var input: [String: Value] = [
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+                "preview": .bool(true)
+            ]
+            if explicit { input["session_id"] = .string(a.uuidString) }
+            let reply = try await fixture.call(input)
+            XCTAssertNil(reply["current_groups"])
+            XCTAssertFalse(String(describing: reply).contains("Private"))
+            XCTAssertFalse(String(describing: reply).contains(outsider.uuidString))
+        }
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRecoveryRequiresObserveForDiscovery() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        try fixture.grant([.organize])
+        for explicit in [false, true] {
+            var arguments: [String: Value] = [
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString)
+            ]
+            if explicit { arguments["session_id"] = .string(a.uuidString) }
+            let denied = try await fixture.call(arguments)
+            XCTAssertEqual(denied["result"], .string("denied"))
+            XCTAssertEqual(denied["capability"], .string("observe"))
+            XCTAssertNil(denied["current_groups"])
+            XCTAssertFalse(String(describing: denied).contains("Alpha"))
+        }
+        let denied = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Unknown")]), "expected_order": .array([.string("Unknown")])
+        ])
+        XCTAssertEqual(denied["result"], .string("denied"))
+        XCTAssertEqual(denied["capability"], .string("observe"))
+        XCTAssertNil(denied["current_groups"])
+        XCTAssertFalse(String(describing: denied).contains("Alpha"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsEmptyRecoveryValidatesExpectations() async throws {
+        let fixture = Fixture()
+        try fixture.grant()
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString)
+        ]
+        let reply = try await fixture.call(input)
+        XCTAssertEqual(reply["result"], .string("order_required"))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        let empty = try await fixture.call(arguments)
+        XCTAssertEqual(empty["result"], .string("no_matching_sessions"))
+        for explicitOrder in [false, true] {
+            for malformed: Value in [.null, .string("Alpha"), .array([.int(1)])] {
+                var invalid = input
+                if explicitOrder { invalid["order"] = .array([]) }
+                invalid["expected_order"] = malformed
+                do {
+                    _ = try await fixture.call(invalid)
+                    XCTFail("Empty selection must not bypass argument validation")
+                } catch {
+                    XCTAssertTrue(fixture.organizer.written.isEmpty)
+                }
+            }
+            var mismatch = input
+            if explicitOrder { mismatch["order"] = .array([]) }
+            mismatch["expected_order"] = .array([.string("Gone")])
+            let invalid = try await fixture.call(mismatch)
+            XCTAssertEqual(invalid["result"], .string("invalid_order"))
+            XCTAssertEqual(invalid["subreason"], .string("order_set_mismatch"))
+        }
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRecoveryPreservesPreviewAndRequiresApproval() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroupOrder = 1
+        try fixture.grant(threshold: 1)
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Beta"), .string("Alpha")]), "preview": .bool(true)
+        ]
+        let preview = try await fixture.call(input)
+        var arguments = try XCTUnwrap(preview["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["preview"], .bool(true))
+        _ = try await fixture.call(arguments)
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        arguments.removeValue(forKey: "preview")
+        let pending = try await fixture.call(arguments)
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+    }
+
+    func testReorderGroupsUnknownNamesOfferAuthorizedCurrentOrderRecovery() async throws {
+        let fixture = Fixture()
+        fixture.member("A", group: "Alpha")
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Unknown")]), "expected_order": .array([.string("Unknown")])
+        ])
+        XCTAssertEqual(reply["result"], .string("groups_not_found"))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["order"], .array([.string("Alpha")]))
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
     }
 
     func testReorderGroupsUndoPreservesLaterGroupAssignmentAtSameRank() async throws {
@@ -9458,5 +9885,578 @@ final class SessionAdminInFlightIdempotencyTests: XCTestCase {
         XCTAssertNotEqual(retry["result"], .string("in_progress"))
         XCTAssertNotEqual(retry["idempotent_replay"], .bool(true))
         XCTAssertEqual(fixture.base.worktrees.created, [fixture.target])
+    }
+}
+
+/// `OverseerAuthorizationEngine` is the single owner of full access versus restricted delegation.
+/// These tests pin the gate inventory and prove the front doors consuming the engine agree in both modes.
+@MainActor
+final class OverseerAuthorizationEngineTests: XCTestCase {
+    private func runtime(fullAccess: Bool) -> DelegationScopeRuntime {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        runtime.isGlobalAutoApproveEnabled = { fullAccess }
+        return runtime
+    }
+
+    private static let expectedPermissionGates: Set<OverseerAuthorizationGate> = [
+        .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
+        .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
+        .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing, .creatorLaneQuota,
+        .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired, .observerMustBeCaller,
+        .linkCapabilityCeiling
+    ]
+
+    /// Each permission gate is pinned to effect-level ON/OFF regressions (`Class.testMethod`).
+    private static let permissionGateScenarios: [OverseerAuthorizationGate: [String]] = [
+        .scopeCoverage: ["OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope"],
+        .scopeCapability: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
+        .allSessionsCapabilityCeiling: ["OverseerAuthorizationEngineTests.testScopeRequestValidationAndGlobalGrantFollowThePolicy"],
+        .scopeMembership: [
+            "OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope",
+            "OverseerAuthorizationEngineTests.testFullAccessAdoptsThroughTheHandlerWithoutAScope"
+        ],
+        .confirmationRequirement: [
+            "OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity",
+            "OverseerAuthorizationEngineTests.testApprovedCardSurvivesALaterRestrictedDenialUnderFullAccessAndIsClaimedOnce"
+        ],
+        .sessionQuota: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
+        .worktreeQuota: ["SessionAdminStructureTests.testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation"],
+        .creatorPlacementForAccounting: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
+        .scopeAnchorMoveRestriction: [
+            "OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit",
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure"
+        ],
+        .otherScopeMembershipMove: [
+            "OverseerAuthorizationEngineTests.testFullAccessSkipsScopeMoveAccountingButKeepsLaneStructureChecks",
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure"
+        ],
+        .restrictedScopeNarrowing: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
+        .directChildOrCreatorOwnership: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
+        .humanOnlyForAgent: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
+        .linkRequired: [
+            "AgentSessionLinkToolServiceTests.testFullAccessEstablishesAMissingLinkAndTurningItOffRevokesIt",
+            "AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"
+        ],
+        .observerMustBeCaller: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"],
+        .linkCapabilityCeiling: [
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction",
+            "AgentSessionLinkToolServiceTests.testFullAccessElevatesAWatchOnlyLinkWithoutUpgradingItAndOffRevokesAtTheNextFence"
+        ],
+        .creatorLaneQuota: ["OverseerAuthorizationEngineTests.testFullAccessWaivesTheCreatorLaneQuota"]
+    ]
+
+    /// The gate inventory is total and pinned: adding a gate, or reclassifying one, must update this
+    /// contract, its effect-level scenario, and the guardrail manifest together.
+    func testGateInventoryIsPinnedAndEveryPermissionGateHasAnEffectLevelScenario() {
+        let permission = Set(OverseerAuthorizationGate.allCases.filter { $0.classification == .permission })
+        XCTAssertEqual(permission, Self.expectedPermissionGates)
+        XCTAssertEqual(Set(Self.permissionGateScenarios.keys), permission)
+        for (gate, scenarios) in Self.permissionGateScenarios {
+            for scenario in scenarios {
+                let parts = scenario.split(separator: ".").map(String.init)
+                let testClass: AnyClass? = NSClassFromString("RepoPromptTests.\(parts[0])")
+                let selectors = [parts[1], parts[1] + "AndReturnError:", parts[1] + "WithCompletionHandler:"]
+                XCTAssertTrue(
+                    selectors.contains { testClass?.instancesRespond(to: NSSelectorFromString($0)) ?? false },
+                    "\(gate.rawValue): scenario \(scenario) does not exist"
+                )
+            }
+        }
+    }
+
+    func testEngineWaivesExactlyThePermissionGatesAndOnlyUnderFullAccess() {
+        for fullAccess in [false, true] {
+            // The engine holds its runtime weakly; keep the runtime alive for the assertions.
+            let scopes = runtime(fullAccess: fullAccess)
+            let engine = scopes.authorization
+            for gate in OverseerAuthorizationGate.allCases {
+                XCTAssertEqual(
+                    engine.waives(gate), fullAccess && gate.classification == .permission,
+                    "\(gate.rawValue) fullAccess=\(fullAccess)"
+                )
+            }
+        }
+    }
+
+    func testModeComesFromTheRuntimeSettingInputOnly() {
+        let on = runtime(fullAccess: true), off = runtime(fullAccess: false)
+        XCTAssertTrue(on.authorization.waives(.scopeCoverage))
+        XCTAssertFalse(off.authorization.waives(.scopeCoverage))
+
+        // A recorded unrestricted grant is not authority: once the setting is off, the engine is
+        // restricted and reconciliation revokes the grant.
+        let flag = Flag()
+        flag.value = true
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        scopes.isGlobalAutoApproveEnabled = { flag.value }
+        let grantee = UUID()
+        XCTAssertNotNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
+        flag.value = false
+        XCTAssertFalse(scopes.authorization.waives(.scopeCoverage))
+        XCTAssertTrue(scopes.allLiveScopes().contains { $0.grant.unrestricted }, "precondition: the stale grant is still recorded")
+        scopes.reconcileGlobalAutoApprove()
+        XCTAssertFalse(scopes.allLiveScopes().contains { $0.grant.unrestricted })
+        XCTAssertNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
+    }
+
+    func testTargetOwnershipWaiverKeepsIdentityRulesInBothModes() {
+        let caller = UUID(), other = UUID()
+        let fullScopes = runtime(fullAccess: true), restrictedScopes = runtime(fullAccess: false)
+        let full = fullScopes.authorization
+        let restricted = restrictedScopes.authorization
+        for gate in [OverseerAuthorizationGate.directChildOrCreatorOwnership, .humanOnlyForAgent] {
+            XCTAssertTrue(full.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: other))
+            XCTAssertFalse(full.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: caller), "self-targeting keeps its own rule")
+            XCTAssertFalse(full.waivesTargetOwnership(gate, caller: .unresolvedAgentRun, targetSessionID: other), "unresolved routing never becomes a caller")
+            XCTAssertFalse(
+                full.waivesTargetOwnership(gate, caller: .administrativePrincipal, targetSessionID: other),
+                "administrative callers keep their own authority path"
+            )
+            XCTAssertFalse(restricted.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: other))
+        }
+    }
+
+    func testFullAccessCoversAdministrationWithoutAnyScope() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), outsider = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(outsider, parent: nil)
+            flag.value = fullAccess
+            // `scopeCoverage`: no scope at all.
+            switch fixture.core.authorize(.init(operation: .adminRename, caller: .agentSession(overseer), targetSessionIDs: [member])) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode needs a covering scope")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied(.unknownScope, _):
+                XCTAssertFalse(fullAccess, "full access needs no scope request")
+            default:
+                XCTFail("unexpected coverage outcome, fullAccess=\(fullAccess)")
+            }
+            // `scopeMembership`: a named restricted scope that does not contain the target.
+            flag.value = false
+            let restricted = try fixture.grant(overseer, [.observe, .organize])
+            flag.value = fullAccess
+            switch fixture.core.authorize(.init(
+                operation: .adminRename, caller: .agentSession(overseer), scopeID: restricted.id, targetSessionIDs: [outsider]
+            )) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode never reaches a non-member")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied:
+                XCTAssertFalse(fullAccess, "a named scope's membership never narrows full access")
+            default:
+                XCTFail("unexpected membership outcome, fullAccess=\(fullAccess)")
+            }
+        }
+    }
+
+    func testFullAccessWaivesTheCreatorLaneQuota() {
+        let maximum = AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        for fullAccess in [false, true] {
+            let scopes = runtime(fullAccess: fullAccess)
+            XCTAssertTrue(scopes.authorization.admitsAdditionalLane(admittedLaneCount: maximum - 1))
+            XCTAssertEqual(scopes.authorization.admitsAdditionalLane(admittedLaneCount: maximum), fullAccess)
+        }
+    }
+
+    /// Implicit full access adopts through the real handler: the full-access grant contains every
+    /// session, so "already a member" must not refuse, and the stamp stays placement-consistent.
+    func testFullAccessAdoptsThroughTheHandlerWithoutAScope() async throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), outsider = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(outsider, parent: nil)
+            flag.value = fullAccess
+            let outcome = try await fixture.perform(
+                .adminAdopt, caller: overseer, targets: [outsider],
+                args: ["parent_session_id": .string(member.uuidString)], key: "adopt-\(fullAccess)"
+            )
+            if fullAccess {
+                guard case .completed = outcome else { return XCTFail("full access adopts: \(outcome)") }
+                let placement = try XCTUnwrap(fixture.structure.placements.last)
+                XCTAssertEqual(placement.session, outsider)
+                XCTAssertEqual(placement.parent, member)
+                let stamp = try XCTUnwrap(placement.scope.flatMap { fixture.runtime.record(id: $0) })
+                XCTAssertTrue(stamp.grant.unrestricted, "the stamp is the full-access grant, which contains every session")
+            } else {
+                guard case .denied(.unknownScope, _) = outcome else { return XCTFail("restricted mode needs a covering scope") }
+                XCTAssertTrue(fixture.structure.placements.isEmpty)
+            }
+        }
+    }
+
+    func testFullAccessWaivesPlacementPermissionRefusalsButKeepsStructure() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), other = UUID(), otherMember = UUID(), outside = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(other, parent: nil)
+            fixture.provenance.add(otherMember, parent: other)
+            fixture.provenance.add(outside, parent: nil)
+            let mine = try fixture.grant(overseer)
+            try fixture.grant(other)
+            flag.value = fullAccess
+            let engine = fixture.runtime.authorization
+            let roots = fixture.runtime.liveTreeScopeRoots()
+            let chain = Set(fixture.runtime.scopeChain(from: mine.id).map(\.id))
+            func ancestry(_ id: UUID) -> DomainDelegationOrganizationalAncestry? {
+                fixture.projector.organizationalAncestry(of: id)
+            }
+            // `otherScopeMembershipMove`: moving another overseer's member changes its scope.
+            XCTAssertEqual(engine.reparentPlacementDenial(
+                source: otherMember, destination: member, sourceAncestry: ancestry(otherMember),
+                destinationAncestry: ancestry(member), liveTreeScopes: roots, callerScopeChain: chain
+            ), fullAccess ? nil : .affectsOtherScopes(count: 1))
+            // `organizationalStructure`: a cycle is refused in both modes.
+            XCTAssertEqual(engine.reparentPlacementDenial(
+                source: overseer, destination: member, sourceAncestry: ancestry(overseer),
+                destinationAncestry: ancestry(member), liveTreeScopes: roots, callerScopeChain: chain
+            ), .cycle)
+            // `scopeAnchorMoveRestriction`: adopting another scope's anchor; full access still refuses
+            // the structural cycle the domain rule would only have reached after the anchor check.
+            let anchors = fixture.runtime.liveScopeAnchors()
+            XCTAssertEqual(engine.adoptPlacementDenial(
+                adoptee: other, destination: member, adopteeAncestry: ancestry(other), destinationAncestry: ancestry(member),
+                adopteeSubtree: [other, otherMember], scopeAnchors: anchors, liveTreeScopes: roots, callerScope: mine.grant
+            ), fullAccess ? nil : .adopteeAnchorsScope)
+            XCTAssertEqual(engine.adoptPlacementDenial(
+                adoptee: other, destination: otherMember, adopteeAncestry: ancestry(other), destinationAncestry: ancestry(otherMember),
+                adopteeSubtree: [other, otherMember], scopeAnchors: anchors, liveTreeScopes: roots, callerScope: mine.grant
+            ), fullAccess ? .cycle : .adopteeAnchorsScope)
+            // Adoption stamps a scope consistent with placement; full access chooses its own grant
+            // for a destination outside the admitted scope instead of refusing.
+            XCTAssertEqual(
+                engine.adoptionStampScope(admitted: mine, callerSessionID: overseer, destination: member, projector: fixture.projector)?.id,
+                mine.id
+            )
+            let outsideStamp = engine.adoptionStampScope(
+                admitted: mine, callerSessionID: overseer, destination: outside, projector: fixture.projector
+            )
+            XCTAssertEqual(outsideStamp?.grant.unrestricted, fullAccess ? true : nil)
+        }
+    }
+
+    func testFullAccessWaivesScopeLinkCeilingAndObserverRestriction() async throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), target = UUID(), sibling = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(target, parent: overseer)
+            fixture.provenance.add(sibling, parent: overseer)
+            let watchOnly = try fixture.grant(overseer, [.observe, .restructure])
+            let manage = try fixture.grant(overseer)
+            flag.value = fullAccess
+            func link(_ scope: UUID, observer: UUID? = nil) async throws -> [String: Value] {
+                var args: [String: Value] = [:]
+                if let observer { args["observer_session_id"] = .string(observer.uuidString) }
+                switch try await fixture.core.perform(.init(
+                    operation: .adminLink, caller: .agentSession(overseer), callerTabID: UUID(), scopeID: scope,
+                    targetSessionIDs: [target], arguments: args
+                )) {
+                case let .completed(value):
+                    return try XCTUnwrap(value.objectValue)
+                case let .denied(denial, sessionID):
+                    return try XCTUnwrap(SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID).objectValue)
+                default:
+                    XCTFail("unexpected link outcome")
+                    return [:]
+                }
+            }
+            // `linkCapabilityCeiling`: the named scope lacks `control`, so a managed link exceeds it.
+            let ceiling = try await link(watchOnly.id)
+            if fullAccess {
+                XCTAssertTrue(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: overseer, target: target)), "\(ceiling)")
+            } else {
+                XCTAssertEqual(ceiling["code"], .string("scope_capability_missing"))
+                XCTAssertTrue(fixture.structure.added.isEmpty)
+            }
+            // `observerMustBeCaller`: a link observed by another member.
+            let delegated = try await link(manage.id, observer: sibling)
+            if fullAccess {
+                XCTAssertTrue(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: sibling, target: target)), "\(delegated)")
+            } else {
+                XCTAssertEqual(delegated["code"], .string("observer_must_be_caller"))
+                XCTAssertFalse(fixture.structure.added.contains(SessionAdminStructureTests.Pair(observer: sibling, target: target)))
+            }
+        }
+    }
+
+    @MainActor
+    private final class RecordingRetire: AgentSessionAdministrationOperationHandler {
+        let operations: Set<DomainAgentSessionTargetOperation> = [.adminRetire]
+        var performed: [[UUID]] = []
+
+        func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
+            performed.append(batch.admittedSessionIDs)
+            return .object(["result": .string("applied"), "changed_count": .int(batch.admittedSessionIDs.count)])
+        }
+    }
+
+    /// The approved-card-then-later-denial gap: a card the user approved for a named restricted scope
+    /// stays valid when that scope later stops admitting the request (here the target started running
+    /// and the scope lacks `control`). Full access re-authorizes, validates the card on its own against
+    /// the scope it was issued for, carries it, and `perform` claims it exactly once.
+    func testApprovedCardSurvivesALaterRestrictedDenialUnderFullAccessAndIsClaimedOnce() async throws {
+        let flag = Flag()
+        let fixture = structureFixture(flag)
+        let overseer = UUID(), target = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(target, parent: overseer)
+        let restricted = try fixture.grant(overseer, [.observe, .organize, .restructure])
+        let recorder = RecordingRetire()
+        let core = AgentSessionAdministrationCore(scopes: fixture.runtime, projector: fixture.projector, handlers: [recorder])
+        let tab = UUID()
+        func request(_ confirmation: UUID? = nil, key: String = "retire-1") -> AgentSessionAdministrationRequest {
+            .init(
+                operation: .adminRetire, caller: .agentSession(overseer), callerTabID: tab, scopeID: restricted.id,
+                targetSessionIDs: [target], idempotencyKey: key, confirmationID: confirmation
+            )
+        }
+        guard case let .pendingConfirmation(card, _) = try await core.perform(request()) else {
+            return XCTFail("restricted retire raises a card")
+        }
+        XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+        fixture.provenance.add(target, parent: overseer, state: .running)
+        flag.value = true
+
+        if case .completed = try await core.perform(request(card.id, key: "another-request")) {
+            XCTFail("a card bound to another request is input and is never carried")
+        }
+        XCTAssertTrue(recorder.performed.isEmpty)
+
+        guard case .completed = try await core.perform(request(card.id)) else {
+            return XCTFail("full access applies the approved request despite the later restricted denial")
+        }
+        XCTAssertEqual(recorder.performed, [[target]])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmation(id: card.id, granteeSessionID: overseer)?.state, .consumed)
+
+        if case .completed = try await core.perform(request(card.id)) {
+            XCTFail("an applied card authorizes one application")
+        }
+        XCTAssertEqual(recorder.performed.count, 1)
+    }
+
+    func testScopeRequestValidationAndGlobalGrantFollowThePolicy() {
+        for fullAccess in [false, true] {
+            let scopes = runtime(fullAccess: fullAccess)
+            let requester = UUID()
+            // An all-sessions scope cannot hold spawn unless the request will be answered by the
+            // unrestricted full-access grant.
+            let result = scopes.requestScope(
+                requesterSessionID: requester, requesterTabID: nil, kind: .allSessions,
+                capabilities: [.observe, .spawn], guardrails: .init(), reason: nil, idempotencyKey: nil
+            )
+            switch result {
+            case .success:
+                XCTAssertTrue(fullAccess, "restricted mode keeps the all-sessions capability limit")
+            case .failure:
+                XCTAssertFalse(fullAccess, "full access never refuses a capability for its kind")
+            }
+            XCTAssertEqual(scopes.ensureGlobalAutoApproveScope(for: requester) != nil, fullAccess)
+        }
+    }
+
+    // MARK: - Front doors agree in both modes
+
+    private final class Flag {
+        var value = false
+    }
+
+    /// Legacy restricted scopes are minted while full access is off (when on, every request is answered
+    /// by the unrestricted grant), then the setting flips, so restricted and full-access grants coexist.
+    private func structureFixture(_ flag: Flag) -> SessionAdminStructureTests.Fixture {
+        let fixture = SessionAdminStructureTests.Fixture()
+        fixture.runtime.isGlobalAutoApproveEnabled = { flag.value }
+        return fixture
+    }
+
+    /// The live failure: full access ON, a creator whose agreeing duplicate carriers make it
+    /// `.replicated`, and a legacy restricted scope (here already over its limit) next to the
+    /// unrestricted grant. Full access admits; restricted mode keeps every refusal.
+    func testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let creator = UUID(), member = UUID(), unplaced = UUID(), anchor = UUID()
+            fixture.provenance.add(creator, parent: nil)
+            fixture.provenance.add(member, parent: creator)
+            fixture.provenance.add(unplaced, parent: nil)
+            fixture.provenance.add(anchor, parent: nil)
+            let legacy = try fixture.grant(creator, [.observe, .spawn], guardrails: .init(maxLiveSessions: 1))
+            try fixture.grant(anchor, [.observe])
+            flag.value = fullAccess
+            if fullAccess {
+                XCTAssertNotNil(fixture.runtime.ensureGlobalAutoApproveScope(for: creator), "mixed restricted + unrestricted grants")
+            }
+            let emptyUsage = DomainDelegationScopeUsage(scopeID: legacy.id, liveSessionCount: 0, worktreeCount: 0)
+
+            fixture.provenance.resolutionStates[creator] = .replicated
+            for target in [DelegationSpawnTarget.newSession, .unplacedSession(unplaced)] {
+                XCTAssertEqual(
+                    fixture.admit(creator, target: target),
+                    fullAccess ? .unscoped : .creatorPlacementUnresolved("creator_replicated"),
+                    "\(target) fullAccess=\(fullAccess)"
+                )
+            }
+
+            fixture.provenance.resolutionStates[creator] = nil
+            XCTAssertEqual(
+                fixture.admit(creator, target: .unplacedSession(anchor)),
+                fullAccess ? .unscoped : .targetAnchorsScope,
+                "grafting a session that anchors another live scope is delegated accounting"
+            )
+            let admitted = fixture.admit(creator)
+            if fullAccess {
+                XCTAssertEqual(admitted, .unscoped, "a legacy quota never narrows full access")
+            } else if case .denied(.guardrailExceeded) = admitted {
+                // Restricted mode keeps the legacy limit.
+            } else {
+                XCTFail("restricted mode must keep the legacy limit, got \(admitted)")
+            }
+            // `session_admin fork` / `worktree_create` share the same accounting decision.
+            XCTAssertEqual(
+                try DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: fixture.runtime, projector: fixture.projector).isEmpty,
+                fullAccess
+            )
+            XCTAssertEqual(fixture.runtime.usageIncludingReservations(emptyUsage), emptyUsage, "refusals and full-access admissions reserve nothing")
+        }
+    }
+
+    func testFullAccessSkipsScopeMoveAccountingButKeepsLaneStructureChecks() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let otherOverseer = UUID(), lane = UUID(), laneChild = UUID(), creator = UUID()
+            fixture.provenance.add(otherOverseer, parent: nil)
+            fixture.provenance.add(lane, parent: nil, laneCreator: otherOverseer)
+            fixture.provenance.add(laneChild, parent: lane)
+            fixture.provenance.add(creator, parent: nil)
+            try fixture.grant(otherOverseer)
+            flag.value = fullAccess
+
+            XCTAssertEqual(
+                fixture.admit(creator, target: .otherCreatorsLane(lane)),
+                fullAccess ? .unscoped : .targetMovesBetweenScopes(count: 1),
+                "moving another overseer's lane between scopes is delegated accounting"
+            )
+            XCTAssertEqual(
+                fixture.admit(laneChild, target: .otherCreatorsLane(lane)), .targetUnresolved,
+                "a lane is never re-parented under its own descendant"
+            )
+            fixture.provenance.resolutionStates[creator] = .ambiguous
+            XCTAssertEqual(
+                fixture.admit(creator, target: .otherCreatorsLane(lane)), .targetUnresolved,
+                "conflicting actual identity in the destination ancestry stays structural"
+            )
+        }
+    }
+
+    func testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), sibling = UUID(), stranger = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(sibling, parent: overseer)
+            fixture.provenance.add(stranger, parent: nil)
+            let observeOnly = try fixture.grant(overseer, [.observe])
+            let carded = try fixture.grant(overseer, [.observe, .organize], guardrails: .init(bulkConfirmationThreshold: 1))
+            let organizer = try fixture.grant(overseer, [.observe, .organize])
+            let quota = try fixture.grant(overseer, [.observe, .spawn], guardrails: .init(maxLiveSessions: 1))
+            let foreign = try fixture.grant(stranger, [.observe, .organize])
+            let stale = try fixture.grant(overseer, [.observe, .organize])
+            fixture.runtime.revoke(scopeID: stale.id)
+            flag.value = fullAccess
+
+            func authorize(_ operation: DomainAgentSessionTargetOperation, scope: UUID) -> AgentSessionAdministrationAuthorization {
+                fixture.core.authorize(.init(
+                    operation: operation, caller: .agentSession(overseer), scopeID: scope, targetSessionIDs: [member]
+                ))
+            }
+
+            switch authorize(.adminRename, scope: observeOnly.id) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode keeps the named scope's capability limit")
+                XCTAssertTrue(batch.scope.grant.unrestricted, "authority moves to the full-access grant")
+            case .denied(.capabilityMissing(.organize), _):
+                XCTAssertFalse(fullAccess, "full access is never narrowed by a named restricted scope")
+            default:
+                XCTFail("unexpected capability outcome, fullAccess=\(fullAccess)")
+            }
+
+            switch authorize(.adminFork, scope: quota.id) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode keeps the named scope's quota")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied(.guardrailExceeded, _):
+                XCTAssertFalse(fullAccess, "a named scope's quota never refuses full access")
+            default:
+                XCTFail("unexpected quota outcome, fullAccess=\(fullAccess)")
+            }
+
+            guard case let .authorized(kept) = authorize(.adminRename, scope: organizer.id) else {
+                return XCTFail("a named scope that admits the request authorizes it")
+            }
+            XCTAssertEqual(kept.scope.id, organizer.id, "a fully admitting named scope keeps its placement data")
+
+            // The named scope's batch card is a delegated restriction; full access never raises it.
+            switch fixture.core.authorize(.init(
+                operation: .adminRename, caller: .agentSession(overseer), scopeID: carded.id, targetSessionIDs: [member, sibling]
+            )) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode keeps the named scope's card")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+                XCTAssertNil(batch.confirmation)
+            case .confirmationRequired:
+                XCTAssertFalse(fullAccess, "full access never requires a card")
+            default:
+                XCTFail("unexpected card outcome, fullAccess=\(fullAccess)")
+            }
+            // A presented card that does not exist is an input error in both modes, never retried.
+            guard case .denied(.confirmationMismatch, _) = fixture.core.authorize(.init(
+                operation: .adminRename, caller: .agentSession(overseer), scopeID: organizer.id,
+                targetSessionIDs: [member], confirmationID: UUID()
+            )) else {
+                return XCTFail("an unknown confirmation_id stays a mismatch, fullAccess=\(fullAccess)")
+            }
+
+            // Input validity and identity are never retried as permission.
+            guard case .denied(.unknownScope, _) = authorize(.adminRename, scope: UUID()) else {
+                return XCTFail("an unknown scope_id stays unknown")
+            }
+            guard case .denied(.granteeMismatch, _) = authorize(.adminRename, scope: foreign.id) else {
+                return XCTFail("another session's scope never becomes the caller's authority")
+            }
+            // The caller's own revoked scope is input that full access does not need: it authorizes with
+            // the full-access grant (valid placement). Restricted mode refuses the stale scope.
+            switch authorize(.adminRename, scope: stale.id) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode refuses a revoked scope_id")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied:
+                XCTAssertFalse(fullAccess, "full access is not narrowed by the caller's own stale scope")
+            default:
+                XCTFail("unexpected stale-scope outcome, fullAccess=\(fullAccess)")
+            }
+
+            // Canonical write ownership holds on both authorization passes.
+            fixture.provenance.resolutionStates[member] = .replicated
+            guard case let .denied(denial, refused) = authorize(.adminRename, scope: observeOnly.id),
+                  denial == (fullAccess ? .mutationOwnerUnavailable : .capabilityMissing(.organize))
+            else {
+                return XCTFail("a replicated mutation target stays refused, fullAccess=\(fullAccess)")
+            }
+            XCTAssertEqual(refused, member)
+        }
     }
 }

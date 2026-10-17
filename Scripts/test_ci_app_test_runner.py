@@ -22,6 +22,52 @@ import ci_app_test_runner as runner  # noqa: E402
 import modularization_ci_artifact as artifact  # noqa: E402
 import swift_imports  # noqa: E402
 
+_REAL_INHERITED_STORAGE_READER = runner.read_inherited_storage_preference
+
+
+def setUpModule() -> None:
+    # Pure self-tests never read the machine's real defaults; the reader has dedicated fakes below.
+    runner.read_inherited_storage_preference = lambda *args, **kwargs: None
+
+
+def tearDownModule() -> None:
+    runner.read_inherited_storage_preference = _REAL_INHERITED_STORAGE_READER
+
+
+class InheritedStoragePreferenceTests(unittest.TestCase):
+    """The pre-run storage preference is read, never written, and handed to the test process."""
+
+    @staticmethod
+    def fake_defaults(returncode: int, stdout: str):
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
+        return run, calls
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS defaults only")
+    def test_reader_only_reads_the_preference(self) -> None:
+        run, calls = self.fake_defaults(0, "/var/folders/x/T/old-run/Workspaces\n")
+        self.assertEqual(_REAL_INHERITED_STORAGE_READER(run=run), "/var/folders/x/T/old-run/Workspaces")
+        self.assertEqual([call[1] for call in calls], ["read"], "never writes or deletes defaults")
+        run, _ = self.fake_defaults(1, "")
+        self.assertIsNone(_REAL_INHERITED_STORAGE_READER(run=run))
+
+    def test_suite_environment_hands_the_inherited_value_to_the_test_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: "/var/folders/x/T/old-run/Workspaces",
+            )
+            self.assertEqual(environment[runner.INHERITED_STORAGE_PREFERENCE_ENV], "/var/folders/x/T/old-run/Workspaces")
+            cleared = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: None,
+            )
+            self.assertNotIn(runner.INHERITED_STORAGE_PREFERENCE_ENV, cleared)
+
 
 class InterpreterCompatibilityTests(unittest.TestCase):
     def test_script_help_runs_with_current_interpreter(self) -> None:

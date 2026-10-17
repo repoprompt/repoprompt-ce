@@ -51,8 +51,8 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         displayName: String? = "Target",
         visibleRowCount: Int = 3,
         board: DomainAgentSessionLaneBoard = .empty,
-        /// `nil` derives the ordinary case. Pass `false` for the state that motivates `until: sendable`:
-        /// status-idle with no interaction, but still committing, queued, or preparing.
+        // `nil` derives the ordinary case. Pass `false` for the state that motivates `until: sendable`:
+        // status-idle with no interaction, but still committing, queued, or preparing.
         idleForSend: Bool? = nil
     ) -> DomainAgentSessionObservationSnapshot {
         DomainAgentSessionObservationSnapshot(
@@ -75,9 +75,13 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
         sourcePublicationSequence: UInt64 = 1,
-        status: DomainAgentSessionLinkStatus = .idle
+        status: DomainAgentSessionLinkStatus = .idle,
+        capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.managed,
+        sourceScopeID: UUID? = nil
     ) async throws -> DomainAgentSessionLinkGrant {
-        let reservation = await authority.reserveLink(observer: observer, target: target)
+        let reservation = await authority.reserveLink(
+            observer: observer, target: target, capabilities: capabilities, sourceScopeID: sourceScopeID
+        )
         guard case let .reserved(pending, _) = reservation else {
             XCTFail("Expected reservation, got \(reservation)")
             throw FixtureError.reservationFailed
@@ -92,6 +96,18 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             throw FixtureError.activationFailed
         }
         return activated.grant
+    }
+
+    private func pollState(
+        _ authority: DomainAgentSessionLinkAuthority,
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: DomainAgentSessionLinkEndpointIdentity
+    ) async throws -> DomainAgentSessionLinkTargetState {
+        let lease = try await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        let state = await authority.targetState(for: lease)
+        return try XCTUnwrap(state)
     }
 
     private func waitUntilParked(
@@ -212,7 +228,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertNil(afterRevocation)
     }
 
-    func testSelfMonitorAndUnresolvedBindingsAreRejected() async throws {
+    func testSelfMonitorAndUnresolvedBindingsAreRejected() async {
         let authority = makeAuthority()
         let sessionID = UUID()
         let selfEndpoint = makeEndpoint(sessionID: sessionID)
@@ -292,7 +308,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(snapshot.observedTargetCount, 1)
     }
 
-    func testActivationRollsBackWhenTargetEndpointDrifted() async throws {
+    func testActivationRollsBackWhenTargetEndpointDrifted() async {
         let authority = makeAuthority()
         let observer = makeEndpoint()
         let target = makeEndpoint(windowID: 2)
@@ -316,7 +332,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(snapshot.activeLinkCount, 0)
     }
 
-    func testConcurrentReservationsForOneTargetElectExactlyOneFirstInboundInstaller() async throws {
+    func testConcurrentReservationsForOneTargetElectExactlyOneFirstInboundInstaller() async {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let observerA = makeEndpoint(windowID: 1)
@@ -380,7 +396,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertFalse(pendingC.provisionallyInstallsTargetObservation)
     }
 
-    func testInstallerRoleIsReElectedWhenTheElectedReservationIsAbandoned() async throws {
+    func testInstallerRoleIsReElectedWhenTheElectedReservationIsAbandoned() async {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let elected = await authority.reserveLink(observer: makeEndpoint(windowID: 1), target: target)
@@ -426,7 +442,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(observedTargets, 1)
     }
 
-    func testInstallerRoleIsReElectedWhenTheElectedObserverIsInvalidatedBeforeSiblingActivation() async throws {
+    func testInstallerRoleIsReElectedWhenTheElectedObserverIsInvalidatedBeforeSiblingActivation() async {
         let authority = makeAuthority()
         let target = makeEndpoint(windowID: 9)
         let electedObserver = makeEndpoint(windowID: 1)
@@ -1615,6 +1631,204 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
 
     // MARK: - Wait
 
+    func testWaitCursorResolutionPreservesRequestOrderAndSuccessorBaselines() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let targets = [makeEndpoint(windowID: 2), makeEndpoint(windowID: 3)]
+        var states: [DomainAgentSessionLinkTargetState] = []
+        for target in targets {
+            try await activateLink(authority, observer: observer, target: target, status: .running)
+            try await states.append(pollState(authority, observer: observer, target: target))
+        }
+        let orderedStates = Array(states.reversed())
+        let resolved = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: orderedStates.map(\.waitCursor)
+        ).get()
+        XCTAssertEqual(resolved, targets.reversed().map(\.sessionID))
+        _ = await authority.publishTargetSnapshot(
+            endpoint: targets[0],
+            snapshot: makeSnapshot(sessionID: targets[0].sessionID, status: .idle),
+            sourcePublicationSequence: 2
+        )
+        var requests: [DomainAgentSessionLinkWaitRequest] = []
+        for (sessionID, state) in zip(resolved, orderedStates) {
+            let lease = try await authority.authorize(
+                operation: .monitorWait, observerEndpoint: observer, targetSessionID: sessionID
+            ).get()
+            requests.append(.init(lease: lease, cursor: state.waitCursor))
+        }
+        let changed = await authority.wait(requests: requests, until: .change, timeoutSeconds: 0)
+        XCTAssertEqual(changed.outcome, .changed(sessionID: targets[0].sessionID))
+        XCTAssertEqual(changed.targets.map(\.sessionID), resolved)
+        let successors = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: changed.targets.map(\.waitCursor)
+        ).get()
+        XCTAssertEqual(successors, resolved)
+    }
+
+    func testWaitCursorResolutionRejectsForeignAndReboundObserverHandlesAtomically() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let state = try await pollState(authority, observer: observer, target: target)
+        let otherObservers = [
+            makeEndpoint(windowID: 3),
+            makeEndpoint(windowID: 4, sessionID: observer.sessionID),
+            makeEndpoint(
+                windowID: observer.windowID, workspaceID: observer.workspaceID,
+                tabID: observer.tabID, sessionID: observer.sessionID,
+                persistentBindingGeneration: observer.persistentBindingGeneration,
+                bindingTransitionGeneration: observer.bindingTransitionGeneration + 1
+            ),
+            makeEndpoint(
+                windowID: observer.windowID, workspaceID: observer.workspaceID,
+                tabID: observer.tabID, sessionID: observer.sessionID
+            )
+        ]
+        for other in otherObservers {
+            try await activateLink(authority, observer: other, target: target)
+            let otherState = try await pollState(authority, observer: other, target: target)
+            let borrowed = await authority.resolveWaitCursorTargets(
+                observerEndpoint: other, cursors: [state.waitCursor]
+            )
+            XCTAssertEqual(borrowed.failureError, .cursorExpired)
+            let mixed = await authority.resolveWaitCursorTargets(
+                observerEndpoint: observer, cursors: [state.waitCursor, otherState.waitCursor]
+            )
+            XCTAssertEqual(mixed.failureError, .cursorExpired, "A foreign cursor must not expose the valid sibling")
+        }
+        let original = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        ).get()
+        XCTAssertEqual(original, [target.sessionID])
+    }
+
+    func testWaitCursorResolutionDoesNotRenewOrConsumeRetention() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let oldest = try await pollState(authority, observer: observer, target: target)
+        for _ in 1 ..< DomainAgentSessionLinkAuthority.waitCursorsPerLinkLimit {
+            _ = try await pollState(authority, observer: observer, target: target)
+        }
+        let before = await authority.snapshot().authorityRevision
+        for _ in 0 ... DomainAgentSessionLinkAuthority.waitCursorsPerLinkLimit {
+            let resolved = try await authority.resolveWaitCursorTargets(
+                observerEndpoint: observer, cursors: [oldest.waitCursor]
+            ).get()
+            XCTAssertEqual(resolved, [target.sessionID])
+        }
+        let after = await authority.snapshot().authorityRevision
+        XCTAssertEqual(after, before)
+        let newest = try await pollState(authority, observer: observer, target: target)
+        let evicted = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [oldest.waitCursor]
+        )
+        XCTAssertEqual(evicted.failureError, .cursorExpired, "Lookup must not renew the oldest handle")
+        let current = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [newest.waitCursor]
+        ).get()
+        XCTAssertEqual(current, [target.sessionID])
+    }
+
+    func testWaitCursorResolutionRejectsOldLinkAndTargetIncarnations() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        let grant = try await activateLink(authority, observer: observer, target: target)
+        let original = try await pollState(authority, observer: observer, target: target)
+        _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
+        let revoked = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [original.waitCursor]
+        )
+        XCTAssertEqual(revoked.failureError, .cursorExpired)
+        try await activateLink(authority, observer: observer, target: target)
+        let relinked = try await pollState(authority, observer: observer, target: target)
+        let oldGeneration = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [relinked.waitCursor, original.waitCursor]
+        )
+        XCTAssertEqual(oldGeneration.failureError, .cursorExpired)
+        let replacement = makeEndpoint(windowID: 3, sessionID: target.sessionID)
+        try await activateLink(authority, observer: observer, target: replacement)
+        let current = try await pollState(authority, observer: observer, target: replacement)
+        let oldIncarnation = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [relinked.waitCursor]
+        )
+        XCTAssertEqual(oldIncarnation.failureError, .cursorExpired)
+        let resolved = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [current.waitCursor]
+        ).get()
+        XCTAssertEqual(resolved, [target.sessionID])
+    }
+
+    func testWaitCursorResolutionRequiresCurrentWaitCapability() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target, capabilities: [.poll])
+        let state = try await pollState(authority, observer: observer, target: target)
+        let denied = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        )
+        XCTAssertEqual(denied.failureError, .cursorExpired)
+        let elevation = DomainAgentSessionLinkCapabilityElevation()
+        await authority.installCapabilityElevation(elevation)
+        elevation.elevate(observer: observer.sessionID)
+        let allowed = try await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        ).get()
+        XCTAssertEqual(allowed, [target.sessionID])
+        elevation.revokeAll()
+        let revoked = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        )
+        XCTAssertEqual(revoked.failureError, .cursorExpired)
+    }
+
+    func testWaitCursorResolutionLosesScopeConsentBeforeLinkCleanup() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        var scopes = DomainDelegationScopeAuthority()
+        let scope = try scopes.grant(.init(
+            granteeSessionID: observer.sessionID, kind: .session(targetSessionID: target.sessionID),
+            capabilities: [.observe, .control, .restructure], guardrails: .init()
+        ), scopeID: UUID(), now: Date(timeIntervalSince1970: 1000)).get()
+        let consent = DomainDelegationScopeLinkConsent()
+        consent.replace([scope.grant])
+        let installed = await authority.installScopeConsent(consent)
+        XCTAssertTrue(installed)
+        try await activateLink(authority, observer: observer, target: target, sourceScopeID: scope.id)
+        let state = try await pollState(authority, observer: observer, target: target)
+        consent.replace([])
+        let activeCount = await authority.snapshot().activeLinkCount
+        XCTAssertEqual(activeCount, 1, "The source-consent fence precedes physical link cleanup")
+        let expired = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        )
+        XCTAssertEqual(expired.failureError, .cursorExpired)
+    }
+
+    func testWaitCursorResolutionRejectsInvalidBatchShapes() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target)
+        let first = try await pollState(authority, observer: observer, target: target)
+        let second = try await pollState(authority, observer: observer, target: target)
+        let oversized = (0 ... DomainAgentSessionLinkAuthority.waitFanOutLimit).map { "w_unknown_\($0)" }
+        for cursors in [[], [first.waitCursor, first.waitCursor], [first.waitCursor, second.waitCursor], oversized] {
+            let rejected = await authority.resolveWaitCursorTargets(observerEndpoint: observer, cursors: cursors)
+            XCTAssertEqual(rejected.failureError, .invalidRequest)
+        }
+        let unknown = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [first.waitCursor, "w_unknown"]
+        )
+        XCTAssertEqual(unknown.failureError, .cursorExpired)
+    }
+
     func testWaitReturnsImmediatelyWhenChangeAlreadyAdvancedAndOnZeroTimeout() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -1797,7 +2011,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let conflict = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
+                DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil)
             ],
             until: .change,
             timeoutSeconds: 30
@@ -1848,7 +2062,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         async let pending = authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
             ],
             until: .change,
             timeoutSeconds: 30
@@ -1867,7 +2081,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let reuse = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
             ],
             until: .change,
             timeoutSeconds: 0
@@ -1885,12 +2099,18 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         ).get()
         let requests = [DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil)]
         await authority.acceptLocalInput(.init(endpoint: observer, generation: 1))
-        let old = await authority.wait(requests: requests, timeoutSeconds: 0,
-                                       observerInput: .init(endpoint: observer, generation: 0))
+        let old = await authority.wait(
+            requests: requests,
+            timeoutSeconds: 0,
+            observerInput: .init(endpoint: observer, generation: 0)
+        )
         XCTAssertEqual(old.outcome, .cancelled)
         XCTAssertTrue(old.interruptedByLocalInput)
-        let current = await authority.wait(requests: requests, timeoutSeconds: 0,
-                                           observerInput: .init(endpoint: observer, generation: 1))
+        let current = await authority.wait(
+            requests: requests,
+            timeoutSeconds: 0,
+            observerInput: .init(endpoint: observer, generation: 1)
+        )
         XCTAssertEqual(current.outcome, .timedOut)
         XCTAssertFalse(current.interruptedByLocalInput)
     }
@@ -1908,15 +2128,21 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             requests.append(.init(lease: lease, cursor: nil))
         }
         let frozenRequests = requests
-        let old = Task { await authority.wait(requests: frozenRequests, timeoutSeconds: 30,
-                                             observerInput: .init(endpoint: observer, generation: 0)) }
+        let old = Task { await authority.wait(
+            requests: frozenRequests,
+            timeoutSeconds: 30,
+            observerInput: .init(endpoint: observer, generation: 0)
+        ) }
         try await waitUntilParked(authority, count: 1)
         await authority.acceptLocalInput(.init(endpoint: observer, generation: 1))
         let result = await old.value
         XCTAssertEqual(result.outcome, .cancelled)
         XCTAssertTrue(result.interruptedByLocalInput)
-        let next = Task { await authority.wait(requests: frozenRequests, timeoutSeconds: 30,
-                                              observerInput: .init(endpoint: observer, generation: 1)) }
+        let next = Task { await authority.wait(
+            requests: frozenRequests,
+            timeoutSeconds: 30,
+            observerInput: .init(endpoint: observer, generation: 1)
+        ) }
         try await waitUntilParked(authority, count: 1)
         await authority.acceptLocalInput(.init(endpoint: observer, generation: 2))
         let nextResult = await next.value
@@ -1932,8 +2158,11 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let lease = try await authority.authorize(
             operation: .monitorWait, observerEndpoint: observer, targetSessionID: target.sessionID
         ).get()
-        let task = Task { await authority.wait(requests: [.init(lease: lease, cursor: nil)], timeoutSeconds: 30,
-                                              observerInput: .init(endpoint: observer, generation: 0)) }
+        let task = Task { await authority.wait(
+            requests: [.init(lease: lease, cursor: nil)],
+            timeoutSeconds: 30,
+            observerInput: .init(endpoint: observer, generation: 0)
+        ) }
         try await waitUntilParked(authority, count: 1)
         _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
         await authority.acceptLocalInput(.init(endpoint: other, generation: 1))
@@ -1949,10 +2178,16 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let replacement = makeEndpoint(sessionID: observer.sessionID)
         let target = makeEndpoint(windowID: 2)
         try await activateLink(authority, observer: observer, target: target, status: .running)
-        let lease = try await authority.authorize(operation: .monitorWait, observerEndpoint: observer,
-                                                 targetSessionID: target.sessionID).get()
-        let waiter = Task { await authority.wait(requests: [.init(lease: lease, cursor: nil)], timeoutSeconds: 30,
-                                                observerInput: .init(endpoint: observer, generation: 0)) }
+        let lease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        let waiter = Task { await authority.wait(
+            requests: [.init(lease: lease, cursor: nil)],
+            timeoutSeconds: 30,
+            observerInput: .init(endpoint: observer, generation: 0)
+        ) }
         try await waitUntilParked(authority, count: 1)
         await authority.acceptLocalInput(.init(endpoint: replacement, generation: 1))
         let count = await authority.snapshot().parkedWaiterCount
@@ -1969,14 +2204,26 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let target = makeEndpoint(windowID: 2)
         try await activateLink(authority, observer: observer, target: target, status: .running)
         try await activateLink(authority, observer: other, target: target, status: .running)
-        let lease = try await authority.authorize(operation: .monitorWait, observerEndpoint: observer,
-                                                 targetSessionID: target.sessionID).get()
-        let otherLease = try await authority.authorize(operation: .monitorWait, observerEndpoint: other,
-                                                      targetSessionID: target.sessionID).get()
-        let completed = await authority.wait(requests: [.init(lease: lease, cursor: nil)], timeoutSeconds: 0,
-                                             observerInput: .init(endpoint: observer, generation: 0))
-        let unrelated = Task { await authority.wait(requests: [.init(lease: otherLease, cursor: nil)], timeoutSeconds: 30,
-                                                   observerInput: .init(endpoint: other, generation: 0)) }
+        let lease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        let otherLease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: other,
+            targetSessionID: target.sessionID
+        ).get()
+        let completed = await authority.wait(
+            requests: [.init(lease: lease, cursor: nil)],
+            timeoutSeconds: 0,
+            observerInput: .init(endpoint: observer, generation: 0)
+        )
+        let unrelated = Task { await authority.wait(
+            requests: [.init(lease: otherLease, cursor: nil)],
+            timeoutSeconds: 30,
+            observerInput: .init(endpoint: other, generation: 0)
+        ) }
         try await waitUntilParked(authority, count: 1)
         await authority.acceptLocalInput(.init(endpoint: observer, generation: 1))
         XCTAssertEqual(completed.outcome, .timedOut)
@@ -2025,7 +2272,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let duplicated = await authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil),
+                DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil)
             ],
             until: .change,
             timeoutSeconds: 5
@@ -2047,7 +2294,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         var leases: [DomainAgentSessionLinkLease] = []
         for target in targets {
             try await activateLink(authority, observer: observer, target: target, status: .running)
-            leases.append(try await authority.authorize(
+            try await leases.append(authority.authorize(
                 operation: .monitorWait,
                 observerEndpoint: observer,
                 targetSessionID: target.sessionID
@@ -2100,7 +2347,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         async let pending = authority.wait(
             requests: [
                 DomainAgentSessionLinkWaitRequest(lease: leaseA, cursor: nil),
-                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil),
+                DomainAgentSessionLinkWaitRequest(lease: leaseB, cursor: nil)
             ],
             until: .change,
             timeoutSeconds: 30
@@ -2229,6 +2476,10 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             sourceItemsRevision: 12
         )
         let first = try await authority.openReadCursor(lease: readLease, anchor: anchor, direction: .tail).get()
+        let waitTarget = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [first.handle]
+        )
+        XCTAssertEqual(waitTarget.failureError, .cursorExpired, "A read cursor cannot route a wait")
         guard case let .resolved(resolved) = await authority.resolveReadCursor(
             lease: readLease,
             opaqueCursor: first.handle
@@ -2530,6 +2781,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             observerEndpoint: observer,
             targetSessionID: target.sessionID
         ).get()
+        let state = try await pollState(authority, observer: observer, target: target)
 
         async let pending = authority.wait(
             requests: [DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil)],
@@ -2549,6 +2801,10 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             targetSessionID: target.sessionID
         )
         XCTAssertEqual(denied.failureError, .runtimeShuttingDown)
+        let cursorResolution = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        )
+        XCTAssertEqual(cursorResolution.failureError, .runtimeShuttingDown)
 
         // The link survives phase one so an in-flight invocation can still settle.
         let survivingLinks = await authority.snapshot().activeLinkCount
@@ -2566,6 +2822,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             targetSessionID: target.sessionID
         ).get()
         let beforeGeneration = await authority.runtimeGeneration
+        let state = try await pollState(authority, observer: observer, target: target)
 
         await authority.beginDrain()
         await authority.finishShutdown()
@@ -2579,6 +2836,10 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.runtimeGeneration, beforeGeneration)
         let leaseError = await authority.validate(lease: lease)
         XCTAssertEqual(leaseError, .runtimeShuttingDown)
+        let cursorResolution = await authority.resolveWaitCursorTargets(
+            observerEndpoint: observer, cursors: [state.waitCursor]
+        )
+        XCTAssertEqual(cursorResolution.failureError, .runtimeShuttingDown)
         await authority.finishShutdown()
         let generationAfterRepeat = await authority.snapshot().runtimeGeneration
         XCTAssertEqual(generationAfterRepeat, snapshot.runtimeGeneration)

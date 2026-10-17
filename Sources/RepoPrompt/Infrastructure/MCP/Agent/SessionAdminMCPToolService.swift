@@ -463,7 +463,8 @@ struct SessionAdminMCPToolService {
             }
             return .object([
                 "result": .string("denied"), "code": .string("placement_unresolved"),
-                "detail": .string("Your scope's configured limits require complete session placement evidence. Load or resolve ambiguous session bindings, then retry the same operation. Use session_admin scope_status to inspect limits. A new capability grant alone will not repair missing provenance.")
+                "subreason": .string("usage_evidence_unavailable"), "recovery": .string("manual"),
+                "detail": .string(DelegationSpawnAdmission.placementUnresolvedDetail(subreason: "usage_evidence_unavailable"))
             ])
         case let .denied(denial, sessionID):
             return try Self.deniedValue(denial, sessionID: sessionID)
@@ -519,6 +520,11 @@ struct SessionAdminMCPToolService {
         }
         var value: [String: Value] = ["result": .string("denied"), "code": .string(code)]
         switch denial {
+        case .mutationOwnerUnavailable:
+            value["subreason"] = .string("replicated_binding")
+            value["detail"] = .string("Your scope covers this session, but the app could not prove one current writer for the state this operation changes. Session loading or handoff must finish, or competing writable copies must be resolved, before retrying. Opening the target tab is not required when it already has one current writer.")
+            value["retryable"] = .bool(false)
+            value["recovery"] = .string("manual")
         case let .capabilityMissing(capability):
             value["capability"] = .string(capability.rawValue)
             value["detail"] = .string("This scope lacks \(capability.rawValue). Request a new scope including \(capability.rawValue) by calling session_admin request_scope with all capabilities needed by the operation; wait for the user's approval. Call session_admin scope_status for the operation catalog and your current grants. \(inventoryGuidance)")

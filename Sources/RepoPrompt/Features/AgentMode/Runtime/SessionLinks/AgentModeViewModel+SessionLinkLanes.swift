@@ -94,6 +94,8 @@ extension AgentModeViewModel {
             )
         } catch let published as AgentSessionLanePublishedFailure {
             return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
+        } catch let failure as AgentSessionLaneAdmissionFailure {
+            throw AgentSessionLaneDestinationFailure.admissionRejected(failure)
         } catch let MCPError.internalError(detail) {
             // Every internal error on this path is app-authored (binding admission, workspace or
             // prompt-manager availability), so the reason reaches the caller instead of a type name.

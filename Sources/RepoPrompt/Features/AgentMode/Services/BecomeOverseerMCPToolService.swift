@@ -7,10 +7,7 @@ import RepoPromptDomainRuntime
 struct BecomeOverseerMCPToolService {
     /// Read the setting for each call, never freeze mode-specific instructions at first access.
     static var nextTurnResult: String {
-        if OverseerGlobalAutoApprove.isEnabled() {
-            return "Overseer enabled. Overseer full access: ON. For session_admin inventory/rename/retire/link, agent_session_link create_lane, or agent_run start/steer, just call the operation; full access supplies the scope and capabilities without cards. For one saved target, call become_overseer with session_id and optional message to prepare, link and dispatch automatically. session_admin scope_status lists operations and current grants. Exact routing, target readiness and user-instruction boundaries still apply."
-        }
-        return "Overseer enabled. Overseer full access: OFF. Use existing covering grants directly; activation alone grants no authority. Request authority only when no current grant covers the operation: for listing call session_admin {op:\"request_scope\",kind:\"workspace\",capabilities:[\"observe\"]}; add organize for renaming/grouping, and restructure for release/retire (also control for running targets). Existing standing consent may settle a request without a card. Otherwise the user sees one approval card; RepoPrompt notifies you after the decision, then continue with session_admin inventory. Do not re-request while pending. For one saved target, become_overseer with session_id and optional message requests observe + control + restructure together and automatically prepares, links and dispatches after consent. session_admin scope_status lists every operation, required capabilities and current grants."
+        OverseerAuthorizationEngine.current.bootstrapGuidance
     }
 
     static var devinResult: String {

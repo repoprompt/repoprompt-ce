@@ -2519,4 +2519,48 @@ import XCTest
             return value
         }
     }
+
+    /// The custom-storage preference read seam: the value a test process inherited from a killed run
+    /// never pins this run's workspace store, while values the run's own fixtures set and every product
+    /// launch are unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    final class WorkspaceStoragePreferenceTests: XCTestCase {
+        private func defaults(storing path: String?) -> UserDefaults {
+            let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
+            defaults.setVolatileDomain(
+                path.map { [WorkspaceStoragePreference.key: $0] } ?? [:], forName: UserDefaults.argumentDomain
+            )
+            return defaults
+        }
+
+        private let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"
+
+        func testProductLaunchUsesTheStoredValue() {
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stale), environment: [:]), stale)
+            XCTAssertNil(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: nil), environment: [:]))
+        }
+
+        func testTestRunIgnoresOnlyTheInheritedValueAndHonorsItsOwnFixtures() {
+            let environment = [
+                WorkspaceStoragePreference.testSandboxEnvironmentKey: "/var/folders/x/T/rpce-local-tests-now/25bf8e1a2393f110",
+                WorkspaceStoragePreference.inheritedPreferenceEnvironmentKey: stale
+            ]
+            XCTAssertNil(
+                WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: stale), environment: environment),
+                "the store a killed run left pinned is never adopted"
+            )
+            // A fixture's own storage, even outside the sandbox (FileManager's per-user temporary
+            // directory), is honored, and so is a later restore of a different value.
+            let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("fixture-\(UUID().uuidString)").path
+            XCTAssertEqual(WorkspaceStoragePreference.customStoragePath(defaults: defaults(storing: fixture), environment: environment), fixture)
+            // Inherited but inside this run's own sandbox: honored.
+            let inside = "/var/folders/x/T/rpce-local-tests-now/25bf8e1a2393f110/Workspaces"
+            XCTAssertEqual(
+                WorkspaceStoragePreference.customStoragePath(
+                    defaults: defaults(storing: inside),
+                    environment: environment.merging([WorkspaceStoragePreference.inheritedPreferenceEnvironmentKey: inside]) { $1 }
+                ),
+                inside
+            )
+        }
+    }
 #endif

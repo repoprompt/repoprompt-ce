@@ -2039,9 +2039,19 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: child, target: .newSession, scopes: scopes, administration: core, projector: projector
         ), .creatorPlacementUnresolved("creator_ancestry_conflict"))
-        let diagnostic = String(describing: DelegationSpawnAdmission.error(for: .usageProofMissing, subreason: "creator_ancestry_conflict"))
-        XCTAssertTrue(diagnostic.contains("creator_ancestry_conflict"))
-        XCTAssertTrue(diagnostic.contains("scope_status"))
+        for subreason in ["creator_ancestry_conflict", "creator_replicated"] {
+            guard case let .invalidParams(message) = DelegationSpawnAdmission.error(for: .usageProofMissing, subreason: subreason),
+                  let message, let start = message.firstIndex(of: "{"),
+                  let fields = try JSONSerialization.jsonObject(with: Data(message[start...].utf8)) as? [String: Any]
+            else { return XCTFail("placement refusal must stay a structured invalid-params error") }
+            XCTAssertEqual(fields["reason"] as? String, "placement_unresolved")
+            XCTAssertEqual(fields["subreason"] as? String, subreason)
+            XCTAssertEqual(fields["retryable"] as? Bool, false)
+            XCTAssertEqual(fields["recovery"] as? String, "manual")
+            XCTAssertNil(fields["next_call"], "no executable call repairs placement; a generic scope_status is not a repair")
+            XCTAssertEqual(fields["detail"] as? String, DelegationSpawnAdmission.placementUnresolvedDetail(subreason: subreason))
+        }
+        XCTAssertTrue(DelegationSpawnAdmission.placementUnresolvedDetail(subreason: "creator_replicated").contains("duplicate presentation"))
         XCTAssertEqual(scopes.usageIncludingReservations(emptyUsage), emptyUsage)
 
         // An actually unloaded root retains the existing ancestry contract; it is distinct from a

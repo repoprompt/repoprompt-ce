@@ -47,6 +47,16 @@ struct AgentSessionAdministrationRequest {
         DomainDelegationScopeArgumentsDigest.digest(arguments)
     }
 
+    /// The same request without its presented card. The full-access pass never requires a card, and a card
+    /// is bound to the scope it was issued for, so it is not revalidated against the full-access grant.
+    func withoutConfirmation() -> AgentSessionAdministrationRequest {
+        AgentSessionAdministrationRequest(
+            operation: operation, caller: caller, callerTabID: callerTabID, scopeID: scopeID,
+            targetSessionIDs: targetSessionIDs, idempotencyKey: idempotencyKey, confirmationID: nil,
+            preview: preview, arguments: arguments
+        )
+    }
+
     /// The same request narrowed to `targets` (the admitted subset).
     func narrowed(to targets: [UUID]) -> AgentSessionAdministrationRequest {
         AgentSessionAdministrationRequest(
@@ -170,131 +180,9 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         handlersByOperation[operation] != nil
     }
 
+    /// The decision is owned by the runtime's `OverseerAuthorizationEngine`; the core executes it.
     func authorize(_ request: AgentSessionAdministrationRequest) -> AgentSessionAdministrationAuthorization {
-        guard let callerSessionID = request.caller.agentSessionID else {
-            return .denied(.callerNotAgentSession, sessionID: nil)
-        }
-        let scope: DomainDelegationScopeRecord
-        // Off means off: a global grant left from an earlier "on" never outlives the setting.
-        scopes.reconcileGlobalAutoApprove()
-        if let scopeID = request.scopeID {
-            // The authority checks grantee identity before disclosing anything about this scope.
-            guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
-            scope = record
-        } else if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) {
-            // Global auto-approve: the one unrestricted grant covers every operation and session, with
-            // no request, no scope choice and no card. Authorization below still runs against it.
-            scope = global
-        } else {
-            let live = scopes.liveScopes(grantedTo: callerSessionID)
-            var required = request.operation.requiredScopeCapabilities(for: .idle)
-            if request.operation == .adminLink { required.formUnion([.observe, .control]) }
-            let capable = live.filter { record in
-                scopes.scopeChain(from: record.id).allSatisfy { required.isSubset(of: $0.grant.capabilities) }
-            }
-            // Select by capability only, never guess from target membership. The ordinary authority
-            // below still proves membership, state-dependent capabilities, guardrails and leases.
-            if capable.count == 1 {
-                scope = capable[0]
-            } else if live.count == 1 {
-                scope = live[0] // Preserve the actionable capability-missing result.
-            } else if live.isEmpty {
-                return .denied(.unknownScope, sessionID: nil)
-            } else {
-                return .scopeSelectionRequired(scopeIDs: (capable.isEmpty ? live : capable).map(\.id))
-            }
-        }
-
-        guard scope.grant.granteeSessionID == callerSessionID else {
-            return .denied(.granteeMismatch, sessionID: nil)
-        }
-        // Scope-level reads with no target/state/usage projection must not enumerate every session.
-        guard !request.targetSessionIDs.isEmpty || request.operation.scopeGuardrailUse != nil else {
-            return authorize(request, scope: scope, projector: projector)
-        }
-        if request.operation.scopeGuardrailUse != nil {
-            return projector.withSynchronousCensus { projector in
-                authorize(request, scope: scope, projector: projector)
-            }
-        }
-        return projector.withSynchronousTargets(Set(request.targetSessionIDs)) { projector in
-            authorize(request, scope: scope, projector: projector)
-        }
-    }
-
-    private func authorize(
-        _ request: AgentSessionAdministrationRequest,
-        scope: DomainDelegationScopeRecord,
-        projector: any DelegationMembershipProjector
-    ) -> AgentSessionAdministrationAuthorization {
-        guard let callerSessionID = request.caller.agentSessionID else {
-            return .denied(.callerNotAgentSession, sessionID: nil)
-        }
-        // One proof per target for the scope and each ancestor: an attenuated scope never reaches a
-        // session its parents could not.
-        let chain = scopes.scopeChain(from: scope.id)
-        var memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:]
-        for target in request.targetSessionIDs {
-            // Equal mirrors can supply a read proof, but no current canonical write owner has
-            // been established. Refuse before confirmation or effects rather than mutate one
-            // presentation and make the returned undo token immediately unusable.
-            if request.operation.mutatesTarget, projector.pointResolutionState(for: target) == .replicated {
-                return .denied(.membershipProofMissing, sessionID: target)
-            }
-            memberships[target] = chain.compactMap { projector.membershipProof(for: target, in: $0.grant) }
-        }
-        var targetStates: [UUID: DomainDelegationScopeTargetState] = [:]
-        for target in request.targetSessionIDs {
-            targetStates[target] = projector.targetState(for: target)
-        }
-        var usage: [UUID: DomainDelegationScopeUsage] = [:]
-        if request.operation.scopeGuardrailUse != nil {
-            for record in chain where request.operation.requiresScopeUsage(for: record.grant.guardrails) {
-                // In-flight creations (spawn, fork, worktree_create) count until they settle.
-                guard let evidence = projector.usageEvidence(
-                    of: record.grant, spawnParentSessionID: request.targetSessionIDs.first
-                ) else { return .denied(.usageProofMissing, sessionID: nil) }
-                usage[record.id] = scopes.usageIncludingReservations(evidence)
-            }
-        }
-        let confirmation = request.confirmationID.flatMap {
-            scopes.confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)?.domainConfirmation
-        }
-        // A supplied stale, consumed or unknown card is not equivalent to omitting a card.
-        guard request.confirmationID == nil || confirmation != nil else {
-            return .denied(.confirmationMismatch, sessionID: nil)
-        }
-        let outcome = scopes.authorize(DomainDelegationScopeAuthorizationRequest(
-            operation: request.operation,
-            caller: request.caller,
-            scopeID: scope.id,
-            presentedGeneration: scope.generation,
-            targetSessionIDs: request.targetSessionIDs,
-            memberships: memberships,
-            usageByScopeID: usage,
-            targetStates: targetStates,
-            argumentsDigest: request.argumentsDigest,
-            idempotencyKey: request.idempotencyKey,
-            confirmation: confirmation
-        ))
-        func batch(_ items: DomainDelegationScopeAuthorizedItems) -> AgentSessionAdministrationAuthorizedBatch {
-            AgentSessionAdministrationAuthorizedBatch(
-                request: request,
-                scope: scope,
-                leases: items.leases,
-                bases: items.bases,
-                itemsRequiringControl: items.itemsRequiringControl,
-                confirmation: confirmation
-            )
-        }
-        switch outcome {
-        case let .authorized(items):
-            return .authorized(batch(items))
-        case let .confirmationRequired(reason, items):
-            return .confirmationRequired(reason, batch(items))
-        case let .denied(denial, sessionID):
-            return .denied(denial, sessionID: sessionID)
-        }
+        scopes.authorization.authorizeAdministration(request, projector: projector)
     }
 
     func perform(_ request: AgentSessionAdministrationRequest) async throws -> AgentSessionAdministrationOutcome {

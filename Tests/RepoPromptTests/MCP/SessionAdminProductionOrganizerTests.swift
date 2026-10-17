@@ -431,14 +431,189 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     XCTAssertEqual(gone["result"], .string("groups_not_found"))
                     XCTAssertEqual(gone["current_groups"], .array([]))
                     XCTAssertNotNil(gone["detail"])
-                    XCTAssertNil(gone["next_call"], "a no-op reorder must not be offered as a runnable next call")
-                    XCTAssertNotNil(gone["next_step"])
+                    let emptyRecovery = try XCTUnwrap(gone["next_call"]?.objectValue?["arguments"]?.objectValue)
+                    XCTAssertEqual(emptyRecovery["order"], .array([]))
+                    XCTAssertEqual(emptyRecovery["expected_order"], .array([]))
+                    let emptyResult = try await perform(.adminReorderGroups, arguments: emptyRecovery, key: "empty-recovery")
+                    XCTAssertEqual(emptyResult["result"], .string("no_matching_sessions"), "an empty recovery must not claim a write")
                     let noOrder = try await perform(.adminReorderGroups, arguments: ["workspace": .string(destination.workspaceID.uuidString)], key: "no-order")
                     XCTAssertEqual(noOrder["result"], .string("order_required"))
                     XCTAssertNotNil(noOrder["current_groups"])
                     await destination.cleanup()
                     await caller.cleanup()
                 } catch {
+                    await destination.cleanup()
+                    await caller.cleanup()
+                    throw error
+                }
+            }
+        }
+    }
+
+    func testReorderGroupsMCPRecoveryAndApplyUseOneWriterForAgreeingReplicas() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let previous = OverseerGlobalAutoApprove.isEnabled
+            defer { OverseerGlobalAutoApprove.isEnabled = previous }
+            for (fullAccess, namedRestrictedScope) in [(false, false), (true, false), (true, true)] {
+                OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+                let caller = try await Fixture.make(isolated: true)
+                let destination = try await Fixture.make(isolated: true)
+                var replica: WindowState?
+                do {
+                    destination.installGroups()
+                    let mirror = try await destination.addReplica()
+                    replica = mirror
+                    let ids = Set([destination.callerTab.activeAgentSessionID!, destination.targetTab.activeAgentSessionID!])
+                    let proof = AgentSessionCarrierResolver.capture(windows: [destination.window, mirror], sessionIDs: ids)
+                    XCTAssertEqual(proof.replicatedSessionIDs, ids)
+                    XCTAssertTrue(proof.ambiguousSessionIDs.isEmpty)
+                    XCTAssertTrue(
+                        caller.scopes.allLiveScopes().isEmpty || !fullAccess,
+                        "The first full-access MCP call must materialize its own scope"
+                    )
+                    var arguments: [String: Value] = ["workspace": .string(destination.workspaceID.uuidString)]
+                    if !fullAccess || namedRestrictedScope {
+                        let request = try caller.scopes.requestScope(
+                            requesterSessionID: caller.callerTab.activeAgentSessionID!, requesterTabID: caller.callerTab.id,
+                            kind: .workspace(workspaceID: namedRestrictedScope ? caller.workspaceID : destination.workspaceID),
+                            capabilities: namedRestrictedScope ? [.observe] : [.observe, .organize],
+                            guardrails: .init(), reason: nil, idempotencyKey: nil
+                        ).get()
+                        let granted = try caller.scopes.approve(requestID: request.id).get()
+                        arguments["scope_id"] = .string(granted.id.uuidString)
+                    }
+                    destination.window.promptManager.promptText = "Writer's unsaved user draft"
+                    destination.window.promptManager.testSetDirtyTabIDs([destination.callerTab.id])
+                    mirror.promptManager.promptText = "Peer's independent unsaved user draft"
+                    mirror.promptManager.testSetDirtyTabIDs([destination.callerTab.id])
+                    let discovery = try await caller.call("reorder_groups", arguments)
+                    XCTAssertEqual(discovery["result"], .string("order_required"))
+                    XCTAssertEqual(discovery["current_groups"], .array([.string("Alpha"), .string("Beta")]))
+                    let next = try XCTUnwrap(discovery["next_call"]?.objectValue)
+                    XCTAssertEqual(next["tool"], .string("session_admin"))
+                    var followup = try XCTUnwrap(next["arguments"]?.objectValue)
+                    XCTAssertNil(followup["session_id"], "Workspace discovery must not borrow the caller or an arbitrary target")
+                    XCTAssertNil(followup["targets"])
+                    XCTAssertEqual(followup["expected_order"], discovery["current_order"])
+                    let unchanged = try await caller.call("reorder_groups", followup)
+                    XCTAssertEqual(unchanged["result"], .string("applied"), "The exact advertised next call must satisfy the requested order")
+                    XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+                    XCTAssertEqual(unchanged["changed_count"], .int(0))
+                    XCTAssertEqual(unchanged["group_order"], discovery["current_order"])
+                    XCTAssertEqual(Set(unchanged["items"]?.arrayValue?.compactMap { $0.objectValue?["status"]?.stringValue } ?? []), ["unchanged"])
+                    XCTAssertNil(unchanged["code"])
+                    XCTAssertNil(unchanged["next_call"])
+                    XCTAssertNil(unchanged["undo_token"])
+                    XCTAssertEqual(destination.window.workspaceManager.activeWorkspace?.composeTabs.map(\.sidebarGroupOrder), [4, 9])
+                    XCTAssertEqual(mirror.workspaceManager.activeWorkspace?.composeTabs.map(\.sidebarGroupOrder), [4, 9])
+                    followup["order"] = .array([.string("Beta"), .string("Alpha")])
+                    followup["idempotency_key"] = .string(UUID().uuidString)
+                    let applied = try await caller.call("reorder_groups", followup)
+                    XCTAssertEqual(applied["result"], .string("applied"))
+                    XCTAssertEqual(applied["changed_count"], .int(2))
+                    for window in [destination.window, mirror] {
+                        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.map(\.sidebarGroupOrder), [9, 4])
+                        XCTAssertEqual(window.promptManager.currentComposeTabs.map(\.sidebarGroupOrder), [9, 4])
+                        XCTAssertEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, destination.callerTab.id)
+                        XCTAssertEqual(window.promptManager.activeComposeTabID, destination.callerTab.id)
+                    }
+                    XCTAssertEqual(destination.window.promptManager.promptText, "Writer's unsaved user draft")
+                    XCTAssertEqual(mirror.promptManager.promptText, "Peer's independent unsaved user draft")
+                    let undo = try await caller.undo(applied)
+                    XCTAssertEqual(undo["result"], .string("undone"))
+                    for window in [destination.window, mirror] {
+                        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.map(\.sidebarGroupOrder), [4, 9])
+                    }
+                    // The original recovery expectation is compared again on every new call.
+                    destination.installGroups(alphaOrder: 9, betaOrder: 4)
+                    destination.installGroups(in: mirror, alphaOrder: 9, betaOrder: 4)
+                    let stale = try await caller.call("reorder_groups", followup.merging([
+                        "idempotency_key": .string(UUID().uuidString)
+                    ]) { _, new in new })
+                    XCTAssertEqual(stale["result"], .string("order_conflict"))
+                    await destination.removeReplica(mirror)
+                    replica = nil
+                    await destination.cleanup()
+                    await caller.cleanup()
+                } catch {
+                    if let replica { await destination.removeReplica(replica) }
+                    await destination.cleanup()
+                    await caller.cleanup()
+                    throw error
+                }
+            }
+        }
+    }
+
+    func testReorderGroupsReportsCommittedSaveWhenAuthorityOrReplicaIdentityChangesDuringSave() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let previous = OverseerGlobalAutoApprove.isEnabled
+            defer { OverseerGlobalAutoApprove.isEnabled = previous }
+            OverseerGlobalAutoApprove.isEnabled = { false }
+            for change in ["scope", "identity"] {
+                let caller = try await Fixture.make(isolated: true)
+                let destination = try await Fixture.make(ephemeral: false, runtimeBacked: true)
+                var replica: WindowState?
+                let manager = destination.window.workspaceManager
+                do {
+                    destination.installGroups()
+                    let mirror = try await destination.addReplica()
+                    replica = mirror
+                    let carrierIDs = Set([destination.callerTab.activeAgentSessionID!, destination.targetTab.activeAgentSessionID!])
+                    for window in [destination.window, mirror] {
+                        XCTAssertEqual(
+                            Set(window.agentModeViewModel.ownerValidatedSessionIndex.keys), carrierIDs,
+                            "Every replica needs owner-valid placement metadata before membership can be proven"
+                        )
+                    }
+                    let request = try caller.scopes.requestScope(
+                        requesterSessionID: caller.callerTab.activeAgentSessionID!, requesterTabID: caller.callerTab.id,
+                        kind: .workspace(workspaceID: destination.workspaceID), capabilities: [.observe, .organize],
+                        guardrails: .init(), reason: nil, idempotencyKey: nil
+                    ).get()
+                    let granted = try caller.scopes.approve(requestID: request.id).get()
+                    XCTAssertTrue(manager.canCommitComposeTabPresentation(workspaceID: destination.workspaceID))
+                    let evidence = GroupOrderSaveEvidence()
+                    let replacement = UUID()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
+                        await MainActor.run {
+                            guard workspaceID == destination.workspaceID, !evidence.didSuspend else { return }
+                            evidence.didSuspend = true
+                            if change == "scope" { caller.scopes.revoke(scopeID: granted.id) }
+                            else {
+                                let session = mirror.agentModeViewModel.session(for: destination.targetTab.id)
+                                session.hasLoadedPersistedState = true
+                                _ = mirror.agentModeViewModel.test_installPersistentSessionBinding(
+                                    sessionID: replacement, on: session, updateWorkspaceMetadata: true
+                                )
+                            }
+                        }
+                    }
+                    let reply = try await caller.call("reorder_groups", [
+                        "workspace": .string(destination.workspaceID.uuidString), "scope_id": .string(granted.id.uuidString),
+                        "order": .array([.string("Beta"), .string("Alpha")]),
+                        "expected_order": .array([.string("Alpha"), .string("Beta")])
+                    ])
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                    XCTAssertTrue(evidence.didSuspend, "The production persistence suspension must be exercised")
+                    XCTAssertEqual(reply["result"], .string("partial"), change)
+                    XCTAssertEqual(reply[AgentSessionAdminRendering.committedChangesKey], .bool(true), change)
+                    XCTAssertEqual(reply["changed_count"], .int(0), "An incomplete operation cannot claim fully applied targets")
+                    let durableReadback = await manager.durableWorkspaceForMutationReadback(workspaceID: destination.workspaceID)
+                    let durable = try XCTUnwrap(durableReadback)
+                    XCTAssertEqual(durable.composeTabs.map(\.sidebarGroupOrder), [9, 4], "Never roll back the acknowledged canonical edit")
+                    if change == "identity" {
+                        XCTAssertEqual(mirror.agentModeViewModel.explicitActiveSessionID(for: destination.targetTab.id), replacement)
+                        XCTAssertEqual(mirror.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == destination.targetTab.id }?.sidebarGroupOrder, 9)
+                        XCTAssertNil(reply["next_call"], "A changed carrier is not repaired by requesting scope")
+                    }
+                    await destination.removeReplica(mirror)
+                    replica = nil
+                    await destination.cleanup()
+                    await caller.cleanup()
+                } catch {
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                    if let replica { await destination.removeReplica(replica) }
                     await destination.cleanup()
                     await caller.cleanup()
                     throw error
@@ -1119,6 +1294,11 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     }
 
     @MainActor
+    private final class GroupOrderSaveEvidence {
+        var didSuspend = false
+    }
+
+    @MainActor
     private final class DraftCaptureEvidence {
         var observedDirtyDraftBeforeCapture = false
     }
@@ -1127,6 +1307,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     private final class Fixture {
         let window: WindowState
         let directory: URL
+        let runtime: MCPDomainRuntime?
         let callerTab = ComposeTabState(name: "Overseer", activeAgentSessionID: UUID())
         let targetTab = ComposeTabState(name: "Target", activeAgentSessionID: UUID())
         let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral)
@@ -1135,28 +1316,59 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         var frontDoor: AgentSessionAdministrationFrontDoor!
         var beforeCallerResolution: (@MainActor () -> Void)?
 
-        private init(window: WindowState, directory: URL) {
+        private init(window: WindowState, directory: URL, runtime: MCPDomainRuntime? = nil) {
             self.window = window
             self.directory = directory
+            self.runtime = runtime
         }
 
-        static func make(ephemeral: Bool = true, isolated: Bool = false) async throws -> Fixture {
+        static func make(ephemeral: Bool = true, isolated: Bool = false, runtimeBacked: Bool = false) async throws -> Fixture {
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("session-admin-production-\(UUID())", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let window = WindowState()
-            let fixture = Fixture(window: window, directory: directory)
+            let runtime: MCPDomainRuntime?
+            if runtimeBacked {
+                let authority = MCPDomainRuntime(configuration: .init(
+                    mode: .app, profileIdentifier: "group-order",
+                    storageDirectory: directory.appendingPathComponent("authority", isDirectory: true),
+                    workspaceStorageDirectory: directory.appendingPathComponent("storage", isDirectory: true),
+                    eventDirectory: directory.appendingPathComponent("events", isDirectory: true),
+                    temporaryDirectory: directory.appendingPathComponent("tmp", isDirectory: true),
+                    externalReloadInterval: nil
+                ))
+                try await authority.start()
+                runtime = authority
+            } else { runtime = nil }
+            let window = runtime.map { WindowState(domainRuntime: $0) } ?? WindowState()
+            let fixture = Fixture(window: window, directory: directory, runtime: runtime)
             WindowStatesManager.shared.registerWindowState(window)
             do {
                 await window.workspaceManager.awaitInitialized()
-                var workspace = isolated
-                    ? WorkspaceModel(name: "Isolated organizer journey", repoPaths: [], ephemeralFlag: true)
+                var workspace = isolated || runtimeBacked
+                    ? WorkspaceModel(name: "Isolated organizer journey", repoPaths: [], ephemeralFlag: isolated || ephemeral)
                     : window.workspaceManager.createWorkspace(name: "Organizer journey", repoPaths: [], ephemeral: ephemeral)
                 workspace.customStoragePath = directory
                 workspace.composeTabs = [fixture.callerTab, fixture.targetTab]
                 workspace.activeComposeTabID = fixture.callerTab.id
                 fixture.workspaceID = workspace.id
-                if isolated {
+                if let runtime {
+                    // Establish the exact path and carrier document in the real authority before
+                    // adopting it. A local assignment or a learned revision is not a write witness.
+                    let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+                    let created = try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                    XCTAssertEqual(created.disposition, .applied)
+                    let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await bridge.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
+                    let canonical = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+                    _ = await window.workspaceManager.switchWorkspace(to: canonical, saveState: false, reason: "groupOrderAuthorityFixture")
+                    // The switch starts a disk session-list refresh for this owner. Let it settle before the
+                    // synthetic index below is installed, or its empty on-disk result replaces those entries
+                    // and every carrier correctly fails closed as unproven placement.
+                    await window.agentModeViewModel.test_waitForSessionListCacheRefresh()
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+                    XCTAssertTrue(window.workspaceManager.canCommitComposeTabPresentation(workspaceID: workspace.id))
+                } else if isolated {
                     window.workspaceManager.workspaces = [workspace]
                     window.workspaceManager.activeWorkspace = workspace
                 } else {
@@ -1253,6 +1465,40 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             try XCTUnwrap(window.workspaceManager.activeWorkspace)
         }
 
+        func installGroups(in targetWindow: WindowState? = nil, alphaOrder: Int = 4, betaOrder: Int = 9) {
+            let targetWindow = targetWindow ?? window
+            _ = targetWindow.workspaceManager.updateComposeTabPresentation(
+                workspaceID: workspaceID, tabIDs: [callerTab.id, targetTab.id]
+            ) { id, tab in
+                tab.sidebarGroup = id == self.callerTab.id ? "Alpha" : "Beta"
+                tab.sidebarGroupOrder = id == self.callerTab.id ? alphaOrder : betaOrder
+            }
+            if let workspace = targetWindow.workspaceManager.activeWorkspace { targetWindow.promptManager.loadComposeTabsFromWorkspace(workspace) }
+        }
+
+        func addReplica() async throws -> WindowState {
+            let replica = WindowState()
+            await replica.workspaceManager.awaitInitialized()
+            let workspace = try workspace()
+            replica.workspaceManager.workspaces = [workspace]
+            replica.workspaceManager.activeWorkspace = workspace
+            replica.promptManager.loadComposeTabsFromWorkspace(workspace)
+            for tabID in Array(replica.agentModeViewModel.sessions.keys) {
+                replica.agentModeViewModel.test_removeSession(tabID: tabID)
+            }
+            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+            replica.agentModeViewModel.test_installSessionIndexSnapshot(
+                window.agentModeViewModel.ownerValidatedSessionIndex, owner: owner, latestOwner: owner, activeWorkspace: workspace
+            )
+            WindowStatesManager.shared.registerWindowState(replica)
+            return replica
+        }
+
+        func removeReplica(_ replica: WindowState) async {
+            WindowStatesManager.shared.unregisterWindowState(replica)
+            await replica.tearDown()
+        }
+
         func call(_ op: String, _ fields: [String: Value]) async throws -> [String: Value] {
             let service = SessionAdminMCPToolService(
                 captureRequestMetadata: {
@@ -1267,7 +1513,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             )
             var arguments = fields
             arguments["op"] = .string(op)
-            if op != "undo", op != "inventory" { arguments["session_id"] = .string(targetTab.activeAgentSessionID!.uuidString) }
+            if op != "undo", op != "inventory", op != "reorder_groups" {
+                arguments["session_id"] = .string(targetTab.activeAgentSessionID!.uuidString)
+            }
             let reply = try await service.execute(args: arguments)
             return try XCTUnwrap(reply.objectValue)
         }
@@ -1321,7 +1569,12 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
 
         func cleanup() async {
             WindowStatesManager.shared.unregisterWindowState(window)
+            if runtime != nil {
+                window.beginClose()
+                await window.joinDomainWorkspaceBridgeForTesting()
+            }
             await window.tearDown()
+            if let runtime { await runtime.shutdown() }
             try? FileManager.default.removeItem(at: directory)
         }
     }

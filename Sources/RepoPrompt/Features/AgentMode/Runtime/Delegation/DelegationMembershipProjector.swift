@@ -25,6 +25,8 @@ struct DelegationSessionProvenance: Hashable {
     let boundWorktreeIDs: Set<String>
     /// Run state for state-dependent requirements (`retire` of a running target needs `control`).
     let runState: DomainDelegationScopeTargetState
+    /// Request-local evidence for payload operations, independent of replicated UI placement.
+    let hasUniqueRuntimeOwner: Bool
 
     init(
         sessionID: UUID,
@@ -36,7 +38,8 @@ struct DelegationSessionProvenance: Hashable {
         isLive: Bool,
         worktreeCount: Int = 0,
         boundWorktreeIDs: Set<String> = [],
-        runState: DomainDelegationScopeTargetState = .unknown
+        runState: DomainDelegationScopeTargetState = .unknown,
+        hasUniqueRuntimeOwner: Bool = false
     ) {
         self.sessionID = sessionID
         self.workspaceID = workspaceID
@@ -48,6 +51,7 @@ struct DelegationSessionProvenance: Hashable {
         self.worktreeCount = worktreeCount
         self.boundWorktreeIDs = boundWorktreeIDs
         self.runState = runState
+        self.hasUniqueRuntimeOwner = hasUniqueRuntimeOwner
     }
 
     /// Tree placement: organizational parent, else spawn parent, else lane creator.
@@ -361,7 +365,8 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         switch scope.kind {
         case let .session(managedTarget):
             guard targetSessionID == managedTarget || targetSessionID == scope.granteeSessionID,
-                  pointResolutionState(for: targetSessionID) != .replicated else { return nil }
+                  pointResolutionState(for: targetSessionID) != .replicated
+                  || source.provenance(for: targetSessionID)?.hasUniqueRuntimeOwner == true else { return nil }
             return DomainDelegationScopeMembershipProof(scopeID: scope.id, targetSessionID: targetSessionID, basis: .exactSession)
         case let .tree(rootSessionID):
             let rootState = pointResolutionState(for: rootSessionID)

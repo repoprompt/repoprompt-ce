@@ -183,20 +183,8 @@ enum AgentSessionTargetOperationGuard {
         provenance: DomainAgentSessionTargetProvenance,
         reference: String
     ) throws {
-        // Global Overseer auto-approve: a routed Agent session may run every existing target
-        // operation on any other session, including ones that are otherwise direct-child or
-        // human-only. Unresolved routing and self-targeting still fail closed.
-        if case let .agentSession(callerSessionID) = caller, OverseerGlobalAutoApprove.isEnabled(),
-           provenance.targetSessionID != callerSessionID
-        {
-            return
-        }
-        let decision = DomainAgentSessionOperationAuthorizer.authorize(
-            operation: operation,
-            caller: caller,
-            target: provenance
-        )
-        guard decision.isAuthorized else {
+        // The decision (full access, direct-child and human-only rules) is the engine's.
+        guard OverseerAuthorizationEngine.current.authorizesTargetOperation(operation, caller: caller, provenance: provenance) else {
             throw denialError(reference: reference)
         }
     }
@@ -229,22 +217,19 @@ enum AgentSessionTargetOperationGuard {
             targetWindow: targetWindow,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID
         )
-        switch caller {
-        case .administrativePrincipal:
-            return
-        case .unresolvedAgentRun:
-            throw denialError(sessionID: targetSessionID)
-        case let .agentSession(callerSessionID):
-            if callerSessionID == targetSessionID || OverseerGlobalAutoApprove.isEnabled() { return }
-            if await resolveTargetProvenance(targetSessionID).parentSessionID == callerSessionID { return }
-            if let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
-               endpoint.sessionID == callerSessionID,
-               await hasManageGrant(endpoint, targetSessionID)
-            {
-                return
+        let authorized = await OverseerAuthorizationEngine.current.authorizesWorktreeBinding(
+            caller: caller,
+            targetSessionID: targetSessionID,
+            spawnParentSessionID: { await resolveTargetProvenance(targetSessionID).parentSessionID },
+            callerHoldsManageGrant: {
+                guard case let .agentSession(callerSessionID) = caller,
+                      let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
+                      endpoint.sessionID == callerSessionID
+                else { return false }
+                return await hasManageGrant(endpoint, targetSessionID)
             }
-            throw denialError(sessionID: targetSessionID)
-        }
+        )
+        guard authorized else { throw denialError(sessionID: targetSessionID) }
     }
 
     /// Resolves provenance and authorizes one target in a single step.
