@@ -1,5 +1,7 @@
 import Foundation
+import os
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import XCTest
 
@@ -319,3 +321,294 @@ final class CodexAppServerFramingTests: XCTestCase {
         return frame
     }
 }
+
+// MARK: - Assembled Codex turn input boundary
+
+#if DEBUG
+    final class CodexInputBoundaryTests: XCTestCase {
+        private let limit = 1_048_576
+
+        func testFinalTurnRequestsRejectOnlyAboveScalarAggregateBeforeDispatch() async throws {
+            let fixture = BoundaryTransport()
+            await fixture.install()
+            defer { fixture.release() }
+            for method in ["turn/start", "turn/steer"] {
+                for count in [limit - 1, limit, limit + 1] {
+                    let before = fixture.frames.count
+                    let text = String(repeating: "😀", count: count)
+                    do {
+                        _ = try await fixture.client.request(method: method, params: ["threadId": "fixture", "input": [["type": "text", "text": text]]], timeout: 2)
+                        XCTAssertLessThanOrEqual(count, limit, "Oversized input reached dispatch")
+                        XCTAssertEqual(fixture.frames.count, before + 1)
+                        let frame = try XCTUnwrap(fixture.frames.last)
+                        let params = try XCTUnwrap(frame["params"] as? [String: Any])
+                        let inputs = try XCTUnwrap(params["input"] as? [[String: Any]])
+                        XCTAssertEqual(inputs.first?["text"] as? String, text, "Accepted input must remain byte-for-byte intact")
+                    } catch {
+                        XCTAssertGreaterThan(count, limit)
+                        assertInputFailure(error, method: method, actual: count)
+                        XCTAssertEqual(fixture.frames.count, before, "Rejected input must never be written")
+                    }
+                    let pending = await fixture.client.debugPendingRequestCount()
+                    let timers = await fixture.client.debugTimeoutTaskCount()
+                    XCTAssertEqual(pending, 0)
+                    XCTAssertEqual(timers, 0)
+                }
+            }
+            await fixture.client.stop()
+        }
+
+        func testAggregationDecodedUnicodeAndNontextVariantsAtActualRequestBoundary() async throws {
+            let fixture = BoundaryTransport()
+            await fixture.install()
+            defer { fixture.release() }
+            // Swift graphemes=524289, UTF8 bytes>limit, Unicode scalars=limit+1.
+            let decomposed = String(repeating: "e\u{301}", count: limit / 2)
+            let inputs: [[String: Any]] = [
+                ["type": "text", "text": decomposed], ["type": "text", "text": "é"],
+                ["type": "image", "url": String(repeating: "x", count: limit + 1)],
+                ["type": "localImage", "path": "/fixture"], ["type": "audio", "audio": "fixture"],
+                ["type": "localAudio", "path": "/fixture"], ["type": "skill", "name": "fixture", "path": "/fixture"],
+                ["type": "mention", "name": "fixture", "path": "/fixture"]
+            ]
+            do {
+                _ = try await fixture.client.request(method: "turn/steer", params: ["input": inputs], timeout: 2)
+                XCTFail("Individually admissible text items must share one allowance")
+            } catch { assertInputFailure(error, method: "turn/steer", actual: limit + 1) }
+            XCTAssertTrue(fixture.frames.isEmpty)
+            let accepted = Array(inputs.dropFirst(2)) + [["type": "text", "text": String(decomposed.dropLast(2)) + "\"\n\\😀"]]
+            // Escaping increases serialized bytes, not decoded scalar count. Nontext contributes zero.
+            _ = try await fixture.client.request(method: "turn/start", params: ["input": accepted], timeout: 2)
+            XCTAssertEqual(fixture.frames.count, 1)
+            // This separate field is not a turn-input quota; only thread/start owns it.
+            _ = try await fixture.client.request(method: "thread/start", params: ["baseInstructions": String(repeating: "x", count: limit + 1)], timeout: 2)
+            XCTAssertEqual(fixture.frames.count, 2)
+            await fixture.client.stop()
+        }
+
+        func testControllerAssemblyTrimsBeforeCountingAndRetainsImagesAndText() async throws {
+            let fixture = BoundaryTransport()
+            await fixture.install()
+            defer { fixture.release() }
+            let text = String(repeating: "é", count: limit)
+            let input = try CodexNativeSessionController.turnInput(text: " \n" + text + "\t ", images: [
+                AgentImageAttachment(source: .url(" https://fixture.invalid/image "), title: nil),
+                AgentImageAttachment(source: .localFile(path: " /fixture/image.png "), title: nil)
+            ])
+            _ = try await fixture.client.request(method: "turn/start", params: ["input": input], timeout: 2)
+            XCTAssertEqual(input.count, 3)
+            XCTAssertEqual(input.last?["text"] as? String, text)
+            XCTAssertEqual(input.first?["url"] as? String, "https://fixture.invalid/image")
+            XCTAssertEqual(input[1]["path"] as? String, "/fixture/image.png")
+            let oversized = try CodexNativeSessionController.turnInput(text: " " + text + "x ", images: [])
+            do {
+                _ = try await fixture.client.request(method: "turn/start", params: ["input": oversized], timeout: 2)
+                XCTFail("Final trimmed text must be guarded")
+            } catch { assertInputFailure(error, method: "turn/start", actual: limit + 1) }
+            XCTAssertEqual(fixture.frames.count, 1)
+            await fixture.client.stop()
+        }
+
+        @MainActor
+        func testStructuredUpstreamRejectionSurvivesProviderStreamWithoutRetryAndCleansUp() async throws {
+            let fixture = BoundaryTransport(upstreamRejection: true)
+            await fixture.install()
+            defer { fixture.release() }
+            let controller = BoundaryFailureController(client: fixture.client)
+            // Invalid disposable runtime selection makes discovery fail closed; no real config/provider is provisioned.
+            let provider = CodexCLIProvider(launchSnapshot: .init(selection: .external(path: "/nonexistent/codex-boundary-fixture")), sessionControllerFactory: { _, _ in controller })
+            let stream = try await provider.streamMessage(AIMessage(systemPrompt: "separate instructions", userMessage: "fixture"), model: .gpt54Mini)
+            do {
+                for try await _ in stream {}
+                XCTFail("Expected upstream rejection")
+            } catch {
+                guard case let AIProviderError.apiError(source) = error else { return XCTFail("Wrong provider classification: \(type(of: error))") }
+                try assertInputFailure(XCTUnwrap(source), method: "turn/start", actual: limit + 7)
+                XCTAssertFalse(error.localizedDescription.contains("private_fixture_data"), "Arbitrary upstream data is not user-facing")
+            }
+            XCTAssertEqual(controller.attempts, 1)
+            XCTAssertEqual(controller.shutdowns, 1)
+            XCTAssertEqual(fixture.frames.count, 1)
+            await fixture.client.stop()
+        }
+
+        @MainActor
+        func testProviderGuardsItsAssembledPromptAndKeepsSeparateInstructionsOutsideAllowance() async throws {
+            for oversized in [false, true] {
+                let fixture = BoundaryTransport()
+                await fixture.install()
+                let controller = BoundaryFailureController(client: fixture.client)
+                let provider = CodexCLIProvider(launchSnapshot: .init(selection: .external(path: "/nonexistent/codex-boundary-fixture")), sessionControllerFactory: { _, _ in controller })
+                let message = AIMessage(systemPrompt: String(repeating: "x", count: limit + 1), userMessage: oversized ? String(repeating: "é", count: limit) : "fixture")
+                let stream = try await provider.streamMessage(message, model: .gpt54Mini)
+                do {
+                    var results: [AIStreamResult] = []
+                    for try await result in stream {
+                        results.append(result)
+                    }
+                    XCTAssertFalse(oversized)
+                    XCTAssertEqual(results.last?.type, "message_stop")
+                    XCTAssertEqual(fixture.frames.count, 1)
+                } catch {
+                    XCTAssertTrue(oversized)
+                    guard case let AIProviderError.apiError(source) = error else { return XCTFail("Lost provider error source") }
+                    let assembled = try XCTUnwrap(controller.submittedText)
+                    XCTAssertGreaterThan(assembled.unicodeScalars.count, limit, "Count includes the real provider reminder/conversation envelope")
+                    try assertInputFailure(XCTUnwrap(source), method: "turn/start", actual: assembled.unicodeScalars.count)
+                    XCTAssertTrue(fixture.frames.isEmpty)
+                }
+                XCTAssertEqual(controller.attempts, 1)
+                XCTAssertEqual(controller.shutdowns, 1)
+                XCTAssertEqual(controller.baseInstructions?.unicodeScalars.count, limit + 1)
+                await fixture.client.stop()
+                fixture.release()
+            }
+        }
+
+        private func assertInputFailure(_ error: Error, method: String, actual: Int, file: StaticString = #filePath, line: UInt = #line) {
+            guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error else { return XCTFail("Lost typed request failure: \(type(of: error))", file: file, line: line) }
+            XCTAssertEqual(failure.method, method, file: file, line: line)
+            XCTAssertEqual(failure.code, -32602, file: file, line: line)
+            guard case let .object(data) = failure.data else { return XCTFail("Missing structured boundary data", file: file, line: line) }
+            XCTAssertEqual(data["input_error_code"], .string("input_too_large"), file: file, line: line)
+            XCTAssertEqual(data["max_chars"], .number(Double(limit)), file: file, line: line)
+            XCTAssertEqual(data["actual_chars"], .number(Double(actual)), file: file, line: line)
+            XCTAssertTrue(failure.userFacingMessage.contains("Reduce"), file: file, line: line)
+        }
+    }
+
+    private final class BoundaryTransport: @unchecked Sendable {
+        private struct State { var client: CodexAppServerClient?
+            var frames: [[String: Any]] = []
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        private let upstreamRejection: Bool
+        lazy var client: CodexAppServerClient = {
+            let client = CodexAppServerClient(writeFrameHandler: { [weak self] _, bytes in
+                guard let self else { throw CodexAppServerClient.ClientError.processNotRunning }
+                let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+                let client = state.withLock { state in state.frames.append(frame)
+                    return state.client
+                }
+                var response: [String: Any] = ["id": frame["id"]!]
+                if upstreamRejection {
+                    response["error"] = ["code": -32602, "message": "Input exceeds the maximum length of 1048576 characters. Network timeout diagnostic.", "data": ["input_error_code": "input_too_large", "max_chars": 1_048_576, "actual_chars": 1_048_583, "private_fixture_data": "must not be displayed"]]
+                } else { response["result"] = ["turn": ["id": "fixture-turn"], "turnId": "fixture-turn"] }
+                let encoded = try JSONSerialization.data(withJSONObject: response)
+                Task { await client?.debugIngestRawStdoutLine(encoded) }
+            })
+            state.withLock { $0.client = client }
+            return client
+        }()
+
+        init(upstreamRejection: Bool = false) {
+            self.upstreamRejection = upstreamRejection
+        }
+
+        var frames: [[String: Any]] {
+            state.withLock { $0.frames }
+        }
+
+        func install() async {
+            await client.debugInstallTestTransport()
+        }
+
+        func release() {
+            state.withLock { $0.client = nil }
+        }
+    }
+
+    private final class BoundaryFailureController: CodexSessionControlling {
+        let client: CodexAppServerClient
+        var attempts = 0
+        var shutdowns = 0
+        var submittedText: String?
+        var baseInstructions: String?
+        var hasActiveThread: Bool {
+            true
+        }
+
+        var events: AsyncStream<CodexNativeSessionController.Event> {
+            AsyncStream { $0.yield(.turnCompleted(turnID: "fixture-turn", status: .completed, failure: nil))
+                $0.finish()
+            }
+        }
+
+        init(client: CodexAppServerClient) {
+            self.client = client
+        }
+
+        func ensureEventsStreamReady() {}
+        func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
+            self.baseInstructions = baseInstructions
+            return .init(conversationID: "fixture", rolloutPath: nil, model: nil, reasoningEffort: nil)
+        }
+
+        func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
+            try await startOrResume(existing: existing, baseInstructions: baseInstructions)
+        }
+
+        func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
+            try await startOrResume(existing: existing, baseInstructions: baseInstructions)
+        }
+
+        func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
+            attempts += 1
+            submittedText = text
+            let result = try await client.request(method: "turn/start", params: ["input": CodexNativeSessionController.turnInput(text: text, images: images)], timeout: 2)
+            let turn = try XCTUnwrap(result["turn"] as? [String: Any])
+            return try CodexTurnStartReceipt(provisionalSubmissionID: XCTUnwrap(turn["id"] as? String))
+        }
+
+        func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func readThreadSnapshot(includeTurns: Bool, timeout: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func setThreadName(_ name: String, threadID: String?) async throws {}
+        func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(expectedCurrentTurnID: String, acceptedDispatchTurnID: String) async -> Bool {
+            false
+        }
+
+        func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func compactThread() async throws {}
+        func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
+            nil
+        }
+
+        func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func setThreadGoalStatus(_ status: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        func clearThreadGoal() async throws -> Bool {
+            false
+        }
+
+        func pendingTurnFailure(turnID: String?) async -> CodexNativeSessionController.TurnFailure? {
+            nil
+        }
+
+        func acknowledgePendingTurnFailure(turnID: String?, failure: CodexNativeSessionController.TurnFailure) async {}
+        func cancelCurrentTurn() async {}
+        func shutdown() async {
+            shutdowns += 1
+        }
+
+        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
+    }
+#endif

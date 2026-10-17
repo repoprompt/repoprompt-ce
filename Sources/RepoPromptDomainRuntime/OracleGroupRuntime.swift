@@ -16,6 +16,17 @@ package struct OracleGroupRuntime: Sendable {
         self.now = now
     }
 
+    package func recoverInterruptedTurn(
+        _ document: OracleGroupDocument,
+        claim: OracleGroupClaim
+    ) async throws -> OracleGroupDocument {
+        guard !claim.isReleased, claim.groupID == document.group.id, claim.owner == document.owner else {
+            throw RuntimeError.continuationChanged
+        }
+        guard document.turns.last?.state == .prepared else { return document }
+        return try await publishInterrupted(document)
+    }
+
     package func execute(
         _ request: Request,
         callbacks: Callbacks

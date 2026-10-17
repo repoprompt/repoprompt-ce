@@ -298,8 +298,13 @@ final class CodexCLIProvider: AIProvider {
                     )
                 }
                 return text.lowercased().contains("ok")
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 let detail = appServerErrorDetail(from: error)
+                if Self.isInputTooLarge(error) {
+                    throw mapAppServerFailure(error: error, detail: detail, timeoutValue: appliedTimeout)
+                }
                 if !didRetryManagedAuthRecovery,
                    CodexManagedAuthRecoveryClassifier.isRecoverable(message: detail)
                 {
@@ -372,16 +377,24 @@ final class CodexCLIProvider: AIProvider {
                 return
             } catch is CancellationError {
                 throw CancellationError()
-            } catch let failure as StreamAttemptFailure {
-                let detail = appServerErrorDetail(from: failure.underlying)
+            } catch {
+                let failure = error as? StreamAttemptFailure
+                let underlying = failure?.underlying ?? error
+                if underlying is CancellationError { throw CancellationError() }
+                let emittedOutput = failure?.emittedOutput ?? false
+                let detail = appServerErrorDetail(from: underlying)
+                if Self.isInputTooLarge(underlying) {
+                    throw mapAppServerFailure(error: underlying, detail: detail, timeoutValue: defaultRequestTimeout)
+                }
 
-                if failure.emittedOutput,
+                if emittedOutput,
                    CodexManagedAuthRecoveryClassifier.isRecoverable(message: detail)
                 {
                     throw AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                 }
 
-                if !failure.emittedOutput {
+                if !emittedOutput {
+                    let permitsAttemptRetry = failure != nil
                     if !didRetryManagedAuthRecovery,
                        CodexManagedAuthRecoveryClassifier.isRecoverable(message: detail)
                     {
@@ -396,7 +409,7 @@ final class CodexCLIProvider: AIProvider {
                         }
                     }
 
-                    if !didRetryBrokenServer,
+                    if permitsAttemptRetry, !didRetryBrokenServer,
                        let brokenServer = CodexProviderHelpers.extractBrokenServerName(from: detail)
                     {
                         let isRepoPrompt = brokenServer.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
@@ -407,7 +420,7 @@ final class CodexCLIProvider: AIProvider {
                         continue
                     }
 
-                    if !didRetryModelFallback,
+                    if permitsAttemptRetry, !didRetryModelFallback,
                        let fallbackModel = CodexProviderHelpers.codexFallbackModelIfNeeded(
                            attemptedModel: activeModelIdentifier,
                            errorDetail: detail
@@ -418,7 +431,7 @@ final class CodexCLIProvider: AIProvider {
                         continue
                     }
 
-                    if attempt <= maxRetries,
+                    if permitsAttemptRetry, attempt <= maxRetries,
                        shouldRetry(detail: detail, timedOut: isTimeoutDetail(detail))
                     {
                         let jitter = Double.random(in: 0.8 ... 1.2)
@@ -429,23 +442,7 @@ final class CodexCLIProvider: AIProvider {
                     }
                 }
 
-                throw mapAppServerFailure(error: failure.underlying, detail: detail, timeoutValue: defaultRequestTimeout)
-            } catch {
-                let detail = appServerErrorDetail(from: error)
-                if !didRetryManagedAuthRecovery,
-                   CodexManagedAuthRecoveryClassifier.isRecoverable(message: detail)
-                {
-                    didRetryManagedAuthRecovery = true
-                    switch await authRecovery.refreshManagedAccount() {
-                    case .recovered:
-                        continue
-                    case let .requiresUserLogin(message):
-                        throw AIProviderError.invalidConfiguration(detail: message)
-                    case let .executableUnavailable(message):
-                        throw AIProviderError.invalidConfiguration(detail: message)
-                    }
-                }
-                throw mapAppServerFailure(error: error, detail: detail, timeoutValue: defaultRequestTimeout)
+                throw mapAppServerFailure(error: underlying, detail: detail, timeoutValue: defaultRequestTimeout)
             }
         }
 
@@ -1138,6 +1135,11 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private func mapAppServerFailure(error: Error, detail: String, timeoutValue: TimeInterval) -> Error {
+        // Typed oversize rejection first: its text carries char counts (for example 1,050,429) and
+        // diagnostics that the heuristics below would misread as rate limiting or a timeout.
+        if Self.isInputTooLarge(error) {
+            return AIProviderError.apiError(source: error)
+        }
         if let providerError = error as? AIProviderError {
             return providerError
         }
@@ -1158,6 +1160,11 @@ final class CodexCLIProvider: AIProvider {
         if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") || lower.contains("503") {
             return AIProviderError.invalidConfiguration(detail: "Codex servers look overloaded. We attempted retries; please try again shortly.")
         }
+        // Keep method/code/data on the existing typed failure, without copying arbitrary data
+        // into user-facing text or a second NSError representation.
+        if case CodexAppServerClient.ClientError.requestFailed = error {
+            return AIProviderError.apiError(source: error)
+        }
         if detail.isEmpty {
             return AIProviderError.apiError(source: error)
         }
@@ -1168,6 +1175,11 @@ final class CodexCLIProvider: AIProvider {
                 userInfo: [NSLocalizedDescriptionKey: detail]
             )
         )
+    }
+
+    private static func isInputTooLarge(_ error: Error) -> Bool {
+        guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error else { return false }
+        return failure.isInputTooLarge
     }
 
     private func appServerErrorDetail(from error: Error) -> String {

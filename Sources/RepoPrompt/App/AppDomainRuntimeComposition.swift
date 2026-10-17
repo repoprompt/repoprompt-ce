@@ -38,6 +38,8 @@ final class AppDomainRuntimeComposition: Sendable {
     ]
 
     let oracleConversationStore: DomainOracleConversationStore
+    /// The one app claim namespace: group execution and explicit lane continuations both acquire it.
+    let oracleGroupClaimManager: OracleGroupClaimManager
     let oracleGroupRuntime: OracleGroupRuntime
     private let defaultRuntime: MCPDomainRuntime
 
@@ -145,7 +147,7 @@ final class AppDomainRuntimeComposition: Sendable {
             persistence: runtime.persistenceCoordinator,
             identity: runtime.identity
         )
-        let oracleGroupClaimManager = OracleGroupClaimManager(
+        oracleGroupClaimManager = OracleGroupClaimManager(
             persistence: runtime.persistenceCoordinator,
             identity: runtime.identity
         )

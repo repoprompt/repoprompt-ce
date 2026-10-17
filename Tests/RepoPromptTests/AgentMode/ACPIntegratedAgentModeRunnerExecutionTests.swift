@@ -640,9 +640,14 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
     }
 
     @MainActor
-    func testSubstantiveTerminalTextAndArraysReplaceProviderLifecycleOnBothRunnerPaths() throws {
+    func testRawOutputLifecycleTerminalUpdatesOnBothRunnerPaths() throws {
         for trackerPath in [false, true] {
-            for output: Any in ["terminal finding", [["type": "text", "text": "terminal finding"]]] {
+            for (terminalStatus, output) in [
+                ("completed", [String: Any]() as Any), ("completed", [Any]() as Any),
+                ("completed", "terminal finding" as Any), ("completed", [["type": "text", "text": "terminal finding"]] as Any),
+                ("failed", [Any]() as Any), ("failed", "Tool execution aborted" as Any),
+                ("failed", ["error": "Tool execution aborted"] as Any)
+            ] {
                 let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
                 let session = harness.makeSession(agent: .devin)
                 let runner = ACPIntegratedAgentModeRunner(
@@ -674,19 +679,504 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
                     }
                     return result
                 }
-                let running = try deliver("running")
+                let running = try deliver("running", output: ["output": "streamed finding"])
                 let rowID = try XCTUnwrap(session.items.first).id
-                let terminal = try deliver("completed", output: output)
+                let terminal = try deliver(terminalStatus, output: output)
                 XCTAssertEqual(session.items.count, 1)
                 let row = try XCTUnwrap(session.items.first)
                 XCTAssertEqual(row.id, rowID)
                 XCTAssertEqual(row.toolInvocationID, running.toolInvocationID)
-                XCTAssertEqual(row.toolResultJSON, terminal.toolResultJSON, "tracker path: \(trackerPath)")
-                XCTAssertEqual(row.text, terminal.toolResultJSON)
-                XCTAssertEqual(row.toolIsError, false)
-                XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: row)?.status, .success)
+                if terminalStatus == "completed", AgentToolResultPayloadRetention.terminalMarkerStatus(terminal.toolResultJSON) != nil {
+                    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(XCTUnwrap(row.toolResultJSON).utf8)) as? [String: Any])
+                    XCTAssertEqual(object["status"] as? String, "completed", "tracker path: \(trackerPath)")
+                    XCTAssertEqual((object["rawOutput"] as? [String: Any])?["output"] as? String, "streamed finding")
+                    XCTAssertTrue(row.toolResultJSON?.contains("working") == true)
+                } else {
+                    XCTAssertEqual(row.toolResultJSON, terminal.toolResultJSON, "tracker path: \(trackerPath)")
+                }
+                XCTAssertEqual(row.text, row.toolResultJSON)
+                XCTAssertEqual(row.toolIsError, terminalStatus == "failed")
+                XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: row)?.status, terminalStatus == "failed" ? .failed : .success)
             }
         }
+    }
+
+    @MainActor
+    func testNestedNativeRawOutputSurvivesTerminalEchoOnBothRunnerPaths() async throws {
+        let storage = try makeTestDirectory(name: "NativeObservationParity")
+        let workspace = WorkspaceModel(name: "Native observation parity", repoPaths: [], customStoragePath: storage)
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9857, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer {
+            composition.contextBuilderAgentViewModel.prepareForWindowClose()
+            composition.workspaceManager.prepareForWindowClose()
+        }
+        addTeardownBlock { await composition.workspaceManager.awaitOwnSavesForWindowClose() }
+        let tabID = UUID()
+        func restore(_ item: AgentChatItem) async throws -> AgentChatItem {
+            let saved = AgentSession(
+                workspaceID: workspace.id, composeTabID: tabID, name: "Native observation",
+                transcript: AgentTranscriptIO.importLegacyItems([.user("Inspect", sequenceIndex: 0), item]), lastRunState: "completed"
+            )
+            let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+            let bytes = try String(contentsOf: file, encoding: .utf8)
+            XCTAssertFalse(bytes.contains("PRIVATE_INPUT"))
+            XCTAssertFalse(bytes.contains("PRIVATE_RESPONSE_BODY"))
+            let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+            let projection = try AgentTranscriptProjectionBuilder.build(from: XCTUnwrap(loaded.transcript))
+            let rows = (projection.archivedBlocks + projection.workingBlocks).flatMap(\.rows)
+            let restored = try XCTUnwrap(rows.first { $0.kind == .toolResult && $0.toolInvocationID == item.toolInvocationID })
+            XCTAssertNil(restored.toolArgsJSON)
+            XCTAssertLessThanOrEqual(try XCTUnwrap(restored.toolResultJSON).utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+            return restored
+        }
+        func verifyFailedTicketObservation(_ item: AgentChatItem, expectedJobStatus: String) async throws {
+            for (restored, row) in try await [(false, item), (true, restore(item))] {
+                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: row.toolResultJSON))
+                XCTAssertEqual(dto.ticket?.job.status.rawValue, expectedJobStatus)
+                XCTAssertEqual(row.toolIsError, true)
+                let context = ContextBuilderCardContext(
+                    tabID: tabID, contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+                    oracleOpenContext: .init(windowID: -9857, workspaceID: workspace.id, tabID: tabID),
+                    transcriptMetadata: ContextBuilderTranscriptMetadata(rows: [row])
+                )
+                let card = ContextBuilderResultCard(item: row, context: context)
+                XCTAssertEqual(card.status, .failure, "Failed control observation must remain visible, restored=\(restored)")
+                XCTAssertTrue(card.summary.contains("Observation failed"), card.summary)
+                XCTAssertTrue(card.summary.contains(expectedJobStatus), "Do not rewrite job state: \(card.summary)")
+                if restored, expectedJobStatus != "completed" {
+                    XCTAssertTrue(card.summary.contains("Live job state unknown"), card.summary)
+                }
+                XCTAssertNil(card.followUpChatID, "A transport error must not grant running/unknown/completed tickets recovery authority")
+                if expectedJobStatus == "completed" {
+                    let later = try AgentChatItem.toolResult(
+                        name: "context_builder", invocationID: UUID(), argsJSON: nil,
+                        resultJSON: XCTUnwrap(row.toolResultJSON), isError: false, sequenceIndex: row.sequenceIndex + 1
+                    )
+                    let historicalContext = ContextBuilderCardContext(
+                        tabID: tabID, contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+                        oracleOpenContext: context.oracleOpenContext,
+                        transcriptMetadata: ContextBuilderTranscriptMetadata(rows: [row, later])
+                    )
+                    let historical = ContextBuilderResultCard(item: row, context: historicalContext)
+                    XCTAssertEqual(historical.status, .failure, "Historical observation must not hide its control failure")
+                    XCTAssertTrue(historical.summary.contains("Observation failed"), historical.summary)
+                }
+                var clean = row
+                clean.toolIsError = false
+                let cleanCard = ContextBuilderResultCard(item: clean, context: context)
+                XCTAssertFalse(cleanCard.summary.contains("Observation failed"))
+                if expectedJobStatus != "completed" { XCTAssertEqual(cleanCard.status, .neutral) }
+                let foreign = ContextBuilderCardContext(
+                    tabID: UUID(), contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+                    oracleOpenContext: context.oracleOpenContext, transcriptMetadata: context.transcriptMetadata
+                )
+                XCTAssertNil(ContextBuilderResultCard(item: row, context: foreign).followUpChatID)
+            }
+        }
+        let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .completed, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "retained answer"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .completed, response: "retained answer")
+        ])
+        let groupObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(ToolOutputFormatter.rawJSONString(.object(OracleGroupMCPCodec.groupFields(group))).utf8)) as? [String: Any])
+        let jobID = UUID().uuidString
+        let ticket: [String: Any] = [
+            "job_id": jobID,
+            "job": ["id": jobID, "context_id": tabID.uuidString, "status": "running", "revision": 3, "chat_id": "captured-chat"]
+        ]
+        let ticketVariants = try ["running", "cancelling", "unknown", "completed"].map { status in
+            var value = ticket
+            var job = try XCTUnwrap(ticket["job"] as? [String: Any])
+            job["status"] = status
+            value["job"] = job
+            return value
+        }
+        for trackerPath in [false, true] {
+            for native in [groupObject] + ticketVariants {
+                for (terminalStatus, echo) in [
+                    ("completed", [Any]() as Any), ("completed", "terminal echo" as Any),
+                    ("completed", [["type": "text", "text": "terminal echo"]] as Any),
+                    ("failed", [Any]() as Any), ("failed", "Tool execution aborted" as Any),
+                    ("failed", ["error": "Tool execution aborted"] as Any)
+                ] {
+                    let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                    let session = harness.makeSession(agent: .devin)
+                    let runner = ACPIntegratedAgentModeRunner(
+                        hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+                        toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
+                        controllerFactory: { provider, request in
+                            try ACPAgentSessionController(provider: provider, runRequest: request)
+                        }
+                    )
+                    let toolName = native["job"] == nil ? "ask_oracle" : "context_builder"
+                    func deliver(_ status: String, output: Any) throws -> AIStreamResult {
+                        let events = ACPDefaultSessionUpdateNormalizer.normalize([
+                            "sessionUpdate": "tool_call_update", "toolCallId": "native-raw-output", "title": toolName,
+                            "status": status, "rawOutput": output, "content": [["type": "text", "text": "provider echo"]]
+                        ], providerID: .devin)
+                        guard case let .stream(result) = events.first else { throw NSError(domain: "Missing ACP event", code: 1) }
+                        if trackerPath {
+                            try runner.testHandleTrackerToolResult(
+                                invocationID: XCTUnwrap(result.toolInvocationID), toolName: toolName, args: nil,
+                                resultJSON: XCTUnwrap(result.toolResultJSON), isError: result.toolIsError == true, session: session
+                            )
+                        } else {
+                            XCTAssertTrue(try runner.handleToolStreamEvent(.toolResult(.init(
+                                toolName: toolName, invocationID: result.toolInvocationID, argsJSON: nil,
+                                resultJSON: XCTUnwrap(result.toolResultJSON), isError: result.toolIsError
+                            )), session: session))
+                        }
+                        return result
+                    }
+                    _ = try deliver("running", output: native)
+                    let rowID = try XCTUnwrap(session.items.first?.id)
+                    let terminal = try deliver(terminalStatus, output: echo)
+                    XCTAssertEqual(session.items.map(\.id), [rowID])
+                    let row = try XCTUnwrap(session.items.first)
+                    let payload = try XCTUnwrap(row.toolResultJSON)
+                    guard let object = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any] else {
+                        XCTFail("Provider terminal echo erased the native envelope: \(payload)")
+                        continue
+                    }
+                    let expectedOuterStatus = terminalStatus == "completed" && AgentToolResultPayloadRetention.terminalMarkerStatus(terminal.toolResultJSON) != nil ? "completed" : "running"
+                    XCTAssertEqual(row.toolIsError, terminalStatus == "failed", "Transport failure remains visible on both paths")
+                    XCTAssertEqual(object["status"] as? String, expectedOuterStatus, "tracker path: \(trackerPath)")
+                    guard let retained = object["rawOutput"] as? [String: Any] else {
+                        XCTFail("Failed provider echo erased the nested native facts: \(payload)")
+                        continue
+                    }
+                    XCTAssertEqual(NSDictionary(dictionary: retained), NSDictionary(dictionary: native))
+                    if native["job"] != nil {
+                        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: row.toolResultJSON))
+                        XCTAssertEqual(dto.ticket?.jobID.uuidString, jobID)
+                        let nativeStatus = try XCTUnwrap((native["job"] as? [String: Any])?["status"] as? String)
+                        XCTAssertEqual(dto.ticket?.job.status.rawValue, nativeStatus, "Provider completion must not finish the app-owned job")
+                        if terminalStatus == "failed" {
+                            var observed = row
+                            observed.toolArgsJSON = #"{"op":"wait","message":"PRIVATE_INPUT"}"#
+                            try await verifyFailedTicketObservation(observed, expectedJobStatus: nativeStatus)
+                        }
+                    }
+                    var replacement = native
+                    if var job = native["job"] as? [String: Any] {
+                        job["revision"] = 4
+                        job["status"] = "cancelled"
+                        replacement["job"] = job
+                    } else if var lanes = native["oracle_results"] as? [[String: Any]] {
+                        lanes[0]["response"] = "new canonical answer"
+                        replacement["oracle_results"] = lanes
+                    }
+                    let newerEnvelope = try deliver("running", output: replacement)
+                    XCTAssertEqual(session.items.first?.toolResultJSON, newerEnvelope.toolResultJSON, "A genuine nested native update must replace the older facts")
+                    let directNative = try deliver("failed", output: replacement)
+                    XCTAssertEqual(session.items.first?.toolResultJSON, directNative.toolResultJSON, "A genuine direct native result still replaces its envelope")
+                    XCTAssertEqual(session.items.first?.toolIsError, true)
+                }
+            }
+        }
+
+        let partial = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "PRIVATE_RESPONSE_BODY"),
+            OracleLaneResult(
+                laneIndex: 1,
+                chatID: "sibling",
+                providerID: nil,
+                modelID: "sibling-model",
+                status: .cancelled,
+                error: OracleLaneError(code: "cancelled", message: "Sibling cancelled")
+            )
+        ])
+        var fields = OracleGroupMCPCodec.groupFields(partial)
+        fields["chat_id"] = .string(partial.primary.chatID)
+        fields["mode"] = .string("review")
+        fields["response"] = .string("PRIVATE_RESPONSE_BODY")
+        let partialJSON = ToolOutputFormatter.rawJSONString(.object(fields))
+        let partialObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(partialJSON.utf8)) as? [String: Any])
+        var representations = [("direct", partialJSON)]
+        for provider in [ACPProviderID.devin, .cursor] {
+            for stringOutput in [false, true] {
+                for conflictingContent in [false, true] {
+                    var update: [String: Any] = [
+                        "sessionUpdate": "tool_call_update", "toolCallId": "partial-group", "title": "ask_oracle",
+                        "status": provider == .cursor ? "completed" : "running", "rawOutput": stringOutput ? partialJSON : partialObject
+                    ]
+                    if conflictingContent { update["content"] = [["type": "text", "text": #"{"status":"completed","chat_id":"wrong-chat"}"#]] }
+                    let events = provider == .cursor
+                        ? CursorACPEventNormalizer.normalize(update)
+                        : ACPDefaultSessionUpdateNormalizer.normalize(update, providerID: provider)
+                    guard case let .stream(result) = events.first else { throw NSError(domain: "Missing native group event", code: 1) }
+                    try representations.append(("\(provider) string=\(stringOutput) conflict=\(conflictingContent)", XCTUnwrap(result.toolResultJSON)))
+                }
+            }
+        }
+        // Native root facts outrank an incidental older group envelope and structured content.
+        for stringOutput in [false, true] {
+            var direct = partialObject
+            direct["rawOutput"] = stringOutput ? ToolOutputFormatter.rawJSONString(.object(OracleGroupMCPCodec.groupFields(group))) : groupObject
+            direct["content"] = [["type": "text", "text": #"{"status":"completed","chat_id":"wrong-chat"}"#]]
+            try representations.append(("direct authority string=\(stringOutput)", String(decoding: JSONSerialization.data(withJSONObject: direct), as: UTF8.self)))
+        }
+        for trackerPath in [false, true] {
+            for (representation, payload) in representations {
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = harness.makeSession(agent: .devin)
+                let runner = ACPIntegratedAgentModeRunner(
+                    hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp,
+                    providerFactory: { _, _ in nil }, controllerFactory: { provider, request in
+                        try ACPAgentSessionController(provider: provider, runRequest: request)
+                    }
+                )
+                let invocationID = UUID()
+                func deliver(_ json: String) {
+                    if trackerPath {
+                        runner.testHandleTrackerToolResult(invocationID: invocationID, toolName: "ask_oracle", args: ["message": .string("PRIVATE_INPUT")], resultJSON: json, isError: false, session: session)
+                    } else {
+                        XCTAssertTrue(runner.handleToolStreamEvent(.toolResult(.init(
+                            toolName: "ask_oracle", invocationID: invocationID, argsJSON: #"{"message":"PRIVATE_INPUT"}"#,
+                            resultJSON: json, isError: false
+                        )), session: session))
+                    }
+                }
+                deliver(partialJSON)
+                let rowID = try XCTUnwrap(session.items.first?.id)
+                deliver(payload)
+                XCTAssertEqual(session.items.map(\.id), [rowID])
+                let incoming = try XCTUnwrap(session.items.first)
+                for (restored, row) in try await [(false, incoming), (true, restore(incoming))] {
+                    let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: row.toolResultJSON))
+                    XCTAssertEqual(dto.status, "partial_failure", "\(representation), restored=\(restored)")
+                    XCTAssertEqual(dto.chatID, "primary")
+                    XCTAssertEqual(dto.oracleGroupID, partial.groupID.rawValue.uuidString)
+                    XCTAssertEqual(dto.oracleCount, 2)
+                    XCTAssertEqual(dto.oracleResults?.map(\.status), ["completed", "cancelled"])
+                    XCTAssertEqual(dto.oracleResults?.last?.error?.code, "cancelled")
+                    XCTAssertEqual(ChatSendResultCard(item: row, oracleOpenContext: nil).status, .warning, representation)
+                    XCTAssertEqual(row.toolIsError, incoming.toolIsError, "Persistence must preserve the actual runner transport flag")
+                    if restored { XCTAssertTrue(dto.oracleResults?.allSatisfy { $0.response == nil } == true) }
+                }
+            }
+        }
+        // Invalid groups and unsupported deeper wrappers keep legacy content precedence.
+        var invalidGroup = partialObject
+        invalidGroup["oracle_count"] = 3
+        for rawOutput in [invalidGroup, ["rawOutput": partialObject]] {
+            for stringOutput in [false, true] {
+                let outputJSON = try String(decoding: JSONSerialization.data(withJSONObject: rawOutput), as: UTF8.self)
+                let envelope: [String: Any] = [
+                    "status": "success", "acp_status": "completed", "rawOutput": stringOutput ? outputJSON : rawOutput,
+                    "content": [["type": "text", "text": #"{"status":"completed","chat_id":"legacy-chat"}"#]]
+                ]
+                let json = try String(decoding: JSONSerialization.data(withJSONObject: envelope), as: UTF8.self)
+                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: json))
+                XCTAssertEqual(dto.chatID, "legacy-chat")
+                XCTAssertEqual(dto.status, "completed")
+                XCTAssertNil(dto.oracleResults)
+                XCTAssertNil(ToolResultDTOs.ChatSendDTO.nativeOracleGroupJSONData(from: json))
+            }
+        }
+    }
+
+    @MainActor
+    func testNativeObservationsSurviveProductionTerminalRepairOnBothRunnerPaths() throws {
+        let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "paid-primary", providerID: nil, modelID: "primary", status: .completed, response: "PRIVATE_RESPONSE_BODY"),
+            OracleLaneResult(laneIndex: 1, chatID: "cancelled-sibling", providerID: nil, modelID: "sibling", status: .cancelled, error: .init(code: "cancelled", message: "Sibling cancelled"))
+        ])
+        let groupObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(ToolOutputFormatter.rawJSONString(.object(OracleGroupMCPCodec.groupFields(group))).utf8)) as? [String: Any])
+        let jobID = UUID().uuidString
+        let tickets = ["running", "cancelling", "unknown", "completed", "failed", "cancelled", "expired"].map { status in
+            ["job_id": jobID, "job": ["id": jobID, "status": status, "revision": 4]] as [String: Any]
+        }
+        for trackerPath in [false, true] {
+            for native in [groupObject] + tickets {
+                let toolName = native["job"] == nil ? "ask_oracle" : "context_builder"
+                for representation in ["direct", "object", "string"] {
+                    for isError in [false, true] {
+                        let row = try nativeObservationRow(native, toolName: toolName, representation: representation, trackerPath: trackerPath, isError: isError)
+                        for terminalState in [AgentSessionRunState.completed, .cancelled, .failed] {
+                            let pending = AgentChatItem.toolCall(name: "read_file", argsJSON: nil, sequenceIndex: row.sequenceIndex + 1)
+                            let running = AgentChatItem.toolResult(name: "get_file_tree", argsJSON: nil, resultJSON: #"{"status":"running"}"#, isError: false, sequenceIndex: row.sequenceIndex + 2)
+                            var items = [row, pending, running]
+                            let repaired = AgentTranscriptQualityRepair.finalizePendingTerminalTools(
+                                in: &items, terminalState: terminalState, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6
+                            )
+                            XCTAssertEqual(repaired, 2, "Only unresolved calls need terminal fallback: \(toolName), \(representation), tracker=\(trackerPath)")
+                            XCTAssertEqual(items[0].id, row.id)
+                            XCTAssertEqual(items[0].toolResultJSON, row.toolResultJSON, "Terminal fallback must not erase returned native facts")
+                            XCTAssertEqual(items[0].toolIsError, isError, "A run terminal is not a new error in an already-returned control observation")
+                            XCTAssertEqual(items[1].kind, .toolResult)
+                            XCTAssertEqual(items[1].toolIsError, true)
+                            XCTAssertEqual(items[2].toolIsError, true)
+                            XCTAssertFalse(items[2].toolResultJSON == running.toolResultJSON)
+                            if toolName == "ask_oracle" {
+                                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: items[0].toolResultJSON))
+                                XCTAssertEqual(dto.oracleGroupID, group.groupID.rawValue.uuidString)
+                                XCTAssertEqual(dto.oracleResults?.map(\.status), ["completed", "cancelled"])
+                                XCTAssertEqual(dto.oracleResults?.first?.response, "PRIVATE_RESPONSE_BODY")
+                                XCTAssertEqual(dto.oracleResults?.last?.error?.code, "cancelled")
+                            } else {
+                                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: items[0].toolResultJSON))
+                                XCTAssertEqual(dto.ticket?.jobID.uuidString, jobID)
+                                XCTAssertEqual(dto.ticket?.job.status.rawValue, (native["job"] as? [String: Any])?["status"] as? String)
+                                XCTAssertEqual(dto.ticket?.job.revision, 4)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Malformed tickets and deeper provider wrappers are not native observations.
+        for rawOutput in [
+            ["job_id": jobID, "job": ["id": UUID().uuidString, "status": "running"]] as [String: Any],
+            ["rawOutput": tickets[0]]
+        ] {
+            for trackerPath in [false, true] {
+                var items = try [nativeObservationRow(rawOutput, toolName: "context_builder", representation: "object", trackerPath: trackerPath, isError: false)]
+                XCTAssertEqual(AgentTranscriptQualityRepair.finalizePendingTerminalTools(
+                    in: &items, terminalState: .cancelled, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6
+                ), 1)
+                XCTAssertEqual(items[0].toolIsError, true)
+            }
+        }
+    }
+
+    @MainActor
+    func testCleanContextBuilderObservationsPreserveNativeStateThroughDiskRestore() async throws {
+        let storage = try makeTestDirectory(name: "CleanNativeObservationRestore")
+        let workspace = WorkspaceModel(name: "Clean native observation", repoPaths: [], customStoragePath: storage)
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9858, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer {
+            composition.contextBuilderAgentViewModel.prepareForWindowClose()
+            composition.workspaceManager.prepareForWindowClose()
+        }
+        addTeardownBlock { await composition.workspaceManager.awaitOwnSavesForWindowClose() }
+        let tabID = UUID()
+        let jobID = UUID().uuidString
+        let partialGroup = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "paid-chat", providerID: nil, modelID: "primary", status: .completed, response: "PRIVATE_RESPONSE_BODY"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling", status: .cancelled, error: .init(code: "cancelled", message: "Sibling cancelled"))
+        ])
+        let partialReply = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(ToolOutputFormatter.rawJSONString(.object(OracleGroupMCPCodec.groupFields(partialGroup))).utf8)) as? [String: Any])
+        let jobCases = ["running", "cancelling", "unknown", "completed", "failed", "cancelled", "expired"].map { ($0, false) } + [("completed", true)]
+        for trackerPath in [false, true] {
+            for (jobStatus, hasPartialReply) in jobCases {
+                var native: [String: Any] = [
+                    "job_id": jobID,
+                    "job": ["id": jobID, "context_id": tabID.uuidString, "status": jobStatus, "revision": 5, "chat_id": "paid-chat"]
+                ]
+                if jobStatus == "completed" {
+                    native["status"] = "success"
+                    native["response_type"] = "plan"
+                    var reply = hasPartialReply ? partialReply : [:]
+                    reply["chat_id"] = "paid-chat"
+                    reply["mode"] = "plan"
+                    reply["response"] = "PRIVATE_RESPONSE_BODY"
+                    native["plan"] = reply
+                }
+                for representation in ["direct", "object", "string"] {
+                    for isError in [false, true] {
+                        var row = try nativeObservationRow(native, toolName: "context_builder", representation: representation, trackerPath: trackerPath, isError: isError)
+                        row.toolArgsJSON = #"{"op":"wait","message":"PRIVATE_INPUT"}"#
+                        let saved = AgentSession(
+                            workspaceID: workspace.id, composeTabID: tabID, name: "Clean observation",
+                            transcript: AgentTranscriptIO.importLegacyItems([.user("Inspect", sequenceIndex: 0), row]), lastRunState: "completed"
+                        )
+                        let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+                        let bytes = try String(contentsOf: file, encoding: .utf8)
+                        XCTAssertFalse(bytes.contains("PRIVATE_INPUT"))
+                        XCTAssertFalse(bytes.contains("PRIVATE_RESPONSE_BODY"))
+                        let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+                        let projection = try AgentTranscriptProjectionBuilder.build(from: XCTUnwrap(loaded.transcript))
+                        let rows = (projection.archivedBlocks + projection.workingBlocks).flatMap(\.rows)
+                        let restored = try XCTUnwrap(rows.first { $0.kind == .toolResult && $0.toolInvocationID == row.toolInvocationID })
+                        XCTAssertEqual(restored.toolIsError, isError, "Cold restore must not manufacture observation failure: \(representation), \(jobStatus), tracker=\(trackerPath)")
+                        XCTAssertNil(restored.toolArgsJSON)
+                        XCTAssertLessThanOrEqual(try XCTUnwrap(restored.toolResultJSON).utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+                        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: restored.toolResultJSON))
+                        XCTAssertEqual(dto.ticket?.jobID.uuidString, jobID)
+                        XCTAssertEqual(dto.ticket?.job.contextID, tabID)
+                        XCTAssertEqual(dto.ticket?.job.status.rawValue, jobStatus)
+                        XCTAssertEqual(dto.ticket?.job.revision, 5)
+                        XCTAssertEqual(dto.ticket?.summaryOnly, true)
+                        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: restored), isError ? .failed : hasPartialReply ? .warning : .success, "A returned control observation is settled, not its job")
+                        let context = ContextBuilderCardContext(
+                            tabID: tabID, contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+                            oracleOpenContext: .init(windowID: -9858, workspaceID: workspace.id, tabID: tabID),
+                            transcriptMetadata: ContextBuilderTranscriptMetadata(rows: [restored])
+                        )
+                        let card = ContextBuilderResultCard(item: restored, context: context)
+                        XCTAssertEqual(card.summary.contains("Observation failed"), isError, card.summary)
+                        if isError {
+                            XCTAssertEqual(card.status, .failure)
+                        } else {
+                            switch jobStatus {
+                            case "completed":
+                                XCTAssertEqual(card.status, hasPartialReply ? .warning : .success)
+                                XCTAssertEqual(dto.plan?.chatID, "paid-chat")
+                                XCTAssertNil(dto.plan?.response)
+                                if hasPartialReply {
+                                    XCTAssertEqual(dto.plan?.oracleGroupID, partialGroup.groupID.rawValue.uuidString)
+                                    XCTAssertEqual(dto.plan?.oracleResults?.map(\.status), ["completed", "cancelled"])
+                                    XCTAssertEqual(dto.plan?.oracleResults?.last?.error?.code, "cancelled")
+                                    XCTAssertTrue(dto.plan?.oracleResults?.allSatisfy { $0.response == nil } == true)
+                                }
+                                XCTAssertEqual(card.followUpChatID, "paid-chat")
+                            case "failed", "cancelled": XCTAssertEqual(card.status, .failure)
+                            case "expired": XCTAssertEqual(card.status, .warning)
+                            default:
+                                XCTAssertEqual(card.status, .neutral)
+                                XCTAssertTrue(card.summary.contains("Live job state unknown"), card.summary)
+                                XCTAssertNil(card.followUpChatID, "An archived observation does not establish liveness")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Cold restoration must still cancel a genuinely unresolved ordinary call.
+        let generic = AgentChatItem.toolResult(name: "get_file_tree", argsJSON: nil, resultJSON: #"{"status":"running"}"#, isError: false, sequenceIndex: 1)
+        let saved = AgentSession(workspaceID: workspace.id, composeTabID: tabID, name: "Unresolved", transcript: AgentTranscriptIO.importLegacyItems([.user("Inspect", sequenceIndex: 0), generic]), lastRunState: "running")
+        let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+        let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+        let restored = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(loaded.transcript))
+        let result = try XCTUnwrap(restored.first { $0.kind == .toolResult })
+        XCTAssertEqual(result.toolIsError, true)
+        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: result), .cancelled)
+    }
+
+    @MainActor
+    private func nativeObservationRow(
+        _ native: [String: Any], toolName: String, representation: String, trackerPath: Bool, isError: Bool
+    ) throws -> AgentChatItem {
+        let json = try String(decoding: JSONSerialization.data(withJSONObject: native, options: [.sortedKeys]), as: UTF8.self)
+        let events = ACPDefaultSessionUpdateNormalizer.normalize([
+            "sessionUpdate": "tool_call_update", "toolCallId": "native-observation", "title": toolName,
+            "status": representation == "direct" ? "completed" : "running",
+            "rawOutput": representation == "string" ? json : native
+        ], providerID: .devin)
+        guard case let .stream(result) = events.first else { throw NSError(domain: "Missing native observation", code: 1) }
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = harness.makeSession(agent: .devin)
+        let runner = ACPIntegratedAgentModeRunner(
+            hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp,
+            providerFactory: { _, _ in nil }, controllerFactory: { provider, request in
+                try ACPAgentSessionController(provider: provider, runRequest: request)
+            }
+        )
+        if trackerPath {
+            try runner.testHandleTrackerToolResult(invocationID: XCTUnwrap(result.toolInvocationID), toolName: toolName, args: nil, resultJSON: XCTUnwrap(result.toolResultJSON), isError: isError, session: session)
+        } else {
+            XCTAssertTrue(try runner.handleToolStreamEvent(.toolResult(.init(
+                toolName: toolName, invocationID: result.toolInvocationID, argsJSON: nil,
+                resultJSON: XCTUnwrap(result.toolResultJSON), isError: isError
+            )), session: session))
+        }
+        return try XCTUnwrap(session.items.first)
     }
 
     private let rich = #"{"review":{"chat_id":"c","oracle_results":[]},"status":"success"}"#
@@ -830,5 +1320,226 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(
             existing: "text", incoming: "other text", incomingIsError: false, requireObjectReplacement: true
         ))
+    }
+}
+
+@MainActor
+final class ACPOracleNativeObservationTests: XCTestCase {
+    func testIssuedOracleTicketsSurviveACPRepairAndBoundedDiskRestore() async throws {
+        for tool in ["ask_oracle", "oracle_send"] {
+            try await withOracleFixture(holdTransport: true) { driver, service, invocation in
+                let start = try await self.execute(tool, args: ["op": .string("start"), "detach": .bool(true), "message": .string("PRIVATE_INPUT"), "new_chat": .bool(true)], service: service, invocation: invocation)
+                let id = try XCTUnwrap(start.objectValue?["job_id"]?.stringValue)
+                let poll = try await self.execute(tool, args: ["op": .string("poll"), "job_id": .string(id)], service: service, invocation: invocation)
+                XCTAssertEqual(poll.objectValue?["job_id"]?.stringValue, id)
+                XCTAssertEqual(poll.objectValue?["job"]?.objectValue?["status"]?.stringValue, "running")
+                let cancel = try await self.execute(tool, args: ["op": .string("cancel"), "job_id": .string(id)], service: service, invocation: invocation)
+                _ = try await self.execute(tool, args: ["op": .string("wait"), "job_id": .string(id), "timeout": .int(5)], service: service, invocation: invocation)
+                for issued in [start, cancel] {
+                    let native = try self.object(issued)
+                    let expected = try JSONDecoder().decode(ToolResultDTOs.LongRunningJobTicketDTO.self, from: JSONSerialization.data(withJSONObject: native))
+                    for representation in ["direct", "object", "string"] {
+                        for tracker in [false, true] {
+                            for terminal in ["none", "text", "abort", "abort-marker"] {
+                                let row = try self.observation(native, tool: tool, representation: representation, tracker: tracker, terminal: terminal)
+                                var items = [row]
+                                XCTAssertEqual(AgentTranscriptQualityRepair.finalizePendingTerminalTools(in: &items, terminalState: .cancelled, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6), 0, "A returned \(tool) ticket is not a missing result")
+                                XCTAssertEqual(items[0].toolResultJSON, row.toolResultJSON)
+                                XCTAssertEqual(items[0].toolIsError, terminal.hasPrefix("abort"))
+                                let restored = try await self.saveLoad(items[0], workspace: driver.fixture.workspace, tabID: driver.tabID)
+                                let dto = ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: restored.toolResultJSON)
+                                XCTAssertEqual(dto?.ticket?.jobID, expected.jobID)
+                                XCTAssertEqual(dto?.ticket?.job.contextID, expected.job.contextID)
+                                XCTAssertEqual(dto?.ticket?.job.revision, expected.job.revision)
+                                XCTAssertEqual(dto?.ticket?.job.status, expected.job.status, "Saved status is the observation, not a new live query")
+                                XCTAssertEqual(dto?.ticket?.summaryOnly, true)
+                                XCTAssertEqual(restored.toolIsError, terminal.hasPrefix("abort"))
+                                XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: restored), terminal.hasPrefix("abort") ? .failed : .success)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testProducedSingletonRepliesSurviveACPEchoAbortAndBoundedDiskRestore() async throws {
+        for tool in ["ask_oracle", "oracle_send"] {
+            try await withOracleFixture(holdTransport: false) { driver, service, invocation in
+                // Real single-roster packaging/send builds the actual ChatSendReply, not a permissive DTO fixture.
+                let issued = try await self.execute(tool, args: ["message": .string("PRIVATE_INPUT"), "new_chat": .bool(true)], service: service, invocation: invocation)
+                let native = try self.object(issued)
+                let expectedChat = try XCTUnwrap(native["chat_id"] as? String)
+                let expectedMode = try XCTUnwrap(native["mode"] as? String)
+                XCTAssertNil(native["oracle_results"])
+                XCTAssertEqual(native["response"] as? String, "PRIVATE_RESPONSE_BODY")
+                for representation in ["direct", "object", "string"] {
+                    for tracker in [false, true] {
+                        for terminal in ["none", "text", "abort", "abort-marker"] {
+                            let row = try self.observation(native, tool: tool, representation: representation, tracker: tracker, terminal: terminal)
+                            var items = [row]
+                            XCTAssertEqual(AgentTranscriptQualityRepair.finalizePendingTerminalTools(in: &items, terminalState: .completed, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6), 0)
+                            XCTAssertEqual(items[0].toolResultJSON, row.toolResultJSON)
+                            XCTAssertEqual(items[0].toolIsError, terminal.hasPrefix("abort"))
+                            let live = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: items[0].toolResultJSON)
+                            XCTAssertEqual(live?.chatID, expectedChat)
+                            XCTAssertEqual(live?.mode, expectedMode)
+                            XCTAssertEqual(live?.response, "PRIVATE_RESPONSE_BODY")
+                            let restored = try await self.saveLoad(items[0], workspace: driver.fixture.workspace, tabID: driver.tabID)
+                            let dto = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: restored.toolResultJSON)
+                            XCTAssertEqual(dto?.chatID, expectedChat)
+                            XCTAssertEqual(dto?.mode, expectedMode)
+                            XCTAssertNil(dto?.response)
+                            XCTAssertEqual(restored.toolIsError, terminal.hasPrefix("abort"))
+                            XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: restored), terminal.hasPrefix("abort") ? .failed : .success)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testNativeSelectionRejectsMalformedAndDeeperRepliesWithoutWeakeningDirectAuthority() throws {
+        let singleton = try object(ChatSendReply(chatId: UUID(), shortId: "single", mode: "chat", response: "answer", errors: nil).toMCPValue())
+        let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary", status: .completed, response: "answer"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling", status: .cancelled, error: .init(code: "cancelled", message: "Cancelled"))
+        ])
+        let groupObject = try object(.object(OracleGroupMCPCodec.groupFields(group)))
+        for native in [singleton, groupObject] {
+            var direct = native
+            direct["rawOutput"] = native["oracle_results"] == nil ? groupObject : singleton
+            let raw = try String(decoding: JSONSerialization.data(withJSONObject: direct), as: UTF8.self)
+            let dto = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: raw)
+            if native["oracle_results"] == nil {
+                XCTAssertEqual(dto?.chatID, "single", "Valid direct native singleton outranks a nested echo")
+                XCTAssertNil(dto?.oracleResults)
+            } else {
+                XCTAssertEqual(dto?.oracleGroupID, group.groupID.rawValue.uuidString)
+                XCTAssertEqual(dto?.oracleResults?.map(\.status), ["completed", "cancelled"])
+            }
+        }
+        let jobID = UUID().uuidString
+        for invalid in [
+            ["chat_id": "single"], ["mode": "chat"], ["chat_id": 42, "mode": "chat"],
+            ["chat_id": "single", "mode": 42], ["chat_id": "single", "mode": "chat", "response": 42],
+            ["chat_id": "single", "mode": "chat", "errors": [42]],
+            ["chat_id": "single", "mode": "chat", "oracle_count": 2, "oracle_results": []],
+            ["rawOutput": singleton],
+            ["job_id": jobID, "job": ["id": UUID().uuidString, "status": "running"]]
+        ] as [[String: Any]] {
+            for tool in ["ask_oracle", "oracle_send", "context_builder"] {
+                let row = try observation(invalid, tool: tool, representation: "object", tracker: false, terminal: "none", expectRetention: false)
+                var items = [row]
+                XCTAssertEqual(AgentTranscriptQualityRepair.finalizePendingTerminalTools(in: &items, terminalState: .failed, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6), 1)
+                XCTAssertEqual(items[0].toolIsError, true)
+            }
+        }
+        var generic = [AgentChatItem.toolResult(name: "get_file_tree", argsJSON: nil, resultJSON: #"{"status":"running"}"#, isError: false, sequenceIndex: 1)]
+        XCTAssertEqual(AgentTranscriptQualityRepair.finalizePendingTerminalTools(in: &generic, terminalState: .completed, context: .liveTerminal(agentKind: .devin), nonToolBoundary: 6), 1)
+        XCTAssertEqual(generic[0].toolIsError, true)
+    }
+
+    private func observation(_ native: [String: Any], tool: String, representation: String, tracker: Bool, terminal: String, expectRetention: Bool = true) throws -> AgentChatItem {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = harness.makeSession(agent: .devin)
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
+        let raw = try String(decoding: JSONSerialization.data(withJSONObject: native), as: UTF8.self)
+        func deliver(_ update: [String: Any]) throws {
+            let events = ACPDefaultSessionUpdateNormalizer.normalize(update, providerID: .devin)
+            guard case let .stream(event) = events.first else { throw NSError(domain: "Missing normalized tool result", code: 1) }
+            let invocation = try XCTUnwrap(event.toolInvocationID)
+            let payload = try XCTUnwrap(event.toolResultJSON)
+            if tracker {
+                runner.testHandleTrackerToolResult(invocationID: invocation, toolName: tool, args: nil, resultJSON: payload, isError: event.toolIsError ?? false, session: session)
+            } else {
+                XCTAssertTrue(runner.handleToolStreamEvent(.toolResult(.init(toolName: tool, invocationID: invocation, argsJSON: nil, resultJSON: payload, isError: event.toolIsError ?? false)), session: session))
+            }
+        }
+        try deliver(["sessionUpdate": "tool_call_update", "toolCallId": "native-observation", "title": tool, "status": representation == "direct" ? "completed" : "running", "rawOutput": representation == "string" ? raw : native])
+        let original = try XCTUnwrap(session.items.first)
+        if terminal != "none" {
+            try deliver(["sessionUpdate": "tool_call_update", "toolCallId": "native-observation", "title": tool, "status": terminal.hasPrefix("abort") ? "failed" : "completed", "rawOutput": terminal.hasPrefix("abort") ? "Provider transport aborted" : "Provider terminal echo"])
+        }
+        if terminal == "abort-marker" {
+            // A later empty successful echo is not a new native result and cannot clear the genuine abort.
+            try deliver(["sessionUpdate": "tool_call_update", "toolCallId": "native-observation", "title": tool, "status": "completed", "rawOutput": [String: Any]()])
+        }
+        var row = try XCTUnwrap(session.items.first)
+        XCTAssertEqual(session.items.count, 1)
+        XCTAssertEqual(row.id, original.id)
+        if expectRetention { XCTAssertEqual(row.toolResultJSON, original.toolResultJSON, "Returned native facts survive the provider \(terminal) on tracker=\(tracker), representation=\(representation)") }
+        XCTAssertEqual(row.toolIsError, terminal.hasPrefix("abort"), "The actual failed ACP event must remain an error")
+        row.toolArgsJSON = #"{"message":"PRIVATE_INPUT"}"#
+        return row
+    }
+
+    private func saveLoad(_ row: AgentChatItem, workspace: WorkspaceModel, tabID: UUID) async throws -> AgentChatItem {
+        let saved = AgentSession(workspaceID: workspace.id, composeTabID: tabID, name: "Native observation", transcript: AgentTranscriptIO.importLegacyItems([.user("Inspect", sequenceIndex: 0), row]), lastRunState: "completed")
+        let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+        let bytes = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertFalse(bytes.contains("PRIVATE_INPUT"))
+        XCTAssertFalse(bytes.contains("PRIVATE_RESPONSE_BODY"))
+        let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+        let projection = try AgentTranscriptProjectionBuilder.build(from: XCTUnwrap(loaded.transcript))
+        let rows = (projection.archivedBlocks + projection.workingBlocks).flatMap(\.rows)
+        let restored = try XCTUnwrap(rows.first { $0.kind == .toolResult && $0.toolInvocationID == row.toolInvocationID })
+        XCTAssertNil(restored.toolArgsJSON)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(restored.toolResultJSON).utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+        return restored
+    }
+
+    private func object(_ value: Value) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(ToolOutputFormatter.rawJSONString(value).utf8)) as? [String: Any])
+    }
+
+    private func execute(_ tool: String, args: [String: Value], service: MCPOracleToolService, invocation: ToolInvocationContext) async throws -> Value {
+        try await (tool == "ask_oracle" ? service.executeAskOracle(args: args, invocationContext: invocation) : service.executeOracleSend(args: args, invocationContext: invocation))
+    }
+
+    private func withOracleFixture(holdTransport: Bool, _ body: @escaping @MainActor (ContextBuilderMultiRootDiscoveryDriver, MCPOracleToolService, ToolInvocationContext) async throws -> Void) async throws {
+        try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["NativeObservation"]) { driver in
+            let settings = GlobalSettingsStore.shared
+            let previousExposure = settings.mcpShowModelPresets()
+            let previousDisabled = settings.mcpTemporarilyDisablePresets()
+            defer {
+                settings.setMCPShowModelPresets(previousExposure, commit: false)
+                settings.setMCPTemporarilyDisablePresets(previousDisabled, commit: false)
+                driver.window.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
+            }
+            settings.setMCPShowModelPresets(false, commit: false)
+            settings.setMCPTemporarilyDisablePresets(false, commit: false)
+            settings.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: []))
+            driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+            driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+            driver.window.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting { _, _ in
+                let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                    if !holdTransport {
+                        continuation.yield(.init(text: "PRIVATE_RESPONSE_BODY", reasoning: nil, tokens: .init(), terminalOutcome: .completed))
+                        continuation.finish()
+                    }
+                }
+                return (UUID(), stream)
+            }
+            let context = MCPTabContextSnapshot(tabID: driver.tabID, windowID: driver.window.windowID, workspaceID: driver.fixture.workspace.id, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Native observation", runID: nil, frozenLookupContext: .visibleWorkspace, explicitlyBound: true)
+            let invocation = ToolInvocationContext.trustedLocal(toolName: "oracle_send", metadata: MCPRequestMetadata(connectionID: UUID(), clientName: "native-observation-fixture", windowID: driver.window.windowID))
+            let service = MCPOracleToolService(
+                askOracleToolName: "ask_oracle", oracleSendToolName: "oracle_send", oracleChatLogToolName: "oracle_chat_log",
+                promptVM: driver.window.promptManager, oracleVM: driver.window.oracleViewModel,
+                liveRunPurpose: { _ in .unknown }, resolveTabContextSnapshot: { _ in .init(snapshot: context) }, requireCurrentTabContext: { _ in context }, stabilizedVirtualContext: { $0 },
+                resolveDelegatedReviewPackaging: { _, _, _, _ in nil }, rebindChatSessionIfNeeded: { _, _ in XCTFail("Fresh native requests must not rebind") },
+                resolveTabIDForAgentMode: { _, _ in driver.tabID }, requireTargetWindow: { driver.window }, rawExplicitTabID: { _ in nil }, sendStageProgress: { _, _, _, _ in }, withHeartbeat: { _, _, _, _, operation in try await operation() },
+                resolveStartExecution: { mode, model, workspaceID in try driver.window.oracleViewModel.resolveMCPFollowUpExecution(mode: mode, modelParam: model, workspaceID: workspaceID) },
+                sendChat: { args, prompt, tabContext in try await driver.window.oracleViewModel.tool_chatSendWithConfiguredRoster(args: args, promptVM: prompt, tabContext: tabContext) },
+                exportOracleResponse: { _ in throw ChatToolError.internalError("Unexpected fixture export") }, jobCenter: MCPLongRunningJobCenter()
+            )
+            do {
+                try await body(driver, service, invocation)
+                await driver.window.oracleViewModel.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+            } catch {
+                await driver.window.oracleViewModel.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                throw error
+            }
+        }
     }
 }

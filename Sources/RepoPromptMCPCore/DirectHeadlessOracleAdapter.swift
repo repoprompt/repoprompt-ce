@@ -27,6 +27,8 @@ actor DirectHeadlessOracleAdapter {
         case appOnlyOraclePreset
         case unsupportedProviderOverride
         case unsupportedImageAttachments
+        case appOnlyJobOperation
+        case appOnlyOracleDiagnostics
         case unknownChatID
         case rosterConflict
         case missingPreparedInvocation
@@ -39,7 +41,7 @@ actor DirectHeadlessOracleAdapter {
             case .contextPackRequiresOracleGroup:
                 "context_pack_requires_oracle_group: a supplied frozen pack is supported only with multiple configured Oracles; use instructions for a single Oracle."
             case let .unsupportedContextBuilderArgument(key):
-                "context_builder_unsupported_argument: '\(key)' is unsupported in direct-headless Context Builder; discovery, exports, and app presets require the app-backed tool."
+                "context_builder_unsupported_argument: '\(key)' is unsupported in direct-headless Context Builder; discovery, exports, app presets, and job operations require the app-backed tool."
             case .unsupportedContextBuilderDiscovery:
                 "context_builder_discovery_unsupported: direct-headless Context Builder does not discover files or commit selections. Use the app-backed tool for clarify/discovery."
             case .invalidContextBuilderResponseType:
@@ -66,6 +68,10 @@ actor DirectHeadlessOracleAdapter {
                 "oracle_preset is available only through the app-backed Context Builder."
             case .unsupportedProviderOverride:
                 "Direct Oracle provider overrides are unsupported; select a model or start a new chat."
+            case .appOnlyOracleDiagnostics:
+                "Oracle request diagnostics require the DEBUG app backend; direct headless rejects these controls."
+            case .appOnlyJobOperation:
+                "oracle_job_operations_unsupported: job tickets require the app backend; direct headless does not implement job operations."
             case .unsupportedImageAttachments:
                 "Oracle `images` require the app backend; the direct headless backend cannot attach images."
             case .unknownChatID:
@@ -164,11 +170,15 @@ actor DirectHeadlessOracleAdapter {
     }
 
     func start(arguments: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
+        if ["op", "job_id", "detach", "timeout"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyJobOperation }
+        if ["debug_primary_only", "debug_lane_timeout_seconds"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyOracleDiagnostics }
         let plan = try await consumePlan(toolName: "ask_oracle", arguments: arguments, request: request)
         return try await execute(plan, request: request)
     }
 
     func `continue`(arguments: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
+        if ["op", "job_id", "detach", "timeout"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyJobOperation }
+        if ["debug_primary_only", "debug_lane_timeout_seconds"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyOracleDiagnostics }
         let plan = try await consumePlan(toolName: "oracle_send", arguments: arguments, request: request)
         return try await execute(plan, request: request)
     }
@@ -244,6 +254,8 @@ actor DirectHeadlessOracleAdapter {
         if toolName == "context_builder" {
             try Self.validateContextBuilderArguments(arguments)
         }
+        if ["oracle_send", "ask_oracle"].contains(toolName), ["op", "job_id", "detach", "timeout"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyJobOperation }
+        if ["debug_primary_only", "debug_lane_timeout_seconds"].contains(where: { arguments[$0] != nil }) { throw AdapterError.appOnlyOracleDiagnostics }
         if arguments["provider"] != nil { throw AdapterError.unsupportedProviderOverride }
         if arguments["images"] != nil { throw AdapterError.unsupportedImageAttachments }
         let route: OracleConversationRoute

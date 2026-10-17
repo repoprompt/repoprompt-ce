@@ -8,6 +8,499 @@ import XCTest
 #if DEBUG
     @MainActor
     final class ContextBuilderGroupedSupervisionTests: XCTestCase {
+        func testCancelledAdmissionReleasesBuilderControlForNextRoutedRun() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                let admitted = XCTestExpectation(description: "builder ticket registered before worker entry")
+                let gate = driver.fixture.makeGate()
+                var jobID: UUID?
+                jobs.admissionDidRegister = { id in
+                    jobID = id
+                    admitted.fulfill()
+                    await gate.wait()
+                }
+                defer {
+                    jobs.admissionDidRegister = nil
+                    gate.release()
+                }
+                var startError: Error?
+                let starting = driver.fixture.startOwnedTask {
+                    do {
+                        _ = try await connection.client.callTool(name: "context_builder", arguments: [
+                            "op": .string("start"), "detach": .bool(true),
+                            "instructions": .string("Cancelled before discovery"), "_rawJSON": .bool(true)
+                        ])
+                    } catch { startError = error }
+                }
+                try await harness.wait(admitted)
+                let id = try XCTUnwrap(jobID)
+                jobs.cancel(id: id)
+                jobs.admissionDidRegister = nil
+                gate.release()
+                await starting.value
+                if let startError { throw startError }
+                let cancelled = await jobs.store.wait(id: id, timeout: 5)
+                XCTAssertEqual(cancelled?.status, .cancelled)
+                XCTAssertEqual(driver.constructed, 0)
+
+                // Exercise the real preparation/token acquisition again, not just the job's busy slot.
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                let next = try await connection.client.callTool(name: "context_builder", arguments: [
+                    "op": .string("start"), "timeout": .int(5),
+                    "instructions": .string("Discovery after abandoned admission"), "_rawJSON": .bool(true)
+                ])
+                let text = next.content.compactMap { content -> String? in
+                    if case let .text(text, _, _) = content { return text }
+                    return nil
+                }.joined(separator: "\n")
+                XCTAssertNotEqual(next.isError, true, text)
+                if next.isError != true {
+                    let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                    XCTAssertEqual((fields["job"] as? [String: Any])?["status"] as? String, "completed", text)
+                }
+                XCTAssertEqual(driver.constructed, 1)
+                XCTAssertEqual(driver.streamStarts, 1)
+            }
+        }
+
+        func testOwningRunCancellationDuringAdmissionPreventsRoutedDiscovery() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                let runID = try XCTUnwrap(context.frozenTabContext.runID)
+                let admitted = XCTestExpectation(description: "owning run has admitting ticket")
+                let gate = driver.fixture.makeGate()
+                var jobID: UUID?
+                jobs.admissionDidRegister = { id in
+                    jobID = id
+                    admitted.fulfill()
+                    await gate.wait()
+                }
+                defer {
+                    jobs.admissionDidRegister = nil
+                    gate.release()
+                }
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                var startError: Error?
+                let starting = driver.fixture.startOwnedTask {
+                    do {
+                        _ = try await connection.client.callTool(name: "context_builder", arguments: [
+                            "op": .string("start"), "detach": .bool(true),
+                            "instructions": .string("Must not outlive cancelled owner"), "_rawJSON": .bool(true)
+                        ])
+                    } catch { startError = error }
+                }
+                try await harness.wait(admitted)
+                let id = try XCTUnwrap(jobID)
+                XCTAssertGreaterThan(driver.window.mcpServer.cancelActiveToolsForRun(runID: runID, reason: "admission regression"), 0)
+                jobs.admissionDidRegister = nil
+                gate.release()
+                await starting.value
+                if let startError { throw startError }
+                let terminal = await jobs.store.wait(id: id, timeout: 5)
+                XCTAssertEqual(terminal?.status, .cancelled)
+                XCTAssertEqual(driver.constructed, 0)
+                XCTAssertEqual(driver.streamStarts, 0)
+                XCTAssertFalse(driver.window.mcpServer.hasActiveToolExecutions(runID: runID))
+            }
+        }
+
+        func testTicketCLIExplicitContextSelectorSupportsControlsWithoutWeakeningOwnership() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                await driver.window.mcpServer.startServer()
+                let initiating = try await driver.connect(name: "RepoPromptCLI-selector-start", purpose: .unknown)
+                @MainActor
+                func call(_ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection, _ args: [String: Value], selector: UUID? = nil) async throws -> (content: [MCP.Tool.Content], isError: Bool?) {
+                    var routed = args
+                    routed["_windowID"] = .int(driver.window.windowID)
+                    routed["context_id"] = .string((selector ?? driver.tabID).uuidString)
+                    routed["_rawJSON"] = .bool(true)
+                    let reply = try await connection.client.callTool(name: "context_builder", arguments: routed)
+                    return (reply.content, reply.isError)
+                }
+                func payload(_ reply: (content: [MCP.Tool.Content], isError: Bool?)) throws -> [String: Any] {
+                    let text = reply.content.compactMap { content -> String? in
+                        if case let .text(text, _, _) = content { return text }
+                        return nil
+                    }.joined(separator: "\n")
+                    XCTAssertNotEqual(reply.isError, true, text)
+                    return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                }
+                let started = try await payload(call(initiating, [
+                    "op": .string("start"), "detach": .bool(true),
+                    "instructions": .string("Build one controlled plan"), "response_type": .string("plan"),
+                    "oracle_preset": .string(harness.preset.name)
+                ]))
+                guard let id = started["job_id"] as? String else { return XCTFail("Valid CLI selectors must admit a job") }
+                await initiating.cleanup()
+                try await harness.waitForStreams()
+                let reconnected = try await driver.connect(name: "RepoPromptCLI-selector-reconnect", purpose: .unknown)
+                let poll = try await payload(call(reconnected, ["op": .string("poll"), "job_id": .string(id)]))
+                XCTAssertEqual((poll["job"] as? [String: Any])?["status"] as? String, "running")
+                XCTAssertNil(poll["plan"])
+                let wait = try await payload(call(reconnected, ["op": .string("wait"), "job_id": .string(id), "timeout": .double(0)]))
+                XCTAssertEqual(wait["job_id"] as? String, id)
+                let wrong = try await call(reconnected, ["op": .string("cancel"), "job_id": .string(id)], selector: UUID())
+                XCTAssertEqual(wrong.isError, true)
+                let invoking = try await driver.connectInvokingAgent(driver.resolve())
+                let wrongOwner = try await invoking.client.callTool(name: "context_builder", arguments: ["op": .string("cancel"), "job_id": .string(id)])
+                XCTAssertEqual(wrongOwner.isError, true)
+                XCTAssertEqual(driver.constructed, 1)
+                _ = try await payload(call(reconnected, ["op": .string("cancel"), "job_id": .string(id)]))
+                let terminal = try await payload(call(reconnected, ["op": .string("wait"), "job_id": .string(id), "timeout": .double(5)]))
+                XCTAssertEqual((terminal["job"] as? [String: Any])?["status"] as? String, "cancelled")
+                XCTAssertEqual(driver.constructed, 1)
+                XCTAssertEqual(driver.streamStarts, 1)
+            }
+        }
+
+        func testBuilderRejectsOracleRequestDiagnosticsBeforeDiscovery() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                for diagnostic in ["debug_primary_only", "debug_lane_timeout_seconds"] {
+                    for ticketed in [false, true] {
+                        var args: [String: Value] = [
+                            "instructions": .string("Build one controlled plan"),
+                            "response_type": .string("plan"),
+                            "oracle_preset": .string(harness.preset.name),
+                            diagnostic: diagnostic == "debug_primary_only" ? .bool(true) : .double(3)
+                        ]
+                        if ticketed { args["op"] = .string("start") }
+                        let reply = try await connection.client.callTool(name: "context_builder", arguments: args)
+                        XCTAssertEqual(reply.isError, true)
+                        XCTAssertTrue(reply.content.contains { content in
+                            if case let .text(text, _, _) = content {
+                                return text.contains("Context Builder does not support Oracle request diagnostics")
+                            }
+                            return false
+                        })
+                        XCTAssertEqual(driver.constructed, 0)
+                        XCTAssertEqual(driver.streamStarts, 0)
+                        XCTAssertTrue(harness.registeredModels.isEmpty)
+                    }
+                }
+            }
+        }
+
+        func testOracleRequestPrimaryOnlyDispatchesOneControlledTransport() async throws {
+            try await withHarness { harness in
+                let driver = harness.driver
+                var context = OracleViewModel.OracleSendTabContext(
+                    tabID: driver.tabID,
+                    workspaceID: driver.fixture.workspace.id,
+                    activationPolicy: .background,
+                    packaging: .init(
+                        sourceTabID: driver.tabID,
+                        sourceWorkspaceID: driver.fixture.workspace.id,
+                        sourceSelectionRevision: 0,
+                        sourceAgentSessionID: nil,
+                        sourceAgentRunID: nil,
+                        promptText: "",
+                        selection: StoredSelection(),
+                        lookupContext: .visibleWorkspace,
+                        reviewGitContext: .automaticOnly(),
+                        provenance: .direct
+                    )
+                )
+                context.requestDiagnostics.primaryOnly = true
+                var reply: [String: Value]?
+                harness.start {
+                    reply = try await driver.window.oracleViewModel.tool_chatSendWithConfiguredRoster(
+                        args: ["message": .string("Controlled primary-only"), "new_chat": .bool(true), "model": .string(harness.preset.name)],
+                        promptVM: driver.window.oracleViewModel.promptViewModel, tabContext: context
+                    )
+                }
+                try await harness.waitForStream(.gpt54Mini)
+                harness.complete(.gpt54Mini, text: "only primary")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                XCTAssertEqual(reply?["response"], .string("only primary"))
+                XCTAssertNil(reply?["oracle_group_id"])
+                XCTAssertEqual(harness.registeredModels, [.gpt54Mini])
+                XCTAssertEqual(harness.preset.modelStrings, [AIModel.gpt54Mini.rawValue, AIModel.gpt54.rawValue])
+            }
+        }
+
+        func testOracleRequestDiagnosticDeadlineSettlesAndDrainsWithoutLateSuccess() async throws {
+            try await withHarness { harness in
+                let driver = harness.driver
+                var context = OracleViewModel.OracleSendTabContext(
+                    tabID: driver.tabID,
+                    workspaceID: driver.fixture.workspace.id,
+                    activationPolicy: .background,
+                    packaging: .init(
+                        sourceTabID: driver.tabID,
+                        sourceWorkspaceID: driver.fixture.workspace.id,
+                        sourceSelectionRevision: 0,
+                        sourceAgentSessionID: nil,
+                        sourceAgentRunID: nil,
+                        promptText: "",
+                        selection: StoredSelection(),
+                        lookupContext: .visibleWorkspace,
+                        reviewGitContext: .automaticOnly(),
+                        provenance: .direct
+                    )
+                )
+                context.requestDiagnostics.laneTimeout = 3
+                var reply: [String: Value]?
+                harness.start {
+                    reply = try await driver.window.oracleViewModel.tool_chatSendWithConfiguredRoster(
+                        args: ["message": .string("Controlled deadline"), "new_chat": .bool(true), "model": .string(harness.preset.name)],
+                        promptVM: driver.window.oracleViewModel.promptViewModel, tabContext: context
+                    )
+                }
+                try await harness.waitForStreams()
+                harness.complete(.gpt54Mini, text: "completed primary")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                let result = try XCTUnwrap(reply?["oracle_results"]?.arrayValue)
+                XCTAssertEqual(result.map { $0.objectValue?["status"]?.stringValue }, ["completed", "failed"])
+                XCTAssertEqual(result[1].objectValue?["error"]?.objectValue?["code"]?.stringValue, "oracle_diagnostic_overall_timeout")
+                let owner = try OracleViewModel.oracleGroupOwner(workspaceID: driver.fixture.workspace.id, tabID: driver.tabID)
+                let groupID = try OracleGroupID(rawValue: XCTUnwrap(reply?["oracle_group_id"]?.stringValue.flatMap(UUID.init(uuidString:))))
+                let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+                let loadedBefore = try await store.load(groupID: groupID, owner: owner)
+                let before = try XCTUnwrap(loadedBefore)
+                let delivery = harness.complete(.gpt54, text: "must not become late success")
+                guard case .terminated? = delivery else { return XCTFail("Timed-out transport was not drained") }
+                await Task.yield()
+                let loadedAfter = try await store.load(groupID: groupID, owner: owner)
+                let after = try XCTUnwrap(loadedAfter)
+                XCTAssertEqual(after, before)
+                XCTAssertEqual(after.turns.last?.results.map(\.status), [.completed, .failed])
+                XCTAssertEqual(harness.registeredModels.count, 2)
+            }
+        }
+
+        func testTicketSurvivesRoutedDisconnectAndExportsOnePipelineExactlyOnce() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                let gate = driver.fixture.makeGate()
+                let entered = XCTestExpectation(description: "ticket discovery started")
+                driver.streamBody = { runID in
+                    entered.fulfill()
+                    await gate.wait()
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                func payload(_ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection, _ args: [String: Value]) async throws -> [String: Any] {
+                    let reply = try await connection.client.callTool(name: "context_builder", arguments: args.merging(["_rawJSON": .bool(true)]) { _, new in new })
+                    let text = reply.content.compactMap { content -> String? in
+                        if case let .text(text, _, _) = content { return text }
+                        return nil
+                    }.joined(separator: "\n")
+                    XCTAssertNotEqual(reply.isError, true, text)
+                    return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                }
+                let context = try await driver.resolve()
+                let initiating = try await driver.connectInvokingAgent(context)
+                let started = try await payload(initiating, [
+                    "op": .string("start"), "detach": .bool(true),
+                    "instructions": .string("Build one controlled plan"), "response_type": .string("plan"),
+                    "oracle_preset": .string(harness.preset.name), "export_response": .bool(true)
+                ])
+                let jobID = try XCTUnwrap(started["job_id"] as? String)
+                try await harness.wait(entered)
+                await initiating.cleanup()
+                let reconnected = try await driver.connectInvokingAgent(context)
+                let observing = try await payload(reconnected, ["op": .string("wait"), "job_id": .string(jobID), "timeout": .double(0)])
+                XCTAssertEqual(observing["job_id"] as? String, jobID)
+                XCTAssertEqual((observing["job"] as? [String: Any])?["status"] as? String, "running")
+                XCTAssertNil(observing["plan"])
+                XCTAssertEqual(driver.constructed, 1)
+                let wrongKind = try await reconnected.client.callTool(name: "ask_oracle", arguments: ["op": .string("cancel"), "job_id": .string(jobID)])
+                XCTAssertEqual(wrongKind.isError, true)
+                XCTAssertTrue(wrongKind.content.contains { content in
+                    if case let .text(text, _, _) = content { return text.contains("belongs to a different tool") }
+                    return false
+                }, "The owning service rejects kind, not tool visibility")
+                let otherOrigin = try await driver.connectInvokingAgent(driver.resolve())
+                let wrongOwner = try await otherOrigin.client.callTool(name: "context_builder", arguments: ["op": .string("cancel"), "job_id": .string(jobID)])
+                XCTAssertEqual(wrongOwner.isError, true)
+                XCTAssertTrue(wrongOwner.content.contains { content in
+                    if case let .text(text, _, _) = content { return text.contains("belongs to a different Agent session/run") }
+                    return false
+                })
+                XCTAssertEqual(driver.constructed, 1, "Control authorization never enters discovery")
+                gate.release()
+                try await harness.waitForStreams()
+                try await harness.emit(.gpt54Mini, text: "primary partial ")
+                let streaming = try await payload(reconnected, ["op": .string("poll"), "job_id": .string(jobID)])
+                XCTAssertFalse(String(describing: streaming).contains("primary partial"), "poll projects lane state, never response bodies")
+                harness.complete(.gpt54, text: "sibling complete")
+                harness.complete(.gpt54Mini, text: "primary complete")
+                let terminal = try await payload(reconnected, ["op": .string("wait"), "job_id": .string(jobID), "timeout": .double(10)])
+                XCTAssertEqual((terminal["job"] as? [String: Any])?["status"] as? String, "completed")
+                let plan = try XCTUnwrap(terminal["plan"] as? [String: Any])
+                let lanes = try XCTUnwrap(plan["oracle_results"] as? [[String: Any]])
+                XCTAssertEqual(lanes.map { $0["status"] as? String }, ["completed", "completed"])
+                XCTAssertEqual(lanes[0]["response"] as? String, "primary partial primary complete")
+                let exportPath = try XCTUnwrap(terminal["oracle_export_path"] as? String)
+                let exportURL = URL(fileURLWithPath: exportPath.hasPrefix("/") ? exportPath : driver.fixture.rootPaths[0] + "/" + exportPath)
+                let exported = try Data(contentsOf: exportURL)
+                XCTAssertFalse(exported.isEmpty)
+                let exports = try FileManager.default.contentsOfDirectory(at: exportURL.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+                XCTAssertEqual(exports.count(where: { $0.pathExtension == "md" }), 1)
+                for op in ["poll", "wait", "cancel"] {
+                    let result = try await payload(reconnected, ["op": .string(op), "job_id": .string(jobID)])
+                    XCTAssertEqual(NSDictionary(dictionary: result), NSDictionary(dictionary: terminal))
+                }
+                XCTAssertEqual(try Data(contentsOf: exportURL), exported)
+                XCTAssertEqual(driver.constructed, 1)
+                XCTAssertEqual(driver.streamStarts, 1)
+                XCTAssertEqual(driver.teardownIDs.count, 1)
+                XCTAssertEqual(harness.registeredModels.count, 2)
+                XCTAssertEqual(Set(harness.registeredModels), Set([.gpt54Mini, .gpt54]))
+            }
+        }
+
+        func testTicketCancellationRetainsPartialFollowUpAndDrainsBothLanes() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                func call(_ args: [String: Value]) async throws -> [String: Any] {
+                    let reply = try await connection.client.callTool(name: "context_builder", arguments: args.merging(["_rawJSON": .bool(true)]) { _, new in new })
+                    XCTAssertNotEqual(reply.isError, true)
+                    let text = reply.content.compactMap { content -> String? in
+                        if case let .text(text, _, _) = content { return text }
+                        return nil
+                    }.joined(separator: "\n")
+                    return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                }
+                let start = try await call(["op": .string("start"), "detach": .bool(true), "instructions": .string("Controlled cancellation"), "response_type": .string("plan"), "oracle_preset": .string(harness.preset.name), "export_response": .bool(true)])
+                let id = try XCTUnwrap(start["job_id"] as? String)
+                try await harness.waitForStreams()
+                try await harness.emit(.gpt54Mini, text: "retained partial")
+                _ = try await call(["op": .string("cancel"), "job_id": .string(id)])
+                let terminal = try await call(["op": .string("wait"), "job_id": .string(id), "timeout": .double(10)])
+                XCTAssertEqual((terminal["job"] as? [String: Any])?["status"] as? String, "cancelled")
+                let lanes = try XCTUnwrap((terminal["plan"] as? [String: Any])?["oracle_results"] as? [[String: Any]])
+                XCTAssertEqual(lanes.map { $0["status"] as? String }, ["cancelled", "cancelled"])
+                XCTAssertEqual((lanes[0]["error"] as? [String: Any])?["partial_response"] as? String, "retained partial")
+                XCTAssertNotNil(terminal["oracle_export_error"])
+                XCTAssertNil(terminal["oracle_export_path"])
+                XCTAssertFalse(FileManager.default.fileExists(atPath: driver.fixture.rootPaths[0] + "/prompt-exports"))
+                XCTAssertEqual(driver.constructed, 1)
+                XCTAssertEqual(harness.registeredModels.count, 2)
+                try await harness.wait(harness.cancelled[.gpt54Mini]!)
+                try await harness.wait(harness.cancelled[.gpt54]!)
+            }
+        }
+
+        func testTicketRetainsSettledGroupWhenExportFailsOrIsCancelledDuringWrite() async throws {
+            for cancelDuringExport in [false, true] {
+                try await withHarness(routed: true) { harness in
+                    let driver = harness.driver
+                    driver.streamBody = { runID in
+                        let child = try await driver.connectChild(runID: runID)
+                        try await driver.discover(using: child)
+                    }
+                    let entered = XCTestExpectation(description: "writer entered exactly once")
+                    entered.assertForOverFulfill = true
+                    let gate = driver.fixture.makeGate()
+                    driver.window.mcpServer.contextBuilderExportFileOverrideForTesting = { _, _, _ in
+                        entered.fulfill()
+                        await gate.wait()
+                        if cancelDuringExport { try Task.checkCancellation() }
+                        throw NSError(domain: "SENSITIVE_WRITER_FAILURE", code: 1)
+                    }
+                    let context = try await driver.resolve()
+                    let connection = try await driver.connectInvokingAgent(context)
+                    func call(_ args: [String: Value]) async throws -> [String: Any] {
+                        let reply = try await connection.client.callTool(name: "context_builder", arguments: args.merging(["_rawJSON": .bool(true)]) { _, new in new })
+                        let text = reply.content.compactMap { content -> String? in
+                            if case let .text(text, _, _) = content { return text }
+                            return nil
+                        }.joined(separator: "\n")
+                        XCTAssertNotEqual(reply.isError, true, text)
+                        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                    }
+                    let start = try await call(["op": .string("start"), "detach": .bool(true), "instructions": .string("One export attempt"), "response_type": .string("plan"), "oracle_preset": .string(harness.preset.name), "export_response": .bool(true)])
+                    let id = try XCTUnwrap(start["job_id"] as? String)
+                    try await harness.waitForStreams()
+                    harness.complete(.gpt54Mini, text: "completed primary")
+                    harness.complete(.gpt54, text: "completed sibling")
+                    try await harness.wait(entered)
+                    if cancelDuringExport { _ = try await call(["op": .string("cancel"), "job_id": .string(id)]) }
+                    gate.release()
+                    let terminal = try await call(["op": .string("wait"), "job_id": .string(id), "timeout": .double(10)])
+                    XCTAssertEqual((terminal["job"] as? [String: Any])?["status"] as? String, cancelDuringExport ? "cancelled" : "completed")
+                    let plan = try XCTUnwrap(terminal["plan"] as? [String: Any])
+                    let lanes = try XCTUnwrap(plan["oracle_results"] as? [[String: Any]])
+                    XCTAssertEqual(lanes.map { $0["status"] as? String }, ["completed", "completed"])
+                    XCTAssertEqual(lanes.map { $0["response"] as? String }, ["completed primary", "completed sibling"])
+                    XCTAssertNotNil(plan["oracle_group_id"])
+                    XCTAssertNotNil(lanes[0]["chat_id"])
+                    XCTAssertNotNil(lanes[1]["chat_id"])
+                    XCTAssertNotNil(terminal["oracle_export_error"])
+                    XCTAssertNil(terminal["oracle_export_path"])
+                    XCTAssertFalse(String(describing: terminal).contains("SENSITIVE_WRITER_FAILURE"))
+                    let value = try JSONDecoder().decode(Value.self, from: JSONSerialization.data(withJSONObject: terminal))
+                    let rendered = ToolOutputFormatter.buildContentBlocks(toolName: "context_builder", args: [:], result: value, emitResources: false)
+                        .compactMap { content -> String? in
+                            if case let .text(text, _, _) = content { return text }
+                            return nil
+                        }.joined(separator: "\n")
+                    XCTAssertTrue(rendered.contains(cancelDuringExport ? "Oracle export cancelled" : "Oracle export failed"))
+                    XCTAssertTrue(rendered.contains("completed primary"))
+                    XCTAssertTrue(rendered.contains("completed sibling"))
+                    let repeated = try await call(["op": .string("poll"), "job_id": .string(id)])
+                    XCTAssertEqual(NSDictionary(dictionary: repeated), NSDictionary(dictionary: terminal))
+                    XCTAssertEqual(driver.constructed, 1)
+                    XCTAssertEqual(harness.registeredModels.count, 2)
+                }
+            }
+        }
+
+        func testLegacyBuilderExportFailureRemainsRequestError() async throws {
+            try await withHarness(routed: true) { harness in
+                let driver = harness.driver
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child)
+                }
+                driver.window.mcpServer.contextBuilderExportFileOverrideForTesting = { _, _, _ in
+                    throw NSError(domain: "fixture-export-error", code: 1)
+                }
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                var failed = false
+                harness.start {
+                    let reply = try await connection.client.callTool(name: "context_builder", arguments: ["instructions": .string("Legacy export"), "response_type": .string("plan"), "oracle_preset": .string(harness.preset.name), "export_response": .bool(true)])
+                    failed = reply.isError == true
+                }
+                try await harness.waitForStreams()
+                harness.complete(.gpt54Mini, text: "legacy primary")
+                harness.complete(.gpt54, text: "legacy sibling")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                XCTAssertTrue(failed, "Omitted op preserves legacy export failure, not ticket retention")
+            }
+        }
+
         func testUIGroupWaitsForAuthoritativeCompletionAfterInteractiveGrace() async throws {
             try await withHarness { harness in
                 let driver = harness.driver
@@ -658,6 +1151,512 @@ import XCTest
         }
     }
 
+    @MainActor
+    final class SingleOracleTicketLifetimeTests: XCTestCase {
+        func testFiredInteractiveWatchdogFinalizerDrainsBeforeTicketTerminalAndCannotClearReplacement() async throws {
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let gate = driver.fixture.makeGate()
+                let fired = XCTestExpectation(description: "real interactive watchdog fired")
+                let entered = XCTestExpectation(description: "real watchdog finalizer held before processing")
+                var scope: ContextBuilderOracleLaneScope?
+                var queryID: UUID?
+                var finalizer: Task<Void, Never>?
+                var heldFinalizerReturned = false
+                oracle.contextBuilderBeforeAvailabilityForTesting = { lane, _ in scope = lane }
+                oracle.interactiveWatchdogBeforeFinalizationForTesting = { id in
+                    guard id == queryID else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                    heldFinalizerReturned = true
+                }
+                oracle.interactiveWatchdogFinalizerScheduledForTesting = { id, task in
+                    if id == queryID { finalizer = task }
+                }
+                let connection = try await driver.connectInvokingAgent(driver.resolve())
+                let started = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "message": .string("Controlled fired watchdog"), "debug_primary_only": .bool(true)
+                ])
+                let id = try XCTUnwrap(UUID(uuidString: XCTUnwrap(started["job_id"] as? String)))
+                try await harness.waitForStream(.gpt54Mini)
+                let lane = try XCTUnwrap(scope)
+                let oldQuery = try XCTUnwrap(lane.queryID)
+                queryID = oldQuery
+                let observer = oracle.addMessageLifecycleActivityObserver(for: oldQuery) { event in
+                    if event.kind == .streamInactivityWatchdogFired { fired.fulfill() }
+                }
+                defer { oracle.removeMessageLifecycleActivityObserver(for: oldQuery, observerID: observer) }
+                oracle.pinSession(lane.sessionID)
+                defer { oracle.unpinSession(lane.sessionID) }
+                try await harness.emit(.gpt54Mini, text: "partial ")
+                harness.clock.advance(to: 2)
+                try await harness.emit(.gpt54Mini, text: "<chatName name=\"Stale watchdog rename\"/>")
+                let oldContent = oracle.getChatMessage(withId: oldQuery)?.content
+                let oldName = oracle.sessions.first { $0.id == lane.sessionID }?.name
+                try await harness.clock.waitForSleep(10)
+                harness.clock.advance(to: 13)
+                try await harness.wait(fired)
+                try await harness.wait(entered)
+                let watchdogFinalizer = try XCTUnwrap(finalizer)
+                _ = try await self.payload(connection, tool: "ask_oracle", args: ["op": .string("cancel"), "job_id": .string(id.uuidString)])
+                let cancellingSnapshot = await jobs.store.wait(id: id, timeout: 0.1)
+                let cancelling = try XCTUnwrap(cancellingSnapshot)
+                XCTAssertEqual(cancelling.status, .cancelling, "A fired local finalizer is not remotely disposed work")
+                XCTAssertFalse(heldFinalizerReturned)
+                XCTAssertFalse(lane.hasDrainedForTesting)
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 1)
+                do {
+                    try await jobs.store.checkAdmission(owner: cancelling.owner)
+                    XCTFail("Admission released before the held watchdog finalizer drained")
+                } catch {}
+                let replacementRegistered = harness.expectNextStream(.gpt54Mini)
+                let replacement = await oracle.sendMessage("Replacement", sessionID: lane.sessionID, overrideModel: .gpt54Mini)
+                let replacementQuery = try XCTUnwrap(replacement)
+                try await harness.wait(replacementRegistered)
+                try await harness.emit(.gpt54Mini, text: "replacement ")
+                gate.release()
+                await watchdogFinalizer.value
+                let terminalSnapshot = await jobs.store.wait(id: id, timeout: 10)
+                let terminal = try XCTUnwrap(terminalSnapshot)
+                XCTAssertEqual(terminal.status, .cancelled)
+                XCTAssertTrue(heldFinalizerReturned)
+                XCTAssertTrue(lane.hasDrainedForTesting)
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                try await jobs.store.checkAdmission(owner: terminal.owner)
+                XCTAssertEqual(oracle.getChatMessage(withId: oldQuery)?.content, oldContent, "Revoked watchdog must not process stale content")
+                XCTAssertEqual(oracle.sessions.first { $0.id == lane.sessionID }?.name, oldName, "Revoked watchdog must not rename the chat")
+                XCTAssertEqual(oracle.activeQueryId(for: lane.sessionID), replacementQuery)
+                XCTAssertTrue(oracle.isSessionStreaming(lane.sessionID), "Old watchdog must not clear replacement state")
+                harness.complete(.gpt54Mini, text: "complete")
+                let response = try await oracle.waitForContextBuilderCompletion(replacementQuery)
+                XCTAssertEqual(response, "replacement complete")
+            }
+        }
+
+        func testGroupedTicketCancellationDrainsAdditionalProducerAndProtectsSettledPrimaryAndReplacement() async throws {
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let gate = driver.fixture.makeGate()
+                var heldProducerReturned = false
+                var firstAdditional = true
+                var scopes: [AIModel: ContextBuilderOracleLaneScope] = [:]
+                oracle.contextBuilderBeforeChatResolutionForTesting = { scope, model in scopes[model] = scope }
+                harness.beforeTransportReturn = { id in
+                    guard firstAdditional, harness.streams[.gpt54]?.id == id else { return }
+                    firstAdditional = false
+                    await gate.wait()
+                    heldProducerReturned = true
+                }
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                let started = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "model": .string(harness.preset.name), "message": .string("Ordinary two-lane ticket")
+                ])
+                let id = try XCTUnwrap(UUID(uuidString: XCTUnwrap(started["job_id"] as? String)))
+                try await harness.waitForStreams()
+                let primary = try XCTUnwrap(oracle.sessions.first { $0.oracleGroupID != nil && $0.preferredAIModel == AIModel.gpt54Mini.rawValue })
+                let additional = try XCTUnwrap(oracle.sessions.first { $0.oracleGroupID != nil && $0.preferredAIModel == AIModel.gpt54.rawValue })
+                let primaryQuery = try XCTUnwrap(oracle.activeQueryId(for: primary.id))
+                let oldQuery = try XCTUnwrap(oracle.activeQueryId(for: additional.id))
+                let oldStream = try XCTUnwrap(harness.streams[.gpt54])
+                oracle.pinSession(primary.id)
+                oracle.pinSession(additional.id)
+                defer { oracle.unpinSession(primary.id)
+                    oracle.unpinSession(additional.id)
+                }
+                harness.complete(.gpt54Mini, text: "settled paid primary")
+                let paidResponse = try await oracle.waitForContextBuilderCompletion(primaryQuery)
+                XCTAssertEqual(paidResponse, "settled paid primary")
+                oldStream.continuation.yield(.init(text: "MUST NOT COMMIT", reasoning: nil, tokens: .init(), terminalOutcome: .completed))
+                _ = try await self.payload(connection, tool: "ask_oracle", args: ["op": .string("cancel"), "job_id": .string(id.uuidString)])
+                let cancellingSnapshot = await jobs.store.wait(id: id, timeout: 0.1)
+                let cancelling = try XCTUnwrap(cancellingSnapshot)
+                XCTAssertEqual(cancelling.status, .cancelling, "The additional producer is still held at transport return")
+                XCTAssertFalse(heldProducerReturned)
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 1, "Run cancellation registration must remain until every local lane drains")
+                do {
+                    try await jobs.store.checkAdmission(owner: cancelling.owner)
+                    XCTFail("Busy reservation released while additional producer remains held")
+                } catch {}
+                XCTAssertNotNil(scopes[.gpt54], "Every ordinary ticket lane needs the common lifetime owner, not a progress-field shortcut")
+                XCTAssertEqual(scopes[.gpt54]?.checkDeadlines(at: ProcessInfo.processInfo.systemUptime + 14400), false, "Cancellation revokes admission without a CB deadline")
+                let replacementRegistered = harness.expectNextStream(.gpt54)
+                let replacement = await oracle.sendMessage("Replacement", sessionID: additional.id, overrideModel: .gpt54)
+                let replacementQuery = try XCTUnwrap(replacement)
+                try await harness.wait(replacementRegistered)
+                try await harness.emit(.gpt54, text: "replacement ")
+                gate.release()
+                let terminalSnapshot = await jobs.store.wait(id: id, timeout: 10)
+                let terminal = try XCTUnwrap(terminalSnapshot)
+                XCTAssertTrue(heldProducerReturned, "Ticket terminal must follow actual additional producer return")
+                XCTAssertEqual(terminal.status, .cancelled)
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                try await jobs.store.checkAdmission(owner: terminal.owner)
+                let lanes = try XCTUnwrap(terminal.result?.objectValue?["oracle_results"]?.arrayValue)
+                XCTAssertEqual(lanes.map { $0.objectValue?["status"]?.stringValue }, ["completed", "cancelled"])
+                XCTAssertEqual(lanes.first?.objectValue?["response"]?.stringValue, "settled paid primary")
+                XCTAssertEqual(terminal.result?.objectValue?["status"]?.stringValue, "partial_failure")
+                try await harness.wait(harness.cancelled[.gpt54]!)
+                if case .terminated = oldStream.continuation.yield(.init(text: "late", reasoning: nil, tokens: .init())) {} else {
+                    XCTFail("Exact additional stream remained live after ticket cancellation")
+                }
+                XCTAssertFalse(oracle.messagesSnapshot(for: additional.id).contains { $0.content.contains("MUST NOT COMMIT") })
+                XCTAssertNil(oracle.getChatMessage(withId: oldQuery))
+                XCTAssertEqual(oracle.getChatMessage(withId: primaryQuery)?.content, "settled paid primary")
+                XCTAssertEqual(oracle.activeQueryId(for: additional.id), replacementQuery)
+                XCTAssertTrue(oracle.isSessionStreaming(additional.id), "Old group cleanup must not clear the replacement")
+                harness.complete(.gpt54, text: "complete")
+                let response = try await oracle.waitForContextBuilderCompletion(replacementQuery)
+                XCTAssertEqual(response, "replacement complete")
+            }
+        }
+
+        func testCancellationKeepsTicketOwnershipUntilExactProducerDrainsAndProtectsReplacement() async throws {
+            let tool = "ask_oracle"
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let gate = driver.fixture.makeGate()
+                var heldProducerReturned = false
+                var first = true
+                harness.beforeTransportReturn = { _ in
+                    guard first else { return }
+                    first = false
+                    await gate.wait()
+                    heldProducerReturned = true
+                }
+                let context = try await driver.resolve()
+                let connection = try await driver.connectInvokingAgent(context)
+                let started = try await self.payload(connection, tool: tool, args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "message": .string("Controlled single ticket"), "debug_primary_only": .bool(true)
+                ])
+                let id = try XCTUnwrap(UUID(uuidString: XCTUnwrap(started["job_id"] as? String)))
+                try await harness.waitForStream(.gpt54Mini)
+                let sessionID = try XCTUnwrap(oracle.sessions.last?.id)
+                let oldQuery = try XCTUnwrap(oracle.activeQueryId(for: sessionID))
+                let oldStream = try XCTUnwrap(harness.streams[.gpt54Mini])
+                oracle.pinSession(sessionID)
+                defer { oracle.unpinSession(sessionID) }
+                // Buffer a successful late output inside the actual Oracle producer's transport admission.
+                oldStream.continuation.yield(.init(text: "MUST NOT COMMIT", reasoning: nil, tokens: .init(), terminalOutcome: .completed))
+                _ = try await self.payload(connection, tool: tool, args: ["op": .string("cancel"), "job_id": .string(id.uuidString)])
+                let cancellingSnapshot = await jobs.store.wait(id: id, timeout: 0.1)
+                let cancelling = try XCTUnwrap(cancellingSnapshot)
+                XCTAssertEqual(cancelling.status, .cancelling, "Ticket must not settle before the gated Oracle producer returns: \(tool)")
+                XCTAssertFalse(heldProducerReturned)
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 1, "Keep run cancellation registration through local drain")
+                do {
+                    try await jobs.store.checkAdmission(owner: cancelling.owner)
+                    XCTFail("Busy reservation released before producer drain: \(tool)")
+                } catch {}
+                let replacementRegistered = harness.expectNextStream(.gpt54Mini)
+                let replacement = await oracle.sendMessage("Replacement", sessionID: sessionID, overrideModel: .gpt54Mini)
+                let replacementQuery = try XCTUnwrap(replacement)
+                try await harness.wait(replacementRegistered)
+                try await harness.emit(.gpt54Mini, text: "replacement ")
+                gate.release()
+                let terminalSnapshot = await jobs.store.wait(id: id, timeout: 10)
+                let terminal = try XCTUnwrap(terminalSnapshot)
+                XCTAssertEqual(terminal.status, .cancelled)
+                XCTAssertTrue(heldProducerReturned, "Terminal means the actual local producer has drained")
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                try await jobs.store.checkAdmission(owner: terminal.owner)
+                try await harness.wait(harness.cancelled[.gpt54Mini]!)
+                if case .terminated = oldStream.continuation.yield(.init(text: "late", reasoning: nil, tokens: .init())) {} else {
+                    XCTFail("Exact old stream remained live after ticket cancellation")
+                }
+                XCTAssertFalse(oracle.messagesSnapshot(for: sessionID).contains { $0.content.contains("MUST NOT COMMIT") })
+                XCTAssertNil(oracle.getChatMessage(withId: oldQuery))
+                XCTAssertEqual(oracle.activeQueryId(for: sessionID), replacementQuery)
+                XCTAssertTrue(oracle.isSessionStreaming(sessionID), "Old-ticket cleanup cannot cancel the replacement")
+                harness.complete(.gpt54Mini, text: "complete")
+                let response = try await oracle.waitForContextBuilderCompletion(replacementQuery)
+                XCTAssertEqual(response, "replacement complete")
+            }
+        }
+
+        func testObserverCancellationAndDisconnectLeaveSingleProducerRunningUntilExplicitTicketCancel() async throws {
+            let tool = "ask_oracle"
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let context = try await driver.resolve()
+                let initiating = try await driver.connectInvokingAgent(context)
+                var scope: ContextBuilderOracleLaneScope?
+                var watchdogEnabled: Bool?
+                oracle.streamWatchdogScheduledForTesting = { _, _, enabled in watchdogEnabled = enabled }
+                oracle.contextBuilderBeforeAvailabilityForTesting = { lane, _ in scope = lane }
+                let started = try await self.payload(initiating, tool: tool, args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "message": .string("Controlled consuming ticket"), "debug_primary_only": .bool(true)
+                ])
+                let id = try XCTUnwrap(UUID(uuidString: XCTUnwrap(started["job_id"] as? String)))
+                try await harness.waitForStream(.gpt54Mini)
+                let sessionID = try XCTUnwrap(oracle.sessions.last?.id)
+                let query = try XCTUnwrap(oracle.activeQueryId(for: sessionID))
+                let stream = try XCTUnwrap(harness.streams[.gpt54Mini])
+                oracle.pinSession(sessionID)
+                defer { oracle.unpinSession(sessionID) }
+                try await harness.emit(.gpt54Mini, text: "admitted partial ")
+                XCTAssertEqual(scope?.checkDeadlines(at: ProcessInfo.processInfo.systemUptime + 14400), true, "Single tickets gain ownership, not Context Builder deadlines")
+                XCTAssertEqual(watchdogEnabled, true, "Retain ordinary Oracle's existing watchdog policy")
+                let observer = Task { await jobs.store.wait(id: id, timeout: 60) }
+                observer.cancel()
+                _ = await observer.value
+                await initiating.cleanup()
+                let reconnected = try await driver.connectInvokingAgent(context)
+                let observed = try await self.payload(reconnected, tool: tool, args: ["op": .string("poll"), "job_id": .string(id.uuidString)])
+                XCTAssertEqual((observed["job"] as? [String: Any])?["status"] as? String, "running")
+                XCTAssertEqual(oracle.activeQueryId(for: sessionID), query)
+                XCTAssertTrue(oracle.isSessionStreaming(sessionID))
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 1)
+                _ = try await self.payload(reconnected, tool: tool, args: ["op": .string("cancel"), "job_id": .string(id.uuidString)])
+                let terminalSnapshot = await jobs.store.wait(id: id, timeout: 10)
+                let terminal = try XCTUnwrap(terminalSnapshot)
+                XCTAssertEqual(terminal.status, .cancelled)
+                if case .terminated = stream.continuation.yield(.init(text: "late forbidden", reasoning: nil, tokens: .init())) {} else {
+                    XCTFail("Explicit ticket cancel did not reach the exact consuming stream: \(tool)")
+                }
+                XCTAssertFalse(oracle.isSessionStreaming(sessionID))
+                XCTAssertEqual(oracle.getChatMessage(withId: query)?.content, "admitted partial ")
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+            }
+        }
+
+        func testOmittedOperationStillBlocksWithoutTicketLifetimeOrContextBuilderBudgets() async throws {
+            let tool = "ask_oracle"
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                let connection = try await driver.connectInvokingAgent(driver.resolve())
+                var scoped = false
+                var watchdogEnabled: Bool?
+                oracle.streamWatchdogScheduledForTesting = { _, _, enabled in watchdogEnabled = enabled }
+                oracle.contextBuilderBeforeAvailabilityForTesting = { _, _ in scoped = true }
+                var reply: [String: Any]?
+                harness.start {
+                    reply = try await self.payload(connection, tool: tool, args: [
+                        "new_chat": .bool(true), "message": .string("Blocking compatibility"), "debug_primary_only": .bool(true)
+                    ])
+                }
+                try await harness.waitForStream(.gpt54Mini)
+                try await harness.emit(.gpt54Mini, text: "blocking ")
+                XCTAssertFalse(harness.didSettle)
+                XCTAssertFalse(scoped, "Omitted op must retain the existing blocking path")
+                XCTAssertEqual(watchdogEnabled, true)
+                harness.complete(.gpt54Mini, text: "complete")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                XCTAssertNil(reply?["job_id"])
+                XCTAssertEqual(reply?["response"] as? String, "blocking complete")
+            }
+        }
+
+        func testOrdinaryGroupedTicketObserverDisconnectAndOmittedOperationPreserveInteractivePolicy() async throws {
+            for ticketed in [false, true] {
+                try await withHarness { harness in
+                    let driver = harness.driver
+                    let oracle = driver.window.oracleViewModel
+                    let jobs = WindowStatesManager.shared.longRunningJobs
+                    let context = try await driver.resolve()
+                    let initiating = try await driver.connectInvokingAgent(context)
+                    var scopes: [ContextBuilderOracleLaneScope] = []
+                    var watchdogs: [Bool] = []
+                    oracle.contextBuilderBeforeAvailabilityForTesting = { lane, _ in scopes.append(lane) }
+                    oracle.streamWatchdogScheduledForTesting = { _, _, enabled in watchdogs.append(enabled) }
+                    var args: [String: Value] = [
+                        "new_chat": .bool(true), "message": .string("Ordinary group compatibility"),
+                        "model": .string(harness.preset.name)
+                    ]
+                    if ticketed {
+                        args["op"] = .string("start")
+                        args["detach"] = .bool(true)
+                    }
+                    var reply: [String: Any]?
+                    harness.start { reply = try await self.payload(initiating, tool: "ask_oracle", args: args) }
+                    try await harness.waitForStreams()
+                    try await harness.emit(.gpt54Mini, text: "primary ")
+                    try await harness.emit(.gpt54, text: "additional ")
+                    XCTAssertFalse(watchdogs.isEmpty)
+                    XCTAssertTrue(watchdogs.allSatisfy(\.self), "Ordinary grouped lanes keep interactive watchdogs")
+                    let sessions = oracle.sessions.filter { $0.oracleGroupID != nil }
+                    XCTAssertEqual(sessions.count, 2)
+                    sessions.forEach { oracle.pinSession($0.id) }
+                    defer { sessions.forEach { oracle.unpinSession($0.id) } }
+                    let queries = try sessions.map { try XCTUnwrap(oracle.activeQueryId(for: $0.id)) }
+                    var ticketID: UUID?
+                    if ticketed {
+                        try await harness.wait(harness.settled)
+                        XCTAssertNil(harness.error)
+                        ticketID = try XCTUnwrap(UUID(uuidString: XCTUnwrap(reply?["job_id"] as? String)))
+                        XCTAssertEqual(scopes.count, 2, "Every ordinary ticket lane shares the group lifetime")
+                        for scope in scopes {
+                            XCTAssertEqual(scope.completionPolicy, .interactive)
+                            XCTAssertTrue(scope.checkDeadlines(at: ProcessInfo.processInfo.systemUptime + 14400), "Ownership adds no Context Builder budget")
+                        }
+                        let id = try XCTUnwrap(ticketID)
+                        let observer = Task { await jobs.store.wait(id: id, timeout: 60) }
+                        observer.cancel()
+                        _ = await observer.value
+                        await initiating.cleanup()
+                        let reconnected = try await driver.connectInvokingAgent(context)
+                        let observed = try await self.payload(reconnected, tool: "ask_oracle", args: ["op": .string("poll"), "job_id": .string(id.uuidString)])
+                        XCTAssertEqual((observed["job"] as? [String: Any])?["status"] as? String, "running")
+                        XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 1)
+                        for (session, query) in zip(sessions, queries) {
+                            XCTAssertEqual(oracle.activeQueryId(for: session.id), query)
+                            XCTAssertTrue(oracle.isSessionStreaming(session.id))
+                        }
+                    } else {
+                        XCTAssertFalse(harness.didSettle, "Omitted op blocks until the configured group completes")
+                        XCTAssertTrue(scopes.isEmpty, "Blocking callers do not gain a ticket lifetime")
+                    }
+                    harness.complete(.gpt54Mini, text: "complete")
+                    harness.complete(.gpt54, text: "complete")
+                    if let ticketID {
+                        let terminal = await jobs.store.wait(id: ticketID, timeout: 10)
+                        XCTAssertEqual(terminal?.status, .completed)
+                        XCTAssertTrue(scopes.allSatisfy(\.hasDrainedForTesting))
+                        XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                    } else {
+                        try await harness.wait(harness.settled)
+                        XCTAssertNil(harness.error)
+                        XCTAssertNil(reply?["job_id"])
+                        XCTAssertEqual(reply?["status"] as? String, "completed")
+                        let lanes = try XCTUnwrap(reply?["oracle_results"] as? [[String: Any]])
+                        XCTAssertEqual(lanes.map { $0["status"] as? String }, ["completed", "completed"])
+                    }
+                    for (session, query) in zip(sessions, queries) {
+                        XCTAssertEqual(oracle.getChatMessage(withId: query)?.content, session.preferredAIModel == AIModel.gpt54Mini.rawValue ? "primary complete" : "additional complete")
+                    }
+                }
+            }
+        }
+
+        private func payload(_ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection, tool: String, args: [String: Value]) async throws -> [String: Any] {
+            let reply = try await connection.client.callTool(name: tool, arguments: args.merging(["_rawJSON": .bool(true)]) { _, new in new })
+            let text = reply.content.compactMap { content -> String? in
+                if case let .text(text, _, _) = content { return text }
+                return nil
+            }.joined(separator: "\n")
+            XCTAssertNotEqual(reply.isError, true, text)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        }
+
+        private func withHarness(_ body: @escaping @MainActor (GroupedOracleHarness) async throws -> Void) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "C"], routedRuntime: true) { driver in
+                let harness = try GroupedOracleHarness(driver: driver)
+                do {
+                    try await body(harness)
+                    await harness.close()
+                } catch {
+                    await harness.close()
+                    throw error
+                }
+            }
+        }
+    }
+
+    @MainActor
+    final class SingleOracleFollowUpGenerationTests: XCTestCase {
+        func testCancelledBackgroundFollowUpDrainsWithoutClearingReplacementGeneration() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "C"], routedRuntime: true) { driver in
+                let harness = try GroupedOracleHarness(driver: driver)
+                let oracle = driver.window.oracleViewModel
+                let vm = driver.vm
+                var tasks: [Task<Void, Never>] = []
+                do {
+                    GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                        planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: []
+                    ))
+                    let index = try XCTUnwrap(driver.manager.workspaces.firstIndex { $0.id == driver.fixture.workspace.id })
+                    driver.manager.workspaces[index].composeTabs[0].promptText = "Build the controlled plan"
+                    driver.window.promptManager.loadComposeTabsFromWorkspace(driver.manager.workspaces[index], syncPromptText: true)
+                    let gate = driver.fixture.makeGate()
+                    let entered = XCTestExpectation(description: "A owned finalizer entered")
+                    let released = XCTestExpectation(description: "Cancel A released exact dependencies before finalizer join")
+                    var scopes: [ContextBuilderOracleLaneScope] = []
+                    oracle.contextBuilderBeforeAvailabilityForTesting = { scope, _ in scopes.append(scope) }
+                    oracle.contextBuilderBeforeFinalizationForTesting = { scope in
+                        if scope === scopes.first {
+                            entered.fulfill()
+                            await gate.wait()
+                        }
+                    }
+                    oracle.contextBuilderLaneReleasedForTesting = { scope in
+                        if scope === scopes.first { released.fulfill() }
+                    }
+
+                    vm.startBackgroundPlanGeneration(tabID: driver.tabID, oracleViewModel: oracle)
+                    let session = try XCTUnwrap(vm.sessions[driver.tabID])
+                    let taskA = try XCTUnwrap(session.backgroundPlanTask)
+                    tasks.append(taskA)
+                    let generationA = try XCTUnwrap(session.backgroundPlanGenerationID)
+                    try await harness.waitForStream(.gpt54Mini)
+                    harness.complete(.gpt54Mini, text: "cancelled A")
+                    try await harness.wait(entered)
+                    let scopeA = try XCTUnwrap(scopes.first)
+                    vm.cancelBackgroundPlanGeneration(forTabID: driver.tabID)
+                    try await harness.wait(released)
+                    XCTAssertFalse(scopeA.hasDrainedForTesting, "Cancel releases dependencies but still owes the real finalizer")
+
+                    let registeredB = harness.expectNextStream(.gpt54Mini)
+                    vm.startBackgroundPlanGeneration(tabID: driver.tabID, oracleViewModel: oracle)
+                    let taskB = try XCTUnwrap(session.backgroundPlanTask)
+                    tasks.append(taskB)
+                    let generationB = try XCTUnwrap(session.backgroundPlanGenerationID)
+                    XCTAssertNotEqual(generationA, generationB)
+                    try await harness.wait(registeredB)
+                    try await harness.emit(.gpt54Mini, text: "replacement ")
+                    let routeB = try XCTUnwrap(session.generatedAnswerRoute)
+                    let followUpB = try XCTUnwrap(session.followUpOracleSessionID)
+                    XCTAssertEqual(session.backgroundPlanResponseText, "replacement ")
+                    XCTAssertEqual(scopes.count, 2, "Actual single-lane A and B, not a grouped request")
+
+                    gate.release()
+                    await taskA.value
+                    XCTAssertTrue(scopeA.hasDrainedForTesting)
+                    XCTAssertEqual(session.backgroundPlanGenerationID, generationB)
+                    XCTAssertNotNil(session.backgroundPlanTask)
+                    XCTAssertTrue(session.isBackgroundPlanGenerating, "Drained A must not clear B's generating state")
+                    XCTAssertEqual(session.followUpOracleSessionID, followUpB)
+                    XCTAssertEqual(session.generatedAnswerRoute, routeB)
+                    XCTAssertEqual(session.backgroundPlanResponseText, "replacement ")
+                    try await harness.emit(.gpt54Mini, text: "continues ")
+                    XCTAssertEqual(session.backgroundPlanResponseText, "replacement continues ", "B progress remains publishable after A drains")
+                    harness.complete(.gpt54Mini, text: "complete")
+                    await taskB.value
+                    XCTAssertTrue(scopes.allSatisfy(\.hasDrainedForTesting))
+                    XCTAssertEqual(session.backgroundPlanResponseText, "replacement continues complete")
+                    XCTAssertEqual(session.generatedAnswerRoute, routeB)
+                    XCTAssertFalse(session.isBackgroundPlanGenerating)
+                    XCTAssertNil(session.backgroundPlanGenerationID)
+                    XCTAssertNil(session.backgroundPlanTask)
+                    XCTAssertNil(session.backgroundPlanError)
+                    XCTAssertNil(session.followUpOracleSessionID)
+                    XCTAssertEqual(harness.registeredModels, [.gpt54Mini, .gpt54Mini])
+                    await harness.close()
+                } catch {
+                    vm.cancelBackgroundPlanGeneration(forTabID: driver.tabID)
+                    await harness.close()
+                    for task in tasks {
+                        await task.value
+                    }
+                    throw error
+                }
+            }
+        }
+    }
+
     /// One clock drives both the real legacy watchdog and the candidate lane scope.
     /// Sleeps acknowledge registration and are cancellation-connected; advancing never guesses
     /// how many executor yields constitute an observation.
@@ -709,6 +1708,266 @@ import XCTest
     }
 
     @MainActor
+    final class StandaloneOracleTicketRecoveryTests: XCTestCase {
+        func testTypedCodexInputLimitGuidanceSurvivesTicketFailureAndChatPersistence() async throws {
+            let failure = CodexAppServerClient.RequestFailure(
+                method: "turn/start", code: -32602,
+                message: "Input exceeds the maximum length of 1048576 characters (1049069 Unicode scalar values supplied).",
+                data: .object([
+                    "input_error_code": .string("input_too_large"),
+                    "max_chars": .number(1_048_576), "actual_chars": .number(1_049_069)
+                ])
+            )
+            let wrapped = AIProviderError.apiError(source: CodexAppServerClient.ClientError.requestFailed(failure))
+            let expected = failure.userFacingMessage
+            XCTAssertEqual(wrapped.asFriendlyString(), expected, "The real provider wrapper must retain the typed input-limit guidance")
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                GlobalSettingsStore.shared.setMCPShowModelPresets(false, commit: false)
+                GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                    planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: []
+                ))
+                let connection = try await self.connect(tool: "ask_oracle", driver: driver)
+                let started = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "message": .string("Controlled typed rejection; no oversized input or remote request")
+                ])
+                let id = try XCTUnwrap(started["job_id"] as? String)
+                try await harness.waitForStream(.gpt54Mini)
+                let created = try XCTUnwrap(oracle.sessions.last)
+                oracle.pinSession(created.id)
+                defer { oracle.unpinSession(created.id) }
+                // Deliver the exact Codex provider error through the real Oracle failure owner.
+                // The controlled stream avoids invoking Codex or replaying the live oversized request.
+                harness.streams[.gpt54Mini]?.continuation.finish(throwing: wrapped)
+                let terminal = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("wait"), "job_id": .string(id), "timeout": .int(10)
+                ])
+                let job = try XCTUnwrap(terminal["job"] as? [String: Any])
+                XCTAssertEqual(job["status"] as? String, "failed")
+                XCTAssertEqual(job["chat_id"] as? String, created.shortID)
+                let error = try XCTUnwrap(job["error"] as? [String: Any])
+                XCTAssertEqual(error["code"] as? String, "failed", "Formatting does not reclassify the ticket")
+                XCTAssertEqual(error["message"] as? String, expected)
+                XCTAssertTrue(expected.contains("Reduce the selected context or message"))
+                XCTAssertTrue(expected.contains("does not truncate or automatically retry"))
+                XCTAssertNil(terminal["response"], "A local rejection is not a paid successful reply")
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                await oracle.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                let persisted = try XCTUnwrap(oracle.sessions.first { $0.id == created.id })
+                let saved = try await oracle.chatData.loadChatSession(from: XCTUnwrap(persisted.fileURL))
+                let savedError = try XCTUnwrap(saved.messages.last { !$0.isUser }?.rawText)
+                XCTAssertTrue(savedError.hasSuffix(expected), "Actual saved assistant history must retain exact guidance after its existing Error block prefix")
+                XCTAssertEqual(harness.registeredModels, [.gpt54Mini], "No retry or additional lane is introduced by formatting")
+            }
+        }
+
+        func testTypedCodexNonInputFailureKeepsPrivateDataOutOfTicketAndChatPersistence() async throws {
+            let privateMarker = "PRIVATE_CODEX_ERROR_DATA"
+            let publicMessage = "Codex could not complete this request."
+            let failure = CodexAppServerClient.RequestFailure(
+                method: "turn/start", code: -32603, message: publicMessage,
+                data: .object(["diagnostic": .string(privateMarker)])
+            )
+            let wrapped = AIProviderError.apiError(source: CodexAppServerClient.ClientError.requestFailed(failure))
+            XCTAssertEqual(wrapped.asFriendlyString(), publicMessage, "Only the public message belongs at the friendly boundary")
+            try await withHarness { harness in
+                let driver = harness.driver
+                let oracle = driver.window.oracleViewModel
+                GlobalSettingsStore.shared.setMCPShowModelPresets(false, commit: false)
+                GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                    planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: []
+                ))
+                let connection = try await self.connect(tool: "ask_oracle", driver: driver)
+                let started = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                    "message": .string("Controlled non-input Codex failure; no remote request")
+                ])
+                let id = try XCTUnwrap(started["job_id"] as? String)
+                try await harness.waitForStream(.gpt54Mini)
+                let created = try XCTUnwrap(oracle.sessions.last)
+                oracle.pinSession(created.id)
+                defer { oracle.unpinSession(created.id) }
+                harness.streams[.gpt54Mini]?.continuation.finish(throwing: wrapped)
+                let terminal = try await self.payload(connection, tool: "ask_oracle", args: [
+                    "op": .string("wait"), "job_id": .string(id), "timeout": .int(10)
+                ])
+                let job = try XCTUnwrap(terminal["job"] as? [String: Any])
+                XCTAssertEqual(job["status"] as? String, "failed")
+                XCTAssertEqual(job["chat_id"] as? String, created.shortID)
+                let error = try XCTUnwrap(job["error"] as? [String: Any])
+                XCTAssertEqual(error["code"] as? String, "failed")
+                XCTAssertEqual(error["message"] as? String, publicMessage, "Native failed tickets must not expose typed error data")
+                XCTAssertNil(terminal["response"])
+                XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0)
+                await oracle.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                let persisted = try XCTUnwrap(oracle.sessions.first { $0.id == created.id })
+                let saved = try await oracle.chatData.loadChatSession(from: XCTUnwrap(persisted.fileURL))
+                let savedError = try XCTUnwrap(saved.messages.last { !$0.isUser }?.rawText)
+                XCTAssertTrue(savedError.hasSuffix(publicMessage), "Saved assistant history must retain the public message")
+                XCTAssertFalse(savedError.contains(privateMarker), "Private provider error data must not be persisted")
+                XCTAssertFalse(savedError.contains("CodexAppServerClient.RequestFailure"), "Internal typed error dumps must not be persisted")
+                XCTAssertEqual(harness.registeredModels, [.gpt54Mini])
+            }
+        }
+
+        func testCreatedStandaloneChatSurvivesPartialFailureAndCancellationInEveryRecoveryProjection() async throws {
+            for tool in ["ask_oracle", "oracle_send"] {
+                for cancelled in [false, true] {
+                    try await withHarness { harness in
+                        let driver = harness.driver
+                        let oracle = driver.window.oracleViewModel
+                        GlobalSettingsStore.shared.setMCPShowModelPresets(false, commit: false)
+                        GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                            planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: []
+                        ))
+                        let connection = try await self.connect(tool: tool, driver: driver)
+                        let started = try await self.payload(connection, tool: tool, args: [
+                            "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                            "message": .string("PRIVATE_RECOVERY_INPUT")
+                        ])
+                        let id = try XCTUnwrap(started["job_id"] as? String)
+                        try await harness.waitForStream(.gpt54Mini)
+                        XCTAssertEqual(harness.registeredModels, [.gpt54Mini], "Real singleton roster, not a group child")
+                        let created = try XCTUnwrap(oracle.sessions.last)
+                        let query = try XCTUnwrap(oracle.activeQueryId(for: created.id))
+                        oracle.pinSession(created.id)
+                        defer { oracle.unpinSession(created.id) }
+                        try await harness.emit(.gpt54Mini, text: "PRIVATE_PAID_PARTIAL")
+                        XCTAssertEqual(oracle.getChatMessage(withId: query)?.content, "PRIVATE_PAID_PARTIAL")
+                        let running = try await self.payload(connection, tool: tool, args: ["op": .string("poll"), "job_id": .string(id)])
+                        XCTAssertEqual((running["job"] as? [String: Any])?["status"] as? String, "running", "Publishing a handle must not fake completion")
+                        XCTAssertEqual((running["job"] as? [String: Any])?["chat_id"] as? String, created.shortID)
+                        if cancelled {
+                            _ = try await self.payload(connection, tool: tool, args: ["op": .string("cancel"), "job_id": .string(id)])
+                        } else {
+                            harness.streams[.gpt54Mini]?.continuation.finish(throwing: ChatToolError.internalError("Controlled failure after accepted partial"))
+                        }
+                        let terminal = try await self.payload(connection, tool: tool, args: ["op": .string("wait"), "job_id": .string(id), "timeout": .int(10)])
+                        XCTAssertEqual((terminal["job"] as? [String: Any])?["status"] as? String, cancelled ? "cancelled" : "failed")
+                        XCTAssertEqual((terminal["job"] as? [String: Any])?["chat_id"] as? String, created.shortID, "Created chats require recovery, never an optional nil route")
+                        XCTAssertNil(terminal["response"], "Partial paid text remains in history, not a fabricated successful reply")
+                        XCTAssertEqual(driver.window.mcpServer.test_activeToolExecutionCount(), 0, "Terminal still follows exact local drain")
+                        await oracle.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                        let persisted = try XCTUnwrap(oracle.sessions.first { $0.id == created.id })
+                        let savedChat = try await oracle.chatData.loadChatSession(from: XCTUnwrap(persisted.fileURL))
+                        XCTAssertEqual(savedChat.shortID, created.shortID)
+                        XCTAssertTrue(savedChat.messages.last { !$0.isUser }?.rawText.hasPrefix("PRIVATE_PAID_PARTIAL") == true, "Provider failure may append its diagnostic, but must retain accepted paid text")
+                        let formatted = try await connection.client.callTool(name: tool, arguments: ["op": .string("poll"), "job_id": .string(id)])
+                        XCTAssertNotEqual(formatted.isError, true)
+                        XCTAssertTrue(self.text(formatted.content).contains("**Oracle chat**: `\(created.shortID)`"), "Actual default formatted response must expose the same recovery handle")
+                        try await self.assertSavedRecovery(terminal, chatID: created.shortID, tool: tool, driver: driver)
+                    }
+                }
+            }
+        }
+
+        func testGroupedTicketKeepsCanonicalPrimaryRecoveryWithoutStandaloneLanePublication() async throws {
+            for tool in ["ask_oracle", "oracle_send"] {
+                try await withHarness { harness in
+                    let driver = harness.driver
+                    let oracle = driver.window.oracleViewModel
+                    let connection = try await self.connect(tool: tool, driver: driver)
+                    let started = try await self.payload(connection, tool: tool, args: [
+                        "op": .string("start"), "detach": .bool(true), "new_chat": .bool(true),
+                        "message": .string("Group recovery"), "model": .string(harness.preset.name)
+                    ])
+                    let id = try XCTUnwrap(started["job_id"] as? String)
+                    try await harness.waitForStreams()
+                    let primary = try XCTUnwrap(oracle.sessions.first { $0.preferredAIModel == AIModel.gpt54Mini.rawValue })
+                    let additional = try XCTUnwrap(oracle.sessions.first { $0.preferredAIModel == AIModel.gpt54.rawValue })
+                    let observed = try await self.payload(connection, tool: tool, args: ["op": .string("poll"), "job_id": .string(id)])
+                    let job = try XCTUnwrap(observed["job"] as? [String: Any])
+                    XCTAssertNil(job["chat_id"], "Group children must not publish standalone metadata over group authority")
+                    let lanes = try XCTUnwrap(job["oracle_lanes"] as? [[String: Any]])
+                    XCTAssertEqual(lanes.map { $0["chat_id"] as? String }, [primary.shortID, additional.shortID])
+                    try await harness.emit(.gpt54Mini, text: "paid primary ")
+                    harness.complete(.gpt54Mini, text: "complete")
+                    harness.streams[.gpt54]?.continuation.finish(throwing: ChatToolError.internalError("Controlled additional failure"))
+                    let terminal = try await self.payload(connection, tool: tool, args: ["op": .string("wait"), "job_id": .string(id), "timeout": .int(10)])
+                    XCTAssertEqual(terminal["status"] as? String, "partial_failure")
+                    XCTAssertEqual(terminal["chat_id"] as? String, primary.shortID)
+                    XCTAssertEqual((terminal["job"] as? [String: Any])?["chat_id"] as? String, primary.shortID)
+                    let results = try XCTUnwrap(terminal["oracle_results"] as? [[String: Any]])
+                    XCTAssertEqual(results.map { $0["chat_id"] as? String }, [primary.shortID, additional.shortID])
+                    XCTAssertEqual(results.first?["response"] as? String, "paid primary complete")
+                }
+            }
+        }
+
+        private func assertSavedRecovery(_ native: [String: Any], chatID: String, tool: String, driver: ContextBuilderMultiRootDiscoveryDriver) async throws {
+            let raw = try JSONSerialization.data(withJSONObject: native)
+            let open = AgentOracleOpenContext(windowID: driver.window.windowID, workspaceID: driver.fixture.workspace.id, tabID: driver.tabID)
+            for representation in [native, ["rawOutput": native], ["rawOutput": String(decoding: raw, as: UTF8.self)]] {
+                var item = try AgentChatItem.toolResult(name: tool, argsJSON: #"{"message":"PRIVATE_RECOVERY_INPUT"}"#, resultJSON: String(decoding: JSONSerialization.data(withJSONObject: representation), as: UTF8.self), isError: false, sequenceIndex: 1)
+                item.toolInvocationID = UUID()
+                let session = AgentSession(workspaceID: driver.fixture.workspace.id, composeTabID: driver.tabID, name: "Standalone recovery", transcript: AgentTranscriptIO.importLegacyItems([.user("Inspect", sequenceIndex: 0), item]), lastRunState: "completed")
+                let file = try await AgentSessionDataService().saveAgentSession(session, for: driver.fixture.workspace)
+                let bytes = try String(contentsOf: file, encoding: .utf8)
+                XCTAssertFalse(bytes.contains("PRIVATE_RECOVERY_INPUT"))
+                XCTAssertFalse(bytes.contains("PRIVATE_PAID_PARTIAL"))
+                let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+                let projection = try AgentTranscriptProjectionBuilder.build(from: XCTUnwrap(loaded.transcript))
+                let restored = try XCTUnwrap((projection.archivedBlocks + projection.workingBlocks).flatMap(\.rows).first { $0.kind == .toolResult && $0.toolInvocationID == item.toolInvocationID })
+                XCTAssertNil(restored.toolArgsJSON)
+                let restoredRaw = try XCTUnwrap(restored.toolResultJSON)
+                XCTAssertLessThanOrEqual(restoredRaw.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+                let data = try XCTUnwrap(ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: restoredRaw))
+                let ticket = try JSONDecoder().decode(ToolResultDTOs.LongRunningJobTicketDTO.self, from: data)
+                XCTAssertEqual(ticket.job.chatID, chatID, "Bounded saved/restored projection must retain the exact created handle")
+                for row in [item, restored] {
+                    let route = AgentOraclePopoverRoute(notificationUserInfo: oracleToolResultPopoverUserInfo(item: row, openContext: open))
+                    XCTAssertEqual(route?.chatID, chatID)
+                    XCTAssertEqual(route?.tabID, driver.tabID)
+                    XCTAssertEqual(route?.presentation, .generatedAnswerReadOnly)
+                    XCTAssertNil(oracleToolResultPopoverUserInfo(item: row, openContext: .init(windowID: open.windowID, workspaceID: open.workspaceID, tabID: UUID())))
+                    XCTAssertEqual(ChatSendResultCard(item: row, oracleOpenContext: open).status, .failure)
+                }
+            }
+        }
+
+        private func connect(tool: String, driver: ContextBuilderMultiRootDiscoveryDriver) async throws -> ContextBuilderMultiRootDiscoveryDriver.RoutedConnection {
+            if tool == "ask_oracle" { return try await driver.connectInvokingAgent(driver.resolve()) }
+            // oracle_send belongs to app-backed CLI clients, not the restricted Agent tool set.
+            await driver.window.mcpServer.startServer()
+            let connection = try await driver.connect(name: "RepoPromptCLI-recovery", purpose: .unknown)
+            let bound = try await connection.client.callTool(name: "bind_context", arguments: [
+                "op": .string("bind"), "context_id": .string(driver.tabID.uuidString),
+                "_windowID": .int(driver.window.windowID)
+            ])
+            XCTAssertNotEqual(bound.isError, true, text(bound.content))
+            return connection
+        }
+
+        private func text(_ content: [MCP.Tool.Content]) -> String {
+            content.compactMap { content -> String? in
+                if case let .text(text, _, _) = content { return text }
+                return nil
+            }.joined(separator: "\n")
+        }
+
+        private func payload(_ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection, tool: String, args: [String: Value]) async throws -> [String: Any] {
+            let reply = try await connection.client.callTool(name: tool, arguments: args.merging(["_rawJSON": .bool(true)]) { _, new in new })
+            XCTAssertNotEqual(reply.isError, true, text(reply.content))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text(reply.content).utf8)) as? [String: Any])
+        }
+
+        private func withHarness(_ body: @escaping @MainActor (GroupedOracleHarness) async throws -> Void) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["OracleRecovery"], routedRuntime: true) { driver in
+                let harness = try GroupedOracleHarness(driver: driver)
+                do {
+                    try await body(harness)
+                    await harness.close()
+                } catch {
+                    await harness.close()
+                    throw error
+                }
+            }
+        }
+    }
+
+    @MainActor
     private final class GroupedOracleHarness {
         enum Failure: Error { case checkpoint(String) }
         let driver: ContextBuilderMultiRootDiscoveryDriver
@@ -727,7 +1986,8 @@ import XCTest
         private(set) var interactiveWatchdogEnabled = false
         private(set) var interactiveWatchdogObserved = false
         private var remoteCleanupTasks: [Task<Void, Never>] = []
-        private var streams: [AIModel: (id: UUID, continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation)] = [:]
+        private(set) var streams: [AIModel: (id: UUID, continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation)] = [:]
+        var beforeTransportReturn: ((UUID) async -> Void)?
         private var streamEvents: [AIModel: XCTestExpectation] = [:]
         private var outputEvent: (text: String, event: XCTestExpectation)?
         private var producers: [Task<Void, Never>] = []
@@ -798,6 +2058,7 @@ import XCTest
                 allStreams.append((id, stream.continuation))
                 registeredModels.append(model)
                 streamEvents.removeValue(forKey: model)?.fulfill()
+                await beforeTransportReturn?(id)
                 return (id, stream.stream)
             }
         }
@@ -862,9 +2123,11 @@ import XCTest
             try await wait(event)
         }
 
-        func complete(_ model: AIModel, text: String, reasoning: String? = nil) {
-            streams[model]?.continuation.yield(.init(text: text, reasoning: reasoning, tokens: .init(), terminalOutcome: .completed))
+        @discardableResult
+        func complete(_ model: AIModel, text: String, reasoning: String? = nil) -> AsyncThrowingStream<ChatStreamOutput, Error>.Continuation.YieldResult? {
+            let delivery = streams[model]?.continuation.yield(.init(text: text, reasoning: reasoning, tokens: .init(), terminalOutcome: .completed))
             streams[model]?.continuation.finish()
+            return delivery
         }
 
         func close() async {
@@ -886,6 +2149,7 @@ import XCTest
                 await driver.window.aiQueriesService.removeControlledStreamForTesting(id: stream.id)
             }
             XCTAssertEqual(producerExits, producers.count, "Controlled producer tasks drained (not a remote provider-disposal claim)")
+            driver.window.mcpServer.contextBuilderExportFileOverrideForTesting = nil
             let oracle = driver.window.oracleViewModel
             // Oracle persistence is separately owned, not part of lane drainage. The fixture
             // must finish its workspace's tracked writes before the driver removes its files.
@@ -899,6 +2163,8 @@ import XCTest
             oracle.contextBuilderBeforeChatResolutionForTesting = nil
             oracle.contextBuilderBeforeAvailabilityForTesting = nil
             oracle.contextBuilderBeforeFinalizationForTesting = nil
+            oracle.interactiveWatchdogBeforeFinalizationForTesting = nil
+            oracle.interactiveWatchdogFinalizerScheduledForTesting = nil
             oracle.contextBuilderLaneReleasedForTesting = nil
             oracle.providerConversationCleanupForTesting = nil
             oracle.providerCleanupTaskScheduledForTesting = nil

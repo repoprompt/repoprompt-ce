@@ -379,40 +379,47 @@ actor MCPCommandRunner {
         // Normalize context_builder instruction aliases (task, prompt, etc. -> instructions)
         if name == "context_builder" {
             var argsDict = args ?? [:]
-            try MCPCommandParser.normalizeContextBuilderArgs(&argsDict)
-
-            let hasInstructions: Bool = if case let .string(value) = argsDict["instructions"] {
-                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if MCPCommandParser.isLongRunningControlOperation(argsDict["op"]?.stringValue) {
+                guard let id = argsDict["job_id"]?.stringValue, UUID(uuidString: id) != nil else {
+                    throw CommandParseError.invalidArgument("context_builder controls require job_id from a start response")
+                }
+                args = argsDict
             } else {
-                false
-            }
-            let hasContextPackReference: Bool = if case let .string(value) = argsDict["context_pack_ref"] {
-                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            } else {
-                false
-            }
+                try MCPCommandParser.normalizeContextBuilderArgs(&argsDict)
 
-            switch (hasInstructions, hasContextPackReference) {
-            case (true, false), (false, true):
-                break
-            case (true, true):
-                throw CommandParseError.invalidArgument(
-                    "context_builder accepts exactly one of instructions or context_pack_ref"
-                )
-            case (false, false):
-                throw CommandParseError.missingArgument(
-                    """
-                    exactly one of instructions or context_pack_ref
+                let hasInstructions: Bool = if case let .string(value) = argsDict["instructions"] {
+                    !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                } else {
+                    false
+                }
+                let hasContextPackReference: Bool = if case let .string(value) = argsDict["context_pack_ref"] {
+                    !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                } else {
+                    false
+                }
 
-                    Usage:
-                      call context_builder {"task": "your task"}
-                      call context_builder {"instructions": "...", "response_type": "plan"}
-                      call context_builder {"context_pack_ref": "oracle-pack:sha256:..."}
-                    """
-                )
+                switch (hasInstructions, hasContextPackReference) {
+                case (true, false), (false, true):
+                    break
+                case (true, true):
+                    throw CommandParseError.invalidArgument(
+                        "context_builder accepts exactly one of instructions or context_pack_ref"
+                    )
+                case (false, false):
+                    throw CommandParseError.missingArgument(
+                        """
+                        exactly one of instructions or context_pack_ref
+
+                        Usage:
+                          call context_builder {"task": "your task"}
+                          call context_builder {"instructions": "...", "response_type": "plan"}
+                          call context_builder {"context_pack_ref": "oracle-pack:sha256:..."}
+                        """
+                    )
+                }
+
+                args = argsDict
             }
-
-            args = argsDict
         }
 
         if settings.verbose {
@@ -577,7 +584,10 @@ actor MCPCommandRunner {
           prompt                          Get/set prompt, export, presets
           workspace_context (context)     Get workspace snapshot
           context_builder  (builder)      Auto-build selection + generate response
-            instructions/task (required)  What you need help with
+              op=start|poll|wait|cancel     App-owned job lifecycle; omitted stays blocking
+              job_id                       Job UUID for controls; no instructions required
+              timeout                      start/wait observation seconds (agent_run policy)
+              instructions/task (execution) What you need help with
             response_type (optional)
               omit/clarify  Build context only (default)
               question      Build context → answer question → return chat_id
@@ -587,7 +597,8 @@ actor MCPCommandRunner {
             Examples:
               builder "Find auth code"
               context_builder task="Add logout" response_type=plan
-              builder "Add logout" --response-type plan --export
+                builder "Add logout" --response-type plan --export --detach
+                call context_builder {"op":"wait","job_id":"<job>","timeout":20}
               builder "Review these changes" --type review
 
         Editing:

@@ -1128,6 +1128,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
             .map(advertiseOracleImageAttachments)
+            .map(advertiseOracleDebugDiagnostics)
             .map(advertiseWorktreeListPagination)
             .map(advertiseSessionDiscovery)
     }
@@ -1147,6 +1148,27 @@ package enum MCPDomainCanonicalToolDefinitions {
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
         )
+    }
+
+    private static func advertiseOracleDebugDiagnostics(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        #if DEBUG
+            guard [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend].contains(definition.name),
+                  case var .object(schema) = definition.inputSchema,
+                  case var .object(properties)? = schema["properties"]
+            else { return definition }
+            properties["debug_primary_only"] = .object([
+                "type": .string("boolean"),
+                "description": .string("DEBUG app only: new_chat=true and no chat_id; run only the resolved primary model for this request, without changing settings. Cannot combine with debug_lane_timeout_seconds. Headless execution rejects this control.")
+            ])
+            properties["debug_lane_timeout_seconds"] = .object([
+                "type": .string("number"), "minimum": .int(1), "maximum": .int(300),
+                "description": .string("DEBUG app only: fresh configured multi-lane request, finite 1–300 second overall deadline per lane including setup and finalization. Not the ticket observer timeout. No persistent setting change. Headless execution and context_builder reject this control.")
+            ])
+            schema["properties"] = .object(properties)
+            return MCPDomainToolDefinition(name: definition.name, description: definition.description + "\n\nDEBUG-only request diagnostics: debug_primary_only=true or debug_lane_timeout_seconds (1–300s) require new_chat=true and no chat_id. They cannot combine; timeout requires multiple configured lanes. App backend only; unsupported backends reject, never ignore. These controls do not change settings or defaults.", inputSchema: .object(schema), annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault)
+        #else
+            return definition
+        #endif
     }
 
     private static let becomeOverseerDefinition = MCPDomainToolDefinition(
@@ -1504,10 +1526,12 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "type": .string("boolean"),
                 "description": .string("Start a new conversation. Omitted chat_id also selects the start route; false with chat_id continues that conversation.")
             ])
+            properties.merge(MCPLongRunningJobToolContract.properties) { _, ticket in ticket }
+            schema["required"] = .array([])
             schema["properties"] = .object(properties)
             return MCPDomainToolDefinition(
                 name: definition.name,
-                description: definition.description + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
+                description: definition.description + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.\n\n" + MCPLongRunningJobToolContract.askOracleGuidance,
                 inputSchema: .object(schema),
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault
@@ -1530,13 +1554,15 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "description": .string("Optional exposed Model Preset name/UUID or available raw primary-model override for an explicit new_chat=true start. Exact preset identity wins a collision; a raw model retains configured additional Oracles. Rejected on continuation."),
                 "maxLength": .int(OracleRosterContract.maximumModelIdentifierLength)
             ])
+            properties.merge(MCPLongRunningJobToolContract.properties) { _, ticket in ticket }
+            schema["required"] = .array([])
             schema["properties"] = .object(properties)
             return MCPDomainToolDefinition(
                 name: definition.name,
                 description: definition.description.replacingOccurrences(
                     of: "Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.",
                     with: "Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start. With Model Presets exposed, an exact preset UUID or name is resolved before raw-model interpretation and supplies the complete roster and mapped Chat Preset. An available raw model replaces only the configured primary and retains configured additional Oracles."
-                ),
+                ) + "\n\n" + MCPLongRunningJobToolContract.oracleSendGuidance,
                 inputSchema: .object(schema),
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault
@@ -1557,10 +1583,12 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "pattern": .string("^oracle-pack:sha256:[0-9a-f]{64}$"),
                 "description": .string("Direct-headless only: canonical reference to a resolvable persisted frozen Context Builder package. Raw multi-Oracle instructions remain rejected with context_pack_required.")
             ])
+            properties.merge(MCPLongRunningJobToolContract.properties) { _, ticket in ticket }
+            schema["required"] = .array([])
             schema["properties"] = .object(properties)
             return MCPDomainToolDefinition(
                 name: definition.name,
-                description: definition.description + " For app-backed plan, question, or review responses, oracle_preset selects an exposed Model Preset's complete Oracle roster and prompt independently of the discovery model. Direct-headless execution rejects oracle_preset. Direct grouped execution accepts only a canonical resolvable context_pack_ref; raw multi-Oracle instructions still require a frozen package.",
+                description: definition.description + " For app-backed plan, question, or review responses, oracle_preset selects an exposed Model Preset's complete Oracle roster and prompt independently of the discovery model. Direct-headless execution rejects oracle_preset. Direct grouped execution accepts only a canonical resolvable context_pack_ref; raw multi-Oracle instructions still require a frozen package.\n\n" + MCPLongRunningJobToolContract.contextBuilderGuidance,
                 inputSchema: .object(schema),
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault

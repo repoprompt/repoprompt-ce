@@ -49,6 +49,8 @@ enum RepoPromptMCPInstructions {
 
         AGENT DELEGATION: Your system prompt lists the delegation tool available to you and how to use it. Use that tool to spawn or drive separate Agent Mode sessions when the task needs work in a fresh session or read-only exploration probes; do not assume any specific delegation tool is in scope for this connection.
 
+        LONG ORACLE WORK: Prefer context_builder, ask_oracle or oracle_send op=start, detach=true, then poll/wait with job_id (timeout bounds observation, not execution). A wait timeout or client disconnect leaves the app-owned job running. Never repeat paid start to retrieve a result. Tickets are process-local; bind the returned context_id to reconnect. Omit op for legacy blocking execution.
+
         SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder`, `ask_oracle`, or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next delegation call — your system prompt names the specific delegation tool you should use. The child agent already has `read_file` and will open the export itself.
         """
     }
@@ -76,6 +78,8 @@ enum RepoPromptMCPInstructions {
         AGENT DELEGATION: Use agent_run to spawn separate Agent Mode sessions. Omit model_id to use the pair role, or pass model_id with a role label (explore, engineer, pair, design) or a specific model from agent_manage.list_agents. Explore agents are lightweight — use them proactively when codebase investigation would ground your work. Heavier roles (engineer, pair, design) should be launched when the user requests delegation. Design agents produce a markdown review document (saved under docs/reviews/, docs/designs/, or docs/analysis/) as their primary deliverable for review/analysis tasks — expect a report path in their summary, not just an inline response.
 
         SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder` or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next `agent_run` `start` or `steer` call. You may emit `oracle_export_instruction` verbatim at the head of that `message`; the child already has `read_file` and will open the export itself.
+
+        LONG ORACLE WORK: Prefer context_builder or oracle_send op=start, detach=true, then poll/wait with job_id (for example timeout=20). A wait timeout or client disconnect leaves the job running; cancel explicitly. Read every lane in the complete terminal response before reconciling. job_id is not chat_id or session_id. Tickets expire on app restart; never automatically repeat paid work. Omit op for legacy blocking behavior.
 
         Workspace tabs isolate tab contexts for parallel tasks. Use bind_context with context_id to bind this connection to the intended tab context for multi-window/tab routing.
         """

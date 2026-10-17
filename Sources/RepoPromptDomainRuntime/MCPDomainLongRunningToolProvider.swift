@@ -357,8 +357,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         arguments: [String: Value]
     ) -> [String] {
         switch toolName {
-        case "ask_oracle", "oracle_send", "context_builder":
-            return ["ai_cost", "external_process"]
+        case "oracle_send", "ask_oracle", "context_builder":
+            return ["poll", "wait", "cancel"].contains(normalizedOperation(arguments, fallback: "")) ? [] : ["ai_cost", "external_process"]
         case "agent_explore":
             return normalizedOperation(arguments, fallback: "") == "start"
                 ? ["ai_cost", "external_process"]
@@ -384,8 +384,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         arguments: [String: Value]
     ) -> Bool {
         switch toolName {
-        case "context_builder", "ask_oracle", "oracle_send":
-            return true
+        case "oracle_send", "ask_oracle", "context_builder":
+            return !["poll", "wait", "cancel"].contains(normalizedOperation(arguments, fallback: ""))
         case "agent_explore":
             return normalizedOperation(arguments, fallback: "") == "start"
         case "agent_run":

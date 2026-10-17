@@ -528,37 +528,18 @@ enum ToolOutputFormatter {
         return out.joined(separator: "\n")
     }
 
-    // MARK: - Chat Send
+    // MARK: - Oracle replies (oracle_send / ask_oracle)
 
-    static func chatSend(chatId: String?, mode: String?, response: String?, diffs: [(path: String, patch: String)]) -> String {
+    private static func oracleReplyText(
+        heading: String,
+        chatId: String?,
+        mode: String?,
+        response: String?,
+        diffs: [(path: String, patch: String)]
+    ) -> String {
         var out: [String] = []
         out.reserveCapacity(6 + diffs.count * 2)
-        out.append("## Chat Send \(statusIcon(success: true))")
-        if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
-        if let resp = response, !resp.isEmpty {
-            out.append("")
-            out.append("### Response")
-            out.append(resp)
-        }
-        if !diffs.isEmpty {
-            out.append("")
-            out.append("### Patches")
-            out.append("**Note:** The diffs shown below have already been applied to the files on disk.")
-            out.append("")
-            for d in diffs {
-                out.append("Patch for `\(d.path)`:")
-                out.append("\n```diff\n\(d.patch)\n```")
-            }
-        }
-        return out.joined(separator: "\n")
-    }
-
-    // MARK: - Ask Oracle
-
-    static func askOracle(chatId: String?, mode: String?, response: String?, diffs: [(path: String, patch: String)]) -> String {
-        var out: [String] = []
-        out.reserveCapacity(6 + diffs.count * 2)
-        out.append("## Ask Oracle \(statusIcon(success: true))")
+        out.append(heading)
         if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
         if let resp = response, !resp.isEmpty {
             out.append("")
@@ -867,6 +848,57 @@ extension ToolOutputFormatter {
 
     // Run-ID note removed — routing is handled automatically by the MCP connection layer
 
+    private static let longRunningTicketToolNames: Set<String> = ["context_builder", "ask_oracle", "oracle_send"]
+
+    /// Renders an app-owned long-running ticket. Returns nil unless the tool owns tickets and the
+    /// envelope validates as `LongRunningJobTicketDTO` (matching UUID `job_id`/`job.id`), so
+    /// anything else keeps its ordinary formatting. Only a terminal ticket that carries result
+    /// fields beyond the envelope renders them, through the tool's own formatter; the header
+    /// keeps failure/recovery text so payload rendering cannot hide it.
+    private static func formatLongRunningTicket(
+        toolName: String,
+        args: [String: Value],
+        object: [String: Value],
+        emitResources: Bool
+    ) -> [MCP.Tool.Content]? {
+        guard longRunningTicketToolNames.contains(toolName),
+              let job = object["job"]?.objectValue,
+              let ticket = Value.object(object).decode(ToolResultDTOs.LongRunningJobTicketDTO.self)
+        else { return nil }
+
+        let header = [
+            "## Long-running job",
+            "- **Job ID**: `\(object["job_id"]?.stringValue ?? "")`",
+            "- **Status**: \(job["status"]?.stringValue ?? "unknown")"
+        ]
+        let recovery = [
+            job["error"]?.objectValue?["message"]?.stringValue,
+            job["message"]?.stringValue,
+            object["next_action"]?.stringValue
+        ].compactMap(\.self)
+        if ticket.job.status.isTerminal {
+            var payload = object
+            for key in ["job", "job_id", "next_action"] {
+                payload.removeValue(forKey: key)
+            }
+            if !payload.isEmpty {
+                let headerText = (header + recovery).joined(separator: "\n") + "\n\n"
+                return [.text(headerText)] + buildContentBlocks(toolName: toolName, args: args, result: .object(payload), emitResources: emitResources)
+            }
+        }
+        var lines = header
+        if let phase = job["phase"]?.stringValue { lines.append("- **Phase**: \(phase)") }
+        if let context = job["context_id"]?.stringValue { lines.append("- **Context ID**: `\(context)`") }
+        if let chat = job["chat_id"]?.stringValue { lines.append("- **Oracle chat**: `\(chat)`") }
+        if case let .array(lanes)? = job["oracle_lanes"] {
+            for lane in lanes {
+                let fields = lane.objectValue ?? [:]
+                lines.append("- \(fields["label"]?.stringValue ?? "Oracle"): \(fields["status"]?.stringValue ?? "unknown") • chat `\(fields["chat_id"]?.stringValue ?? "")`")
+            }
+        }
+        return [.text((lines + recovery).joined(separator: "\n"))]
+    }
+
     /// Central router: build content blocks for any tool based on name + result.
     static func buildContentBlocks(
         toolName: String,
@@ -877,6 +909,12 @@ extension ToolOutputFormatter {
         // Raw JSON mode: bypass all markdown/text formatting.
         if wantsRawJSON(args: args) {
             return [.text(rawJSONString(result))]
+        }
+
+        if let object = result.objectValue,
+           let ticket = formatLongRunningTicket(toolName: toolName, args: args, object: object, emitResources: emitResources)
+        {
+            return ticket
         }
 
         switch toolName {
@@ -2538,6 +2576,20 @@ extension ToolOutputFormatter {
     }
 
     static func formatChatSend(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        formatOracleReply(heading: "## Chat Send \(statusIcon(success: true))", args: args, value: value, emitResources: emitResources)
+    }
+
+    static func formatAskOracle(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        formatOracleReply(heading: "## Ask Oracle \(statusIcon(success: true))", args: args, value: value, emitResources: emitResources)
+    }
+
+    /// Shared `oracle_send` / `ask_oracle` reply rendering; the tools differ only in heading.
+    private static func formatOracleReply(
+        heading: String,
+        args: [String: Value],
+        value: Value,
+        emitResources: Bool
+    ) -> [MCP.Tool.Content] {
         var shortId: String? = args["chat_id"]?.stringValue
         var mode = args["mode"]?.stringValue
         var response: String?
@@ -2545,6 +2597,7 @@ extension ToolOutputFormatter {
         var errors: [String] = []
         var oracleExportPath: String?
         var oracleExportInstruction: String?
+        var oracleExportError: String?
 
         switch value {
         case let .string(s):
@@ -2562,6 +2615,7 @@ extension ToolOutputFormatter {
             }
             oracleExportPath = obj["oracle_export_path"]?.stringValue
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
+            oracleExportError = obj["oracle_export_error"]?.stringValue
             // Nested result support
             if response == nil, let res = obj["result"] {
                 if let s = res.stringValue { response = s }
@@ -2574,9 +2628,12 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
-            ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: heading)
+            ?? oracleReplyText(heading: heading, chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
+        if let errorBlock = oracleExportErrorBlock(oracleExportError) {
+            blocks.append(.text("\n" + errorBlock))
+        }
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
         }
@@ -2598,6 +2655,14 @@ extension ToolOutputFormatter {
             }
         }
         return blocks
+    }
+
+    /// Optional-export notice for a reply that settled but whose export failed or was cancelled.
+    /// It is not a generation failure. The trailing newline keeps a following block (for example
+    /// `### Oracle export`) on its own line when clients concatenate text blocks without separators.
+    private static func oracleExportErrorBlock(_ error: String?) -> String? {
+        guard let notice = error?.trimmingCharacters(in: .whitespacesAndNewlines), !notice.isEmpty else { return nil }
+        return "### Oracle export notice\n- \(notice)\n"
     }
 
     private static func oracleExportBlock(path: String?, instruction: String?) -> String? {
@@ -2623,64 +2688,6 @@ extension ToolOutputFormatter {
             lines.append("```")
         }
         return lines.joined(separator: "\n")
-    }
-
-    static func formatAskOracle(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
-        var shortId: String? = args["chat_id"]?.stringValue
-        var mode = args["mode"]?.stringValue
-        var response: String?
-        var diffs: [(path: String, patch: String)] = []
-        var errors: [String] = []
-        var oracleExportPath: String?
-        var oracleExportInstruction: String?
-
-        switch value {
-        case let .string(s):
-            response = s
-        case let .object(obj):
-            shortId = obj["chat_id"]?.stringValue ?? shortId
-            mode = obj["mode"]?.stringValue ?? mode
-            response = obj["response"]?.stringValue ?? obj["message"]?.stringValue ?? obj["text"]?.stringValue
-            if let arr = obj["diffs"]?.arrayValue ?? obj["patches"]?.arrayValue {
-                diffs = parseDiffArray(arr)
-            }
-            if let errArr = obj["errors"]?.arrayValue {
-                errors = errArr.compactMap(\.stringValue)
-            }
-            oracleExportPath = obj["oracle_export_path"]?.stringValue
-            oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
-            if response == nil, let res = obj["result"] {
-                if let s = res.stringValue { response = s }
-                else if let arr = res.objectValue?["diffs"]?.arrayValue { diffs = parseDiffArray(arr) }
-            }
-        case let .array(arr):
-            diffs = parseDiffArray(arr)
-        default:
-            break
-        }
-
-        let text = formatOracleGroup(value: value, heading: "## Ask Oracle ✅")
-            ?? askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
-        var blocks: [MCP.Tool.Content] = [.text(text)]
-        if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
-            blocks.append(.text(handoffBlock))
-        }
-        if !errors.isEmpty {
-            var lines: [String] = []
-            lines.reserveCapacity(errors.count + 2)
-            lines.append("")
-            lines.append("### Errors")
-            for e in errors {
-                lines.append("- \(e)")
-            }
-            blocks.append(.text(lines.joined(separator: "\n")))
-        }
-        if emitResources, !diffs.isEmpty {
-            for d in diffs {
-                blocks.append(.text("Patch for `\(d.path)`:\n```diff\n\(d.patch)\n```"))
-            }
-        }
-        return blocks
     }
 
     static func formatPromptState(value: Value) -> [MCP.Tool.Content] {
@@ -4517,6 +4524,11 @@ extension ToolOutputFormatter {
                     let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
                     blocks.append(contentsOf: reviewBlocks)
                 }
+            }
+
+            if let errorBlock = oracleExportErrorBlock(obj["oracle_export_error"]?.stringValue) {
+                let prefix = blocks.isEmpty ? "" : "\n\n"
+                blocks.append(.text("\(prefix)\(errorBlock)"))
             }
 
             // Follow-up hint

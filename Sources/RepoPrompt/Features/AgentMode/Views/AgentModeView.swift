@@ -1633,38 +1633,14 @@ struct AgentModeChatDetailView: View {
 
     private func transcriptRenderMetadata(for rows: [AgentChatItem]) -> AgentTranscriptPresentationMetadata {
         let snapshotMetadata = transcriptPresentation.metadata
-        let latestContextBuilderCall = rows.last(where: { item in
-            item.kind == .toolCall && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let latestContextBuilderResult = rows.last(where: { item in
-            item.kind == .toolResult && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let activeContextBuilderCallID: UUID? = {
-            guard let call = latestContextBuilderCall else { return nil }
-            if let result = latestContextBuilderResult,
-               result.sequenceIndex > call.sequenceIndex
-            {
-                return nil
-            }
-            return call.id
-        }()
-        let activeContextBuilderResultID: UUID? = {
-            guard let result = latestContextBuilderResult else { return nil }
-            if let call = latestContextBuilderCall,
-               call.sequenceIndex > result.sequenceIndex
-            {
-                return nil
-            }
-            return result.id
-        }()
+        let contextBuilder = ContextBuilderTranscriptMetadata(rows: rows)
         let mostRecentEditID = rows.last(where: isAutoExpandableEditToolResult)?.id
         return .init(
             latestUserMessageID: snapshotMetadata.latestUserMessageID,
             latestTurnID: snapshotMetadata.latestTurnID,
             dynamicSummaryLockTargetTurnID: snapshotMetadata.dynamicSummaryLockTargetTurnID,
             recentAssistantItemIDs: snapshotMetadata.recentAssistantItemIDs,
-            activeContextBuilderCallItemID: activeContextBuilderCallID,
-            activeContextBuilderResultItemID: activeContextBuilderResultID,
+            contextBuilder: contextBuilder,
             mostRecentEditItemID: mostRecentEditID
         )
     }
@@ -2612,8 +2588,7 @@ struct AgentModeChatDetailView: View {
 
     private struct TranscriptRenderContext {
         let isContextBuilderQuestionActive: Bool
-        let activeContextBuilderCallID: UUID?
-        let activeContextBuilderResultID: UUID?
+        let contextBuilder: ContextBuilderTranscriptMetadata
         let mostRecentEditID: UUID?
 
         let recentAssistantItemIDs: Set<UUID>
@@ -2626,8 +2601,7 @@ struct AgentModeChatDetailView: View {
         let renderMetadata = transcriptRenderMetadata(for: blocks)
         let renderContext = TranscriptRenderContext(
             isContextBuilderQuestionActive: isContextBuilderQuestionActive,
-            activeContextBuilderCallID: renderMetadata.activeContextBuilderCallItemID,
-            activeContextBuilderResultID: renderMetadata.activeContextBuilderResultItemID,
+            contextBuilder: renderMetadata.contextBuilder,
             mostRecentEditID: renderMetadata.mostRecentEditItemID,
 
             recentAssistantItemIDs: renderMetadata.recentAssistantItemIDs,
@@ -2813,15 +2787,14 @@ struct AgentModeChatDetailView: View {
             contextBuilderContext: .init(
                 tabID: ownerTabID,
                 contextBuilderAgentVM: contextBuilderAgentVM,
-                activeContextBuilderCallItemID: renderContext.activeContextBuilderCallID,
-                activeContextBuilderResultItemID: renderContext.activeContextBuilderResultID,
                 oracleOpenContext: .init(
                     windowID: windowID,
                     workspaceID: ownerWorkspaceID,
                     tabID: ownerTabID
                 ),
                 showRunScopedToolCancel: showCancel,
-                cancelActiveToolsAction: cancelAction
+                cancelActiveToolsAction: cancelAction,
+                transcriptMetadata: renderContext.contextBuilder
             ),
             promptManager: promptManager,
             handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,

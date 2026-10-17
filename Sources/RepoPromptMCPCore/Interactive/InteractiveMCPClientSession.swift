@@ -1523,6 +1523,19 @@ actor InteractiveMCPClientSession {
     ) -> TimeInterval? {
         switch effectiveTimeoutPolicy(policy) {
         case .default:
+            if ["oracle_send", "ask_oracle", "context_builder"].contains(toolName),
+               let op = arguments["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               ["start", "poll", "wait", "cancel"].contains(op)
+            {
+                let observes = op == "wait" || (op == "start" && arguments["detach"]?.boolValue != true)
+                if observes {
+                    let wait = arguments["timeout"].flatMap(Self.parsedNonNegativeFiniteSeconds)
+                        .flatMap { $0 <= 86400 ? $0 : nil }
+                        ?? TimeInterval(MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds)
+                    return max(30, wait + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds)
+                }
+                return 30
+            }
             if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
                 return nil
             }

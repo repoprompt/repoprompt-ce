@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 
@@ -1183,6 +1184,57 @@ enum ToolResultDTOs {
             case oracleCount = "oracle_count"
             case oracleResults = "oracle_results"
             case warnings
+            case rawOutput
+        }
+
+        /// ChatSendReply.toMCPValue requires chat_id and mode even when response/errors are absent.
+        /// The presentation DTO's optional fields alone cannot establish native authority.
+        private struct NativeSingleReply: Decodable {
+            let chatID: String
+            let mode: String
+            let response: String?
+            let errors: [String]?
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                guard ![CodingKeys.oracleGroupID, .oracleCount, .oracleResults, .warnings].contains(where: container.contains) else {
+                    throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Group fields require a valid Oracle group"))
+                }
+                chatID = try container.decode(String.self, forKey: .chatID)
+                mode = try container.decode(String.self, forKey: .mode)
+                response = try container.decodeIfPresent(String.self, forKey: .response)
+                errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            }
+        }
+
+        private static func isNativeOracleReply(_ data: Data) -> Bool {
+            (try? JSONDecoder().decode(OracleGroupResult.self, from: data)) != nil
+                || (try? JSONDecoder().decode(NativeSingleReply.self, from: data)) != nil
+        }
+
+        /// Select the actual native reply at the root or one provider envelope, never incidental content.
+        static func nativeOracleReplyJSONData(from value: String) -> Data? {
+            guard let data = value.data(using: .utf8) else { return nil }
+            if isNativeOracleReply(data) { return data }
+            // A direct ticket is already native; a nested provider echo cannot displace it.
+            if (try? JSONDecoder().decode(LongRunningJobTicketDTO.self, from: data)) != nil { return nil }
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+            let nestedData: Data? = if let nested = object["rawOutput"] as? String {
+                nested.data(using: .utf8)
+            } else if let nested = object["rawOutput"] as? [String: Any] {
+                try? JSONSerialization.data(withJSONObject: nested, options: [.sortedKeys])
+            } else {
+                nil
+            }
+            guard let nestedData, isNativeOracleReply(nestedData) else { return nil }
+            return nestedData
+        }
+
+        static func nativeOracleGroupJSONData(from value: String) -> Data? {
+            guard let data = nativeOracleReplyJSONData(from: value),
+                  (try? JSONDecoder().decode(OracleGroupResult.self, from: data)) != nil
+            else { return nil }
+            return data
         }
 
         init(
@@ -1213,6 +1265,23 @@ enum ToolResultDTOs {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            if (try? OracleGroupResult(from: decoder)) == nil, (try? NativeSingleReply(from: decoder)) == nil,
+               (try? LongRunningJobTicketDTO(from: decoder)) == nil
+            {
+                if let nested = try? container.superDecoder(forKey: .rawOutput),
+                   (try? OracleGroupResult(from: nested)) != nil || (try? NativeSingleReply(from: nested)) != nil
+                {
+                    self = try ChatSendDTO(from: nested)
+                    return
+                }
+                if let value = try? container.decode(String.self, forKey: .rawOutput),
+                   let data = value.data(using: .utf8),
+                   Self.isNativeOracleReply(data)
+                {
+                    self = try JSONDecoder().decode(Self.self, from: data)
+                    return
+                }
+            }
             chatID = try container.decodeIfPresent(String.self, forKey: .chatID)
             mode = try container.decodeIfPresent(String.self, forKey: .mode)
             response = try container.decodeIfPresent(String.self, forKey: .response)
@@ -1248,6 +1317,91 @@ enum ToolResultDTOs {
 
     // MARK: - Context Builder
 
+    struct LongRunningJobTicketDTO: Codable, Equatable {
+        struct Job: Codable, Equatable {
+            enum Status: String, Codable {
+                case running, cancelling, completed, failed, cancelled, expired, unknown
+
+                init(from decoder: Decoder) throws {
+                    self = try Status(rawValue: decoder.singleValueContainer().decode(String.self)) ?? .unknown
+                }
+
+                var isTerminal: Bool {
+                    switch self {
+                    case .running, .cancelling, .unknown: false
+                    case .completed, .failed, .cancelled, .expired: true
+                    }
+                }
+            }
+
+            struct Identity: Hashable {
+                let id: UUID
+                let contextID: UUID
+            }
+
+            let id: UUID
+            let status: Status
+            let contextID: UUID?
+            let revision: Int?
+            let chatID: String?
+
+            var identity: Identity? {
+                contextID.map { Identity(id: id, contextID: $0) }
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case id, status, revision
+                case contextID = "context_id"
+                case chatID = "chat_id"
+            }
+        }
+
+        let jobID: UUID
+        let job: Job
+        let summaryOnly: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case jobID = "job_id"
+            case job
+            case summaryOnly = "summary_only"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            jobID = try container.decode(UUID.self, forKey: .jobID)
+            job = try container.decode(Job.self, forKey: .job)
+            guard jobID == job.id else {
+                throw DecodingError.dataCorruptedError(forKey: .jobID, in: container, debugDescription: "Ticket IDs disagree")
+            }
+            summaryOnly = try container.decodeIfPresent(Bool.self, forKey: .summaryOnly) ?? false
+        }
+
+        /// One validated ticket boundary shared by all three app-backed job tools.
+        static func nativeJSONData(from value: String) -> Data? {
+            if let direct = validatedJSONData(from: value) { return direct }
+            guard let data = value.data(using: .utf8),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return nil }
+            let nested: String? = if let value = object["rawOutput"] as? String {
+                value
+            } else if let value = object["rawOutput"] as? [String: Any],
+                      let data = try? JSONSerialization.data(withJSONObject: value)
+            {
+                String(data: data, encoding: .utf8)
+            } else {
+                nil
+            }
+            return nested.flatMap(validatedJSONData)
+        }
+
+        static func validatedJSONData(from value: String) -> Data? {
+            guard let data = value.data(using: .utf8),
+                  (try? JSONDecoder().decode(Self.self, from: data)) != nil
+            else { return nil }
+            return data
+        }
+    }
+
     struct ContextBuilderDTO: Codable, Equatable {
         let tabID: String?
         let status: String?
@@ -1261,6 +1415,8 @@ enum ToolResultDTOs {
         let followUpHint: String?
         let message: String?
         let summary: String?
+        let ticket: LongRunningJobTicketDTO?
+        let oracleExportError: String?
 
         private enum CodingKeys: String, CodingKey {
             case tabID = "context_id"
@@ -1275,6 +1431,8 @@ enum ToolResultDTOs {
             case followUpHint = "follow_up_hint"
             case message
             case summary
+            case oracleExportError = "oracle_export_error"
+            case rawOutput
         }
 
         private enum LegacyCodingKeys: String, CodingKey {
@@ -1283,6 +1441,23 @@ enum ToolResultDTOs {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            let nativeTicket = try? LongRunningJobTicketDTO(from: decoder)
+            // ACP completion describes the control call, not the nested job's lifecycle.
+            // A native ticket is authoritative; unwrap only one validated provider envelope.
+            if nativeTicket == nil {
+                if let rawOutput = try? container.superDecoder(forKey: .rawOutput),
+                   (try? LongRunningJobTicketDTO(from: rawOutput)) != nil
+                {
+                    self = try ContextBuilderDTO(from: rawOutput)
+                    return
+                }
+                if let value = try? container.decode(String.self, forKey: .rawOutput),
+                   let data = LongRunningJobTicketDTO.validatedJSONData(from: value)
+                {
+                    self = try JSONDecoder().decode(Self.self, from: data)
+                    return
+                }
+            }
             let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
 
             tabID = try container.decodeIfPresent(String.self, forKey: .tabID)
@@ -1298,6 +1473,26 @@ enum ToolResultDTOs {
             followUpHint = try container.decodeIfPresent(String.self, forKey: .followUpHint)
             message = try container.decodeIfPresent(String.self, forKey: .message)
             summary = try container.decodeIfPresent(String.self, forKey: .summary)
+            ticket = nativeTicket
+            oracleExportError = try container.decodeIfPresent(String.self, forKey: .oracleExportError)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(tabID, forKey: .tabID)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(prompt, forKey: .prompt)
+            try container.encodeIfPresent(fileCount, forKey: .fileCount)
+            try container.encodeIfPresent(totalTokens, forKey: .totalTokens)
+            try container.encodeIfPresent(selection, forKey: .selection)
+            try container.encodeIfPresent(responseType, forKey: .responseType)
+            try container.encodeIfPresent(plan, forKey: .plan)
+            try container.encodeIfPresent(review, forKey: .review)
+            try container.encodeIfPresent(followUpHint, forKey: .followUpHint)
+            try container.encodeIfPresent(message, forKey: .message)
+            try container.encodeIfPresent(summary, forKey: .summary)
+            try container.encodeIfPresent(oracleExportError, forKey: .oracleExportError)
+            try ticket?.encode(to: encoder)
         }
     }
 

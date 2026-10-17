@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MCP
-import RepoPromptDomainRuntime
+@testable import RepoPromptDomainRuntime
 @testable import RepoPromptMCPCore
 import RepoPromptShared
 import RepoPromptTestSupport
@@ -46,6 +46,95 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             try FileManager.default.removeItem(at: updateMarker)
         }
         XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
+    }
+
+    func testCanonicalOracleToolsAdvertiseLongRunningTicketContract() throws {
+        let descriptions = [
+            "op": MCPLongRunningJobToolContract.operationDescription,
+            "job_id": MCPLongRunningJobToolContract.jobIDDescription,
+            "detach": MCPLongRunningJobToolContract.detachDescription,
+            "timeout": MCPLongRunningJobToolContract.timeoutDescription
+        ]
+        for toolName in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend, MCPWindowToolName.contextBuilder] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            XCTAssertEqual(
+                definition.description.components(separatedBy: MCPLongRunningJobToolContract.usageContract).count - 1,
+                1,
+                toolName
+            )
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            XCTAssertEqual(schema["type"], .string("object"), toolName)
+            XCTAssertEqual(schema["required"], .array([]), toolName)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            for (name, description) in descriptions {
+                XCTAssertEqual(properties[name]?.objectValue?["description"], .string(description), "\(toolName).\(name)")
+            }
+            XCTAssertEqual(properties["op"]?.objectValue?["type"], .string("string"), toolName)
+            XCTAssertEqual(properties["op"]?.objectValue?["enum"], .array(["start", "poll", "wait", "cancel"].map(Value.string)), toolName)
+            XCTAssertEqual(properties["job_id"]?.objectValue?["type"], .string("string"), toolName)
+            XCTAssertEqual(properties["detach"]?.objectValue?["type"], .string("boolean"), toolName)
+            XCTAssertEqual(properties["timeout"]?.objectValue?["type"], .string("number"), toolName)
+            XCTAssertTrue(MCPLongRunningJobToolContract.timeoutDescription.contains(MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase))
+            XCTAssertFalse(MCPLongRunningJobToolContract.timeoutDescription.contains("120s"))
+        }
+    }
+
+    func testCanonicalTicketToolsPreserveDistinctGuidanceAndSchemas() throws {
+        let ask = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle))
+        let send = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.oracleSend))
+        let builder = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.contextBuilder))
+        XCTAssertTrue(ask.description.contains("Omit chat_id or set new_chat=true to start"))
+        XCTAssertTrue(ask.description.contains("`images`"))
+        XCTAssertTrue(send.description.contains("selected eligible conversation"))
+        XCTAssertTrue(send.description.contains("exact preset UUID or name"))
+        XCTAssertTrue(send.description.contains("Terminal payload preserves existing fields and adds job/job_id; lane progress contains statuses, not early responses."))
+        XCTAssertFalse(ask.description.contains("lane progress contains statuses"))
+        XCTAssertTrue(builder.description.contains("One job owns discovery, optional Oracle follow-up and export."))
+        XCTAssertTrue(builder.description.contains("oracle_preset selects an exposed Model Preset's complete Oracle roster"))
+        XCTAssertTrue(builder.description.contains("canonical resolvable context_pack_ref"))
+        for definition in [ask, send, builder] {
+            XCTAssertTrue(definition.description.contains("oracle_export_path"), definition.name)
+            let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(properties["export_response"]?.objectValue?["type"], .string("boolean"), definition.name)
+            if definition.name == MCPWindowToolName.contextBuilder {
+                XCTAssertEqual(properties["response_type"]?.objectValue?["enum"], .array(["plan", "question", "review", "clarify"].map(Value.string)))
+                XCTAssertEqual(properties["context_pack_ref"]?.objectValue?["pattern"], .string("^oracle-pack:sha256:[0-9a-f]{64}$"))
+                XCTAssertNil(properties["images"])
+                XCTAssertNil(properties["debug_primary_only"])
+                XCTAssertNil(properties["debug_lane_timeout_seconds"])
+            } else {
+                XCTAssertEqual(properties["message"]?.objectValue?["minLength"], .int(1), definition.name)
+                XCTAssertEqual(properties["mode"]?.objectValue?["enum"], .array(["chat", "plan", "review"].map(Value.string)), definition.name)
+                XCTAssertEqual(properties["model"]?.objectValue?["maxLength"], .int(OracleRosterContract.maximumModelIdentifierLength), definition.name)
+                XCTAssertEqual(properties["images"] != nil, definition.name == MCPWindowToolName.askOracle)
+                #if DEBUG
+                    XCTAssertEqual(properties["debug_primary_only"]?.objectValue?["type"], .string("boolean"), definition.name)
+                    XCTAssertEqual(properties["debug_lane_timeout_seconds"]?.objectValue?["minimum"], .int(1), definition.name)
+                    XCTAssertEqual(properties["debug_lane_timeout_seconds"]?.objectValue?["maximum"], .int(300), definition.name)
+                    XCTAssertTrue(definition.description.contains("DEBUG-only request diagnostics"), definition.name)
+                #else
+                    XCTAssertNil(properties["debug_primary_only"], definition.name)
+                    XCTAssertNil(properties["debug_lane_timeout_seconds"], definition.name)
+                #endif
+            }
+        }
+    }
+
+    func testStandaloneTicketToolAdvertisementPreservesIntentionalBackendProjection() throws {
+        for name in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend, MCPWindowToolName.contextBuilder] {
+            let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            let advertised = DirectHeadlessToolAdvertisement.project(canonical)
+            if name == MCPWindowToolName.contextBuilder {
+                let properties = try XCTUnwrap(advertised.inputSchema.objectValue?["properties"]?.objectValue)
+                XCTAssertEqual(Set(properties.keys), ["instructions", "context_pack_ref", "response_type", "model"])
+                XCTAssertFalse(advertised.description.contains(MCPLongRunningJobToolContract.usageContract))
+                XCTAssertTrue(advertised.description.contains("does not discover files"))
+                XCTAssertTrue(advertised.description.contains("does not export responses"))
+            } else {
+                XCTAssertEqual(advertised.description, canonical.description, name)
+                XCTAssertEqual(advertised.inputSchema, canonical.inputSchema, name)
+            }
+        }
     }
 
     func testCanonicalAgentControlWaitDescriptionsUseConfiguredSubagentWaitPhrase() throws {

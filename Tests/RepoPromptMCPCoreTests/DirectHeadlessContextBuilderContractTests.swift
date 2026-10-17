@@ -52,6 +52,12 @@ final class DirectHeadlessContextBuilderContractTests: XCTestCase {
         let fixture = try await makeFixture()
         let cases: [([String: Value], String)] = [
             (["instructions": .string("review this"), "export_response": .bool(true)], "context_builder_unsupported_argument:"),
+            (["op": .string("start"), "instructions": .string("must not launch")], "context_builder_unsupported_argument:"),
+            (["op": .string("poll"), "job_id": .string(UUID().uuidString)], "context_builder_unsupported_argument:"),
+            (["op": .string("wait"), "job_id": .string(UUID().uuidString), "timeout": .int(20)], "context_builder_unsupported_argument:"),
+            (["op": .string("cancel"), "job_id": .string(UUID().uuidString)], "context_builder_unsupported_argument:"),
+            (["instructions": .string("must not launch"), "detach": .bool(true)], "context_builder_unsupported_argument:"),
+            (["instructions": .string("must not launch"), "timeout": .int(20)], "context_builder_unsupported_argument:"),
             (["instructions": .string("review this"), "response_type": .string("clarify")], "context_builder_discovery_unsupported:"),
             (["instructions": .string("review this"), "response_type": .string("typo")], "context_builder_invalid_response_type:"),
             (["instructions": .int(42)], "context_builder_invalid_arguments:"),

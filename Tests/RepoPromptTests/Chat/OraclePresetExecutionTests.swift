@@ -7,6 +7,165 @@ import XCTest
 
 @MainActor
 final class OraclePresetExecutionTests: XCTestCase {
+    #if DEBUG
+        func testTicketImplicitGroupContinuationKeepsCapturedGroupAfterSelectionChanges() async throws {
+            try await withTicketRoutingFixture { driver, service, invocation in
+                let oracle = driver.window.oracleViewModel
+                var models: [AIModel] = []
+                oracle.setOraclePostPackagingTransportOverrideForTesting { _, model in
+                    models.append(model)
+                    let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                        continuation.yield(.init(text: "controlled answer", reasoning: nil, tokens: .init(), terminalOutcome: .completed))
+                        continuation.finish()
+                    }
+                    return (UUID(), stream)
+                }
+                let initial = try await service.executeOracleSend(args: ["message": .string("Create original group"), "new_chat": .bool(true)], invocationContext: invocation)
+                let groupID = try XCTUnwrap(initial.objectValue?["oracle_group_id"]?.stringValue)
+                await oracle.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                let projections = oracle.sessions.filter { $0.oracleGroupID?.uuidString == groupID }
+                var original: [ChatSession] = []
+                for projection in projections {
+                    try await original.append(oracle.chatData.loadChatSession(from: XCTUnwrap(projection.fileURL)))
+                }
+                XCTAssertEqual(original.count, 2)
+                try driver.manager.setActiveChatSessionID(XCTUnwrap(original.first?.id), forTabID: driver.tabID)
+                models = []
+                var alternateID: UUID?
+                service.jobCenter.admissionDidRegister = { _ in
+                    do {
+                        let alternate = try await oracle.createSession(named: "Unrelated selected chat", tabID: driver.tabID, activateInUI: false)
+                        alternateID = alternate.id
+                        driver.manager.setActiveChatSessionID(alternate.id, forTabID: driver.tabID)
+                    } catch {
+                        XCTFail("Failed to change selection: \(error)")
+                    }
+                }
+                defer { service.jobCenter.admissionDidRegister = nil }
+                let continued = try await service.executeOracleSend(args: [
+                    "op": .string("start"), "timeout": .int(5), "message": .string("Continue captured group")
+                ], invocationContext: invocation)
+                XCTAssertEqual(continued.objectValue?["oracle_group_id"]?.stringValue, groupID)
+                XCTAssertEqual(continued.objectValue?["oracle_count"]?.intValue, 2)
+                XCTAssertEqual(Set(models), Set([.gpt54Mini, .gpt54]))
+                XCTAssertEqual(models.count, 2)
+                await oracle.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                for session in original {
+                    let continuedSession = try await oracle.chatData.loadChatSession(from: XCTUnwrap(session.fileURL))
+                    XCTAssertEqual(continuedSession.messages.count, session.messages.count + 2)
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = .sortedKeys
+                    XCTAssertEqual(try encoder.encode(Array(continuedSession.messages.prefix(session.messages.count))), try encoder.encode(session.messages))
+                    XCTAssertEqual(continuedSession.name, session.name)
+                }
+                XCTAssertTrue(try XCTUnwrap(oracle.sessions.first { $0.id == alternateID }).messages.isEmpty)
+            }
+        }
+
+        func testBothTicketProducersFreezeEmittedRosterAndMappedPromptAtAdmission() async throws {
+            for ask in [false, true] {
+                try await withTicketRoutingFixture { driver, service, invocation in
+                    let promptVM = driver.window.promptManager
+                    let oracle = driver.window.oracleViewModel
+                    let oldID = UUID(), changedID = UUID()
+                    let marker = "CAPTURED TICKET PROMPT"
+                    promptVM.storedPrompts.append(.init(id: oldID, title: "Captured", content: marker))
+                    promptVM.storedPrompts.append(.init(id: changedID, title: "Changed", content: "POST ADMISSION PROMPT"))
+                    let capturedPrompt = ChatPreset(name: "Captured ticket review", mode: .review, gitInclusion: GitInclusion.none, storedPromptIds: [oldID], useStoredPromptsAsSystem: true)
+                    let changedPrompt = ChatPreset(name: "Changed ticket review", mode: .review, gitInclusion: GitInclusion.none, storedPromptIds: [changedID], useStoredPromptsAsSystem: true)
+                    ChatPresetManager.shared.add(capturedPrompt)
+                    ChatPresetManager.shared.add(changedPrompt)
+                    defer {
+                        ChatPresetManager.shared.remove(capturedPrompt)
+                        ChatPresetManager.shared.remove(changedPrompt)
+                    }
+                    let preset = try ModelPreset(name: "Captured ticket roster", models: [.gpt54Mini, .gpt54], chatPresetMappings: .init(reviewPresetID: capturedPrompt.id))
+                    ModelPresetsManager.shared.presets = [preset]
+                    GlobalSettingsStore.shared.setMCPShowModelPresets(true, commit: false)
+                    var messages: [AIMessage] = []
+                    var models: [AIModel] = []
+                    oracle.setOraclePostPackagingTransportOverrideForTesting { message, model in
+                        messages.append(message)
+                        models.append(model)
+                        let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                            continuation.yield(.init(text: "controlled answer", reasoning: nil, tokens: .init(), terminalOutcome: .completed))
+                            continuation.finish()
+                        }
+                        return (UUID(), stream)
+                    }
+                    let changedPreset = try ModelPreset(id: preset.id, name: preset.name, model: .gpt54, chatPresetMappings: .init(reviewPresetID: changedPrompt.id))
+                    service.jobCenter.admissionDidRegister = { _ in
+                        ModelPresetsManager.shared.presets = [changedPreset]
+                    }
+                    defer { service.jobCenter.admissionDidRegister = nil }
+                    var args: [String: Value] = ["message": .string("Frozen authority"), "mode": .string("review"), "new_chat": .bool(true)]
+                    if !ask { args["model"] = .string(preset.name) }
+                    let startArgs = args.merging(["op": .string("start"), "timeout": .int(5)]) { _, new in new }
+                    let ticket = try await (ask ? service.executeAskOracle(args: startArgs, invocationContext: invocation) : service.executeOracleSend(args: startArgs, invocationContext: invocation))
+                    XCTAssertEqual(ticket.objectValue?["job"]?.objectValue?["status"]?.stringValue, "completed")
+                    XCTAssertEqual(ticket.objectValue?["oracle_count"]?.intValue, 2)
+                    XCTAssertEqual(Set(models), Set([.gpt54Mini, .gpt54]))
+                    XCTAssertEqual(messages.count, 2)
+                    XCTAssertTrue(messages.allSatisfy { $0.systemPrompt.contains(marker) && !$0.systemPrompt.contains("POST ADMISSION PROMPT") })
+
+                    // Capture is request-local: a subsequent ordinary start must use changed settings.
+                    service.jobCenter.admissionDidRegister = nil
+                    models = []
+                    messages = []
+                    _ = try await (ask ? service.executeAskOracle(args: args, invocationContext: invocation) : service.executeOracleSend(args: args, invocationContext: invocation))
+                    XCTAssertEqual(models, [.gpt54])
+                    XCTAssertTrue(try XCTUnwrap(messages.first).systemPrompt.contains("POST ADMISSION PROMPT"))
+                }
+            }
+        }
+
+        private func withTicketRoutingFixture(
+            _ body: @escaping @MainActor (ContextBuilderMultiRootDiscoveryDriver, MCPOracleToolService, ToolInvocationContext) async throws -> Void
+        ) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["Ticket"]) { driver in
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = ModelPresetsManager.shared.presets
+                let previousExposure = settings.mcpShowModelPresets()
+                let previousDisabled = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    ModelPresetsManager.shared.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousExposure, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousDisabled, commit: false)
+                    driver.window.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
+                }
+                settings.setMCPShowModelPresets(false, commit: false)
+                settings.setMCPTemporarilyDisablePresets(false, commit: false)
+                settings.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(planningModelRaw: AIModel.gpt54Mini.rawValue, additionalOracleModelRaws: [AIModel.gpt54.rawValue]))
+                driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+                driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                let context = MCPTabContextSnapshot(tabID: driver.tabID, windowID: driver.window.windowID, workspaceID: driver.fixture.workspace.id, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Ticket", runID: nil, frozenLookupContext: .visibleWorkspace, explicitlyBound: true)
+                let connectionID = UUID()
+                let invocation = ToolInvocationContext.trustedLocal(toolName: "oracle_send", metadata: MCPRequestMetadata(connectionID: connectionID, clientName: "ticket-routing-fixture", windowID: driver.window.windowID))
+                let service = MCPOracleToolService(
+                    askOracleToolName: "ask_oracle", oracleSendToolName: "oracle_send", oracleChatLogToolName: "oracle_chat_log",
+                    promptVM: driver.window.promptManager, oracleVM: driver.window.oracleViewModel,
+                    liveRunPurpose: { _ in .unknown }, resolveTabContextSnapshot: { _ in .init(snapshot: context) },
+                    requireCurrentTabContext: { _ in context }, stabilizedVirtualContext: { $0 },
+                    resolveDelegatedReviewPackaging: { _, _, _, _ in nil }, rebindChatSessionIfNeeded: { _, _ in XCTFail("Fresh/implicit requests must not rebind") },
+                    resolveTabIDForAgentMode: { _, _ in driver.tabID }, requireTargetWindow: { driver.window }, rawExplicitTabID: { _ in nil },
+                    sendStageProgress: { _, _, _, _ in }, withHeartbeat: { _, _, _, _, operation in try await operation() },
+                    resolveStartExecution: { mode, model, workspaceID in
+                        try driver.window.oracleViewModel.resolveMCPFollowUpExecution(mode: mode, modelParam: model, workspaceID: workspaceID)
+                    },
+                    sendChat: { args, prompt, tabContext in try await driver.window.oracleViewModel.tool_chatSendWithConfiguredRoster(args: args, promptVM: prompt, tabContext: tabContext) },
+                    exportOracleResponse: { _ in throw ChatToolError.internalError("Unexpected fixture export") }, jobCenter: MCPLongRunningJobCenter()
+                )
+                do {
+                    try await body(driver, service, invocation)
+                    await driver.window.oracleViewModel.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                } catch {
+                    await driver.window.oracleViewModel.drainTrackedAutosaves(for: driver.fixture.workspace.id)
+                    throw error
+                }
+            }
+        }
+    #endif
+
     func testSchema1ReviewPresetOverridesConflictingAgentRosterAndUsesMappedPrompt() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9321,
@@ -505,6 +664,16 @@ final class OraclePresetExecutionTests: XCTestCase {
         XCTAssertEqual(persistedPrimary.selectedChatPresetID, chatPreset.id)
         XCTAssertEqual(persistedPrimary.oracleExecutionAuthority, .frozen)
 
+        let historyEncoder = JSONEncoder()
+        historyEncoder.outputFormatting = [.sortedKeys]
+        let groupURL = AppDomainRuntimeComposition.shared.runtime.persistenceCoordinator.oracleStorageRoot
+            .appendingPathComponent("groups/\(groupUUID.uuidString).json")
+        let groupBytes = try Data(contentsOf: groupURL)
+        let sibling = try XCTUnwrap(composition.oracleViewModel.sessions.first(where: {
+            $0.oracleGroupID == groupUUID && $0.oracleLaneIndex == 1
+        }))
+        let siblingURL = try XCTUnwrap(sibling.fileURL)
+        let siblingBytes = try Data(contentsOf: siblingURL)
         let changedProfile = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54.rawValue,
             additionalOracleModelRaws: [],
@@ -514,21 +683,86 @@ final class OraclePresetExecutionTests: XCTestCase {
             args: [
                 "message": .string("Second"),
                 "mode": .string("review"),
-                "chat_id": .string(chatID)
+                "chat_id": .string(chatID),
+                "chat_name": .string("Must not rename historical group")
             ],
             promptVM: composition.promptManager,
             tabContext: context,
             capturedProfile: changedProfile,
             selectionSnapshotOverride: snapshot
         )
-        XCTAssertEqual(continued["oracle_group_id"]?.stringValue, groupID)
-        XCTAssertEqual(continued["oracle_count"]?.intValue, 2)
-        XCTAssertEqual(continued["oracle_reconciliation_guidance"]?.stringValue, continuationGuidance)
+        XCTAssertNil(continued["oracle_group_id"])
+        XCTAssertNil(continued["oracle_count"])
+        XCTAssertEqual(continued["chat_id"]?.stringValue, chatID)
+        XCTAssertEqual(capturedMessages.count, 3)
+        XCTAssertEqual(capturedModels.last, AIModel.gpt54Mini)
+        XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        XCTAssertEqual(try Data(contentsOf: groupURL), groupBytes)
+        XCTAssertEqual(try Data(contentsOf: siblingURL), siblingBytes)
+        let continuedPrimary = try await composition.oracleViewModel.chatData.loadChatSession(from: primaryURL)
+        XCTAssertEqual(continuedPrimary.id, persistedPrimary.id)
+        XCTAssertEqual(continuedPrimary.name, persistedPrimary.name)
+        XCTAssertEqual(try historyEncoder.encode(Array(continuedPrimary.messages.prefix(persistedPrimary.messages.count))), try historyEncoder.encode(persistedPrimary.messages))
+        XCTAssertEqual(continuedPrimary.messages.count, persistedPrimary.messages.count + 2)
+
+        // Cold UUID continuation addresses the other lane, not the primary or its historical group.
+        let primaryBytes = try Data(contentsOf: primaryURL)
+        let persistedSibling = try await composition.oracleViewModel.chatData.loadChatSession(from: siblingURL)
+        for session in composition.oracleViewModel.sessions {
+            composition.oracleViewModel.purgeSessionStorage(session.id)
+        }
+        composition.oracleViewModel.sessions = []
+        composition.oracleViewModel.currentSessionID = nil
+        await composition.oracleViewModel.loadSessionsFromWorkspace()
+        let siblingReply = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("Only the second lane"),
+                "mode": .string("review"),
+                "chat_id": .string(sibling.id.uuidString), "chat_name": .string("Must not rename sibling")
+            ],
+            promptVM: composition.promptManager,
+            tabContext: context,
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: snapshot
+        )
+        XCTAssertNil(siblingReply["oracle_group_id"])
+        XCTAssertEqual(siblingReply["chat_id"]?.stringValue, sibling.shortID)
+        XCTAssertEqual(capturedMessages.count, 4)
+        XCTAssertEqual(capturedModels.last, AIModel.gpt54)
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        XCTAssertEqual(try Data(contentsOf: groupURL), groupBytes)
+        XCTAssertEqual(try Data(contentsOf: primaryURL), primaryBytes)
+        let continuedSibling = try await composition.oracleViewModel.chatData.loadChatSession(from: siblingURL)
+        XCTAssertEqual(continuedSibling.id, persistedSibling.id)
+        XCTAssertEqual(continuedSibling.name, persistedSibling.name)
+        XCTAssertEqual(try historyEncoder.encode(Array(continuedSibling.messages.prefix(persistedSibling.messages.count))), try historyEncoder.encode(persistedSibling.messages))
+        XCTAssertEqual(continuedSibling.messages.count, persistedSibling.messages.count + 2)
+
+        // Implicit selected-chat continuation still continues the frozen group roster.
+        composition.workspaceManager.setActiveChatSessionID(primarySession.id, forTabID: tab.id)
+        let implicit = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: ["message": .string("Continue the selected group"), "mode": .string("review")],
+            promptVM: composition.promptManager,
+            tabContext: context,
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: snapshot
+        )
+        XCTAssertEqual(implicit["oracle_group_id"]?.stringValue, groupID)
+        XCTAssertEqual(implicit["oracle_count"]?.intValue, 2)
+        XCTAssertEqual(implicit["oracle_reconciliation_guidance"]?.stringValue, continuationGuidance)
+        XCTAssertEqual(capturedMessages.count, 6)
+        XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
         XCTAssertTrue(capturedMessages.allSatisfy {
             !$0.systemPrompt.contains(dispatchGuidance) && !$0.systemPrompt.contains(continuationGuidance)
         })
-        XCTAssertEqual(capturedMessages.count, 4)
-        XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        let implicitPrimary = try await composition.oracleViewModel.chatData.loadChatSession(from: primaryURL)
+        let implicitSibling = try await composition.oracleViewModel.chatData.loadChatSession(from: siblingURL)
+        XCTAssertEqual(implicitPrimary.name, continuedPrimary.name)
+        XCTAssertEqual(implicitSibling.name, continuedSibling.name)
+        XCTAssertEqual(try historyEncoder.encode(Array(implicitPrimary.messages.prefix(continuedPrimary.messages.count))), try historyEncoder.encode(continuedPrimary.messages))
+        XCTAssertEqual(try historyEncoder.encode(Array(implicitSibling.messages.prefix(continuedSibling.messages.count))), try historyEncoder.encode(continuedSibling.messages))
 
         let groupSessionIDs = composition.oracleViewModel.sessions
             .filter { $0.oracleGroupID == groupUUID }
@@ -559,11 +793,30 @@ final class OraclePresetExecutionTests: XCTestCase {
                 .review: chatPreset
             ]
         )
+        let legacyGroupBytes = try Data(contentsOf: groupURL)
+        let legacySiblingBytes = try Data(contentsOf: siblingURL)
+        let upgradedLane = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("Legacy lane upgrade"),
+                "mode": .string("review"),
+                "chat_id": .string(chatID)
+            ],
+            promptVM: composition.promptManager,
+            tabContext: context,
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: legacySnapshot
+        )
+        XCTAssertNil(upgradedLane["oracle_group_id"])
+        XCTAssertEqual(capturedModels.last, AIModel.gpt54Mini, "canonical model wins over stale projection/settings")
+        XCTAssertTrue(try XCTUnwrap(capturedMessages.last).systemPrompt.contains(promptMarker))
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        XCTAssertEqual(try Data(contentsOf: groupURL), legacyGroupBytes)
+        XCTAssertEqual(try Data(contentsOf: siblingURL), legacySiblingBytes)
+
         let upgradedLegacyGroup = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
             args: [
                 "message": .string("Legacy group upgrade"),
-                "mode": .string("review"),
-                "chat_id": .string(chatID)
+                "mode": .string("review")
             ],
             promptVM: composition.promptManager,
             tabContext: context,
@@ -605,8 +858,7 @@ final class OraclePresetExecutionTests: XCTestCase {
         _ = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
             args: [
                 "message": .string("Frozen group continuation"),
-                "mode": .string("review"),
-                "chat_id": .string(chatID)
+                "mode": .string("review")
             ],
             promptVM: composition.promptManager,
             tabContext: context,

@@ -181,6 +181,50 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(try fixture.calls().isEmpty)
     }
 
+    func testOracleSendRejectsAppJobOperationsBeforeProviderWork() async throws {
+        let fixture = try Fixture(name: "oracle-send-jobs-rejected")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(providerCoordinator: prepared.providerCoordinator, oracleAdapter: prepared.oracleAdapter)
+        for tool in ["oracle_send", "ask_oracle"] {
+            for operation in ["start", "poll", "wait", "cancel"] {
+                do {
+                    _ = try await invoke(prepared: prepared, backend: backend, toolName: tool, arguments: ["op": .string(operation), "message": .string("must not launch")])
+                    XCTFail("Expected app-only job rejection")
+                } catch {
+                    XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .appOnlyJobOperation)
+                }
+            }
+        }
+        XCTAssertTrue(try fixture.calls().isEmpty)
+    }
+
+    func testRequestDiagnosticsRejectBeforeHeadlessProviderWork() async throws {
+        let fixture = try Fixture(name: "oracle-diagnostics-rejected")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(providerCoordinator: prepared.providerCoordinator, oracleAdapter: prepared.oracleAdapter)
+        for tool in ["oracle_send", "ask_oracle", "context_builder"] {
+            for control in [["debug_primary_only": Value.bool(true)], ["debug_lane_timeout_seconds": Value.int(30)]] {
+                do {
+                    _ = try await invoke(prepared: prepared, backend: backend, toolName: tool, arguments: control.merging(["message": .string("must not launch"), "new_chat": .bool(true)]) { first, _ in first })
+                    XCTFail("Unsupported diagnostics caused provider work")
+                } catch {
+                    if tool == "context_builder" {
+                        XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, try .unsupportedContextBuilderArgument(XCTUnwrap(control.keys.first)))
+                    } else {
+                        XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .appOnlyOracleDiagnostics)
+                    }
+                }
+            }
+        }
+        XCTAssertTrue(try fixture.calls().isEmpty)
+    }
+
     func testAskOracleRejectsImagesBeforeProviderWork() async throws {
         let fixture = try Fixture(name: "ask-oracle-images-rejected")
         defer { fixture.cleanup() }

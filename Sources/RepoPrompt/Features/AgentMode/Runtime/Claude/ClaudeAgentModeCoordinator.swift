@@ -693,6 +693,17 @@ final class ClaudeAgentModeCoordinator {
     }
 
     #if DEBUG
+        /// Exercises the actual steering idle/ACK gate without constructing a provider.
+        func test_reachesSteeringInterruptSafePoint(
+            session: AgentTabSession, runID: UUID,
+            handler: ClaudeAgentToolTrackingHandler, timeoutSeconds: TimeInterval
+        ) async -> Bool {
+            if case .ready = await awaitSteeringInterruptSafePoint(
+                session: session, runID: runID, handler: handler, timeoutSeconds: timeoutSeconds
+            ) { return true }
+            return false
+        }
+
         static func test_makeDefaultController(
             runID: UUID,
             tabID: UUID,

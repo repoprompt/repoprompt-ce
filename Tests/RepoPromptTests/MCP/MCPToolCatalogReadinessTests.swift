@@ -1,7 +1,109 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
+
+@MainActor
+final class MCPLongRunningJobToolContractParityTests: XCTestCase {
+    func testAppTicketToolDiscoveryMatchesStandaloneCanonicalDefinitions() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let window = WindowState()
+        let tools = try window.mcpServer.windowMCPToolCatalogService.materializeTools()
+        for name in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend, MCPWindowToolName.contextBuilder] {
+            let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            let appTool = try XCTUnwrap(tools.first { $0.name == name })
+            XCTAssertEqual(appTool.description, canonical.description, name)
+            try assertSchemaContract(Value(appTool.inputSchema), matches: canonical)
+            XCTAssertEqual(appTool.annotations.title, canonical.annotations.title, name)
+            XCTAssertEqual(appTool.annotations.readOnlyHint, canonical.annotations.readOnlyHint, name)
+            XCTAssertEqual(appTool.annotations.destructiveHint, canonical.annotations.destructiveHint, name)
+            XCTAssertEqual(appTool.annotations.idempotentHint, canonical.annotations.idempotentHint, name)
+            XCTAssertEqual(appTool.annotations.openWorldHint, canonical.annotations.openWorldHint, name)
+            XCTAssertEqual(appTool.isEnabledByDefault, canonical.isEnabledByDefault, name)
+            XCTAssertEqual(try appTool.domainBinding().definition, canonical, name)
+        }
+    }
+
+    func testBinderPreservesLocalMetadataAndCanonicalizationPreservesExecution() async throws {
+        let runtime = MCPAppToolBinder(windowID: 42) { name, freshness, args, implementation in
+            guard case .providerManaged = freshness else {
+                throw MCPError.internalError("Unexpected freshness policy")
+            }
+            return try await implementation(
+                MCPAppToolInvocation(
+                    toolName: name,
+                    windowID: 42,
+                    context: .trustedLocal(toolName: name, metadata: .init(connectionID: nil, clientName: nil, windowID: 42))
+                ),
+                args
+            )
+        }
+        for name in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend, MCPWindowToolName.contextBuilder] {
+            let local = runtime.tool(
+                name: name,
+                freshnessPolicy: .providerManaged,
+                description: "Local provider guidance",
+                inputSchema: .object(properties: [
+                    "op": .string(description: MCPLongRunningJobToolContract.operationDescription, enum: ["start", "poll", "wait", "cancel"]),
+                    "job_id": .string(description: MCPLongRunningJobToolContract.jobIDDescription),
+                    "detach": .boolean(description: MCPLongRunningJobToolContract.detachDescription),
+                    "timeout": .number(description: MCPLongRunningJobToolContract.timeoutDescription)
+                ], required: [])
+            ) { invocation, args in
+                .object([
+                    "tool": .string(invocation.toolName),
+                    "window_id": .int(invocation.windowID),
+                    "arguments": .object(args)
+                ])
+            }
+            XCTAssertEqual(local.description, "Local provider guidance")
+            let localProperties = try XCTUnwrap(Value(local.inputSchema).objectValue?["properties"]?.objectValue)
+            let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            let canonicalProperties = try XCTUnwrap(canonical.inputSchema.objectValue?["properties"]?.objectValue)
+            for property in ["op", "job_id", "detach", "timeout"] {
+                XCTAssertEqual(localProperties[property], canonicalProperties[property], "\(name).\(property)")
+            }
+            let projected = try RepoPromptApp.Tool(canonicalizing: local)
+            XCTAssertEqual(projected.description, canonical.description, name)
+            try assertSchemaContract(Value(projected.inputSchema), matches: canonical)
+            let args: [String: Value] = ["op": .string("start"), "detach": .bool(true), "message": .string("fixture")]
+            let result = try await projected(args)
+            XCTAssertEqual(result, .object([
+                "tool": .string(name),
+                "window_id": .int(42),
+                "arguments": .object(args)
+            ]), name)
+        }
+    }
+
+    private func assertSchemaContract(_ schema: Value, matches canonical: MCPDomainToolDefinition) throws {
+        let name = canonical.name
+        let appSchema = try XCTUnwrap(schema.objectValue, name)
+        let canonicalSchema = try XCTUnwrap(canonical.inputSchema.objectValue, name)
+        let appProperties = try XCTUnwrap(appSchema["properties"]?.objectValue, name)
+        let canonicalProperties = try XCTUnwrap(canonicalSchema["properties"]?.objectValue, name)
+        XCTAssertEqual(appSchema["type"], canonicalSchema["type"], name)
+        XCTAssertEqual(appSchema["required"] ?? .array([]), try XCTUnwrap(canonicalSchema["required"], name), name)
+        let ticketProperties: Set = ["op", "job_id", "detach", "timeout"]
+        XCTAssertTrue(ticketProperties.isSubset(of: Set(canonicalProperties.keys)), "\(name): missing canonical ticket properties")
+        for (property, expected) in canonicalProperties {
+            XCTAssertEqual(appProperties[property], expected, "\(name).\(property)")
+        }
+        var allowedExtras: Set<String> = []
+        #if DEBUG
+            if [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend].contains(name) {
+                allowedExtras = ["debug_primary_only", "debug_lane_timeout_seconds"]
+            }
+        #endif
+        let extras = Set(appProperties.keys).subtracting(canonicalProperties.keys)
+        XCTAssertTrue(extras.isSubset(of: allowedExtras), "\(name): unexpected schema properties \(extras.subtracting(allowedExtras))")
+    }
+}
 
 @MainActor
 final class MCPToolCatalogReadinessTests: XCTestCase {

@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import OrderedCollections
 import RepoPromptDomainRuntime
 
 @MainActor
@@ -11,6 +12,23 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
     static let askOracleImageUsageDescription = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
 
     static let askOracleImagesArgumentDescription = "Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` inside a loaded workspace root (including screenshots saved under a workspace root) or the exact path of an image the user attached to this agent session, and may include transient `title`. Unsupported transports, remote URLs, sibling attachments, and arbitrary paths outside loaded roots are rejected. Max \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
+
+    private static func withDebugDiagnostics(_ properties: OrderedDictionary<String, JSONSchema>) -> OrderedDictionary<String, JSONSchema> {
+        var result = properties
+        #if DEBUG
+            result["debug_primary_only"] = .boolean(description: "DEBUG app only: true for a fresh new_chat=true request without chat_id; execute only primary for this request. Cannot combine with lane timeout. No settings change; headless rejects.")
+            result["debug_lane_timeout_seconds"] = .number(description: "DEBUG app only: fresh configured multi-lane request, finite 1–300 second overall deadline per lane including setup/finalization; not ticket observer timeout. Cannot combine with primary-only. Headless and context_builder reject.", minimum: 1, maximum: 300)
+        #endif
+        return result
+    }
+
+    private static var debugInstructions: String {
+        #if DEBUG
+            "\n\nDEBUG-only request controls: debug_primary_only=true or debug_lane_timeout_seconds (finite 1–300s) require new_chat=true and no chat_id. Cannot combine; timeout requires a multi-lane roster. App backend only; unsupported backends reject rather than ignore. Settings/defaults are unchanged."
+        #else
+            ""
+        #endif
+    }
 
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
@@ -69,10 +87,14 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             Use `oracle_chat_log` after compaction to recover recent oracle messages.
-            """,
+            """ + Self.debugInstructions,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
-                properties: [
+                properties: Self.withDebugDiagnostics([
+                    "op": .string(description: MCPLongRunningJobToolContract.operationDescription, enum: ["start", "poll", "wait", "cancel"]),
+                    "job_id": .string(description: MCPLongRunningJobToolContract.jobIDDescription),
+                    "detach": .boolean(description: MCPLongRunningJobToolContract.detachDescription),
+                    "timeout": .number(description: MCPLongRunningJobToolContract.timeoutDescription),
                     "message": .string(
                         description: "Your message to send",
                         minLength: 1
@@ -106,8 +128,8 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )
-                ],
-                required: ["message"]
+                ]),
+                required: []
             )
         ) { [dependencies] _, args in
             try await dependencies.executeAskOracle(args)
@@ -127,10 +149,14 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             Build context first with file reads, `manage_selection`, or `workspace_context`.
-            """,
+            """ + Self.debugInstructions,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
-                properties: [
+                properties: Self.withDebugDiagnostics([
+                    "op": .string(description: MCPLongRunningJobToolContract.operationDescription, enum: ["start", "poll", "wait", "cancel"]),
+                    "job_id": .string(description: MCPLongRunningJobToolContract.jobIDDescription),
+                    "detach": .boolean(description: MCPLongRunningJobToolContract.detachDescription),
+                    "timeout": .number(description: MCPLongRunningJobToolContract.timeoutDescription),
                     "message": .string(
                         description: "Your message to send",
                         minLength: 1
@@ -153,8 +179,8 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )
-                ],
-                required: ["message"]
+                ]),
+                required: []
             )
         ) { [dependencies] _, args in
             try await dependencies.executeOracleSend(args)

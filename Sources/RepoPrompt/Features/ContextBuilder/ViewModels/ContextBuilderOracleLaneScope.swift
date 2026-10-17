@@ -2,26 +2,33 @@ import Foundation
 import os
 import RepoPromptDomainRuntime
 
-/// Explicit app-only opt-in. Retained by the CB generation, never inferred from model/origin.
+/// Explicit app-only lifetime ownership, never inferred from model/origin.
+/// Context Builder opts into deadlines; single Oracle tickets use cancellation/drain only.
 @MainActor
 final class ContextBuilderOracleGroupSupervision {
     typealias Clock = @MainActor @Sendable () -> TimeInterval
     typealias Sleep = @MainActor @Sendable (TimeInterval) async throws -> Void
 
     nonisolated let cancellation = ContextBuilderOracleCancellation()
-    let configuration: ContextBuilderFollowUpFinalizationConfiguration
+    let configuration: ContextBuilderFollowUpFinalizationConfiguration?
     let clock: Clock
     let sleep: Sleep
+    let timeoutOwner: String
+    let timeoutCodePrefix: String
     private var lanes: [ContextBuilderOracleLaneScope] = []
 
     init(
-        configuration: ContextBuilderFollowUpFinalizationConfiguration = .production,
+        configuration: ContextBuilderFollowUpFinalizationConfiguration? = .production,
         clock: @escaping Clock = { ProcessInfo.processInfo.systemUptime },
-        sleep: @escaping Sleep = { try await Task.sleep(for: .seconds($0)) }
+        sleep: @escaping Sleep = { try await Task.sleep(for: .seconds($0)) },
+        timeoutOwner: String = "Context Builder Oracle",
+        timeoutCodePrefix: String = "context_builder"
     ) {
         self.configuration = configuration
         self.clock = clock
         self.sleep = sleep
+        self.timeoutOwner = timeoutOwner
+        self.timeoutCodePrefix = timeoutCodePrefix
     }
 
     func makeLane(sessionID: UUID) -> ContextBuilderOracleLaneScope {
@@ -68,13 +75,16 @@ final class ContextBuilderOracleLaneScope {
     private(set) var phase = Phase.startup
     var partialResponse: String?
     var executionProfile: OracleExecutionProfile?
-    private let configuration: ContextBuilderFollowUpFinalizationConfiguration
+    private let configuration: ContextBuilderFollowUpFinalizationConfiguration?
     private let clock: ContextBuilderOracleGroupSupervision.Clock
     private let sleep: ContextBuilderOracleGroupSupervision.Sleep
     private let groupCancellation: ContextBuilderOracleCancellation
+    private let timeoutOwner: String
+    private let timeoutCodePrefix: String
     nonisolated let cancellation = ContextBuilderOracleCancellation()
     private let startedAt: TimeInterval
     private var lastActivityAt: TimeInterval
+    private var boundedOneShot: (deadline: TimeInterval, timeout: TimeInterval)?
     private var providerStopped = false
     private var finalizationStarted = false
     private var terminal: Terminal?
@@ -108,8 +118,15 @@ final class ContextBuilderOracleLaneScope {
         clock = group.clock
         sleep = group.sleep
         groupCancellation = group.cancellation
+        timeoutOwner = group.timeoutOwner
+        timeoutCodePrefix = group.timeoutCodePrefix
         startedAt = group.clock()
         lastActivityAt = startedAt
+    }
+
+    /// Lifetime ownership alone must not replace ordinary Oracle's existing watchdog policy.
+    var completionPolicy: OracleResponseCompletionPolicy {
+        configuration == nil ? .interactive : .contextBuilderStrict
     }
 
     var terminalError: Error? {
@@ -131,7 +148,15 @@ final class ContextBuilderOracleLaneScope {
             latch(.failure(CancellationError()))
             return false
         }
+        guard let configuration else { return true }
         let now = observationTime ?? clock()
+        if now - startedAt < configuration.overallTimeout, phase == .streaming, let boundedOneShot {
+            if now >= boundedOneShot.deadline {
+                latch(.failure(OracleLaneFailure(code: "\(timeoutCodePrefix)_request_timeout", message: "\(timeoutOwner) exceeded its \(String(format: "%g", boundedOneShot.timeout))s bounded one-shot request budget during streaming.")))
+                return false
+            }
+            return true
+        }
         let kind: ContextBuilderFollowUpTimeoutSnapshot.Kind? = if now - startedAt >= configuration.overallTimeout {
             .overall
         } else if now - lastActivityAt >= configuration.inactivityTimeout {
@@ -142,8 +167,8 @@ final class ContextBuilderOracleLaneScope {
         if let kind {
             let budget = kind == .overall ? configuration.overallTimeout : configuration.inactivityTimeout
             // Only configured local values and a closed phase enum; typed domain errors do not truncate.
-            let message = "Context Builder Oracle exceeded its \(String(format: "%.0f", budget))s \(kind.rawValue) budget during \(phase.rawValue)."
-            latch(.failure(OracleLaneFailure(code: "context_builder_\(kind.rawValue)_timeout", message: message)))
+            let message = "\(timeoutOwner) exceeded its \(String(format: "%g", budget))s \(kind.rawValue) budget during \(phase.rawValue)."
+            latch(.failure(OracleLaneFailure(code: "\(timeoutCodePrefix)_\(kind.rawValue)_timeout", message: message)))
             return false
         }
         return true
@@ -159,6 +184,23 @@ final class ContextBuilderOracleLaneScope {
         self.queryID = queryID
         phase = .streaming
         lastActivityAt = now
+        return true
+    }
+
+    /// The adapter declares its actual silent transport once, before waiting for its result.
+    /// Old deadlines still win; repeated declarations and activity cannot extend the bound.
+    @discardableResult
+    func observeRequestProgressPolicy(_ policy: ProviderRequestProgressPolicy) -> Bool {
+        guard checkDeadlines() else { return false }
+        guard configuration != nil, phase == .streaming, boundedOneShot == nil else { return true }
+        switch policy {
+        case let .boundedOneShot(timeout):
+            guard timeout.isFinite, timeout > 0 else {
+                latch(.failure(OracleLaneFailure(message: "Provider declared an invalid bounded one-shot request timeout.")))
+                return false
+            }
+            boundedOneShot = (clock() + timeout, timeout)
+        }
         return true
     }
 
@@ -236,15 +278,19 @@ final class ContextBuilderOracleLaneScope {
             }
         }
         cancelOperation = { work.cancel() }
-        let poll = Task { @MainActor in
-            while self.terminal == nil {
-                do { try await self.sleep(self.configuration.checkInterval) }
-                catch {
-                    if !Task.isCancelled { self.admitFailure(error) }
-                    return
+        // Cancellation-only tickets have no deadline scheduler; cancellation connects directly
+        // to the exact-query release and owned-task joins below.
+        let poll: Task<Void, Never>? = configuration.map { configuration in
+            Task { @MainActor in
+                while self.terminal == nil {
+                    do { try await self.sleep(configuration.checkInterval) }
+                    catch {
+                        if !Task.isCancelled { self.admitFailure(error) }
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.checkDeadlines()
                 }
-                guard !Task.isCancelled else { return }
-                self.checkDeadlines()
             }
         }
         let result = await withTaskCancellationHandler {
@@ -257,9 +303,9 @@ final class ContextBuilderOracleLaneScope {
             self.cancellation.request()
             Task { @MainActor in self.checkDeadlines() }
         }
-        poll.cancel()
+        poll?.cancel()
         await releaseTask?.value // Exact stream + hub dependency release precedes producer/finalizer joins.
-        await poll.value
+        await poll?.value
         while !ownedTasks.isEmpty {
             let tasks = ownedTasks
             ownedTasks.removeAll()

@@ -533,6 +533,9 @@ class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
+    /// One app-owned ticket center across windows; client connections only observe its workers.
+    let longRunningJobs = MCPLongRunningJobCenter()
+
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
 

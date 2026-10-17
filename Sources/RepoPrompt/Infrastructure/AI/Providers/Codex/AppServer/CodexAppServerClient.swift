@@ -66,7 +66,17 @@ actor CodexAppServerClient {
         let message: String
         let data: CodexJSONValue?
 
+        var isInputTooLarge: Bool {
+            guard ["turn/start", "turn/steer"].contains(method), code == -32602,
+                  case let .object(data) = data
+            else { return false }
+            return data["input_error_code"] == .string("input_too_large")
+        }
+
         var userFacingMessage: String {
+            if isInputTooLarge {
+                return "\(message) Reduce the selected context or message before submitting again. RepoPrompt does not truncate or automatically retry oversized input."
+            }
             guard ["initialize", "thread/resume"].contains(method),
                   code == -32601 || code == -32602
             else {
@@ -1348,6 +1358,30 @@ actor CodexAppServerClient {
         try Task.checkCancellation()
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
+        }
+        // Pinned Codex 0.159.0 (687a119f), turn_processor.rs and UserInput::text_char_count:
+        // decoded text items share one Unicode-scalar allowance; nontext and baseInstructions do not.
+        // Check the final assembled request before registering a pending RPC or writing any input.
+        if ["turn/start", "turn/steer"].contains(method),
+           let input = params?["input"] as? [[String: Any]]
+        {
+            let maxChars = 1 << 20
+            let actualChars = input.reduce(0) { count, item in
+                guard item["type"] as? String == "text", let text = item["text"] as? String else { return count }
+                return count + text.unicodeScalars.count
+            }
+            if actualChars > maxChars {
+                throw ClientError.requestFailed(RequestFailure(
+                    method: method,
+                    code: -32602,
+                    message: "Input exceeds the maximum length of \(maxChars) characters (\(actualChars) Unicode scalar values supplied).",
+                    data: .object([
+                        "input_error_code": .string("input_too_large"),
+                        "max_chars": .number(Double(maxChars)),
+                        "actual_chars": .number(Double(actualChars))
+                    ])
+                ))
+            }
         }
         let requestID = makeRequestID()
         let generation = activeTransport.generation

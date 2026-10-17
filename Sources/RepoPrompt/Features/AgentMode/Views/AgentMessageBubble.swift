@@ -270,7 +270,7 @@ struct AgentMessageBubble: View {
         normalizedToolCardName(item.toolName)?.lowercased()
     }
 
-    private var renderingItem: AgentChatItem {
+    var renderingItem: AgentChatItem {
         guard item.kind == .toolResult,
               let rawToolResultPayload,
               !rawToolResultPayload.isEmpty
@@ -322,8 +322,14 @@ struct AgentMessageBubble: View {
             } else if isAskUserTool(renderItem.toolName) {
                 askUserQuestionExchangeView
             } else if normalizedToolName == "context_builder", let contextBuilderContext {
-                ContextBuilderResultCard(item: renderItem, context: contextBuilderContext)
-                    .id(rawToolResultPayloadRenderRevision)
+                if let ticket = contextBuilderContext.transcriptMetadata.compactSuccessfulObservation(
+                    for: renderItem, contextID: contextBuilderContext.tabID
+                ) {
+                    ContextBuilderObservationHistoryRow(item: renderItem, ticket: ticket)
+                } else {
+                    ContextBuilderResultCard(item: renderItem, context: contextBuilderContext)
+                        .id(rawToolResultPayloadRenderRevision)
+                }
             } else {
                 ToolCardRouter.resultView(
                     for: renderItem,

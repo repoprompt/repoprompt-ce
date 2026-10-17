@@ -66,6 +66,7 @@ private struct ContextBuilderToolResult: Codable {
     let followUpHint: String?
     let oracleExportPath: String?
     let oracleExportInstruction: String?
+    let oracleExportError: String?
 
     enum CodingKeys: String, CodingKey {
         case tabID = "context_id"
@@ -85,6 +86,7 @@ private struct ContextBuilderToolResult: Codable {
         case followUpHint = "follow_up_hint"
         case oracleExportPath = "oracle_export_path"
         case oracleExportInstruction = "oracle_export_instruction"
+        case oracleExportError = "oracle_export_error"
     }
 
     func toMCPValue() -> Value {
@@ -135,6 +137,9 @@ private struct ContextBuilderToolResult: Codable {
         }
         if let oracleExportInstruction {
             obj["oracle_export_instruction"] = .string(oracleExportInstruction)
+        }
+        if let oracleExportError {
+            obj["oracle_export_error"] = .string(oracleExportError)
         }
 
         return .object(obj)
@@ -288,14 +293,17 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
     private typealias Dependencies = (
         execution: MCPAppPhysicalCapabilityAdapters.Execution,
         context: MCPAppPhysicalCapabilityAdapters.Context,
-        files: MCPAppPhysicalCapabilityAdapters.Files
+        files: MCPAppPhysicalCapabilityAdapters.Files,
+        jobs: MCPLongRunningJobCenter,
+        registerJob: (UUID, UUID?, @escaping () -> Void) -> Void,
+        unregisterJob: (UUID) -> Void
     )
 
     private let dependencies: Dependencies
 
-    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution, context: MCPAppPhysicalCapabilityAdapters.Context, files: MCPAppPhysicalCapabilityAdapters.Files) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution, context: MCPAppPhysicalCapabilityAdapters.Context, files: MCPAppPhysicalCapabilityAdapters.Files, jobs: MCPLongRunningJobCenter, registerJob: @escaping (UUID, UUID?, @escaping () -> Void) -> Void, unregisterJob: @escaping (UUID) -> Void) {
         self.runtime = runtime
-        dependencies = (execution: execution, context: context, files: files)
+        dependencies = (execution: execution, context: context, files: files, jobs: jobs, registerJob: registerJob, unregisterJob: unregisterJob)
     }
 
     func buildTools() -> [Tool] {
@@ -344,6 +352,10 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
+                    "op": .string(description: MCPLongRunningJobToolContract.operationDescription, enum: ["start", "poll", "wait", "cancel"]),
+                    "job_id": .string(description: MCPLongRunningJobToolContract.jobIDDescription),
+                    "detach": .boolean(description: MCPLongRunningJobToolContract.detachDescription),
+                    "timeout": .number(description: MCPLongRunningJobToolContract.timeoutDescription),
                     "instructions": .string(description: "Your request, ideally structured with XML tags: <task> for the main goal, <context> for background/constraints/file references, <discovery_agent-guidelines> for optional starting hints. Describe what you need — the agent finds the right files."),
                     "response_type": .string(description: "Optional: 'plan' to generate implementation plan, 'question' to ask a question, or 'review' to generate a code review. Omit or 'clarify' to just return context.", enum: ["plan", "question", "review", "clarify"]),
                     "oracle_preset": .string(
@@ -359,12 +371,11 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         ) { [dependencies] invocation, args in
             let invocationContext = invocation.context
             do {
-                let result = try await Self.executeContextBuilder(
+                return try await Self.executeContextBuilder(
                     args: args,
                     invocationContext: invocationContext,
                     dependencies: dependencies
                 )
-                return result.toMCPValue()
             } catch let error as ContextBuilderWorkspaceContextError {
                 throw MCPError.invalidParams(error.localizedDescription)
             }
@@ -396,11 +407,93 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         return trimmed
     }
 
-    private static func executeContextBuilder(
+    private struct PreparedContextBuilderRun {
+        let instructions: String
+        let invocationContext: ToolInvocationContext
+        let targetWindow: WindowState
+        let tabResolution: MCPAppPhysicalCapabilityAdapters.ContextBuilderTabResolution
+        let initialResultTab: ComposeTabState
+        let responseType: ContextBuilderResponseType?
+        let exportResponse: Bool
+        let runAuthority: ContextBuilderResolvedRunAuthority
+        let exportDestination: OracleExportDestination?
+        let controlToken: UUID
+
+        var owner: MCPLongRunningJobCenter.Owner {
+            .init(windowID: targetWindow.windowID, workspaceID: tabResolution.identity.workspaceID, tabID: tabResolution.identity.tabID, sessionID: tabResolution.agentModeSessionID, runID: tabResolution.agentModeRunID)
+        }
+
+        @MainActor func abandon() {
+            targetWindow.contextBuilderAgentViewModel.clearMCPControlledRun(forTabID: tabResolution.identity.tabID, controlToken: controlToken)
+        }
+    }
+
+    private static func executeContextBuilder(args: [String: Value], invocationContext: ToolInvocationContext, dependencies: Dependencies) async throws -> Value {
+        guard args["debug_primary_only"] == nil, args["debug_lane_timeout_seconds"] == nil else {
+            throw MCPError.invalidParams("Context Builder does not support Oracle request diagnostics")
+        }
+        // Routing selectors are validated against the resolved context below, not job controls.
+        let operation = try MCPLongRunningJobOperation.parse(args.filter { $0.key != "context_id" })
+        if operation.id != nil {
+            return try await dependencies.jobs.control(operation: operation, tool: MCPWindowToolName.contextBuilder) { owner in
+                let context = try await dependencies.execution.requireCurrentTabContext(MCPWindowToolName.contextBuilder)
+                let window = try dependencies.execution.requireTargetWindow()
+                guard window.windowID == owner.windowID, context.workspaceID == owner.workspaceID, context.tabID == owner.tabID else {
+                    throw MCPError.invalidParams("job_id belongs to a different workspace/context; bind the context_id from its start snapshot")
+                }
+                let purpose = if let connection = invocationContext.connectionID { await dependencies.execution.liveRunPurpose(connection) } else { MCPRunPurpose.unknown }
+                for key in ["context_id", "_tabID"] {
+                    guard let selector = args[key] else { continue }
+                    guard purpose != .agentModeRun else {
+                        throw MCPError.invalidParams("Agent Mode context_builder cannot replace the invoking run-scoped tab context with an explicit context_id")
+                    }
+                    guard let raw = selector.stringValue, let id = UUID(uuidString: raw), id == context.tabID else {
+                        throw MCPError.invalidParams("\(key) must identify the job's bound tab context")
+                    }
+                }
+                if purpose == .agentModeRun, context.activeAgentSessionID == nil || context.runID == nil {
+                    throw MCPError.invalidParams("Ticket controls require the active Agent session/run context")
+                }
+                guard owner.sessionID == (purpose == .agentModeRun ? context.activeAgentSessionID : nil), owner.runID == (purpose == .agentModeRun ? context.runID : nil) else {
+                    throw MCPError.invalidParams("job_id belongs to a different Agent session/run")
+                }
+            }
+        }
+        let ticketed = if case .start = operation { true } else { false }
+        let executionArgs = MCPLongRunningJobOperation.executionArgs(args)
+        if ticketed, !executionArgs.keys.allSatisfy({ $0.hasPrefix("_") || ["instructions", "response_type", "oracle_preset", "context_pack_ref", "export_response", "context_id"].contains($0) }) {
+            throw MCPError.invalidParams("context_builder start accepts only instructions, response_type, oracle_preset, context_pack_ref, export_response, context_id")
+        }
+        #if DEBUG
+            let window = try dependencies.execution.requireTargetWindow()
+            let binding = invocationContext.connectionID.map { window.mcpServer.connectionBindingSnapshot(forConnection: $0) }
+            let observation = window.contextBuilderAgentViewModel.startupObservationForTesting(workspaceID: binding?.workspaceID, tabID: binding?.tabID, invokingRunID: binding?.runID)
+            defer { observation?.recordRequestTerminal() }
+        #endif
+        let prepared = try await prepareContextBuilderRun(args: executionArgs, invocationContext: invocationContext, dependencies: dependencies, ticketed: ticketed)
+        guard case let .start(detach, timeout) = operation else {
+            return try await performContextBuilderRun(prepared, dependencies: dependencies).toMCPValue()
+        }
+        let snapshot = try await dependencies.jobs.start(tool: MCPWindowToolName.contextBuilder, owner: prepared.owner, admissible: {
+            // Tab close sweeps only admitting/registered jobs; reject a tab removed during preparation.
+            guard prepared.targetWindow.workspaceManager.composeTab(for: prepared.tabResolution.identity) != nil else {
+                throw MCPError.invalidRequest("Tab context '\(prepared.tabResolution.identity.tabID.uuidString)' was closed before the job was admitted")
+            }
+        }, register: { id, cancel in
+            dependencies.registerJob(id, prepared.owner.runID, cancel)
+        }, unregister: dependencies.unregisterJob, onNotStarted: { prepared.abandon() }) { progress in
+            try await performContextBuilderRun(prepared, dependencies: dependencies, jobProgress: progress).toMCPValue()
+        }
+        if detach { return snapshot.value() }
+        return await dependencies.jobs.store.wait(id: snapshot.id, timeout: timeout)?.value() ?? MCPLongRunningJobCenter.expired(id: snapshot.id)
+    }
+
+    private static func prepareContextBuilderRun(
         args: [String: Value],
         invocationContext: ToolInvocationContext,
-        dependencies: Dependencies
-    ) async throws -> ContextBuilderToolResult {
+        dependencies: Dependencies,
+        ticketed: Bool
+    ) async throws -> PreparedContextBuilderRun {
         guard args["context_pack_ref"] == nil else {
             throw MCPError.invalidParams(
                 "context_pack_ref is accepted only by the direct-headless Context Builder adapter."
@@ -425,20 +518,20 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         }
 
         let targetWindow = try dependencies.execution.requireTargetWindow()
-        #if DEBUG
-            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(forConnection: $0) }
-            let startupObservation = targetWindow.contextBuilderAgentViewModel.startupObservationForTesting(
-                workspaceID: invokingBinding?.workspaceID, tabID: invokingBinding?.tabID,
-                invokingRunID: invokingBinding?.runID
-            )
-            defer { startupObservation?.recordRequestTerminal() }
-        #endif
         let tabResolution = try await dependencies.execution.resolveContextBuilderTab(
             args,
             targetWindow,
             connectionID
         )
         let resolvedIdentity = tabResolution.identity
+        if ticketed {
+            let purpose = if let connectionID { await dependencies.execution.liveRunPurpose(connectionID) } else { MCPRunPurpose.unknown }
+            if purpose == .agentModeRun, tabResolution.agentModeSessionID == nil || tabResolution.agentModeRunID == nil {
+                throw MCPError.invalidParams("Ticket admission requires the active Agent session/run context")
+            }
+            let owner = MCPLongRunningJobCenter.Owner(windowID: targetWindow.windowID, workspaceID: resolvedIdentity.workspaceID, tabID: resolvedIdentity.tabID, sessionID: tabResolution.agentModeSessionID, runID: tabResolution.agentModeRunID)
+            try await dependencies.jobs.store.checkAdmission(owner: owner)
+        }
         let finalTabID = resolvedIdentity.tabID
         guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == resolvedIdentity.workspaceID }) else {
             throw MCPError.invalidParams("The resolved Context Builder workspace is no longer available.")
@@ -539,7 +632,6 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         }
         // swiftformat:enable conditionalAssignment
 
-        let tabIDForCleanup = finalTabID
         let mcpControlToken = try await MainActor.run {
             try contextBuilderVM.beginMCPControlledRun(
                 forTabID: finalTabID,
@@ -549,6 +641,27 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             )
         }
 
+        return PreparedContextBuilderRun(instructions: instructions, invocationContext: invocationContext, targetWindow: targetWindow, tabResolution: tabResolution, initialResultTab: initialResultTab, responseType: responseType, exportResponse: exportResponse, runAuthority: runAuthority, exportDestination: capturedOracleExportDestination, controlToken: mcpControlToken)
+    }
+
+    private static func performContextBuilderRun(_ prepared: PreparedContextBuilderRun, dependencies: Dependencies, jobProgress: MCPLongRunningJobProgress? = nil) async throws -> ContextBuilderToolResult {
+        let instructions = prepared.instructions
+        let invocationContext = prepared.invocationContext
+        let connectionID = jobProgress == nil ? invocationContext.connectionID : nil
+        let targetWindow = prepared.targetWindow
+        let tabResolution = prepared.tabResolution
+        let resolvedIdentity = tabResolution.identity
+        let finalTabID = resolvedIdentity.tabID
+        let workspaceContext = tabResolution.workspaceContext
+        let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
+        let initialResultTab = prepared.initialResultTab
+        let responseType = prepared.responseType
+        let exportResponse = prepared.exportResponse
+        let runAuthority = prepared.runAuthority
+        let capturedOracleExportDestination = prepared.exportDestination
+        let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
+        let mcpControlToken = prepared.controlToken
+        let tabIDForCleanup = finalTabID
         return try await AsyncScope.withCleanup({}, cleanup: {
             await MainActor.run {
                 contextBuilderVM.clearMCPControlledRun(
@@ -560,8 +673,15 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             let contextBuilderTokenBudget = runAuthority.configuration.effectiveTokenBudget
             let planModelName = runAuthority.configuration.generatedResponseAuthority.planningModelName
 
-            let sendStageProgress = dependencies.execution.sendStageProgress
+            let sendStageProgress: MCPAppPhysicalCapabilityAdapters.SendStageProgress = { connection, tool, stage, message in
+                guard jobProgress == nil else { return }
+                await dependencies.execution.sendStageProgress(connection, tool, stage, message)
+            }
             let progressTimeline = ContextBuilderMCPProgressTimeline { event in
+                if let jobProgress {
+                    if event.kind == .started { await jobProgress.phase(event.phase.rawValue, stage: event.stage) }
+                    return
+                }
                 await sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
@@ -577,14 +697,14 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             }
 
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
-                await dependencies.execution.sendStageProgress(
+                await sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "starting",
                     "Starting context builder..."
                 )
 
-                await dependencies.execution.sendStageProgress(
+                await sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovering",
@@ -597,7 +717,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         tool: MCPWindowToolName.contextBuilder,
                         stage: "discovering",
                         message: "Still building context...",
-                        timeline: progressTimeline
+                        timeline: progressTimeline,
+                        jobProgress: jobProgress
                     ) {
                         try await contextBuilderVM.runContextBuilderForMCP(
                             authority: runAuthority,
@@ -610,7 +731,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     }
                 }
 
-                await dependencies.execution.sendStageProgress(
+                await sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovered",
@@ -634,7 +755,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         tool: MCPWindowToolName.contextBuilder,
                         stage: "processing",
                         message: "Still rendering Context Builder selection...",
-                        timeline: progressTimeline
+                        timeline: progressTimeline,
+                        jobProgress: jobProgress
                     ) {
                         let committedResultTab: ComposeTabState?
                         if let committedTab = snapshot.committedTab {
@@ -738,6 +860,9 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 let fileCount = renderedSelection.fileCount
                 let selectionReply = renderedSelection.reply
                 let formattedSelection = renderedSelection.formatted
+                if let jobProgress {
+                    await jobProgress.store.update(id: jobProgress.id, fields: ["discovery": .object(["file_count": .int(fileCount), "total_tokens": .int(selectionReply.totalTokens ?? 0)])])
+                }
 
                 var planReply: ChatSendReply? = nil
                 var reviewReply: ChatSendReply? = nil
@@ -781,7 +906,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                                 tool: MCPWindowToolName.contextBuilder,
                                 stage: "generating",
                                 message: "Still authorizing Context Builder review selection...",
-                                timeline: progressTimeline
+                                timeline: progressTimeline,
+                                jobProgress: jobProgress
                             ) {
                                 await dependencies.execution.beforeContextBuilderFinalReviewAuthorization()
                                 let preAuthorizationCanonical = await MainActor.run {
@@ -859,7 +985,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     }
 
                     let modeLabel = responseType?.generationLabel ?? "question"
-                    await dependencies.execution.sendStageProgress(
+                    await sendStageProgress(
                         connectionID,
                         MCPWindowToolName.contextBuilder,
                         "generating",
@@ -873,7 +999,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                             tool: MCPWindowToolName.contextBuilder,
                             stage: "generating",
                             message: "Still generating \(modeLabel)...",
-                            timeline: progressTimeline
+                            timeline: progressTimeline,
+                            jobProgress: jobProgress
                         ) {
                             try await dependencies.execution.runMCPPlanOrQuestion(
                                 contextBuilderVM,
@@ -888,7 +1015,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                                 tabResolution.reviewGitContext,
                                 finalReviewAuthorization,
                                 progressReporter,
-                                activityReporter
+                                activityReporter,
+                                jobProgress
                             )
                         }
                     }
@@ -905,7 +1033,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     )
                 }
 
-                await dependencies.execution.sendStageProgress(
+                await sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "complete",
@@ -925,7 +1053,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     tokenNote = nil
                 }
 
-                func makeResult(oracleExportPath: String?, oracleExportInstruction: String? = nil) -> ContextBuilderToolResult {
+                func makeResult(oracleExportPath: String?, oracleExportInstruction: String? = nil, oracleExportError: String? = nil) -> ContextBuilderToolResult {
                     ContextBuilderToolResult(
                         tabID: resultTab.id.uuidString,
                         status: status,
@@ -945,46 +1073,59 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         review: reviewReply,
                         followUpHint: followUpHint,
                         oracleExportPath: oracleExportPath,
-                        oracleExportInstruction: oracleExportInstruction
+                        oracleExportInstruction: oracleExportInstruction,
+                        oracleExportError: oracleExportError
                     )
                 }
 
                 if exportResponse,
                    planReply != nil || reviewReply != nil
                 {
-                    let resultForExport = makeResult(oracleExportPath: nil)
-                    let markdown = ToolOutputFormatter.formatDiscoverContext(value: resultForExport.toMCPValue())
-                        .compactMap { block -> String? in
-                            switch block {
-                            case .text(text: let text, annotations: _, _meta: _):
-                                return text
-                            default:
-                                return nil
+                    do {
+                        // Ticket observers retain the settled result even if optional export is
+                        // cancelled or fails. Legacy requests keep their existing throwing contract.
+                        if jobProgress != nil { try Task.checkCancellation() }
+                        await jobProgress?.phase("response_export", stage: "exporting")
+                        let resultForExport = makeResult(oracleExportPath: nil)
+                        let markdown = ToolOutputFormatter.formatDiscoverContext(value: resultForExport.toMCPValue())
+                            .compactMap { block -> String? in
+                                switch block {
+                                case .text(text: let text, annotations: _, _meta: _):
+                                    return text
+                                default:
+                                    return nil
+                                }
                             }
+                            .joined(separator: "\n")
+                        let exportMode = responseType?.rawValue ?? planReply?.mode ?? reviewReply?.mode ?? "response"
+                        let chatID = planReply?.shortId ?? reviewReply?.shortId
+                        guard let capturedOracleExportDestination else {
+                            throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
                         }
-                        .joined(separator: "\n")
-                    let exportMode = responseType?.rawValue ?? planReply?.mode ?? reviewReply?.mode ?? "response"
-                    let chatID = planReply?.shortId ?? reviewReply?.shortId
-                    guard let capturedOracleExportDestination else {
-                        throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
+                        let exportPath = try await dependencies.execution.resolveDefaultOracleExportPath(
+                            exportMode,
+                            chatID,
+                            capturedOracleExportDestination
+                        )
+                        let resolvedPath = try await dependencies.execution.writeGeneratedOracleExportFile(
+                            exportPath,
+                            markdown,
+                            capturedOracleExportDestination
+                        )
+                        let exportedLaneCount = [planReply, reviewReply]
+                            .compactMap { $0?.oracleGroup?.result.oracleResults.count }
+                            .max()
+                        oracleExportFile = OracleExportFile(
+                            path: resolvedPath,
+                            instruction: AgentOracleExport.instruction(path: resolvedPath, oracleLaneCount: exportedLaneCount)
+                        )
+                    } catch {
+                        guard jobProgress != nil else { throw error }
+                        let notice = error is CancellationError || Task.isCancelled
+                            ? "Oracle export cancelled; output may remain. Recover the settled result using the returned chat IDs."
+                            : "Oracle export failed; output may remain. Recover the settled result using the returned chat IDs."
+                        return makeResult(oracleExportPath: nil, oracleExportError: notice)
                     }
-                    let exportPath = try await dependencies.execution.resolveDefaultOracleExportPath(
-                        exportMode,
-                        chatID,
-                        capturedOracleExportDestination
-                    )
-                    let resolvedPath = try await dependencies.execution.writeGeneratedOracleExportFile(
-                        exportPath,
-                        markdown,
-                        capturedOracleExportDestination
-                    )
-                    let exportedLaneCount = [planReply, reviewReply]
-                        .compactMap { $0?.oracleGroup?.result.oracleResults.count }
-                        .max()
-                    oracleExportFile = OracleExportFile(
-                        path: resolvedPath,
-                        instruction: AgentOracleExport.instruction(path: resolvedPath, oracleLaneCount: exportedLaneCount)
-                    )
                 }
 
                 return makeResult(
@@ -1005,7 +1146,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         guard let reminder = OracleGroupDeliveryContract.followUpReminder(laneCount: oracleCount ?? 0) else {
             return continuation
         }
-        return reminder + "\n\nOptional later follow-up: " + continuation
+        return reminder + "\nThis explicit chat_id continues only the addressed Oracle lane; other lanes are not re-run.\n\nOptional later follow-up: " + continuation
     }
 
     nonisolated static func responseDisposition(
@@ -1073,10 +1214,11 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         stage: String,
         message: String,
         timeline: ContextBuilderMCPProgressTimeline? = nil,
+        jobProgress: MCPLongRunningJobProgress? = nil,
         interval: Duration = .seconds(30),
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        guard let connectionID = invocationContext.connectionID else {
+        guard jobProgress == nil, let connectionID = invocationContext.connectionID else {
             return try await operation()
         }
         let shouldSendProgress = await execution.supportsProgressNotifications(connectionID)

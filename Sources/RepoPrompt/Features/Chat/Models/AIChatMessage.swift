@@ -16,6 +16,8 @@ struct AIChatMessage: Identifiable, Equatable {
     let id: UUID
     private(set) var content: String
     let isUser: Bool
+    /// Creation time survives persistence and restoration; autosave must not restamp history.
+    let timestamp: Date
 
     /// The sequence index determining message order.
     let sequenceIndex: Int
@@ -48,6 +50,7 @@ struct AIChatMessage: Identifiable, Equatable {
         id: UUID = UUID(),
         content: String,
         isUser: Bool,
+        timestamp: Date = Date(),
         isFinalized: Bool = false,
         sequenceIndex: Int = 0,
         allowedFilePaths: [String] = [],
@@ -58,6 +61,7 @@ struct AIChatMessage: Identifiable, Equatable {
         self.id = id
         self.content = content
         self.isUser = isUser
+        self.timestamp = timestamp
         self.sequenceIndex = sequenceIndex
         self.allowedFilePaths = allowedFilePaths
         self.isFinalized = isFinalized

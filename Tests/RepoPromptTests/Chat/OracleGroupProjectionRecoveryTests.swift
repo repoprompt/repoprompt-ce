@@ -7,6 +7,99 @@ import XCTest
 
 @MainActor
 final class OracleGroupProjectionRecoveryTests: XCTestCase {
+    func testSettledLaneAwaitsCanonicalPublicationWithoutLosingOwnershipGuards() throws {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let owner = try OracleViewModel.oracleGroupOwner(workspaceID: workspaceID, tabID: tabID)
+        let models = try ["model-a", "model-b"].map { try OracleModelReference(modelID: $0) }
+        let descriptor = try OracleGroupDescriptor(size: models.count)
+        let members = try models.enumerated().map { index, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: index), publicChatID: "lane-\(index)", model: model
+            )
+        }
+        let timestamp = Date(timeIntervalSince1970: 1000)
+        let prepared = try OracleGroupDocument(
+            group: descriptor, owner: owner, name: "Publication", revision: 1,
+            createdAt: timestamp, updatedAt: timestamp,
+            roster: OracleRoster(primary: models[0], additional: [models[1]]), members: members,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .chat, userMessage: "Question"), state: .prepared, startedAt: timestamp
+            )]
+        )
+        let turnID = try XCTUnwrap(prepared.turns.last?.id)
+        let sessions = members.map { member in
+            ChatSession(
+                id: member.memberID.rawValue, workspaceID: workspaceID, composeTabID: tabID,
+                oracleGroupID: descriptor.id.rawValue, oracleLaneIndex: member.laneID.index,
+                oracleGroupSize: 2, oracleModelRaw: member.model.modelID,
+                name: "Publication", shortID: member.publicChatID
+            )
+        }
+        var presentation = OracleGroupPresentation(document: prepared, invocationID: UUID())
+        for member in members {
+            presentation.receive(.init(
+                kind: .laneStarted, groupID: descriptor.id, turnID: turnID,
+                laneID: member.laneID, sequence: 0
+            ))
+        }
+        presentation.receive(.init(
+            kind: .laneSettled, groupID: descriptor.id, turnID: turnID,
+            laneID: members[0].laneID, sequence: 2, text: "completed"
+        ))
+        XCTAssertEqual(presentation.member(sessions[0]).status.rawValue, "Settled — awaiting group result")
+        XCTAssertEqual(presentation.member(sessions[1]).status, .streaming)
+        let settled = presentation
+        for event in [
+            OracleProgressEvent(kind: .laneStarted, groupID: descriptor.id, turnID: turnID, laneID: members[0].laneID, sequence: 1),
+            OracleProgressEvent(kind: .laneStarted, groupID: descriptor.id, turnID: turnID, laneID: members[0].laneID, sequence: 2),
+            OracleProgressEvent(kind: .laneSettled, groupID: OracleGroupID(rawValue: UUID()), turnID: turnID, laneID: members[1].laneID, sequence: 3),
+            OracleProgressEvent(kind: .laneSettled, groupID: descriptor.id, turnID: OracleTurnID(rawValue: UUID()), laneID: members[1].laneID, sequence: 3),
+            OracleProgressEvent(kind: .laneStarted, groupID: descriptor.id, turnID: turnID, laneID: members[0].laneID, sequence: 3)
+        ] {
+            presentation.receive(event)
+            XCTAssertEqual(presentation, settled)
+        }
+        var wrongOwner = sessions[0]
+        wrongOwner.composeTabID = UUID()
+        XCTAssertEqual(presentation.member(wrongOwner).status, .unknown)
+        presentation.receive(.init(
+            kind: .laneSettled, groupID: descriptor.id, turnID: turnID,
+            laneID: members[1].laneID, sequence: 1, text: "failed"
+        ))
+        XCTAssertEqual(presentation.member(sessions[1]).status.rawValue, "Settled — awaiting group result")
+        presentation.endExecution()
+        XCTAssertEqual(presentation.member(sessions[0]).status, .unknown)
+        presentation.receive(.init(
+            kind: .laneStarted, groupID: descriptor.id, turnID: turnID,
+            laneID: members[0].laneID, sequence: 3
+        ))
+        XCTAssertEqual(presentation.member(sessions[0]).status, .unknown)
+
+        let results = try members.map { member in
+            let failed = member.laneID.index == 1
+            return try OracleLaneResult(
+                laneIndex: member.laneID.index, chatID: member.publicChatID,
+                providerID: member.model.providerID, modelID: member.model.modelID,
+                status: failed ? .failed : .completed, response: failed ? nil : "Paid answer",
+                error: failed ? OracleLaneError(code: "provider_error", message: "Provider stopped") : nil
+            )
+        }
+        let terminal = try prepared.settling(OracleGroupResult(
+            groupID: descriptor.id, status: .partialFailure, oracleResults: results
+        ))
+        presentation = OracleGroupPresentation(document: terminal)
+        XCTAssertEqual(presentation.member(sessions[0]).status, .completed)
+        XCTAssertEqual(presentation.member(sessions[1]).status, .failed)
+        let published = presentation
+        presentation.receive(.init(
+            kind: .laneStarted, groupID: descriptor.id, turnID: turnID,
+            laneID: members[0].laneID, sequence: 4
+        ))
+        presentation.endExecution()
+        XCTAssertEqual(presentation, published)
+    }
+
     func testMissingProjectionWithPriorOutputFailsBeforeProviderDispatch() async throws {
         for partial in [false, true] {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
@@ -128,9 +221,10 @@ final class OracleGroupProjectionRecoveryTests: XCTestCase {
                     provenance: .direct
                 )
             )
+            composition.workspaceManager.setActiveChatSessionID(primary.memberID.rawValue, forTabID: tab.id)
             do {
                 _ = try await composition.oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
-                    args: ["message": .string("Follow up"), "chat_id": .string(primary.publicChatID)],
+                    args: ["message": .string("Follow up")],
                     promptVM: composition.promptManager,
                     tabContext: context,
                     callbacks: AppOracleGroupExecutionCallbacks(

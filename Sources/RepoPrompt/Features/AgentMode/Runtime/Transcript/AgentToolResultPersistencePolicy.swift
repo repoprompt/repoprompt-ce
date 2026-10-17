@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptDomainRuntime
 
 struct AgentSanitizedToolResult: Equatable {
     let text: String
@@ -175,6 +174,10 @@ enum AgentToolResultPersistencePolicy {
             ? BashToolResultParser.parseMetadata(raw: rawResultJSON, context: context)
             : nil
         let statusWord: String = {
+            if let nativeStatus = AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: item) {
+                // A returned control observation is not an unresolved provider call on cold restore.
+                return AgentTranscriptToolStatusSemantics.persistedStatusWord(from: nativeStatus)
+            }
             if normalizedToolName != "bash",
                let executionStatus = execution?.status,
                executionStatus != .unknown
@@ -1471,7 +1474,32 @@ enum AgentToolResultPersistencePolicy {
         argsJSON: String?,
         context: AgentToolResultProcessingContext?
     ) -> String? {
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+           let rawObject, let value = jsonString(from: rawObject),
+           let data = ToolResultDTOs.ChatSendDTO.nativeOracleReplyJSONData(from: value)
+           ?? ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: value),
+           let native = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        {
+            // Preserve native replies and returned tickets before generic ACP summaries strip their identity.
+            return oracleChatSummaryJSON(
+                normalizedToolName: normalizedToolName, statusWord: stringValue(native, keys: ["status"]) ?? statusWord, rawObject: native
+            )
+        }
         let allowExistingRenderSummary = boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true
+        if normalizedToolName == "context_builder",
+           let rawObject, let value = jsonString(from: rawObject),
+           let data = ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: value),
+           let native = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        {
+            return contextBuilderSummaryJSON(statusWord: statusWord, rawObject: native)
+        }
+        let contextBuilderRawOutput = rawObject?["rawOutput"] as? [String: Any]
+        if normalizedToolName == "context_builder",
+           let payload = contextBuilderRawOutput ?? rawObject,
+           payload["job"] != nil
+        {
+            return contextBuilderSummaryJSON(statusWord: statusWord, rawObject: payload)
+        }
         if let renderSummary = AgentToolCardRenderSummaryBuilder.build(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -1489,7 +1517,7 @@ enum AgentToolResultPersistencePolicy {
             )
         }
         if normalizedToolName == "context_builder",
-           let rawOutput = rawObject?["rawOutput"] as? [String: Any]
+           let rawOutput = contextBuilderRawOutput
         {
             return contextBuilderSummaryJSON(
                 statusWord: statusWord,
@@ -2170,6 +2198,12 @@ enum AgentToolResultPersistencePolicy {
         if let contextID = smallStringValue(rawObject, keys: ["context_id", "tab_id", "tabID"]) {
             object["context_id"] = contextID
         }
+        if let fields = boundedJobTicketFields(from: rawObject) {
+            object.merge(fields) { _, new in new }
+        }
+        if rawObject["oracle_export_error"] != nil {
+            object["oracle_export_error"] = "Oracle export incomplete; recover the settled result using its chat ID."
+        }
         let responseType = smallStringValue(rawObject, keys: ["response_type", "responseType"])
         if let responseType {
             object["response_type"] = responseType
@@ -2268,6 +2302,21 @@ enum AgentToolResultPersistencePolicy {
         return reply
     }
 
+    /// Shared structural evidence only; archived running/cancelling snapshots do not prove liveness.
+    private static func boundedJobTicketFields(from rawObject: [String: Any]) -> [String: Any]? {
+        guard let job = rawObject["job"] as? [String: Any], let jobID = rawObject["job_id"] else { return nil }
+        var retainedJob = job.filter { ["id", "status", "context_id", "revision"].contains($0.key) }
+        if let chatID = smallStringValue(job, keys: ["chat_id"]) {
+            retainedJob["chat_id"] = chatID
+        }
+        let envelope: [String: Any] = ["job_id": jobID, "job": retainedJob, "summary_only": true]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope),
+              let ticket = try? JSONDecoder().decode(ToolResultDTOs.LongRunningJobTicketDTO.self, from: data),
+              let encoded = try? JSONEncoder().encode(ticket)
+        else { return nil }
+        return (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any]
+    }
+
     private static func oracleChatSummaryJSON(
         normalizedToolName: String?,
         statusWord: String,
@@ -2280,6 +2329,9 @@ enum AgentToolResultPersistencePolicy {
             exitCode: nil
         )
         guard let rawObject else { return jsonString(from: object) }
+        if let fields = boundedJobTicketFields(from: rawObject) {
+            object.merge(fields) { _, new in new }
+        }
         if let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"]) {
             object["chat_id"] = chatID
         }

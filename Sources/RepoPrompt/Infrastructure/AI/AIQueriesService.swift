@@ -223,6 +223,9 @@ public class AIQueriesService {
     private let taskManager = TaskManager()
 
     #if DEBUG
+        /// Uses a disposable local provider fixture without bypassing stream normalization.
+        var providerOverrideForTesting: (any AIProvider)?
+
         /// Cancellation-connected replacement transport. Registration is acknowledged before
         /// returning to sendMessage, including cancellation that raced registration.
         func registerControlledStreamForTesting(
@@ -391,7 +394,15 @@ public class AIQueriesService {
 
                 do {
                     // Build a provider
-                    let provider = try await self.providerPool.createProvider(for: model)
+                    #if DEBUG
+                        let provider = if let fixture = self.providerOverrideForTesting {
+                            fixture
+                        } else {
+                            try await self.providerPool.createProvider(for: model)
+                        }
+                    #else
+                        let provider = try await self.providerPool.createProvider(for: model)
+                    #endif
 
                     // Ensure provider is always disposed, regardless of how we exit
                     defer {
@@ -415,6 +426,11 @@ public class AIQueriesService {
                             if Task.isCancelled || managerCancelled {
                                 wasCancelled = true
                                 break streamLoop
+                            }
+
+                            if let policy = result.requestProgressPolicy {
+                                continuation.yield(ChatStreamOutput(text: "", reasoning: nil, tokens: ChatTokenInfo(), requestProgressPolicy: policy))
+                                continue streamLoop
                             }
 
                             if let activityOutput = Self.transportActivityOutput(for: result) {

@@ -390,7 +390,11 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             attachments: []
         )
         await fixture.session.agentTask?.value
-        XCTAssertEqual(fixture.session.runState, .completed, "The ordinary turn must leave a live session")
+        XCTAssertEqual(
+            fixture.session.runState,
+            .completed,
+            "The ordinary turn must leave a live session. Recorded terminal .error transcript: \(fixture.session.items.filter { $0.kind == .error }.map(\.text).joined(separator: "\n"))"
+        )
         if let controller = fixture.session.acpController, !liveControllers.contains(where: { $0 === controller }) {
             liveControllers.append(controller)
         }

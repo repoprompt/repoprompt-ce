@@ -17,6 +17,16 @@ extension Error {
             return friendlyError.friendlyErrorString
         }
 
+        // Codex preserves typed request failures inside the provider wrapper.
+        // Keep its public guidance without exposing arbitrary data or a diagnostic dump.
+        if let providerError = self as? AIProviderError,
+           case let .apiError(source) = providerError,
+           let codexError = source as? CodexAppServerClient.ClientError,
+           case let .requestFailed(failure) = codexError
+        {
+            return failure.userFacingMessage
+        }
+
         // 2. Check if this is a struct conforming to Error like OpenAIErrorResponse
         //    (You'd need `extension OpenAIErrorResponse: Error` in order to cast successfully.)
         if let openAIResponse = self as? OpenAIErrorResponse {

@@ -60,6 +60,58 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertFalse(askOracleText.contains("Secondary Oracle"))
     }
 
+    func testExportNoticeRendersOnceAfterNestedGroupWithoutDisturbingLanes() throws {
+        let notice = "Oracle export cancelled; output may remain. Recover the settled result using the returned chat IDs."
+        let result = try groupResult(
+            status: .partialFailure,
+            lanes: [
+                lane(index: 0, status: .completed, response: "primary answer"),
+                lane(index: 1, status: .failed, error: laneError(message: "adviser failed", partialResponse: "adviser partial"))
+            ]
+        )
+        let base: [String: Value] = [
+            "status": .string("completed"),
+            "response_type": .string("review"),
+            "review": .object(ContextBuilderOracleGroupReply(result: result).toMCPFields()),
+            "oracle_export_error": .string(notice)
+        ]
+        var withPath = base
+        withPath["oracle_export_path"] = .string("/tmp/prompt-exports/review.md")
+        for value in [base, withPath] {
+            // Clients may concatenate text blocks without separators.
+            let text = ToolOutputFormatter.formatDiscoverContext(value: .object(value)).compactMap { block -> String? in
+                guard case let .text(text, _, _) = block else { return nil }
+                return text
+            }.joined()
+            XCTAssertEqual(text.components(separatedBy: "### Oracle export notice").count, 2, text)
+            let lines = text.components(separatedBy: "\n")
+            let primary = try XCTUnwrap(lines.firstIndex(where: { $0.contains("primary answer") }), text)
+            let partial = try XCTUnwrap(lines.firstIndex(where: { $0.contains("adviser partial") }), text)
+            let endMarker = try XCTUnwrap(lines.firstIndex(of: "End of Oracle group: 2 lanes above."), text)
+            let heading = try XCTUnwrap(lines.firstIndex(of: "### Oracle export notice"), text)
+            XCTAssertEqual(lines[heading + 1], "- \(notice)", text)
+            XCTAssertLessThan(primary, partial)
+            XCTAssertLessThan(partial, endMarker)
+            XCTAssertLessThan(endMarker, heading)
+            if value["oracle_export_path"] != nil {
+                let handoff = try XCTUnwrap(lines.firstIndex(of: "### Oracle export"), text)
+                XCTAssertLessThan(heading, handoff)
+                XCTAssertEqual(lines[handoff + 1], "- Path: `/tmp/prompt-exports/review.md`")
+            } else {
+                XCTAssertFalse(lines.contains("### Oracle export"), text)
+            }
+        }
+
+        var blank = base
+        blank["oracle_export_error"] = .string(" \n")
+        let blankText = ToolOutputFormatter.formatDiscoverContext(value: .object(blank)).compactMap { block -> String? in
+            guard case let .text(text, _, _) = block else { return nil }
+            return text
+        }.joined()
+        XCTAssertFalse(blankText.contains("Oracle export notice"), blankText)
+        XCTAssertTrue(blankText.contains("End of Oracle group: 2 lanes above."), blankText)
+    }
+
     func testFormattedGroupPreservesCancelledLaneStatus() throws {
         let result = try groupResult(
             status: .partialFailure,

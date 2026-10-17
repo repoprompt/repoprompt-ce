@@ -272,7 +272,8 @@ enum ACPDefaultSessionUpdateNormalizer {
                 title: title,
                 progressText: progressText,
                 rawContent: payload["content"],
-                rawInput: payload["rawInput"]
+                rawInput: payload["rawInput"],
+                rawOutput: payload["rawOutput"]
             )
             return [
                 .stream(
@@ -312,7 +313,8 @@ enum ACPDefaultSessionUpdateNormalizer {
         title: String?,
         progressText: String?,
         rawContent: Any?,
-        rawInput: Any?
+        rawInput: Any?,
+        rawOutput: Any?
     ) -> String {
         var payload: [String: Any] = ["status": status]
         if let title, !title.isEmpty {
@@ -326,6 +328,9 @@ enum ACPDefaultSessionUpdateNormalizer {
         }
         if let rawInput {
             payload["rawInput"] = rawInput
+        }
+        if let rawOutput {
+            payload["rawOutput"] = rawOutput
         }
         return ACPRuntimeEventParsing.serializeJSON(payload) ?? "{\"status\":\"\(status)\"}"
     }

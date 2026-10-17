@@ -137,6 +137,39 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         XCTAssertTrue(recorded.isEmpty)
     }
 
+    func testOnlyAdoptedTicketControlsBypassPaidLaunchPreparation() async throws {
+        let runtime = makeRuntime(mode: .app, profile: "ticket-control-admission")
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = LaunchRecorder()
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity, policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker, activityCenter: runtime.activityCenter,
+            resolveChildLaunchPlan: { _, _, _ in nil },
+            prepareChildLaunches: { _, _, _, _ in throw DomainChildLaunchPlanError.carrierMismatch },
+            revokeChildLaunches: { _, _ in }
+        )
+        for tool in ["oracle_send", "ask_oracle", "context_builder"] {
+            let binding = MCPDomainToolBinding(definition: .init(name: tool, description: "control admission fixture", inputSchema: .object([:]))) { _ in
+                await recorder.record(tool)
+                return .string("observed")
+            }
+            let security = makeSecurityContext(identity: runtime.identity, toolName: tool)
+            for operation in ["poll", "wait", "cancel"] {
+                do {
+                    let value = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
+                        try await provider.wrapping(binding)(["op": .string(operation), "instructions": .string("must not launch"), "message": .string("must not launch")])
+                    }
+                    XCTAssertEqual(value, .string("observed"))
+                } catch {
+                    XCTFail("Ticket control must not prepare a paid child launch: \(error)")
+                }
+            }
+        }
+        let dispatched = await recorder.values()
+        XCTAssertEqual(dispatched, ["oracle_send", "oracle_send", "oracle_send", "ask_oracle", "ask_oracle", "ask_oracle", "context_builder", "context_builder", "context_builder"])
+    }
+
     func testPreparationFailureRevokesReservedPlanBeforeDispatch() async throws {
         let runtime = makeRuntime(mode: .app, profile: "prepare-failure")
         try await runtime.start()

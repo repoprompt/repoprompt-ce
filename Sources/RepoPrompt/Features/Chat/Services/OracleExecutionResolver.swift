@@ -113,6 +113,19 @@ struct ResolvedOracleExecution {
         self.reconciliationGuidance = reconciliationGuidance
     }
 
+    #if DEBUG
+        func primaryOnlyForDiagnostics() throws -> Self {
+            try Self(
+                mode: mode,
+                roster: OracleRoster(primary: roster.primary, additional: []),
+                models: [primaryModel],
+                promptConfiguration: promptConfiguration,
+                selection: selection,
+                reconciliationGuidance: reconciliationGuidance
+            )
+        }
+    #endif
+
     var primaryModel: AIModel {
         models[0]
     }

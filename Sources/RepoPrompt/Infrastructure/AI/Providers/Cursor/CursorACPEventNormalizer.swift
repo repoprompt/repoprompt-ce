@@ -1,14 +1,22 @@
 import Foundation
 
 enum CursorACPEventNormalizer {
-    static func normalize(_ payload: [String: Any]) -> [NormalizedAgentRuntimeEvent] {
+    /// Controller-owned attribution, never inferred from provider-supplied payload fields.
+    enum ToolUpdateAdmission { case unattributed, establishedInActiveRequest }
+
+    static func normalize(
+        _ payload: [String: Any],
+        toolUpdateAdmission: ToolUpdateAdmission = .unattributed
+    ) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
             return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .cursor)
         }
 
         switch sessionUpdate {
         case "tool_call", "tool_call_update":
-            guard !shouldSuppressPlaceholderToolEvent(payload) else { return [] }
+            let isEstablishedUpdate = sessionUpdate == "tool_call_update"
+                && toolUpdateAdmission == .establishedInActiveRequest
+            guard isEstablishedUpdate || !shouldSuppressPlaceholderToolEvent(payload) else { return [] }
             return ACPDefaultSessionUpdateNormalizer.normalize(
                 ACPToolUpdateResultAdapter.adaptedTerminalToolUpdatePayload(payload, sessionUpdate: sessionUpdate),
                 providerID: .cursor

@@ -62,7 +62,7 @@ final class DevinCLIProvider: AIProvider {
                 do {
                     let modelName = devinModelName(for: model)
                     if aiMessage.transientImages.isEmpty {
-                        let text = try await runOneShot(aiMessage, modelName: modelName)
+                        let text = try await runOneShot(aiMessage, modelName: modelName, continuation: continuation)
                         continuation.yield(AIStreamResult(type: "content", text: text))
                         continuation.yield(AIStreamResult(type: "message_stop", text: nil))
                     } else {
@@ -196,7 +196,7 @@ final class DevinCLIProvider: AIProvider {
         )
     }
 
-    private func runOneShot(_ message: AIMessage, modelName: String?) async throws -> String {
+    private func runOneShot(_ message: AIMessage, modelName: String?, continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation) async throws -> String {
         try Task.checkCancellation()
         let support = try await launchResolver.probeSupport(for: config)
         guard case .supported = support else {
@@ -249,6 +249,9 @@ final class DevinCLIProvider: AIProvider {
         let result: CLIProcessRunner.Result
         do {
             try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
+            // Only this actual text transport is silent until exit. Declare its finite
+            // process bound once, after preparation; do not fabricate ongoing activity.
+            continuation.yield(AIStreamResult(type: "request_policy", text: nil, requestProgressPolicy: .boundedOneShot(timeout: requestTimeout)))
             result = try await runner.run(
                 args: DevinOneShotCLIOptions(
                     modelName: modelName,

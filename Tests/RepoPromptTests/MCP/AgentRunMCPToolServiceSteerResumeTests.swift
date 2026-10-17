@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -1343,3 +1344,163 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Detached job lifetime versus provider steering
+
+#if DEBUG
+    @MainActor
+    final class DetachedJobSteeringTests: XCTestCase {
+        func testRunningTicketDoesNotVetoSteeringButProviderInvocationAndAckStillDo() async throws {
+            try await withTicket { driver, connection, runID, id, release, _ in
+                let server = driver.window.mcpServer
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                let session = AgentTabSession(tabID: driver.tabID)
+                session.installRunID(runID)
+                session.runState = .running
+                let handler = ClaudeAgentToolTrackingHandler()
+                await handler.startTracking(runID: runID, session: session, clientNameHint: nil)
+                let coordinator = ClaudeAgentModeCoordinator(
+                    windowID: driver.window.windowID, workspacePathProvider: { _ in nil },
+                    awaitNoActiveMCPTools: { try await server.awaitNoActiveToolExecutions(runID: $0) },
+                    toolEndedCount: { server.toolEndedCount(runID: $0) },
+                    hasActiveMCPTools: { server.hasActiveToolExecutions(runID: $0) }
+                )
+                @MainActor
+                func ready() async -> Bool {
+                    await coordinator.test_reachesSteeringInterruptSafePoint(
+                        session: session, runID: runID, handler: handler, timeoutSeconds: 0.1
+                    )
+                }
+                @MainActor
+                func acknowledge(_ tool: String) {
+                    handler.handleProviderToolEvent(.toolResult(.init(
+                        toolName: "mcp__" + MCPIntegrationHelper.repoPromptMCPServerName + "__" + tool, invocationID: UUID(), argsJSON: "{}",
+                        resultJSON: "{}", isError: false
+                    )), session: session)
+                }
+                do {
+                    XCTAssertEqual(server.closeSafetyState.activeExecutionCount, 1, "Returned start call leaves the detached worker owned")
+                    XCTAssertEqual(server.toolEndedCount(runID: runID), 1, "Only the returned provider tool call needs an ACK")
+                    XCTAssertFalse(server.hasActiveToolExecutions(runID: runID), "A running ticket is not a provider invocation")
+                    let beforeAck = await ready()
+                    XCTAssertFalse(beforeAck, "Provider's returned start result must still be acknowledged")
+                    acknowledge("ask_oracle")
+                    XCTAssertEqual(handler.explicitProviderToolResultAckSnapshot(for: runID).ackCount, 1)
+                    let metadata = MCPServerViewModel.RequestMetadata(connectionID: connection.connectionID, clientName: nil, windowID: driver.window.windowID)
+                    let registered = await server.test_beginResolvedToolExecution(metadata: metadata, resolvedContext: nil, toolName: "read_file")
+                    let providerID = try XCTUnwrap(registered?.executionID)
+                    XCTAssertTrue(server.hasActiveToolExecutions(runID: runID))
+                    let duringProvider = await ready()
+                    XCTAssertFalse(duringProvider, "An active provider invocation still vetoes steering")
+                    let idleReached = XCTestExpectation(description: "provider invocation drains while ticket remains running")
+                    let idle = Task {
+                        try await server.awaitNoActiveToolExecutions(runID: runID)
+                        idleReached.fulfill()
+                    }
+                    await Task.yield()
+                    server.test_endToolExecution(executionID: providerID)
+                    await self.fulfillment(of: [idleReached], timeout: 1)
+                    idle.cancel()
+                    _ = try? await idle.value
+                    XCTAssertEqual(server.toolEndedCount(runID: runID), 2)
+                    let missingReadAck = await ready()
+                    XCTAssertFalse(missingReadAck, "Local completion alone is not a provider result ACK")
+                    acknowledge("read_file")
+                    XCTAssertEqual(handler.explicitProviderToolResultAckSnapshot(for: runID).ackCount, 2)
+                    let afterAck = await ready()
+                    XCTAssertTrue(afterAck, "ACK parity permits steering while the app-owned ticket continues")
+                    XCTAssertEqual(server.closeSafetyState.activeExecutionCount, 1)
+                    let running = await jobs.store.snapshot(id: id)
+                    XCTAssertEqual(running?.status, .running)
+                    release()
+                    _ = await jobs.store.wait(id: id, timeout: 5)
+                    XCTAssertEqual(server.toolEndedCount(runID: runID), 2, "Detached completion cannot fabricate a provider ACK requirement")
+                } catch {
+                    await handler.stopTracking(for: session)
+                    throw error
+                }
+                await handler.stopTracking(for: session)
+            }
+        }
+
+        func testRunAndWindowCancellationKeepJobOwnedUntilItsDrainCompletes() async throws {
+            for closeWindow in [false, true] {
+                try await withTicket { driver, connection, runID, id, release, cancelled in
+                    let server = driver.window.mcpServer
+                    let jobs = WindowStatesManager.shared.longRunningJobs
+                    XCTAssertEqual(server.cancelActiveToolsForConnection(connectionID: connection.connectionID, reason: "observer disconnect"), 0)
+                    let before = await jobs.store.snapshot(id: id)
+                    XCTAssertEqual(before?.status, .running, "Detached work is not connection-owned")
+                    if closeWindow { jobs.close(windowID: driver.window.windowID) }
+                    else { XCTAssertEqual(server.cancelActiveToolsForRun(runID: runID, reason: "owner stopped"), 1) }
+                    await self.fulfillment(of: [cancelled], timeout: 1)
+                    XCTAssertEqual(server.closeSafetyState.activeExecutionCount, 1, "Cancellation intent is not completed feature drain")
+                    XCTAssertEqual(server.test_activeToolExecutionCount(), 1)
+                    XCTAssertFalse(server.hasActiveToolExecutions(runID: runID))
+                    XCTAssertEqual(server.toolEndedCount(runID: runID), closeWindow ? 1 : 0)
+                    release()
+                    let terminal = await jobs.store.wait(id: id, timeout: 5)
+                    XCTAssertEqual(terminal?.status, .cancelled)
+                    XCTAssertEqual(server.closeSafetyState.activeExecutionCount, 0)
+                    XCTAssertEqual(server.test_activeToolExecutionCount(), 0)
+                    XCTAssertEqual(server.toolEndedCount(runID: runID), closeWindow ? 1 : 0, "Drained jobs never add provider-result counts")
+                }
+            }
+        }
+
+        private func withTicket(_ body: @escaping @MainActor (
+            ContextBuilderMultiRootDiscoveryDriver, ContextBuilderMultiRootDiscoveryDriver.RoutedConnection,
+            UUID, UUID, () -> Void, XCTestExpectation
+        ) async throws -> Void) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A"], routedRuntime: true) { driver in
+                let context = try await driver.resolve()
+                let runID = try XCTUnwrap(context.frozenTabContext.runID)
+                let connection = try await driver.connectInvokingAgent(context)
+                let server = driver.window.mcpServer
+                let jobs = WindowStatesManager.shared.longRunningJobs
+                driver.window.apiSettingsViewModel.openAIApiKey = "local-fixture-key"
+                driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                let entered = XCTestExpectation(description: "actual detached worker entered")
+                let cancelled = XCTestExpectation(description: "owned cancellation reached detached worker")
+                let gate = driver.fixture.makeGate()
+                server.setOracleChatSendOverrideForTesting { _, _, tabContext in
+                    XCTAssertNotNil(tabContext?.jobProgress)
+                    return try await withTaskCancellationHandler {
+                        entered.fulfill()
+                        await gate.wait()
+                        try Task.checkCancellation()
+                        return ["response": .string("fixture answer")]
+                    } onCancel: { cancelled.fulfill() }
+                }
+                defer {
+                    gate.release()
+                    server.setOracleChatSendOverrideForTesting(nil)
+                }
+                let result = try await connection.client.callTool(name: "ask_oracle", arguments: [
+                    "op": .string("start"), "detach": .bool(true), "message": .string("fixture question"),
+                    "export_response": .bool(false), "model": .string(AIModel.gpt54Mini.rawValue), "_rawJSON": .bool(true)
+                ])
+                let text = result.content.compactMap { content -> String? in
+                    if case let .text(text, _, _) = content { return text }
+                    return nil
+                }.joined(separator: "\n")
+                XCTAssertNotEqual(result.isError, true, text)
+                let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                let id = try XCTUnwrap((fields["job_id"] as? String).flatMap(UUID.init(uuidString:)))
+                await self.fulfillment(of: [entered], timeout: 2)
+                do {
+                    try await body(driver, connection, runID, id, { gate.release() }, cancelled)
+                } catch {
+                    jobs.cancel(id: id)
+                    gate.release()
+                    _ = await jobs.store.wait(id: id, timeout: 5)
+                    throw error
+                }
+                gate.release()
+                let terminal = await jobs.store.wait(id: id, timeout: 5)
+                XCTAssertTrue(terminal?.status.isTerminal == true)
+                XCTAssertEqual(server.test_activeToolExecutionCount(), 0)
+            }
+        }
+    }
+#endif

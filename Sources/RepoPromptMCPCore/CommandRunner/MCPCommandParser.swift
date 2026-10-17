@@ -269,6 +269,10 @@ enum MCPCommandParser {
         }
     }
 
+    static func isLongRunningControlOperation(_ operation: String?) -> Bool {
+        ["poll", "wait", "cancel"].contains(operation?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+    }
+
     /// Normalizes context_builder arguments by mapping instruction aliases to 'instructions'.
     /// - Parameter args: The arguments dictionary to normalize (modified in place)
     /// - Throws: CommandParseError if multiple conflicting instruction aliases are provided
@@ -795,7 +799,7 @@ enum MCPCommandParser {
         // When no response-type flag is provided, response_type is NOT sent (context-only mode per API default)
         case "builder":
             let remaining = Array(parts.dropFirst())
-            let flags = parseFlagArgs(remaining)
+            let flags = parseFlagArgs(remaining, booleanFlags: ["detach"])
 
             // Get instructions from flags or positional arguments
             // Priority: explicit flags > positional text
@@ -832,6 +836,16 @@ enum MCPCommandParser {
             }
 
             try applyContextBuilderExportFlag(flags, to: &args)
+            if let raw = flags["detach"] {
+                guard let detach = parseBoolFlag(raw) else { throw CommandParseError.invalidArgument("--detach must be boolean") }
+                args["op"] = UncheckedSendableValue("start")
+                args["detach"] = UncheckedSendableValue(detach)
+            }
+            if let raw = flags["timeout"] {
+                guard let timeout = Double(raw), timeout.isFinite else { throw CommandParseError.invalidArgument("--timeout must be finite seconds") }
+                args["op"] = UncheckedSendableValue("start")
+                args["timeout"] = UncheckedSendableValue(timeout)
+            }
 
             return .aliasCall(toolName: "context_builder", args: args)
 
@@ -1810,6 +1824,12 @@ enum MCPCommandParser {
             }
             // Normalize instruction aliases (task, prompt, query, etc. -> instructions)
             var args = parsed.args
+            if isLongRunningControlOperation(args["op"]?.value as? String) {
+                guard let id = args["job_id"]?.value as? String, UUID(uuidString: id) != nil else {
+                    throw CommandParseError.invalidArgument("context_builder controls require job_id from a start response")
+                }
+                return .aliasCall(toolName: "context_builder", args: args)
+            }
             try normalizeContextBuilderArgs(&args)
 
             // Validate required instructions parameter
@@ -2016,7 +2036,7 @@ enum MCPCommandParser {
     /// Returns both named flags and positional arguments.
     /// Supports: --flag value, --flag=value, -f value
     /// Handles values starting with dash correctly (e.g., "- change bombs")
-    private static func parseFlagArgs(_ tokens: [String]) -> FlagParseResult {
+    private static func parseFlagArgs(_ tokens: [String], booleanFlags: Set<String> = []) -> FlagParseResult {
         var result = FlagParseResult()
         var i = 0
         while i < tokens.count {
@@ -2028,8 +2048,10 @@ enum MCPCommandParser {
                     let key = String(flagPart[..<eqIdx])
                     let value = String(flagPart[flagPart.index(after: eqIdx)...])
                     result.named[key] = value
-                } else if i + 1 < tokens.count, !looksLikeFlagToken(tokens[i + 1]) {
-                    // --flag value format (next token is not a flag)
+                } else if i + 1 < tokens.count, !looksLikeFlagToken(tokens[i + 1]),
+                          !booleanFlags.contains(flagPart) || parseBoolFlag(tokens[i + 1]) != nil
+                {
+                    // Boolean presence flags must not consume positional instructions.
                     result.named[flagPart] = tokens[i + 1]
                     i += 1
                 } else {

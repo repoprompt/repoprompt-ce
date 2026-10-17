@@ -1,7 +1,210 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import XCTest
+
+final class OracleNativeObservationStatusTests: XCTestCase {
+    func testOracleGroupStatusMatchesLivePersistedAndTwoRestoresAcrossNativeEnvelopes() throws {
+        for status in [OracleGroupStatus.completed, .partialFailure, .failed] {
+            let payload = try groupPayload(status)
+            for tool in ["ask_oracle", "oracle_send"] {
+                for isError in [true, false, nil] as [Bool?] {
+                    let expected: AgentTranscriptToolStatus = status == .partialFailure ? .warning : status == .failed || isError == true ? .failed : .success
+                    for (label, raw) in try envelopes(payload) {
+                        let item = AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: raw, toolIsError: isError)
+                        try assertParity(item, expected: expected, label: "\(tool) \(status) \(String(describing: isError)) \(label)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testSingletonCancellationErrorsAndSettledNonterminalOutcomesKeepParity() throws {
+        let cases: [(status: String, errors: [String], isError: Bool?, expected: AgentTranscriptToolStatus)] = [
+            ("cancelled", [], true, .cancelled),
+            ("cancelled", ["stopped"], true, .cancelled),
+            ("completed", [], true, .failed),
+            ("cancelled", ["stopped"], false, .cancelled),
+            ("cancelled", ["stopped"], nil, .cancelled),
+            ("completed", ["provider error"], true, .failed),
+            ("completed", ["provider error"], false, .failed),
+            ("completed", ["provider error"], nil, .failed),
+            ("running", ["provider error"], false, .failed),
+            ("pending", [], false, .success),
+            ("running", [], nil, .success),
+            ("future_outcome", [], false, .success)
+        ]
+        for testCase in cases {
+            let payload: [String: Any] = [
+                "chat_id": "recovery-chat", "mode": "chat", "response": "NATIVE_RESPONSE",
+                "status": testCase.status, "errors": testCase.errors
+            ]
+            for tool in ["ask_oracle", "oracle_send"] {
+                for (label, raw) in try envelopes(payload) {
+                    try assertParity(AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: raw, toolIsError: testCase.isError), expected: testCase.expected, label: "\(tool) \(testCase.status) \(label)")
+                }
+            }
+        }
+    }
+
+    func testPersistedErrorCountAppliesOnlyToAlreadyValidatedSingletonSummaries() throws {
+        for tool in ["ask_oracle", "oracle_send"] {
+            for summaryOnly in [false, true] {
+                let payload: [String: Any] = ["chat_id": "recovery-chat", "mode": "chat", "status": "completed", "summary_only": summaryOnly, "error_count": 1]
+                let item = try AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: json(payload), toolIsError: false)
+                XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: item), summaryOnly ? .failed : .success)
+                if summaryOnly { try assertParity(item, expected: .failed, label: "\(tool) persisted error count") }
+            }
+            let malformed: [String: Any] = ["status": "completed", "summary_only": true, "error_count": 1]
+            let item = try AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: json(malformed), toolIsError: false)
+            XCTAssertNil(AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: item))
+            XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: item), .success)
+        }
+    }
+
+    func testTicketOnlySnapshotsSettleObservationNotObservedJob() throws {
+        for jobStatus in ["running", "cancelling", "completed", "failed", "cancelled", "expired"] {
+            let payload = ticketPayload(jobStatus: jobStatus)
+            for tool in ["ask_oracle", "oracle_send"] {
+                for isError in [true, false, nil] as [Bool?] {
+                    for (label, raw) in try envelopes(payload) {
+                        try assertParity(AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: raw, toolIsError: isError), expected: isError == true ? .failed : .success, label: "\(tool) \(jobStatus) \(label)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testMalformedNativePayloadsStayOnLegacyFallbacks() throws {
+        var malformedGroup = try groupPayload(.completed)
+        malformedGroup["oracle_count"] = 3
+        var mismatchedTicket = ticketPayload(jobStatus: "failed")
+        mismatchedTicket["job_id"] = UUID().uuidString
+        let payloads: [[String: Any]] = [
+            malformedGroup,
+            mismatchedTicket,
+            ["response": "incidental response", "status": "running"],
+            ["chat_id": "missing-mode", "status": "running"],
+            ["status": "cancelled"]
+        ]
+        for tool in ["ask_oracle", "oracle_send"] {
+            for payload in payloads {
+                let item = try AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: json(payload), toolIsError: true)
+                XCTAssertNil(AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: item))
+                XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: item), payload["status"] as? String == "cancelled" ? .cancelled : .failed)
+            }
+            let raw = try json(["status": "running", "rawOutput": malformedGroup])
+            let wrapped = AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: raw, toolIsError: false)
+            XCTAssertNil(AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: wrapped))
+            XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: wrapped), .running)
+        }
+    }
+
+    func testContextBuilderKeepsOuterOutcomeAndDoesNotBorrowOracleErrorException() throws {
+        for nestedStatus in [OracleGroupStatus.completed, .partialFailure, .failed] {
+            for outerStatus in ["success", "cancelled", "running"] {
+                var payload = ticketPayload(jobStatus: "completed")
+                payload["status"] = outerStatus
+                payload["response_type"] = "review"
+                payload["review"] = try groupPayload(nestedStatus)
+                for isError in [true, false, nil] as [Bool?] {
+                    let expected: AgentTranscriptToolStatus = if isError == true {
+                        outerStatus == "cancelled" ? .cancelled : .failed
+                    } else if outerStatus == "cancelled" {
+                        .cancelled
+                    } else if outerStatus == "success" {
+                        nestedStatus == .partialFailure ? .warning : nestedStatus == .failed ? .failed : .success
+                    } else {
+                        .success
+                    }
+                    for (label, raw) in try envelopes(payload) {
+                        try assertParity(AgentChatItem(kind: .toolResult, text: "", toolName: "context_builder", toolResultJSON: raw, toolIsError: isError), expected: expected, label: "builder \(outerStatus) \(nestedStatus) \(label)")
+                    }
+                }
+            }
+        }
+        let unrelated = try AgentChatItem(kind: .toolResult, text: "", toolName: "unrelated_tool", toolResultJSON: json(groupPayload(.partialFailure)), toolIsError: true)
+        XCTAssertNil(AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: unrelated))
+    }
+
+    private func assertParity(_ item: AgentChatItem, expected: AgentTranscriptToolStatus, label: String) throws {
+        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: item), expected, label)
+        try assertTerminalFallbackPreserves(item, label: label)
+        let sanitized = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: item))
+        XCTAssertEqual(sanitized.transcriptStatus, expected, label)
+        let summary = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item))
+        XCTAssertEqual(summary.transcriptStatus, expected, label)
+        var persisted = item
+        persisted.toolResultJSON = summary.resultJSON
+        persisted.text = summary.summaryText
+        persisted.toolIsError = summary.toolIsError
+        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: persisted), expected, label)
+        let restored = try JSONDecoder().decode(AgentChatItem.self, from: JSONEncoder().encode(persisted))
+        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: restored), expected, label)
+        try assertTerminalFallbackPreserves(restored, label: label)
+        let second = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: restored))
+        XCTAssertEqual(second.transcriptStatus, expected, label)
+        var persistedAgain = restored
+        persistedAgain.toolResultJSON = second.resultJSON
+        persistedAgain.toolIsError = second.toolIsError
+        let restoredAgain = try JSONDecoder().decode(AgentChatItem.self, from: JSONEncoder().encode(persistedAgain))
+        XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: restoredAgain), expected, label)
+        let firstObject = try object(summary.resultJSON)
+        let secondObject = try object(second.resultJSON)
+        for key in ["chat_id", "oracle_group_id", "job_id", "error_count", "has_response"] {
+            XCTAssertEqual(firstObject[key] as? AnyHashable, secondObject[key] as? AnyHashable, "\(label) retained \(key)")
+        }
+    }
+
+    private func assertTerminalFallbackPreserves(_ item: AgentChatItem, label: String) throws {
+        var rows = [item]
+        XCTAssertEqual(AgentTranscriptIO.finalizePendingToolCalls(in: &rows, terminalState: .cancelled, includeExplicitRepoPromptToolCalls: true, nonToolBoundary: 3), 0, label)
+        XCTAssertEqual(rows.first?.toolResultJSON, item.toolResultJSON, "\(label): native responses, errors, and recovery IDs must survive terminal fallback")
+        XCTAssertEqual(rows.first?.toolIsError, item.toolIsError, label)
+    }
+
+    private func envelopes(_ payload: [String: Any]) throws -> [(String, String)] {
+        var result = try [("direct", json(payload))]
+        for outerStatus in ["running", "failed", "completed", "cancelled"] {
+            for stringOutput in [false, true] {
+                let rawOutput: Any = if stringOutput { try json(payload) } else { payload }
+                try result.append(("ACP \(outerStatus) string=\(stringOutput)", json([
+                    "status": outerStatus, "acp_status": "in_progress", "rawOutput": rawOutput,
+                    "content": [["type": "text", "text": "provider lifecycle, not native outcome"]]
+                ])))
+            }
+        }
+        return result
+    }
+
+    private func groupPayload(_ status: OracleGroupStatus) throws -> [String: Any] {
+        let lanes = try (0 ... 1).map { index in
+            let completed = status == .completed || (status == .partialFailure && index == 0)
+            return try OracleLaneResult(
+                laneIndex: index, chatID: "recovery-chat-\(index)", providerID: "fixture", modelID: "m\(index)",
+                status: completed ? .completed : .failed,
+                response: completed ? "NATIVE_RESPONSE_\(index)" : nil,
+                error: completed ? nil : OracleLaneError(code: "provider_error", message: "NATIVE_ERROR_\(index)")
+            )
+        }
+        let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: status, oracleResults: lanes)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(OracleGroupMCPCodec.groupFields(group))) as? [String: Any])
+    }
+
+    private func ticketPayload(jobStatus: String) -> [String: Any] {
+        let id = UUID().uuidString
+        return ["job_id": id, "job": ["id": id, "status": jobStatus, "chat_id": "recovery-chat", "context_id": UUID().uuidString]]
+    }
+
+    private func object(_ raw: String) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+    }
+
+    private func json(_ payload: [String: Any]) throws -> String {
+        try String(decoding: JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]), as: UTF8.self)
+    }
+}
 
 final class AgentConversationReplaySerializationTests: XCTestCase {
     private final class ReplayPerfRecorder: AgentModePerfRecording, @unchecked Sendable {
@@ -79,6 +282,91 @@ final class AgentConversationReplaySerializationTests: XCTestCase {
             defer { lock.unlock() }
             return (replayEvent, selectedEvent)
         }
+    }
+
+    @MainActor
+    func testSpartanLogKeepsObservedInputsAndMarksStrippedRestoredInputsUnavailable() async throws {
+        // The five input shapes replaced by summaries in the original cold-restore log diff.
+        let calls: [(String, String)] = [
+            ("workspace_context", #"{"include":["prompt","selection","files"]}"#),
+            ("ask_oracle", #"{"export_response":true,"message":"fixture sum","mode":"chat","new_chat":true}"#),
+            ("get_file_tree", #"{"type":"roots"}"#),
+            ("workspace_context", #"{"include":["prompt","selection","files"]}"#),
+            ("ask_oracle", #"{"chat_id":"fixture-lane","export_response":true,"message":"fixture product","new_chat":false}"#)
+        ]
+        let storage = try makeTestDirectory(name: "SpartanLogRestoreFixture")
+        let workspace = WorkspaceModel(name: "Log restore fixture", repoPaths: [], customStoragePath: storage)
+        for (toolName, args) in calls {
+            let result = #"{"status":"success","summary_only":true,"summary_text":"RESULT_NOT_INPUT"}"#
+            let transcript = AgentTranscriptIO.importLegacyItems([
+                .user("Inspect fixture", sequenceIndex: 0),
+                .toolResult(name: toolName, invocationID: UUID(), argsJSON: args, resultJSON: result, isError: false, sequenceIndex: 1),
+                .assistant("Done", sequenceIndex: 2)
+            ])
+            let before = AgentTranscriptIO.buildSpartanLogXML(from: transcript)
+            XCTAssertTrue(before.contains("<tool_call name=\"\(toolName)\">\(args)</tool_call>"), before)
+            XCTAssertFalse(before.contains("key_paths"), "Derived preview metadata must not be added to observed inputs")
+            let saved = AgentSession(workspaceID: workspace.id, composeTabID: UUID(), name: "Log fixture", transcript: transcript, lastRunState: "completed")
+            let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+            let durableBefore = try Data(contentsOf: file)
+            let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+            let restored = try XCTUnwrap(loaded.transcript)
+            XCTAssertTrue(restored.turns.flatMap(\.allActivities).compactMap(\.toolExecution).allSatisfy { $0.argsJSON == nil }, "Current storage/privacy policy is unchanged")
+            let after = AgentTranscriptIO.buildSpartanLogXML(from: restored)
+            XCTAssertTrue(after.contains("<tool_call name=\"\(toolName)\" input_status=\"unavailable\"/>"), after)
+            XCTAssertFalse(after.contains("RESULT_NOT_INPUT"), "Result summaries are not call inputs")
+            XCTAssertEqual(try Data(contentsOf: file), durableBefore, "get_log must not rewrite historical user data")
+            // Compact handoff projection is intentionally separate from faithful log inputs.
+            XCTAssertFalse(AgentTranscriptIO.buildForkTranscriptXML(from: restored).contains("input_status=\"unavailable\""))
+        }
+    }
+
+    @MainActor
+    func testSpartanLogRetainsGroupedAndFailedCallsAfterPersistence() async throws {
+        let storage = try makeTestDirectory(name: "SpartanLogTerminalRestoreFixture")
+        let workspace = WorkspaceModel(name: "Terminal log fixture", repoPaths: [], customStoragePath: storage)
+        let treeArgs = #"{"type":"roots"}"#
+        let failedArgs = #"{"message":"first fixture","new_chat":true}"#
+        let cancelledArgs = #"{"message":"second fixture","new_chat":true}"#
+        var items: [AgentChatItem] = [
+            .user("Inspect fixture", sequenceIndex: 0),
+            .toolResult(name: "get_file_tree", invocationID: UUID(), argsJSON: treeArgs, resultJSON: #"{"status":"success","summary_only":true,"summary_text":"RESULT_NOT_INPUT"}"#, isError: false, sequenceIndex: 1)
+        ]
+        // Nine actual calls reproduce the live owner's collapsed first file-tree row.
+        for index in 0 ..< 6 {
+            items.append(.toolResult(name: "read_file", invocationID: UUID(), argsJSON: #"{"path":"fixture.txt"}"#, resultJSON: #"{"status":"success","summary_only":true}"#, isError: false, sequenceIndex: index + 2))
+        }
+        items += [
+            .assistant("Root verified. Calling first Oracle.", sequenceIndex: 8),
+            .toolResult(name: "ask_oracle", invocationID: UUID(), argsJSON: failedArgs, resultJSON: #"{"status":"failed","summary_only":true}"#, isError: true, sequenceIndex: 9),
+            .assistant("First call failed. Calling second Oracle.", sequenceIndex: 10),
+            .toolResult(name: "oracle_send", invocationID: UUID(), argsJSON: cancelledArgs, resultJSON: #"{"status":"cancelled","summary_only":true}"#, isError: true, sequenceIndex: 11),
+            .assistant("Done", sequenceIndex: 12)
+        ]
+        let transcript = AgentTranscriptIO.importLegacyItems(items)
+        let projection = AgentTranscriptPolicyPipeline.handoffTranscript(from: transcript, upToRowID: nil).projection
+        XCTAssertTrue((projection.archivedBlocks + projection.workingBlocks).contains { $0.kind == .groupedHistory }, "Reproduce the presentation grouping that erased the first file-tree call")
+        let compactHandoff = AgentTranscriptIO.buildForkTranscriptXML(from: transcript)
+        XCTAssertFalse(compactHandoff.contains("<tool_call name=\"ask_oracle\""), compactHandoff)
+        XCTAssertFalse(compactHandoff.contains("<tool_call name=\"oracle_send\""), compactHandoff)
+        for (name, args) in [("get_file_tree", treeArgs), ("ask_oracle", failedArgs), ("oracle_send", cancelledArgs)] {
+            let log = AgentTranscriptIO.buildSpartanLogXML(from: transcript)
+            XCTAssertEqual(log.components(separatedBy: "<tool_call name=\"\(name)\"").count - 1, 1, log)
+            XCTAssertTrue(log.contains("<tool_call name=\"\(name)\">\(args)</tool_call>"), log)
+        }
+        let saved = AgentSession(workspaceID: workspace.id, composeTabID: UUID(), name: "Terminal log fixture", transcript: transcript, lastRunState: "cancelled")
+        let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+        let durableBefore = try Data(contentsOf: file)
+        let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+        let restored = try XCTUnwrap(loaded.transcript)
+        let log = AgentTranscriptIO.buildSpartanLogXML(from: restored)
+        for name in ["get_file_tree", "ask_oracle", "oracle_send"] {
+            XCTAssertEqual(log.components(separatedBy: "<tool_call name=\"\(name)\"").count - 1, 1, log)
+            XCTAssertTrue(log.contains("<tool_call name=\"\(name)\" input_status=\"unavailable\"/>"), log)
+        }
+        XCTAssertFalse(log.contains("RESULT_NOT_INPUT"), log)
+        XCTAssertEqual(try Data(contentsOf: file), durableBefore, "Faithful monitoring must not rewrite the saved transcript")
+        XCTAssertEqual(AgentTranscriptIO.buildForkTranscriptXML(from: transcript), compactHandoff, "Compact handoff behavior stays independent of faithful monitoring")
     }
 
     func testEquivalentModeMatchesLegacyBytesAndCategoryMetrics() throws {

@@ -18,9 +18,11 @@ enum AgentToolResultPayloadRetention {
         existing: String?,
         incoming: String,
         incomingIsError: Bool?,
+        existingIsError: Bool? = nil,
         requireObjectReplacement: Bool = false
     ) -> String? {
-        if incomingIsError != true,
+        // A later lifecycle completion cannot clear an already observed transport failure.
+        if incomingIsError != true, existingIsError != true,
            let terminalStatus = terminalMarkerStatus(incoming),
            var object = jsonObject(existing),
            isProviderLifecycle(object)
@@ -43,12 +45,15 @@ enum AgentToolResultPayloadRetention {
             }
             return serialize(object) ?? incoming
         }
-        return shouldKeepExisting(
+        let keepExisting = shouldKeepExisting(
             existing: existing,
             incoming: incoming,
             incomingIsError: incomingIsError,
             requireObjectReplacement: requireObjectReplacement
-        ) ? nil : incoming
+        )
+        // Return the retained bytes on an abort so both delivery paths record the transport error.
+        if keepExisting, incomingIsError == true { return existing }
+        return keepExisting ? nil : incoming
     }
 
     /// True when `incoming` carries no output and should not replace `existing`.
@@ -58,20 +63,25 @@ enum AgentToolResultPayloadRetention {
         incomingIsError: Bool?,
         requireObjectReplacement: Bool = false
     ) -> Bool {
-        // A provider abort is transport truth, not a replacement for settled native lane coverage.
-        if requireObjectReplacement, jsonObject(existing)?["oracle_group_id"] != nil,
-           let data = existing?.data(using: .utf8), (try? JSONDecoder().decode(OracleGroupResult.self, from: data)) != nil,
-           incoming?.data(using: .utf8).flatMap({ try? JSONDecoder().decode(OracleGroupResult.self, from: $0) }) == nil
-        {
-            return true
+        // Provider status is transport truth, not native authority. A genuine native update
+        // can replace older facts whether delivered directly or in the normalizer's envelope.
+        if requireObjectReplacement, hasNativeAuthority(existing) {
+            return !hasNativeAuthority(incoming)
         }
         guard incomingIsError != true, !isThin(existing), !isProgress(existing) else { return false }
         if isThin(incoming) || isProgress(incoming) || terminalMarkerStatus(incoming) != nil { return true }
         guard requireObjectReplacement, let object = jsonObject(existing) else { return false }
-        guard let incomingObject = jsonObject(incoming) else { return !isProviderLifecycle(object) }
+        let replaceableLifecycle = isProviderLifecycle(object)
+        guard let incomingObject = jsonObject(incoming) else { return !replaceableLifecycle }
         // A content-bearing provider lifecycle echo is still not an authoritative
         // RepoPrompt result. Keep it from regressing an already-delivered native result.
-        return !isProviderLifecycle(object) && isProviderLifecycle(incomingObject)
+        return !replaceableLifecycle && isProviderLifecycle(incomingObject)
+    }
+
+    private static func hasNativeAuthority(_ payload: String?) -> Bool {
+        guard let payload else { return false }
+        return ToolResultDTOs.ChatSendDTO.nativeOracleReplyJSONData(from: payload) != nil
+            || ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: payload) != nil
     }
 
     static func isThin(_ payload: String?) -> Bool {
@@ -112,7 +122,7 @@ enum AgentToolResultPayloadRetention {
     /// native results can also be running, but carry their own result fields.
     private static func isProviderLifecycle(_ object: [String: Any]) -> Bool {
         isLifecycleStatus(object["status"])
-            && Set(object.keys).isSubset(of: ["status", "title", "progress", "content", "rawInput", "kind", "summary_only"])
+            && Set(object.keys).isSubset(of: ["status", "title", "progress", "content", "rawInput", "rawOutput", "kind", "summary_only"])
     }
 
     /// Non-MCP lifecycle envelopes can be compacted before a terminal echo arrives.

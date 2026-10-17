@@ -146,7 +146,8 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ reviewGitContext: FrozenPromptGitReviewContext,
         _ finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?,
         _ progressReporter: ContextBuilderMCPProgressReporter?,
-        _ activityReporter: ContextBuilderMCPActivityReporter?
+        _ activityReporter: ContextBuilderMCPActivityReporter?,
+        _ jobProgress: MCPLongRunningJobProgress?
     ) async throws -> ChatSendReply
     typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPRequestMetadata
     typealias ResolveImplicitContextBuilderGitTarget = @MainActor @Sendable (

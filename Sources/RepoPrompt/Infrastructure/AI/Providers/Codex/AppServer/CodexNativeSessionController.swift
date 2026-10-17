@@ -2491,7 +2491,7 @@ final class CodexNativeSessionController {
         return actual.isEmpty ? nil : actual
     }
 
-    private static func turnInput(
+    static func turnInput(
         text: String,
         images: [AgentImageAttachment]
     ) throws -> [[String: Any]] {

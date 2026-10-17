@@ -20,7 +20,7 @@ struct ContextBuilderCallCard: View {
     }
 
     private var isActiveCallCard: Bool {
-        context.activeContextBuilderCallItemID == item.id
+        context.transcriptMetadata.activeCallItemID == item.id
     }
 
     private var planStatusForTab: ContextBuilderPlanStatus {
@@ -34,7 +34,28 @@ struct ContextBuilderCallCard: View {
         return false
     }
 
+    /// Only control operations and detached starts return a ticket observation; a blocking
+    /// `op=start` is still the live run (see `MCPLongRunningJobOperation.parse`).
+    private var isTicketObservationCall: Bool {
+        guard let args = ToolJSON.rawObject(from: item.toolArgsJSON),
+              let op = (args["op"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        if op == "start" { return args["detach"] as? Bool == true }
+        return ["poll", "wait", "cancel"].contains(op)
+    }
+
+    private var ticket: ToolResultDTOs.LongRunningJobTicketDTO? {
+        guard let ticket = context.transcriptMetadata.ticket(forInvocationID: item.toolInvocationID),
+              ticket.job.contextID == context.tabID else { return nil }
+        return ticket
+    }
+
+    var title: String {
+        isTicketObservationCall ? "Context Builder observation" : "Context Builder"
+    }
+
     private var phase: ContextBuilderCardPhase {
+        if isTicketObservationCall { return .observation }
         if isActiveCallCard, isRunningForTab {
             return .running
         }
@@ -45,23 +66,26 @@ struct ContextBuilderCallCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        if isTicketObservationCall { return ticket.map { "Job \($0.jobID.uuidString)" } }
+        return contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
     }
 
-    private var summary: String {
-        contextBuilderCardSubtitle(
+    var summary: String {
+        if isTicketObservationCall {
+            return ticket.map { longRunningJobTicketObservationLabel($0) } ?? "Ticket request observation"
+        }
+        return contextBuilderCardSubtitle(
             contextBuilderAgentVM: contextBuilderAgentVM,
             fallbackStatus: nil,
             phase: phase
         )
     }
 
-    private var status: ToolCardStatus {
+    var status: ToolCardStatus {
         switch phase {
-        case .running, .generatingPlan:
-            .running
-        case .completed:
-            .success
+        case .running, .generatingPlan: .running
+        case .observation: .neutral
+        case .completed: .success
         }
     }
 
@@ -87,7 +111,7 @@ struct ContextBuilderCallCard: View {
         ToolCardContainer(
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
-            title: "Context Builder",
+            title: title,
             detailText: detailLine,
             subtitle: summary,
             status: status,
@@ -117,6 +141,10 @@ struct ContextBuilderCallCard: View {
                         contextBuilderAgentVM.cancelBackgroundPlanGeneration(forTabID: context.tabID)
                     }
                 )
+            case .observation:
+                Text(summary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             case .completed:
                 Text("Context builder run completed.")
                     .font(.system(size: 11))
@@ -134,7 +162,7 @@ struct ContextBuilderCallCard: View {
                 performAgentToolCardExpansionStateUpdateWithoutAnimation {
                     isExpanded = true
                 }
-            case .completed:
+            case .observation, .completed:
                 performAgentToolCardExpansionStateUpdateWithoutAnimation {
                     isExpanded = false
                 }
@@ -159,8 +187,37 @@ struct ContextBuilderResultCard: View {
         ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: item.toolResultJSON)
     }
 
+    private var ticket: ToolResultDTOs.LongRunningJobTicketDTO? {
+        dto?.ticket
+    }
+
+    var followUpChatID: String? {
+        if let replyChatID = contextBuilderFollowUpChatID(for: dto) { return replyChatID }
+        // Failure may follow chat creation but precede the reply and response_type.
+        // Recover only correlated, owner-scoped evidence, never ambient chat or live authority.
+        guard let ticket, ticket.job.status == .failed || ticket.job.status == .cancelled,
+              let tabID = context.tabID, ticket.job.contextID == tabID,
+              context.transcriptMetadata.ticket(forInvocationID: item.toolInvocationID)?.job == ticket.job,
+              let openContext = context.oracleOpenContext,
+              openContext.workspaceID != nil, openContext.tabID == tabID
+        else { return nil }
+        return nonEmptyContextBuilderValue(ticket.job.chatID)
+    }
+
+    private var isHistoricalObservation: Bool {
+        ticket.map { context.transcriptMetadata.isHistoricalResult(item.id, job: $0.job) } ?? false
+    }
+
+    var title: String {
+        ticket == nil ? "Context Builder" : "Context Builder observation"
+    }
+
     private var isActiveResultCard: Bool {
-        context.activeContextBuilderResultItemID == item.id
+        if let ticket {
+            return context.transcriptMetadata.activeResultItemID == item.id
+                && ticket.job.contextID == context.tabID && !isHistoricalObservation
+        }
+        return context.transcriptMetadata.activeResultItemID == item.id
     }
 
     private var isRunningForTab: Bool {
@@ -180,6 +237,13 @@ struct ContextBuilderResultCard: View {
     }
 
     private var phase: ContextBuilderCardPhase {
+        if let ticket {
+            if ticket.job.status.isTerminal { return .completed }
+            guard !ticket.summaryOnly, isActiveResultCard else { return .observation }
+            if isRunningForTab { return .running }
+            if isPlanGeneratingForTab { return .generatingPlan }
+            return .observation
+        }
         if isActiveResultCard, isRunningForTab {
             return .running
         }
@@ -190,10 +254,16 @@ struct ContextBuilderResultCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: dto)
+        if let ticket { return "Job \(ticket.jobID.uuidString)" }
+        return contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: dto)
     }
 
     var summary: String {
+        let observationFailed = ticket != nil && item.toolIsError == true
+        let observationPrefix = observationFailed ? "Observation failed · " : ""
+        if let ticket, ticket.job.status != .completed || isHistoricalObservation {
+            return observationPrefix + longRunningJobTicketObservationLabel(ticket)
+        }
         let label = isActiveResultCard
             ? contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
@@ -201,13 +271,15 @@ struct ContextBuilderResultCard: View {
                 phase: phase
             )
             : contextBuilderFinalStatusLabel(dto?.status)
-        guard phase == .completed else { return label }
+        guard phase == .completed else { return observationPrefix + label }
         let outcome = contextBuilderCompletedOutcomeLabel(
-            label, coverage: laneCoverage, toolIsError: item.toolIsError,
-            fallbackStatus: AgentTranscriptToolNormalizer.status(for: item)
+            label, coverage: laneCoverage, toolIsError: observationFailed ? nil : item.toolIsError,
+            fallbackStatus: observationFailed ? .unknown : AgentTranscriptToolNormalizer.status(for: item)
         )
-        guard let laneCoverage else { return outcome }
-        return outcome.isEmpty ? laneCoverage.summaryText : "\(outcome) · \(laneCoverage.summaryText)"
+        let coverageLabel = laneCoverage.map { outcome.isEmpty ? $0.summaryText : "\(outcome) · \($0.summaryText)" } ?? outcome
+        guard let ticket else { return coverageLabel }
+        let exportWarning = dto?.oracleExportError == nil ? "" : " · export incomplete"
+        return observationPrefix + "Job completed · \(coverageLabel)\(exportWarning) · \(ticket.jobID.uuidString)"
     }
 
     private var laneCoverage: OracleLaneCoverage? {
@@ -215,12 +287,26 @@ struct ContextBuilderResultCard: View {
     }
 
     var status: ToolCardStatus {
+        // This is the control observation's failure, not a replacement for native job state.
+        if ticket != nil, item.toolIsError == true { return .failure }
+        if let ticket {
+            switch ticket.job.status {
+            case .failed, .cancelled: return .failure
+            case .expired: return .warning
+            case .running, .cancelling, .unknown:
+                return phase == .running || phase == .generatingPlan ? .running : .neutral
+            case .completed:
+                if isHistoricalObservation { return .neutral }
+            }
+        }
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true || dto?.status?.lowercased() == "error" { return .failure }
         let outcome = AgentTranscriptToolNormalizer.status(for: item)
         if outcome == .failed || outcome == .cancelled { return .failure }
-        if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
-        if outcome == .warning { return .warning }
+        if let coverageStatus = laneCoverage?.cardStatus {
+            return coverageStatus == .failure || dto?.oracleExportError == nil ? coverageStatus : .warning
+        }
+        if dto?.oracleExportError != nil || outcome == .warning { return .warning }
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure
@@ -263,7 +349,7 @@ struct ContextBuilderResultCard: View {
         ToolCardContainer(
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
-            title: "Context Builder",
+            title: title,
             detailText: detailLine,
             subtitle: summary,
             status: status,
@@ -293,10 +379,15 @@ struct ContextBuilderResultCard: View {
                         contextBuilderAgentVM.cancelBackgroundPlanGeneration(forTabID: context.tabID)
                     }
                 )
+            } else if phase == .observation {
+                Text(summary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             } else {
                 ContextBuilderCompletedSummaryView(
                     dto: dto,
-                    oracleOpenContext: context.oracleOpenContext
+                    oracleOpenContext: context.oracleOpenContext,
+                    followUpChatID: followUpChatID
                 )
             }
         }
@@ -311,7 +402,7 @@ struct ContextBuilderResultCard: View {
                 performAgentToolCardExpansionStateUpdateWithoutAnimation {
                     isExpanded = true
                 }
-            case .completed:
+            case .observation, .completed:
                 if isActiveResultCard {
                     performAgentToolCardExpansionStateUpdateWithoutAnimation {
                         isExpanded = false
@@ -319,6 +410,51 @@ struct ContextBuilderResultCard: View {
                 }
             }
         }
+    }
+}
+
+/// A past control observation stays at its original transcript position, without claiming another live job.
+struct ContextBuilderObservationHistoryRow: View {
+    let item: AgentChatItem
+    let ticket: ToolResultDTOs.LongRunningJobTicketDTO
+    @State private var isExpanded = false
+
+    var summary: String {
+        "Context Builder history · \(longRunningJobTicketObservationLabel(ticket)) · revision \(ticket.job.revision.map(String.init) ?? "unknown")"
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let invocationID = item.toolInvocationID {
+                        Text("Invocation \(invocationID.uuidString)")
+                    }
+                    if let args = item.toolArgsJSON {
+                        Text("Request")
+                            .fontWeight(.medium)
+                        Text(verbatim: ToolJSON.prettyPrinted(args))
+                    }
+                    if let result = item.toolResultJSON {
+                        Text("Observation")
+                            .fontWeight(.medium)
+                        Text(verbatim: ToolJSON.prettyPrinted(result))
+                    }
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(verbatim: summary)
+                Spacer(minLength: 4)
+                MessageTimestampText(date: item.timestamp)
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("agentTranscript.contextBuilderObservationHistory")
     }
 }
 
@@ -486,10 +622,7 @@ private struct ContextBuilderPlanProgressView: View {
 private struct ContextBuilderCompletedSummaryView: View {
     let dto: ToolResultDTOs.ContextBuilderDTO?
     let oracleOpenContext: AgentOracleOpenContext?
-
-    private var followUpChatID: String? {
-        contextBuilderFollowUpChatID(for: dto)
-    }
+    let followUpChatID: String?
 
     private var detailParts: [String] {
         var parts: [String] = []
@@ -526,7 +659,7 @@ private struct ContextBuilderCompletedSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Context builder run completed.")
+            Text(dto?.ticket.map(longRunningJobTicketObservationLabel) ?? "Context builder run completed.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
@@ -563,9 +696,18 @@ private struct ContextBuilderCompletedSummaryView: View {
 }
 
 private enum ContextBuilderCardPhase {
+    case observation
     case running
     case generatingPlan
     case completed
+}
+
+func longRunningJobTicketObservationLabel(_ ticket: ToolResultDTOs.LongRunningJobTicketDTO) -> String {
+    let status = ticket.job.status.rawValue
+    let label = ticket.summaryOnly && !ticket.job.status.isTerminal
+        ? "Live job state unknown (last observed \(status))"
+        : "Observed \(status)"
+    return "\(label) · \(ticket.jobID.uuidString)"
 }
 
 func contextBuilderOraclePopoverUserInfo(
@@ -760,6 +902,8 @@ private func contextBuilderCardSubtitle(
 ) -> String {
     var parts: [String] = []
     switch phase {
+    case .observation:
+        parts.append("observed")
     case .running:
         parts.append("running")
         if contextBuilderAgentVM.toolCallCount > 0 {

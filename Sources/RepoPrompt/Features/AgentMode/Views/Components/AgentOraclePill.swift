@@ -298,7 +298,7 @@ struct AgentOraclePill: View {
         case .failed: Color.red
         case .completed: Color.green
         case .cancelled: Color.orange
-        case .unknown: Color.secondary
+        case .settled, .unknown: Color.secondary
         }
     }
 

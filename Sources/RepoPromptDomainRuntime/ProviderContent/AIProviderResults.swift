@@ -103,6 +103,11 @@ package enum AIProviderCompletionOutcome: Equatable {
     case incomplete(reason: String)
 }
 
+/// A request transport declaration, not a provider heartbeat or a renewable lease.
+public enum ProviderRequestProgressPolicy: Sendable, Equatable {
+    case boundedOneShot(timeout: TimeInterval)
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 package struct AIStreamResult {
     /// Standard type strings for stream results
@@ -139,6 +144,7 @@ package struct AIStreamResult {
     package let contentMessageID: String?
     /// Optional provider conversation cleanup handle, used for best-effort Oracle cleanup.
     package let cleanupHandle: ProviderConversationCleanupHandle?
+    package let requestProgressPolicy: ProviderRequestProgressPolicy?
 
     package init(
         type: String,
@@ -159,7 +165,8 @@ package struct AIStreamResult {
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
         contentMessageID: String? = nil,
-        cleanupHandle: ProviderConversationCleanupHandle? = nil
+        cleanupHandle: ProviderConversationCleanupHandle? = nil,
+        requestProgressPolicy: ProviderRequestProgressPolicy? = nil
     ) {
         self.type = type
         self.text = text
@@ -180,6 +187,7 @@ package struct AIStreamResult {
         self.contextUsedTokens = contextUsedTokens
         self.contentMessageID = contentMessageID
         self.cleanupHandle = cleanupHandle
+        self.requestProgressPolicy = requestProgressPolicy
     }
 }
 
@@ -236,6 +244,7 @@ public struct ChatStreamOutput: Sendable {
     public let terminalOutcome: ChatStreamTerminalOutcome?
     public let cleanupHandle: ProviderConversationCleanupHandle?
     public let isTransportActivity: Bool
+    public let requestProgressPolicy: ProviderRequestProgressPolicy?
 
     public var isFinal: Bool {
         terminalOutcome == .completed
@@ -247,7 +256,8 @@ public struct ChatStreamOutput: Sendable {
         tokens: ChatTokenInfo,
         terminalOutcome: ChatStreamTerminalOutcome? = nil,
         cleanupHandle: ProviderConversationCleanupHandle? = nil,
-        isTransportActivity: Bool = false
+        isTransportActivity: Bool = false,
+        requestProgressPolicy: ProviderRequestProgressPolicy? = nil
     ) {
         self.text = text
         self.reasoning = reasoning
@@ -255,5 +265,6 @@ public struct ChatStreamOutput: Sendable {
         self.terminalOutcome = terminalOutcome
         self.cleanupHandle = cleanupHandle
         self.isTransportActivity = isTransportActivity
+        self.requestProgressPolicy = requestProgressPolicy
     }
 }

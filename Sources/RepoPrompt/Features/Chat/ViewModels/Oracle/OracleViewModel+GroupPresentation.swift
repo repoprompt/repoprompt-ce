@@ -4,6 +4,7 @@ import RepoPromptDomainRuntime
 struct OracleMemberPresentation: Equatable {
     enum Status: String {
         case streaming = "In progress"
+        case settled = "Settled — awaiting group result"
         case completed = "Completed"
         case failed = "Failed"
         case cancelled = "Cancelled"
@@ -92,9 +93,11 @@ struct OracleGroupPresentation: Equatable {
               let sequence = event.sequence,
               sequences[laneID].map({ sequence > $0 }) ?? true
         else { return }
+        // Settlement is monotonic within this invocation, even if a later started event arrives.
+        guard event.kind != .laneStarted || lanes[laneID]?.status != .settled else { return }
         sequences[laneID] = sequence
         // Settled progress precedes durable publication; it cannot establish terminal success.
-        lanes[laneID] = event.kind == .laneStarted ? .init(status: .streaming) : .unknown
+        lanes[laneID] = .init(status: event.kind == .laneStarted ? .streaming : .settled)
     }
 
     mutating func endExecution() {

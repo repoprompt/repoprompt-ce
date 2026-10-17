@@ -1,10 +1,39 @@
 import Foundation
 import SwiftUI
 
+private func oracleToolResultTicket(from raw: String?) -> ToolResultDTOs.LongRunningJobTicketDTO? {
+    guard let raw else { return nil }
+    // Completed jobs may also carry a reply. A direct ticket owns its job state;
+    // a direct reply must not be displaced by a conflicting nested ticket echo.
+    let data: Data?
+    if let direct = ToolResultDTOs.LongRunningJobTicketDTO.validatedJSONData(from: raw) {
+        data = direct
+    } else if ToolResultDTOs.ChatSendDTO.nativeOracleReplyJSONData(from: raw) == Data(raw.utf8) {
+        return nil
+    } else {
+        data = ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: raw)
+    }
+    guard let data else { return nil }
+    return try? JSONDecoder().decode(ToolResultDTOs.LongRunningJobTicketDTO.self, from: data)
+}
+
 func oracleToolResultPopoverUserInfo(
     item: AgentChatItem,
     openContext: AgentOracleOpenContext?
 ) -> [AnyHashable: Any]? {
+    if let ticket = oracleToolResultTicket(from: item.toolResultJSON) {
+        guard let openContext, openContext.workspaceID != nil,
+              let tabID = ticket.job.contextID, openContext.tabID == tabID,
+              ticket.job.status == .completed || ticket.job.status == .failed || ticket.job.status == .cancelled
+        else { return nil }
+        let reply = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON)
+        let chatID = ticket.job.status == .completed ? reply?.chatID ?? ticket.job.chatID : ticket.job.chatID
+        return AgentOracleToolRouting.operationPopoverUserInfo(
+            openContext: openContext,
+            chatID: chatID,
+            presentation: ticket.job.status == .completed ? .standard : .generatedAnswerReadOnly
+        )
+    }
     let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
     return AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
@@ -25,12 +54,21 @@ struct ChatSendResultCard: View {
         ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON)
     }
 
+    private var ticket: ToolResultDTOs.LongRunningJobTicketDTO? {
+        isOracleTool ? oracleToolResultTicket(from: item.toolResultJSON) : nil
+    }
+
     private var laneCoverage: OracleLaneCoverage? {
         isOracleTool ? OracleLaneCoverage(lanes: dto?.oracleResults, oracleCount: dto?.oracleCount) : nil
     }
 
     /// Compact summary showing mode and a small amount of result context
-    private var summary: String {
+    var summary: String {
+        let ticket = ticket
+        let observationPrefix = ticket != nil && item.toolIsError == true ? "Observation failed · " : ""
+        if let ticket, ticket.job.status != .completed {
+            return observationPrefix + longRunningJobTicketObservationLabel(ticket)
+        }
         guard let dto else { return "" }
         var parts: [String] = []
         if let mode = dto.mode { parts.append(mode) }
@@ -42,10 +80,24 @@ struct ChatSendResultCard: View {
         if let diffs = dto.diffs, !diffs.isEmpty {
             parts.append("\(diffs.count) diffs")
         }
-        return parts.joined(separator: " • ")
+        let replySummary = parts.joined(separator: " • ")
+        guard let ticket else { return replySummary }
+        let detail = replySummary.isEmpty ? "" : " · \(replySummary)"
+        return observationPrefix + "Job completed\(detail) · \(ticket.jobID.uuidString)"
     }
 
     var status: ToolCardStatus {
+        if let ticket {
+            // A successful control observation is not a completed job. No live job
+            // binding exists here, so even a fresh nonterminal snapshot is neutral.
+            if item.toolIsError == true { return .failure }
+            switch ticket.job.status {
+            case .failed, .cancelled: return .failure
+            case .expired: return .warning
+            case .running, .cancelling, .unknown: return .neutral
+            case .completed: break
+            }
+        }
         if isOracleTool, dto?.status == "partial_failure" { return .warning }
         if item.toolIsError == true { return .failure }
         if let dto {
@@ -81,7 +133,7 @@ struct ChatSendResultCard: View {
         StaticToolCardContainer(
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
-            title: isOracleTool ? "Oracle" : "Chat",
+            title: isOracleTool ? (ticket == nil ? "Oracle" : "Oracle observation") : "Chat",
             subtitle: summary,
             status: status,
             timestamp: item.timestamp,

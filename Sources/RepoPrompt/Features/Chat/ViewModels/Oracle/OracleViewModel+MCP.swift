@@ -122,7 +122,15 @@ extension OracleViewModel {
         let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
         let transientImages: [AITransientImage]
+        /// Ticket-only capture: preserve implicit group intent without injecting a public chat_id.
+        var implicitContinuationSessionID: UUID?
+        /// Fresh ticket authority is resolved before admission, not from later mutable settings.
+        var resolvedStartExecution: ResolvedOracleExecution?
+        var jobProgress: MCPLongRunningJobProgress?
         var toolSettlement: OracleToolSettlementCallbacks?
+        #if DEBUG
+            var requestDiagnostics = OracleRequestDiagnostics()
+        #endif
 
         init(
             tabID: UUID,
@@ -144,6 +152,44 @@ extension OracleViewModel {
             self.transientImages = transientImages
         }
     }
+
+    #if DEBUG
+        /// Request-only controls: never stored in settings or conversation authority.
+        struct OracleRequestDiagnostics: Equatable {
+            static let argumentKeys: Set<String> = ["debug_primary_only", "debug_lane_timeout_seconds"]
+            var primaryOnly = false
+            var laneTimeout: TimeInterval?
+
+            static func parse(_ args: [String: Value]) throws -> Self {
+                guard !argumentKeys.isDisjoint(with: args.keys) else { return Self() }
+                guard args["new_chat"]?.boolValue == true, args["chat_id"] == nil else {
+                    throw MCPError.invalidParams("Oracle diagnostics require new_chat=true and no chat_id")
+                }
+                var result = Self()
+                if let value = args["debug_primary_only"] {
+                    guard let enabled = value.boolValue, enabled else {
+                        throw MCPError.invalidParams("debug_primary_only must be true when provided")
+                    }
+                    result.primaryOnly = enabled
+                }
+                if let value = args["debug_lane_timeout_seconds"] {
+                    let seconds: Double? = switch value {
+                    case let .int(number): Double(number)
+                    case let .double(number): number
+                    default: nil
+                    }
+                    guard let seconds, seconds.isFinite, seconds >= 1, seconds <= 300 else {
+                        throw MCPError.invalidParams("debug_lane_timeout_seconds must be a finite number from 1 through 300")
+                    }
+                    result.laneTimeout = seconds
+                }
+                guard !result.primaryOnly || result.laneTimeout == nil else {
+                    throw MCPError.invalidParams("debug_lane_timeout_seconds requires grouped execution; it cannot combine with debug_primary_only")
+                }
+                return result
+            }
+        }
+    #endif
 
     @MainActor
     func resolveOracleStartExecution(
@@ -830,6 +876,7 @@ extension OracleViewModel {
         resolvedLaneIndex: Int = 0,
         implicitSessionID: UUID? = nil,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        requiresProducerDrain: Bool = false,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
@@ -923,6 +970,14 @@ extension OracleViewModel {
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
+        // Retain recovery before persistence/send can fail. Group lanes publish through
+        // their canonical group owner; an additional lane must not overwrite its primary.
+        if contextBuilderScope == nil, let progress = tabContext?.jobProgress,
+           let shortID = sessions.first(where: { $0.id == chatID })?.shortID
+        {
+            await progress.settled(.object(["chat_id": .string(shortID)]))
+        }
+
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == chatID }) else {
             throw ChatToolError.internalError("Oracle conversation was not created.")
         }
@@ -953,44 +1008,65 @@ extension OracleViewModel {
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
 
         // ────────── 5. Send user message & wait for completion ──────────
-        // Pass the selected model, chat preset, and mode to sendMessage without affecting global state.
-        let send = {
-            await self.sendMessage(
-                message,
-                sessionID: chatID,
-                overrideModel: selectedModel,
-                overrideChatPresetID: resolvedExecution.promptConfiguration.chatPresetID,
-                oraclePromptConfiguration: resolvedExecution.promptConfiguration,
-                overrideMode: effectiveMode,
-                gitInclusionOverride: nil,
-                gitBaseOverride: nil,
-                selectionOverride: selectionOverride,
-                lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride,
-                overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
-                oracleTransientImages: transientImages,
-                completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
-                contextBuilderScope: contextBuilderScope,
-                onProgress: onProgress
-            )
+        // A ticket, or a caller holding a claim until the producer stops, must own sendMessage's
+        // independent producer, not just its hub waiter. Reuse exact-query release/join without
+        // opting ordinary Oracle into CB deadlines.
+        let ownedScope = contextBuilderScope == nil && (tabContext?.jobProgress != nil || requiresProducerDrain)
+            ? ContextBuilderOracleGroupSupervision(configuration: nil).makeLane(sessionID: chatID) : nil
+        let execute: (ContextBuilderOracleLaneScope?) async throws -> OracleLaneExecutionResponse = { [self] scope in
+            let send = {
+                await self.sendMessage(
+                    message,
+                    sessionID: chatID,
+                    overrideModel: selectedModel,
+                    overrideChatPresetID: resolvedExecution.promptConfiguration.chatPresetID,
+                    oraclePromptConfiguration: resolvedExecution.promptConfiguration,
+                    overrideMode: effectiveMode,
+                    gitInclusionOverride: nil,
+                    gitBaseOverride: nil,
+                    selectionOverride: selectionOverride,
+                    lookupContextOverride: lookupContextOverride,
+                    reviewGitContextOverride: reviewGitContextOverride,
+                    overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                    oracleTransientImages: transientImages,
+                    completionPolicy: scope?.completionPolicy ?? .interactive,
+                    contextBuilderScope: scope,
+                    onProgress: onProgress
+                )
+            }
+            let queryId: UUID?
+            #if DEBUG
+                let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
+                    tabContext: tabContext,
+                    observer: oracleReviewPackagingTraceObserverForTesting
+                )
+                queryId = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+            #else
+                queryId = await send()
+            #endif
+            guard let queryId else {
+                // No query exists to clear the label this call set above.
+                clearMCPSessionUIState(for: chatID)
+                throw OracleContextBuilderCompletionError.missingExactQuery
+            }
+            let response = try await waitForContextBuilderCompletion(queryId)
+            try scope?.admitSuccess()
+            return OracleLaneExecutionResponse(response: response)
         }
-        let queryId: UUID?
-        #if DEBUG
-            let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
-                tabContext: tabContext,
-                observer: oracleReviewPackagingTraceObserverForTesting
-            )
-            queryId = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
-        #else
-            queryId = await send()
-        #endif
-        guard let queryId else {
-            // No query exists to clear the label this call set above.
-            clearMCPSessionUIState(for: chatID)
-            throw OracleContextBuilderCompletionError.missingExactQuery
+        let response: String
+        if let ownedScope {
+            do {
+                response = try await ownedScope.run(oracle: self) { try await execute(ownedScope) }.response
+            } catch {
+                if ownedScope.queryID == nil { clearMCPSessionUIState(for: chatID) }
+                // This call owns the scope, so its typed lane outcome stops here: an in-app stop is
+                // ordinary cancellation to callers and the job center. Caller-owned scopes keep it.
+                if error is OracleLaneCancellation { throw CancellationError() }
+                throw error
+            }
+        } else {
+            response = try await execute(contextBuilderScope).response
         }
-        let response = try await waitForContextBuilderCompletion(queryId)
-        try contextBuilderScope?.admitSuccess()
 
         // ────────── 6. Build typed reply ──────────
         let replyObj = ChatSendReply(

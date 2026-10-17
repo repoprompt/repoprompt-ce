@@ -6,6 +6,20 @@ import XCTest
 
 @MainActor
 final class OracleExecutionResolverTests: XCTestCase {
+    #if DEBUG
+        func testRequestPrimarySelectionPreservesPromptAuthorityAndOriginalRoster() throws {
+            let preset = try ModelPreset(name: "Diagnostic fixture", modelStrings: [AIModel.gpt54.rawValue, AIModel.gpt54Mini.rawValue])
+            let execution = try makeResolver().resolve(choice: .oracleSend(preset.id.uuidString), mode: "review", snapshot: makeSnapshot(presets: [preset]))
+            let primary = try execution.primaryOnlyForDiagnostics()
+            XCTAssertEqual(primary.models, [.gpt54])
+            XCTAssertEqual(primary.roster.orderedModels, [execution.roster.primary])
+            XCTAssertEqual(primary.promptConfiguration.chatPresetID, execution.promptConfiguration.chatPresetID)
+            XCTAssertEqual(primary.selection, execution.selection)
+            XCTAssertEqual(execution.roster.count, 2)
+            XCTAssertEqual(preset.modelStrings, [AIModel.gpt54.rawValue, AIModel.gpt54Mini.rawValue])
+        }
+    #endif
+
     func testExplicitPresetOwnsOrderedRosterAndMappingIncludingDuplicates() throws {
         let customReview = ChatPreset(name: "Custom Review", mode: .review)
         let preset = try ModelPreset(

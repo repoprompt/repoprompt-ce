@@ -1159,6 +1159,8 @@ class OracleViewModel: ObservableObject {
         var contextBuilderBeforeChatResolutionForTesting: (@MainActor @Sendable (ContextBuilderOracleLaneScope, AIModel) async -> Void)?
         var contextBuilderBeforeAvailabilityForTesting: (@MainActor @Sendable (ContextBuilderOracleLaneScope, AIModel) -> Void)?
         var contextBuilderBeforeFinalizationForTesting: (@MainActor @Sendable (ContextBuilderOracleLaneScope) async -> Void)?
+        var interactiveWatchdogBeforeFinalizationForTesting: (@MainActor @Sendable (UUID) async -> Void)?
+        var interactiveWatchdogFinalizerScheduledForTesting: (@MainActor @Sendable (UUID, Task<Void, Never>) -> Void)?
         var contextBuilderLaneReleasedForTesting: (@MainActor @Sendable (ContextBuilderOracleLaneScope) -> Void)?
         var providerConversationCleanupForTesting: (@MainActor @Sendable (ProviderConversationCleanupHandle) async -> Void)?
         var providerCleanupTaskScheduledForTesting: (@MainActor @Sendable (Task<Void, Never>) -> Void)?
@@ -1368,6 +1370,7 @@ class OracleViewModel: ObservableObject {
             return
         }
         let grace = currentInactivityGrace(for: queryId)
+        let scope = contextBuilderScopes[queryId]
         let task = Task { [weak self] in
             guard grace > 0 else { return }
             do {
@@ -1383,8 +1386,15 @@ class OracleViewModel: ObservableObject {
             } catch {
                 return
             }
-            guard let self else { return }
-            await handleStreamInactivityTimeout(for: queryId)
+            guard let self, canCommitContextBuilderLane(scope) else { return }
+            if let scope {
+                // Join fired local work, not every sleeping/re-armed timer.
+                let firing = Task { await self.handleStreamInactivityTimeout(for: queryId, scope: scope) }
+                scope.retain(firing)
+                await firing.value
+            } else {
+                await handleStreamInactivityTimeout(for: queryId)
+            }
         }
         streamInactivityWatchdogs[queryId] = task
     }
@@ -1421,11 +1431,14 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func handleStreamInactivityTimeout(for queryId: UUID) async {
+    private func handleStreamInactivityTimeout(
+        for queryId: UUID, scope: ContextBuilderOracleLaneScope? = nil
+    ) async {
         #if DEBUG
             defer { streamWatchdogCheckedForTesting?(queryId) }
         #endif
-        guard let sessionID = sessionIDByMessageId[queryId],
+        guard canCommitContextBuilderLane(scope),
+              let sessionID = sessionIDByMessageId[queryId],
               isSessionStreaming(sessionID),
               let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId && !$0.isUser }),
               let message = messageStore[sessionID]?[idx],
@@ -1471,17 +1484,23 @@ class OracleViewModel: ObservableObject {
             await aiQueriesService.cancelStream(id: streamId)
             streamIDsByQueryId.removeValue(forKey: queryId)
         }
+        guard canCommitContextBuilderLane(scope) else { return }
         let content = message.content
         cancelFinalizationWatchdog(for: queryId)
         clearStreamActivityTracking(for: queryId)
-        Task {
+        let finalizer = Task {
             await self.finalizeAIResponse(
                 aiResponseId: queryId,
                 sessionID: sessionID,
                 partialBuffer: content,
-                outcome: .interactiveWatchdog
+                outcome: .interactiveWatchdog,
+                contextBuilderScope: scope
             )
         }
+        scope?.retain(finalizer)
+        #if DEBUG
+            interactiveWatchdogFinalizerScheduledForTesting?(queryId, finalizer)
+        #endif
     }
 
     static func shouldFireStreamInactivityWatchdog(
@@ -1517,6 +1536,7 @@ class OracleViewModel: ObservableObject {
         }
 
         let token = UUID()
+        let scope = contextBuilderScopes[queryId]
         finalizationWatchdogTokens[queryId] = token
         let task = Task { [weak self] in
             guard delay > 0 else {
@@ -1541,8 +1561,14 @@ class OracleViewModel: ObservableObject {
                 status: "fired",
                 shouldFire: true
             )
-            guard shouldFire else { return }
-            await finalizationWatchdogFired(for: queryId)
+            guard shouldFire, canCommitContextBuilderLane(scope) else { return }
+            if let scope {
+                let firing = Task { await self.finalizationWatchdogFired(for: queryId, scope: scope) }
+                scope.retain(firing)
+                await firing.value
+            } else {
+                await finalizationWatchdogFired(for: queryId)
+            }
         }
         finalizationWatchdogs[queryId] = task
         emitMessageLifecycleActivity(.finalizationWatchdogArmed, for: queryId)
@@ -1591,9 +1617,12 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func finalizationWatchdogFired(for queryId: UUID) async {
-        // If already finished, nothing to do
-        guard let sessionID = sessionIDByMessageId[queryId],
+    private func finalizationWatchdogFired(
+        for queryId: UUID, scope: ContextBuilderOracleLaneScope? = nil
+    ) async {
+        // If already finished or its exact lane lost authority, nothing to do.
+        guard canCommitContextBuilderLane(scope),
+              let sessionID = sessionIDByMessageId[queryId],
               isSessionStreaming(sessionID),
               let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId }),
               let message = messageStore[sessionID]?[idx],
@@ -1634,20 +1663,26 @@ class OracleViewModel: ObservableObject {
             await aiQueriesService.cancelStream(id: streamId)
             streamIDsByQueryId.removeValue(forKey: queryId)
         }
+        guard canCommitContextBuilderLane(scope) else { return }
         let content = message.content
 
         // Clear the watchdogs to avoid double-finalization races
         cancelFinalizationWatchdog(for: queryId)
         clearStreamActivityTracking(for: queryId)
 
-        Task {
+        let finalizer = Task {
             await self.finalizeAIResponse(
                 aiResponseId: queryId,
                 sessionID: sessionID,
                 partialBuffer: content,
-                outcome: .interactiveWatchdog
+                outcome: .interactiveWatchdog,
+                contextBuilderScope: scope
             )
         }
+        scope?.retain(finalizer)
+        #if DEBUG
+            interactiveWatchdogFinalizerScheduledForTesting?(queryId, finalizer)
+        #endif
     }
 
     // MARK: - Message Finalisation
@@ -2494,7 +2529,7 @@ class OracleViewModel: ObservableObject {
                 id: msg.id,
                 isUser: msg.isUser,
                 rawText: msg.content,
-                timestamp: Date(),
+                timestamp: msg.timestamp,
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
                 imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
@@ -3045,7 +3080,7 @@ class OracleViewModel: ObservableObject {
                 id: msg.id,
                 isUser: msg.isUser,
                 rawText: msg.content,
-                timestamp: Date(),
+                timestamp: msg.timestamp,
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
                 imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
@@ -3390,7 +3425,7 @@ class OracleViewModel: ObservableObject {
             msgs.append(aiPlaceholder)
         }
         registerMessage(aiResponseId, sessionID: targetSessionID)
-        completionPolicies[aiResponseId] = contextBuilderScope == nil ? completionPolicy : .contextBuilderStrict
+        completionPolicies[aiResponseId] = contextBuilderScope?.completionPolicy ?? completionPolicy
         if oraclePromptConfiguration != nil {
             oracleControlledResponseIDs.insert(aiResponseId)
         }
@@ -3493,6 +3528,18 @@ class OracleViewModel: ObservableObject {
                 for try await output in stream {
                     if contextBuilderScope != nil {
                         guard await shouldContinueStreaming() else { throw CancellationError() }
+                    }
+                    if let policy = output.requestProgressPolicy {
+                        let admitted = await MainActor.run {
+                            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return false }
+                            let admitted = contextBuilderScope?.observeRequestProgressPolicy(policy) != false
+                            #if DEBUG
+                                self.streamOutputObservedForTesting?(aiResponseId, output)
+                            #endif
+                            return admitted
+                        }
+                        guard admitted else { throw CancellationError() }
+                        continue
                     }
                     let activityKind = Self.lifecycleActivityKind(for: output)
                     if output.isTransportActivity {
@@ -3803,6 +3850,7 @@ class OracleViewModel: ObservableObject {
 
         #if DEBUG
             if let contextBuilderScope { await contextBuilderBeforeFinalizationForTesting?(contextBuilderScope) }
+            if case .interactiveWatchdog = outcome { await interactiveWatchdogBeforeFinalizationForTesting?(aiResponseId) }
         #endif
         // 2️⃣ Process final display content before toggling the finished flags that external tools poll for.
         await processAIResponse(finalContent, forQueryId: aiResponseId, sessionID: sessionID, contextBuilderScope: contextBuilderScope)
@@ -4220,6 +4268,7 @@ class OracleViewModel: ObservableObject {
             id: stored.id,
             content: stored.rawText,
             isUser: stored.isUser,
+            timestamp: stored.timestamp,
             isFinalized: true,
             sequenceIndex: stored.sequenceIndex,
             allowedFilePaths: stored.allowedFilePaths ?? [],

@@ -1049,13 +1049,93 @@ public struct AgentTranscriptProjection: Sendable, Equatable {
     public static let empty = AgentTranscriptProjection()
 }
 
+/// One pass over the existing visible projection; cards never scan transcript history.
+struct ContextBuilderTranscriptMetadata: Equatable {
+    struct Observation: Equatable {
+        let resultItemID: UUID
+        let ticket: ToolResultDTOs.LongRunningJobTicketDTO
+    }
+
+    let activeCallItemID: UUID?
+    let activeResultItemID: UUID?
+    private let jobsByInvocationID: [UUID: ToolResultDTOs.LongRunningJobTicketDTO.Job.Identity]
+    private let observations: [ToolResultDTOs.LongRunningJobTicketDTO.Job.Identity: Observation]
+
+    init() {
+        activeCallItemID = nil
+        activeResultItemID = nil
+        jobsByInvocationID = [:]
+        observations = [:]
+    }
+
+    init(rows: [AgentChatItem]) {
+        var call: AgentChatItem?
+        var result: AgentChatItem?
+        var jobsByInvocationID: [UUID: ToolResultDTOs.LongRunningJobTicketDTO.Job.Identity] = [:]
+        var observations: [ToolResultDTOs.LongRunningJobTicketDTO.Job.Identity: Observation] = [:]
+        for row in rows where normalizedToolCardName(row.toolName) == "context_builder" {
+            switch row.kind {
+            case .toolCall:
+                call = row
+            case .toolResult:
+                result = row
+                if let ticket = ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: row.toolResultJSON)?.ticket {
+                    if let identity = ticket.job.identity {
+                        if let invocationID = row.toolInvocationID { jobsByInvocationID[invocationID] = identity }
+                        if (ticket.job.revision ?? 0) >= (observations[identity]?.ticket.job.revision ?? 0) {
+                            observations[identity] = Observation(resultItemID: row.id, ticket: ticket)
+                        }
+                    }
+                }
+            default: break
+            }
+        }
+        self.jobsByInvocationID = jobsByInvocationID
+        self.observations = observations
+        activeCallItemID = call.flatMap { call in
+            result.map { $0.sequenceIndex > call.sequenceIndex } == true ? nil : call.id
+        }
+        activeResultItemID = result.flatMap { result in
+            call.map { $0.sequenceIndex > result.sequenceIndex } == true ? nil : result.id
+        }
+    }
+
+    func ticket(forInvocationID invocationID: UUID?) -> ToolResultDTOs.LongRunningJobTicketDTO? {
+        guard let invocationID, let identity = jobsByInvocationID[invocationID] else { return nil }
+        return observations[identity]?.ticket
+    }
+
+    /// Compact only accountable successful observations; errors and unidentified requests keep their own cards.
+    func compactSuccessfulObservation(
+        for item: AgentChatItem, contextID: UUID?
+    ) -> ToolResultDTOs.LongRunningJobTicketDTO? {
+        guard item.kind == .toolResult, item.toolIsError != true,
+              let dto = ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: item.toolResultJSON),
+              dto.oracleExportError == nil, let ticket = dto.ticket,
+              ticket.job.contextID == contextID, let identity = ticket.job.identity,
+              let invocationID = item.toolInvocationID, jobsByInvocationID[invocationID] == identity,
+              let revision = ticket.job.revision, revision >= 0,
+              let observation = observations[identity], observation.resultItemID != item.id,
+              let latestRevision = observation.ticket.job.revision, latestRevision >= revision,
+              latestRevision != revision || observation.ticket.job == ticket.job,
+              ticket.job.status == .running || ticket.job.status == .completed,
+              AgentTranscriptToolNormalizer.status(for: item) == .success
+        else { return nil }
+        return ticket
+    }
+
+    func isHistoricalResult(_ itemID: UUID, job: ToolResultDTOs.LongRunningJobTicketDTO.Job) -> Bool {
+        guard let identity = job.identity, let observation = observations[identity] else { return false }
+        return observation.resultItemID != itemID
+    }
+}
+
 struct AgentTranscriptPresentationMetadata: Equatable {
     let latestUserMessageID: UUID?
     let latestTurnID: UUID?
     let dynamicSummaryLockTargetTurnID: UUID?
     let recentAssistantItemIDs: Set<UUID>
-    let activeContextBuilderCallItemID: UUID?
-    let activeContextBuilderResultItemID: UUID?
+    let contextBuilder: ContextBuilderTranscriptMetadata
     let mostRecentEditItemID: UUID?
 
     init(
@@ -1063,16 +1143,14 @@ struct AgentTranscriptPresentationMetadata: Equatable {
         latestTurnID: UUID? = nil,
         dynamicSummaryLockTargetTurnID: UUID? = nil,
         recentAssistantItemIDs: Set<UUID> = [],
-        activeContextBuilderCallItemID: UUID? = nil,
-        activeContextBuilderResultItemID: UUID? = nil,
+        contextBuilder: ContextBuilderTranscriptMetadata = .init(),
         mostRecentEditItemID: UUID? = nil
     ) {
         self.latestUserMessageID = latestUserMessageID
         self.latestTurnID = latestTurnID
         self.dynamicSummaryLockTargetTurnID = dynamicSummaryLockTargetTurnID
         self.recentAssistantItemIDs = recentAssistantItemIDs
-        self.activeContextBuilderCallItemID = activeContextBuilderCallItemID
-        self.activeContextBuilderResultItemID = activeContextBuilderResultItemID
+        self.contextBuilder = contextBuilder
         self.mostRecentEditItemID = mostRecentEditItemID
     }
 

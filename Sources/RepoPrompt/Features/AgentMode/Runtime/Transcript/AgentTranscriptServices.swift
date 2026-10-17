@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 enum AgentConversationReplayMode: String, Equatable {
@@ -1600,6 +1601,9 @@ enum AgentTranscriptToolNormalizer {
             return .unknown
         }
         if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send" || normalizedToolName == "context_builder" {
+            if let nativeStatus = settledNativeObservationStatus(for: item) {
+                return nativeStatus
+            }
             // A settled group can have completed lanes even when its transport reports an error.
             if normalizedToolName != "context_builder", stringValue(resultObject, keys: ["status"]) == "partial_failure" {
                 return .warning
@@ -1659,6 +1663,66 @@ enum AgentTranscriptToolNormalizer {
             return toolIsError ? .failed : .success
         }
         return .unknown
+    }
+
+    /// Returned native facts settle the control observation, not the app-owned job.
+    /// Provider lifecycle annotations and run termination must not erase that observation.
+    static func settledNativeObservationStatus(for item: AgentChatItem) -> AgentTranscriptToolStatus? {
+        guard item.kind == .toolResult, let raw = item.toolResultJSON else { return nil }
+        switch normalizedToolName(item.toolName) {
+        case "ask_oracle", "oracle_send":
+            if let data = ToolResultDTOs.ChatSendDTO.nativeOracleReplyJSONData(from: raw) {
+                if let group = try? JSONDecoder().decode(OracleGroupResult.self, from: data) {
+                    switch group.status {
+                    case .completed: return item.toolIsError == true ? .failed : .success
+                    case .partialFailure: return .warning
+                    case .failed: return .failed
+                    }
+                }
+                guard let reply = try? JSONDecoder().decode(ToolResultDTOs.ChatSendDTO.self, from: data) else { return nil }
+                let outcome = AgentTranscriptToolStatusSemantics.transcriptStatus(
+                    fromNormalizedStatusWord: AgentTranscriptToolStatusSemantics.normalizedStatusWord(reply.status)
+                )
+                if outcome == .cancelled { return .cancelled }
+                let summary = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                let hasPersistedErrors = summary?["summary_only"] as? Bool == true
+                    && (summary?["error_count"] as? Int ?? 0) > 0
+                if item.toolIsError == true || !(reply.errors ?? []).isEmpty || hasPersistedErrors { return .failed }
+                // Bounded native summaries retain terminal outcome, not provider call liveness.
+                switch outcome {
+                case .pending, .running, .unknown: return .success
+                default: return outcome
+                }
+            }
+            guard ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: raw) != nil else { return nil }
+            // Returning a control snapshot settles the observation, not its job status.
+            return item.toolIsError == true ? .failed : .success
+        case "context_builder":
+            guard let data = ToolResultDTOs.LongRunningJobTicketDTO.nativeJSONData(from: raw),
+                  let dto = try? JSONDecoder().decode(ToolResultDTOs.ContextBuilderDTO.self, from: data),
+                  dto.ticket != nil
+            else { return nil }
+            let outcome = AgentTranscriptToolStatusSemantics.transcriptStatus(
+                fromNormalizedStatusWord: AgentTranscriptToolStatusSemantics.normalizedStatusWord(dto.status)
+            )
+            if item.toolIsError == true { return outcome == .cancelled ? .cancelled : .failed }
+            if outcome == .success,
+               let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType),
+               let reply = branch == .plan ? dto.plan : dto.review, (reply.oracleCount ?? 0) > 1
+            {
+                switch reply.status {
+                case "partial_failure": return .warning
+                case "failed": return .failed
+                default: break
+                }
+            }
+            switch outcome {
+            case .pending, .running, .unknown: return .success
+            default: return outcome
+            }
+        default:
+            return nil
+        }
     }
 
     static func isSummaryOnly(raw: String?) -> Bool {
@@ -2738,7 +2802,9 @@ enum AgentTranscriptIO {
                 finalizedCount += 1
                 consecutiveNonToolItems = 0
             case .toolResult:
-                guard runningToolResultStatusWord(from: items[index].toolResultJSON) != nil else {
+                guard runningToolResultStatusWord(from: items[index].toolResultJSON) != nil,
+                      AgentTranscriptToolNormalizer.settledNativeObservationStatus(for: items[index]) == nil
+                else {
                     consecutiveNonToolItems = 0
                     continue
                 }
@@ -3677,12 +3743,14 @@ enum AgentTranscriptIO {
         upToRowID: UUID? = nil,
         maxTranscriptItems: Int = 200,
         maxToolArgsCharacters: Int = 2000,
-        preserveIntermediateAssistantNarration: Bool = false
+        preserveIntermediateAssistantNarration: Bool = false,
+        preserveToolInputFidelity: Bool = false
     ) -> String {
         let entries = handoffExportEntries(
             from: transcript,
             upToRowID: upToRowID,
-            preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration
+            preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration,
+            preserveToolInputFidelity: preserveToolInputFidelity
         )
         logHandoffDebug("buildForkTranscriptXML entries=\(entries.count) transcriptTurns=\(transcript.turns.count) upToRowID=\(upToRowID?.uuidString ?? "nil") preserveIntermediateAssistantNarration=\(preserveIntermediateAssistantNarration)")
 
@@ -3735,8 +3803,9 @@ enum AgentTranscriptIO {
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
                           let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName) else { continue }
                     let args = truncateArgs(row.toolArgsJSON, max: maxToolArgsCharacters)
+                    let inputStatus = preserveToolInputFidelity ? " input_status=\"unavailable\"" : ""
                     let xml = args.isEmpty
-                        ? "<tool_call name=\"\(toolName)\"/>"
+                        ? "<tool_call name=\"\(toolName)\"\(inputStatus)/>"
                         : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
                     forkItems.append(ForkItem(pos: pos, payload: .rawXML(xml), dropPriority: .toolCall, turnID: tid))
                     pos += 1
@@ -3882,7 +3951,8 @@ enum AgentTranscriptIO {
             from: transcript,
             maxTranscriptItems: maxTranscriptItems,
             maxToolArgsCharacters: maxToolArgsCharacters,
-            preserveIntermediateAssistantNarration: true
+            preserveIntermediateAssistantNarration: true,
+            preserveToolInputFidelity: true
         )
     }
 
@@ -3965,14 +4035,21 @@ enum AgentTranscriptIO {
     private static func handoffExportEntries(
         from transcript: AgentTranscript,
         upToRowID: UUID?,
-        preserveIntermediateAssistantNarration: Bool = false
+        preserveIntermediateAssistantNarration: Bool = false,
+        preserveToolInputFidelity: Bool = false
     ) -> [HandoffExportEntry] {
         let materialized = AgentTranscriptPolicyPipeline.handoffTranscript(
             from: transcript,
             upToRowID: upToRowID
         )
         let projection = materialized.projection
-        let blocks = projection.archivedBlocks + projection.workingBlocks
+        let blocks = (projection.archivedBlocks + projection.workingBlocks).flatMap { block in
+            guard preserveToolInputFidelity, block.kind == .groupedHistory else { return [block] }
+            // Presentation collapse is not log retention: expand observed children without
+            // changing compact handoff behavior or reconstructing discarded historical inputs.
+            let children = block.groupedHistory?.sections.flatMap(\.childBlocks) ?? []
+            return children.isEmpty ? [block] : children
+        }
         // Build turn lookup for rewriting baked summary text in handoff.
         // Use uniquingKeysWith to tolerate duplicate turn IDs without crashing;
         // keep the first occurrence when duplicates are present.
@@ -4021,7 +4098,7 @@ enum AgentTranscriptIO {
             // same sanitized tool-result shape we persist rather than the full live payload.
             if block.kind == .standaloneTool {
                 let migratedToolRow = handoffMigratedStandaloneToolItem(for: block)
-                let toolPreviewItem = groupedHistoryToolPreviewItem(for: block)
+                let toolPreviewItem = groupedHistoryToolPreviewItem(for: block, preserveToolInputFidelity: preserveToolInputFidelity)
                 if let toolPreviewItem {
                     logHandoffDebug("standaloneTool synthesized toolCall tool=\(toolPreviewItem.toolName ?? "nil")")
                 }
@@ -4396,7 +4473,8 @@ enum AgentTranscriptIO {
     }
 
     private static func groupedHistoryToolPreviewItem(
-        for childBlock: AgentTranscriptRenderBlock
+        for childBlock: AgentTranscriptRenderBlock,
+        preserveToolInputFidelity: Bool = false
     ) -> AgentChatItem? {
         let visibleRows = childBlock.rows.filter { !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow($0) }
         let toolCallRow = visibleRows.first(where: { $0.kind == .toolCall })
@@ -4410,13 +4488,16 @@ enum AgentTranscriptIO {
         let toolExecution = childBlock.rows
             .compactMap { AgentTranscriptToolNormalizer.toolExecution(for: $0) }
             .last
-        if let toolExecution,
+        if !preserveToolInputFidelity, let toolExecution,
            toolExecution.status == .failed || toolExecution.status == .cancelled
         {
             logHandoffDebug("tool preview pruned tool=\(toolName) status=\(toolExecution.status.rawValue)")
             return nil
         }
-        let argsJSON = localizedGroupedHistoryPreviewArgsJSON(
+        // Faithful logs use only observed input bytes. Compact handoff previews may use
+        // result metadata and derived paths, but those are never evidence of call arguments.
+        // Historical storage intentionally strips inputs; absence must remain unavailable.
+        let argsJSON = preserveToolInputFidelity ? sourceRow.toolArgsJSON : localizedGroupedHistoryPreviewArgsJSON(
             from: sourceRow,
             execution: toolExecution
         )

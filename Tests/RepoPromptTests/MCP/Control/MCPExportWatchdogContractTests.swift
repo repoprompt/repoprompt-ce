@@ -1351,6 +1351,63 @@ import XCTest
             }
         }
 
+        func testTicketControlsUseBoundedObservationDeadlinesWithoutChangingExplicitClientPolicies() async {
+            let session = makeUnconnectedSession()
+            let margin = MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            let defaultObservation = TimeInterval(MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds)
+            let fallback = max(30, defaultObservation + margin)
+            let maximumObservation = AgentMCPToolHelpers.maximumTimeoutSeconds
+            let startedAtNanoseconds: UInt64 = 10000
+            let cases: [(label: String, arguments: [String: Value], expected: TimeInterval)] = [
+                ("poll", ["op": .string("poll")], 30),
+                ("cancel", ["op": .string("cancel")], 30),
+                ("poll ignores timeout", ["op": .string("poll"), "timeout": .int(600)], 30),
+                ("cancel ignores timeout", ["op": .string("cancel"), "timeout": .int(600)], 30),
+                ("wait int timeout", ["op": .string("wait"), "timeout": .int(600)], 600 + margin),
+                ("wait omitted timeout", ["op": .string("wait")], fallback),
+                ("wait equivalent numeric string timeout", ["op": .string("wait"), "timeout": .string("600")], max(30, 600 + margin)),
+                ("wait maximum timeout", ["op": .string("wait"), "timeout": .double(maximumObservation)], maximumObservation + margin),
+                ("wait negative timeout", ["op": .string("wait"), "timeout": .int(-5)], fallback),
+                ("wait nonfinite timeout", ["op": .string("wait"), "timeout": .double(.infinity)], fallback),
+                ("wait NaN timeout", ["op": .string("wait"), "timeout": .double(.nan)], fallback),
+                ("wait malformed timeout", ["op": .string("wait"), "timeout": .string("abc")], fallback),
+                ("wait nonfinite string", ["op": .string("wait"), "timeout": .string("NaN")], fallback),
+                ("wait over-limit timeout", ["op": .string("wait"), "timeout": .double(maximumObservation + 1)], fallback),
+                ("wait over-limit string", ["op": .string("wait"), "timeout": .string(String(maximumObservation + 1))], fallback),
+                ("wait equivalent double timeout", ["op": .string("wait"), "timeout": .double(600)], max(30, 600 + margin)),
+                ("wait fractional timeout", ["op": .string("wait"), "timeout": .double(600.5)], max(30, 600.5 + margin)),
+                ("wait zero timeout", ["op": .string("wait"), "timeout": .int(0)], max(30, margin)),
+                ("wait uppercase padded op", ["op": .string("  WAIT\n"), "timeout": .int(600)], 600 + margin),
+                ("detached start", ["op": .string("start"), "detach": .bool(true)], 30),
+                ("detached start ignores timeout", ["op": .string("start"), "detach": .bool(true), "timeout": .int(600)], 30),
+                ("non-detached start default timeout", ["op": .string("start")], fallback),
+                ("explicitly non-detached start default", ["op": .string("start"), "detach": .bool(false)], fallback),
+                ("string detach is not Boolean true", ["op": .string("start"), "detach": .string("true")], fallback),
+                ("explicitly non-detached start", ["op": .string("start"), "detach": .bool(false), "timeout": .int(600)], 600 + margin),
+                ("non-detached start string timeout", ["op": .string(" Start "), "timeout": .string("900")], 900 + margin)
+            ]
+            for tool in ["oracle_send", "ask_oracle", "context_builder"] {
+                for testCase in cases {
+                    let deadline = await session.test_resolvedToolCallDeadline(
+                        toolName: tool, arguments: testCase.arguments, startedAtNanoseconds: startedAtNanoseconds
+                    )
+                    XCTAssertEqual(deadline.timeoutSeconds, testCase.expected, "\(tool): \(testCase.label)")
+                    XCTAssertEqual(deadline.expiresAtNanoseconds, startedAtNanoseconds + UInt64(testCase.expected * 1_000_000_000), "\(tool): \(testCase.label)")
+                }
+                for testCase in cases {
+                    let explicit = await session.test_resolvedToolCallDeadline(.seconds(90), toolName: tool, arguments: testCase.arguments)
+                    XCTAssertEqual(explicit.timeoutSeconds, 90)
+                    XCTAssertEqual(explicit.expiresAtNanoseconds, 90_000_000_000)
+                    let unbounded = await session.test_resolvedToolCallDeadline(.none, toolName: tool, arguments: testCase.arguments)
+                    XCTAssertNil(unbounded.timeoutSeconds)
+                    XCTAssertNil(unbounded.expiresAtNanoseconds)
+                }
+                let legacy = await session.test_resolvedToolCallDeadline(toolName: tool, arguments: ["timeout": .int(600)])
+                XCTAssertNil(legacy.timeoutSeconds)
+                XCTAssertNil(legacy.expiresAtNanoseconds)
+            }
+        }
+
         func testOracleSendDefaultDeadlineDoesNotAbandonPaidLanes() async {
             let session = makeUnconnectedSession()
             let defaultTimeout = await session.test_resolvedToolCallTimeout(toolName: "oracle_send")

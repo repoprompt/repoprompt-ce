@@ -9,10 +9,12 @@ actor ACPAgentSessionController {
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
         let operationalSeconds: TimeInterval
+        let cancellationSettlementSeconds: TimeInterval
 
-        init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
+        init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30, cancellationSettlementSeconds: TimeInterval = 15) {
             self.bootstrapSeconds = bootstrapSeconds
             self.operationalSeconds = operationalSeconds
+            self.cancellationSettlementSeconds = cancellationSettlementSeconds
         }
 
         static let `default` = RequestTimeouts(
@@ -309,6 +311,7 @@ actor ACPAgentSessionController {
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
     private var processWaitTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
     private var stdoutFramer = LineFramer()
     private var stderrFramer = LineFramer()
     private var launchDescription: String?
@@ -325,6 +328,8 @@ actor ACPAgentSessionController {
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
     private var recentDevinToolCalls: [String: [String: Any]] = [:]
     private var recentDevinToolCallIDs: [String] = []
+    /// Request-local display identity only; never permission/authorization evidence.
+    private var promptToolNames: [String: String] = [:]
     private var activePromptTurnID: UUID?
     private var activePromptOpenCodeStderrError: String?
     #if DEBUG
@@ -535,6 +540,7 @@ actor ACPAgentSessionController {
 
     #if DEBUG
         private var testRejectNextTurnPreparation = false
+        private var testShutdownCallerCount = 0
         private var testHoldNextSteeringInterrupt = false
         private var testSteeringInterruptEntered = false
         private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
@@ -824,6 +830,7 @@ actor ACPAgentSessionController {
         suppressSessionLoadReplayUpdates = false
         recentDevinToolCalls.removeAll()
         recentDevinToolCallIDs.removeAll()
+        promptToolNames.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
         resetActivePromptTrace()
@@ -908,7 +915,7 @@ actor ACPAgentSessionController {
                 if state == .promptRunning { state = .sessionOpen }
                 throw error
             }
-            if error is CancellationError {
+            if error is CancellationError || state == .closing || state == .closed {
                 throw error
             }
             let message = displayText(for: provider.normalizeError(error))
@@ -1585,19 +1592,33 @@ actor ACPAgentSessionController {
         }
     }
 
-    func cancelPrompt() async {
-        guard sessionID != nil else { return }
+    @discardableResult
+    func cancelPrompt() async -> Bool {
+        guard sessionID != nil else { return false }
+        let sent: Bool
         do {
             try sendSessionCancelNotification()
+            sent = true
         } catch {
             log("ACP cancel send failed: \(error.localizedDescription)")
+            sent = false
         }
         cancelPendingPermissionRequestsLocally()
+        return sent
     }
 
     #if DEBUG
         func debugPromptSettlementWaiterCount() -> Int {
             promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
+        }
+
+        func debugShutdownCallerCount() -> Int {
+            testShutdownCallerCount
+        }
+
+        func debugInjectProcessWaitFailure(_ error: Error) async -> Bool {
+            await handleProcessWaitFailure(error)
+            return eventStreamFinished
         }
     #endif
 
@@ -1767,16 +1788,45 @@ actor ACPAgentSessionController {
 
     func shutdown() async {
         #if DEBUG
+            testShutdownCallerCount += 1
+            defer { testShutdownCallerCount -= 1 }
+        #endif
+        // Teardown drains the provider's cancelled prompt before reaping it, so a later caller
+        // must wait for that same teardown instead of observing a half-closed controller.
+        // The task is unstructured: a stopped run's cancellation must not abort the drain.
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        guard state != .closed else { return }
+        #if DEBUG
             debugResumeConfigurationMutationPostcheck()
         #endif
-        guard state != .closed, state != .closing else { return }
         state = .closing
+        let task = Task { [self] in
+            await performShutdown()
+        }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func performShutdown() async {
         recentDevinToolCalls.removeAll()
         recentDevinToolCallIDs.removeAll()
         promptImagesSupported = false
         log("Shutting down ACP controller")
 
-        await cancelPrompt()
+        if await cancelPrompt(), let turnID = activePromptTurnID {
+            // session/cancel is a notification, not an acknowledgement. Keep readers and
+            // the process alive until the provider settles its prompt and persists terminal
+            // tool parts. Drain once, only at teardown and after a successful cancel write.
+            // A stopped run's cancellation must not abort this bounded transport drain.
+            do {
+                try await waitForPromptSettlement(turnID: turnID, timeoutSeconds: requestTimeouts.cancellationSettlementSeconds)
+            } catch {
+                log("ACP cancellation settlement drain failed: \(error.localizedDescription)")
+            }
+        }
         failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
 
@@ -2026,7 +2076,10 @@ actor ACPAgentSessionController {
             )
         #endif
         guard let update = params["update"] as? [String: Any] else { return }
-        let sessionID = (params["sessionId"] as? String) ?? sessionID ?? ""
+        let updateSessionID = params["sessionId"] as? String
+        // Late updates for another session must not enter either semantic output or activity.
+        if let updateSessionID, let sessionID, updateSessionID != sessionID { return }
+        let sessionID = updateSessionID ?? sessionID ?? ""
         #if DEBUG
             captureRawACPEvent(
                 kind: "session.update.raw",
@@ -2094,7 +2147,54 @@ actor ACPAgentSessionController {
             }
         }
 
-        let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
+        let isActiveRequest = activePromptTurnID != nil && updateSessionID == self.sessionID && !sessionID.isEmpty
+        let updateKind = (update["sessionUpdate"] as? String)?.lowercased()
+        let toolCallID = (update["toolCallId"] as? String).flatMap { raw in
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : raw
+        }
+        let knownToolName = toolCallID.flatMap { promptToolNames[$0] }
+        var normalizationPayload = update
+        let normalizedEvents: [NormalizedAgentRuntimeEvent]
+        if isActiveRequest, provider.providerID == .cursor, updateKind == "tool_call_update", let knownToolName {
+            if ["tool", "other"].contains(ACPRuntimeEventParsing.normalizedToolName(from: update).lowercased()) {
+                normalizationPayload["toolName"] = knownToolName
+            }
+            // A meaningful initial call established this request-local ID, even if its
+            // display name remained generic. Attribution is not a wire payload flag.
+            normalizedEvents = CursorACPEventNormalizer.normalize(
+                normalizationPayload, toolUpdateAdmission: .establishedInActiveRequest
+            )
+        } else {
+            normalizedEvents = provider.normalizeSessionUpdate(normalizationPayload, sessionID: sessionID)
+        }
+        // Only accepted, attributed request events certify nonsemantic progress. Session-load
+        // replay was excluded above; unknown updates and local timers never reach this seam.
+        if isActiveRequest {
+            let hasToolEvent = normalizedEvents.contains { event in
+                guard case let .stream(result) = event else { return false }
+                return result.type == "tool_call" || result.type == "tool_result"
+            }
+            if updateKind == "tool_call", let toolCallID, !toolCallID.isEmpty, hasToolEvent {
+                promptToolNames[toolCallID] = normalizedEvents.compactMap { event in
+                    if case let .stream(result) = event { return result.toolName }
+                    return nil
+                }.first
+            }
+            let isToolActivity = hasToolEvent && toolCallID?.isEmpty == false && (updateKind == "tool_call" || knownToolName != nil)
+            let isUsageActivity = updateKind == "usage_update" && normalizedEvents.contains { event in
+                if case let .stream(result) = event { return result.type == "usage" }
+                return false
+            }
+            if isToolActivity || isUsageActivity {
+                emit(.stream(AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)))
+            }
+            if updateKind == "tool_call_update", let toolCallID,
+               let status = (update["status"] as? String)?.lowercased(),
+               ["completed", "failed", "cancelled"].contains(status)
+            {
+                promptToolNames.removeValue(forKey: toolCallID)
+            }
+        }
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
         #endif
@@ -2163,6 +2263,21 @@ actor ACPAgentSessionController {
     }
 
     private func handlePermissionRequest(id: JSONRPCID, params: [String: Any]) {
+        // Shutdown keeps readers alive while the cancelled prompt settles, so a provider can still
+        // ask for permission after Stop. Teardown never grants new authority: answer `cancelled`
+        // before strict RepoPrompt or full-access auto-approval and before surfacing a prompt.
+        if state == .closing || state == .closed {
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": id.jsonValue,
+                    "result": ["outcome": ["outcome": "cancelled"]]
+                ])
+            } catch {
+                log("Failed to cancel ACP permission request \(id.displayValue) during shutdown: \(error.localizedDescription)")
+            }
+            return
+        }
         guard
             let sessionID = params["sessionId"] as? String,
             let toolCall = params["toolCall"] as? [String: Any]
@@ -2284,8 +2399,9 @@ actor ACPAgentSessionController {
     }
 
     private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
-        guard state != .closing, state != .closed else {
-            finishEventsIfNeeded()
+        guard state != .closed else { return }
+        if state == .closing {
+            settleTransportForProcessLossWhileClosing()
             return
         }
 
@@ -2307,8 +2423,9 @@ actor ACPAgentSessionController {
     }
 
     private func handleProcessWaitFailure(_ error: Error) async {
-        guard state != .closing, state != .closed else {
-            finishEventsIfNeeded()
+        guard state != .closed else { return }
+        if state == .closing {
+            settleTransportForProcessLossWhileClosing()
             return
         }
 
@@ -2325,6 +2442,14 @@ actor ACPAgentSessionController {
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()
         finishEventsIfNeeded()
+    }
+
+    /// Shutdown owns the state transition while it drains a cancelled prompt. A provider that
+    /// disappears during that drain can no longer settle it, so release the drain and any pending
+    /// requests now instead of letting teardown wait out the settlement timeout.
+    private func settleTransportForProcessLossWhileClosing() {
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
     }
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {

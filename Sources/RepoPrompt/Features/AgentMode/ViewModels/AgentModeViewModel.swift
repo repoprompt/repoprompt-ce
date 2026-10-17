@@ -13182,30 +13182,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         transcript: AgentTranscript,
         runState: AgentSessionRunState
     ) -> AgentTranscriptPresentationMetadata {
-        let latestContextBuilderCall = visibleRows.last(where: { item in
-            item.kind == .toolCall && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let latestContextBuilderResult = visibleRows.last(where: { item in
-            item.kind == .toolResult && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let activeContextBuilderCallID: UUID? = {
-            guard let call = latestContextBuilderCall else { return nil }
-            if let result = latestContextBuilderResult,
-               result.sequenceIndex > call.sequenceIndex
-            {
-                return nil
-            }
-            return call.id
-        }()
-        let activeContextBuilderResultID: UUID? = {
-            guard let result = latestContextBuilderResult else { return nil }
-            if let call = latestContextBuilderCall,
-               call.sequenceIndex > result.sequenceIndex
-            {
-                return nil
-            }
-            return result.id
-        }()
+        let contextBuilder = ContextBuilderTranscriptMetadata(rows: visibleRows)
         let mostRecentEditID = visibleRows.last(where: { item in
             guard item.kind == .toolResult,
                   let toolName = normalizedToolCardName(item.toolName)
@@ -13249,8 +13226,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             latestTurnID: transcript.turns.last?.id,
             dynamicSummaryLockTargetTurnID: dynamicSummaryLockTargetTurnID,
             recentAssistantItemIDs: recentAssistantItemIDs,
-            activeContextBuilderCallItemID: activeContextBuilderCallID,
-            activeContextBuilderResultItemID: activeContextBuilderResultID,
+            contextBuilder: contextBuilder,
             mostRecentEditItemID: mostRecentEditID
         )
     }

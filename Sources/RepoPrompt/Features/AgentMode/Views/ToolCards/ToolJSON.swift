@@ -63,6 +63,20 @@ enum ToolJSON {
         cache.projection(T.self, variant: "result", primary: json) {
             guard let directData = data(from: json) else { return nil }
             let decoder = JSONDecoder()
+            // Validated native replies outrank provider lifecycle/content at this bounded boundary.
+            if type == ToolResultDTOs.ChatSendDTO.self,
+               let json, let nativeData = ToolResultDTOs.ChatSendDTO.nativeOracleReplyJSONData(from: json),
+               let native = try? decoder.decode(type, from: nativeData)
+            {
+                return native
+            }
+            // A validated job ticket describes the builder run; ACP content may only describe its control call.
+            if type == ToolResultDTOs.ContextBuilderDTO.self,
+               let direct = try? decoder.decode(type, from: directData),
+               (direct as? ToolResultDTOs.ContextBuilderDTO)?.ticket != nil
+            {
+                return direct
+            }
             if let nestedJSON = preferredStructuredResultJSON(from: json, requireEnvelope: true, cache: cache),
                let nestedData = data(from: nestedJSON),
                let nested = try? decoder.decode(type, from: nestedData)
