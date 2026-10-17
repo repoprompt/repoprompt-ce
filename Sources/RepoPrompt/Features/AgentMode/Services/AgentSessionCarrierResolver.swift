@@ -5,6 +5,17 @@ import Foundation
 @MainActor
 enum AgentSessionCarrierResolver {
     weak static var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
+
+    /// Evidence for projecting an already acknowledged workspace group-order edit. Only the exact
+    /// before/after rank may differ; every other carrier and placement conflict remains visible.
+    struct AcknowledgedGroupOrder {
+        let workspaceID: UUID
+        let tabID: UUID
+        let group: String
+        let before: Int?
+        let after: Int?
+    }
+
     struct Observation {
         let window: WindowState
         let workspaceID: UUID
@@ -91,7 +102,7 @@ enum AgentSessionCarrierResolver {
         let isPinned: Bool
         let pinnedOrder: Int?
         let group: String?
-        let groupOrder: Int?
+        var groupOrder: Int?
 
         init(_ tab: ComposeTabState, workspaceName: String?) {
             name = tab.name
@@ -117,7 +128,10 @@ enum AgentSessionCarrierResolver {
         let directCarriers: [WorkspaceManagerViewModel.SessionCarrier]
     }
 
-    static func capture(windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil) -> Snapshot {
+    static func capture(
+        windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil,
+        acknowledgedGroupOrders: [UUID: AcknowledgedGroupOrder] = [:]
+    ) -> Snapshot {
         var seenWindows: Set<ObjectIdentifier> = []
         // Prepared runtimes borrow a saved carrier; they are not a second physical/UI claim.
         // Their exact saved witness is joined below only after real carrier conflicts are checked.
@@ -248,7 +262,17 @@ enum AgentSessionCarrierResolver {
                     snapshot.sessionIDs.insert(id)
                     snapshot.claimedWorkspaceIDs[id, default: []].insert(carrier.workspaceID)
                     physicalKeys[id, default: []].insert(key)
-                    let presentation = Presentation(tab, workspaceName: window.workspaceManager.workspace(withID: carrier.workspaceID)?.name)
+                    var presentation = Presentation(tab, workspaceName: window.workspaceManager.workspace(withID: carrier.workspaceID)?.name)
+                    if let acknowledged = acknowledgedGroupOrders[id] {
+                        guard carrier.workspaceID == acknowledged.workspaceID, tab.id == acknowledged.tabID,
+                              carrier.stashedTabID == nil, tab.sidebarGroup == acknowledged.group,
+                              tab.sidebarGroupOrder == acknowledged.before || tab.sidebarGroupOrder == acknowledged.after
+                        else {
+                            snapshot.ambiguousSessionIDs.insert(id)
+                            continue
+                        }
+                        presentation.groupOrder = acknowledged.after
+                    }
                     let sourceWindow = ObjectIdentifier(window)
                     if var existing = physical[id] {
                         if existing.key != key || existing.presentation != presentation || !existing.sourceWindows.insert(sourceWindow).inserted {

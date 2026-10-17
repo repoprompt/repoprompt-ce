@@ -1639,6 +1639,45 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets([:]))
     }
 
+    func testCursorOnlyWaitReplaysBothPolledTargetsAndSuccessorCursors() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected the second managed link") }
+
+        let requested = [second.sessionID, fixture.target.sessionID].map { Value.string($0.uuidString) }
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_ids": .array(requested)
+        ])
+        var rows = try XCTUnwrap(polled["targets"]?.arrayValue)
+        // Replay only the cursor records returned by the public tool. No separately supplied
+        // session_ids can hide a mismatch between target inference and cursor admission.
+        for _ in 0 ..< 2 {
+            XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, requested.map(Optional.some))
+            let cursors = try rows.map { row -> Value in
+                let fields = try XCTUnwrap(row.objectValue)
+                return try .object([
+                    "session_id": XCTUnwrap(fields["session_id"]),
+                    "cursor": XCTUnwrap(fields["wait_cursor"])
+                ])
+            }
+            let waited = try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"), "cursors": .array(cursors),
+                "until": .string("change"), "timeout_seconds": .int(0)
+            ])
+            XCTAssertEqual(waited["result"], .string("timeout"))
+            XCTAssertNil(waited["unavailable_session_ids"])
+            rows = try XCTUnwrap(waited["targets"]?.arrayValue)
+        }
+        XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, requested.map(Optional.some))
+        let authorityState = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityState.parkedWaiterCount, 0, "Every completed wait releases its slot")
+    }
+
     func testCreateLaneUsesResolvedCallerOnceAndReportsHostAndSelectorFailures() async throws {
         try await withActivatedLaneFixture { fixture in
             var windowReads = 0
@@ -1672,10 +1711,86 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let rejected = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("rejected")])
             XCTAssertEqual(rejected["subreason"], .string("lane_creation_rejected"))
             XCTAssertEqual(rejected["detail"], .string("binding was not durably accepted"))
-            XCTAssertEqual(rejected["retryable"], .bool(true))
+            XCTAssertEqual(rejected["retryable"], .bool(false))
+            XCTAssertNil(rejected["next_call"])
             fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.destinationChanged
             let changed = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("changed")])
             XCTAssertEqual(changed["subreason"], .string("destination_changed"))
+        }
+    }
+
+    func testCreateLanePreservesPrecommitDiagnosticAndReusesUnallocatedKey() async throws {
+        try await withActivatedLaneFixture { fixture in
+            let args: [String: Value] = ["op": .string("create_lane"), "idempotency_key": .string("admission-recovery")]
+            fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.admissionRejected(.init(
+                reason: "workspace_persistence_rejected",
+                saveResult: "workspace_save_failed",
+                category: "authority_revision_conflict",
+                domainDiagnostic: "workspace_revision_mismatch",
+                domainErrorCode: DomainCommandErrorCode.stateConflict.rawValue,
+                workingCommitted: false
+            ))
+            let rejected = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(rejected["result"], .string("workspace_admission_rejected"))
+            XCTAssertEqual(rejected["stage"], .string("workspace_admission"))
+            XCTAssertEqual(rejected["subreason"], .string("workspace_persistence_rejected"))
+            XCTAssertEqual(rejected["failure_category"], .string("authority_revision_conflict"))
+            XCTAssertEqual(rejected["authority_diagnostic"], .string("workspace_revision_mismatch"))
+            XCTAssertEqual(rejected["authority_error"], .string(DomainCommandErrorCode.stateConflict.rawValue))
+            XCTAssertEqual(rejected["working_committed"], .bool(false))
+            XCTAssertEqual(rejected["retryable"], .bool(false), "A repeated tool call does not repair persistence")
+            XCTAssertNil(rejected["next_call"], "Neither workspace listing nor scope discovery repairs admission")
+            XCTAssertNil(rejected["session_id"])
+            XCTAssertEqual(fixture.host.laneCreationCount, 0)
+            XCTAssertTrue(fixture.host.firstTaskRequests.isEmpty)
+
+            fixture.host.laneCreationError = nil
+            let created = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(created["result"], .string("created"))
+            let replay = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(replay["session_id"], created["session_id"])
+            XCTAssertEqual(replay["duplicate"], .bool(true))
+            XCTAssertEqual(fixture.host.laneCreationCount, 1, "Recovery must not require a new key or duplicate a lane")
+        }
+    }
+
+    func testRetainedAdmissionReplaysItsIdentityWithoutAllocatingOrDispatchingAgain() async throws {
+        try await withActivatedLaneFixture { fixture in
+            fixture.host.laneAdmissionRecovery = .blockedManual(WorkspacePersistenceFailureCategory.authorityReadOnly.rawValue)
+            let args: [String: Value] = [
+                "op": .string("create_lane"), "idempotency_key": .string("retained-admission"),
+                "message": .string("MUST_NOT_SEND")
+            ]
+            let first = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(first["result"], .string("creation_incomplete"))
+            XCTAssertEqual(first["stage"], .string("workspace_admission"))
+            XCTAssertEqual(first["authority_diagnostic"], .string("durable_save_revision_mismatch"))
+            XCTAssertEqual(first["working_committed"], .bool(true))
+            XCTAssertEqual(first["recovery_state"], .string("blocked_manual"))
+            XCTAssertEqual(first["recovery_category"], .string(WorkspacePersistenceFailureCategory.authorityReadOnly.rawValue))
+            XCTAssertEqual(first["linked"], .bool(false))
+            XCTAssertEqual(first["first_task"], .string("none"))
+            XCTAssertEqual(first["retryable"], .bool(false))
+            XCTAssertNil(first["next_call"])
+            let allocated = try XCTUnwrap(fixture.host.candidates.last)
+            XCTAssertEqual(first["session_id"], .string(allocated.sessionID.uuidString))
+            XCTAssertEqual(first["tab_id"], .string(allocated.tabID.uuidString))
+            XCTAssertEqual(first["workspace_id"], .string(allocated.workspaceID.uuidString))
+
+            fixture.host.laneAdmissionRecovery = nil
+            let replay = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(replay["result"], .string("creation_incomplete"))
+            XCTAssertEqual(replay["session_id"], first["session_id"])
+            XCTAssertEqual(replay["duplicate"], .bool(true))
+            XCTAssertEqual(fixture.host.laneCreationCount, 1, "Clearing recovery must not make a retained key allocate another session")
+            XCTAssertTrue(fixture.host.firstTaskRequests.isEmpty)
+            let links = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+            XCTAssertTrue(links.items.isEmpty)
+            var changed = args
+            changed["message"] = .string("DIFFERENT_REQUEST")
+            let conflict = try await Self.executeObject(fixture.service, args: changed)
+            XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
+            XCTAssertEqual(fixture.host.laneCreationCount, 1)
         }
     }
 
@@ -1697,7 +1812,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let rendered = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
         XCTAssertEqual(rendered["result"], .string("destination_unavailable"))
         XCTAssertEqual(rendered["subreason"], .string("caller_window_has_no_workspace"))
-        XCTAssertEqual(rendered["next_call"], .object(["tool": .string("manage_workspaces"), "arguments": .object(["action": .string("list")])]))
+        XCTAssertNil(rendered["next_call"], "An unavailable workspace tool is not executable recovery")
     }
 
     func testLaneWorkspaceDigestUsesExactlyDestinationNameEquivalence() {
@@ -3628,6 +3743,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var laneCreationCount = 0
         var laneCreationError: (any Error)?
+        var laneAdmissionRecovery: AgentSessionLaneAdmissionFailure.RetainedAdmission.Recovery?
         private(set) var lastLaneSelection: AgentSessionLanePolicy.RoleSelection?
 
         func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
@@ -3673,6 +3789,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             candidates.append(lane)
             laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
             await duringLaneCreation?(lane.domainEndpoint)
+            if let laneAdmissionRecovery {
+                throw AgentSessionLaneDestinationFailure.admissionRejected(.init(
+                    reason: "workspace_persistence_rejected", saveResult: "workspace_save_failed",
+                    category: "authority_revision_conflict", domainDiagnostic: "durable_save_revision_mismatch",
+                    domainErrorCode: DomainCommandErrorCode.stateConflict.rawValue, workingCommitted: true,
+                    retainedAdmission: .init(
+                        identity: .init(recoveryID: UUID(), workspaceID: workspaceID, tabID: lane.tabID, sessionID: lane.sessionID, replacementTabID: UUID()),
+                        recovery: laneAdmissionRecovery
+                    )
+                ))
+            }
             if failLaneSave { return .creationIncomplete(sessionID: lane.sessionID, tabID: lane.tabID) }
             return .created(sessionID: lane.sessionID, tabID: lane.tabID, bindingToken: token)
         }

@@ -219,30 +219,47 @@ final class OverseerAuthorizationEngine {
             return fullAccessFallback(
                 request, explicitScope: record, global: global, callerSessionID: callerSessionID, projector: projector
             )
-        } else if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) {
-            // Full access: the one unrestricted grant covers every operation and session, with no
-            // request, no scope choice and no card. Authorization below still runs against it.
-            scope = global
         } else {
-            let live = scopes.liveScopes(grantedTo: callerSessionID)
-            var required = request.operation.requiredScopeCapabilities(for: .idle)
-            if request.operation == .adminLink { required.formUnion([.observe, .control]) }
-            let capable = live.filter { record in
-                scopes.scopeChain(from: record.id).allSatisfy { required.isSubset(of: $0.grant.capabilities) }
+            let selection = implicitAdministrationScopes(request, callerSessionID: callerSessionID)
+            guard let selected = selection.first, selection.count == 1 else {
+                return selection.isEmpty ? .denied(.unknownScope, sessionID: nil)
+                    : .scopeSelectionRequired(scopeIDs: selection.map(\.id))
             }
-            // Select by capability only, never guess from target membership. The ordinary authority
-            // below still proves membership, state-dependent capabilities, guardrails and leases.
-            if capable.count == 1 {
-                scope = capable[0]
-            } else if live.count == 1 {
-                scope = live[0] // Preserve the actionable capability-missing result.
-            } else if live.isEmpty {
-                return .denied(.unknownScope, sessionID: nil)
-            } else {
-                return .scopeSelectionRequired(scopeIDs: (capable.isEmpty ? live : capable).map(\.id))
-            }
+            scope = selected
         }
         return authorize(request, scope: scope, callerSessionID: callerSessionID, projector: projector)
+    }
+
+    /// Target derivation uses the same scope choice as execution, including the first full-access
+    /// call before a grant has been materialized. Selection grants no access to group names: the
+    /// front door still proves discovery capabilities and each carrier's membership.
+    func scopeForAdministrationShaping(_ request: AgentSessionAdministrationRequest) -> DomainDelegationScopeRecord? {
+        guard let scopes, let callerSessionID = request.caller.agentSessionID else { return nil }
+        scopes.reconcileGlobalAutoApprove()
+        if let scopeID = request.scopeID {
+            guard let record = scopes.record(id: scopeID),
+                  record.grant.granteeSessionID == callerSessionID else { return nil }
+            if waives(.restrictedScopeNarrowing), !record.grant.unrestricted,
+               let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) { return global }
+            return record.isActive ? record : nil
+        }
+        let selection = implicitAdministrationScopes(request, callerSessionID: callerSessionID)
+        return selection.count == 1 ? selection[0] : nil
+    }
+
+    private func implicitAdministrationScopes(
+        _ request: AgentSessionAdministrationRequest, callerSessionID: UUID
+    ) -> [DomainDelegationScopeRecord] {
+        guard let scopes else { return [] }
+        if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) { return [global] }
+        let live = scopes.liveScopes(grantedTo: callerSessionID)
+        var required = request.operation.requiredScopeCapabilities(for: .idle)
+        if request.operation == .adminLink { required.formUnion([.observe, .control]) }
+        let capable = live.filter { record in
+            scopes.scopeChain(from: record.id).allSatisfy { required.isSubset(of: $0.grant.capabilities) }
+        }
+        // Select by capability only; membership and every current lease are proved after shaping.
+        return capable.count == 1 ? capable : live.count == 1 || capable.isEmpty ? live : capable
     }
 
     /// The caller's explicitly named restricted scope would not admit the whole request: a denial, a
@@ -327,12 +344,15 @@ final class OverseerAuthorizationEngine {
         // session its parents could not.
         let chain = scopes.scopeChain(from: scope.id)
         var memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:]
+        var replicatedMutationTarget: UUID?
         for target in request.targetSessionIDs {
-            // `canonicalMutationOwner`: equal mirrors can supply a read proof, but no current canonical
-            // write owner has been established. Refuse before confirmation or effects rather than
-            // mutate one presentation and make the returned undo token immediately unusable.
-            if request.operation.mutatesTarget, projector.pointResolutionState(for: target) == .replicated {
-                return .denied(.membershipProofMissing, sessionID: target)
+            // Session payload mutations still require one runtime owner. Group ordering mutates
+            // workspace presentation instead; its backend admits an exact workspace writer at
+            // commit, while discovery needs only the read membership proved below.
+            if request.operation.mutatesTarget, request.operation != .adminReorderGroups,
+               projector.pointResolutionState(for: target) == .replicated
+            {
+                replicatedMutationTarget = replicatedMutationTarget ?? target
             }
             memberships[target] = chain.compactMap { projector.membershipProof(for: target, in: $0.grant) }
         }
@@ -382,8 +402,10 @@ final class OverseerAuthorizationEngine {
         }
         switch outcome {
         case let .authorized(items):
+            if let replicatedMutationTarget { return .denied(.mutationOwnerUnavailable, sessionID: replicatedMutationTarget) }
             return .authorized(batch(items))
         case let .confirmationRequired(reason, items):
+            if let replicatedMutationTarget { return .denied(.mutationOwnerUnavailable, sessionID: replicatedMutationTarget) }
             return .confirmationRequired(reason, batch(items))
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)

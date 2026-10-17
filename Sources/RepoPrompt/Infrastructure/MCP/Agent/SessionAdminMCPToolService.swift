@@ -520,6 +520,11 @@ struct SessionAdminMCPToolService {
         }
         var value: [String: Value] = ["result": .string("denied"), "code": .string(code)]
         switch denial {
+        case .mutationOwnerUnavailable:
+            value["subreason"] = .string("replicated_binding")
+            value["detail"] = .string("Your scope covers this session, but it has multiple agreeing runtime presentations and this operation needs one current session writer. Ask the user to keep one presentation of the target open, then retry the same operation.")
+            value["retryable"] = .bool(false)
+            value["recovery"] = .string("manual")
         case let .capabilityMissing(capability):
             value["capability"] = .string(capability.rawValue)
             value["detail"] = .string("This scope lacks \(capability.rawValue). Request a new scope including \(capability.rawValue) by calling session_admin request_scope with all capabilities needed by the operation; wait for the user's approval. Call session_admin scope_status for the operation catalog and your current grants. \(inventoryGuidance)")

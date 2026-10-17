@@ -347,6 +347,22 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
     @MainActor
     final class FakeProvenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
+        var resolutionStates: [UUID: DelegationSessionResolutionState] = [:]
+
+        func resolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+            resolutionStates[sessionID] ?? (sessions[sessionID] == nil ? .absent : .indexOnly)
+        }
+
+        func pointSnapshot(for sessionIDs: Set<UUID>) -> DelegationProvenanceSnapshot {
+            .init(
+                records: sessions.filter { sessionIDs.contains($0.key) },
+                states: Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, resolutionState(for: $0)) })
+            )
+        }
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            .init(records: sessions, states: sessions.mapValues { resolutionState(for: $0.sessionID) })
+        }
 
         func add(
             _ id: UUID,
@@ -648,7 +664,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         receipt.refusalStage = "host_allocation"
         let value = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
         XCTAssertEqual(value["subreason"], .string("lane_creation_rejected"))
-        XCTAssertEqual(value["retryable"], .bool(true))
+        XCTAssertEqual(value["retryable"], .bool(false))
+        XCTAssertNil(value["next_call"])
         XCTAssertTrue(value["detail"]?.stringValue?.contains("workspace_persistence_rejected") == true)
         XCTAssertFalse(value["hint"]?.stringValue?.contains("No unambiguous active destination") == true)
     }
@@ -4248,6 +4265,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var otherWindowRunStates: [UUID: DomainDelegationScopeTargetState] = [:]
         /// Runs inside each per-session stash, at its suspension point before the commit-time check.
         var onStashSuspension: (@MainActor (UUID) -> Void)?
+        var beforeGroupOrderCommit: (@MainActor () async -> Void)?
 
         func add(
             _ id: UUID, workspace: UUID, name: String, pinned: Bool = false, pinnedOrder: Int? = nil,
@@ -4329,6 +4347,21 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 changed.insert(id)
             }
             return changed
+        }
+
+        func commitGroupOrderValues(
+            _ values: [UUID: Int?], workspaceID: UUID,
+            expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
+            isAuthorized: @escaping @MainActor (UUID) -> Bool
+        ) async -> AgentSessionGroupOrderWriteOutcome {
+            await beforeGroupOrderCommit?()
+            guard !Task.isCancelled, affectedSessionIDs.allSatisfy(isAuthorized) else {
+                return .init(failure: "scope_no_longer_current")
+            }
+            let entries = groupEntries(workspaceID: workspaceID) ?? []
+            guard Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }) == expected
+            else { return .init(failure: "group_state_changed") }
+            return .init(changed: setGroupOrderValues(values))
         }
 
         func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState {
@@ -4709,6 +4742,75 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(shared["result"], .string("groups_outside_scope"))
         XCTAssertFalse(String(describing: shared).contains(outsider.uuidString))
         XCTAssertEqual(fixture.organizer.states[outsider]?.sidebarGroupOrder, 1)
+    }
+
+    func testReplicatedMutationRefusalRequiresAuthorizedTargetBeforeDisclosingWriterConflict() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        let fixture = Fixture()
+        let member = fixture.member("Member")
+        let outsider = fixture.outsider("Private")
+        let unknown = UUID()
+        for id in [member, outsider, unknown] {
+            fixture.provenance.resolutionStates[id] = .replicated
+        }
+        let noGrant = try await fixture.call([
+            "op": .string("rename"), "session_id": .string(member.uuidString), "name": .string("Changed")
+        ])
+        XCTAssertNotEqual(noGrant["code"], .string("mutation_owner_unavailable"))
+        try fixture.grant([.observe, .organize])
+        for id in [outsider, unknown] {
+            do {
+                let refused = try await fixture.call([
+                    "op": .string("rename"), "session_id": .string(id.uuidString), "name": .string("Changed")
+                ])
+                XCTAssertNotEqual(refused["code"], .string("mutation_owner_unavailable"))
+            } catch {
+                XCTAssertFalse(String(describing: error).contains("mutation_owner_unavailable"))
+                XCTAssertFalse(String(describing: error).contains("Private"))
+            }
+        }
+        let refused = try await fixture.call([
+            "op": .string("rename"), "session_id": .string(member.uuidString), "name": .string("Changed")
+        ])
+        XCTAssertEqual(refused["code"], .string("mutation_owner_unavailable"))
+        XCTAssertEqual(refused["subreason"], .string("replicated_binding"))
+        XCTAssertEqual(refused["retryable"], .bool(false))
+        XCTAssertNil(refused["next_call"])
+        XCTAssertEqual(fixture.organizer.states[member]?.name, "Member")
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRechecksAuthorityAndCapturedOrderAfterCommitSuspension() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        for change in ["revoke", "rank"] {
+            let fixture = Fixture()
+            let a = fixture.member("A", group: "Alpha")
+            let b = fixture.member("B", group: "Beta")
+            fixture.organizer.states[a]?.sidebarGroupOrder = 0
+            fixture.organizer.states[b]?.sidebarGroupOrder = 1
+            let scope = try fixture.grant([.observe, .organize])
+            fixture.organizer.beforeGroupOrderCommit = {
+                await Task.yield()
+                if change == "revoke" { fixture.runtime.revoke(scopeID: scope.id) }
+                else { fixture.organizer.states[a]?.sidebarGroupOrder = 9 }
+            }
+            let reply = try await fixture.call([
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+                "order": .array([.string("Beta"), .string("Alpha")]),
+                "expected_order": .array([.string("Alpha"), .string("Beta")])
+            ])
+            XCTAssertEqual(reply["changed_count"], .int(0), change)
+            XCTAssertTrue(fixture.organizer.written.isEmpty, change)
+            XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 1, change)
+            XCTAssertNil(reply["undo_token"], change)
+            let reasons = reply["items"]?.arrayValue?.compactMap { $0.objectValue?["reason"]?.stringValue } ?? []
+            XCTAssertEqual(Set(reasons), [change == "revoke" ? "scope_no_longer_current" : "group_state_changed"])
+            if change == "rank" { XCTAssertNil(reply["next_call"], "A changed workspace is not repaired by requesting scope") }
+        }
     }
 
     func testReorderGroupsMissingOrderReturnsExecutableAuthorizedRecovery() async throws {
@@ -10271,7 +10373,9 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
 
             // Canonical write ownership holds on both authorization passes.
             fixture.provenance.resolutionStates[member] = .replicated
-            guard case let .denied(.membershipProofMissing, refused) = authorize(.adminRename, scope: observeOnly.id) else {
+            guard case let .denied(denial, refused) = authorize(.adminRename, scope: observeOnly.id),
+                  denial == (fullAccess ? .mutationOwnerUnavailable : .capabilityMissing(.organize))
+            else {
                 return XCTFail("a replicated mutation target stays refused, fullAccess=\(fullAccess)")
             }
             XCTAssertEqual(refused, member)

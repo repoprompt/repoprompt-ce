@@ -158,7 +158,8 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             backend: backend,
             isLeaseCurrent: isLeaseCurrent,
             holdsControl: holdsControl,
-            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false }
+            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false },
+            isGroupOrderLeaseCurrent: isReadLeaseCurrent
         ))
         register(AgentSessionReleaseOperationHandler(
             backend: backend,
@@ -214,7 +215,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         // goes straight to the core, which owns every denial.
         guard handlers[request.operation] != nil,
               let callerSessionID = request.caller.agentSessionID,
-              let scope = selectScope(request, callerSessionID: callerSessionID)
+              let scope = scopes.authorization.scopeForAdministrationShaping(request)
         else { return try await core.perform(request) }
         // Cards left behind on a tab that no longer shows the caller can never be presented again;
         // release their pending slots before the call may need a new card.
@@ -608,17 +609,6 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         guard let object = value.objectValue else { return false }
         return (object["changed_count"]?.intValue ?? 0) > 0
             || object[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
-    }
-
-    private func selectScope(_ request: AgentSessionAdministrationRequest, callerSessionID: UUID) -> DomainDelegationScopeRecord? {
-        if let scopeID = request.scopeID {
-            guard let record = scopes.record(id: scopeID), record.isActive, record.grant.granteeSessionID == callerSessionID else {
-                return nil
-            }
-            return record
-        }
-        let live = scopes.liveScopes(grantedTo: callerSessionID)
-        return live.count == 1 ? live[0] : nil
     }
 
     func isMember(_ sessionID: UUID, of scope: DomainDelegationScopeRecord) -> Bool {

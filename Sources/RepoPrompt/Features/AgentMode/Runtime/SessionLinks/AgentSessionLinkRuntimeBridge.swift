@@ -8567,10 +8567,29 @@ final class AgentSessionLinkRuntimeBridge {
             receipt.refusalStage = "scope_admission"
             return receipt
         } catch let failure as AgentSessionLaneDestinationFailure {
-            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            let reason: AgentSessionLaneCreateReceipt.Reason = if case .admissionRejected = failure {
+                .workspaceAdmissionRejected
+            } else { .destinationUnavailable }
+            var receipt: AgentSessionLaneCreateReceipt
+            if case let .admissionRejected(admission) = failure, let retained = admission.retainedAdmission {
+                // Recovery has not proved removal of this exact provisional identity. Retain the
+                // request in the existing incomplete ledger, including when admission was cancelled.
+                receipt = await AgentSessionLaneCreateReceipt(
+                    result: .creationIncomplete, sessionID: retained.identity.sessionID,
+                    sessionName: request.sessionName, linked: false, reason: reason, firstTask: .none,
+                    laneCount: linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
+                )
+                receipt.workspaceName = workspaceName
+            } else {
+                receipt = .refused(reason)
+            }
             receipt.destinationFailure = failure
             receipt.refusalStage = "host_allocation"
             if case let .creationRejected(detail) = failure { receipt.refusalDetail = detail }
+            if case let .admissionRejected(admission) = failure {
+                receipt.refusalDetail = admission.detail
+                receipt.refusalStage = "workspace_admission"
+            }
             return receipt
         } catch {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)

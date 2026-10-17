@@ -456,6 +456,16 @@ final class DomainWorkspacePresentationBridge {
         }
     }
 
+    /// Admission joins the existing catalog owner before creating or re-submitting a provisional
+    /// binding. Reading a newer revision alone never qualifies a local whole-document write.
+    func refreshForAgentAdmission() async -> Bool {
+        guard let runID = subscriptionRunID, isCurrentRun(runID) else { return false }
+        requestCatalogRefresh(isRetry: false)
+        guard let task = catalogRefreshTask else { return false }
+        await task.value
+        return isCurrentRun(runID)
+    }
+
     /// Close/stop cancellation: never publishes an error. A task already inside runtime I/O may finish
     /// there; its result is discarded by the run/cancellation checks.
     func cancelCatalogRefresh() {

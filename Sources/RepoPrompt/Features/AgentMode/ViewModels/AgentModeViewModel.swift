@@ -10444,7 +10444,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: intendedSessionID,
                 parentSessionID: parentSessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
             let createdTabID = creation.tabID
             defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
@@ -10620,7 +10621,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID,
         parentSessionID: UUID?,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard promptManager != nil else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10633,7 +10635,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 name: name,
                 sessionID: sessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
         } catch {
             provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
@@ -10645,7 +10648,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         name: String?,
         sessionID: UUID,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard let promptManager else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10692,7 +10696,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 removePendingUIRefresh(for: creation.session.tabID)
             }
         }
-        switch try await promptManager.createDurableBackgroundAgentSessionTab(
+        let admissionResult = try await promptManager.createDurableBackgroundAgentSessionTab(
             name: name,
             sessionID: sessionID,
             expectedWorkspaceID: expectedWorkspaceID,
@@ -10704,7 +10708,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 return true
             }
-        ) {
+        )
+        switch admissionResult {
         case let .created(createdTab, receipt, recoveryClaim):
             let identity = receipt.outcome.workspaceID.map {
                 AgentSessionLifecycleAuthority.Identity(
@@ -10735,22 +10740,58 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 recoveryClaim: recoveryClaim,
                 freshSession: capturedFreshSession
             )
-        case let .rejected(receipt, reason):
+        case let .rejected(receipt, reason), let .recoveryRequired(_, receipt, reason, _):
+            let retainedAdmission: AgentSessionLaneAdmissionFailure.RetainedAdmission?
+            if case let .recoveryRequired(identity, _, _, recovery) = admissionResult {
+                let recoveryValue: AgentSessionLaneAdmissionFailure.RetainedAdmission.Recovery = switch recovery {
+                case .recovered: .recovered
+                case .alreadyRecovered: .alreadyRecovered
+                case .localOnly: .localOnly
+                case .ownershipChanged: .ownershipChanged
+                case .retryablePartial: .retryablePartial
+                case let .failed(category): .failed(category.rawValue)
+                case let .blockedManual(category): .blockedManual(category.rawValue)
+                }
+                retainedAdmission = .init(identity: identity, recovery: recoveryValue)
+            } else {
+                retainedAdmission = nil
+            }
+            let retainedLifecycleIdentity = retainedAdmission.map {
+                AgentSessionLifecycleAuthority.Identity(
+                    workspaceID: $0.identity.workspaceID,
+                    tabID: $0.identity.tabID,
+                    sessionID: $0.identity.sessionID,
+                    persistentBindingGeneration: nil,
+                    bindingTransitionGeneration: 0
+                )
+            }
             sessionLifecycleAuthority.record(.init(
                 caller: .agentRunStart,
                 intent: .createOrContinue,
                 phase: .beforeProviderStart,
                 decision: .rejected,
-                identity: tentativeIdentity,
+                identity: retainedLifecycleIdentity ?? tentativeIdentity,
                 previousSessionID: nil,
                 currentSessionID: sessionID,
                 isPinned: false,
                 isLive: false,
                 isActive: false,
-                isProtected: false,
+                isProtected: retainedAdmission != nil,
                 workspaceSaveResult: receipt.outcome.diagnosticCategory,
                 reason: reason.rawValue
             ))
+            if case .oversightLane = creationKind {
+                throw AgentSessionLaneAdmissionFailure(
+                    reason: reason.rawValue,
+                    saveResult: receipt.outcome.diagnosticCategory,
+                    category: receipt.outcome.normalizedFailureCategory?.rawValue ?? "none",
+                    domainDiagnostic: receipt.outcome.domainDiagnostic,
+                    domainErrorCode: receipt.outcome.domainErrorCode?.rawValue,
+                    workingCommitted: receipt.outcome.workingCommitted || receipt.commitEvidence != .none,
+                    retainedAdmission: retainedAdmission
+                )
+            }
+            if retainedAdmission != nil, Task.isCancelled { throw CancellationError() }
             throw MCPError.internalError(
                 "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory), category=\(receipt.outcome.normalizedFailureCategory?.rawValue ?? "none")). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
             )

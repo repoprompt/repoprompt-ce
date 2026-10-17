@@ -196,6 +196,12 @@ enum SessionAdminReply {
             "The workspace or tab carrier changed before restoration. Inspect the session and resolve conflicting tab identities before retrying undo."
         case "persistence_rejected", "persistence_unconfirmed":
             "The local restore changed state but its workspace save was not acknowledged. Inspect the current session and resolve the save failure; do not blindly repeat the mutation."
+        case "workspace_writer_unavailable":
+            "The groups are readable, but no current workspace writer could accept their order. Ask the user to resolve the workspace's save or duplicate-binding conflict, then inspect the groups again."
+        case "group_state_changed", "group_projection_changed":
+            "The workspace's group carriers or presentation changed while this request ran. Inspect the current group order before submitting another change; any committed_changes reported here remain committed."
+        case "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete":
+            "The workspace owner could not confirm the complete group-order save. Inspect local_changes and committed_changes, resolve the workspace save failure, and read the current order before another mutation."
         case "no_change":
             "No item changed. Inspect current state before choosing another operation."
         default:
@@ -211,6 +217,10 @@ enum SessionAdminReply {
         if code == "target_busy" { result["retryable"] = .bool(true) }
         // Nothing failed, so there is no recovery call to suggest.
         if code == "no_change" { result.removeValue(forKey: "next_call") }
+        if ["workspace_writer_unavailable", "group_state_changed", "group_projection_changed", "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete"].contains(code) {
+            result.removeValue(forKey: "next_call")
+            result["recovery"] = .string("manual")
+        }
         if let sessionID = sessionIDs.first,
            ["replicated_binding", "ambiguous_binding", "archived_carrier_unavailable", "not_restorable", "not_archived", "compose_flush_rejected", "workspace_changed", "target_changed", "tab_id_conflict", "persistence_rejected", "persistence_unconfirmed"].contains(code)
         {

@@ -72,6 +72,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     private let backend: any AgentSessionOrganizingBackend
     private let isLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
+    private let isGroupOrderLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
     /// Whether the scope is still live and its whole chain holds `control`, for targets that turned
     /// out not to be idle when re-read.
     private let holdsControl: @MainActor (DomainDelegationScopeRecord) -> Bool
@@ -85,12 +86,14 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         isLeaseCurrent: @escaping @MainActor (DomainDelegationScopeLease) -> Bool,
         holdsControl: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool,
         holdsObserve: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool = { _ in false },
+        isGroupOrderLeaseCurrent: (@MainActor (DomainDelegationScopeLease) -> Bool)? = nil,
         now: @escaping () -> Date = Date.init,
         makeToken: @escaping () -> String = { UUID().uuidString },
         undoLifetime: TimeInterval = 15 * 60
     ) {
         self.backend = backend
         self.isLeaseCurrent = isLeaseCurrent
+        self.isGroupOrderLeaseCurrent = isGroupOrderLeaseCurrent ?? isLeaseCurrent
         self.holdsControl = holdsControl
         self.holdsObserve = holdsObserve
         self.now = now
@@ -265,7 +268,10 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        let context = Context(batch: batch, leases: leases, isLeaseCurrent: isLeaseCurrent)
+        let context = Context(
+            batch: batch, leases: leases,
+            isLeaseCurrent: batch.request.operation == .adminReorderGroups ? isGroupOrderLeaseCurrent : isLeaseCurrent
+        )
         let args = batch.request.arguments
         switch batch.request.operation {
         case .adminRename:
@@ -286,7 +292,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             return try finish(context, payload: setGroup(context, group: normalizedGroupArgument(args)))
         case .adminReorderGroups:
-            return try reorderGroups(context, args: args)
+            return try await reorderGroups(context, args: args)
         case .adminArchive:
             return await finish(context, payload: archive(context))
         case .adminUnarchive:
@@ -486,7 +492,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         })
     }
 
-    private func reorderGroups(_ context: Context, args: [String: Value]) throws -> Value {
+    private func reorderGroups(_ context: Context, args: [String: Value]) async throws -> Value {
         let (workspaceID, order) = try groupReorderArguments(args)
         guard let expectedRaw = try AgentSessionAdminArguments.strings(args, "expected_order") else {
             throw AgentSessionAdminArguments.invalid("reorder_groups requires expected_order.")
@@ -539,10 +545,16 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         guard affected.allSatisfy(context.isCurrent) else {
             return Self.scopeNoLongerCurrent(context.batch.request.operation)
         }
-        let changed = writes.isEmpty ? [] : backend.setGroupOrderValues(writes)
+        let outcome = await backend.commitGroupOrderValues(
+            writes, workspaceID: workspaceID,
+            expected: Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }),
+            affectedSessionIDs: Set(affected), isAuthorized: context.isCurrent
+        )
+        let changed = outcome.changed
         for id in affected {
-            context.add(id, changed.contains(id) ? .changed : .unchanged)
+            context.add(id, outcome.failure != nil ? .failed : changed.contains(id) ? .changed : .unchanged, outcome.failure)
         }
+        recordGroupOrderWrite(outcome, context: context)
         context.extra["workspace_id"] = .string(workspaceID.uuidString)
         let after = backend.groupEntries(workspaceID: workspaceID) ?? []
         context.extra["group_order"] = .array(
@@ -690,10 +702,13 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     func performUndo(_ entry: UndoEntry, batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        let context = Context(batch: batch, leases: leases, isLeaseCurrent: isLeaseCurrent)
+        let context = Context(
+            batch: batch, leases: leases,
+            isLeaseCurrent: entry.operation == .adminReorderGroups ? isGroupOrderLeaseCurrent : isLeaseCurrent
+        )
         switch entry.payload {
         case let .fields(restores):
-            undoFields(restores, context: context)
+            await undoFields(restores, context: context)
         case let .unarchive(ids):
             let current = ids.filter(context.isCurrent)
             let outcome = await backend.unarchive(current, isAuthorized: context.isCurrent)
@@ -739,7 +754,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     /// One fresh read region, then bounded batches. CAS and each target's lease remain mandatory;
     /// pin mutations still use the shared PromptViewModel path, never direct field writes.
-    private func undoFields(_ restores: [AgentSessionOrganizeFieldRestore], context: Context) {
+    private func undoFields(_ restores: [AgentSessionOrganizeFieldRestore], context: Context) async {
         let states = backend.states(of: restores.map(\.sessionID))
         var pending: [AgentSessionOrganizeFieldRestore] = []
         var outcomes: [UUID: (AgentSessionAdminItemResult.Status, String?)] = [:]
@@ -804,7 +819,43 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let currentGroups = groups.filter { isCurrent($0.key) }
         if !currentGroups.isEmpty { changed.formUnion(backend.setGroups(currentGroups)) }
         let currentOrders = groupOrders.filter { isCurrent($0.key) }
-        if !currentOrders.isEmpty { changed.formUnion(backend.setGroupOrderValues(currentOrders)) }
+        if !currentOrders.isEmpty {
+            let byWorkspace = Dictionary(grouping: Array(currentOrders.keys), by: { states[$0]?.workspaceID })
+            for workspaceID in byWorkspace.keys.compactMap(\.self).sorted(by: { $0.uuidString < $1.uuidString }) {
+                var ids = Set(byWorkspace[workspaceID] ?? [])
+                guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
+                    for id in ids {
+                        outcomes[id] = (.failed, "workspace_not_loaded")
+                    }
+                    continue
+                }
+                // A preceding workspace commit can suspend. Re-prove each field's original CAS
+                // against this fresh snapshot before using its captured restore value.
+                let byID = Dictionary(entries.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+                for restore in pending where ids.contains(restore.sessionID) {
+                    guard case let .groupOrder(group, _, after) = restore.change,
+                          let current = byID[restore.sessionID], current.group == group, current.order == after
+                    else {
+                        outcomes[restore.sessionID] = (.skipped, "changed_since")
+                        ids.remove(restore.sessionID)
+                        continue
+                    }
+                }
+                guard !ids.isEmpty else { continue }
+                let result = await backend.commitGroupOrderValues(
+                    currentOrders.filter { ids.contains($0.key) }, workspaceID: workspaceID,
+                    expected: Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }),
+                    affectedSessionIDs: ids, isAuthorized: context.isCurrent
+                )
+                changed.formUnion(result.changed)
+                recordGroupOrderWrite(result, context: context)
+                if let reason = result.failure {
+                    for id in ids {
+                        outcomes[id] = (.failed, reason)
+                    }
+                }
+            }
+        }
         for restore in restores where context.leases[restore.sessionID] != nil {
             let id = restore.sessionID
             let outcome = outcomes[id] ?? (changed.contains(id) ? (.changed, nil) : (.failed, "mutation_rejected"))
@@ -813,6 +864,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
     }
 
     // MARK: - Helpers
+
+    private func recordGroupOrderWrite(_ outcome: AgentSessionGroupOrderWriteOutcome, context: Context) {
+        if outcome.localChanges { context.extra["local_changes"] = .bool(true) }
+        if outcome.persistenceConfirmed { context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
+    }
 
     /// The schema advertises `group` as a plain string; an empty (or whitespace-only) string clears
     /// the group. A literal `null` is still tolerated for callers written against the earlier schema.
