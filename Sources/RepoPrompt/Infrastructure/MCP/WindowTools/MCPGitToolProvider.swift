@@ -41,7 +41,7 @@ private final class MCPGitRequestContext {
             let standardized = root.standardizedFullPath
             let rootKey = standardized.lowercased()
             guard seenRoots.insert(rootKey).inserted else { continue }
-            guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) else { continue }
+            guard let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: standardized), authorizedRoots: rootRefs.map { URL(fileURLWithPath: $0.standardizedFullPath) }) else { continue }
             let repo = GitRepoDescriptor(rootURL: resolved.rootURL)
             guard seenRepos.insert(repo.rootPath.lowercased()).inserted else { continue }
             repos.append(repo)
@@ -140,7 +140,7 @@ private final class MCPGitRequestContext {
         let worktreeHead = await (headID(for: repoURL)).map { String($0.prefix(7)) }
         var mainBranch: String?
         var mainHead: String?
-        if let mainRoot {
+        if let mainRoot, GitRepoRootAuthorization.isPathWithinAuthorizedRoots(mainRoot.path, roots: rootRefs.map(\.standardizedFullPath)) {
             mainBranch = await currentBranch(for: mainRoot)
             mainHead = await (headID(for: mainRoot)).map { String($0.prefix(7)) }
         }
@@ -563,6 +563,14 @@ final class MCPGitToolProvider {
                 )
             } catch let error as GitRepoTargetResolverError {
                 throw MCPError.invalidParams(error.message)
+            }
+        }
+
+        // Explicit external worktree selectors retain the resolver's identity-based grant.
+        // Regardless of selector, reject unrelated metadata before executing any Git read.
+        for repo in repos {
+            guard await vcsService.resolveRepoForRead(at: repo.rootURL, authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]) != nil else {
+                throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
             }
         }
 

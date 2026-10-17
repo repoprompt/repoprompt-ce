@@ -231,7 +231,9 @@ public struct GitRepoTargetResolver: Sendable {
             if GitRepoRootAuthorization.isPathWithinAuthorizedRoots(trimmed, roots: visibleRootPaths) {
                 let standardized = GitRepoRootAuthorization.canonicalPath(trimmed)
 
-                if let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: standardized)) {
+                if let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: standardized)),
+                   isAuthorizedDiscoveredRepository(resolved, roots: visibleRootPaths)
+                {
                     return resolved
                 }
                 throw GitRepoTargetResolverError.invalidParams("No VCS repository found at path: \(trimmed)")
@@ -257,7 +259,9 @@ public struct GitRepoTargetResolver: Sendable {
 
         for folder in visibleRoots where folder.name.lowercased() == lowercasedToken {
             let standardized = folder.standardizedFullPath
-            if let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: standardized)) {
+            if let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: standardized)),
+               isAuthorizedDiscoveredRepository(resolved, roots: visibleRoots.map(\.standardizedFullPath))
+            {
                 return resolved
             }
         }
@@ -276,6 +280,15 @@ public struct GitRepoTargetResolver: Sendable {
 
         let availableNames = visibleRoots.map(\.name).joined(separator: ", ")
         throw GitRepoTargetResolverError.invalidParams("No repo found matching '\(trimmed)'. Available root names: \(availableNames)")
+    }
+
+    private func isAuthorizedDiscoveredRepository(_ repo: GitRepoDescriptor, roots: [String]) -> Bool {
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(repo.rootPath, roots: roots) else { return false }
+        // Discovery is not a grant to use external metadata for a later tree selector.
+        if FileManager.default.fileExists(atPath: repo.rootURL.appendingPathComponent(".git").path) {
+            return GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: repo.rootURL, authorizedRoots: roots.map { URL(fileURLWithPath: $0) }) != nil
+        }
+        return true
     }
 
     // MARK: - Specifier parsing and application
