@@ -45,6 +45,17 @@ esac
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-tip-publish.XXXXXX")"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Keep the bearer header out of process arguments. Tokens cannot inject config lines.
+[[ "$TIP_GH_TOKEN" != *$'\n'* && "$TIP_GH_TOKEN" != *$'\r'* ]] || fail "Invalid Tip token"
+curl_token="${TIP_GH_TOKEN//\\/\\\\}"
+curl_token="${curl_token//\"/\\\"}"
+TIP_CURL_CONFIG="$TMP_DIR/github-curl.conf"
+(umask 077; printf 'header = "Authorization: Bearer %s"\n' "$curl_token" > "$TIP_CURL_CONFIG")
+unset curl_token
 
 ASSETS=("$@")
 EXPECTED_NAMES=()
@@ -195,7 +206,7 @@ fetch_json_status() {
         fail "Unexpected Tip metadata API URL"
     if ! status="$(curl --silent --show-error \
         --connect-timeout 10 --max-time 30 \
-        -H "Authorization: Bearer $TIP_GH_TOKEN" \
+        --config "$TIP_CURL_CONFIG" \
         -H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
         --output "$output" --write-out '%{http_code}' "$url")"; then
@@ -646,7 +657,7 @@ PY
             --header 'Accept: application/vnd.github+json' \
             --header 'Content-Type: application/octet-stream' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --header "Authorization: Bearer $TIP_GH_TOKEN" \
+            --config "$TIP_CURL_CONFIG" \
             --data-binary "@$path" \
             --output "$upload_response" --write-out '%{http_code}' \
             "https://uploads.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/$release_id/assets?name=$encoded_name")" ||
