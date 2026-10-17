@@ -1175,6 +1175,45 @@ package actor DomainAgentSessionLinkAuthority {
         return makeTargetState(linkID: lease.linkID)
     }
 
+    /// Resolves retained wait handles only within the exact observer's current grants. The result
+    /// supplies routing identities, not leases; execution must still authorize and validate each
+    /// cursor. Lookup neither mints successors nor extends the lifetime of a retained handle.
+    package func resolveWaitCursorTargets(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        cursors: [String]
+    ) -> Result<[UUID], DomainAgentSessionLinkError> {
+        guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+        guard !cursors.isEmpty, cursors.count <= Self.waitFanOutLimit,
+              Set(cursors).count == cursors.count
+        else { return .failure(.invalidRequest) }
+
+        let linkIDs = outboundLinksByEndpoint[observerEndpoint] ?? []
+        var sessionIDs: [UUID] = []
+        var seenSessionIDs: Set<UUID> = []
+        for cursor in cursors {
+            let matches = linkIDs.compactMap { id -> LinkRecord? in
+                guard let record = links[id], record.grant.observer == observerEndpoint,
+                      record.waitCursors[cursor] != nil
+                else { return nil }
+                return record
+            }
+            guard matches.count == 1, let record = matches.first,
+                  case let .success(lease) = authorize(
+                      operation: .monitorWait,
+                      observerEndpoint: observerEndpoint,
+                      targetSessionID: record.grant.target.sessionID
+                  ),
+                  lease.linkID == record.grant.id,
+                  lease.linkGeneration == record.grant.generation
+            else { return .failure(.cursorExpired) }
+            guard seenSessionIDs.insert(lease.target.sessionID).inserted else {
+                return .failure(.invalidRequest)
+            }
+            sessionIDs.append(lease.target.sessionID)
+        }
+        return .success(sessionIDs)
+    }
+
     private func makeTargetState(linkID: UUID) -> DomainAgentSessionLinkTargetState? {
         guard var record = links[linkID], hasSourceConsent(record.grant),
               let target = targets[record.grant.target.sessionID]

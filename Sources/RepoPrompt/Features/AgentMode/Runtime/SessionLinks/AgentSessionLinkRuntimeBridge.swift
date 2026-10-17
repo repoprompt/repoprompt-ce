@@ -6902,6 +6902,13 @@ final class AgentSessionLinkRuntimeBridge {
         return task
     }
 
+    func resolveWaitCursorTargets(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        cursors: [String]
+    ) async -> Result<[UUID], DomainAgentSessionLinkError> {
+        await authority.resolveWaitCursorTargets(observerEndpoint: observerEndpoint, cursors: cursors)
+    }
+
     /// Bounded, event-driven wait. The authority owns one-waiter admission and atomic multi-target
     /// slot reservation; this is a pure forward so the service never holds the authority itself.
     func wait(

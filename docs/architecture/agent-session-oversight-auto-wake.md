@@ -90,6 +90,14 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+`wait` accepts returned `wait_cursor` strings directly in `cursors`, without a separate session ID
+list. Existing `{session_id, cursor}` records remain valid and may be mixed with strings. The link
+authority resolves each opaque string only within the current caller's exact outbound grants;
+the string supplies no authority. The normal capability, lease, consent, and cursor-generation
+checks still apply. Unknown, expired, or foreign handles cannot select another caller's target.
+Explicit `session_id` and `session_ids` calls remain supported, and supplied cursor targets must
+agree with that selection.
+
 ## Passive retained user-input excerpts
 
 Optional excerpts decorate only the status `<change>` rows already selected by the baseline

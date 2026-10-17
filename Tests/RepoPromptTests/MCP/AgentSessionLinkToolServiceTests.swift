@@ -868,6 +868,13 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             XCTAssertEqual(object["result"]?.stringValue, expectedName)
             XCTAssertEqual(object["triggered_session_id"], .null)
             XCTAssertEqual(object["detail"] != nil, expectsDetail, expectedName)
+            if case .cursorExpired = outcome {
+                XCTAssertEqual(object["retryable"], .bool(true))
+                XCTAssertEqual(object["next_call"], .object([
+                    "tool": .string("agent_session_link"),
+                    "arguments": .object(["op": .string("poll"), "session_id": .string(conflicting.uuidString)])
+                ]))
+            }
         }
     }
 
@@ -1625,7 +1632,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ))
     }
 
-    func testWaitCursorsAloneNameTheirTargets() throws {
+    func testWaitCursorRecordsAloneNameTheirTargets() throws {
         let first = UUID(), second = UUID()
         let parsed = try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([
             .object(["session_id": .string(first.uuidString), "cursor": .string("c1")]),
@@ -1633,9 +1640,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ])])
         XCTAssertEqual(parsed.sessionIDs, [first, second])
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.object(["cursor": .string("c")])])]))
-        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.string("opaque")])])) { error in
-            XCTAssertTrue(String(describing: error).contains("{session_id, cursor}"), String(describing: error))
-        }
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.string("opaque")])]))
         XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets([:]))
     }
 
@@ -1654,28 +1659,160 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             "op": .string("poll"), "session_ids": .array(requested)
         ])
         var rows = try XCTUnwrap(polled["targets"]?.arrayValue)
-        // Replay only the cursor records returned by the public tool. No separately supplied
-        // session_ids can hide a mismatch between target inference and cursor admission.
-        for _ in 0 ..< 2 {
+        fixture.host.waitingOn = try XCTUnwrap(DomainAgentSessionWaitingOn(
+            summary: "Waiting for LANE_OK", declaredAt: Date(timeIntervalSince1970: 1001)
+        ))
+        for expectedResult in ["changed", "timeout"] {
             XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, requested.map(Optional.some))
             let cursors = try rows.map { row -> Value in
-                let fields = try XCTUnwrap(row.objectValue)
-                return try .object([
-                    "session_id": XCTUnwrap(fields["session_id"]),
-                    "cursor": XCTUnwrap(fields["wait_cursor"])
-                ])
+                try XCTUnwrap(row.objectValue?["wait_cursor"])
             }
+            XCTAssertTrue(cursors.allSatisfy { $0.stringValue != nil })
             let waited = try await Self.executeObject(fixture.service, args: [
                 "op": .string("wait"), "cursors": .array(cursors),
                 "until": .string("change"), "timeout_seconds": .int(0)
             ])
-            XCTAssertEqual(waited["result"], .string("timeout"))
+            XCTAssertEqual(waited["result"], .string(expectedResult))
+            XCTAssertEqual(waited["triggered_session_id"], expectedResult == "changed" ? requested[0] : .null)
             XCTAssertNil(waited["unavailable_session_ids"])
             rows = try XCTUnwrap(waited["targets"]?.arrayValue)
         }
         XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, requested.map(Optional.some))
         let authorityState = await fixture.authority.snapshot()
         XCTAssertEqual(authorityState.parkedWaiterCount, 0, "Every completed wait releases its slot")
+    }
+
+    func testWaitResolvesBareAndMixedCursorFormsByIdentityInsteadOfPosition() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("Expected the second managed link") }
+
+        let firstID = Value.string(fixture.target.sessionID.uuidString)
+        let secondID = Value.string(second.sessionID.uuidString)
+        let requested = [firstID, secondID]
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_ids": .array(requested)
+        ])
+        let rows = try XCTUnwrap(polled["targets"]?.arrayValue)
+        XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, requested.map(Optional.some))
+        guard rows.count == 2 else { return XCTFail("Expected two polled targets") }
+        let firstCursor = try XCTUnwrap(rows[0].objectValue?["wait_cursor"])
+        let secondCursor = try XCTUnwrap(rows[1].objectValue?["wait_cursor"])
+        let secondRecord = Value.object(["session_id": secondID, "cursor": secondCursor])
+        let cases: [(String, [String: Value], [Value])] = [
+            ("reversed bare handles", ["session_ids": .array(requested), "cursors": .array([secondCursor, firstCursor])], requested),
+            ("mixed explicit targets", ["session_ids": .array(requested), "cursors": .array([secondRecord, firstCursor])], requested),
+            ("mixed inferred targets", ["cursors": .array([secondRecord, firstCursor])], [secondID, firstID])
+        ]
+        for (label, cursorArgs, expectedOrder) in cases {
+            var args = cursorArgs
+            args["op"] = .string("wait")
+            args["timeout_seconds"] = .int(0)
+            let waited = try await Self.executeObject(fixture.service, args: args)
+            XCTAssertEqual(waited["result"], .string("timeout"), label)
+            let targets = try XCTUnwrap(waited["targets"]?.arrayValue)
+            XCTAssertEqual(targets.map { $0.objectValue?["session_id"] }, expectedOrder.map(Optional.some), label)
+            XCTAssertTrue(targets.allSatisfy { $0.objectValue?["wait_cursor"]?.stringValue != nil }, label)
+        }
+        let authorityState = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityState.parkedWaiterCount, 0)
+    }
+
+    func testCursorOnlyWaitRejectsForeignAndUnknownHandlesWithExecutableRecovery() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let secondObserver = makeCandidate(windowID: 3, displayName: "Other observer")
+        fixture.host.candidates.append(secondObserver)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: secondObserver.sessionID,
+            rawTargetSessionID: fixture.target.sessionID.uuidString
+        ) else { return XCTFail("Expected an independent link to the same target") }
+
+        let targetID = Value.string(fixture.target.sessionID.uuidString)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": targetID
+        ])
+        let foreignCursor = try XCTUnwrap(polled["wait_cursor"])
+        let service = fixture.routedService(from: secondObserver.domainEndpoint)
+        for cursor in [foreignCursor, .string("w_not_issued_by_this_authority")] {
+            let rejected = try await Self.executeObject(service, args: [
+                "op": .string("wait"), "cursors": .array([cursor]), "timeout_seconds": .int(0)
+            ])
+            XCTAssertEqual(rejected["result"], .string("cursor_expired"))
+            XCTAssertEqual(rejected["retryable"], .bool(true))
+            for field in ["session_id", "session_ids", "targets", "snapshot", "wait_cursor"] {
+                XCTAssertNil(rejected[field], "An unresolved handle must not disclose \(field)")
+            }
+            XCTAssertFalse(String(describing: rejected).contains(fixture.observer.sessionID.uuidString))
+            XCTAssertFalse(String(describing: rejected).contains(secondObserver.sessionID.uuidString))
+            XCTAssertFalse(try String(describing: rejected).contains(XCTUnwrap(cursor.stringValue)))
+            let nextCall = try XCTUnwrap(rejected["next_call"]?.objectValue)
+            XCTAssertEqual(nextCall["tool"], .string("agent_session_link"))
+            let nextArgs = try XCTUnwrap(nextCall["arguments"]?.objectValue)
+            XCTAssertEqual(nextArgs, ["op": .string("list")])
+            let listed = try await Self.executeObject(service, args: nextArgs)
+            let items = try XCTUnwrap(listed["items"]?.arrayValue)
+            XCTAssertEqual(items.map { $0.objectValue?["session_id"] }, [targetID])
+        }
+
+        let refreshed = try await Self.executeObject(service, args: [
+            "op": .string("poll"), "session_id": targetID
+        ])
+        let ownCursor = try XCTUnwrap(refreshed["wait_cursor"])
+        let recovered = try await Self.executeObject(service, args: [
+            "op": .string("wait"), "cursors": .array([ownCursor]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(recovered["result"], .string("timeout"))
+        let recoveredTargets = try XCTUnwrap(recovered["targets"]?.arrayValue)
+        XCTAssertEqual(recoveredTargets.map { $0.objectValue?["session_id"] }, [targetID])
+        let authorityState = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityState.parkedWaiterCount, 0)
+    }
+
+    func testCursorWaitRejectsMalformedDuplicateAndOversizedRequestsWithoutParking() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let targetID = Value.string(fixture.target.sessionID.uuidString)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": targetID
+        ])
+        let cursor = try XCTUnwrap(polled["wait_cursor"])
+        let record = Value.object(["session_id": targetID, "cursor": cursor])
+        let overflow = (0 ... DomainAgentSessionLinkAuthority.waitFanOutLimit).map {
+            Value.string("w_unissued_\($0)")
+        }
+        let cases: [(String, [String: Value])] = [
+            ("empty", ["cursors": .array([])]),
+            ("not an array", ["cursors": cursor]),
+            ("malformed mixed entry", ["cursors": .array([cursor, .object(["session_id": targetID, "cursor": .bool(false)])])]),
+            ("duplicate bare handle", ["cursors": .array([cursor, cursor])]),
+            ("mixed aliases for one target", ["cursors": .array([cursor, record])]),
+            ("fanout overflow", ["cursors": .array(overflow)]),
+            ("explicit target mismatch", ["session_ids": .array([.string(UUID().uuidString)]), "cursors": .array([cursor])]),
+            ("both cursor forms", ["session_id": targetID, "cursor": cursor, "cursors": .array([cursor])])
+        ]
+        for (label, cursorArgs) in cases {
+            var args = cursorArgs
+            args["op"] = .string("wait")
+            args["timeout_seconds"] = .int(0)
+            do {
+                _ = try await fixture.service.execute(args: args)
+                XCTFail("Accepted \(label)")
+            } catch let error as MCPError {
+                guard case .invalidParams = error else { return XCTFail("\(label): \(error)") }
+            }
+        }
+        let valid = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "cursors": .array([cursor]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertEqual(valid["result"], .string("timeout"))
+        let authorityState = await fixture.authority.snapshot()
+        XCTAssertEqual(authorityState.parkedWaiterCount, 0)
     }
 
     func testCreateLaneUsesResolvedCallerOnceAndReportsHostAndSelectorFailures() async throws {

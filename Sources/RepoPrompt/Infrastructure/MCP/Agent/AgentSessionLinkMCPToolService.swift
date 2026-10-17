@@ -872,9 +872,19 @@ struct AgentSessionLinkMCPToolService {
         // admission, without borrowing another endpoint's local-input cancellation generation.
         let observerInput = capturedInput.flatMap { $0.endpoint == observerEndpoint ? $0 : nil }
         let metadata = await captureRequestMetadata()
-        let request = try Self.parseTargets(args)
         let predicate = try Self.parsePredicate(args["until"])
-        let cursorsBySessionID = try Self.parseWaitCursors(args, request: request)
+        let resolvedArgs: [String: Value]
+        do {
+            resolvedArgs = try await resolveWaitCursorArguments(args, observerEndpoint: observerEndpoint)
+        } catch DomainAgentSessionLinkError.cursorExpired {
+            return AgentSessionLinkResponseRenderer.waitCursorRecoveryValue()
+        } catch DomainAgentSessionLinkError.runtimeShuttingDown {
+            throw MCPError.internalError("RepoPrompt is shutting down.")
+        } catch DomainAgentSessionLinkError.invalidRequest {
+            throw MCPError.invalidParams("cursors must name each target at most once, with at most 32 targets per call.")
+        }
+        let request = try Self.parseTargets(resolvedArgs)
+        let cursorsBySessionID = try Self.parseWaitCursors(resolvedArgs, request: request)
 
         let targets = try await authorizeAll(
             operation: .monitorWait,
@@ -966,6 +976,57 @@ struct AgentSessionLinkMCPToolService {
             )
             return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(unavailable, to: rendered)
         }
+    }
+
+    private func resolveWaitCursorArguments(
+        _ args: [String: Value],
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async throws -> [String: Value] {
+        guard case let .array(entries)? = args["cursors"] else { return args }
+        guard AgentMCPToolHelpers.normalizedString(args["cursor"]) == nil else {
+            throw MCPError.invalidParams("cursor and cursors are mutually exclusive.")
+        }
+        guard entries.count <= DomainAgentSessionLinkAuthority.waitFanOutLimit else {
+            throw MCPError.invalidParams(
+                "cursors accepts at most \(DomainAgentSessionLinkAuthority.waitFanOutLimit) targets per call."
+            )
+        }
+        var opaqueCursors: [String] = []
+        for entry in entries {
+            switch entry {
+            case .string:
+                guard let cursor = AgentMCPToolHelpers.normalizedString(entry) else {
+                    throw MCPError.invalidParams("cursors entries must be nonempty returned wait_cursor strings.")
+                }
+                opaqueCursors.append(cursor)
+            case let .object(fields):
+                guard let rawSessionID = AgentMCPToolHelpers.normalizedString(fields["session_id"]),
+                      UUID(uuidString: rawSessionID) != nil,
+                      AgentMCPToolHelpers.normalizedString(fields["cursor"]) != nil
+                else {
+                    throw MCPError.invalidParams("cursors records require session_id and cursor strings.")
+                }
+            default:
+                throw MCPError.invalidParams(
+                    "cursors entries must be returned wait_cursor strings or {session_id, cursor} objects."
+                )
+            }
+        }
+        guard !opaqueCursors.isEmpty else { return args }
+        let sessionIDs = try await bridge.resolveWaitCursorTargets(
+            observerEndpoint: observerEndpoint, cursors: opaqueCursors
+        ).get()
+        var resolved = args
+        var index = 0
+        resolved["cursors"] = .array(entries.map { entry in
+            guard case .string = entry else { return entry }
+            defer { index += 1 }
+            return .object([
+                "session_id": .string(sessionIDs[index].uuidString),
+                "cursor": .string(opaqueCursors[index])
+            ])
+        })
+        return resolved
     }
 
     // MARK: - read
@@ -1556,13 +1617,12 @@ struct AgentSessionLinkMCPToolService {
             throw MCPError.invalidParams("session_ids must be an array of session UUID strings.")
         }
 
-        // `wait` cursors each name their session, so a cursors-only call needs no separate list.
+        // Bare wait cursors have already been resolved through the caller's authority records.
         if single == nil, many == nil, case let .array(cursors)? = args["cursors"], !cursors.isEmpty {
-            // Cursors are opaque and do not name a session, so a bare cursor string cannot be routed.
             guard cursors.allSatisfy({ $0.objectValue?["session_id"]?.stringValue != nil }) else {
                 throw MCPError.invalidParams(
-                    "wait cursors must be {session_id, cursor} objects (poll and wait return both per target), "
-                        + "or pass session_ids alongside them. A bare cursor string does not identify its session."
+                    "Resolved wait cursors must be {session_id, cursor} objects. "
+                        + "Replay returned wait_cursor strings through agent_session_link wait."
                 )
             }
             many = cursors.map { $0.objectValue?["session_id"] ?? .null }
@@ -1638,7 +1698,7 @@ struct AgentSessionLinkMCPToolService {
         case let .some(.array(values)):
             entries = values
         case .some:
-            throw MCPError.invalidParams("cursors must be an array of {session_id, cursor} objects.")
+            throw MCPError.invalidParams("cursors must be an array of returned wait_cursor strings or {session_id, cursor} objects.")
         }
         guard single == nil || entries == nil else {
             throw MCPError.invalidParams("cursor and cursors are mutually exclusive.")
@@ -2389,6 +2449,27 @@ enum AgentSessionLinkResponseRenderer {
         }
     }
 
+    static func waitCursorRecoveryValue(sessionID: UUID? = nil) -> Value {
+        let arguments: [String: Value] = if let sessionID {
+            ["op": .string("poll"), "session_id": .string(sessionID.uuidString)]
+        } else {
+            ["op": .string("list")]
+        }
+        let detail = sessionID.map {
+            "The wait cursor for \($0.uuidString) expired. Poll that session again."
+        } ?? "One or more wait cursors are not available to this caller. List current links, then "
+            + "poll the intended sessions for fresh wait_cursor values before waiting again."
+        return .object([
+            "notice": .string(AgentSessionLinkMCPToolService.untrustedContentNotice),
+            "result": .string("cursor_expired"),
+            "retryable": .bool(true),
+            "detail": .string(detail),
+            "next_call": .object([
+                "tool": .string("agent_session_link"), "arguments": .object(arguments)
+            ])
+        ])
+    }
+
     static func waitValue(
         _ result: DomainAgentSessionLinkWaitResult,
         pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:],
@@ -2404,6 +2485,11 @@ enum AgentSessionLinkResponseRenderer {
         ]
         if let detail = waitDetail(result.outcome) {
             payload["detail"] = .string(detail)
+        }
+        if case let .cursorExpired(sessionID) = result.outcome,
+           case let .object(recovery) = waitCursorRecoveryValue(sessionID: sessionID)
+        {
+            payload.merge(recovery) { _, new in new }
         }
         if result.interruptedByLocalInput {
             payload["_meta"] = .object(["wake_reason": .string("local_user_input")])

@@ -2270,6 +2270,46 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Extend the served wait contract without changing the historical schema migration anchors.
+    private enum AgentSessionLinkWaitCursorMigration {
+        static let description = AgentSessionLinkOverseerActivationGuidance.description.replacingOccurrences(
+            of: "- `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned. A multi-target result omits targets that became unavailable while waiting and lists them in `unavailable_session_ids`; refresh `list` before using them.",
+            with: "- `wait`: pass returned `wait_cursor` strings in `cursors`, without session IDs. Wait for change, idle, or sendable; managed prompts may appear. Unavailable targets are omitted and named in `unavailable_session_ids`; refresh `list` before using them."
+        )
+
+        static let inputSchema: Value = {
+            guard case var .object(schema) = AgentSessionLinkModelSelectionMigration.inputSchema,
+                  case var .object(properties)? = schema["properties"],
+                  case var .object(cursors)? = properties["cursors"],
+                  let previousItems = cursors["items"],
+                  case let .string(summary)? = schema["description"]
+            else { preconditionFailure("agent_session_link cursor migration requires the prior wait schema") }
+            cursors["description"] = .string("[wait] Returned wait_cursor strings and/or {session_id, cursor} records; max 32, no duplicate targets. No separate IDs required.")
+            cursors["items"] = .object([
+                "anyOf": .array([.object(["type": .string("string")]), previousItems])
+            ])
+            properties["cursors"] = .object(cursors)
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(summary.replacingOccurrences(
+                of: "wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.",
+                with: "wait: cursors alone, or session_id/session_ids with cursor(s)?; until?; timeout_seconds? Local input cancels older waits."
+            ))
+            return .object(schema)
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkOverseerActivationGuidance.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private enum AgentSessionLinkAutonomyContractState: String {
         case historicalIncomingOnly
         case historicalAutomatic
@@ -2478,6 +2518,13 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) { return definition }
+        return AgentSessionLinkWaitCursorMigration.applying(to: canonicalizeAgentSessionLinkBeforeWaitCursors(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeWaitCursors(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
         if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
         if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
@@ -2489,7 +2536,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
+        !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
+            && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
@@ -2890,6 +2938,10 @@ package enum MCPDomainCanonicalToolDefinitions {
 
         package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
             canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
+        }
+
+        package static func test_agentSessionLinkPreviousCursorDefinition() -> MCPDomainToolDefinition {
+            canonicalizeAgentSessionLinkBeforeWaitCursors(test_agentSessionLinkLegacyCurrentDefinition())
         }
 
         package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
