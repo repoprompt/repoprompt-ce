@@ -230,7 +230,20 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 "op": .string("fork"), "session_id": .string(creatorID.uuidString), "idempotency_key": .string("limited-fork")
             ])
             XCTAssertEqual(forkRefusal.objectValue?["code"]?.stringValue, "placement_unresolved", "A capacity-proof refusal must not claim that session_admin disappeared")
+            XCTAssertNil(forkRefusal.objectValue?["next_call"], "Placement has no executable repair")
             XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.count, count)
+
+            // Live regression: with Overseer full access the same legacy limited grant and incomplete
+            // census no longer refuse; the identical create_lane allocates through the real bridge.
+            let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+            OverseerGlobalAutoApprove.isEnabled = { true }
+            defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+            let overridden = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "limited-full-access", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Full access lane", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: fixture.workspaceID.uuidString, callerWindowID: endpoint.windowID, callerWorkspaceID: endpoint.workspaceID) }
+            )
+            XCTAssertEqual(overridden.result, .created, "Full access must not be refused by delegated placement accounting: \(overridden)")
         }
     }
 

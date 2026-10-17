@@ -180,8 +180,12 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
 
     private func chainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
         let chain = scopes.scopeChain(from: scope.id)
+        // Full access lifts capability limits only; the scope chain must still be live.
+        let fullAccess = scopes.permissionPolicy.isFullAccess
         return !chain.isEmpty && chain.allSatisfy { record in
-            guard record.isActive, record.grant.capabilities.contains(capability) else { return false }
+            guard record.isActive else { return false }
+            if fullAccess { return true }
+            guard record.grant.capabilities.contains(capability) else { return false }
             if case .allSessions = record.grant.kind, !record.grant.unrestricted {
                 return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
             }

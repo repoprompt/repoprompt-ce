@@ -463,7 +463,8 @@ struct SessionAdminMCPToolService {
             }
             return .object([
                 "result": .string("denied"), "code": .string("placement_unresolved"),
-                "detail": .string("Your scope's configured limits require complete session placement evidence. Load or resolve ambiguous session bindings, then retry the same operation. Use session_admin scope_status to inspect limits. A new capability grant alone will not repair missing provenance.")
+                "subreason": .string("usage_evidence_unavailable"), "recovery": .string("manual"),
+                "detail": .string(DelegationSpawnAdmission.placementUnresolvedDetail(subreason: "usage_evidence_unavailable"))
             ])
         case let .denied(denial, sessionID):
             return try Self.deniedValue(denial, sessionID: sessionID)

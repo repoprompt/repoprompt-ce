@@ -47,6 +47,16 @@ struct AgentSessionAdministrationRequest {
         DomainDelegationScopeArgumentsDigest.digest(arguments)
     }
 
+    /// The same request without its presented card. The full-access pass never requires a card, and a card
+    /// is bound to the scope it was issued for, so it is not revalidated against the full-access grant.
+    func withoutConfirmation() -> AgentSessionAdministrationRequest {
+        AgentSessionAdministrationRequest(
+            operation: operation, caller: caller, callerTabID: callerTabID, scopeID: scopeID,
+            targetSessionIDs: targetSessionIDs, idempotencyKey: idempotencyKey, confirmationID: nil,
+            preview: preview, arguments: arguments
+        )
+    }
+
     /// The same request narrowed to `targets` (the admitted subset).
     func narrowed(to targets: [UUID]) -> AgentSessionAdministrationRequest {
         AgentSessionAdministrationRequest(
@@ -180,7 +190,25 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         if let scopeID = request.scopeID {
             // The authority checks grantee identity before disclosing anything about this scope.
             guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
-            scope = record
+            let explicit = authorize(request, scope: record, callerSessionID: callerSessionID)
+            // Full access is never narrowed by the caller's own live restricted scope; an unknown,
+            // foreign, or stale scope stays an input-validity refusal (`OverseerPermissionPolicy`).
+            guard scopes.permissionPolicy.reauthorizesExplicitScope(after: explicit),
+                  !record.grant.unrestricted,
+                  scopes.liveScopes(grantedTo: callerSessionID).contains(where: { $0.id == record.id }),
+                  let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID)
+            else { return explicit }
+            let fullAccess = authorize(request.withoutConfirmation(), scope: global, callerSessionID: callerSessionID)
+            // A card the explicit pass accepted stays claimed and settled exactly once by `perform`.
+            guard case let .authorized(batch) = fullAccess,
+                  let card = request.confirmationID.flatMap({
+                      scopes.confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)?.domainConfirmation
+                  })
+            else { return fullAccess }
+            return .authorized(AgentSessionAdministrationAuthorizedBatch(
+                request: request, scope: batch.scope, leases: batch.leases, bases: batch.bases,
+                itemsRequiringControl: batch.itemsRequiringControl, confirmation: card
+            ))
         } else if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) {
             // Global auto-approve: the one unrestricted grant covers every operation and session, with
             // no request, no scope choice and no card. Authorization below still runs against it.
@@ -204,7 +232,15 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
                 return .scopeSelectionRequired(scopeIDs: (capable.isEmpty ? live : capable).map(\.id))
             }
         }
+        return authorize(request, scope: scope, callerSessionID: callerSessionID)
+    }
 
+    /// Grantee identity, then one fresh projection region for the selected scope.
+    private func authorize(
+        _ request: AgentSessionAdministrationRequest,
+        scope: DomainDelegationScopeRecord,
+        callerSessionID: UUID
+    ) -> AgentSessionAdministrationAuthorization {
         guard scope.grant.granteeSessionID == callerSessionID else {
             return .denied(.granteeMismatch, sessionID: nil)
         }

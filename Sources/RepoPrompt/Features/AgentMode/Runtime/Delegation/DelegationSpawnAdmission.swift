@@ -22,6 +22,11 @@ import RepoPromptDomainRuntime
 ///
 /// A creator with no such scope gets `.unscoped` and every surface behaves exactly as before.
 /// Administrative principals never have a creator session, so they are never affected.
+///
+/// With Overseer full access (`OverseerPermissionPolicy.appliesDelegatedAccounting` false) none of
+/// this delegated accounting applies: no guardrail, joining count, reservation, auto-join stamp, scope-move
+/// refusal, or creator placement proof stands between a routed creator and its creation surface. Structural
+/// invariants (a lane is never re-parented under itself or an unresolvable ancestry) hold in both modes.
 @MainActor
 enum DelegationSpawnAdmission {
     struct Admission: Equatable {
@@ -68,18 +73,40 @@ enum DelegationSpawnAdmission {
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
     ) throws -> [DomainDelegationScopeRecord] {
+        switch resolveGuardrailScopes(forCreator: creator, scopes: scopes, projector: projector) {
+        case let .scopes(records):
+            return records
+        case let .creatorPlacementUnresolved(reason):
+            throw error(for: .usageProofMissing, subreason: reason)
+        }
+    }
+
+    private enum GuardrailScopeResolution {
+        case scopes([DomainDelegationScopeRecord])
+        case creatorPlacementUnresolved(String)
+    }
+
+    /// The one decision behind `guardrailScopes` and `admit`, so the creator placement proof is
+    /// demanded for exactly the scopes that could count the creation.
+    private static func resolveGuardrailScopes(
+        forCreator creator: UUID,
+        scopes: DelegationScopeRuntime,
+        projector: any DelegationMembershipProjector
+    ) -> GuardrailScopeResolution {
+        // Full access: no delegation bounds or blocks a creation, whatever restricted scopes remain.
+        guard scopes.permissionPolicy.appliesDelegatedAccounting else { return .scopes([]) }
         // A global auto-approve grant has no guardrails to count against, so it is not a delegation
         // that can bound or block a creation.
         let liveScopes = scopes.allLiveScopes().filter { !$0.grant.unrestricted }
         // These creation surfaces already have their own caller authority. With no delegation
         // anywhere, missing scope provenance cannot hide a limit or revoke that authority.
-        guard !liveScopes.isEmpty else { return [] }
+        guard !liveScopes.isEmpty else { return .scopes([]) }
         // Ambiguous ancestry can hide the scope that should count this spawn. It must never
         // become the absence of delegation and consequently an unscoped admission.
         if let reason = creatorPlacementFailure(creator, projector: projector) {
-            throw error(for: .usageProofMissing, subreason: reason)
+            return .creatorPlacementUnresolved(reason)
         }
-        return liveScopes.filter { record in
+        return .scopes(liveScopes.filter { record in
             switch record.grant.kind {
             case .session, .allSessions:
                 false
@@ -89,7 +116,7 @@ enum DelegationSpawnAdmission {
             case .tree:
                 isMember(creator, ofChainFrom: record, scopes: scopes, projector: projector)
             }
-        }
+        })
     }
 
     /// The session, or an organizational ancestor, is the scope's grantee or stamped with the scope.
@@ -122,6 +149,8 @@ enum DelegationSpawnAdmission {
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
     ) -> (denial: DomainDelegationScopeDenial?, scopeIDs: Set<UUID>) {
+        // Full access: nothing is counted or reserved, even for records a caller passes in directly.
+        guard scopes.permissionPolicy.appliesDelegatedAccounting else { return (nil, []) }
         var scopeIDs: Set<UUID> = []
         for record in records {
             var usage: [UUID: DomainDelegationScopeUsage] = [:]
@@ -174,28 +203,28 @@ enum DelegationSpawnAdmission {
         projector: any DelegationMembershipProjector
     ) -> Outcome {
         guard let creator = creatorSessionID else { return .unscoped }
+        let policy = scopes.permissionPolicy
         let joiningSessionID: UUID?
         switch target {
         case .placedSession:
             return .unscoped
         case let .otherCreatorsLane(lane):
             // Whatever the creator's own scopes, the lane's current scopes would lose it.
-            return laneMoveOutcome(lane, creator: creator, scopes: scopes, projector: projector)
+            return laneMoveOutcome(lane, creator: creator, scopes: scopes, projector: projector, policy: policy)
         case .newSession:
             joiningSessionID = nil
         case let .unplacedSession(sessionID):
             joiningSessionID = sessionID
         }
-        if !scopes.allLiveScopes().isEmpty,
-           let reason = creatorPlacementFailure(creator, projector: projector)
-        {
-            return .creatorPlacementUnresolved(reason)
-        }
+        // Full access: the creation surface's own authority decides. Nothing is counted, reserved,
+        // stamped, or refused for delegated placement, including a replicated creator.
+        guard policy.appliesDelegatedAccounting else { return .unscoped }
         let records: [DomainDelegationScopeRecord]
-        do {
-            records = try guardrailScopes(forCreator: creator, scopes: scopes, projector: projector)
-        } catch {
-            return .denied(.usageProofMissing)
+        switch resolveGuardrailScopes(forCreator: creator, scopes: scopes, projector: projector) {
+        case let .creatorPlacementUnresolved(reason):
+            return .creatorPlacementUnresolved(reason)
+        case let .scopes(resolved):
+            records = resolved
         }
         guard !records.isEmpty else { return .unscoped }
 
@@ -246,12 +275,16 @@ enum DelegationSpawnAdmission {
     }
 
     /// Another creator's lane that `agent_run` would re-parent under `creator`: allowed (and not
-    /// counted or stamped) only when no live tree scope's membership changes.
+    /// counted or stamped) only when no live tree scope's membership changes. Full access skips that
+    /// scope-membership refusal only. The structural checks hold in both modes: both ancestries resolve
+    /// without conflict, the lane is not on the creator's chain, and truncated chains are comparable
+    /// (otherwise the lane could sit in the unknown part of the creator's chain, a hidden cycle).
     private static func laneMoveOutcome(
         _ lane: UUID,
         creator: UUID,
         scopes: DelegationScopeRuntime,
-        projector: any DelegationMembershipProjector
+        projector: any DelegationMembershipProjector,
+        policy: OverseerPermissionPolicy
     ) -> Outcome {
         guard let laneAncestry = projector.organizationalAncestry(of: lane),
               let creatorAncestry = projector.organizationalAncestry(of: creator),
@@ -263,6 +296,7 @@ enum DelegationSpawnAdmission {
                   liveTreeScopes: scopes.liveTreeScopeRoots()
               )
         else { return .targetUnresolved }
+        guard policy.appliesDelegatedAccounting else { return .unscoped }
         return affected.isEmpty ? .unscoped : .targetMovesBetweenScopes(count: affected.count)
     }
 
@@ -354,11 +388,25 @@ enum DelegationSpawnAdmission {
         case .usageProofMissing, .membershipProofMissing:
             fields["reason"] = .string("placement_unresolved")
             if fields["subreason"] == nil { fields["subreason"] = .string("usage_evidence_unavailable") }
-            fields["detail"] = .string("Scope capacity or creator provenance cannot be proved from the loaded sessions. Load or resolve ambiguous session bindings, then retry. Call session_admin scope_status to inspect limits; another capability grant alone will not repair placement.")
+            fields["detail"] = .string(placementUnresolvedDetail(subreason: fields["subreason"]?.stringValue))
         default:
             break
         }
         return error(code: denial.publicCode ?? "scope_denied", fields: fields)
+    }
+
+    /// Manual recovery for a placement proof that no tool call can supply. Shared by every surface
+    /// that reports `placement_unresolved`, so the guidance never drifts between them.
+    nonisolated static func placementUnresolvedDetail(subreason: String?) -> String {
+        let noToolRepair = "No grant, capability, or session_admin call repairs this."
+        switch subreason {
+        case "creator_replicated":
+            return "Your session is presented by more than one window or tab, so no single canonical owner can prove which delegation scope counts this creation. Close the duplicate presentation of this session (keep one tab), then retry. \(noToolRepair)"
+        case "creator_ancestry_conflict":
+            return "An organizational ancestor of your session has conflicting or unproven placement (a duplicated or stale tab binding), so the delegation scope that counts this creation cannot be proved. Close or resolve that ancestor's conflicting presentation, then retry. \(noToolRepair)"
+        default:
+            return "Delegation scope capacity cannot be proved: a session counted by your scope's limits has missing or conflicting placement (an unindexed, duplicated, or stale tab binding). Resolve or close that presentation, then retry. \(noToolRepair)"
+        }
     }
 
     private static func error(code: String, fields: [String: Value]) -> MCPError {
@@ -369,7 +417,13 @@ enum DelegationSpawnAdmission {
             fields["detail"] = .string("Scope admission was refused. Inspect scope_status and resolve the reported authority or placement check before retrying.")
         }
         if fields["subreason"] == nil { fields["subreason"] = .string(code) }
-        fields["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+        // An unresolved placement has no executable repair; a generic next_call would only pretend
+        // otherwise. Its detail carries the manual recovery.
+        if code == "placement_unresolved" || fields["reason"] == .string("placement_unresolved") {
+            fields["recovery"] = .string("manual")
+        } else {
+            fields["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let json = (try? encoder.encode(Value.object(fields))).map { String(decoding: $0, as: UTF8.self) } ?? "{}"

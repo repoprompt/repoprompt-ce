@@ -19,6 +19,16 @@ import RepoPromptDomainRuntime
 /// canonical write ownership of a target, organizational cycles, idempotency, and durable persistence
 /// proofs.
 ///
+/// Enforcement points (each asks this policy, none decides on its own):
+/// - grant lifecycle: `DelegationScopeRuntime` request validation, full-access grant minting, OFF revocation;
+/// - scope selection: `AgentSessionAdministrationCore.authorize` (implicit grant, explicit-scope re-authorization);
+/// - capability re-checks mid-operation: `AgentSessionAdministrationFrontDoor.chainHolds`;
+/// - delegated accounting: `DelegationSpawnAdmission` (spawn/lane admission, shared guardrail evaluation),
+///   `SessionAdminWorktreeHandler.reserveBinding`, `SessionAdminRestructureHandler` adoption quotas;
+/// - existing-target and human-only gates: `AgentSessionTargetOperationGuard`, `agent_manage` cleanup;
+/// - link and lane gates: `AgentSessionLinkRuntimeBridge`;
+/// - presentation: MCP catalog surface, `become_overseer` and listing guidance.
+///
 /// Authority source: `DelegationScopeRuntime.isGlobalAutoApproveEnabled`, whose production value is the
 /// stored user setting (`OverseerGlobalAutoApprove`). Never tool arguments, prompt text, or the existence
 /// of a recorded grant (a grant left from an earlier "on" is revoked by `reconcileGlobalAutoApprove`).
@@ -59,10 +69,32 @@ struct OverseerPermissionPolicy: Equatable {
         return callerSessionID != targetSessionID
     }
 
-    /// Delegated creation accounting: scope guardrails a creation counts toward, joining-subtree counting,
-    /// auto-join stamping, scope-membership changes of a re-parented lane, and the creator placement proofs
-    /// whose only purpose is to decide which scope counts the creation. Restricted mode only.
-    var appliesDelegatedCreationAccounting: Bool {
+    /// Delegated accounting: guardrail quotas (`maxLiveSessions`, `maxDepth`, `maxWorktrees`) that a
+    /// creation, worktree binding, or adoption counts toward, joining-subtree counting, reservations,
+    /// auto-join stamping, scope-membership changes of a re-parented lane, and the creator placement
+    /// proofs whose only purpose is to decide which scope counts the operation. Restricted mode only.
+    var appliesDelegatedAccounting: Bool {
         !isFullAccess
+    }
+
+    /// A caller's explicitly named live restricted scope is authorization *and* placement data (fork,
+    /// adopt, and worktree stamps record it). Under full access that scope is tried first, so a request
+    /// it fully admits keeps its placement. Whenever it would not admit the whole request (a denial, a
+    /// confirmation card, or targets set aside for a missing `control`), full access re-authorizes the
+    /// request against the full-access grant instead. Integrity checks run again on that pass and still
+    /// refuse; unknown, foreign, and stale scope IDs are never retried (input validity, not permission).
+    /// A presented card that does not match is an input error (like a stale scope ID) and is never retried.
+    func reauthorizesExplicitScope(after outcome: AgentSessionAdministrationAuthorization) -> Bool {
+        guard isFullAccess else { return false }
+        switch outcome {
+        case let .authorized(batch):
+            return !batch.itemsRequiringControl.isEmpty
+        case .denied(.confirmationMismatch, _):
+            return false
+        case .confirmationRequired, .denied:
+            return true
+        case .scopeSelectionRequired:
+            return false
+        }
     }
 }

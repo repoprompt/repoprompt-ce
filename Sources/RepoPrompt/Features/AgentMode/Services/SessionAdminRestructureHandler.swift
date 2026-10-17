@@ -400,6 +400,8 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         moved: Set<UUID>
     ) throws -> Value? {
+        // Full access: no delegated quota refuses an adoption (`OverseerPermissionPolicy`).
+        guard context.scopes.permissionPolicy.appliesDelegatedAccounting else { return nil }
         let joining = moved.filter { !context.isMember($0, ofChainFrom: batch.scope) }
         let addedLive = joining.count { context.projector.knownProvenance(for: $0)?.isLive ?? true }
         let addedWorktrees = joining.reduce(into: Set<String>()) {
