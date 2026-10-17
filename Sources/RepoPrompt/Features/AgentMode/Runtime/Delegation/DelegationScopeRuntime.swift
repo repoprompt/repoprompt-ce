@@ -149,7 +149,14 @@ final class DelegationScopeRuntime: ObservableObject {
     /// delegation request is approved as requested without a card. Deliberately not exposed through
     /// MCP `app_settings`, so an agent cannot enable it.
     static let autoApproveAllRequestsKey = OverseerGlobalAutoApprove.defaultsKey
+    /// Raw setting input, injectable per runtime for tests. Decisions never call it directly: they ask
+    /// `permissionPolicy`, the single owner of full-access versus restricted delegation.
     var isGlobalAutoApproveEnabled: @MainActor () -> Bool = { OverseerGlobalAutoApprove.isEnabled() }
+
+    /// The authoritative full-access versus restricted policy (`OverseerPermissionPolicy`), read fresh.
+    var permissionPolicy: OverseerPermissionPolicy {
+        OverseerPermissionPolicy(scopes: self)
+    }
 
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
@@ -622,7 +629,7 @@ final class DelegationScopeRuntime: ObservableObject {
             now: now(),
             // Global auto-approve answers any request with an unrestricted grant, so no capability is
             // refused for its kind before that.
-            unrestricted: isGlobalAutoApproveEnabled()
+            unrestricted: permissionPolicy.isFullAccess
         ) {
             return .failure(.invalid(denial))
         }
@@ -821,7 +828,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// ordinary recorded grant, so it shows in Active delegations and can be revoked.
     @discardableResult
     func ensureGlobalAutoApproveScope(for grantee: UUID) -> DomainDelegationScopeRecord? {
-        guard canUseAuthority, isGlobalAutoApproveEnabled(), !deletedSessionIDs.contains(grantee) else { return nil }
+        guard canUseAuthority, permissionPolicy.isFullAccess, !deletedSessionIDs.contains(grantee) else { return nil }
         expireDueScopes()
         if let existing = liveScopes(grantedTo: grantee).first(where: \.grant.unrestricted) { return existing }
         let request = DomainDelegationScopeGrantRequest(
@@ -839,7 +846,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Off means off: revoke every global grant once the setting is turned off. Called when the
     /// setting changes and before each scoped administration decision.
     func reconcileGlobalAutoApprove() {
-        guard canUseAuthority, !isGlobalAutoApproveEnabled() else { return }
+        guard canUseAuthority, !permissionPolicy.isFullAccess else { return }
         let global = authority.liveRecords(now: now()).filter(\.grant.unrestricted)
         guard !global.isEmpty else { return }
         var changed: [DomainDelegationScopeRecord] = []

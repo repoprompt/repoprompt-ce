@@ -9672,3 +9672,71 @@ final class SessionAdminInFlightIdempotencyTests: XCTestCase {
         XCTAssertEqual(fixture.base.worktrees.created, [fixture.target])
     }
 }
+
+/// `OverseerPermissionPolicy` is the single owner of full access versus restricted delegation. These
+/// tests pin its decisions and prove that the front doors consuming it agree in both modes.
+@MainActor
+final class OverseerPermissionPolicyTests: XCTestCase {
+    private func runtime(fullAccess: Bool) -> DelegationScopeRuntime {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        runtime.isGlobalAutoApproveEnabled = { fullAccess }
+        return runtime
+    }
+
+    func testModeComesFromTheRuntimeSettingInputOnly() {
+        XCTAssertEqual(runtime(fullAccess: true).permissionPolicy.mode, .fullAccess)
+        XCTAssertEqual(runtime(fullAccess: false).permissionPolicy.mode, .restricted)
+
+        // A recorded unrestricted grant is not authority: once the setting is off, the policy is
+        // restricted and reconciliation revokes the grant.
+        var enabled = true
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        scopes.isGlobalAutoApproveEnabled = { enabled }
+        let grantee = UUID()
+        XCTAssertNotNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
+        enabled = false
+        XCTAssertEqual(scopes.permissionPolicy.mode, .restricted)
+        XCTAssertTrue(scopes.allLiveScopes().contains { $0.grant.unrestricted }, "precondition: the stale grant is still recorded")
+        scopes.reconcileGlobalAutoApprove()
+        XCTAssertFalse(scopes.allLiveScopes().contains { $0.grant.unrestricted })
+        XCTAssertNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
+    }
+
+    func testCrossSessionOperationKeepsIdentityRulesInBothModes() {
+        let caller = UUID(), other = UUID()
+        let full = OverseerPermissionPolicy(mode: .fullAccess)
+        let restricted = OverseerPermissionPolicy(mode: .restricted)
+
+        XCTAssertTrue(full.permitsCrossSessionOperation(by: .agentSession(caller), on: other))
+        XCTAssertFalse(full.permitsCrossSessionOperation(by: .agentSession(caller), on: caller), "self-targeting keeps its own rule")
+        XCTAssertFalse(full.permitsCrossSessionOperation(by: .unresolvedAgentRun, on: other), "unresolved routing never becomes a caller")
+        XCTAssertFalse(
+            full.permitsCrossSessionOperation(by: .administrativePrincipal, on: other),
+            "administrative callers keep their own authority path"
+        )
+        XCTAssertFalse(restricted.permitsCrossSessionOperation(by: .agentSession(caller), on: other))
+
+        XCTAssertFalse(full.appliesDelegatedCreationAccounting)
+        XCTAssertTrue(restricted.appliesDelegatedCreationAccounting)
+    }
+
+    func testScopeRequestValidationAndGlobalGrantFollowThePolicy() {
+        for fullAccess in [false, true] {
+            let scopes = runtime(fullAccess: fullAccess)
+            let requester = UUID()
+            // An all-sessions scope cannot hold spawn unless the request will be answered by the
+            // unrestricted full-access grant.
+            let result = scopes.requestScope(
+                requesterSessionID: requester, requesterTabID: nil, kind: .allSessions,
+                capabilities: [.observe, .spawn], guardrails: .init(), reason: nil, idempotencyKey: nil
+            )
+            switch result {
+            case .success:
+                XCTAssertTrue(fullAccess, "restricted mode keeps the all-sessions capability limit")
+            case .failure:
+                XCTAssertFalse(fullAccess, "full access never refuses a capability for its kind")
+            }
+            XCTAssertEqual(scopes.ensureGlobalAutoApproveScope(for: requester) != nil, fullAccess)
+        }
+    }
+}

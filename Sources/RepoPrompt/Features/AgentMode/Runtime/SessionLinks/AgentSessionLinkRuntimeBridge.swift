@@ -3294,7 +3294,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard let observerSessionID else {
             return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
         }
-        let approved = delegationScopes.isGlobalAutoApproveEnabled() || delegationScopes.liveScopes(grantedTo: observerSessionID).contains {
+        let approved = delegationScopes.permissionPolicy.isFullAccess || delegationScopes.liveScopes(grantedTo: observerSessionID).contains {
             $0.grant.kind == .session(targetSessionID: candidate.sessionID)
                 && delegationScopes.linkConsent.permits(scopeID: $0.id, observer: observerSessionID, target: candidate.sessionID, at: Date())
         }
@@ -8183,7 +8183,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) async -> Bool {
         guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
         // Global Overseer full access: an eligible caller creates lanes without activation or a link.
-        if case .linked = basis, !OverseerGlobalAutoApprove.isEnabled() {
+        if case .linked = basis, !delegationScopes.permissionPolicy.isFullAccess {
             guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
         }
         return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)
