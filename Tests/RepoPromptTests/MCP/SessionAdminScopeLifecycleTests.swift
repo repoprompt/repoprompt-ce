@@ -2018,7 +2018,7 @@ final class SessionAdminStructureTests: XCTestCase {
                 XCTAssertNil(status["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
             }
             // Restricted mode: a caller cannot hide the restricted scopes its target's bindings count toward.
-            // Full access overrides those delegated quotas (`OverseerPermissionPolicy`). Create restrictions
+            // Full access overrides those delegated quotas (`OverseerAuthorizationEngine`). Create restrictions
             // with the setting OFF, then exercise the actual ON/OFF front door.
             OverseerGlobalAutoApprove.isEnabled = { false }
             let ancestor = UUID()
@@ -9708,51 +9708,205 @@ final class SessionAdminInFlightIdempotencyTests: XCTestCase {
     }
 }
 
-/// `OverseerPermissionPolicy` is the single owner of full access versus restricted delegation. These
-/// tests pin its decisions and prove that the front doors consuming it agree in both modes.
+/// `OverseerAuthorizationEngine` is the single owner of full access versus restricted delegation.
+/// These tests pin the gate inventory and prove the front doors consuming the engine agree in both modes.
 @MainActor
-final class OverseerPermissionPolicyTests: XCTestCase {
+final class OverseerAuthorizationEngineTests: XCTestCase {
     private func runtime(fullAccess: Bool) -> DelegationScopeRuntime {
         let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         runtime.isGlobalAutoApproveEnabled = { fullAccess }
         return runtime
     }
 
-    func testModeComesFromTheRuntimeSettingInputOnly() {
-        XCTAssertEqual(runtime(fullAccess: true).permissionPolicy.mode, .fullAccess)
-        XCTAssertEqual(runtime(fullAccess: false).permissionPolicy.mode, .restricted)
+    private static let expectedPermissionGates: Set<OverseerAuthorizationGate> = [
+        .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
+        .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
+        .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing,
+        .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired
+    ]
 
-        // A recorded unrestricted grant is not authority: once the setting is off, the policy is
+    /// Each permission gate is pinned to effect-level ON/OFF regressions (`Class.testMethod`).
+    private static let permissionGateScenarios: [OverseerAuthorizationGate: [String]] = [
+        .scopeCoverage: ["OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope"],
+        .scopeCapability: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
+        .allSessionsCapabilityCeiling: ["OverseerAuthorizationEngineTests.testScopeRequestValidationAndGlobalGrantFollowThePolicy"],
+        .scopeMembership: ["OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope"],
+        .confirmationRequirement: [
+            "OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity",
+            "OverseerAuthorizationEngineTests.testApprovedCardSurvivesALaterRestrictedDenialUnderFullAccessAndIsClaimedOnce"
+        ],
+        .sessionQuota: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
+        .worktreeQuota: ["SessionAdminStructureTests.testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation"],
+        .creatorPlacementForAccounting: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
+        .scopeAnchorMoveRestriction: ["OverseerAuthorizationEngineTests.testFullAccessAdmitsReplicatedCreatorDespiteLegacyRestrictedScopeAtItsLimit"],
+        .otherScopeMembershipMove: ["OverseerAuthorizationEngineTests.testFullAccessSkipsScopeMoveAccountingButKeepsLaneStructureChecks"],
+        .restrictedScopeNarrowing: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
+        .directChildOrCreatorOwnership: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
+        .humanOnlyForAgent: ["AgentSessionTargetOperationAuthorizationTests.testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession"],
+        .linkRequired: ["AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"]
+    ]
+
+    /// The gate inventory is total and pinned: adding a gate, or reclassifying one, must update this
+    /// contract, its effect-level scenario, and the guardrail manifest together.
+    func testGateInventoryIsPinnedAndEveryPermissionGateHasAnEffectLevelScenario() {
+        let permission = Set(OverseerAuthorizationGate.allCases.filter { $0.classification == .permission })
+        XCTAssertEqual(permission, Self.expectedPermissionGates)
+        XCTAssertEqual(Set(Self.permissionGateScenarios.keys), permission)
+        for (gate, scenarios) in Self.permissionGateScenarios {
+            for scenario in scenarios {
+                let parts = scenario.split(separator: ".").map(String.init)
+                let testClass: AnyClass? = NSClassFromString("RepoPromptTests.\(parts[0])")
+                let selectors = [parts[1], parts[1] + "AndReturnError:", parts[1] + "WithCompletionHandler:"]
+                XCTAssertTrue(
+                    selectors.contains { testClass?.instancesRespond(to: NSSelectorFromString($0)) ?? false },
+                    "\(gate.rawValue): scenario \(scenario) does not exist"
+                )
+            }
+        }
+    }
+
+    func testEngineWaivesExactlyThePermissionGatesAndOnlyUnderFullAccess() {
+        for fullAccess in [false, true] {
+            // The engine holds its runtime weakly; keep the runtime alive for the assertions.
+            let scopes = runtime(fullAccess: fullAccess)
+            let engine = scopes.authorization
+            for gate in OverseerAuthorizationGate.allCases {
+                XCTAssertEqual(
+                    engine.waives(gate), fullAccess && gate.classification == .permission,
+                    "\(gate.rawValue) fullAccess=\(fullAccess)"
+                )
+            }
+        }
+    }
+
+    func testModeComesFromTheRuntimeSettingInputOnly() {
+        let on = runtime(fullAccess: true), off = runtime(fullAccess: false)
+        XCTAssertTrue(on.authorization.waives(.scopeCoverage))
+        XCTAssertFalse(off.authorization.waives(.scopeCoverage))
+
+        // A recorded unrestricted grant is not authority: once the setting is off, the engine is
         // restricted and reconciliation revokes the grant.
-        var enabled = true
+        let flag = Flag()
+        flag.value = true
         let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
-        scopes.isGlobalAutoApproveEnabled = { enabled }
+        scopes.isGlobalAutoApproveEnabled = { flag.value }
         let grantee = UUID()
         XCTAssertNotNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
-        enabled = false
-        XCTAssertEqual(scopes.permissionPolicy.mode, .restricted)
+        flag.value = false
+        XCTAssertFalse(scopes.authorization.waives(.scopeCoverage))
         XCTAssertTrue(scopes.allLiveScopes().contains { $0.grant.unrestricted }, "precondition: the stale grant is still recorded")
         scopes.reconcileGlobalAutoApprove()
         XCTAssertFalse(scopes.allLiveScopes().contains { $0.grant.unrestricted })
         XCTAssertNil(scopes.ensureGlobalAutoApproveScope(for: grantee))
     }
 
-    func testCrossSessionOperationKeepsIdentityRulesInBothModes() {
+    func testTargetOwnershipWaiverKeepsIdentityRulesInBothModes() {
         let caller = UUID(), other = UUID()
-        let full = OverseerPermissionPolicy(mode: .fullAccess)
-        let restricted = OverseerPermissionPolicy(mode: .restricted)
+        let fullScopes = runtime(fullAccess: true), restrictedScopes = runtime(fullAccess: false)
+        let full = fullScopes.authorization
+        let restricted = restrictedScopes.authorization
+        for gate in [OverseerAuthorizationGate.directChildOrCreatorOwnership, .humanOnlyForAgent] {
+            XCTAssertTrue(full.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: other))
+            XCTAssertFalse(full.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: caller), "self-targeting keeps its own rule")
+            XCTAssertFalse(full.waivesTargetOwnership(gate, caller: .unresolvedAgentRun, targetSessionID: other), "unresolved routing never becomes a caller")
+            XCTAssertFalse(
+                full.waivesTargetOwnership(gate, caller: .administrativePrincipal, targetSessionID: other),
+                "administrative callers keep their own authority path"
+            )
+            XCTAssertFalse(restricted.waivesTargetOwnership(gate, caller: .agentSession(caller), targetSessionID: other))
+        }
+    }
 
-        XCTAssertTrue(full.permitsCrossSessionOperation(by: .agentSession(caller), on: other))
-        XCTAssertFalse(full.permitsCrossSessionOperation(by: .agentSession(caller), on: caller), "self-targeting keeps its own rule")
-        XCTAssertFalse(full.permitsCrossSessionOperation(by: .unresolvedAgentRun, on: other), "unresolved routing never becomes a caller")
-        XCTAssertFalse(
-            full.permitsCrossSessionOperation(by: .administrativePrincipal, on: other),
-            "administrative callers keep their own authority path"
-        )
-        XCTAssertFalse(restricted.permitsCrossSessionOperation(by: .agentSession(caller), on: other))
+    func testFullAccessCoversAdministrationWithoutAnyScope() throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), outsider = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(outsider, parent: nil)
+            flag.value = fullAccess
+            // `scopeCoverage`: no scope at all.
+            switch fixture.core.authorize(.init(operation: .adminRename, caller: .agentSession(overseer), targetSessionIDs: [member])) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode needs a covering scope")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied(.unknownScope, _):
+                XCTAssertFalse(fullAccess, "full access needs no scope request")
+            default:
+                XCTFail("unexpected coverage outcome, fullAccess=\(fullAccess)")
+            }
+            // `scopeMembership`: a named restricted scope that does not contain the target.
+            flag.value = false
+            let restricted = try fixture.grant(overseer, [.observe, .organize])
+            flag.value = fullAccess
+            switch fixture.core.authorize(.init(
+                operation: .adminRename, caller: .agentSession(overseer), scopeID: restricted.id, targetSessionIDs: [outsider]
+            )) {
+            case let .authorized(batch):
+                XCTAssertTrue(fullAccess, "restricted mode never reaches a non-member")
+                XCTAssertTrue(batch.scope.grant.unrestricted)
+            case .denied:
+                XCTAssertFalse(fullAccess, "a named scope's membership never narrows full access")
+            default:
+                XCTFail("unexpected membership outcome, fullAccess=\(fullAccess)")
+            }
+        }
+    }
 
-        XCTAssertFalse(full.appliesDelegatedAccounting)
-        XCTAssertTrue(restricted.appliesDelegatedAccounting)
+    @MainActor
+    private final class RecordingRetire: AgentSessionAdministrationOperationHandler {
+        let operations: Set<DomainAgentSessionTargetOperation> = [.adminRetire]
+        var performed: [[UUID]] = []
+
+        func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
+            performed.append(batch.admittedSessionIDs)
+            return .object(["result": .string("applied"), "changed_count": .int(batch.admittedSessionIDs.count)])
+        }
+    }
+
+    /// The approved-card-then-later-denial gap: a card the user approved for a named restricted scope
+    /// stays valid when that scope later stops admitting the request (here the target started running
+    /// and the scope lacks `control`). Full access re-authorizes, validates the card on its own against
+    /// the scope it was issued for, carries it, and `perform` claims it exactly once.
+    func testApprovedCardSurvivesALaterRestrictedDenialUnderFullAccessAndIsClaimedOnce() async throws {
+        let flag = Flag()
+        let fixture = structureFixture(flag)
+        let overseer = UUID(), target = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(target, parent: overseer)
+        let restricted = try fixture.grant(overseer, [.observe, .organize, .restructure])
+        let recorder = RecordingRetire()
+        let core = AgentSessionAdministrationCore(scopes: fixture.runtime, projector: fixture.projector, handlers: [recorder])
+        let tab = UUID()
+        func request(_ confirmation: UUID? = nil, key: String = "retire-1") -> AgentSessionAdministrationRequest {
+            .init(
+                operation: .adminRetire, caller: .agentSession(overseer), callerTabID: tab, scopeID: restricted.id,
+                targetSessionIDs: [target], idempotencyKey: key, confirmationID: confirmation
+            )
+        }
+        guard case let .pendingConfirmation(card, _) = try await core.perform(request()) else {
+            return XCTFail("restricted retire raises a card")
+        }
+        XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+        fixture.provenance.add(target, parent: overseer, state: .running)
+        flag.value = true
+
+        if case .completed = try await core.perform(request(card.id, key: "another-request")) {
+            XCTFail("a card bound to another request is input and is never carried")
+        }
+        XCTAssertTrue(recorder.performed.isEmpty)
+
+        guard case .completed = try await core.perform(request(card.id)) else {
+            return XCTFail("full access applies the approved request despite the later restricted denial")
+        }
+        XCTAssertEqual(recorder.performed, [[target]])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmation(id: card.id, granteeSessionID: overseer)?.state, .consumed)
+
+        if case .completed = try await core.perform(request(card.id)) {
+            XCTFail("an applied card authorizes one application")
+        }
+        XCTAssertEqual(recorder.performed.count, 1)
     }
 
     func testScopeRequestValidationAndGlobalGrantFollowThePolicy() {
@@ -9796,11 +9950,13 @@ final class OverseerPermissionPolicyTests: XCTestCase {
         for fullAccess in [false, true] {
             let flag = Flag()
             let fixture = structureFixture(flag)
-            let creator = UUID(), member = UUID(), unplaced = UUID()
+            let creator = UUID(), member = UUID(), unplaced = UUID(), anchor = UUID()
             fixture.provenance.add(creator, parent: nil)
             fixture.provenance.add(member, parent: creator)
             fixture.provenance.add(unplaced, parent: nil)
+            fixture.provenance.add(anchor, parent: nil)
             let legacy = try fixture.grant(creator, [.observe, .spawn], guardrails: .init(maxLiveSessions: 1))
+            try fixture.grant(anchor, [.observe])
             flag.value = fullAccess
             if fullAccess {
                 XCTAssertNotNil(fixture.runtime.ensureGlobalAutoApproveScope(for: creator), "mixed restricted + unrestricted grants")
@@ -9817,6 +9973,11 @@ final class OverseerPermissionPolicyTests: XCTestCase {
             }
 
             fixture.provenance.resolutionStates[creator] = nil
+            XCTAssertEqual(
+                fixture.admit(creator, target: .unplacedSession(anchor)),
+                fullAccess ? .unscoped : .targetAnchorsScope,
+                "grafting a session that anchors another live scope is delegated accounting"
+            )
             let admitted = fixture.admit(creator)
             if fullAccess {
                 XCTAssertEqual(admitted, .unscoped, "a legacy quota never narrows full access")

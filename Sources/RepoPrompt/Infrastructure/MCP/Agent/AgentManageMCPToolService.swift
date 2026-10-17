@@ -482,11 +482,7 @@ struct AgentManageMCPToolService {
             result["truncated"] = .bool(filtered.count > limit)
             result["note"] = .string(
                 "These are matching direct child sessions only, not a workspace inventory; zero children does not mean this workspace is empty. "
-                    + (
-                        OverseerPermissionPolicy.current.isFullAccess
-                            ? "Overseer full access: ON. For workspace-wide listing, call become_overseer if needed, then just call session_admin inventory with filter.workspace=\(workspace.id.uuidString); no scope request or card is needed. "
-                            : "Overseer full access: OFF. Use existing covering grants directly. Request authority only when no current grant covers workspace-wide listing: call become_overseer if needed, then session_admin request_scope with kind=workspace, workspace=\(workspace.id.uuidString), and capabilities including observe plus needed mutation capabilities. Existing standing consent may settle it without a card. Otherwise continue after the user approves the scope card and RepoPrompt notifies you; then use session_admin inventory. "
-                    )
+                    + OverseerAuthorizationEngine.current.childListingGuidance(workspaceID: workspace.id)
                     + "Tool discovery grants no authority."
             )
         case .none:
@@ -1290,7 +1286,9 @@ struct AgentManageMCPToolService {
                 throw CleanupAuthorityFailure(subreason: "caller_routing_unresolved")
             case let .agentSession(callerID):
                 guard sessionID != callerID else { throw CleanupAuthorityFailure(subreason: "self_target") }
-                guard OverseerPermissionPolicy.current.permitsCrossSessionOperation(by: currentCaller, on: sessionID) else {
+                guard OverseerAuthorizationEngine.current.waivesTargetOwnership(
+                    .humanOnlyForAgent, caller: currentCaller, targetSessionID: sessionID
+                ) else {
                     throw CleanupAuthorityFailure(subreason: "human_only_operation")
                 }
                 guard metadata.connectionID != nil else {
@@ -1482,7 +1480,7 @@ struct AgentManageMCPToolService {
             }
 
             guard candidate.isMCPOriginated || {
-                if case .agentSession = cleanupCaller { return OverseerPermissionPolicy.current.isFullAccess }
+                if case .agentSession = cleanupCaller { return OverseerAuthorizationEngine.current.waives(.humanOnlyForAgent) }
                 return false
             }() else {
                 skippedSessions.append([

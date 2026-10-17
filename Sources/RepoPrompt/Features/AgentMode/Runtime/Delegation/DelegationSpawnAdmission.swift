@@ -23,7 +23,7 @@ import RepoPromptDomainRuntime
 /// A creator with no such scope gets `.unscoped` and every surface behaves exactly as before.
 /// Administrative principals never have a creator session, so they are never affected.
 ///
-/// With Overseer full access (`OverseerPermissionPolicy.appliesDelegatedAccounting` false) none of
+/// With Overseer full access (`OverseerAuthorizationEngine` waives the accounting gates) none of
 /// this delegated accounting applies: no guardrail, joining count, reservation, auto-join stamp, scope-move
 /// refusal, or creator placement proof stands between a routed creator and its creation surface. Structural
 /// invariants (a lane is never re-parented under itself or an unresolvable ancestry) hold in both modes.
@@ -94,7 +94,7 @@ enum DelegationSpawnAdmission {
         projector: any DelegationMembershipProjector
     ) -> GuardrailScopeResolution {
         // Full access: no delegation bounds or blocks a creation, whatever restricted scopes remain.
-        guard scopes.permissionPolicy.appliesDelegatedAccounting else { return .scopes([]) }
+        guard !scopes.authorization.waives(.sessionQuota) else { return .scopes([]) }
         // A global auto-approve grant has no guardrails to count against, so it is not a delegation
         // that can bound or block a creation.
         let liveScopes = scopes.allLiveScopes().filter { !$0.grant.unrestricted }
@@ -150,7 +150,10 @@ enum DelegationSpawnAdmission {
         projector: any DelegationMembershipProjector
     ) -> (denial: DomainDelegationScopeDenial?, scopeIDs: Set<UUID>) {
         // Full access: nothing is counted or reserved, even for records a caller passes in directly.
-        guard scopes.permissionPolicy.appliesDelegatedAccounting else { return (nil, []) }
+        let waived = operation.scopeGuardrailUse == .worktree
+            ? scopes.authorization.waives(.worktreeQuota)
+            : scopes.authorization.waives(.sessionQuota)
+        guard !waived else { return (nil, []) }
         var scopeIDs: Set<UUID> = []
         for record in records {
             var usage: [UUID: DomainDelegationScopeUsage] = [:]
@@ -203,14 +206,14 @@ enum DelegationSpawnAdmission {
         projector: any DelegationMembershipProjector
     ) -> Outcome {
         guard let creator = creatorSessionID else { return .unscoped }
-        let policy = scopes.permissionPolicy
+        let authorization = scopes.authorization
         let joiningSessionID: UUID?
         switch target {
         case .placedSession:
             return .unscoped
         case let .otherCreatorsLane(lane):
             // Whatever the creator's own scopes, the lane's current scopes would lose it.
-            return laneMoveOutcome(lane, creator: creator, scopes: scopes, projector: projector, policy: policy)
+            return laneMoveOutcome(lane, creator: creator, scopes: scopes, projector: projector)
         case .newSession:
             joiningSessionID = nil
         case let .unplacedSession(sessionID):
@@ -218,7 +221,7 @@ enum DelegationSpawnAdmission {
         }
         // Full access: the creation surface's own authority decides. Nothing is counted, reserved,
         // stamped, or refused for delegated placement, including a replicated creator.
-        guard policy.appliesDelegatedAccounting else { return .unscoped }
+        guard !authorization.waives(.creatorPlacementForAccounting) else { return .unscoped }
         let records: [DomainDelegationScopeRecord]
         switch resolveGuardrailScopes(forCreator: creator, scopes: scopes, projector: projector) {
         case let .creatorPlacementUnresolved(reason):
@@ -283,8 +286,7 @@ enum DelegationSpawnAdmission {
         _ lane: UUID,
         creator: UUID,
         scopes: DelegationScopeRuntime,
-        projector: any DelegationMembershipProjector,
-        policy: OverseerPermissionPolicy
+        projector: any DelegationMembershipProjector
     ) -> Outcome {
         guard let laneAncestry = projector.organizationalAncestry(of: lane),
               let creatorAncestry = projector.organizationalAncestry(of: creator),
@@ -296,7 +298,7 @@ enum DelegationSpawnAdmission {
                   liveTreeScopes: scopes.liveTreeScopeRoots()
               )
         else { return .targetUnresolved }
-        guard policy.appliesDelegatedAccounting else { return .unscoped }
+        guard !scopes.authorization.waives(.otherScopeMembershipMove) else { return .unscoped }
         return affected.isEmpty ? .unscoped : .targetMovesBetweenScopes(count: affected.count)
     }
 

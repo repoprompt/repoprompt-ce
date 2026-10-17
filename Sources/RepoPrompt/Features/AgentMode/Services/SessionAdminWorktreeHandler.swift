@@ -387,8 +387,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     private func reserveBinding(
         _ desiredIDs: Set<String>, target: UUID, scope: DomainDelegationScopeRecord
     ) throws -> [DelegationScopeReservation] {
-        // Full access: no delegated `maxWorktrees` counts or reserves a binding (`OverseerPermissionPolicy`).
-        guard context.scopes.permissionPolicy.appliesDelegatedAccounting else { return [] }
+        // Full access: no delegated `maxWorktrees` counts or reserves a binding.
+        guard !context.scopes.authorization.waives(.worktreeQuota) else { return [] }
         let reactivated = desiredIDs.compactMap { ownership.record(worktreeID: $0) }
             .filter { $0.releasedAt != nil && $0.createdBySessionID != nil }
         var records = try context.scopeChain(of: scope)

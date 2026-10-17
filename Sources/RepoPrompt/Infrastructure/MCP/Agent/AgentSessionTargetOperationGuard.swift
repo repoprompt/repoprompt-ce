@@ -185,8 +185,10 @@ enum AgentSessionTargetOperationGuard {
     ) throws {
         // Overseer full access: a routed Agent session may run every existing target operation on any
         // other session, including ones that are otherwise direct-child or human-only. Unresolved
-        // routing and self-targeting still fail closed (`OverseerPermissionPolicy`).
-        if OverseerPermissionPolicy.current.permitsCrossSessionOperation(by: caller, on: provenance.targetSessionID) {
+        // routing and self-targeting still fail closed (`OverseerAuthorizationEngine`).
+        if OverseerAuthorizationEngine.current.waivesTargetOwnership(
+            .directChildOrCreatorOwnership, caller: caller, targetSessionID: provenance.targetSessionID
+        ) {
             return
         }
         let decision = DomainAgentSessionOperationAuthorizer.authorize(
@@ -234,7 +236,9 @@ enum AgentSessionTargetOperationGuard {
             throw denialError(sessionID: targetSessionID)
         case let .agentSession(callerSessionID):
             if callerSessionID == targetSessionID
-                || OverseerPermissionPolicy.current.permitsCrossSessionOperation(by: caller, on: targetSessionID)
+                || OverseerAuthorizationEngine.current.waivesTargetOwnership(
+                    .directChildOrCreatorOwnership, caller: caller, targetSessionID: targetSessionID
+                )
             {
                 return
             }

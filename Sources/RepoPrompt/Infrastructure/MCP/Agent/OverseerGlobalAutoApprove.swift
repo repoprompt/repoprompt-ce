@@ -3,7 +3,7 @@ import Foundation
 /// The user's global Overseer auto-approve ("yolo") setting, Settings › Agent Permissions › Overseer.
 ///
 /// Storage only: the stored value is the production input of `DelegationScopeRuntime`'s
-/// `isGlobalAutoApproveEnabled`. What "on" permits is decided solely by `OverseerPermissionPolicy`;
+/// `isGlobalAutoApproveEnabled`. What "on" permits is decided solely by `OverseerAuthorizationEngine`;
 /// no admission or authorization code reads this setting directly. Off by default. Written only by the
 /// Settings toggle; deliberately not exposed through MCP `app_settings`, so an agent cannot turn it on.
 @MainActor

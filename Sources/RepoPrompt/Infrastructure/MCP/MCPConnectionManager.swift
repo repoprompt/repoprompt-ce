@@ -3317,7 +3317,7 @@ actor ServerNetworkManager {
         let (oversightEnabled, globalOverseer) = await MainActor.run {
             (
                 ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
-                OverseerPermissionPolicy.current.isFullAccess
+                OverseerAuthorizationEngine.current.waives(.linkRequired)
             )
         }
         guard let revalidatedRouteToken = await (
