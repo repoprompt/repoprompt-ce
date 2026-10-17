@@ -152,19 +152,22 @@ enum AgentToolArgumentPersistencePolicy {
         return OracleImageToolArguments.removingImages(fromArgsJSON: argsJSON)
     }
 
-    /// Whether the tool name resolves to RepoPrompt's `ask_oracle`, using the canonical MCP
+    /// Whether the tool name resolves to an Oracle image send, using the canonical MCP
     /// name resolver plus a fail-closed suffix check for server prefixes the resolver does
     /// not own.
     private static func isOracleImageTool(_ toolName: String?) -> Bool {
         guard let toolName else { return false }
-        if MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) == "ask_oracle" {
+        let imageTools = ["ask_oracle", "oracle_send"]
+        if let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName), imageTools.contains(canonical) {
             return true
         }
         let lowered = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return lowered == "ask_oracle"
-            || lowered.hasSuffix("__ask_oracle")
-            || lowered.hasSuffix(":ask_oracle")
-            || lowered.hasSuffix(".ask_oracle")
+        return imageTools.contains { name in
+            lowered == name
+                || lowered.hasSuffix("__\(name)")
+                || lowered.hasSuffix(":\(name)")
+                || lowered.hasSuffix(".\(name)")
+        }
     }
 }
 
