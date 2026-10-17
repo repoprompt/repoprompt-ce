@@ -2479,8 +2479,12 @@ final actor ClaudeNativeProcessSessionController {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
+        let filtered = await ProviderEnvironmentFiltering.filter(
+            result.environment,
+            for: config.runtimeVariant.agentKind
+        )
         return effectiveLaunchEnvironment(
-            base: result.environment,
+            base: filtered,
             resolverOverrides: resolverOverrides,
             resolverRemovedKeys: resolverRemovedKeys
         )
