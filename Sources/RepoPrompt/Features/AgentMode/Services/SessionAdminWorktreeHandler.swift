@@ -581,9 +581,12 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // Listing has no capacity admission: per-row membership and final chain fences remain
         // authoritative. Unrelated incomplete usage evidence must not veto a read.
         let focus = Set(batch.request.targetSessionIDs)
-        let members = context.projector.members(of: batch.scope.grant)
-            .filter { context.isPlacedMember($0, ofChainFrom: batch.scope) }
-            .filter { focus.isEmpty || focus.contains($0) }
+        // Unfocused listing enumerates the admitted scope; a focused listing names its sessions, which
+        // are visible when the operation may reach them (`permitsMember`), so full access never drops a
+        // focused target merely because it is outside a named restricted scope.
+        let members = focus.isEmpty
+            ? context.projector.members(of: batch.scope.grant).filter { context.isPlacedMember($0, ofChainFrom: batch.scope) }
+            : batch.request.targetSessionIDs.filter { context.permitsMember($0, ofChainFrom: batch.scope) }
         let memberSet = Set(members)
         let chainScopeIDs = Set(context.scopeChain(of: batch.scope).map(\.id))
         struct Row {
@@ -651,7 +654,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
               zip(initialChain, currentChain).allSatisfy({ before, after in
                   before.id == after.id && before.generation == after.generation && after.isActive
               }),
-              members.allSatisfy({ context.isPlacedMember($0, ofChainFrom: batch.scope) })
+              members.allSatisfy({ focus.isEmpty ? context.isPlacedMember($0, ofChainFrom: batch.scope) : context.permitsMember($0, ofChainFrom: batch.scope) })
         else { throw SessionAdminMCPToolService.unavailableError }
         let outcomes = deferredOutcomes.keys.filter(memberSet.contains)
             .sorted { $0.uuidString < $1.uuidString }

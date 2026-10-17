@@ -9721,7 +9721,7 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
     private static let expectedPermissionGates: Set<OverseerAuthorizationGate> = [
         .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
         .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
-        .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing,
+        .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing, .creatorLaneQuota,
         .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired, .observerMustBeCaller,
         .linkCapabilityCeiling
     ]
@@ -9731,7 +9731,10 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
         .scopeCoverage: ["OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope"],
         .scopeCapability: ["OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity"],
         .allSessionsCapabilityCeiling: ["OverseerAuthorizationEngineTests.testScopeRequestValidationAndGlobalGrantFollowThePolicy"],
-        .scopeMembership: ["OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope"],
+        .scopeMembership: [
+            "OverseerAuthorizationEngineTests.testFullAccessCoversAdministrationWithoutAnyScope",
+            "OverseerAuthorizationEngineTests.testFullAccessAdoptsThroughTheHandlerWithoutAScope"
+        ],
         .confirmationRequirement: [
             "OverseerAuthorizationEngineTests.testFullAccessOverridesExplicitRestrictedScopeButKeepsInputIdentityAndIntegrity",
             "OverseerAuthorizationEngineTests.testApprovedCardSurvivesALaterRestrictedDenialUnderFullAccessAndIsClaimedOnce"
@@ -9755,7 +9758,11 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
             "AgentSessionLaneFirstSaveTests.testScopedCreatorCreatesLaneThroughResolvedDestination"
         ],
         .observerMustBeCaller: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"],
-        .linkCapabilityCeiling: ["OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction"]
+        .linkCapabilityCeiling: [
+            "OverseerAuthorizationEngineTests.testFullAccessWaivesScopeLinkCeilingAndObserverRestriction",
+            "AgentSessionLinkToolServiceTests.testFullAccessElevatesAWatchOnlyLinkWithoutUpgradingItAndOffRevokesAtTheNextFence"
+        ],
+        .creatorLaneQuota: ["OverseerAuthorizationEngineTests.testFullAccessWaivesTheCreatorLaneQuota"]
     ]
 
     /// The gate inventory is total and pinned: adding a gate, or reclassifying one, must update this
@@ -9862,6 +9869,44 @@ final class OverseerAuthorizationEngineTests: XCTestCase {
                 XCTAssertFalse(fullAccess, "a named scope's membership never narrows full access")
             default:
                 XCTFail("unexpected membership outcome, fullAccess=\(fullAccess)")
+            }
+        }
+    }
+
+    func testFullAccessWaivesTheCreatorLaneQuota() {
+        let maximum = AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        for fullAccess in [false, true] {
+            let scopes = runtime(fullAccess: fullAccess)
+            XCTAssertTrue(scopes.authorization.admitsAdditionalLane(admittedLaneCount: maximum - 1))
+            XCTAssertEqual(scopes.authorization.admitsAdditionalLane(admittedLaneCount: maximum), fullAccess)
+        }
+    }
+
+    /// Implicit full access adopts through the real handler: the full-access grant contains every
+    /// session, so "already a member" must not refuse, and the stamp stays placement-consistent.
+    func testFullAccessAdoptsThroughTheHandlerWithoutAScope() async throws {
+        for fullAccess in [false, true] {
+            let flag = Flag()
+            let fixture = structureFixture(flag)
+            let overseer = UUID(), member = UUID(), outsider = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            fixture.provenance.add(outsider, parent: nil)
+            flag.value = fullAccess
+            let outcome = try await fixture.perform(
+                .adminAdopt, caller: overseer, targets: [outsider],
+                args: ["parent_session_id": .string(member.uuidString)], key: "adopt-\(fullAccess)"
+            )
+            if fullAccess {
+                guard case .completed = outcome else { return XCTFail("full access adopts: \(outcome)") }
+                let placement = try XCTUnwrap(fixture.structure.placements.last)
+                XCTAssertEqual(placement.session, outsider)
+                XCTAssertEqual(placement.parent, member)
+                let stamp = try XCTUnwrap(placement.scope.flatMap { fixture.runtime.record(id: $0) })
+                XCTAssertTrue(stamp.grant.unrestricted, "the stamp is the full-access grant, which contains every session")
+            } else {
+                guard case .denied(.unknownScope, _) = outcome else { return XCTFail("restricted mode needs a covering scope") }
+                XCTAssertTrue(fixture.structure.placements.isEmpty)
             }
         }
     }

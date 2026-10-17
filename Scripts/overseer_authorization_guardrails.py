@@ -45,7 +45,15 @@ OPERATION_AUTHORIZER = re.compile(r"\bDomainAgentSessionOperationAuthorizer\.aut
 ENGINE_ONLY_ALGORITHMS = re.compile(
     r"\bDomainDelegationScopeLinkPolicy\.missingCapability\(|\badoptionGuardrailViolation\(|\.evaluateCreationGuardrails\(scopeID:"
     r"|\bDomainDelegationScopePlacementPolicy\.(?:validateReparent|validateAdopt|depthViolation)\("
+    r"|\bDomainDelegationScopeAuthorizationRequest\(|\bDomainDelegationScopeAuthority\.isValid\("
+    r"|\bDomainAgentSessionLinkCapabilityElevation\(|\.elevate\(observer:"
 )
+# The setting input may be named only by its owner (the runtime declares it; the engine reads it), so
+# an alias such as `let read = scopes.isGlobalAutoApproveEnabled` elsewhere fails too.
+SETTING_INPUT_NAME = re.compile(r"\bisGlobalAutoApproveEnabled\b")
+# The all-sessions capability ceiling is decided by the engine; the runtime uses it only for the
+# user's own approval card ("Grant all for this session").
+ALL_SESSIONS_CEILING = re.compile(r"\ballSessionsPermitted\b")
 RETIRED = re.compile(r"\bOverseerPermissionPolicy\b|\b(?:scopes|delegationScopes|runtime)\.permissionPolicy\b")
 
 
@@ -100,6 +108,10 @@ def check(root: Path) -> list[str]:
     for rel, text in production_sources(root):
         if SETTING_INPUT.search(text) and rel != ENGINE:
             errors.append(f"{rel}: only OverseerAuthorizationEngine may evaluate isGlobalAutoApproveEnabled()")
+        if SETTING_INPUT_NAME.search(text) and rel not in (ENGINE, RUNTIME):
+            errors.append(f"{rel}: the setting input is named only by DelegationScopeRuntime and the engine")
+        if ALL_SESSIONS_CEILING.search(text) and not is_engine(rel) and rel != RUNTIME:
+            errors.append(f"{rel}: the all-sessions capability ceiling is decided by OverseerAuthorizationEngine")
         if SETTING_STORAGE.search(text) and rel != RUNTIME:
             errors.append(f"{rel}: read Overseer full access through OverseerAuthorizationEngine, not OverseerGlobalAutoApprove.isEnabled()")
         if SCOPE_AUTHORITY_ENTRY.search(text) and not is_engine(rel):
@@ -142,6 +154,11 @@ def self_test() -> int:
                 "let e2 = scopes.permissionPolicy",
                 "let f = engine.waives(.linkRequired)",
                 "let h = DomainDelegationScopeLinkPolicy.missingCapability(linkCapabilities: m, grant: g)",
+                "let request = DomainDelegationScopeAuthorizationRequest(operation: op)",
+                "let reader = scopes.isGlobalAutoApproveEnabled",
+                "let ok = DomainDelegationScopeAuthority.isValid(proof, for: grant, targetSessionID: id)",
+                "let caps = DomainDelegationScopeCapability.allSessionsPermitted",
+                "elevation.elevate(observer: id)",
                 "// let g = engine.waives(.humanOnlyForAgent) stays ignored inside a comment",
             ]),
             encoding="utf-8",
@@ -154,6 +171,8 @@ def self_test() -> int:
             "restricted operation authorizer",
             "retired parallel policy name",
             "restricted permission algorithm outside",
+            "setting input is named only",
+            "all-sessions capability ceiling",
             "gate .linkRequired consulted 1x, manifest pins 0x",
             "gate .scopeCoverage consulted 0x, manifest pins 1x",
         ]

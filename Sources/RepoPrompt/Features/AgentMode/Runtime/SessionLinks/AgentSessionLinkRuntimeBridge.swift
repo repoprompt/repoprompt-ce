@@ -1261,6 +1261,7 @@ final class AgentSessionLinkRuntimeBridge {
                 }
             }
         }
+        await authority.installCapabilityElevation(delegationScopes.authorization.linkCapabilityElevation)
         return await authority.installScopeConsent(delegationScopes.linkConsent)
     }
 
@@ -6512,11 +6513,23 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
-        let leaseResult = await authority.authorize(
+        // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
+        delegationScopes.reconcileGlobalAutoApprove()
+        var leaseResult = await authority.authorize(
             operation: operation,
             observerEndpoint: observerEndpoint,
             targetSessionID: targetSessionID
         )
+        // Full access: a stored link capability is not a ceiling (`linkCapabilityCeiling`). Ensuring the
+        // observer's full-access grant elevates its links in the authority; the stored link is unchanged.
+        if case .failure(.capabilityDenied) = leaseResult,
+           delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: observerEndpoint.sessionID)
+        {
+            _ = await ensureScopedLinkConsent()
+            leaseResult = await authority.authorize(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            )
+        }
         let lease: DomainAgentSessionLinkLease
         switch leaseResult {
         case let .success(value):
@@ -6821,6 +6834,7 @@ final class AgentSessionLinkRuntimeBridge {
               grant.target == lease.target
         else { return false }
         return grant.capabilities.contains(.manage)
+            || delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: lease.observer.sessionID, issue: false)
     }
 
     /// Loads durable child metadata once for the batch, then publishes the resulting target
@@ -8493,7 +8507,7 @@ final class AgentSessionLinkRuntimeBridge {
         // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-        guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        guard delegationScopes.authorization.admitsAdditionalLane(admittedLaneCount: admittedCount)
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1

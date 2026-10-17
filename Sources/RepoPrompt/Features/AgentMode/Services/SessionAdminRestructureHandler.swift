@@ -364,7 +364,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         let destinationAncestry = context.projector.organizationalAncestry(of: destination)
         var moved: Set<UUID> = []
         for adoptee in adoptees ?? batch.admittedSessionIDs {
-            if context.isPlacedMember(adoptee, ofChainFrom: batch.scope) {
+            if context.scopes.authorization.adoptionRefusesPlacedAdoptee(adoptee, scope: batch.scope, projector: context.projector) {
                 return SessionAdminReply.refused(
                     code: "already_member",
                     detail: "This session is already in the scope; use reparent to move it.",

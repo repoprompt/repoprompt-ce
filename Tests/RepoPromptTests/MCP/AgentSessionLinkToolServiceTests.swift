@@ -1163,6 +1163,55 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         guard case .failure(.denied) = await poll() else { return XCTFail("off means off: no link, no access") }
     }
 
+    /// `linkCapabilityCeiling` on an existing watch-only link: restricted mode keeps the stored ceiling,
+    /// a stale recorded full-access grant with the setting off never elevates, full access authorizes
+    /// management without upgrading the stored link, and turning full access off (the Settings toggle's
+    /// reconcile path) fails an in-flight management lease at its next fence.
+    func testFullAccessElevatesAWatchOnlyLinkWithoutUpgradingItAndOffRevokesAtTheNextFence() async throws {
+        let fixture = try await makeReadReleaseFixture(restricted: true)
+        defer { fixture.tearDown() }
+        let scopes = fixture.bridge.delegationScopes
+        final class Flag { var value = false }
+        let fullAccess = Flag()
+        scopes.isGlobalAutoApproveEnabled = { fullAccess.value }
+        let observer = fixture.observer.domainEndpoint
+        let targetID = fixture.target.sessionID
+        func respond() async -> Result<AgentSessionLinkRuntimeBridge.AuthorizedTarget, AgentSessionLinkRuntimeBridge.AuthorizationFailure> {
+            await fixture.bridge.authorizeTarget(operation: .monitorRespond, observerEndpoint: observer, targetSessionID: targetID)
+        }
+        guard case .failure(.managementNotGranted) = await respond() else {
+            return XCTFail("restricted mode keeps a watch-only link's ceiling")
+        }
+
+        // A recorded full-access grant whose setting is already off is not authority.
+        fullAccess.value = true
+        XCTAssertNotNil(scopes.ensureGlobalAutoApproveScope(for: observer.sessionID))
+        fullAccess.value = false
+        guard case .failure(.managementNotGranted) = await respond() else {
+            return XCTFail("a stale recorded full-access grant never elevates a link")
+        }
+
+        fullAccess.value = true
+        guard case let .success(managed) = await respond() else {
+            return XCTFail("full access authorizes management over an existing watch-only link")
+        }
+        XCTAssertEqual(managed.lease.capability, .manage)
+        let stored = await fixture.authority.links(forObserver: observer.sessionID).items.first { $0.targetSessionID == targetID }
+        XCTAssertNotNil(stored)
+        XCTAssertFalse(stored?.capabilities.contains(.manage) ?? true, "the stored link is never upgraded")
+        let validWhileOn = await fixture.authority.validate(lease: managed.lease)
+        XCTAssertNil(validWhileOn)
+
+        // In flight: the Settings toggle turns full access off (its reconcile path); the next fence fails.
+        fullAccess.value = false
+        scopes.reconcileGlobalAutoApprove()
+        let validAfterOff = await fixture.authority.validate(lease: managed.lease)
+        XCTAssertEqual(validAfterOff, .capabilityDenied)
+        guard case .failure(.managementNotGranted) = await respond() else {
+            return XCTFail("off means off for the stored ceiling")
+        }
+    }
+
     func testBootstrapGuidanceResamplesFullAccessWithoutChangingAuthorization() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }

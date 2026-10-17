@@ -36,6 +36,8 @@ enum OverseerAuthorizationGate: String, CaseIterable {
     case otherScopeMembershipMove
     /// A caller's own explicitly named restricted scope narrowing its authority.
     case restrictedScopeNarrowing
+    /// The per-creator lane count (`AgentSessionLanePolicy.agentSessionLaneMaximumCount`).
+    case creatorLaneQuota
     /// Existing `agent_run` / `agent_manage` / worktree-binding targets must be the caller's own spawns.
     case directChildOrCreatorOwnership
     /// Operations otherwise reserved for the human (`agent_manage cleanup_sessions` deletion).
@@ -85,7 +87,7 @@ enum OverseerAuthorizationGate: String, CaseIterable {
         switch self {
         case .scopeCoverage, .scopeCapability, .allSessionsCapabilityCeiling, .scopeMembership,
              .confirmationRequirement, .sessionQuota, .worktreeQuota, .creatorPlacementForAccounting,
-             .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing,
+             .scopeAnchorMoveRestriction, .otherScopeMembershipMove, .restrictedScopeNarrowing, .creatorLaneQuota,
              .directChildOrCreatorOwnership, .humanOnlyForAgent, .linkRequired, .observerMustBeCaller,
              .linkCapabilityCeiling:
             .permission
@@ -127,9 +129,19 @@ final class OverseerAuthorizationEngine {
         scopes?.isGlobalAutoApproveEnabled() ?? false
     }
 
+    /// Engine-issued link capability evidence consumed by `DomainAgentSessionLinkAuthority`. Only this
+    /// engine elevates or revokes; every restricted-mode evaluation revokes all elevations, so a
+    /// full-access elevation never outlives the setting at any later link fence.
+    let linkCapabilityElevation = DomainAgentSessionLinkCapabilityElevation()
+
     /// Whether full access waives `gate`. Integrity gates are never waived.
     func waives(_ gate: OverseerAuthorizationGate) -> Bool {
-        gate.classification == .permission && isFullAccess
+        guard gate.classification == .permission else { return false }
+        guard isFullAccess else {
+            linkCapabilityElevation.revokeAll()
+            return false
+        }
+        return true
     }
 
     /// A routed Agent session acting on a *different* session through an existing-target operation is
@@ -196,8 +208,9 @@ final class OverseerAuthorizationEngine {
             guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
             let explicit = authorize(request, scope: record, callerSessionID: callerSessionID, projector: projector)
             // Full access is never narrowed by the caller's own restricted scope, live or stale (revoked,
-            // expired, regenerated): the full-access grant authorizes and becomes the placement. An
-            // unknown ID (above) and another session's scope stay identity/input refusals.
+            // expired, regenerated): the full-access grant authorizes and becomes the placement, so the
+            // agent needs no recovery call. An unknown ID (above) and another session's scope stay
+            // identity/input refusals (`explicitScopeInput`) that disclose nothing about other grants.
             guard waives(.restrictedScopeNarrowing), Self.explicitPassNarrows(explicit),
                   !record.grant.unrestricted,
                   record.grant.granteeSessionID == callerSessionID,

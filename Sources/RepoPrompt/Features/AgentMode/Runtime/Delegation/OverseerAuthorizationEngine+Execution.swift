@@ -186,6 +186,18 @@ extension OverseerAuthorizationEngine {
         ).map(PlacementDepthDenial.exceeded)
     }
 
+    /// Adoption brings sessions from outside the admitted scope into it, so restricted mode refuses an
+    /// adoptee that is already placed there ("use reparent"). Under full access the admitted scope may
+    /// be the full-access grant, which every session belongs to; adoption then performs its placement
+    /// (and stamp) instead of being refused (`scopeMembership`).
+    func adoptionRefusesPlacedAdoptee(
+        _ adoptee: UUID,
+        scope: DomainDelegationScopeRecord,
+        projector: any DelegationMembershipProjector
+    ) -> Bool {
+        !waives(.scopeMembership) && isPlacedMember(adoptee, ofChainFrom: scope, projector: projector)
+    }
+
     /// The scope an adoption stamps onto the moved subtree. Normally the caller's admitted scope, which
     /// must contain the destination so the stamp is consistent with placement. Full access never
     /// refuses for that: when the destination is outside the admitted scope it stamps the caller's

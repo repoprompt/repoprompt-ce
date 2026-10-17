@@ -76,6 +76,12 @@ extension OverseerAuthorizationEngine {
         }
     }
 
+    /// One more lane for a creator that already has `admittedLaneCount` (`creatorLaneQuota`, waived by
+    /// full access). The in-flight lane-task bound in the bridge is operational capacity and stays.
+    func admitsAdditionalLane(admittedLaneCount: Int) -> Bool {
+        waives(.creatorLaneQuota) || admittedLaneCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+    }
+
     /// A linked-basis lane creator must still hold an active link, unless full access waives it.
     var laneCreatorRequiresActiveLink: Bool {
         !waives(.linkRequired)
@@ -93,6 +99,16 @@ extension OverseerAuthorizationEngine {
     func fullAccessLinkSource(observerSessionID: UUID) -> DomainDelegationScopeRecord? {
         guard waives(.linkRequired) else { return nil }
         return scopes?.ensureGlobalAutoApproveScope(for: observerSessionID)
+    }
+
+    /// `linkCapabilityCeiling` for existing links: under full access every link the observer has is
+    /// authorized at every capability. The engine issues revocable evidence the link authority reads
+    /// (`linkCapabilityElevation`); the stored link is never upgraded, and restricted mode revokes it.
+    /// `issue == false` only reports whether the elevation applies now.
+    func elevatesLinkCapabilities(observerSessionID: UUID, issue: Bool = true) -> Bool {
+        guard waives(.linkCapabilityCeiling) else { return false }
+        if issue { linkCapabilityElevation.elevate(observer: observerSessionID) }
+        return linkCapabilityElevation.isElevated(observer: observerSessionID)
     }
 
     /// The commit fence for a link established from `fullAccessLinkSource`.
