@@ -105,7 +105,8 @@ enum OverseerAuthorizationGate: String, CaseIterable {
 /// remaining families consult `waives(_:)` by gate name from the files the guardrail manifest pins.
 @MainActor
 final class OverseerAuthorizationEngine {
-    private weak var scopes: DelegationScopeRuntime?
+    /// The owning runtime (weak: the runtime owns the engine). Engine extension files read it.
+    private(set) weak var scopes: DelegationScopeRuntime?
 
     init(scopes: DelegationScopeRuntime) {
         self.scopes = scopes

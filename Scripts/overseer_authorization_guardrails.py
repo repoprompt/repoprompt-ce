@@ -25,6 +25,15 @@ from collections import Counter
 from pathlib import Path
 
 ENGINE = "Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/OverseerAuthorizationEngine.swift"
+ENGINE_DIR = "Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/"
+
+
+def is_engine(rel: str) -> bool:
+    """The engine owner: `OverseerAuthorizationEngine.swift` and its `+Family.swift` extensions."""
+    name = rel[len(ENGINE_DIR):] if rel.startswith(ENGINE_DIR) else ""
+    return name == "OverseerAuthorizationEngine.swift" or (
+        name.startswith("OverseerAuthorizationEngine+") and name.endswith(".swift") and "/" not in name
+    )
 RUNTIME = "Sources/RepoPrompt/Features/AgentMode/Runtime/Delegation/DelegationScopeRuntime.swift"
 MANIFEST = "Scripts/overseer_authorization_manifest.tsv"
 
@@ -94,13 +103,13 @@ def check(root: Path) -> list[str]:
             errors.append(f"{rel}: only OverseerAuthorizationEngine may evaluate isGlobalAutoApproveEnabled()")
         if SETTING_STORAGE.search(text) and rel != RUNTIME:
             errors.append(f"{rel}: read Overseer full access through OverseerAuthorizationEngine, not OverseerGlobalAutoApprove.isEnabled()")
-        if SCOPE_AUTHORITY_ENTRY.search(text) and rel != ENGINE:
+        if SCOPE_AUTHORITY_ENTRY.search(text) and not is_engine(rel):
             errors.append(f"{rel}: only OverseerAuthorizationEngine may run the restricted scope authority")
         if OPERATION_AUTHORIZER.search(text) and rel not in OPERATION_AUTHORIZER_FILES:
             errors.append(f"{rel}: DomainAgentSessionOperationAuthorizer.authorize is pinned to the target-operation adapter")
         if RETIRED.search(text):
             errors.append(f"{rel}: retired parallel policy name; use OverseerAuthorizationEngine")
-        if rel == ENGINE:
+        if is_engine(rel):
             continue
         for gate in GATE_CALL.findall(text):
             observed[(rel, gate)] += 1
