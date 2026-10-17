@@ -8,6 +8,73 @@ import XCTest
 
 @MainActor
 final class SessionAdminWorktreeRecoveryTests: XCTestCase {
+    func testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica() async throws {
+        for fullAccess in [true, false] {
+            try await withFixture(fullAccess: fullAccess) { fixture in
+                let settings = GlobalSettingsStore.shared
+                let originalProfile = settings.globalAgentModelsProfile()
+                defer {
+                    settings.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership)
+                    AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+                }
+                var profile = originalProfile
+                profile.mcpAgentRoleOverrides = ["explore": "claudeCode:sonnet:medium"]
+                profile.mcpAgentRoleModelParameters = [:]
+                settings.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+                fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                try await AsyncTestWait.waitUntil("model writer availability") {
+                    fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                }
+                AgentAdvertisedModelCatalog.shared.record([
+                    AgentModelOption(
+                        rawValue: "sonnet:medium", displayName: "Sonnet", description: nil,
+                        isPlaceholderDefault: false, isProviderDefault: false
+                    )
+                ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+                let binding = fixture.session.persistentSessionBindingIdentity
+                let peerWorkspace = fixture.replica.workspaceManager.activeWorkspace
+                let peerIndex = fixture.replica.agentModeViewModel.ownerValidatedSessionIndex
+                let modelRequest: [String: Value] = [
+                    "op": .string("set_model"), "session_id": .string(fixture.sessionID.uuidString),
+                    "model_id": .string("explore")
+                ]
+                let model = try await fixture.call(modelRequest)
+                XCTAssertEqual(model["result"], .string("applied"), String(describing: model))
+                XCTAssertEqual(fixture.session.selectedModelRaw, "sonnet:medium")
+                let repeatedModel = try await fixture.call(modelRequest)
+                XCTAssertEqual(repeatedModel["result"], .string("applied"), String(describing: repeatedModel))
+                XCTAssertEqual(repeatedModel["changed_count"], .int(0))
+                XCTAssertEqual(repeatedModel["state_satisfied"], .bool(true))
+                let effortRequest: [String: Value] = [
+                    "op": .string("set_effort"), "session_id": .string(fixture.sessionID.uuidString),
+                    "effort": .string("high")
+                ]
+                let effort = try await fixture.call(effortRequest)
+                XCTAssertEqual(effort["result"], .string("applied"), String(describing: effort))
+                XCTAssertEqual(fixture.session.selectedClaudeEffortRaw, "high")
+                let repeatedEffort = try await fixture.call(effortRequest)
+                XCTAssertEqual(repeatedEffort["result"], .string("applied"), String(describing: repeatedEffort))
+                XCTAssertEqual(repeatedEffort["changed_count"], .int(0))
+                XCTAssertEqual(repeatedEffort["state_satisfied"], .bool(true))
+                try await fixture.window.agentModeViewModel.flushSaveRequired(
+                    for: fixture.session.tabID, workspaceID: fixture.workspaceID
+                ).get()
+                let saved = try await fixture.savedSession()
+                let persisted = try XCTUnwrap(saved)
+                XCTAssertEqual(persisted.agentKind, AgentProviderKind.claudeCode.rawValue)
+                XCTAssertEqual(persisted.agentModel, "sonnet:medium")
+                XCTAssertEqual(persisted.agentReasoningEffort, "high")
+                XCTAssertEqual(fixture.session.persistentSessionBindingIdentity, binding)
+                XCTAssertNil(fixture.session.runID)
+                XCTAssertTrue(fixture.session.items.isEmpty)
+                XCTAssertNil(fixture.replica.agentModeViewModel.sessions[fixture.session.tabID])
+                XCTAssertEqual(fixture.replica.workspaceManager.activeWorkspace, peerWorkspace)
+                XCTAssertEqual(fixture.replica.agentModeViewModel.ownerValidatedSessionIndex, peerIndex)
+                fixture.assertForegroundUnchanged()
+            }
+        }
+    }
+
     func testExistingCheckoutRecoveryReplaysThroughToolBindAndRelease() async throws {
         try await withFixture { fixture in
             let checkout = fixture.git.sandbox.appendingPathComponent("existing-checkout")
@@ -46,14 +113,15 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let savedReleased = try await fixture.savedSession()
             let persistedReleased = try XCTUnwrap(savedReleased)
             XCTAssertTrue(persistedReleased.worktreeBindings.isEmpty)
-            XCTAssertNotNil(fixture.authorization.ownership.record(worktreeID: binding.worktreeID)?.releasedAt)
+            XCTAssertNotNil(fixture.ownership.record(worktreeID: binding.worktreeID)?.releasedAt)
             XCTAssertTrue(FileManager.default.fileExists(atPath: checkout.appendingPathComponent("README.md").path))
             XCTAssertEqual(
                 try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository),
                 before,
                 "Release leaves the checkout and Git registration for human cleanup"
             )
-            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.foregroundTabID)
+            XCTAssertNil(fixture.replica.agentModeViewModel.sessions[fixture.session.tabID])
+            fixture.assertForegroundUnchanged()
         }
     }
 
@@ -70,7 +138,59 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             XCTAssertTrue(refused["detail"]?.stringValue?.contains("new branch name") == true)
             XCTAssertEqual(try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository), before)
             XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
-            XCTAssertTrue(fixture.authorization.ownership.records.isEmpty)
+            XCTAssertTrue(fixture.ownership.records.isEmpty)
+        }
+    }
+
+    func testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree() async throws {
+        for peerReady in [true, false] {
+            try await withFixture { fixture in
+                let originalOwner = try XCTUnwrap(SessionAdminWindows.runtimeOwner(for: fixture.sessionID))
+                XCTAssertTrue(SessionAdminWindows.isCurrent(originalOwner))
+                let peer = fixture.replica.agentModeViewModel.session(for: fixture.session.tabID)
+                peer.selectedAgent = .claudeCode
+                peer.selectedModelRaw = "haiku"
+                peer.selectedClaudeEffortRaw = "low"
+                peer.parentSessionID = fixture.session.parentSessionID
+                peer.createdByOverseerSessionID = fixture.session.createdByOverseerSessionID
+                peer.hasLoadedPersistedState = peerReady
+                _ = try XCTUnwrap(fixture.replica.agentModeViewModel.test_installPersistentSessionBinding(
+                    sessionID: fixture.sessionID, on: peer
+                ))
+                if peerReady { peer.recordRestorationAuthoritative(.persistedPayloadApplied) }
+                XCTAssertEqual(peer.permitsBoundOperationAndSave, peerReady)
+                XCTAssertTrue(try fixture.replica.agentModeViewModel.authoritativeLiveSession(for: fixture.sessionID) === peer)
+                let source = OpenWindowsDelegationProvenanceSource()
+                XCTAssertEqual(source.resolutionState(for: fixture.sessionID), .replicated)
+                XCTAssertEqual(source.provenance(for: fixture.sessionID)?.hasUniqueRuntimeOwner, false)
+                XCTAssertNil(SessionAdminWindows.runtimeOwner(for: fixture.sessionID))
+                XCTAssertFalse(SessionAdminWindows.isCurrent(originalOwner), "A second bound object invalidates prior owner proof before it finishes loading")
+                let before = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository)
+                let ownerSaveGeneration = fixture.session.saveRequestGeneration
+                let peerSaveGeneration = peer.saveRequestGeneration
+                for arguments: [String: Value] in [
+                    ["op": .string("set_model"), "model_id": .string("explore")],
+                    ["op": .string("set_effort"), "effort": .string("high")],
+                    ["op": .string("worktree_create"), "branch": .string("e2e/competing-writers"), "idempotency_key": .string("competing-writers")]
+                ] {
+                    var request = arguments
+                    request["session_id"] = .string(fixture.sessionID.uuidString)
+                    let refused = try await fixture.call(request)
+                    XCTAssertEqual(refused["code"], .string("mutation_owner_unavailable"), String(describing: refused))
+                    XCTAssertEqual(refused["subreason"], .string("replicated_binding"))
+                }
+                XCTAssertEqual(fixture.session.selectedModelRaw, "haiku")
+                XCTAssertEqual(peer.selectedModelRaw, "haiku")
+                XCTAssertEqual(fixture.session.selectedClaudeEffortRaw, "low")
+                XCTAssertEqual(peer.selectedClaudeEffortRaw, "low")
+                XCTAssertEqual(fixture.session.saveRequestGeneration, ownerSaveGeneration)
+                XCTAssertEqual(peer.saveRequestGeneration, peerSaveGeneration)
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+                XCTAssertTrue(peer.worktreeBindings.isEmpty)
+                XCTAssertTrue(fixture.ownership.records.isEmpty)
+                XCTAssertEqual(try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository), before)
+                fixture.assertForegroundUnchanged()
+            }
         }
     }
 
@@ -79,11 +199,13 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         let git: ReviewGitRepositoryFixture
         let repository: URL
         let window: WindowState
+        let replica: WindowState
         let session: AgentTabSession
         let sessionID: UUID
+        let workspaceID: UUID
         let foregroundTabID: UUID
         let dataService: AgentSessionDataService
-        let authorization: SessionAdminStructureTests.Fixture
+        let ownership: WorktreeOwnershipStore
         let service: SessionAdminMCPToolService
 
         func call(_ arguments: [String: Value]) async throws -> [String: Value] {
@@ -95,29 +217,44 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             return try await dataService.loadAgentSession(id: sessionID, for: workspace)
         }
+
+        func assertForegroundUnchanged() {
+            XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTabID)
+            XCTAssertEqual(replica.promptManager.activeComposeTabID, foregroundTabID)
+            XCTAssertEqual(window.promptManager.promptText, "Owner draft")
+            XCTAssertEqual(replica.promptManager.promptText, "Replica draft")
+            XCTAssertNotEqual(window.agentModeViewModel.currentTabID, session.tabID)
+            XCTAssertNotEqual(replica.agentModeViewModel.currentTabID, session.tabID)
+        }
     }
 
-    /// The caller route and permission census are isolated fixtures. Worktree discovery, the host,
-    /// bind/release transitions, and session writes use their production implementations against
-    /// a disposable Git repository. No agent provider is started.
-    private func withFixture(_ body: (Fixture) async throws -> Void) async throws {
+    /// The passive replica is registered first and shares the physical tab and owner-valid index.
+    /// Only the second window binds the background payload. Production provenance, caller binding,
+    /// authorization and hosts must distinguish those facts without selecting either target tab.
+    private func withFixture(fullAccess: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
         let git = try ReviewGitRepositoryFixture(name: "SessionAdminWorktreeRecovery")
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let replica = WindowState()
         let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(replica)
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
-        OverseerGlobalAutoApprove.isEnabled = { true }
+        OverseerGlobalAutoApprove.isEnabled = { fullAccess }
         let cleanup: @MainActor () async -> Void = {
             window.beginClose()
+            replica.beginClose()
             await window.tearDown()
+            await replica.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            WindowStatesManager.shared.unregisterWindowState(replica)
             OverseerGlobalAutoApprove.isEnabled = previousFullAccess
             git.cleanup()
         }
         do {
             let repository = try git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
+            await replica.workspaceManager.awaitInitialized()
             await window.workspaceManager.awaitInitialized()
             let created = window.workspaceManager.createWorkspace(name: "Worktree recovery", repoPaths: [repository.path], ephemeral: true)
             await window.workspaceManager.switchWorkspace(to: created, saveState: false, reason: "worktreeRecoveryTest")
@@ -125,14 +262,26 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             let foregroundTabID = try XCTUnwrap(workspace.activeComposeTabID)
             let sessionID = UUID(), callerID = UUID()
+            let foregroundIndex = try XCTUnwrap(workspace.composeTabs.firstIndex { $0.id == foregroundTabID })
+            workspace.composeTabs[foregroundIndex].activeAgentSessionID = callerID
             let targetTab = ComposeTabState(name: "Background target", activeAgentSessionID: sessionID)
             workspace.composeTabs.append(targetTab)
             let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
             window.workspaceManager.workspaces[workspaceIndex] = workspace
             window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
             let viewModel = window.agentModeViewModel
+            let caller = viewModel.session(for: foregroundTabID)
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: callerID, on: caller))
+            caller.hasLoadedPersistedState = true
+            caller.recordRestorationAuthoritative(.persistedPayloadApplied)
             let session = viewModel.session(for: targetTab.id)
             _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+            session.selectedAgent = .claudeCode
+            session.selectedModelRaw = "haiku"
+            session.selectedReasoningEffortRaw = "low"
+            session.selectedClaudeEffortRaw = "low"
+            session.parentSessionID = callerID
+            session.createdByOverseerSessionID = callerID
             session.hasLoadedPersistedState = true
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
@@ -142,43 +291,90 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
             )
             entry.lastRunStateRaw = "idle"
-            viewModel.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+            entry.parentSessionID = callerID
+            entry.createdByOverseerSessionID = callerID
+            let callerEntry = AgentSessionIndexEntry(
+                id: callerID, tabID: foregroundTabID, name: "Overseer", savedAt: Date(), itemCount: 0,
+                autoEditEnabled: false, hasUnknownConversationContent: false, isMCPOriginated: false,
+                worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            viewModel.test_installSessionIndexSnapshot(
+                [sessionID: entry, callerID: callerEntry], owner: owner, latestOwner: owner, activeWorkspace: workspace
+            )
             let dataService = AgentSessionDataService()
             await dataService.test_setWorkspaceRootOverride(git.sandbox.appendingPathComponent("sessions"))
             viewModel.test_setAgentSessionSaver { payload, workspace, count in
                 try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
             }
+            session.isDirty = true
+            try await viewModel.flushSaveRequired(for: targetTab.id, workspaceID: workspace.id).get()
             XCTAssertTrue(try viewModel.authoritativeLiveSession(for: sessionID) === session)
-
-            let authorization = SessionAdminStructureTests.Fixture()
-            authorization.provenance.add(callerID, parent: nil, workspace: workspace.id)
-            authorization.provenance.add(sessionID, parent: callerID, workspace: workspace.id)
-            typealias Organizing = SessionAdminOrganizingOperationTests
-            let organizer = Organizing.FakeOrganizer(), links = Organizing.FakeLinks()
-            let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
-            defer { withExtendedLifetime((organizer, links, inventoryProvenance)) {} }
-            let door = AgentSessionAdministrationFrontDoor(
-                core: authorization.core, scopes: authorization.runtime, projector: authorization.projector,
-                inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
-                liveBoundSession: { $0 == foregroundTabID ? callerID : nil }
+            workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            replica.workspaceManager.workspaces = [workspace]
+            replica.workspaceManager.activeWorkspace = workspace
+            replica.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+            for tabID in Array(replica.agentModeViewModel.sessions.keys) {
+                replica.agentModeViewModel.test_removeSession(tabID: tabID)
+            }
+            replica.agentModeViewModel.test_installSessionIndexSnapshot(
+                viewModel.ownerValidatedSessionIndex, owner: owner, latestOwner: owner, activeWorkspace: workspace
             )
-            door.registerStructureHandlers(
-                scopes: authorization.runtime, worktreeOwnership: authorization.ownership, projector: authorization.projector,
-                structureHost: SessionAdminWindowsStructureHost(), worktreeHost: SessionAdminWindowsWorktreeHost()
+            window.promptManager.promptText = "Owner draft"
+            replica.promptManager.promptText = "Replica draft"
+            let source = OpenWindowsDelegationProvenanceSource()
+            XCTAssertEqual(source.resolutionState(for: sessionID), .replicated)
+            XCTAssertEqual(source.censusSnapshot().states[sessionID], .replicated)
+            XCTAssertEqual(source.placement(for: sessionID)?.workspaceID, workspace.id)
+            XCTAssertEqual(source.provenance(for: sessionID)?.hasUniqueRuntimeOwner, true)
+            let runtimeOwner = try XCTUnwrap(SessionAdminWindows.runtimeOwner(for: sessionID))
+            XCTAssertTrue(runtimeOwner.location.window === window)
+            XCTAssertTrue(runtimeOwner.session === session)
+            XCTAssertEqual(runtimeOwner.binding, session.currentRestorationBindingToken)
+            let metadataPresenters = WindowStatesManager.shared.allWindows.filter {
+                $0.agentModeViewModel.ownerValidatedSessionIndex[sessionID] != nil
+            }
+            XCTAssertTrue(metadataPresenters.first === replica, "Metadata order must not select the passive replica as writer")
+            XCTAssertEqual(metadataPresenters.count, 2)
+            XCTAssertNil(replica.agentModeViewModel.sessions[targetTab.id])
+            let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            if !fullAccess {
+                let request = try scopes.requestScope(
+                    requesterSessionID: callerID, requesterTabID: nil,
+                    kind: .session(targetSessionID: sessionID), capabilities: [.control],
+                    guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                let grant = try scopes.approve(requestID: request.id).get()
+                XCTAssertEqual(grant.grant.kind, .session(targetSessionID: sessionID))
+                XCTAssertEqual(grant.grant.capabilities, [.control])
+            }
+            let ownership = WorktreeOwnershipStore()
+            let core = AgentSessionAdministrationCore.makeProduction(scopes: scopes, worktreeOwnership: ownership)
+            let location = HistoryWorkspaceLocation(
+                runtimeID: UUID(), workspaceID: workspace.id, name: workspace.name,
+                directory: WorkspaceSessionSidecarMigration.workspaceDirectory(
+                    for: workspace, root: git.sandbox.appendingPathComponent("sessions")
+                )
             )
-            let endpoint = DomainAgentSessionLinkEndpointIdentity(
-                windowID: window.windowID, workspaceID: workspace.id, tabID: foregroundTabID, sessionID: callerID,
-                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
-            )
+            let locations = HistoryWorkspaceLocationResolver(resolve: { selector in
+                switch selector {
+                case let .id(id) where id == location.workspaceID: .matched(location)
+                case let .exactName(name) where name == location.name: .matched(location)
+                default: .notRegistered
+                }
+            })
+            let door = AgentSessionAdministrationFrontDoor.production(core: core, scopes: scopes, workspaceLocations: locations)
+            door.registerStructureHandlers(scopes: scopes, worktreeOwnership: ownership)
             var service = SessionAdminMCPToolService(
                 captureRequestMetadata: { .init(connectionID: UUID(), clientName: "worktree-recovery-test", windowID: window.windowID) },
-                requireTargetWindow: { window }, resolveObserverEndpoint: { _, _ in endpoint },
-                scopes: { authorization.runtime }, administration: { door }
+                requireTargetWindow: { window },
+                resolveObserverEndpoint: { _, _ in viewModel.agentSessionLinkObserverEndpoint(tabID: foregroundTabID) },
+                scopes: { scopes }, administration: { door }
             )
             service.isToolEnabled = { true }
             try await body(.init(
-                git: git, repository: repository, window: window, session: session, sessionID: sessionID,
-                foregroundTabID: foregroundTabID, dataService: dataService, authorization: authorization, service: service
+                git: git, repository: repository, window: window, replica: replica, session: session, sessionID: sessionID,
+                workspaceID: workspace.id, foregroundTabID: foregroundTabID, dataService: dataService,
+                ownership: ownership, service: service
             ))
         } catch {
             await cleanup()

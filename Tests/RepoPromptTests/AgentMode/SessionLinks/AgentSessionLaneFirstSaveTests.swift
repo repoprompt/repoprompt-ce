@@ -393,7 +393,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 peerDocument, expectedWorkspaceRevision: before.revisions.workingRevision,
                 expectedContentDigest: before.document.contentDigest
             )
-            XCTAssertTrue(peerSave.saved?.isSuccessfulDomainMutation == true)
+            XCTAssertEqual(peerSave.saved?.disposition, .applied)
             await fulfillment(of: [projectionParked], timeout: 10)
 
             var awaitedBeforeBinding = false

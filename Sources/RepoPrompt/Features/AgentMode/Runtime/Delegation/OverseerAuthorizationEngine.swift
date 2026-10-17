@@ -61,7 +61,7 @@ enum OverseerAuthorizationGate: String, CaseIterable {
     case explicitScopeInput
     /// A presented confirmation card exists, is approved, and is bound to exactly this request.
     case presentedConfirmationInput
-    /// A mutation needs one canonical physical write owner (no replicated target).
+    /// A mutation needs one exact owner for the state it changes.
     case canonicalMutationOwner
     /// No organizational cycle; ancestry resolvable and comparable.
     case organizationalStructure
@@ -346,11 +346,8 @@ final class OverseerAuthorizationEngine {
         var memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:]
         var replicatedMutationTarget: UUID?
         for target in request.targetSessionIDs {
-            // Session payload mutations still require one runtime owner. Group ordering mutates
-            // workspace presentation instead; its backend admits an exact workspace writer at
-            // commit, while discovery needs only the read membership proved below.
             if request.operation.mutatesTarget, request.operation != .adminReorderGroups,
-               projector.pointResolutionState(for: target) == .replicated
+               !hasMutationOwner(for: target, operation: request.operation, projector: projector)
             {
                 replicatedMutationTarget = replicatedMutationTarget ?? target
             }

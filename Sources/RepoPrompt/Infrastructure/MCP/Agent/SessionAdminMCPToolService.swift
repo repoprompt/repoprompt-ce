@@ -522,7 +522,7 @@ struct SessionAdminMCPToolService {
         switch denial {
         case .mutationOwnerUnavailable:
             value["subreason"] = .string("replicated_binding")
-            value["detail"] = .string("Your scope covers this session, but it has multiple agreeing runtime presentations and this operation needs one current session writer. Ask the user to keep one presentation of the target open, then retry the same operation.")
+            value["detail"] = .string("Your scope covers this session, but the app could not prove one current writer for the state this operation changes. Session loading or handoff must finish, or competing writable copies must be resolved, before retrying. Opening the target tab is not required when it already has one current writer.")
             value["retryable"] = .bool(false)
             value["recovery"] = .string("manual")
         case let .capabilityMissing(capability):

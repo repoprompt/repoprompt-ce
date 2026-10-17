@@ -17,10 +17,11 @@ struct SessionAdminHandlerContext {
     /// The write-time checkpoint for one target (`OverseerAuthorizationEngine.checkpointTarget`).
     func isStillAuthorized(
         _ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord,
-        requiresMutationOwner: Bool = true
+        requiresMutationOwner: Bool = true,
+        operation: DomainAgentSessionTargetOperation? = nil
     ) -> Bool {
         scopes.authorization.checkpointTarget(
-            lease, scope: scope, projector: projector, requiresMutationOwner: requiresMutationOwner
+            lease, scope: scope, projector: projector, requiresMutationOwner: requiresMutationOwner, operation: operation
         )
     }
 
@@ -162,8 +163,10 @@ enum SessionAdminReply {
         let committed = extra[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
             || items.contains { $0.fields[AgentSessionAdminRendering.committedChangesKey] == .bool(true) }
         object["result"] = .string(preview ? "preview" : AgentSessionAdminRendering.mutationResult(
-            statuses: statuses, requiresControl: !requiresControl.isEmpty, committedChanges: committed
+            statuses: statuses, requiresControl: !requiresControl.isEmpty, committedChanges: committed,
+            alreadySatisfied: statuses.count == items.count && extra[AgentSessionAdminRendering.stateSatisfiedKey] == .bool(true)
         ))
+        if object["result"] != .string("applied") { object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey) }
         if committed { object[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
         object["op"] = .string(op)
         object["items"] = .array(items.map(\.value))

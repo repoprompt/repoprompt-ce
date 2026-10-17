@@ -214,7 +214,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         do {
             info = try await host.createWorktree(
                 forSession: target, repoRoot: repoRoot, branch: branch, baseRef: baseRef,
-                isStillAuthorized: { handlerContext.isStillAuthorized(lease, scope: batch.scope) }
+                isStillAuthorized: { handlerContext.isStillAuthorized(lease, scope: batch.scope, operation: .adminWorktreeCreate) }
             )
         } catch SessionAdminHostError.authorityEnded {
             return SessionAdminReply.batch(op: "worktree_create", items: [.revoked(target)])
@@ -370,7 +370,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         } }
         return try await host.bindWorktree(
             sessionID: lease.targetSessionID, worktree: worktree, repoRoot: repoRoot,
-            isStillAuthorized: { context.isStillAuthorized(lease, scope: scope) },
+            isStillAuthorized: { context.isStillAuthorized(lease, scope: scope, operation: .adminWorktreeBind) },
             admitBindings: { desiredIDs in
                 precondition(reservations.isEmpty, "A binding transition admits only once")
                 reservations = try self.reserveBinding(desiredIDs, target: lease.targetSessionID, scope: scope)
@@ -430,7 +430,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         scope: DomainDelegationScopeRecord
     ) async {
         let context = context
-        let isStillAuthorized: @MainActor () -> Bool = { context.isStillAuthorized(lease, scope: scope) }
+        let isStillAuthorized: @MainActor () -> Bool = { context.isStillAuthorized(lease, scope: scope, operation: .adminWorktreeBind) }
         for _ in 0 ..< Self.maxDeferredAttempts {
             await host.waitForIdleBoundary(sessionID: pending.sessionID)
             guard !Task.isCancelled, pendingBinds[pending.sessionID]?.id == pending.id else { return }
@@ -528,7 +528,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 let context = context
                 let scope = batch.scope
                 let removed = try await host.unbindWorktrees(sessionID: target, worktreeID: worktreeID) {
-                    context.isStillAuthorized(lease, scope: scope)
+                    context.isStillAuthorized(lease, scope: scope, operation: batch.request.operation)
                 }
                 if release {
                     // The stale mark is recorded for whatever was actually unbound, even if authority

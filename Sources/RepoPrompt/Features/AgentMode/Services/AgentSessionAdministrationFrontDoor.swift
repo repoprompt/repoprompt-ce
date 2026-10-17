@@ -63,6 +63,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             guard case var .object(object) = value else { return value }
             object["selection"] = self.value
             if !recordsComplete {
+                object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey)
                 // False means completeness is unproven, not that a specific omitted match is known.
                 // Never manufacture a positive selection proof from record coverage alone.
                 object["selection_complete"] = .bool(false)

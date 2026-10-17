@@ -223,7 +223,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             "current_order": .array(expected.map(Value.string)),
             "detail": .string(
                 order == expected
-                    ? "Submit next_call as a safe current-order check, or edit order to request a rearrangement. expected_order is the current order; intervening changes still conflict."
+                    ? "Submit next_call to apply this order; an already satisfied order succeeds with changed_count: 0. Edit order to request a rearrangement. expected_order still rejects intervening changes."
                     : "Submit next_call to apply the supplied order. expected_order is the current relative order; intervening changes still conflict."
             ),
             "next_call": .object(["tool": .string("session_admin"), "arguments": .object(arguments)])
@@ -520,14 +520,15 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         guard affected.allSatisfy(context.isCurrent) else {
             return Self.scopeNoLongerCurrent(context.batch.request.operation)
         }
-        // A validated identity permutation is a no-op, not an instruction to normalize nil or
-        // inconsistent mirrored ranks. CAS and live authority still apply before this shortcut.
+        // A validated identity permutation succeeds without normalizing nil or inconsistent
+        // mirrored ranks. CAS and live authority still apply before acknowledging satisfaction.
         if current.filter(Set(order).contains) == order {
             for id in affected {
                 context.add(id, .unchanged)
             }
             context.extra["workspace_id"] = .string(workspaceID.uuidString)
             context.extra["group_order"] = .array(order.map(Value.string))
+            context.extra[AgentSessionAdminRendering.stateSatisfiedKey] = .bool(true)
             return finish(context, payload: nil)
         }
         // The named groups' values are redistributed among them; only their carriers are written.

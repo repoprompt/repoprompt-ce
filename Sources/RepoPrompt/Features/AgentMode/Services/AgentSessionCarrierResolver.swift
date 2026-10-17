@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// One synchronous view of presented identities and every physical claim touching them. This is
 /// request-local evidence, never a cache or authority retained across an await or mutation.
@@ -33,6 +34,18 @@ enum AgentSessionCarrierResolver {
         let entry: AgentSessionIndexEntry
     }
 
+    struct RuntimeOwner {
+        let location: Observation
+        let session: AgentTabSession
+        let binding: AgentSessionRestorationBindingToken
+
+        func matches(_ other: Self) -> Bool {
+            location.window === other.location.window && session === other.session
+                && location.workspaceID == other.location.workspaceID
+                && location.tab.id == other.location.tab.id && binding == other.binding
+        }
+    }
+
     struct Snapshot {
         var rows: [Observation] = []
         var ambiguousSessionIDs: Set<UUID> = []
@@ -41,6 +54,8 @@ enum AgentSessionCarrierResolver {
         var uniqueLocations: [UUID: Observation] = [:]
         /// Equal replicas are readable, but no synchronous canonical write owner is established.
         var replicatedSessionIDs: Set<UUID> = []
+        /// One exact bound payload owner; agreeing presentation replicas remain replicated.
+        var uniqueRuntimeOwners: [UUID: RuntimeOwner] = [:]
         var claimedWorkspaceIDs: [UUID: Set<UUID>] = [:]
         var sessionIDs: Set<UUID> = []
         fileprivate var fences: [WindowFence] = []
@@ -130,12 +145,14 @@ enum AgentSessionCarrierResolver {
 
     static func capture(
         windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil,
-        acknowledgedGroupOrders: [UUID: AcknowledgedGroupOrder] = [:]
+        acknowledgedGroupOrders: [UUID: AcknowledgedGroupOrder] = [:],
+        includeRuntimeOwners: Bool = false
     ) -> Snapshot {
         var seenWindows: Set<ObjectIdentifier> = []
+        let runtimeWindows = windows.filter { !$0.isClosing && seenWindows.insert(ObjectIdentifier($0)).inserted }
         // Prepared runtimes borrow a saved carrier; they are not a second physical/UI claim.
         // Their exact saved witness is joined below only after real carrier conflicts are checked.
-        let windows = windows.filter { !$0.isClosing && !$0.isPreparedSessionOwner && seenWindows.insert(ObjectIdentifier($0)).inserted }
+        let windows = runtimeWindows.filter { !$0.isPreparedSessionOwner }
         // A census intentionally enumerates owners. Point reads never enumerate dictionary keys,
         // unrelated workspaces, or unrelated live sessions to discover their candidate identities.
         let ids: Set<UUID>
@@ -323,8 +340,55 @@ enum AgentSessionCarrierResolver {
                 snapshot.replicatedSessionIDs.insert(row.sessionID)
             }
         }
-        return preparedSessionRuntimes?.addingPreparedRuntimeCarriers(
+        var result = preparedSessionRuntimes?.addingPreparedRuntimeCarriers(
             to: snapshot, sessionIDs: requestedIDs, windowIDs: Set(windows.map(\.windowID))
         ) ?? snapshot
+        if includeRuntimeOwners {
+            var owners = runtimeWindows
+            for row in result.rows where seenWindows.insert(ObjectIdentifier(row.window)).inserted {
+                owners.append(row.window)
+            }
+            result.uniqueRuntimeOwners = runtimeOwners(in: result, windows: owners, sessionIDs: requestedIDs ?? result.sessionIDs)
+        }
+        return result
+    }
+
+    private static func runtimeOwners(
+        in snapshot: Snapshot, windows: [WindowState], sessionIDs: Set<UUID>
+    ) -> [UUID: RuntimeOwner] {
+        var candidates: [UUID: (Observation, AgentTabSession)] = [:]
+        var conflicts = snapshot.ambiguousSessionIDs
+        for window in windows {
+            for (id, result) in window.agentModeViewModel.authoritativeLiveSessions(for: sessionIDs) {
+                switch result {
+                case .failure:
+                    conflicts.insert(id)
+                case .success(nil):
+                    break
+                case let .success(session?):
+                    guard let row = snapshot.rows.first(where: {
+                        $0.sessionID == id && $0.window === window && $0.stashedTabID == nil
+                            && $0.tab.id == session.tabID && $0.hasCurrentMetadataOwner
+                            && $0.entry?.id == id && $0.entry?.tabID == session.tabID
+                            && window.workspaceManager.activeWorkspaceID == $0.workspaceID
+                    }) else {
+                        conflicts.insert(id)
+                        continue
+                    }
+                    if let existing = candidates[id], existing.1 !== session || existing.0.window !== window {
+                        conflicts.insert(id)
+                    } else {
+                        candidates[id] = (row, session)
+                    }
+                }
+            }
+        }
+        return candidates.reduce(into: [:]) { owners, candidate in
+            let (id, (row, session)) = candidate
+            guard !conflicts.contains(id), session.permitsBoundOperationAndSave,
+                  let binding = session.currentRestorationBindingToken,
+                  binding.bindingIdentity.sessionID == id, binding.bindingIdentity.tabID == row.tab.id else { return }
+            owners[id] = RuntimeOwner(location: row, session: session, binding: binding)
+        }
     }
 }

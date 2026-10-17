@@ -180,6 +180,8 @@ enum AgentSessionAdminRendering {
     /// Set (to `true`) when a call committed durable side effects that per-item `changed` statuses
     /// do not show, for example a release whose first unlink succeeded before a later one failed.
     static let committedChangesKey = "committed_changes"
+    /// A handler-verified postcondition, still subordinate to every item's completion.
+    static let stateSatisfiedKey = "state_satisfied"
 
     /// Standard reply for a mutating op.
     static func mutationValue(
@@ -192,8 +194,10 @@ enum AgentSessionAdminRendering {
         object["result"] = .string(mutationResult(
             statuses: items.map(\.status),
             requiresControl: !itemsRequiringControl.isEmpty,
-            committedChanges: extra[committedChangesKey] == .bool(true) || extra["local_changes"] == .bool(true)
+            committedChanges: extra[committedChangesKey] == .bool(true) || extra["local_changes"] == .bool(true),
+            alreadySatisfied: extra[stateSatisfiedKey] == .bool(true)
         ))
+        if object["result"] != .string("applied") { object.removeValue(forKey: stateSatisfiedKey) }
         object["op"] = .string(operation.adminOperationName)
         object["items"] = .array(items.map(\.value))
         object["changed_count"] = .int(items.count(where: { $0.status == .changed }))
@@ -218,8 +222,10 @@ enum AgentSessionAdminRendering {
         result["result"] = .string(mutationResult(
             statuses: statuses,
             requiresControl: !(object["requires_control"]?.arrayValue ?? []).isEmpty,
-            committedChanges: object[committedChangesKey] == .bool(true) || object["local_changes"] == .bool(true)
+            committedChanges: object[committedChangesKey] == .bool(true) || object["local_changes"] == .bool(true),
+            alreadySatisfied: object[stateSatisfiedKey] == .bool(true)
         ))
+        if result["result"] != .string("applied") { result.removeValue(forKey: stateSatisfiedKey) }
         result["changed_count"] = .int(statuses.count(where: { $0 == .changed }))
         return addingBatchDiagnostic(result)
     }
@@ -238,12 +244,14 @@ enum AgentSessionAdminRendering {
     }
 
     static func mutationResult(
-        statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool
+        statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool,
+        alreadySatisfied: Bool = false
     ) -> String {
         let effects = committedChanges || statuses.contains(.changed)
         let failed = statuses.contains(.failed)
         let incomplete = failed || statuses.contains(.skipped) || requiresControl
         if effects { return incomplete ? "partial" : "applied" }
+        if alreadySatisfied, !statuses.isEmpty, !incomplete { return "applied" }
         return "not_applied"
     }
 }

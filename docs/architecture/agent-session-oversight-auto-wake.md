@@ -294,7 +294,7 @@ Every gate is typed and classified in `OverseerAuthorizationGate`:
 | Class | Gates | Full access |
 | --- | --- | --- |
 | Permission | `scopeCoverage`, `scopeCapability`, `allSessionsCapabilityCeiling`, `scopeMembership`, `confirmationRequirement`, `sessionQuota` (incl. `maxDepth`), `worktreeQuota`, `creatorPlacementForAccounting`, `scopeAnchorMoveRestriction`, `otherScopeMembershipMove`, `restrictedScopeNarrowing`, `creatorLaneQuota` (12 lanes per creator), `directChildOrCreatorOwnership`, `humanOnlyForAgent`, `linkRequired`, `observerMustBeCaller`, `linkCapabilityCeiling` | Waived |
-| Integrity | `callerIdentityAndRoute`, `targetExistence`, `selfTargetRule`, `explicitScopeInput` (unknown or another session's scope), `presentedConfirmationInput`, `canonicalMutationOwner` (replicated mutation target), `organizationalStructure` (cycles, unresolvable/incomparable ancestry), `argumentsAndSelectors`, `idempotencyAndSingleApplication`, `transportIncarnation`, `operationalCapacity` (bounded in-flight tasks, ledgers, queues), `lifecycleAndCancellation`, `persistenceOutcome` | Enforced |
+| Integrity | `callerIdentityAndRoute`, `targetExistence`, `selfTargetRule`, `explicitScopeInput` (unknown or another session's scope), `presentedConfirmationInput`, `canonicalMutationOwner` (one exact writer for the changed state), `organizationalStructure` (cycles, unresolvable/incomparable ancestry), `argumentsAndSelectors`, `idempotencyAndSingleApplication`, `transportIncarnation`, `operationalCapacity` (bounded in-flight tasks, ledgers, queues), `lifecycleAndCancellation`, `persistenceOutcome` | Enforced |
 
 Engine families: administration (`authorizeAdministration`: implicit full-access grant, explicit-scope
 pass then full-access fallback, independent card validation and single claim), creation
@@ -306,6 +306,15 @@ eligibility, lane link requirement, catalog surface, full-access link source).
 
 Rules that keep it honest:
 
+- Agreeing workspace presentations remain replicated. Model, effort and worktree changes may use
+  their one independently proven bound payload owner without opening the target tab. Every bound
+  runtime counts, including a second one still loading; the selected owner must have current
+  metadata and restoration identity. Hosts pin that object and identity through preparation.
+  Presentation and organizational mutations retain their separate writer requirements.
+- A fully authorized group order, model or effort request that already matches current state
+  completes with `result: applied`, `state_satisfied: true`, and `changed_count: 0`. It is not a
+  refusal or a fabricated write. Failed, skipped, incomplete or control-blocked batches cannot
+  claim this result, and unchanged requests recheck current authority and expected-order input.
 - An explicit restricted `scope_id` the caller owns (live, revoked, or expired) never narrows full
   access. A fully admitting live scope keeps its placement; otherwise the full-access grant authorizes
   and is the placement, so no recovery call is needed. Unknown and foreign scope IDs stay

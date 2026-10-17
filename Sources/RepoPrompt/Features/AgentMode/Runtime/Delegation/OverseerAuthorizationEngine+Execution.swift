@@ -46,13 +46,29 @@ extension OverseerAuthorizationEngine {
         _ lease: DomainDelegationScopeLease,
         scope: DomainDelegationScopeRecord,
         projector: any DelegationMembershipProjector,
-        requiresMutationOwner: Bool = true
+        requiresMutationOwner: Bool = true,
+        operation: DomainAgentSessionTargetOperation? = nil
     ) -> Bool {
         guard let scopes, !Task.isCancelled, scopes.isCurrent(lease) else { return false }
-        if requiresMutationOwner, projector.pointResolutionState(for: lease.targetSessionID) == .replicated {
+        if requiresMutationOwner, !hasMutationOwner(for: lease.targetSessionID, operation: operation, projector: projector) {
             return false
         }
         return permitsMember(lease.targetSessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    func hasMutationOwner(
+        for sessionID: UUID, operation: DomainAgentSessionTargetOperation?,
+        projector: any DelegationMembershipProjector
+    ) -> Bool {
+        guard projector.pointResolutionState(for: sessionID) == .replicated else { return true }
+        guard let operation else { return false }
+        switch operation {
+        case .adminSetModel, .adminSetEffort, .adminWorktreeCreate, .adminWorktreeBind,
+             .adminWorktreeUnbind, .adminWorktreeRelease:
+            return projector.knownProvenance(for: sessionID)?.hasUniqueRuntimeOwner == true
+        default:
+            return false
+        }
     }
 
     // MARK: - Capabilities

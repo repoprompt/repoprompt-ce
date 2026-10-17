@@ -1934,6 +1934,38 @@ final class SessionAdminStructureTests: XCTestCase {
                 XCTAssertNotNil(failure[key], key)
             }
         }
+        let satisfiedExtra: [String: Value] = [AgentSessionAdminRendering.stateSatisfiedKey: .bool(true)]
+        let unchanged = SessionAdminItemResult(sessionID: id, result: "unchanged")
+        let satisfied = try XCTUnwrap(SessionAdminReply.batch(
+            op: "set_model", items: [unchanged], extra: satisfiedExtra
+        ).objectValue)
+        XCTAssertEqual(satisfied["result"], .string("applied"))
+        XCTAssertEqual(satisfied["state_satisfied"], .bool(true))
+        XCTAssertEqual(satisfied["changed_count"], .int(0))
+        XCTAssertNil(satisfied["code"])
+        XCTAssertNil(satisfied["next_call"])
+        XCTAssertFalse(AgentSessionAdministrationFrontDoor.changedSomething(.object(satisfied)))
+        let incompleteBatches: [[SessionAdminItemResult]] = [
+            [],
+            [unchanged, .init(sessionID: other, result: "not_applied", code: "scope_revoked")],
+            [unchanged, .init(sessionID: other, result: "not_applied", code: "bind_failed")],
+            [unchanged, .init(sessionID: other, result: "unknown_outcome")]
+        ]
+        for batch in incompleteBatches {
+            let reply = try XCTUnwrap(SessionAdminReply.batch(op: "set_model", items: batch, extra: satisfiedExtra).objectValue)
+            XCTAssertEqual(reply["result"], .string("not_applied"))
+            XCTAssertNil(reply["state_satisfied"])
+        }
+        let requiringControl = try XCTUnwrap(SessionAdminReply.batch(
+            op: "set_model", items: [unchanged], requiresControl: [other], extra: satisfiedExtra
+        ).objectValue)
+        XCTAssertEqual(requiringControl["result"], .string("not_applied"))
+        XCTAssertNil(requiringControl["state_satisfied"])
+        var refreshed = satisfied
+        refreshed["requires_control"] = .array([.string(other.uuidString)])
+        refreshed = AgentSessionAdminRendering.refreshingOrganizingResult(refreshed)
+        XCTAssertEqual(refreshed["result"], .string("not_applied"))
+        XCTAssertNil(refreshed["state_satisfied"])
         for status in [AgentSessionAdminItemResult.Status.unchanged, .failed, .skipped] {
             XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
                 operation: .adminSetGroup, items: [.init(sessionID: id, status: status)], itemsRequiringControl: []
@@ -4837,14 +4869,54 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertNil(arguments["targets"], "derived carriers must be rederived at submission")
         XCTAssertNil(arguments["confirmation_id"])
         let unchanged = try await fixture.call(arguments)
-        XCTAssertEqual(unchanged["result"], .string("not_applied"))
-        XCTAssertEqual(unchanged["code"], .string("no_change"))
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
         XCTAssertEqual(unchanged["changed_count"], .int(0))
         XCTAssertEqual(unchanged["group_order"], reply["current_order"])
+        XCTAssertEqual(items(unchanged), [a.uuidString: "unchanged", b.uuidString: "unchanged"])
+        XCTAssertNil(unchanged["code"])
+        XCTAssertNil(unchanged["next_call"])
         XCTAssertNil(unchanged["undo_token"])
         XCTAssertTrue(fixture.organizer.written.isEmpty, "an identity permutation must not materialize ranks")
         XCTAssertNil(fixture.organizer.states[a]?.sidebarGroupOrder)
         XCTAssertNil(fixture.organizer.states[b]?.sidebarGroupOrder)
+
+        let repeated = try await fixture.call(arguments)
+        XCTAssertEqual(repeated["result"], .string("applied"))
+        XCTAssertEqual(repeated["changed_count"], .int(0))
+        XCTAssertNil(repeated["idempotent_replay"], "A satisfied order must be revalidated while no changes were committed")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 1
+        fixture.organizer.states[b]?.sidebarGroupOrder = 0
+        let stale = try await fixture.call(arguments)
+        XCTAssertEqual(stale["result"], .string("order_conflict"))
+        XCTAssertNil(stale["state_satisfied"])
+        XCTAssertNil(stale["idempotent_replay"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 1)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+    }
+
+    func testSatisfiedGroupOrderDoesNotHideUnloadedRequestedTarget() async throws {
+        let fixture = Fixture()
+        let member = fixture.member("Member", group: "Alpha")
+        let unloaded = UUID()
+        fixture.inventory.historyOnly = [DomainAgentSessionInventoryRecord(
+            sessionID: unloaded, name: "Unloaded", workspaceID: fixture.workspace, isLoaded: false,
+            parentSessionID: fixture.overseer, lastActivityAt: fixture.now
+        )]
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "targets": ids([member, unloaded]),
+            "order": .array([.string("Alpha")]), "expected_order": .array([.string("Alpha")])
+        ])
+        XCTAssertEqual(reply["result"], .string("not_applied"))
+        XCTAssertEqual(reply["changed_count"], .int(0))
+        XCTAssertEqual(items(reply), [member.uuidString: "unchanged", unloaded.uuidString: "skipped"])
+        XCTAssertEqual(reply["code"], .string("workspace_not_loaded"))
+        XCTAssertNil(reply["state_satisfied"])
+        XCTAssertNil(reply["undo_token"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
     }
 
     func testReorderGroupsMissingExpectedOrderUsesRelativeOrderAndStillChecksCAS() async throws {
@@ -4888,7 +4960,9 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
         XCTAssertEqual(arguments["session_id"], input["session_id"])
         let unchanged = try await fixture.call(arguments)
-        XCTAssertEqual(unchanged["result"], .string("not_applied"))
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
         for malformed: Value in [.null, .string("Alpha"), .array([.int(1)])] {
             arguments = input
             arguments["expected_order"] = malformed
@@ -5021,7 +5095,9 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
         XCTAssertEqual(arguments["order"], .array([.string("Alpha")]))
         let unchanged = try await fixture.call(arguments)
-        XCTAssertEqual(unchanged["result"], .string("not_applied"))
+        XCTAssertEqual(unchanged["result"], .string("applied"))
+        XCTAssertEqual(unchanged["state_satisfied"], .bool(true))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
         XCTAssertTrue(fixture.organizer.written.isEmpty)
     }
 
