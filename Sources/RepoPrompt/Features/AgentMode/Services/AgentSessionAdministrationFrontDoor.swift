@@ -157,7 +157,8 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         register(AgentSessionOrganizeOperationHandler(
             backend: backend,
             isLeaseCurrent: isLeaseCurrent,
-            holdsControl: holdsControl
+            holdsControl: holdsControl,
+            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false }
         ))
         register(AgentSessionReleaseOperationHandler(
             backend: backend,
@@ -264,7 +265,11 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         if !request.operation.isScopeLevel {
             // A filter enumerates sessions, so it needs a live scope holding `observe` and the
             // operation's own capability before anything is resolved.
-            if request.arguments["filter"] != nil, let denial = filterDenial(request.operation, scope: scope) {
+            let groupDiscovery = request.operation == .adminReorderGroups
+                && (request.arguments["order"] == nil || request.arguments["expected_order"] == nil)
+            if request.arguments["filter"] != nil || groupDiscovery,
+               let denial = filterDenial(request.operation, scope: scope)
+            {
                 return .denied(denial, sessionID: nil)
             }
             let shapingChain = scopes.scopeChain(from: scope.id)

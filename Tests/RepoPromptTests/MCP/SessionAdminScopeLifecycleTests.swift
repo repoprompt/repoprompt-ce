@@ -4676,6 +4676,218 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(fixture.organizer.states[outsider]?.sidebarGroupOrder, 1)
     }
 
+    func testReorderGroupsMissingOrderReturnsExecutableAuthorizedRecovery() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = nil
+        fixture.organizer.states[b]?.sidebarGroupOrder = nil
+        let scope = try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "idempotency_key": .string("incomplete")
+        ])
+        XCTAssertEqual(reply["result"], .string("order_required"))
+        XCTAssertEqual(reply["current_groups"], .array([.string("Alpha"), .string("Beta")]))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        let next = try XCTUnwrap(reply["next_call"]?.objectValue)
+        XCTAssertEqual(next["tool"], .string("session_admin"))
+        let arguments = try XCTUnwrap(next["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["scope_id"], .string(scope.id.uuidString))
+        XCTAssertEqual(arguments["expected_order"], reply["current_order"])
+        XCTAssertEqual(arguments["order"], reply["current_order"])
+        XCTAssertNotEqual(arguments["idempotency_key"], .string("incomplete"))
+        XCTAssertNil(arguments["targets"], "derived carriers must be rederived at submission")
+        XCTAssertNil(arguments["confirmation_id"])
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("not_applied"))
+        XCTAssertEqual(unchanged["code"], .string("no_change"))
+        XCTAssertEqual(unchanged["changed_count"], .int(0))
+        XCTAssertEqual(unchanged["group_order"], reply["current_order"])
+        XCTAssertNil(unchanged["undo_token"])
+        XCTAssertTrue(fixture.organizer.written.isEmpty, "an identity permutation must not materialize ranks")
+        XCTAssertNil(fixture.organizer.states[a]?.sidebarGroupOrder)
+        XCTAssertNil(fixture.organizer.states[b]?.sidebarGroupOrder)
+    }
+
+    func testReorderGroupsMissingExpectedOrderUsesRelativeOrderAndStillChecksCAS() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let x = fixture.outsider("X")
+        fixture.organizer.states[x]?.sidebarGroup = "Other"
+        fixture.organizer.states[x]?.sidebarGroupOrder = 1
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroupOrder = 2
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Beta"), .string("Alpha")])
+        ])
+        XCTAssertEqual(reply["current_order"], .array([.string("Alpha"), .string("Beta")]))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        let applied = try await fixture.call(arguments)
+        XCTAssertEqual(applied["result"], .string("applied"))
+        XCTAssertEqual(applied["group_order"], .array([.string("Beta"), .string("Alpha")]))
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+        fixture.organizer.written.removeAll()
+        var staleArguments = arguments
+        staleArguments["idempotency_key"] = .string("fresh-stale-expectation")
+        let stale = try await fixture.call(staleArguments)
+        XCTAssertEqual(stale["result"], .string("order_conflict"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertNil(stale["undo_token"])
+    }
+
+    func testReorderGroupsRecoveryWithExplicitTargetAndMalformedArguments() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        try fixture.grant()
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "session_id": .string(a.uuidString)
+        ]
+        let reply = try await fixture.call(input)
+        var arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["session_id"], input["session_id"])
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("not_applied"))
+        for malformed: Value in [.null, .string("Alpha"), .array([.int(1)])] {
+            arguments = input
+            arguments["expected_order"] = malformed
+            do {
+                _ = try await fixture.call(arguments)
+                XCTFail("A malformed expectation must not become recovery")
+            } catch {
+                XCTAssertTrue(fixture.organizer.written.isEmpty)
+            }
+        }
+        arguments = input
+        arguments["order"] = .array([.string("Alpha"), .string("Alpha")])
+        let invalid = try await fixture.call(arguments)
+        XCTAssertEqual(invalid["result"], .string("invalid_order"))
+        XCTAssertEqual(invalid["subreason"], .string("order_set_mismatch"))
+    }
+
+    func testReorderGroupsRecoveryDoesNotDiscloseOutsideScopeGroups() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let outsider = fixture.outsider("X")
+        fixture.organizer.states[outsider]?.sidebarGroup = "Private"
+        try fixture.grant()
+        for explicit in [false, true] {
+            var input: [String: Value] = [
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+                "preview": .bool(true)
+            ]
+            if explicit { input["session_id"] = .string(a.uuidString) }
+            let reply = try await fixture.call(input)
+            XCTAssertNil(reply["current_groups"])
+            XCTAssertFalse(String(describing: reply).contains("Private"))
+            XCTAssertFalse(String(describing: reply).contains(outsider.uuidString))
+        }
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRecoveryRequiresObserveForDiscovery() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        try fixture.grant([.organize])
+        for explicit in [false, true] {
+            var arguments: [String: Value] = [
+                "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString)
+            ]
+            if explicit { arguments["session_id"] = .string(a.uuidString) }
+            let denied = try await fixture.call(arguments)
+            XCTAssertEqual(denied["result"], .string("denied"))
+            XCTAssertEqual(denied["capability"], .string("observe"))
+            XCTAssertNil(denied["current_groups"])
+            XCTAssertFalse(String(describing: denied).contains("Alpha"))
+        }
+        let denied = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Unknown")]), "expected_order": .array([.string("Unknown")])
+        ])
+        XCTAssertEqual(denied["result"], .string("denied"))
+        XCTAssertEqual(denied["capability"], .string("observe"))
+        XCTAssertNil(denied["current_groups"])
+        XCTAssertFalse(String(describing: denied).contains("Alpha"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsEmptyRecoveryValidatesExpectations() async throws {
+        let fixture = Fixture()
+        try fixture.grant()
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString)
+        ]
+        let reply = try await fixture.call(input)
+        XCTAssertEqual(reply["result"], .string("order_required"))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        let empty = try await fixture.call(arguments)
+        XCTAssertEqual(empty["result"], .string("no_matching_sessions"))
+        for explicitOrder in [false, true] {
+            for malformed: Value in [.null, .string("Alpha"), .array([.int(1)])] {
+                var invalid = input
+                if explicitOrder { invalid["order"] = .array([]) }
+                invalid["expected_order"] = malformed
+                do {
+                    _ = try await fixture.call(invalid)
+                    XCTFail("Empty selection must not bypass argument validation")
+                } catch {
+                    XCTAssertTrue(fixture.organizer.written.isEmpty)
+                }
+            }
+            var mismatch = input
+            if explicitOrder { mismatch["order"] = .array([]) }
+            mismatch["expected_order"] = .array([.string("Gone")])
+            let invalid = try await fixture.call(mismatch)
+            XCTAssertEqual(invalid["result"], .string("invalid_order"))
+            XCTAssertEqual(invalid["subreason"], .string("order_set_mismatch"))
+        }
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
+    func testReorderGroupsRecoveryPreservesPreviewAndRequiresApproval() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "Alpha")
+        let b = fixture.member("B", group: "Beta")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroupOrder = 1
+        try fixture.grant(threshold: 1)
+        let input: [String: Value] = [
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Beta"), .string("Alpha")]), "preview": .bool(true)
+        ]
+        let preview = try await fixture.call(input)
+        var arguments = try XCTUnwrap(preview["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["preview"], .bool(true))
+        _ = try await fixture.call(arguments)
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        arguments.removeValue(forKey: "preview")
+        let pending = try await fixture.call(arguments)
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+    }
+
+    func testReorderGroupsUnknownNamesOfferAuthorizedCurrentOrderRecovery() async throws {
+        let fixture = Fixture()
+        fixture.member("A", group: "Alpha")
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Unknown")]), "expected_order": .array([.string("Unknown")])
+        ])
+        XCTAssertEqual(reply["result"], .string("groups_not_found"))
+        let arguments = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue)
+        XCTAssertEqual(arguments["order"], .array([.string("Alpha")]))
+        let unchanged = try await fixture.call(arguments)
+        XCTAssertEqual(unchanged["result"], .string("not_applied"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+    }
+
     func testReorderGroupsUndoPreservesLaterGroupAssignmentAtSameRank() async throws {
         let fixture = Fixture()
         let a = fixture.member("A")
