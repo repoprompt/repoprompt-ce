@@ -3646,7 +3646,8 @@ enum AgentTranscriptIO {
 
     /// Drop-priority tiers for fork transcript items (higher number = dropped first).
     private enum ForkItemDropPriority: Int, Comparable {
-        /// User messages and conclusion assistant messages (last assistant per turn).
+        /// User messages, conclusion assistant messages (last assistant per turn), and
+        /// recovery diagnostics.
         case essential = 0
         /// System summaries and error messages.
         case context = 1
@@ -3724,7 +3725,11 @@ enum AgentTranscriptIO {
                 case .system:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: .context, turnID: tid))
+                    // Recovery diagnostics are the last survivors of per-item budget
+                    // trimming (dropped only with their whole turn in step 2): they are
+                    // the only durable record of a provider-thread transition.
+                    let dropPriority: ForkItemDropPriority = row.recoveryDiagnostic == nil ? .context : .essential
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: dropPriority, turnID: tid))
                     pos += 1
                 case .error:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3951,6 +3956,9 @@ enum AgentTranscriptIO {
             if let summaryItemID = turn.summary?.middleSummaryItemID {
                 rowIDs.append(summaryItemID)
             }
+            if let diagnostics = turn.summary?.normalizedRecoveryDiagnostics {
+                rowIDs.append(contentsOf: diagnostics.map(\.id))
+            }
             if turn.conclusionActivityID == nil, turn.summary != nil {
                 rowIDs.append(deterministicConclusionItemID(for: turn.id))
             }
@@ -4050,10 +4058,14 @@ enum AgentTranscriptIO {
                 if row.kind == .thinking {
                     continue
                 }
-                // Rewrite baked system summary rows with handoff-friendly text
+                // Rewrite baked system summary rows with handoff-friendly text. Only the
+                // generated middle-summary row is rewritten — genuine `.system` rows
+                // (e.g. recovery notices) keep their text.
                 let emittedRow: AgentChatItem
                 let isSummaryRow: Bool
-                if row.kind == .system {
+                if row.kind == .system,
+                   row.id == turnsByID[block.turnID]?.summary?.middleSummaryItemID
+                {
                     let handoffText: String? = {
                         // Prefer collapsedSummary with toolSummary (has tool names, narration)
                         if let cs = collapsedSummaryByTurnID[block.turnID],
@@ -4623,8 +4635,35 @@ enum AgentTranscriptIO {
             compactedActivityCount: max(0, middleActivities.count),
             hadWarning: hadWarning,
             hadError: hadError,
-            lastUserInteractionAt: lastUserInteractionAt
+            lastUserInteractionAt: lastUserInteractionAt,
+            recoveryDiagnostics: boundedRecoveryDiagnostics(
+                from: activities,
+                merging: turn.summary?.recoveryDiagnostics
+            )
         )
+    }
+
+    /// Collects typed recovery diagnostics from the turn's activities before retention
+    /// trimming, merged with any diagnostics a prior summary already captured so a
+    /// rebuild on a partially-trimmed turn can only grow the set. Dedupe is by aligned
+    /// row identity, not content: distinct rows may share identical fields, and every
+    /// row ID must stay resolvable for cutoff anchors.
+    private static func boundedRecoveryDiagnostics(
+        from activities: [AgentTranscriptActivity],
+        merging existing: [AgentTranscriptRecoveryDiagnostic]? = nil
+    ) -> [AgentTranscriptRecoveryDiagnostic]? {
+        var collected = existing ?? []
+        for activity in activities {
+            guard var diagnostic = activity.recoveryDiagnostic else { continue }
+            diagnostic.align(
+                to: activity.id,
+                timestamp: activity.timestamp,
+                sequenceIndex: activity.sequenceIndex
+            )
+            collected.append(diagnostic)
+        }
+        let normalized = AgentTranscriptRecoveryDiagnostic.normalizedList(collected)
+        return normalized.isEmpty ? nil : normalized
     }
 
     private static func latestToolExecutions(from activities: [AgentTranscriptActivity]) -> [AgentTranscriptToolExecution] {
@@ -6607,6 +6646,7 @@ enum AgentTranscriptProjectionBuilder {
 
     private static func compactTierBlockCount(for turn: AgentTranscriptTurn) -> Int {
         var count = turn.request == nil ? 0 : 1
+        count += recoveryDiagnosticBlocks(for: turn, archived: false).count
         var emittedConclusionActivityIDs = Set<UUID>()
         for span in turn.responseSpans {
             if span.activities.isEmpty {
@@ -6632,6 +6672,7 @@ enum AgentTranscriptProjectionBuilder {
 
     private static func compactTierVisibleRowCount(for turn: AgentTranscriptTurn) -> Int {
         var count = turn.request == nil ? 0 : 1
+        count += recoveryDiagnosticBlocks(for: turn, archived: false).count
         var emittedConclusionActivityIDs = Set<UUID>()
         for span in turn.responseSpans {
             if span.activities.isEmpty {
@@ -6663,6 +6704,12 @@ enum AgentTranscriptProjectionBuilder {
         if let request = turn.request?.toItem() {
             rows.append(request)
         }
+        // Recovery notices precede the turn's summarized work (the fresh thread starts
+        // before any retained activity), so they sit directly after the request — the
+        // same fixed position the block builders and history get_session use.
+        rows.append(
+            contentsOf: turn.summary?.normalizedRecoveryDiagnostics.map(recoveryDiagnosticRow) ?? []
+        )
         if let summaryRow = middleSummaryRow(for: turn) {
             rows.append(summaryRow)
         }
@@ -6670,6 +6717,49 @@ enum AgentTranscriptProjectionBuilder {
             rows.append(conclusionRow)
         }
         return rows
+    }
+
+    /// Rebuilds the `.system` notice row for a summary-carried recovery diagnostic,
+    /// reusing the originating activity's identity so anchors and cutoff handling stay
+    /// stable and the notice renders exactly once.
+    private static func recoveryDiagnosticRow(
+        _ diagnostic: AgentTranscriptRecoveryDiagnostic
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: diagnostic.id,
+            timestamp: diagnostic.timestamp,
+            kind: .system,
+            text: diagnostic.text,
+            sequenceIndex: diagnostic.sequenceIndex,
+            isStreaming: false,
+            recoveryDiagnostic: diagnostic
+        )
+    }
+
+    /// Standalone-note blocks for a turn's summary-carried recovery diagnostics. Skips
+    /// any diagnostic whose originating row is still among the turn's retained
+    /// activities — the live row already renders, so a second block would collide on
+    /// `activityBlockID`.
+    private static func recoveryDiagnosticBlocks(
+        for turn: AgentTranscriptTurn,
+        archived: Bool
+    ) -> [AgentTranscriptRenderBlock] {
+        let retainedActivityIDs = Set(turn.allActivities.map(\.id))
+        return (turn.summary?.normalizedRecoveryDiagnostics ?? [])
+            .filter { !retainedActivityIDs.contains($0.id) }
+            .map { diagnostic in
+                AgentTranscriptRenderBlock(
+                    id: activityBlockID(diagnostic.id, fallback: turn.id),
+                    kind: .standaloneNote,
+                    turnID: turn.id,
+                    retentionTier: turn.retentionTier,
+                    rows: [recoveryDiagnosticRow(diagnostic)],
+                    isArchived: archived,
+                    primaryAnchor: nil,
+                    anchorActivityID: diagnostic.id,
+                    activityIDs: [diagnostic.id]
+                )
+            }
     }
 
     private static func estimatedFullBlockCount(for turn: AgentTranscriptTurn, detailedToolTailLimit: Int) -> Int {
@@ -7292,6 +7382,9 @@ enum AgentTranscriptProjectionBuilder {
                 primaryAnchor: requestAnchor(for: turn.id)
             ))
         }
+        // Recovery diagnostics sit directly after the request — the notice precedes the
+        // turn's summarized work — matching compactedRows, compactedBlocks, and history.
+        blocks.append(contentsOf: recoveryDiagnosticBlocks(for: turn, archived: archived))
         var emittedConclusionActivityIDs = Set<UUID>()
         for span in turn.responseSpans {
             if span.activities.isEmpty {
@@ -7359,6 +7452,9 @@ enum AgentTranscriptProjectionBuilder {
                 primaryAnchor: requestAnchor(for: turn.id)
             ))
         }
+        // Recovery diagnostics precede the summarized work; emit before the summary
+        // block so all surfaces agree on request → diagnostics → summary → conclusion.
+        blocks.append(contentsOf: recoveryDiagnosticBlocks(for: turn, archived: archived))
         if let summaryRow = middleSummaryRow(for: turn) {
             blocks.append(.init(
                 id: summaryBlockID(summaryRow.id),

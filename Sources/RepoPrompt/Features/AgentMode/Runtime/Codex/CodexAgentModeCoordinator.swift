@@ -324,7 +324,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case unrecoverable(String?)
     }
 
-    private enum CodexNativeSessionFallbackReason {
+    /// Raw values are persisted in `AgentTranscriptRecoveryDiagnostic.reason`; a case
+    /// rename would change stored tokens, so treat case names as a stable wire contract.
+    private enum CodexNativeSessionFallbackReason: String {
         case missingRollout
         case repeatedResumeTimeout
         case resumeFrameTooLarge
@@ -5078,9 +5080,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         session.codexNativeStartupDisposition = startResult.disposition
         if let fallbackReason = startResult.fallbackReason {
+            let noticeText = Self.recoveryMessage(for: fallbackReason)
             let recoveryNoticeItem = AgentChatItem.system(
-                Self.recoveryMessage(for: fallbackReason),
-                sequenceIndex: session.nextSequenceIndex
+                noticeText,
+                sequenceIndex: session.nextSequenceIndex,
+                recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic(
+                    reason: fallbackReason.rawValue,
+                    outcome: AgentTranscriptRecoveryDiagnostic.freshThreadStartedOutcome,
+                    previousConversationID: session.codexConversationID,
+                    replacementConversationID: startResult.sessionRef?.conversationID,
+                    text: noticeText
+                )
             )
             session.appendItem(recoveryNoticeItem)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
