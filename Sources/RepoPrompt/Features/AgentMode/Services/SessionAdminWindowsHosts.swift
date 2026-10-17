@@ -352,6 +352,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
 
     // MARK: - Repository context of the TARGET session
 
+    @MainActor
     private struct TargetContext {
         let owner: AgentSessionCarrierResolver.RuntimeOwner
         let workspaceID: UUID
