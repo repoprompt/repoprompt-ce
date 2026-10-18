@@ -155,10 +155,19 @@ final actor ServerController: ObservableObject {
                 // executable verification. Do not consult the generic allow-list for these
                 // spoofable client names.
                 let isRepoCLI = Self.isRepoPromptCLIClientName(client.name)
-                let verifiedBundledCLI = isRepoCLI
-                    ? await isBundledRepoPromptCLIConnection(connectionID: connectionID) : false
-                if Self.canAutomaticallyApprove(clientName: client.name, bundledCLI: verifiedBundledCLI) {
-                    serverControllerDebugLog("Auto-approving '\(client.name)' (RepoPrompt bundled CLI verified)")
+                let verifiedHelperPID = await bundledRepoPromptHelperPID(connectionID: connectionID)
+                let verifiedBundledCLI = verifiedHelperPID != nil
+                let appManagedAgent = if let verifiedHelperPID {
+                    await networkManager.authorizeAutomaticAppManagedAgentAdmission(
+                        connectionID: connectionID,
+                        clientName: client.name,
+                        verifiedBundledHelperPID: verifiedHelperPID
+                    )
+                } else {
+                    false
+                }
+                if Self.canAutomaticallyApprove(clientName: client.name, bundledCLI: verifiedBundledCLI) || appManagedAgent {
+                    serverControllerDebugLog("Auto-approving '\(client.name)' (bundled helper verified; appManagedAgent=\(appManagedAgent))")
                     if let service = await mcpService {
                         await service.clientConnectedSuccessfully(name: client.name)
                     }
@@ -249,20 +258,16 @@ final actor ServerController: ObservableObject {
         }
     #endif
 
-    /// Returns true iff the connecting process matches the app-bundled `repoprompt-mcp` executable.
-    private func isBundledRepoPromptCLIConnection(connectionID: UUID) async -> Bool {
-        guard let expectedURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp") else {
-            return false
-        }
-        guard let peerPID = await networkManager.peerPID(for: connectionID) else {
-            return false
-        }
-        guard let actualPath = Self.executablePath(forPID: peerPID) else {
-            return false
-        }
+    /// Only a kernel-observed peer matching the bundled helper can enter either automatic path.
+    private func bundledRepoPromptHelperPID(connectionID: UUID) async -> Int? {
+        guard let expectedURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp"),
+              let peerPID = await networkManager.peerPID(for: connectionID),
+              peerPID > 1,
+              let actualPath = Self.executablePath(forPID: peerPID)
+        else { return nil }
         let expected = expectedURL.resolvingSymlinksInPath().standardizedFileURL.path
         let actual = URL(fileURLWithPath: actualPath).resolvingSymlinksInPath().standardizedFileURL.path
-        return actual == expected
+        return actual == expected ? peerPID : nil
     }
 
     private nonisolated static func executablePath(forPID pid: Int) -> String? {

@@ -1353,6 +1353,21 @@ actor ServerNetworkManager {
 
     private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
     private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
+
+    private struct AutomaticAgentAdmission {
+        enum Source {
+            case pendingPolicy(key: String, id: UUID)
+            case liveToken(String)
+        }
+
+        let runID: UUID
+        let authorityGeneration: UInt64
+        let observedHelperPID: Int
+        let source: Source
+    }
+
+    /// One initialize handoff only; never a standing connection/name grant.
+    private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
     private let terminalRecordClaimsByConnectionID = MCPDomainTerminalClaimRegistry<MCPTerminalRecord>()
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -7216,6 +7231,7 @@ actor ServerNetworkManager {
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
             bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+            automaticAgentAdmissions.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -8233,6 +8249,7 @@ actor ServerNetworkManager {
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
         bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+        automaticAgentAdmissions.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -8567,6 +8584,124 @@ actor ServerNetworkManager {
         return mutableArgs
     }
 
+    /// Admission-only exception for app-launched providers. The controller verifies the helper
+    /// executable; this actor rechecks the same observed peer against current run-owned evidence.
+    /// Claimed PIDs, names alone, and expected ancestry without a policy/token never authorize it.
+    /// The one-initialize proof must survive normal policy consumption; fallback cannot widen it.
+    func authorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) async -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        let deadline = Date().addingTimeInterval(2)
+        // Launchers register the parent PID just after Process.run(). The helper may win
+        // that race. Wait only while a PID-gated policy exists, using observed identity
+        // throughout; absence of proof never becomes approval when the bound expires.
+        repeat {
+            guard !Task.isCancelled,
+                  isCurrentConnection(connectionID, lifecycleGeneration: generation),
+                  bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+            else { return false }
+            if tryAuthorizeAutomaticAppManagedAgentAdmission(
+                connectionID: connectionID, clientName: clientName,
+                verifiedBundledHelperPID: verifiedBundledHelperPID
+            ) { return true }
+            guard hasPIDGatedPendingPolicy(for: clientName), Date() < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while true
+    }
+
+    private func tryAuthorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID],
+              isCurrentConnection(connectionID, lifecycleGeneration: generation),
+              verifiedBundledHelperPID > 1,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+        else { return false }
+
+        func ownsLiveRun(_ runID: UUID) -> Bool {
+            guard runPolicyStateByRunID[runID] != nil,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  revocationFenceGenerationByRunID[runID] != authorityGeneration
+            else { return false }
+            let expectedPIDs = expectedAgentPIDs(for: clientName)
+                .intersection(expectedAgentPIDs(for: clientName, runID: runID))
+            return !expectedPIDs.isEmpty && isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(verifiedBundledHelperPID))
+        }
+
+        if let entry = oldestPendingPolicyEntry(for: clientName, where: { policy in
+            guard policy.requiresExpectedAgentPID,
+                  policy.reservationConnectionID == nil,
+                  let runID = policy.runID
+            else { return false }
+            return ownsLiveRun(runID)
+        }) {
+            // Do not let an old connection's token or mapping borrow a successor run's policy.
+            let boundRunID = runIDByConnectionID[connectionID]
+            let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+            let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+            guard let runID = entry.policy.runID,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  boundRunID == nil || boundRunID == runID,
+                  affinity == nil || affinity?.runID == runID
+            else { return false }
+            automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+                runID: runID, authorityGeneration: authorityGeneration,
+                observedHelperPID: verifiedBundledHelperPID,
+                source: .pendingPolicy(key: entry.key, id: entry.policy.id)
+            )
+            return true
+        }
+
+        // Reconnects require the exact live capability token as well as current ancestry.
+        // An expected process alone cannot join an established run under a new token.
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        guard let sessionKey,
+              let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
+              admittedPolicyRunIDs.contains(affinity.runID),
+              ownsLiveRun(affinity.runID),
+              let authorityGeneration = runRoutingAuthorityGenerationByRunID[affinity.runID],
+              runIDByConnectionID[connectionID].map({ $0 == affinity.runID }) ?? true
+        else { return false }
+        automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+            runID: affinity.runID, authorityGeneration: authorityGeneration,
+            observedHelperPID: verifiedBundledHelperPID, source: .liveToken(sessionKey)
+        )
+        return true
+    }
+
+    private func isCurrentAutomaticAgentAdmission(
+        _ proof: AutomaticAgentAdmission,
+        connectionID: UUID,
+        clientName: String,
+        requiresPendingPolicy: Bool
+    ) -> Bool {
+        guard runPolicyStateByRunID[proof.runID] != nil,
+              runRoutingAuthorityGenerationByRunID[proof.runID] == proof.authorityGeneration,
+              revocationFenceGenerationByRunID[proof.runID] != proof.authorityGeneration,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == proof.observedHelperPID,
+              isExpectedAgentDescendant(clientName: clientName, clientPid: proof.observedHelperPID, runID: proof.runID) == true
+        else { return false }
+        switch proof.source {
+        case let .pendingPolicy(key, id):
+            guard requiresPendingPolicy else { return true }
+            pruneExpiredPolicies(for: clientName)
+            return pendingPoliciesByClient[key]?.contains {
+                $0.id == id && $0.runID == proof.runID && $0.reservationConnectionID == nil
+            } == true
+        case let .liveToken(token):
+            return (connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]) == token
+                && preferredLiveRunAffinity(for: clientName, sessionKey: token)?.runID == proof.runID
+                && admittedPolicyRunIDs.contains(proof.runID)
+        }
+    }
+
     /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
     private func completeApprovedAgentInitialization(
         clientName: String,
@@ -8576,6 +8711,10 @@ actor ServerNetworkManager {
         clientPid: Int,
         expectedLifecycleGeneration: UInt64
     ) async -> Bool {
+        let automaticAdmission = automaticAgentAdmissions.removeValue(forKey: connectionID)
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let readiness = await awaitAgentPolicyAdmissionIfNeeded(
             clientName: clientName,
             bootstrapClientName: bootstrapClientName,
@@ -8589,6 +8728,9 @@ actor ServerNetworkManager {
             return false
         }
 
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let policyOutcome = await applyPendingPolicyIfAvailable(
             clientName: clientName,
             connectionID: connectionID,
@@ -8603,6 +8745,14 @@ actor ServerNetworkManager {
             )
             pendingConnections.removeValue(forKey: connectionID)
             return false
+        }
+        if let automaticAdmission {
+            guard isCurrentAutomaticAgentAdmission(
+                automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+            ),
+                runIDByConnectionID[connectionID] == automaticAdmission.runID,
+                admittedPolicyRunIDs.contains(automaticAdmission.runID)
+            else { return false }
         }
         notifyConnectionWaiters(
             connectionID: connectionID,

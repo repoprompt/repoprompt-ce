@@ -446,6 +446,52 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(events.decisions, ["first-allowed", "second-allowed"])
         }
 
+        func testTwoWindowServiceResponsesCannotResolveSuccessorGeneration() async throws {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let service = MCPService(
+                controller: controller,
+                hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {}
+            )
+            let (windowA, streamA) = await service.subscribeToStateUpdates()
+            let (windowB, streamB) = await service.subscribeToStateUpdates()
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { name, generation in
+                await service.setPendingApprovalForTesting(name, generation: generation)
+                events.prompt(generation)
+            }
+            for peer in ["first", "second"] {
+                await controller.test_requestApproval(
+                    clientID: "same-name", approve: { events.decide("\(peer)-allowed") }, deny: { events.decide("\(peer)-denied") }
+                )
+            }
+            // Init may have installed the equivalent production callback. Read the generations
+            // from the service streams themselves, just as two windows do.
+            var iteratorA = streamA.makeAsyncIterator()
+            _ = await iteratorA.next() // seed
+            let nextFirstSnapshot = await iteratorA.next()
+            let firstSnapshot = try XCTUnwrap(nextFirstSnapshot)
+            let first = try XCTUnwrap(firstSnapshot.pendingApprovalGeneration)
+            await service.continuePendingApproval(allow: true, generation: first)
+            _ = await iteratorA.next() // clear before successor
+            let nextSecondSnapshot = await iteratorA.next()
+            let secondSnapshot = try XCTUnwrap(nextSecondSnapshot)
+            let second = try XCTUnwrap(secondSnapshot.pendingApprovalGeneration)
+            XCTAssertNotEqual(first, second)
+            XCTAssertEqual(secondSnapshot.pendingClientID, "same-name")
+            // A delayed second-window click cannot clear or resolve the successor.
+            await service.continuePendingApproval(allow: false, generation: first)
+            XCTAssertEqual(events.decisions, ["first-allowed"])
+            await service.continuePendingApproval(allow: false, generation: second)
+            XCTAssertEqual(events.decisions, ["first-allowed", "second-denied"])
+            await service.unsubscribeFromStateUpdates(id: windowA)
+            await service.unsubscribeFromStateUpdates(id: windowB)
+            var snapshotsB: [MCPService.Snapshot] = []
+            for await snapshot in streamB {
+                snapshotsB.append(snapshot)
+            }
+            XCTAssertEqual(snapshotsB.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+        }
+
         func testExplicitDenialRemainsConnectionSpecific() async {
             let controller = ServerController(installNetworkCallbacks: false)
             let events = AdmissionEvents()

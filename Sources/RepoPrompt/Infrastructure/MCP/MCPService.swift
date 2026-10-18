@@ -101,7 +101,7 @@ actor MCPService: Sendable {
     // MARK: - Private implementation objects
 
     /// ──────────────────────────────────────────────
-    private let controller = ServerController.shared
+    private let controller: ServerController
     private let hostBootstrapOperation: @Sendable () async -> Void
     private let controllerStartOperation: @Sendable () async throws -> Void
     private let controllerFullShutdownOperation: @Sendable () async -> Void
@@ -134,6 +134,7 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     init(
+        controller: ServerController = .shared,
         hostBootstrapOperation: @escaping @Sendable () async -> Void = {
             // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
             _ = MCPIntegrationHelper.ensureCodexToolTimeout()
@@ -145,6 +146,7 @@ actor MCPService: Sendable {
             await ServerController.shared.fullShutdown()
         }
     ) {
+        self.controller = controller
         self.hostBootstrapOperation = hostBootstrapOperation
         self.controllerStartOperation = controllerStartOperation
         self.controllerFullShutdownOperation = controllerFullShutdownOperation
@@ -311,8 +313,9 @@ actor MCPService: Sendable {
         /// Sets the pending-approval client and broadcasts the snapshot without
         /// going through the controller callback, so tests can exercise the
         /// per-subscriber state fan-out directly.
-        func setPendingApprovalForTesting(_ clientID: String?) {
+        func setPendingApprovalForTesting(_ clientID: String?, generation: UInt64? = nil) {
             state.pendingClientID = clientID
+            state.pendingApprovalGeneration = generation
             yieldState()
         }
     #endif
