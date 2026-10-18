@@ -10181,12 +10181,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requiresHydratedRuntime: Bool
     ) throws {
         guard let workspaceManager,
-              let workspace = workspaceManager.workspaces.first(where: { workspace in
-                  workspace.composeTabs.contains(where: {
-                      $0.id == tabID && $0.activeAgentSessionID == sessionID
-                  })
-              }),
-              expectedWorkspaceID.map({ $0 == workspace.id }) ?? true
+              let workspaceID = workspaceManager.agentSessionLifecycleWorkspaceID(tabID: tabID, sessionID: sessionID),
+              expectedWorkspaceID.map({ $0 == workspaceID }) ?? true
         else {
             throw MCPError.invalidParams(
                 "The requested tab and Agent session binding changed after its selector was frozen."

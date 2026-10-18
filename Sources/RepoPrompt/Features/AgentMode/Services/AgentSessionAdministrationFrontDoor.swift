@@ -283,6 +283,9 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     }
                     shaped = shaped.rebuilt(targets: resolved.sessionIDs)
                 } else {
+                    if let refusal = try await unresolvedTargetRefusal(shaped, scope: scope) {
+                        return .completed(refusal)
+                    }
                     let split = try await splitUnloadedTargets(shaped.targetSessionIDs, scope: scope)
                     if !mutating, !split.unloaded.isEmpty {
                         return .completed(.object([
@@ -553,6 +556,34 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             return .capabilityMissing(missing)
         }
         return nil
+    }
+
+    /// A read-authorized caller may diagnose a conflict, but never acquires a mutation lease from
+    /// it. Use the same unresolved-ID visibility rule as inventory: a workspace/tree membership
+    /// that depends on disputed placement cannot disclose the competing carriers.
+    private func unresolvedTargetRefusal(
+        _ request: AgentSessionAdministrationRequest, scope: DomainDelegationScopeRecord
+    ) async throws -> Value? {
+        let visibility = AgentSessionScopeVisibility(chain: scopes.scopeChain(from: scope.id))
+        let candidates = Set(request.targetSessionIDs.filter { visibility.mayDiscloseUnresolved($0) })
+        guard !candidates.isEmpty, filterDenial(request.operation, scope: scope) == nil else { return nil }
+        let targets = projector.withSynchronousTargets(candidates) { projector in
+            Set(candidates.filter { projector.pointResolutionState(for: $0) == .ambiguous })
+        }
+        guard !targets.isEmpty else { return nil }
+        let chain = scopes.scopeChain(from: scope.id)
+        let snapshot = try await inventory.snapshot(read: .init(loadedOnly: true, sessionIDs: targets))
+        try checkInventoryAuthority(scope, chain: chain)
+        guard filterDenial(request.operation, scope: scope) == nil else { return nil }
+        let unresolved = snapshot.restricted(to: targets, includingUnresolvedDetails: visibility.mayDiscloseCompetingCarriers)
+        guard let id = request.targetSessionIDs.first(where: { unresolved.unresolvedSessions[$0] != nil }),
+              let reason = unresolved.unresolvedSessions[id] else { return nil }
+        var result = AgentSessionInventoryRendering.unresolvedValue(
+            id: id, reason: reason, detail: unresolved.unresolvedDetails[id]
+        ).objectValue ?? [:]
+        result["result"] = .string("not_applied")
+        result["op"] = .string(request.operation.adminOperationName)
+        return .object(result)
     }
 
     /// Explicit targets the projector cannot prove (it only sees loaded workspaces) that inventory

@@ -1218,7 +1218,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // These positions are derived alongside the routing indexes, never a second authority.
         lifecycleBindingPositions.removeAll(keepingCapacity: true)
         lifecycleSessionPositions.removeAll(keepingCapacity: true)
-        for (workspaceIndex, workspace) in workspaces.enumerated() {
+        for (workspaceIndex, workspace) in workspaces.enumerated() where workspace.consolidatedIntoWorkspaceID == nil {
             for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                 #if DEBUG
                     test_sessionCarrierIndexMaintenanceRowsVisited += 1
@@ -1233,7 +1233,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         sessionCarrierPositionsByTabID.removeAll(keepingCapacity: true)
         sessionCarrierPositionsBySessionID.removeAll(keepingCapacity: true)
-        for (workspaceIndex, workspace) in workspaces.enumerated() {
+        for (workspaceIndex, workspace) in workspaces.enumerated() where workspace.consolidatedIntoWorkspaceID == nil {
             for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                 indexSessionCarrier(tab, position: .init(workspace: workspaceIndex, tab: tabIndex, isStashed: false))
             }
@@ -1526,13 +1526,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             tabIDs.insert(tab.id)
             let position = SessionCarrierPosition(workspace: workspaceIndex, tab: tabIndex, isStashed: false)
-            nextTabPositions[tab.id, default: []].append(position)
+            if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                nextTabPositions[tab.id, default: []].append(position)
+            }
             nextRouting[tab.id] = nextRouting[tab.id] == nil ? tabIndex : -1
             if let sessionID = tab.activeAgentSessionID {
                 sessionIDs.insert(sessionID)
                 lifecycleKeys.insert(.init(tabID: tab.id, sessionID: sessionID))
-                nextSessionPositions[sessionID, default: []].append(position)
-                nextLifecyclePositions[sessionID, default: []].append((workspaceIndex, tabIndex))
+                if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                    nextSessionPositions[sessionID, default: []].append(position)
+                    nextLifecyclePositions[sessionID, default: []].append((workspaceIndex, tabIndex))
+                }
             }
         }
         for (tabIndex, stash) in publication.replacement.stashedTabs.enumerated() {
@@ -1541,10 +1545,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             tabIDs.insert(stash.tab.id)
             let position = SessionCarrierPosition(workspace: workspaceIndex, tab: tabIndex, isStashed: true)
-            nextTabPositions[stash.tab.id, default: []].append(position)
+            if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                nextTabPositions[stash.tab.id, default: []].append(position)
+            }
             if let sessionID = stash.tab.activeAgentSessionID {
                 sessionIDs.insert(sessionID)
-                nextSessionPositions[sessionID, default: []].append(position)
+                if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                    nextSessionPositions[sessionID, default: []].append(position)
+                }
             }
         }
         for tabID in tabIDs {
@@ -1612,6 +1620,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func sessionCarrier(at position: SessionCarrierPosition) -> SessionCarrier? {
         guard workspaces.indices.contains(position.workspace) else { return nil }
         let workspace = workspaces[position.workspace]
+        // Consolidation keeps these tabs for recovery, not as a second live binding owner.
+        guard workspace.consolidatedIntoWorkspaceID == nil else { return nil }
         #if DEBUG
             test_sessionCarrierRowsVisited += 1
         #endif
@@ -1624,7 +1634,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         return SessionCarrier(workspaceID: workspace.id, tab: workspace.composeTabs[position.tab], stashedTabID: nil)
     }
 
-    /// Physical claims, preserving duplicates and conflicting identities. Reads never rebuild the
+    /// Physical claims from unconsolidated workspaces, preserving duplicates and conflicting
+    /// identities. Recovery copies retain their data but confer no binding ownership.
+    /// Reads never rebuild the
     /// index; generic model replacement and the identity mutation owner maintain it synchronously.
     func sessionCarriers(
         sessionIDs: Set<UUID>, tabIDs: Set<UUID> = [], excludingSessionIDs: Set<UUID> = []
