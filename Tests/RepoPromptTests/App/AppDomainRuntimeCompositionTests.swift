@@ -560,7 +560,7 @@ extension DebugStateBootstrapTests {
         try seedLease?.allowWriters()
         try nextWriter.acquireProfileAccess()
         seedLease = nil
-        withExtendedLifetime(nextWriter) {
+        try withExtendedLifetime(nextWriter) {
             XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
         }
     }
