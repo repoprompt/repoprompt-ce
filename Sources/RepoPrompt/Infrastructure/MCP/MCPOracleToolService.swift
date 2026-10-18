@@ -308,17 +308,18 @@ struct MCPOracleToolService {
     // MARK: - oracle_send
 
     func executeOracleSend(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
+        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "images", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "oracle_send only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "oracle_send only accepts: message, mode, chat_id, new_chat, model, images, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
         try validateCommonOracleArgs(args)
+        let imageRequests = try Self.parseOracleImageRequests(args["images"])
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
@@ -368,13 +369,15 @@ struct MCPOracleToolService {
                 from: context,
                 owner: owner,
                 origin: .oracleSend,
-                mode: modeRaw
+                mode: modeRaw,
+                imageRequests: imageRequests
             )
         } else {
             tabContext = try await oracleSendTabContext(
                 from: context,
                 origin: .oracleSend,
-                mode: modeRaw
+                mode: modeRaw,
+                imageRequests: imageRequests
             )
         }
 
@@ -398,6 +401,7 @@ struct MCPOracleToolService {
 
         var chatArgs = args
         chatArgs.removeValue(forKey: "export_response")
+        chatArgs.removeValue(forKey: "images")
 
         let capturedTabContext = tabContext
         let capturedChatArgs = chatArgs

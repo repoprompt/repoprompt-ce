@@ -27,7 +27,9 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         displayName: String? = "Build API",
         providerDisplayName: String? = "Codex CLI",
         locationLabel: String? = "worktree/feature",
-        isDeletionInProgress: Bool = false
+        isDeletionInProgress: Bool = false,
+        parentSessionID: UUID? = nil,
+        createdByOverseerSessionID: UUID? = nil
     ) -> AgentSessionLinkEndpointCandidate {
         let readiness: AgentSessionRestorationReadiness
         if let persistentBindingGeneration {
@@ -61,8 +63,26 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
             restorationReadiness: readiness,
-            isDeletionInProgress: isDeletionInProgress
+            isDeletionInProgress: isDeletionInProgress,
+            parentSessionID: parentSessionID,
+            createdByOverseerSessionID: createdByOverseerSessionID
         )
+    }
+
+    func testChildTargetQualificationUsesImmutableProvenanceWithoutChangingObserverEligibility() throws {
+        let observer = UUID()
+        let child = makeCandidate(isTopLevel: false, parentSessionID: observer)
+        XCTAssertEqual(AgentSessionLinkEndpointResolver.resolve(sessionID: child.sessionID, candidates: [child]).failure, .childSession)
+        XCTAssertEqual(try AgentSessionLinkEndpointResolver.resolve(sessionID: child.sessionID, candidates: [child], observerSessionID: observer).get(), child)
+        XCTAssertFalse(child.isTopLevel)
+        XCTAssertEqual(AgentSessionLinkEndpointResolver.resolve(sessionID: child.sessionID, candidates: [child], observerSessionID: UUID()).failure, .childSession)
+        XCTAssertEqual(try AgentSessionLinkEndpointResolver.resolve(sessionID: child.sessionID, candidates: [child], observerSessionID: UUID(), permitsChildTarget: true).get(), child)
+        XCTAssertNotEqual(AgentSessionLinkEndpointEligibility.observerOperationEligibility(child.eligibilityInput, roleAllowsOutboundMonitoring: true), .eligible)
+        let created = makeCandidate(isTopLevel: false, parentSessionID: UUID(), createdByOverseerSessionID: observer)
+        XCTAssertEqual(try AgentSessionLinkEndpointResolver.resolve(sessionID: created.sessionID, candidates: [created], observerSessionID: observer).get(), created)
+        let closing = makeCandidate(isTopLevel: false, isClosing: true, parentSessionID: observer)
+        XCTAssertEqual(AgentSessionLinkEndpointResolver.resolve(sessionID: closing.sessionID, candidates: [closing], observerSessionID: observer, permitsChildTarget: true).failure, .closing)
+        XCTAssertEqual(AgentSessionLinkEndpointResolver.resolve(sessionID: child.sessionID, candidates: [child, child], observerSessionID: observer, permitsChildTarget: true).failure, .ambiguous)
     }
 
     // MARK: - Parsing

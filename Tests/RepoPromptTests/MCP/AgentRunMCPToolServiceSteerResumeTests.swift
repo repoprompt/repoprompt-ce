@@ -6,6 +6,125 @@ import XCTest
 
 @MainActor
 final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
+    func testScopeDecisionWaitsForActiveTurnAndResumesWithoutConsumingDraft() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.isMCPOriginated = false
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        session.runState = .running
+        viewModel.storeDraftText(for: session.tabID, "Keep my draft")
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
+        runtime.test_suppressDecisionDelivery = false
+        let request = try runtime.requestScope(
+            requesterSessionID: sessionID, requesterTabID: session.tabID,
+            kind: .tree(rootSessionID: sessionID), capabilities: [.observe],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try runtime.approve(requestID: request.id).get()
+        XCTAssertTrue(session.items.isEmpty, "Approval must not interrupt the active turn")
+        var deliveredText: String?
+        let resumed = Task { @MainActor in
+            let response = try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            deliveredText = response.text
+        }
+        try await AsyncTestWait.waitUntil("decision instruction continuation") {
+            await MainActor.run { session.instructionContinuation != nil }
+        }
+        session.instructionWaitID = UUID()
+        session.runState = .waitingForUser
+        try await AsyncTestWait.waitUntil("scope decision delivered") {
+            await MainActor.run { deliveredText != nil }
+        }
+        try await resumed.value
+        XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")
+        XCTAssertNil(session.mcpControlContext)
+    }
+
+    func testUnrelatedSteerUsesExactLinkSurfaceInsteadOfChildControl() async throws {
+        let window = try await makeWindow()
+        let target = UUID(), caller = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: target)
+        var service = makeService(window: window, resolveCaller: { _, _ in caller })
+        var forwarded: [String: Value]?
+        service.forwardOversightSteer = { args, metadata in
+            XCTAssertEqual(metadata.windowID, window.windowID)
+            forwarded = args
+            return .object(["result": .string("link_transaction")])
+        }
+        let result = try await service.execute(args: [
+            "op": .string("steer"), "session_id": .string(target.uuidString), "message": .string("Continue")
+        ])
+        XCTAssertEqual(result.objectValue?["result"], .string("link_transaction"))
+        XCTAssertEqual(forwarded?["session_id"], .string(target.uuidString))
+        XCTAssertEqual(forwarded?["message"], .string("Continue"))
+        XCTAssertNil(session.mcpControlContext, "The fallback must never capture the managed lane as an MCP child")
+        XCTAssertTrue(session.items.isEmpty)
+        var cancelled = makeService(window: window, resolveCaller: { _, _ in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return caller
+        })
+        var cancellationForwarded = false
+        cancelled.forwardOversightSteer = { _, _ in
+            cancellationForwarded = true
+            return .null
+        }
+        let task = Task { @MainActor in
+            try await cancelled.execute(args: [
+                "op": .string("steer"), "session_id": .string(target.uuidString), "message": .string("Cancelled")
+            ])
+        }
+        do {
+            _ = try await task.value
+            XCTFail("A cancelled child request must not reach the managed delivery surface")
+        } catch is CancellationError {} catch {
+            XCTFail("Expected cancellation, got \(error)")
+        }
+        XCTAssertFalse(cancellationForwarded)
+    }
+
+    func testManagedSteerRejectsEveryUnforwardableArgumentWithoutDelivery() async throws {
+        let window = try await makeWindow()
+        let target = UUID(), caller = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: target)
+        var service = makeService(window: window, resolveCaller: { _, _ in caller })
+        var deliveries = 0
+        service.forwardOversightSteer = { _, _ in
+            deliveries += 1
+            return .object(["result": .string("delivered")])
+        }
+        let rejected: [(String, Value)] = [
+            ("workflow_name", .string("review")), ("wait", .string("true")),
+            ("wait", .int(1)), ("unknown_option", .string("not forwarded")),
+            ("workflow", .string("review")), ("workflow_id", .string(UUID().uuidString)),
+            ("timeout_seconds", .int(1)), ("wait", .bool(true)), ("wait", .string("false"))
+        ]
+        for (key, value) in rejected {
+            var args: [String: Value] = [
+                "op": .string("steer"), "session_id": .string(target.uuidString), "message": .string("Continue")
+            ]
+            args[key] = value
+            do {
+                _ = try await service.execute(args: args)
+                XCTFail("Unsupported argument \(key) was accepted")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("'\(key)'"), "\(error)")
+                XCTAssertTrue(String(describing: error).contains("Nothing was delivered"), "\(error)")
+            }
+            XCTAssertEqual(deliveries, 0)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertNil(session.mcpControlContext)
+        }
+        _ = try await service.execute(args: [
+            "op": .string("steer"), "session_id": .string(target.uuidString),
+            "message": .string("Continue"), "idempotency_key": .string("approved-shape"), "wait": .bool(false)
+        ])
+        XCTAssertEqual(deliveries, 1, "Literal wait=false remains supported")
+    }
+
     func testResidentInstructionSteerAndPollDoNotCaptureOrConsumeComposer() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel

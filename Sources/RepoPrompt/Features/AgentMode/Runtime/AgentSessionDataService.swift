@@ -527,11 +527,7 @@ actor AgentSessionDataService {
     private func preserveMalformedSelfCompactRecord(_ data: Data, from fileURL: URL) throws {
         let directory = fileURL.deletingLastPathComponent().appendingPathComponent(".self-compact-recovery", isDirectory: true)
         try AppProfileLocations.current.validateMetadataFile(directory)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let backupURL = directory.appendingPathComponent("\(fileURL.lastPathComponent).\(UUID().uuidString).original")
         try data.write(to: backupURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
@@ -1145,7 +1141,9 @@ actor AgentSessionDataService {
     }
 
     func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        // Exact metadata lookup is a read, including for a workspace with no sessions directory.
+        // Oversight uses it before consent; it must not create folders or normalize saved state.
+        let folder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
         let fileURL = agentSessionFileURL(id: id, in: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -1854,6 +1852,9 @@ actor AgentSessionDataService {
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
         do {
+            if let fence = Self.destructiveCommitFence.get(), await !fence() {
+                throw AgentSessionDestructiveCommitRefused()
+            }
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 try AppProfileLocations.current.validateMetadataFile(fileURL)
                 try FileManager.default.removeItem(at: fileURL)

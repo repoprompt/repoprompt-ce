@@ -113,6 +113,17 @@ package extension DomainAgentSessionTargetOperation {
         }
     }
 
+    /// A capacity census is authority evidence only when this operation consumes a configured
+    /// limit. Missing unrelated placement must not veto unlimited creation; configured limits
+    /// still require complete evidence (including ancestor limits).
+    func requiresScopeUsage(for guardrails: DomainDelegationScopeGuardrails) -> Bool {
+        switch scopeGuardrailUse {
+        case .session: guardrails.maxLiveSessions != nil || guardrails.maxDepth != nil
+        case .worktree: guardrails.maxWorktrees != nil
+        case nil: false
+        }
+    }
+
     /// Whether each target must present a membership proof. `adopt` targets are by definition
     /// outside the scope; their consent comes from an always-required batch card instead.
     var requiresScopeMembership: Bool {

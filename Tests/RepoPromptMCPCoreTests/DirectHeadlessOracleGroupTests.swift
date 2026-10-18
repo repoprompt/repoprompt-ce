@@ -181,7 +181,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(try fixture.calls().isEmpty)
     }
 
-    func testAskOracleRejectsImagesBeforeProviderWork() async throws {
+    func testOracleSendToolsRejectImagesBeforeProviderWork() async throws {
         let fixture = try Fixture(name: "ask-oracle-images-rejected")
         defer { fixture.cleanup() }
         let service = fixture.service()
@@ -192,19 +192,21 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             oracleAdapter: prepared.oracleAdapter
         )
 
-        do {
-            _ = try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "ask_oracle",
-                arguments: [
-                    "message": .string("inspect this screenshot"),
-                    "images": .array([.object(["path": .string("/tmp/shot.png")])])
-                ]
-            )
-            XCTFail("Expected images rejection on the direct headless backend")
-        } catch {
-            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .unsupportedImageAttachments)
+        for toolName in ["ask_oracle", "oracle_send"] {
+            do {
+                _ = try await invoke(
+                    prepared: prepared,
+                    backend: backend,
+                    toolName: toolName,
+                    arguments: [
+                        "message": .string("inspect this screenshot"),
+                        "images": .array([.object(["path": .string("/tmp/shot.png")])])
+                    ]
+                )
+                XCTFail("Expected images rejection on the direct headless backend")
+            } catch {
+                XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .unsupportedImageAttachments)
+            }
         }
         XCTAssertTrue(try fixture.calls().isEmpty)
     }

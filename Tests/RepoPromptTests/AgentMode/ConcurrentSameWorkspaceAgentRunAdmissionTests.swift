@@ -356,6 +356,36 @@ import XCTest
             XCTAssertEqual(Set([firstPair, secondPair]).count, 2)
         }
 
+        func testUnchangedCodemapPublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let files = fixture.window.workspaceFilesViewModel
+            XCTAssertTrue(files.autoCodemapFiles.isEmpty)
+            var preparations = 0
+            fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor _, _, _ in
+                preparations += 1
+                // The root/selection reconciler can republish an unchanged empty list
+                // while off-main document preparation is suspended. Exercise the real
+                // Combine subscriber and drain its scheduled dirty-state callback.
+                files.setAutoCodemapFilesForTesting([])
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("unchanged selection must not veto admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let count = await recorder.count()
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(preparations, 1, "No real workspace mutation occurred; the two-attempt retry budget must remain unused")
+        }
+
         func testCanonicalAdmissionRefreshReResolvesWorkspaceAfterReorder() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -2029,6 +2059,25 @@ import XCTest
         let workspaceFileURL: URL
     }
 
+    /// Creation and bridge projection are independent now that canonical decoding suspends.
+    /// Admission tests begin only after the real bridge accepted this durable document; a
+    /// synthetic local append cannot establish the full-document write baseline saves require.
+    @MainActor
+    private func awaitDurableAdmissionCatalog(
+        window: WindowState, runtime: MCPDomainRuntime, workspaceID: UUID
+    ) async throws {
+        let catalog = await runtime.workspaceStore.snapshot()
+        guard let record = catalog.workspaces.first(where: { $0.document.workspaceID == workspaceID }),
+              let bridge = window.domainWorkspacePresentationBridgeForTesting
+        else { throw AdmissionTestError.fixtureSetup("durable admission catalog unavailable") }
+        let checkpoint = await DomainWorkspaceProjectionObserver(bridge: bridge).waitForProjection(
+            afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+        )
+        guard checkpoint != nil,
+              window.workspaceManager.qualifiedDomainWorkspaceDescendant(record) != nil
+        else { throw AdmissionTestError.fixtureSetup("durable admission catalog has no accepted full-document baseline") }
+    }
+
     @MainActor
     private final class DistinctDurableAdmissionFixture {
         let first: DurableAdmissionWindow
@@ -2188,11 +2237,7 @@ import XCTest
                 throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
             }
             await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-            // A sibling window can publish a catalog projection while this synthetic workspace is
-            // being created, so establish the local projection from the workspace just committed.
-            if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
-                window.workspaceManager.workspaces.append(workspace)
-            }
+            try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
             let storedWorkspace = try XCTUnwrap(
                 window.workspaceManager.workspaces.first { $0.id == workspace.id }
             )
@@ -2282,6 +2327,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState(domainRuntime: runtime)
+            window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             do {
@@ -2302,11 +2350,7 @@ import XCTest
                     throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
                 }
                 await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-                // Catalog projection and fixture creation are independent publications; the test
-                // window must expose the workspace that the authority has already committed.
-                if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
-                    window.workspaceManager.workspaces.append(workspace)
-                }
+                try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
                 let storedWorkspace = try XCTUnwrap(
                     window.workspaceManager.workspaces.first { $0.id == workspace.id }
                 )
@@ -2364,6 +2408,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let peer = WindowState(domainRuntime: runtime)
+            peer.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(peer)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             peerWindows.append(peer)

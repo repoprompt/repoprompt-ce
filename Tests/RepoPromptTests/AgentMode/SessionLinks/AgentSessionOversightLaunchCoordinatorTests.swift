@@ -17,6 +17,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// Endpoint host with a full window topology: descriptors, discovery levels, and a restore
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
+        var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
         var candidates: [AgentSessionLinkEndpointCandidate] = [] {
             didSet {
                 byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
@@ -199,9 +200,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             set { lock.withLock { shouldFail = newValue } }
         }
 
-        func write(_ data: Data, to url: URL) throws {
+        func check() throws {
             if failsNextWrites { throw CocoaError(.fileWriteOutOfSpace) }
-            try data.write(to: url, options: .atomic)
         }
     }
 
@@ -333,7 +333,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: mode,
-            writer: { data, url in try gate.write(data, to: url) }
+            beforeCommit: { try gate.check() }
         )
         let bridge = AgentSessionLinkRuntimeBridge(
             authority: authority,
@@ -372,6 +372,113 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     private func replaceTopology(_ fixture: Fixture, with candidates: [AgentSessionLinkEndpointCandidate]) {
         fixture.host.candidates = candidates
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
+    }
+
+    func testUnscopedLaunchIntentDoesNotConstructBackgroundRuntime() async throws {
+        final class Registry: PreparedAgentSessionRuntimeRegistry {
+            var preparations = 0
+            func addingPreparedRuntimeCarriers(to snapshot: AgentSessionCarrierResolver.Snapshot, sessionIDs: Set<UUID>?, windowIDs: Set<Int>) -> AgentSessionCarrierResolver.Snapshot {
+                snapshot
+            }
+
+            func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
+                false
+            }
+
+            func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
+                true
+            }
+
+            func finishPreparedRuntimeVisit(_ sessionID: UUID) {}
+            func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool {
+                true
+            }
+
+            func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {}
+            func beginPreparedOversightPreparation(_ id: UUID) {}
+            func endPreparedOversightPreparation(_ id: UUID) {}
+            func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool {
+                preparations += 1
+                return false
+            }
+        }
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let registry = Registry()
+        fixture.host.preparedSessionRuntimes = registry
+        fixture.host.candidates = [makeReadyCandidate(windowID: 1, sessionID: observerSessionID)]
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        let uncertain = await fixture.bridge.launchCoordinatorPrepareSavedTargets([pair])
+        fixture.bridge.launchCoordinatorFinishSavedTargetPreparation()
+        XCTAssertTrue(uncertain.isEmpty)
+        XCTAssertEqual(registry.preparations, 0, "Ordinary unscoped links restore lazily, not as full background compositions")
+    }
+
+    func testSavedPreparationOwnershipSpansEstablishmentAndIsReleasedOnEarlyExit() async {
+        // The real pass owns this bracket: releasing immediately after hydration lets asynchronous
+        // owner cleanup win before the restored link's actor transaction can commit.
+        final class PreparationDelegate: AgentSessionOversightLaunchCoordinatorDelegate {
+            let launchCoordinatorHost: AgentSessionLinkEndpointHost?
+            var launchCoordinatorIsFrozen = false
+            var freezeDuringPreparation = false
+            var events: [String] = []
+            var ownsPreparation = false
+            init(host: AgentSessionLinkEndpointHost) {
+                launchCoordinatorHost = host
+            }
+
+            func launchCoordinatorPrepareSavedTargets(_: [AgentSessionOversightIntent]) async -> Set<UUID> {
+                ownsPreparation = true
+                events.append("prepare")
+                launchCoordinatorIsFrozen = freezeDuringPreparation
+                return []
+            }
+
+            func launchCoordinatorFinishSavedTargetPreparation() {
+                XCTAssertTrue(ownsPreparation)
+                ownsPreparation = false
+                events.append("finish")
+            }
+
+            func launchCoordinatorEstablish(pair _: AgentSessionOversightIntent, token _: AgentSessionOversightIntentToken?, assertedAt _: UInt64?, proof _: AgentSessionOversightRestorationProof?) async -> AgentSessionLinkRuntimeBridge.EstablishmentResult {
+                XCTAssertTrue(ownsPreparation, "An unlinked prepared owner must survive establishment's actor hops")
+                events.append("establish")
+                await Task.yield()
+                XCTAssertTrue(ownsPreparation)
+                return .init(outcome: .rejected(message: "controlled refusal"))
+            }
+
+            func launchCoordinatorRemoveIntent(pair _: AgentSessionOversightIntent, token _: AgentSessionOversightIntentToken, assertedAt _: UInt64?) async -> AgentSessionOversightIntentMutationReceipt {
+                fatalError("No deletion in this fixture")
+            }
+
+            func launchCoordinatorRevoke(reference _: DomainAgentSessionLinkReference) async {
+                XCTFail("No active grant")
+            }
+
+            func launchCoordinatorReportWarning(id _: String, message _: String) {}
+            func launchCoordinatorRequestHydration(sessionIDs _: Set<UUID>) {
+                XCTFail("Both endpoints are ready")
+            }
+        }
+        for interrupted in [false, true] {
+            let host = FakeHost()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            host.candidates = [observer, target]
+            host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+            host.discovery = [.init(epoch: .init(windowID: 1, workspaceID: observer.workspaceID, generation: 1), isComplete: true)]
+            let delegate = PreparationDelegate(host: host)
+            delegate.freezeDuringPreparation = interrupted
+            let coordinator = AgentSessionOversightLaunchCoordinator(delegate: delegate)
+            let token = AgentSessionOversightIntentToken(storeProcessGeneration: UUID(), pair: pair, pairRevision: 1)
+            coordinator.loadLaunchEntries(.init(source: .loaded, storeRevision: 1, tokenByPair: [pair: token]), automaticRestoreEnabled: true)
+            coordinator.updateTopologyState(.completeAllEntriesConsumed)
+            await coordinator.settle()
+            XCTAssertEqual(delegate.events, interrupted ? ["prepare", "finish"] : ["prepare", "establish", "finish"])
+            XCTAssertFalse(delegate.ownsPreparation)
+            coordinator.freeze()
+        }
     }
 
     /// Actual bridge/authority/launch reconciliation with READY fake addresses, not VM routing,
@@ -641,7 +748,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     func testParkedDeletionCannotRestoreAndFailedCleanupRemainsRetryable() async throws {
+        let base = try XCTUnwrap(directory)
+        defer { directory = base }
         for failsWrite in [false, true] {
+            // Each variant is a separate profile. Reusing a terminal pair would correctly refuse
+            // resurrection from the stale legacy seed and would not test cleanup failure.
+            directory = base.appendingPathComponent("case-\(failsWrite)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             AgentSessionDeletionRegistry.shared.test_reset()
             let (fixture, observer, _) = try await makeRestoredFixture()
             fixture.bridge.attach(host: fixture.host)
@@ -657,8 +770,11 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.test_settleLaunchReconciliation()
             let restored = await isRestored(fixture)
             XCTAssertFalse(restored)
-            XCTAssertEqual(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry, failsWrite)
+            await fixture.store.serializationBarrier()
+            let saving = await fixture.store.saveState
+            XCTAssertEqual(saving, failsWrite ? "failed" : "saved")
             fixture.gate.failsNextWrites = false
+            await fixture.store.retrySaving()
             await fixture.bridge.retryPendingIntentCleanup()
             let token = await fixture.store.token(for: pair)
             XCTAssertNil(token)

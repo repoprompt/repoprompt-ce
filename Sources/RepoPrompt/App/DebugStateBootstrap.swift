@@ -9,8 +9,9 @@ import RepoPromptShared
 enum DebugStateBootstrap {
     static let cleanSlateArgument = "--debug-clean-slate"
     private static let fm = FileManager.default
+    @MainActor private static var appProfileLease: DebugProfileAccessLease?
 
-    static func runIfNeeded() throws {
+    @MainActor static func runIfNeeded() throws {
         guard MCPFilesystemIdentity.current.buildFlavor == .debug,
               !AppLaunchConfiguration.isUnitTestProcess,
               !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects else { return }
@@ -21,6 +22,7 @@ enum DebugStateBootstrap {
         else {
             throw DebugStateSnapshot.Failure.unsafeDestination
         }
+        let lease = try DebugProfileAccessLease.acquire(locations: .current, exclusive: true)
         let start = Date()
         let defaults = UserDefaults.standard
         let release = AppProfileLocations(identity: .repoPromptCE(.release))
@@ -38,27 +40,33 @@ enum DebugStateBootstrap {
         let receipt = try seed(
             locations: .current,
             cleanSlate: clean,
-            releasePreferences: [:],
+            releasePreferences: nil,
             previousPreferences: prior,
             preferenceSourceURL: clean ? nil : sourcePreferencesURL,
-            previousPreferenceFileURL: priorPreferencesURL
+            previousPreferenceFileURL: priorPreferencesURL,
+            profileLease: lease
         )
         let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
         let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
         defaults.setPersistentDomain(preferences, forName: AppProfileLocations.current.preferencesDomain)
+        try lease.allowWriters()
+        appProfileLease = lease
         print("[DebugStateSeed] schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
     }
 
     static func seed(
         locations: AppProfileLocations,
         cleanSlate: Bool,
-        releasePreferences: [String: Any],
+        releasePreferences: [String: Any]?,
         previousPreferences: [String: Any] = [:],
         preferenceSourceURL: URL? = nil,
-        previousPreferenceFileURL: URL? = nil
+        previousPreferenceFileURL: URL? = nil,
+        profileLease: DebugProfileAccessLease? = nil
     ) throws -> DebugStateSnapshot.Receipt {
         let startedAt = Date()
         guard locations.identity.buildFlavor == .debug else { throw DebugStateSnapshot.Failure.unsafeDestination }
+        let lease = try profileLease ?? DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
+        defer { withExtendedLifetime(lease) {} }
         let priorData: Data
         if let url = previousPreferenceFileURL, fm.fileExists(atPath: url.path) {
             _ = try DebugStateSnapshot.stamp(url)
@@ -69,22 +77,32 @@ enum DebugStateBootstrap {
         var lastError: Error = DebugStateSnapshot.Failure.sourceChanged
         for _ in 0 ..< 3 {
             do {
-                var builder = Builder(locations: locations, releasePreferences: releasePreferences, previousPreferences: previousPreferences)
+                var builder = Builder(locations: locations, releasePreferences: releasePreferences ?? [:], previousPreferences: previousPreferences)
+                var hasReleasePreferences = releasePreferences != nil
                 if !cleanSlate, let url = preferenceSourceURL, fm.fileExists(atPath: url.path) {
                     let bytes = try builder.plan.read(url)
                     guard let preferences = try PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any] else {
                         throw DebugStateSnapshot.Failure.unsafeFile
                     }
                     builder.releasePreferences = preferences
+                    hasReleasePreferences = true
                 }
-                var preferences = cleanSlate ? [:] : builder.releasePreferences
+                // Absence is not an empty production domain. Preserve debug defaults when
+                // there is no source, and never source DEBUG-only diagnostics from release.
+                var preferences = cleanSlate ? [:] : (hasReleasePreferences ? builder.releasePreferences : previousPreferences)
+                if !cleanSlate {
+                    for key in ["claudeRawEventLoggingEnabled", "claudeRawEventLogFilePath", "enableAgentModePerfDiagnostics", "emitAgentModePerfDiagnosticsToOSLog"] {
+                        preferences.removeValue(forKey: key)
+                        if let value = previousPreferences[key] { preferences[key] = value }
+                    }
+                }
                 // Materialize every custom metadata source by value inside this
                 // debug profile, not back into its production custom directory.
                 preferences.removeValue(forKey: "GlobalCustomStorageURL")
                 let preferencesData = try PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0)
                 let plan = try cleanSlate ? DebugStateSnapshot.Plan() : builder.build()
                 return try DebugStateSnapshot(locations: locations).publish(
-                    plan: plan, cleanSlate: cleanSlate, preferences: preferencesData, previousPreferences: priorData, startedAt: startedAt
+                    plan: plan, cleanSlate: cleanSlate, preferences: preferencesData, previousPreferences: priorData, startedAt: startedAt, profileLease: lease
                 )
             } catch DebugStateSnapshot.Failure.sourceChanged {
                 lastError = DebugStateSnapshot.Failure.sourceChanged
@@ -133,6 +151,7 @@ enum DebugStateBootstrap {
                 try plan.add(database, as: "ProductionContinuity/continuity.sqlite", database: true)
             }
             try preserveDebugContinuity()
+            try preserveDebugOwnedState()
             plan.generated["debugSeedSources.json"] = try json([
                 "version": 1,
                 "profile": locations.preferencesDomain,
@@ -238,7 +257,15 @@ enum DebugStateBootstrap {
                 }
                 if let retainedIdentities {
                     let tabs = workspace["composeTabs"] as? [[String: Any]] ?? []
-                    guard retainedIdentities.workspaces.contains(id) || tabs.contains(where: {
+                    let sessionsDirectory = url.deletingLastPathComponent().appendingPathComponent("AgentSessions")
+                    let savedSessions = fm.fileExists(atPath: sessionsDirectory.path) ? try plan.children(sessionsDirectory) : []
+                    let hasSavedEndpoint = savedSessions.contains { file in
+                        let name = file.deletingPathExtension().lastPathComponent
+                        guard file.pathExtension == "json", name.hasPrefix("AgentSession-"),
+                              let sessionID = UUID(uuidString: String(name.dropFirst("AgentSession-".count))) else { return false }
+                        return retainedIdentities.sessions.contains(sessionID.uuidString)
+                    }
+                    guard retainedIdentities.workspaces.contains(id) || hasSavedEndpoint || tabs.contains(where: {
                         ($0["activeAgentSessionID"] as? String).map { retainedIdentities.sessions.contains($0) } ?? false
                     }) else { continue }
                     retainedWorkspaceIDs.insert(id)
@@ -281,16 +308,18 @@ enum DebugStateBootstrap {
                     // A rebuildable projection; copied records would retain stale
                     // file size/mtime and runtime summaries after handle detachment.
                     continue
-                } else if retainedIdentities == nil, name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
+                } else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
                     guard var session = try object(url) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
-                    for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
-                        session.removeValue(forKey: key)
+                    if retainedIdentities == nil {
+                        for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
+                            session.removeValue(forKey: key)
+                        }
+                        for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {
+                            session[key] = false
+                        }
+                        session["worktreeMergeOperations"] = []
                     }
-                    for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {
-                        session[key] = false
-                    }
-                    session["worktreeMergeOperations"] = []
-                    try plan.add(url, as: target, replacement: json(rebase(session)))
+                    try plan.add(url, as: target, replacement: json(rebaseManagedAttachments(in: rebase(session) as? [String: Any] ?? session)))
                 } else if url.pathExtension == "json", relative.contains("/Chats") {
                     try plan.add(url, as: target, replacement: json(rebase(object(url))))
                 } else {

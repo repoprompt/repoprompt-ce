@@ -40,18 +40,23 @@ package enum MCPDomainSessionAdminToolDefinition {
 
     package static let capabilityValues: [String] = DomainDelegationScopeCapability.allCases.map(\.rawValue)
 
+    /// Shared static playbook; runtime receipts additionally identify the current setting.
+    package static let overseerPlaybook = "Overseer full access ON: just call the operation; no request_scope or cards. OFF: use a covering grant, or request_scope with needed capabilities. Existing standing consent may avoid a card; otherwise one card appears and RepoPrompt notifies you of the decision. scope_status lists operations, capabilities and grants."
+
     package static let definition = MCPDomainToolDefinition(
         name: MCPWindowToolName.sessionAdmin,
         description: """
         Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.
 
-        A scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
+        A scope is user-approved authority over a set of sessions: `session` (the grantee and one exact `session_id`, never descendants), `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. Ordinary `all_sessions` scopes hold only observe, organize, and restructure; the user's full-access setting supplies an unrestricted grant with every capability. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
-        For cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
+        \(overseerPlaybook)
+
+        For cleanup/organizing without covering authority, request `observe` together with mutation capabilities, then use `inventory`. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
 
         **Scope ops**
-        - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
-        - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
+        - `request_scope`: request missing authority with exact capabilities. Returns `granted` with the actual covering `scope`/`scope_id` under existing standing consent or full access; otherwise `pending_user_approval` with a `request_id`. Nothing is granted while pending; wait for the app-authored decision notice or inspect `scope_status` with that request_id, not a duplicate request.
+        - `scope_status`: when you need to inspect authority, call without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). For a one-target request, `become_overseer` with `session_id` and optional `message` requests one exact-target approval and automatically prepares, links and dispatches; it does not require a filler user turn or a mid-turn catalog refresh.
         - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
@@ -61,13 +66,13 @@ package enum MCPDomainSessionAdminToolDefinition {
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
 
         **Structure ops** (members only; membership never grows by moving sessions)
-        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). New links need observe + control; existing links are never upgraded. `unlink`: from `observer_session_id` (default you), both in scope.
+        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). `link` needs restructure; new links additionally need observe + control. Existing links are never upgraded. Omit scope_id when exactly one active scope holds the needed capabilities. `unlink`: from `observer_session_id` (default you), both in scope.
         - `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions and their subtrees under a member (user card; user-granted scopes only; never another scope's overseer). Refused with `placement_affects_other_scopes` if another scope's membership would change, `placement_unresolved` if a chain runs through an unloaded workspace.
         - `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.
         - `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.
         - `worktree_create` (`repo_root`, `branch`, `base_ref`, `bind`), `worktree_bind` (`worktree`, `apply`: now|next_boundary), `worktree_unbind`, `worktree_release` (card; unbind + mark stale), `worktree_inventory` (`idle_days`), `merge_preview` (`merge_target`), `merge_apply` (`operation_id`; the user reviews it).
 
-        **Rules**: `retire` and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
+        **Rules**: Except under the user's unrestricted full-access grant, `retire` and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -80,8 +85,8 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "kind": .object([
                     "type": .string("string"),
-                    "enum": .array([.string("tree"), .string("workspace"), .string("all_sessions")]),
-                    "description": .string("[request_scope] Scope kind; default tree rooted at this session.")
+                    "enum": .array([.string("session"), .string("tree"), .string("workspace"), .string("all_sessions")]),
+                    "description": .string("[request_scope] Scope kind; session needs the exact session_id and defaults to observe + control + restructure. Default tree is rooted at this session.")
                 ]),
                 "workspace": .object([
                     "type": .string("string"),

@@ -269,8 +269,11 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     package let sessionID: UUID
     package let persistentBindingGeneration: UUID?
     package let bindingTransitionGeneration: UInt64
-    /// `parentSessionID == nil`. Child sessions are never overseeable endpoints.
+    /// `parentSessionID == nil`. Observer eligibility still requires a top-level session.
     package let isTopLevel: Bool
+    /// App-owned immutable spawn/creation provenance, never organizational placement or tool input.
+    package let parentSessionID: UUID?
+    package let createdByOverseerSessionID: UUID?
     package let hasLoadedPersistedState: Bool
     package let bindingTransitionInProgress: Bool
     /// The owning window or tab is closing, or the session is being deleted.
@@ -321,8 +324,12 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
         providerDisplayName: String?,
         locationLabel: String?,
         restorationReadiness: AgentSessionRestorationReadiness = .unbound,
-        isDeletionInProgress: Bool = false
+        isDeletionInProgress: Bool = false,
+        parentSessionID: UUID? = nil,
+        createdByOverseerSessionID: UUID? = nil
     ) {
+        self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
         self.windowID = windowID
         self.workspaceID = workspaceID
         self.tabID = tabID
@@ -435,13 +442,17 @@ package enum AgentSessionLinkEndpointResolver {
 
     package static func resolve(
         sessionID: UUID,
-        candidates: [AgentSessionLinkEndpointCandidate]
+        candidates: [AgentSessionLinkEndpointCandidate],
+        observerSessionID: UUID? = nil,
+        permitsChildTarget: Bool = false
     ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
         let matches = candidates.filter { $0.sessionID == sessionID }
         guard !matches.isEmpty else { return .failure(.notFound) }
         guard matches.count == 1 else { return .failure(.ambiguous) }
         let match = matches[0]
-        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: match) {
+        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(
+            for: match, observerSessionID: observerSessionID, permitsChildTarget: permitsChildTarget
+        ) {
             return .failure(failure)
         }
         return .success(match)
@@ -506,9 +517,14 @@ package enum AgentSessionLinkEndpointEligibility {
     /// and ambiguity, then delegates its unique candidate here; exact sidebar projection and Add
     /// revalidation call the same candidate-local helper without ever choosing between incarnations.
     package static func targetResolveFailure(
-        for candidate: AgentSessionLinkEndpointCandidate
+        for candidate: AgentSessionLinkEndpointCandidate,
+        observerSessionID: UUID? = nil,
+        permitsChildTarget: Bool = false
     ) -> AgentSessionLinkResolveFailure? {
-        targetResolveFailure(for: candidate.eligibilityInput)
+        let isCreator = observerSessionID.map {
+            candidate.parentSessionID == $0 || candidate.createdByOverseerSessionID == $0
+        } ?? false
+        return targetResolveFailure(for: candidate.eligibilityInput, permitsChildTarget: isCreator || permitsChildTarget)
     }
 
     /// Boolean compatibility for consumers that only need offerability. It is intentionally a thin
@@ -517,9 +533,9 @@ package enum AgentSessionLinkEndpointEligibility {
         targetResolveFailure(for: input) == nil
     }
 
-    private static func targetResolveFailure(for input: Input) -> AgentSessionLinkResolveFailure? {
-        // Keep this precedence synchronized with the user-facing resolver contract.
-        if input.isChildSession { return .childSession }
+    private static func targetResolveFailure(for input: Input, permitsChildTarget: Bool = false) -> AgentSessionLinkResolveFailure? {
+        // This qualifies only the child fence; it never changes provenance or observer eligibility.
+        if input.isChildSession, !permitsChildTarget { return .childSession }
         if input.isClosing { return .closing }
         // Transient: a running deletion refuses a new link without implying permanent endpoint loss.
         if input.isDeletionInProgress { return .closing }

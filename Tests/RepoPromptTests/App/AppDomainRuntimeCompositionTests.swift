@@ -1,6 +1,9 @@
+import AppKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 import RepoPromptShared
 import SQLite3
@@ -132,7 +135,7 @@ final class DebugSessionStorageLocationsTests: XCTestCase {
 
 /// Disposable fake HOME fixtures exercise the real startup publish boundary.
 final class DebugStateBootstrapTests: XCTestCase {
-    private struct Fixture {
+    struct Fixture {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("DebugSeed-\(UUID().uuidString)")
         var release: AppProfileLocations {
             .init(identity: .repoPromptCE(.release), homeDirectory: home)
@@ -350,11 +353,10 @@ final class DebugStateBootstrapTests: XCTestCase {
         try f.writeJSON(["id": sessionID.uuidString, "providerSessionID": "debug-owned-thread", "items": [["text": "debug-only history"]]], backing)
         try f.write(Data([7, 8, 9]), prior.appendingPathComponent("AgentSessions/attachments/image.bin"))
         let database = f.debug.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite")
-        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var db: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(database.path, &db), SQLITE_OK)
-        defer { sqlite3_close_v2(db) }
-        XCTAssertEqual(sqlite3_exec(db, "PRAGMA user_version=1; CREATE TABLE profile_state(singleton INTEGER, profile TEXT); INSERT INTO profile_state VALUES(1,'repoprompt-ce-debug-overseer-v1'); CREATE TABLE continuity_rows(owner_id TEXT,anchor_id TEXT,workspace_id TEXT,terminal INTEGER); INSERT INTO continuity_rows VALUES('\(sessionID.uuidString)',NULL,NULL,0);", nil, nil, nil), SQLITE_OK)
+        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let owner = OverseerContinuityStore(databaseURL: database, profile: OverseerContinuityRepository.productionProfile)
+        let grant = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: sessionID, kind: .allSessions, capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+        _ = try owner.commit(operationID: UUID(), origin: "fixture", mutations: [.grant(OverseerContinuityRepository.scopeRow(grant))])
         let sourceBytes = try Data(contentsOf: production.appendingPathComponent("workspace.json"))
         for size in [15, 17] {
             _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: ["fontSize": size])
@@ -394,5 +396,203 @@ final class DebugStateBootstrapTests: XCTestCase {
         let walBytes = try Data(contentsOf: wal)
         XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
         XCTAssertEqual(try Data(contentsOf: wal), walBytes)
+    }
+}
+
+extension DebugStateBootstrapTests {
+    func testRealLegacyScopesAndOwnershipRetainArchivedCarriersWithoutLinksOrDatabase() throws {
+        for kind in ["session", "tree", "workspace", "grantee", "ownership"] {
+            let f = Fixture()
+            defer { f.cleanup() }
+            let workspaceID = UUID(), sessionID = UUID(), granteeID = UUID()
+            let directory = f.debug.workspaceRoot.appendingPathComponent("Workspace-Archived-" + workspaceID.uuidString)
+            try f.writeJSON([["id": workspaceID.uuidString, "name": "Archived"]], f.debug.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+            // No compose tab: the endpoint is archived, not actively selected.
+            try f.writeJSON(["id": workspaceID.uuidString, "name": "Archived", "composeTabs": []], directory.appendingPathComponent("workspace.json"))
+            let backing = directory.appendingPathComponent("AgentSessions/AgentSession-" + sessionID.uuidString + ".json")
+            try f.writeJSON(["id": sessionID.uuidString, "providerSessionID": "debug-owned"], backing)
+            let encoder = JSONEncoder()
+            let continuity: URL
+            let bytes: Data
+            if kind == "ownership" {
+                continuity = f.debug.applicationSupportRoot.appendingPathComponent("delegationWorktreeOwnership.json")
+                let record = WorktreeOwnershipRecord(worktreeID: "fixture", path: "/fixture/repository", createdBySessionID: sessionID, createdAt: Date())
+                encoder.dateEncodingStrategy = .iso8601
+                bytes = try encoder.encode(WorktreeOwnershipDocument(version: 1, worktrees: [record]))
+            } else {
+                continuity = f.debug.applicationSupportRoot.appendingPathComponent("delegationScopes.json")
+                let scopeKind: DomainDelegationScopeKind = kind == "grantee" ? .allSessions : kind == "workspace" ? .workspace(workspaceID: workspaceID) : kind == "tree" ? .tree(rootSessionID: sessionID) : .session(targetSessionID: sessionID)
+                let grant = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: kind == "grantee" ? sessionID : granteeID, kind: scopeKind, capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+                if kind == "grantee" {
+                    // A real v1 envelope predates clean-shutdown bookkeeping.
+                    bytes = try JSONSerialization.data(withJSONObject: ["version": 1, "scopes": JSONSerialization.jsonObject(with: encoder.encode([grant]))])
+                } else {
+                    bytes = try encoder.encode(DelegationScopeDocument(scopes: [grant]))
+                }
+            }
+            try f.write(bytes, continuity)
+            for _ in 0 ..< 2 {
+                _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+                XCTAssertEqual(try Data(contentsOf: continuity), bytes, kind)
+                XCTAssertEqual(try f.object(backing)["providerSessionID"] as? String, "debug-owned", kind)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite").path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.applicationSupportRoot.appendingPathComponent("agentSessionOversightLinks.json").path))
+            }
+        }
+    }
+
+    func testUnknownLegacySchemaAndWrongDatabaseProfileAbortRefreshRatherThanDroppingBacking() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        let legacy = f.debug.applicationSupportRoot.appendingPathComponent("delegationScopes.json")
+        try f.write(Data("keep".utf8), sentinel)
+        try f.writeJSON(["version": 999, "scopes": []], legacy)
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("keep".utf8))
+        try FileManager.default.removeItem(at: legacy)
+        let database = f.debug.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite")
+        let owner = OverseerContinuityStore(databaseURL: database, profile: "another-profile")
+        _ = try owner.engineSettings()
+        let bytes = try Data(contentsOf: database)
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
+        XCTAssertEqual(try Data(contentsOf: database), bytes)
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("keep".utf8))
+    }
+
+    func testManagedAttachmentsInItemsAndTranscriptSurviveRemovalOfProductionBacking() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspaceID = UUID(), sessionID = UUID()
+        let folder = "Workspace-Images-" + workspaceID.uuidString
+        let source = f.release.workspaceRoot.appendingPathComponent(folder)
+        try f.writeJSON([["id": workspaceID.uuidString, "name": "Images"]], f.release.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+        try f.writeJSON(["id": workspaceID.uuidString, "name": "Images"], source.appendingPathComponent("workspace.json"))
+        let image = f.home.appendingPathComponent("source.png")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        bitmap.setColor(.red, atX: 0, y: 0)
+        let imageBytes = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try f.write(imageBytes, image)
+        let imported = try AgentAttachmentStore().importImageFile(sourceURL: image, workspaceDirectory: source)
+        let external = AgentImageAttachment(source: .localFile(path: image.path))
+        let remote = AgentImageAttachment(source: .url("https://example.invalid/image.png"))
+        let item = AgentChatItem(kind: .user, text: imported.fileURL.path, attachments: [imported.attachment, external, remote])
+        let activity = AgentTranscriptActivity(id: UUID(), timestamp: Date(), sequenceIndex: 1, role: .assistant, itemKind: .assistant, text: imported.fileURL.path, attachments: [imported.attachment])
+        let transcript = AgentTranscript(turns: [.init(request: .init(from: item), responseSpans: [.init(startedAt: Date(), activities: [activity])], startedAt: Date())])
+        let encoder = JSONEncoder()
+        let payload: [String: Any] = try [
+            "id": sessionID.uuidString,
+            "items": JSONSerialization.jsonObject(with: encoder.encode([item])),
+            "transcript": JSONSerialization.jsonObject(with: encoder.encode(transcript)),
+            "toolPayload": ["attachments": JSONSerialization.jsonObject(with: encoder.encode([imported.attachment]))],
+            "text": imported.fileURL.path
+        ]
+        let file = "AgentSessions/AgentSession-" + sessionID.uuidString + ".json"
+        try f.writeJSON(payload, source.appendingPathComponent(file))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let copied = try f.object(f.debug.workspaceRoot.appendingPathComponent(folder + "/" + file))
+        try FileManager.default.removeItem(at: source)
+        let copiedItems = try JSONDecoder().decode([AgentChatItem].self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(copied["items"])))
+        let copiedTranscript = try JSONDecoder().decode(AgentTranscript.self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(copied["transcript"])))
+        let expected = f.debug.workspaceRoot.appendingPathComponent(folder + "/agent_attachments/" + imported.fileURL.lastPathComponent)
+        for attachment in try [copiedItems[0].attachments[0], XCTUnwrap(copiedTranscript.turns[0].request).attachments[0], copiedTranscript.turns[0].responseSpans[0].activities[0].attachments[0]] {
+            XCTAssertEqual(attachment.source, .localFile(path: expected.path))
+        }
+        XCTAssertEqual(try Data(contentsOf: expected), imageBytes)
+        XCTAssertNotNil(NSImage(contentsOf: expected), "Copied history can render its own managed image after the production backing is removed")
+        XCTAssertEqual(copiedItems[0].attachments[1], external)
+        XCTAssertEqual(copiedItems[0].attachments[2], remote)
+        XCTAssertEqual(copiedItems[0].text, imported.fileURL.path)
+        XCTAssertEqual(copied["text"] as? String, imported.fileURL.path)
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(copied["toolPayload"]), options: .sortedKeys), try JSONSerialization.data(withJSONObject: XCTUnwrap(payload["toolPayload"]), options: .sortedKeys))
+    }
+
+    func testMissingReleasePreferencesAndDebugOwnedRuntimeRecoverySurviveRepeatedRefresh() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let runtime = DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: f.debug.profileIdentifier)
+        let paths = [runtime + "/settings/runtime-policy.json", runtime + "/settings/protected-mutations.json", runtime + "/settings/agent-sessions.json", runtime + "/settings/agent-worktree-bindings.json", "Settings/Backups/future.json", "Presets/Backups/future.json", "workspace-cleanup-backups/recovery.bin", "Workspaces/Workspace-Orphan-" + UUID().uuidString + "/AgentSessions/.self-compact-recovery/corrupt.json"]
+        let bytes = Data("unknown exact debug-owned recovery bytes".utf8)
+        for path in paths {
+            try f.write(bytes, f.debug.applicationSupportRoot.appendingPathComponent(path))
+        }
+        let preferences: [String: Any] = ["fontSize": 13, "claudeRawEventLoggingEnabled": true, "enableAgentModePerfDiagnostics": true]
+        for _ in 0 ..< 5 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: nil, previousPreferences: preferences, preferenceSourceURL: f.home.appendingPathComponent("missing.plist"))
+            let values = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")), format: nil) as? [String: Any])
+            XCTAssertEqual(values["fontSize"] as? Int, 13)
+            XCTAssertEqual(values["claudeRawEventLoggingEnabled"] as? Bool, true)
+            for path in paths {
+                XCTAssertEqual(try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent(path)), bytes, path)
+            }
+        }
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: ["fontSize": 19], previousPreferences: preferences)
+        let values = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")), format: nil) as? [String: Any])
+        XCTAssertEqual(values["fontSize"] as? Int, 19)
+        XCTAssertEqual(values["enableAgentModePerfDiagnostics"] as? Bool, true)
+    }
+
+    func testFreshDebugDomainNeverInheritsReleaseDiagnosticPreferences() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let release: [String: Any] = ["fontSize": 19, "claudeRawEventLoggingEnabled": true, "claudeRawEventLogFilePath": "/release/logs", "enableAgentModePerfDiagnostics": true, "emitAgentModePerfDiagnosticsToOSLog": true]
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: release)
+        let values = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")), format: nil) as? [String: Any])
+        XCTAssertEqual(values["fontSize"] as? Int, 19)
+        for key in release.keys where key != "fontSize" {
+            XCTAssertNil(values[key], key)
+        }
+    }
+
+    func testHeadlessAdmissionPreventsSeedUntilAllWritersReleaseAndSeedExcludesNewWriters() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        var policy: AppMetadataPathPolicy? = .init(locations: f.debug, roots: [f.debug.applicationSupportRoot])
+        try policy?.acquireProfileAccess()
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        policy = nil
+        var seedLease: DebugProfileAccessLease? = try .acquire(locations: f.debug, exclusive: true)
+        let nextWriter = AppMetadataPathPolicy(locations: f.debug, roots: [f.debug.applicationSupportRoot])
+        XCTAssertThrowsError(try nextWriter.acquireProfileAccess())
+        try seedLease?.allowWriters()
+        try nextWriter.acquireProfileAccess()
+        seedLease = nil
+        withExtendedLifetime(nextWriter) {
+            XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:]))
+        }
+    }
+}
+
+@MainActor
+final class DebugStorageRootAdmissionTests: XCTestCase {
+    func testAppClientAdmitsSafeSelectionBeforeRuntimeCreateAndRejectsAliasesBeforeMove() async throws {
+        let f = DebugStateBootstrapTests.Fixture()
+        defer { f.cleanup() }
+        let policy = AppMetadataPathPolicy(locations: f.debug, roots: [f.debug.applicationSupportRoot, f.debug.workspaceRoot])
+        let runtime = MCPDomainRuntime(configuration: .init(mode: .app, profileIdentifier: f.debug.profileIdentifier, storageDirectory: f.debug.applicationSupportRoot, workspaceStorageDirectory: f.debug.workspaceRoot, eventDirectory: f.debug.applicationSupportRoot.appendingPathComponent("Events"), temporaryDirectory: f.home.appendingPathComponent("Temporary"), externalReloadInterval: nil, metadataPathPolicy: policy))
+        let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1381, metadataPathPolicy: policy)
+        let selected = try f.debug.customWorkspaceRoot(selectedDirectory: f.home.appendingPathComponent("Chosen"))
+        var workspace = WorkspaceModel(name: "Selected", repoPaths: [])
+        let destination = selected.appendingPathComponent("Workspace-Selected-" + workspace.id.uuidString + "/workspace.json")
+        XCTAssertThrowsError(try policy.validate(destination))
+        try client.admitStorageRoot(selected)
+        let created = try await client.create(workspace, fileURL: destination)
+        XCTAssertEqual(created.disposition, .applied)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        workspace.currentPromptText = "persisted after relocation"
+        let current = await client.workspaceSnapshot(workspace.id)
+        let snapshot = try XCTUnwrap(current)
+        _ = try await client.saveFailClosed(workspace, fileURL: destination, expectedWorkspaceRevision: snapshot.revisions.workingRevision, expectedContentDigest: snapshot.document.contentDigest)
+        XCTAssertEqual(try f.object(destination)["currentPromptText"] as? String, "persisted after relocation")
+        let sourceBytes = try Data(contentsOf: destination)
+        XCTAssertThrowsError(try client.admitStorageRoot(f.release.applicationSupportRoot))
+        let alias = f.home.appendingPathComponent("Alias/RepoPrompt CE Debug")
+        try FileManager.default.createDirectory(at: alias.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: f.release.applicationSupportRoot)
+        XCTAssertThrowsError(try client.admitStorageRoot(alias))
+        XCTAssertEqual(try Data(contentsOf: destination), sourceBytes)
     }
 }

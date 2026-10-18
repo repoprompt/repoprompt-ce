@@ -36,6 +36,98 @@ enum AgentSessionLaneHostCreationOutcome {
 
 enum AgentSessionLaneHostUnavailable: Error { case unavailable }
 
+/// Admission failed before provider start. Keep the app-owned persistence evidence typed across
+/// the host boundary; a rendered MCP error is not a persistence or retry protocol.
+struct AgentSessionLaneAdmissionFailure: Error, Equatable {
+    struct RetainedAdmission: Equatable {
+        /// Host boundary values; the lane transaction does not depend on workspace UI models.
+        enum Recovery: Equatable {
+            case recovered, alreadyRecovered, localOnly, ownershipChanged, retryablePartial
+            case failed(String), blockedManual(String)
+        }
+
+        let identity: AgentProvisionalAdmissionIdentity
+        let recovery: Recovery
+    }
+
+    let reason: String
+    let saveResult: String
+    let category: String
+    let domainDiagnostic: String?
+    let domainErrorCode: String?
+    let workingCommitted: Bool
+    let retainedAdmission: RetainedAdmission?
+
+    init(
+        reason: String, saveResult: String, category: String,
+        domainDiagnostic: String?, domainErrorCode: String?, workingCommitted: Bool,
+        retainedAdmission: RetainedAdmission? = nil
+    ) {
+        self.reason = reason
+        self.saveResult = saveResult
+        self.category = category
+        self.domainDiagnostic = domainDiagnostic
+        self.domainErrorCode = domainErrorCode
+        self.workingCommitted = workingCommitted
+        self.retainedAdmission = retainedAdmission
+    }
+
+    var detail: String {
+        "Lane admission did not complete (reason=\(reason), save=\(saveResult), category=\(category)). No provider was started."
+    }
+}
+
+struct AgentSessionLaneDestination: Equatable {
+    let windowID: Int
+    let workspaceID: UUID
+    let workspaceName: String
+}
+
+enum AgentSessionLaneDestinationFailure: Error, Equatable {
+    case callerWindowHasNoWorkspace, selectorMatchedNone, selectorAmbiguous, destinationChanged
+    case hostError(String)
+    /// App-authored refusal from lane session creation (e.g. the workspace binding was not
+    /// durably accepted). The detail is agent-facing; no session was allocated.
+    case creationRejected(String)
+    case admissionRejected(AgentSessionLaneAdmissionFailure)
+
+    var subreason: String {
+        switch self {
+        case .callerWindowHasNoWorkspace: "caller_window_has_no_workspace"
+        case .selectorMatchedNone: "selector_matched_none"
+        case .selectorAmbiguous: "selector_ambiguous"
+        case .destinationChanged: "destination_changed"
+        case let .hostError(type): "host_error:\(type)"
+        case .creationRejected: "lane_creation_rejected"
+        case .admissionRejected: "workspace_admission_rejected"
+        }
+    }
+}
+
+enum AgentSessionLaneDestinationResolution {
+    case available(AgentSessionLaneDestination)
+    case unavailable(AgentSessionLaneDestinationFailure)
+
+    var destination: AgentSessionLaneDestination? {
+        if case let .available(value) = self { return value }
+        return nil
+    }
+}
+
+/// A destination was resolved, but scoped creation was refused before allocating any session.
+/// Keeping this separate prevents the bridge from misreporting authority as destination failure.
+struct AgentSessionLaneSpawnAdmissionFailure: Error {
+    let detail: String
+
+    /// Only the structured error emitted by our admission owner is decoded here, never target text.
+    var subreason: String {
+        guard let start = detail.firstIndex(of: "{"),
+              let fields = try? JSONSerialization.jsonObject(with: Data(detail[start...].utf8)) as? [String: Any]
+        else { return "scope_denied" }
+        return fields["subreason"] as? String ?? fields["code"] as? String ?? "scope_denied"
+    }
+}
+
 struct AgentSessionLaneCreateReceipt: Equatable {
     enum Result: Equatable { case created, creationIncomplete, refused }
     enum Reason: String, Equatable {
@@ -43,6 +135,8 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case denied
         case persistenceUnavailable = "persistence_unavailable"
         case destinationUnavailable = "destination_unavailable"
+        case workspaceAdmissionRejected = "workspace_admission_rejected"
+        case scopeDenied = "scope_denied"
         case hostUnavailable = "host_unavailable"
         case laneLimitReached = "lane_limit_reached"
         case admissionUnstable = "admission_unstable"
@@ -65,6 +159,10 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     let laneCount: Int
     var duplicate = false
     var firstTaskReason: String?
+    var refusalDetail: String?
+    var admissionSubreason: String?
+    var destinationFailure: AgentSessionLaneDestinationFailure?
+    var refusalStage: String?
     /// Original destination display name, preserved on replay; not a live location or selector.
     var workspaceName: String?
 

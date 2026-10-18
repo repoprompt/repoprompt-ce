@@ -6512,6 +6512,22 @@ extension ToolOutputFormatter {
             if skippedCount > 0 {
                 lines.append("- Skipped: **\(skippedCount)** sessions")
             }
+            if let result = object["result"]?.stringValue { lines.append("- Result: `\(result)`") }
+            // Every item is listed, so a caller can see what was deleted, not only what failed.
+            for (key, label) in [("deleted_sessions", "deleted"), ("skipped_sessions", "skipped"), ("unprocessed_sessions", "unprocessed")] {
+                for entry in object[key]?.arrayValue ?? [] {
+                    guard let item = entry.objectValue else { continue }
+                    let id = item["session_id"]?.stringValue ?? "unknown"
+                    let name = item["name"]?.stringValue.map { " (\($0))" } ?? ""
+                    guard let code = item["code"]?.stringValue ?? item["reason"]?.stringValue else {
+                        lines.append("  - `\(id)`\(name) — \(label)")
+                        continue
+                    }
+                    let detail = item["detail"]?.stringValue ?? item["message"]?.stringValue ?? ""
+                    let next = item["next_step"]?.stringValue ?? "Inspect the session in the app."
+                    lines.append("  - `\(id)`\(name) — \(label) `\(code)`: \(detail) Next: \(next)")
+                }
+            }
         }
         if let returned = object["returned_turn_count"]?.intValue,
            let total = object["total_turns"]?.intValue

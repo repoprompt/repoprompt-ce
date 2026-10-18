@@ -113,6 +113,7 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     /// Termination freeze. A frozen process makes no new missing classification and performs no
     /// cleanup, so grace-uncertain and lazy entries stay durable for the next launch.
     var launchCoordinatorIsFrozen: Bool { get }
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure?
 
     /// The one shared fresh-establishment path. Restoration never reconstructs a grant itself.
     ///
@@ -148,6 +149,24 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
     /// each tab. Fire-and-forget: readiness changes re-enter the pass through the ordinary signal.
     func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>)
+
+    /// Resolves only saved targets named by waiting intents before missing classification. Returned
+    /// identities have uncertain saved state and must not be retired as missing in this pass.
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID>
+    /// Releases temporary runtime ownership after every establishment/early-exit path in the pass.
+    func launchCoordinatorFinishSavedTargetPreparation()
+}
+
+extension AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
+        AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
+    }
+
+    func launchCoordinatorFinishSavedTargetPreparation() {}
+
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID> {
+        []
+    }
 }
 
 // MARK: - Coordinator
@@ -657,6 +676,11 @@ final class AgentSessionOversightLaunchCoordinator {
             didLogDiscoveryPending = false
         #endif
 
+        defer { delegate.launchCoordinatorFinishSavedTargetPreparation() }
+        let uncertainSavedTargets = await delegate.launchCoordinatorPrepareSavedTargets(launchPairOrder.filter {
+            entries[$0]?.state == .waiting || entries[$0]?.parkedReference != nil
+        })
+        guard !isFrozen, !delegate.launchCoordinatorIsFrozen, !isDirty else { return }
         let descriptors = host.agentSessionLinkComposeTabDescriptors()
         let candidates = host.agentSessionLinkCandidates()
         var descriptorCounts: [UUID: Int] = [:]
@@ -676,6 +700,7 @@ final class AgentSessionOversightLaunchCoordinator {
         for pair in launchPairOrder {
             guard !isFrozen, !isDirty else { return }
             guard var entry = entries[pair] else { continue }
+            if uncertainSavedTargets.contains(pair.targetSessionID) { continue }
             if entry.parkedReference != nil {
                 let sessions = [pair.observerSessionID, pair.targetSessionID]
                 guard sessions.allSatisfy({ sessionID in
@@ -839,7 +864,9 @@ final class AgentSessionOversightLaunchCoordinator {
             // Candidate construction carries the same transient marker for UI eligibility. Keep the
             // registry check above as the authority because it closes the gap before candidates update.
             if candidate.isDeletionInProgress { return .wait }
-            if !candidate.isTopLevel { return .terminal(.ineligible) }
+            if sessionID == pair.observerSessionID, !candidate.isTopLevel { return .terminal(.ineligible) }
+            if sessionID == pair.targetSessionID,
+               delegate?.launchCoordinatorTargetFailure(for: candidate, observerSessionID: pair.observerSessionID) == .childSession { return .terminal(.ineligible) }
             if candidate.isClosing { return .terminal(.ineligible) }
             if sessionID == pair.observerSessionID, !candidate.roleAllowsOutboundMonitoring {
                 return .terminal(.ineligible)
@@ -920,7 +947,7 @@ final class AgentSessionOversightLaunchCoordinator {
         if !observer.roleAllowsOutboundMonitoring || observer.isMCPControlled || observer.isMCPOriginated {
             return .ineligible
         }
-        if !target.isTopLevel || target.isClosing { return .ineligible }
+        if target.isClosing || delegate?.launchCoordinatorTargetFailure(for: target, observerSessionID: pair.observerSessionID) == .childSession { return .ineligible }
         return nil
     }
 

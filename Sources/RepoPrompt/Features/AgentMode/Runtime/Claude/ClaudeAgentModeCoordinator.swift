@@ -98,6 +98,8 @@ final class ClaudeAgentModeCoordinator {
             _ session: AgentTabSession,
             _ dispatchID: AgentSessionLinkPromptDispatchID
         ) -> Void
+        let proveLocalInput: @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof
+        let handoffLocalInput: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim?, AgentSessionLinkProviderInputRelease.Proof) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext
         let acceptAgentSessionLinkPromptClaim: @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
         init(
@@ -130,6 +132,8 @@ final class ClaudeAgentModeCoordinator {
                 _ session: AgentTabSession,
                 _ dispatchID: AgentSessionLinkPromptDispatchID
             ) -> Void,
+            proveLocalInput: @escaping @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof = { _, claim in await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false } },
+            handoffLocalInput: @escaping @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim?, AgentSessionLinkProviderInputRelease.Proof) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext = { _, _, claim, proof in AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { claim.map { .claimed($0) } ?? .nothingOwed }, isPending: { _ in false }, consume: { _ in false }) },
             acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
         ) {
             self.isSessionCurrent = isSessionCurrent
@@ -139,6 +143,8 @@ final class ClaudeAgentModeCoordinator {
             self.prependPendingHandoff = prependPendingHandoff
             self.qualifyAgentSessionLinkProviderInputRoute = qualifyAgentSessionLinkProviderInputRoute
             self.hasCurrentAgentSessionLinkProviderInputRoute = hasCurrentAgentSessionLinkProviderInputRoute
+            self.proveLocalInput = proveLocalInput
+            self.handoffLocalInput = handoffLocalInput
             self.decorateAgentSessionLinkPrompt = decorateAgentSessionLinkPrompt
             self.acquireAgentSessionLinkPhysicalDispatch = acquireAgentSessionLinkPhysicalDispatch
             self.recordAgentSessionLinkPhysicalDispatchNotAttempted = recordAgentSessionLinkPhysicalDispatchNotAttempted
@@ -1578,6 +1584,12 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded
                 }
+                let inputProof = await hostCapabilities.proveLocalInput(session, monitoring.claim)
+                if monitoring.claim?.localInput != nil {
+                    guard !Task.isCancelled, intentIsCurrent(intent, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else { return .superseded }
+                }
                 guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
                     session,
                     promptDispatchID
@@ -1586,10 +1598,6 @@ final class ClaudeAgentModeCoordinator {
                     return .superseded
                 }
                 let instructions = agentModeInstructionInjection(for: session)
-                let providerBoundText = providerBoundUserMessage(
-                    monitoring.text,
-                    instructions: instructions
-                )
                 guard let configurationProof,
                       configurationIsCurrent(),
                       !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
@@ -1605,6 +1613,9 @@ final class ClaudeAgentModeCoordinator {
                     session.selfCompactState = state
                     hostCapabilities.scheduleSave(session)
                 }
+                let released = hostCapabilities.handoffLocalInput(session, promptDispatchID, monitoring.claim, inputProof)
+                guard !released.mustAbortDispatch else { return .superseded }
+                let providerBoundText = providerBoundUserMessage(released.text(textWithNote), instructions: instructions)
                 let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
                 recordOrdinaryDispatchAttempt()
                 if let parked {
@@ -1631,7 +1642,7 @@ final class ClaudeAgentModeCoordinator {
                 }
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
-                hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, monitoring.claim)
+                hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, released.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

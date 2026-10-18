@@ -256,7 +256,28 @@ and exits instead of opening a partial mixture. `debugSeed.json` and the redacte
 startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
 preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
 CLI requests do not re-seed a running app. Explicit standalone headless profiles
-remain independent and do not run the app launch bootstrap.
+remain independent and do not run the app launch bootstrap. The default debug
+headless runtime and interactive policy administrator hold shared admission on a
+stable sibling profile lock for their store lifetime. Bootstrap requires exclusive
+admission before capture/publication; the app then retains shared admission. A
+busy owner causes an explicit startup refusal, never a swap under a live writer.
+
+Missing release preference data is not an empty domain: ordinary startup retains
+prior debug preferences when that source is absent, and retains debug-only Agent
+Mode diagnostic toggles even when release preferences are available. Ordinary
+refresh also carries debug runtime settings/grants/bindings, settings/preset backups,
+workspace cleanup backups and self-compact recovery bytes verbatim. Clean-slate
+continues to archive rather than carry these bytes. Continuity retention reads the
+owning legacy Codable models and read-only database projection; incompatible input
+aborts refresh without displacing the previous profile. Archived endpoint backing
+counts even when no compose tab currently selects it.
+
+Copied Agent session items, transcript request anchors and response activities
+rebase only typed local image references under the copied workspace's managed
+attachment store. External paths, remote URLs, text and arbitrary tool payloads
+remain unchanged. Storage relocation admits the validated debug workspace root
+through the same runtime metadata policy **before** any directory is moved; each
+later write still checks production aliases and symlink components.
 
 Custom debug storage selections and explicit headless profiles use a build-flavor-namespaced child directory. Runtime profile IDs and release directory semantics remain unchanged. Known
 release roots (including configured custom storage), canonical aliases, symlinked
@@ -503,41 +524,63 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 
 ## Delegation scope intent
 
-Delegation scopes are not settings, but their durable intent lives beside the oversight-link file
-and follows the same preserve-first rules:
+Delegation scopes are not settings. `DelegationScopeRuntime` owns current user decisions;
+continuity storage records them but never authorizes or vetoes a live action. Scope grants/revokes,
+link intent, and delegation worktree ownership share a row-transaction repository:
 
 ```text
-~/Library/Application Support/RepoPrompt CE/delegationScopes.json
+Release: ~/Library/Application Support/RepoPrompt CE/Overseer/continuity.sqlite
+Debug:   ~/Library/Application Support/RepoPrompt CE Debug/Overseer/continuity.sqlite
 ```
 
-- Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
-  `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
-  `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
-- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`, and a legacy
-  `clean_shutdown` field) holding only the **active** grants: scope ID, grantee session, kind,
-  capabilities, guardrails (including the per-scope bulk confirmation threshold), origin (user or
-  attenuated parent), and grant time. Revoked and expired scopes are removed from `scopes`.
-  `revoked_scope_ids` is a bounded (1,024, oldest dropped) tombstone list: a tombstoned grant, or a
-  child of one, is never reactivated even if a stale copy of the file still lists it. Generations,
-  leases, pending `request_scope` cards, and batch confirmations are process-local and never written.
-- **Crash-safe by construction.** Every grant, revocation, release, and expiry is written
-  synchronously and durably (temp file, `F_FULLFSYNC`, `rename`, directory fsync —
-  `DurableAtomicFileWriter`) inside the mutating call, before it returns. Nothing is sealed at quit and
-  correctness never depends on a graceful termination; the quit-time write is a final no-op-or-write.
-  A failed write leaves the revocation in effect in memory, is surfaced in "Active delegations", and is
-  carried by the next successful write. `clean_shutdown` is ignored on load and always written `true`
-  so older builds that still gate on it keep the grants.
-- Launch: the file is read once and every grant is reactivated under a **fresh generation**, however
-  the previous launch ended. v1 documents migrate their grants to v2. Grants past their expiry,
-  tombstoned grants, and attenuated grants whose parent is missing, inactive, or no longer satisfies
-  the attenuation invariants (tree rooted at the grantee, capabilities a subset, guardrails no looser)
-  are not reactivated, so a reload can never undo a cascade or widen a child. The opening write
-  rewrites exactly the loaded rows, never an empty list in place of loaded grants.
-- Recovery: an undecodable row (or tombstone) is dropped alone and its siblings still load; a future
-  `version` is preserved and blocks writes; a wholly malformed file is moved intact to
-  `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
-  and row counts are preserved and block writes. A deletion that commits while quitting still records
-  its revocation.
+- Owner: typed app adapters (`DelegationScopeStore`, `AgentSessionOversightIntentStore`, and
+  `WorktreeOwnershipStore`) over `RepoPromptPersistence.OverseerContinuityStore`. The locations
+  above are overseer-only, not an all-app path migration. `OverseerContinuityRepository.production()`
+  is the sole path seam for the database and legacy input; both use the same profile directory.
+    That seam composes its directory through the shared app-profile policy, without
+  adding adapter-specific paths. Debug does not open the release legacy source or its lock.
+  Suppressed launches perform no file I/O.
+- Storage uses short SQLite `BEGIN IMMEDIATE` transactions, DELETE rollback journal,
+  `synchronous=EXTRA`, `fullfsync=ON`, and foreign keys. Effective settings are checked on open;
+  an Apple version string is not evidence of the upstream WAL-reset fix. No lifetime flock remains.
+  The three adapters serialize short database access in-process; lock acquisition and SQLite busy
+  waiting are bounded. Schema creation rechecks the version inside its transaction.
+- Each transition writes only its rows and an operation-ID/digest/revision receipt atomically.
+  Scope creation is immutable; explicit revocation cascades permanently to descendants. Deleted
+  anchors and terminal scope identities are retained without a pruning cap. Link/worktree updates
+  compare their acknowledged row revision, so a stale owner cannot replace another owner's row.
+  Omission never means deletion. Receipt replay is idempotent and cannot repeat an effect.
+- Live explicit user approval/revocation applies in its current process immediately. Grants save
+  separately with bounded backoff. A scope revoke/deletion attempts its own synchronous transaction
+  before returning, never behind an unrelated grant. Only a committed receipt acknowledges durable
+  revocation. If that entire write fails, the local deny remains and the affected IDs are reported
+  as **unsettled**; no record exists to carry that unsaved decision across process death. The next
+  launch can recover only the last committed state, including a grant whose revoke never saved.
+  This limitation is not a durable-revoke acknowledgement or a blanket invalidation of other grants.
+  Quit settlement has a two-second deadline and reports unacknowledged transactions honestly.
+  Impossible row transitions are retained as failed diagnostics, not retried forever at the queue
+  head; independent rows can still save. `continuity_save_state` and the UI distinguish **saved**,
+  **pending**, **failed**, and explicitly **not_persisted**, with the cause and retry guidance.
+  A pending or failed change is not promised to survive a kill or reach another process. Storage
+  failure neither manufactures approval nor denies an approved task. Caller/target routing, scope
+  membership, expiry, and revocation checks remain mandatory.
+- Launch restores compatible saved grants under fresh generations without clean-shutdown gating.
+  Retry uses the same store/runtime after an open failure; restoration cannot replace newer live
+  decisions or reactivate locally deleted anchors. Generations, leases, pending cards, batch
+  confirmations, and live-only authority remain process-local.
+- Legacy `delegationScopes.json` (v1/v2), `agentSessionOversightLinks.json`, and
+  `delegationWorktreeOwnership.json` are **read-only sources**. Exact stable bytes and individual
+  accepted/rejected rows are archived with provenance in the destination. Unknown schema, malformed
+  data and invalid terminal history remain recoverable, never quarantined, rewritten, silently
+  dropped, or used as approval. Destination rows/terminal identities win. Valid same-profile legacy
+  rows migrate idempotently; release factories preserve existing links and worktree ownership.
+  Same-profile debug links and ownership also migrate. Historically mixed sources, when explicitly
+  supplied for recovery, and unknown scope authority are preserved for explicit recovery instead
+  of being silently promoted. The scope recovery card displays root descriptions
+  and requires a new explicit user approval, issuing new identities rather than reviving old IDs
+  or lifting attenuated grants. Other valid database rows restore normally; malformed entries stay
+  preserved and inactive with a diagnostic. Legacy bytes are read without opening or probing the
+  release lock. An unavailable legacy source cannot veto a new approval.
 
 ### Organizational placement and delegated worktree ownership
 
@@ -556,19 +599,11 @@ and follows the same preserve-first rules:
   a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
   `history` scan until rebuilt, changing external `history` output. A record missing the fields
   falls back to spawn provenance, and placement only exists after this build writes it.
-- **Worktree ownership.**
-
-  ```text
-  ~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json
-  ```
-
-  Owner: `WorktreeOwnershipStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
-  `WindowStatesManager` with the oversight persistence mode (suppressed launches stay in memory).
-  A versioned document (`version`, `worktrees`) recording, per worktree created under a scope,
-  `created_by_session_id`, `delegation_scope_id`, `created_at`, and, after `worktree_release`,
-  `released_at` / `released_by_session_id` (the stale mark). It never authorizes and never removes a
-  worktree; removing or pruning worktrees stays human-only. A future `version` is preserved and
-  blocks writes; malformed bytes move to `Backups/delegationWorktreeOwnership.corrupt.<uuid>.json`.
+- **Worktree ownership.** `WorktreeOwnershipStore` records one transactional continuity row per
+  worktree, including creator/scope/time and release marks. Current provenance remains usable while
+  saving retries; tool results report `ownership_continuity_save_state` separately. It never
+  authorizes or removes a worktree. Release records are not arbitrarily pruned; an explicit rebind
+  is a new revision-checked transition, not a stale snapshot replacement.
 
 ## Sidebar groups on compose tabs
 

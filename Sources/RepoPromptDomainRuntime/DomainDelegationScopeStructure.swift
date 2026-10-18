@@ -67,7 +67,7 @@ package enum DomainDelegationScopeLinkPolicy {
 
     private static func holds(_ capability: DomainDelegationScopeCapability, in grant: DomainDelegationScopeGrant) -> Bool {
         guard grant.capabilities.contains(capability) else { return false }
-        if case .allSessions = grant.kind {
+        if case .allSessions = grant.kind, !grant.unrestricted {
             return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
         }
         return true

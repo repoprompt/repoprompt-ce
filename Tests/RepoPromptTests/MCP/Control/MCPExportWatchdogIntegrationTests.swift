@@ -4875,6 +4875,8 @@ import XCTest
             label: String,
             networkManager: ServerNetworkManager,
             clientName overrideClientName: String? = nil,
+            useProductionAgentAdmission: Bool = false,
+            sessionToken overrideSessionToken: String? = nil,
             requiredToolNames: Set<String> = [
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.search,
@@ -4882,9 +4884,9 @@ import XCTest
             ]
         ) async throws -> PersistentMCPTestEndpoint {
             let connectionID = UUID()
-            let sessionToken = "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
+            let sessionToken = overrideSessionToken ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
             let clientName = overrideClientName ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
-            await networkManager.debugClearPersistedRoutingState(for: clientName)
+            if !useProductionAgentAdmission { await networkManager.debugClearPersistedRoutingState(for: clientName) }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
                 throw PersistentMCPTestSocketClient.ClientError.posix(operation: "socketpair", code: errno)
@@ -4927,9 +4929,28 @@ import XCTest
                 sessionToken: sessionToken,
                 bootstrapPeerPID: Int(getpid())
             )
+            let catalogChanges = AsyncStream<Void>.makeStream()
+            defer { catalogChanges.continuation.finish() }
+            if useProductionAgentAdmission {
+                client.observeNotifications { data in
+                    if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       object["method"] as? String == "notifications/tools/list_changed"
+                    {
+                        catalogChanges.continuation.yield(())
+                    }
+                }
+            }
             let startTask = Task {
                 try await manager.start { clientInfo in
                     guard clientInfo.name == clientName else { return false }
+                    if useProductionAgentAdmission {
+                        // Substitute only the human socket approval. Readiness, lifecycle,
+                        // run-policy admission and route installation are production-owned.
+                        return await networkManager.debugCompleteApprovedAgentInitialization(
+                            clientName: clientName, connectionID: connectionID,
+                            sessionToken: sessionToken, clientPid: Int(getpid())
+                        )
+                    }
                     _ = await networkManager.debugApplyPendingPolicy(
                         clientName: clientName,
                         connectionID: connectionID,
@@ -4957,7 +4978,25 @@ import XCTest
                 let tools = try await client.request(method: "tools/list", params: [:])
                 let names = try Set(Self.toolNames(from: tools))
                 let missing = requiredToolNames.subtracting(names)
-                guard missing.isEmpty else {
+                if !missing.isEmpty, useProductionAgentAdmission {
+                    // A real MCP client relists on server notifications, not a blind retry.
+                    // Keep the final required-tool assertion strict across held-turn refresh.
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask {
+                            for await _ in catalogChanges.stream {
+                                let refreshed = try await client.request(method: "tools/list", params: [:])
+                                if try requiredToolNames.isSubset(of: Set(Self.toolNames(from: refreshed))) { return }
+                            }
+                            throw ClientFixtureError.requiredToolsMissing(missing.sorted())
+                        }
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(10))
+                            throw ClientFixtureError.requiredToolsMissing(missing.sorted())
+                        }
+                        defer { group.cancelAll() }
+                        _ = try await group.next()
+                    }
+                } else if !missing.isEmpty {
                     throw ClientFixtureError.requiredToolsMissing(missing.sorted())
                 }
                 return endpoint
@@ -4966,7 +5005,7 @@ import XCTest
                 client.close()
                 await manager.stop()
                 await networkManager.debugRemoveConnection(connectionID)
-                await networkManager.debugClearPersistedRoutingState(for: clientName)
+                if !useProductionAgentAdmission { await networkManager.debugClearPersistedRoutingState(for: clientName) }
                 _ = try? await startTask.value
                 throw error
             }

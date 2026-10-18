@@ -810,6 +810,19 @@ final class MCPServerViewModel: ObservableObject {
             }
         )
         toolService.perfRecorder = perfRecorder
+        toolService.forwardOversightSteer = { [self] args, metadata in
+            // AgentRunMCPToolService applies the exact argument allowlist before entering this forwarder.
+            guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
+                throw MCPError.invalidParams("Oversight steering is disabled. Enable agent_session_link in tool settings, then use its steer operation under a Manage link.")
+            }
+            var forwarded: [String: Value] = [
+                "op": .string("steer"),
+                "idempotency_key": args["idempotency_key"] ?? .string(UUID().uuidString)
+            ]
+            forwarded["session_id"] = args["session_id"]
+            forwarded["message"] = args["message"]
+            return try await makeAgentSessionLinkToolService(metadata: metadata).execute(args: forwarded)
+        }
         return toolService
     }
 
@@ -1115,14 +1128,30 @@ final class MCPServerViewModel: ObservableObject {
                 ), await ServerNetworkManager.shared.isBecomeOverseerAvailable(connectionID: connectionID, endpoint: endpoint)
                 else { return nil }
                 return endpoint
+            },
+            resolveRoutedEndpointForRefusal: { [self] metadata in
+                guard let invocation = try? service.captureInvocationContext(
+                    toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
+                ) else { return nil }
+                return await resolveAgentSessionLinkModelObserverEndpoint(
+                    metadata: metadata,
+                    modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
+                )
             }
         )
     }
 
     private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
+        makeAgentSessionLinkToolService()
+    }
+
+    private func makeAgentSessionLinkToolService(metadata: RequestMetadata? = nil) -> AgentSessionLinkMCPToolService {
         AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
-            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            captureRequestMetadata: { [self] in
+                if let metadata { return metadata }
+                return await captureRequestMetadata()
+            },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             // Exact run-installed/handover/pending-run routing only: the observing endpoint can never
             // be supplied, hinted, or explicitly bound by the caller.

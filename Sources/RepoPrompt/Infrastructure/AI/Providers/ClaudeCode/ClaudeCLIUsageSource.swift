@@ -38,6 +38,8 @@ actor ClaudeCLIUsageSource {
     typealias Collect = @Sendable (ClaudeUsageCredentialProfile, URL) async throws -> ClaudeCLIUsageRecord
     private let profileProvider: @Sendable () -> ClaudeUsageCredentialProfile
     private let consentProvider: @Sendable () async -> String?
+    private let setupConsentProvider: @Sendable () async -> String?
+    private let setupCommandProvider: @Sendable () async -> String
     private let collect: Collect
     private let cache: ClaudeCLIUsageCache
 
@@ -45,10 +47,14 @@ actor ClaudeCLIUsageSource {
         root: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RepoPrompt CE/ClaudeUsage", isDirectory: true),
         profileProvider: @escaping @Sendable () -> ClaudeUsageCredentialProfile = { .current() },
         collect: @escaping Collect = { profile, root in try await ClaudeCLIUsageSource.collectUsage(profile: profile, root: root) },
-        consentProvider: @escaping @Sendable () async -> String?
+        consentProvider: @escaping @Sendable () async -> String?,
+        setupConsentProvider: (@Sendable () async -> String?)? = nil,
+        setupCommandProvider: @escaping @Sendable () async -> String = { await ClaudeCLIUsageSource.resolveCommand() }
     ) {
         self.profileProvider = profileProvider
         self.consentProvider = consentProvider
+        self.setupConsentProvider = setupConsentProvider ?? consentProvider
+        self.setupCommandProvider = setupCommandProvider
         self.collect = collect
         cache = ClaudeCLIUsageCache(root: root)
     }
@@ -74,23 +80,17 @@ actor ClaudeCLIUsageSource {
         return record.snapshot(profileID: profile.id)
     }
 
-    private func validate(_ profile: ClaudeUsageCredentialProfile) async throws {
+    private func validate(_ profile: ClaudeUsageCredentialProfile, forSetup: Bool = false) async throws {
         try Task.checkCancellation()
-        guard await consentProvider() == profile.id, profileProvider() == profile else { throw ProviderQuotaReadError.needsConsent }
+        let authorizedProfile = await (forSetup ? setupConsentProvider() : consentProvider())
+        guard authorizedProfile == profile.id, profileProvider() == profile else { throw ProviderQuotaReadError.needsConsent }
     }
 
     /// Creates an explicit user-invoked setup action; never opens Terminal or accepts trust itself.
     func prepareSetup() async throws -> URL {
         let profile = profileProvider()
-        try await validate(profile)
-        try ProviderProcessLaunchPolicy.check()
-        let environment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
-        let command = CommandPathResolver.resolve(
-            "claude",
-            environment: environment,
-            additionalPaths: [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin").path],
-            shellLookupMode: .disabled
-        )
+        try await validate(profile, forSetup: true)
+        let command = await setupCommandProvider()
         guard FileManager.default.isExecutableFile(atPath: command) else { throw ProviderQuotaReadError.cliUnavailable }
         let root = cache.root
         let workdir = root.appendingPathComponent("workdir", isDirectory: true)
@@ -105,8 +105,18 @@ actor ClaudeCLIUsageSource {
         let script = setup.appendingPathComponent("Set up Claude usage.command")
         try ClaudeCLIUsageFiles.write(Data(Self.setupScript(command: command, profile: profile, workdir: workdir, settings: settings, mcp: mcp).utf8), to: script)
         guard chmod(script.path, 0o700) == 0 else { throw ProviderQuotaReadError.transport }
-        try await validate(profile)
+        try await validate(profile, forSetup: true)
         return script
+    }
+
+    static func resolveCommand() async -> String {
+        let environment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
+        return CommandPathResolver.resolve(
+            "claude",
+            environment: environment,
+            additionalPaths: [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin").path],
+            shellLookupMode: .disabled
+        )
     }
 
     static func setupScript(command: String, profile: ClaudeUsageCredentialProfile, workdir: URL, settings: URL, mcp: URL) -> String {

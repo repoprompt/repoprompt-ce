@@ -73,6 +73,59 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         return denial
     }
 
+    func testExactTargetContinuityNeverIncludesDescendantsAndFencesLinkCommitBeforeCleanup() async throws {
+        var scopes = DomainDelegationScopeAuthority()
+        let approved = try scopes.grant(.init(
+            granteeSessionID: overseer, kind: .session(targetSessionID: child),
+            capabilities: [.observe, .control, .restructure], guardrails: .init()
+        ), scopeID: UUID(), now: now).get()
+        for target in [overseer, child] {
+            _ = try lease(scopes, approved, .adminLink, target: target, proof: .init(
+                scopeID: approved.id, targetSessionID: target, basis: .exactSession
+            )).get()
+        }
+        XCTAssertNotNil(denial(lease(scopes, approved, .adminLink, target: grandchild, proof: .init(
+            scopeID: approved.id, targetSessionID: grandchild, basis: .exactSession
+        ))), "Not even a descendant inherits this one-target approval")
+        let bytes = try JSONEncoder().encode(approved.grant)
+        let saved = try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: bytes)
+        var restored = DomainDelegationScopeAuthority()
+        XCTAssertEqual(restored.reactivate([saved], revokedScopeIDs: [], now: now).map(\.id), [approved.id])
+        let consent = DomainDelegationScopeLinkConsent()
+        consent.replace([saved])
+        let links = DomainAgentSessionLinkAuthority(identity: .init(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: now
+        ))
+        let installed = await links.installScopeConsent(consent)
+        XCTAssertTrue(installed)
+        func endpoint(_ id: UUID) -> DomainAgentSessionLinkEndpointIdentity {
+            .init(windowID: 1, workspaceID: workspaceID, tabID: UUID(), sessionID: id,
+                  persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
+        }
+        let observerEndpoint = endpoint(overseer)
+        let targetEndpoint = endpoint(child)
+        guard case let .reserved(reservation, _) = await links.reserveLink(
+            observer: observerEndpoint, target: targetEndpoint, sourceScopeID: approved.id
+        ), case .activated = await links.activateLink(reservation: reservation, initialSnapshot: .init(
+            sessionID: child, displayName: nil, providerDisplayName: nil, status: .idle, board: .empty,
+            idleForSend: true, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil,
+            visibleRowCount: 0, lastActivityAt: now
+        ), sourcePublicationSequence: 1) else { return XCTFail("Exact restored consent must support its link") }
+        let authorized = await links.authorize(operation: .monitorSteer, observerEndpoint: observerEndpoint, targetSessionID: child)
+        let linkLease = try authorized.get()
+        guard case let .reserved(send) = await links.beginSend(lease: linkLease, idempotencyKey: "assigned", messageDigest: "hi") else {
+            return XCTFail("Expected pending assigned task")
+        }
+        _ = restored.revoke(scopeID: approved.id)
+        consent.replace([]) // Physical link cleanup deliberately has not run.
+        let committed = await links.commitSendAuthorization(reservation: send, linkGeneration: linkLease.linkGeneration, requiresManagement: true)
+        XCTAssertEqual(committed, .linkRevoked)
+        let state = await links.targetState(for: linkLease)
+        XCTAssertNil(state)
+        var restarted = DomainDelegationScopeAuthority()
+        XCTAssertTrue(restarted.reactivate([saved], revokedScopeIDs: [approved.id], now: now).isEmpty)
+    }
+
     // MARK: - Grant validation
 
     func testGrantRejectsEmptyCapabilitiesMalformedGuardrailsAndPastExpiry() {
@@ -115,6 +168,60 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
                 XCTAssertEqual(denial(result), .capabilityNotPermittedForKind(capability), capability.rawValue)
             }
         }
+    }
+
+    /// The user's global auto-approve (yolo) mode: one unrestricted grant holds every capability over
+    /// every session and never raises a card. Only the app's global setting may mint it.
+    func testUnrestrictedGlobalGrantHoldsEveryCapabilityOverAllSessionsWithoutCards() throws {
+        XCTAssertNil(DomainDelegationScopeAuthority.validate(
+            kind: .allSessions, capabilities: DomainDelegationScopeCapability.fullPreset,
+            guardrails: .init(), now: now, unrestricted: true
+        ))
+        XCTAssertEqual(
+            DomainDelegationScopeAuthority.validate(
+                kind: .allSessions, capabilities: DomainDelegationScopeCapability.fullPreset,
+                guardrails: .init(), now: now
+            ),
+            .capabilityNotPermittedForKind(.control),
+            "an ordinary all-sessions grant stays restricted"
+        )
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(
+                granteeSessionID: overseer, kind: .allSessions,
+                capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(), unrestricted: true
+            ),
+            scopeID: UUID(), now: now
+        ).get()
+        XCTAssertTrue(scope.grant.unrestricted)
+        for operation in [DomainAgentSessionTargetOperation.adminRetire, .adminRename] {
+            XCTAssertNil(
+                DomainDelegationScopeAuthority.confirmationRequirement(
+                    operation: operation, itemCount: 10_000, guardrails: scope.grant.guardrails, unrestricted: true
+                ),
+                "\(operation.rawValue) is never carded under global auto-approve"
+            )
+        }
+        XCTAssertEqual(
+            DomainDelegationScopeAuthority.confirmationRequirement(operation: .adminRetire, itemCount: 1, guardrails: .init()),
+            .destructive, "restricted grants keep their cards"
+        )
+    }
+
+    func testUnrestrictedFlagRoundTripsAndOlderGrantsDecodeAsRestricted() throws {
+        let grant = DomainDelegationScopeGrant(
+            id: UUID(), granteeSessionID: overseer, kind: .allSessions,
+            capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(),
+            origin: .user, grantedAt: now, unrestricted: true
+        )
+        let data = try JSONEncoder().encode(grant)
+        XCTAssertTrue(try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: data).unrestricted)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "unrestricted")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: legacy)
+        XCTAssertFalse(decoded.unrestricted, "grants saved before global mode never become unrestricted")
+        XCTAssertEqual(decoded.capabilities, grant.capabilities)
     }
 
     func testPresetsMatchTheDesignDefaults() {

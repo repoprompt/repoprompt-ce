@@ -14,6 +14,8 @@ import XCTest
 /// two-window add/revoke/status flows are deterministic without constructing windows.
 @MainActor
 final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
+    private var laneIntentStores: [URL: AgentSessionOversightIntentStore] = [:]
+
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
@@ -210,7 +212,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Fake host
 
-    private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
+    final class FakeEndpointHost: AgentSessionLinkEndpointHost {
+        weak var promptViewModel: AgentModeViewModel?
         var beforeActivation: ((DomainAgentSessionLinkEndpointIdentity) async -> Void)?
         func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
             await beforeActivation?(endpoint)
@@ -387,10 +390,33 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var autoWakeTargetsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: Set<UUID>] = [:]
         var publishedProps: [UUID: AgentMonitorPillProps] = [:]
         var publishedPromptInventories: [UUID: AgentSessionLinkPromptInventory] = [:]
+        var localInputIndexes: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRetainedLocalInputIndex] = [:]
+        var localInputSnapshotReads = 0
+        var localInputRecordVisits = 0
+        // Real-target transport regressions forward the production view-model lookup rather than
+        // constructing an independent index that never encounters transcript retention.
+        var localInputSnapshotOverride: ((DomainAgentSessionLinkEndpointIdentity, Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?)?
+        func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+            localInputSnapshotReads += 1
+            if let localInputSnapshotOverride { return localInputSnapshotOverride(endpoint, includeRecords) }
+            guard candidatesByEndpoint[endpoint] != nil, let snapshot = localInputIndexes[endpoint]?.snapshot else { return nil }
+            if includeRecords { localInputRecordVisits += snapshot.records.count
+                return snapshot
+            }
+            return .init(
+                epoch: snapshot.epoch,
+                revision: snapshot.revision,
+                producedThrough: snapshot.producedThrough,
+                droppedThrough: snapshot.droppedThrough,
+                records: []
+            )
+        }
+
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         /// Recorded reader identity for the most recent read, so a test can prove the observer's own
         /// session ID reaches the sanitizer rather than being dropped at the host boundary.
         var lastTranscriptReaderSessionID: UUID?
+        var transcriptMaterializations = 0
         /// Runs *inside* the transcript materialization, standing in for the real host's off-actor
         /// canonical projection. It is the suspension point a user's Stop can land in, so a test can
         /// revoke exactly where the read's post-await release gate has to arbitrate.
@@ -556,6 +582,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             guard promptInventoryHoldsByEndpoint[endpoint] == nil else { return }
             publishedInventoriesByEndpoint[endpoint] = inventory
             publishedPromptInventories[endpoint.sessionID] = inventory
+            promptViewModel?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
         }
 
         /// Passive queues recorded per exact endpoint, with a publication counter: a test has to be
@@ -571,6 +598,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) {
             passiveNoticePublicationCount += 1
             publishedPassiveNoticesByEndpoint[endpoint] = snapshot
+            promptViewModel?.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
         }
 
         /// Mirrors the real store's fence, because the bridge's contract is that a publication
@@ -620,6 +648,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             maxOutputBytes: Int,
             readerSessionID: UUID?
         ) async -> Result<AgentSessionLinkTranscriptPage, AgentSessionLinkReadUnavailableReason> {
+            transcriptMaterializations += 1
             lastTranscriptReaderSessionID = readerSessionID
             await duringTranscriptPage?()
             return transcriptPages[candidate.sessionID].map { .success($0) } ?? .failure(.targetLoading)
@@ -4593,7 +4622,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             XCTAssertEqual(nativeSignature(actualNative), nativeSignature(expectedNative), "Mark/hover/context use this same native builder")
         }
-        // The VM overlays the pill's persistence-first reason after fresh menu materialization.
+        // Continuity diagnostics must not turn fresh, explicitly approved menu choices into a veto.
         let openedObserver = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: fixture.observer.domainEndpoint))
         let blocked = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
         let displayed = AgentModeViewModel.monitorPillProps(
@@ -4606,8 +4635,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let blockedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(overlaid, busyKeys: [], actions: .init()))
         let blockedChoices = try XCTUnwrap(blockedNative.items.first { $0.title == AgentOversightUICopy.overseeNewTitle })
         let submenu = try XCTUnwrap(blockedChoices.submenu)
-        XCTAssertEqual(submenu.items.map(\.title), try [XCTUnwrap(blocked.addBlockerMessage)] + overlaid.availableTargets.map(\.menuLabel) + ["", "Session ID…"])
-        XCTAssertTrue(submenu.items.allSatisfy { !$0.isEnabled })
+        XCTAssertNil(blocked.addBlockerMessage)
+        let unblockedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(openedObserver, busyKeys: [], actions: .init()))
+        let unblockedChoices = try XCTUnwrap(unblockedNative.items.first { $0.title == AgentOversightUICopy.overseeNewTitle }?.submenu)
+        XCTAssertEqual(submenu.items.map(\.title), unblockedChoices.items.map(\.title))
+        XCTAssertEqual(submenu.items.map(\.isEnabled), unblockedChoices.items.map(\.isEnabled))
         XCTAssertEqual(blockedChoices.accessibilityValue() as? String, AgentOversightUICopy.overseeMenuAccessibilityValue(overseeingCount: overlaid.linkedTargets.count, availableCount: overlaid.availableTargets.count))
         let tracked = try XCTUnwrap(fixture.bridge.sidebarOversightMenu(for: third.domainEndpoint))
         let trackedNative = NSMenu.stableMenu(from: AgentSessionRow.sidebarOversightMenuItems(tracked, busyKeys: [], actions: .init()))
@@ -4962,9 +4994,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .added = outcome else { return XCTFail("First exact Add failed: \(outcome)") }
         let snapshot = await fixture.authority.snapshot()
         XCTAssertEqual(snapshot.activeLinkCount, 1)
-        let data = try Data(contentsOf: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename))
-        let saved = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: data)
-        XCTAssertTrue(saved.links.contains(AgentSessionOversightIntent(
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertTrue(saved.contains(AgentSessionOversightIntent(
             observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID
         )))
     }
@@ -4995,11 +5026,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(outcome, .rejected(message: AgentSessionLinkResolveFailure.rebinding.uiMessage))
         let snapshot = await fixture.authority.snapshot()
         XCTAssertEqual(snapshot.activeLinkCount, 0)
-        let file = directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
-        if FileManager.default.fileExists(atPath: file.path) {
-            let saved = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: Data(contentsOf: file))
-            XCTAssertTrue(saved.links.isEmpty, "Stale consent must not leave a durable intent")
-        }
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertTrue(saved.isEmpty, "Stale consent must not leave a durable intent")
     }
 
     func testObserverRebindRevokesItsOutboundLink() async {
@@ -6419,7 +6447,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         stageReadyTarget(fixture)
         await publishTargetActivity(fixture, status: .idle, activity: 2000)
-        await settleDrains { !fixture.host.sendRequests.isEmpty }
+        await settleDrains {
+            guard !fixture.host.sendRequests.isEmpty else { return false }
+            return await self.pendingSend(fixture)?.pending == nil
+        }
 
         let delivered = try? XCTUnwrap(fixture.host.sendRequests.last?.request)
         XCTAssertEqual(delivered?.observerEndpoint, fixture.observer.domainEndpoint)
@@ -7082,6 +7113,239 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(fixture.host.sendRequests.isEmpty)
     }
 
+    func testLocalInputBridgeReadProofConsumptionAndRevocationLeaveWakeSnapshotUnchanged() async throws {
+        let fixture = makeFixture()
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint] = AgentSessionLinkRetainedLocalInputIndex()
+        guard case .added = await addLink(fixture) else { return XCTFail("link setup failed") }
+        await publishStatus(fixture, .running, at: 1001)
+        let before = try XCTUnwrap(passiveSnapshot(fixture))
+        let authorityBeforeStamp = try await agentSessionLinkEvidenceBytes(fixture.authority.snapshot())
+        let passiveBeforeStamp = try agentSessionLinkEvidenceBytes((before, before.wakeEligibilityFingerprint))
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint]?.settle(
+            AgentChatItem.user("Research only; do not edit.", sequenceIndex: 0, userInputOrigin: .localComposer), at: 0
+        )
+        XCTAssertEqual(passiveSnapshot(fixture), before, "retained input is not an observation publisher")
+        let authorityAfterStamp = try await agentSessionLinkEvidenceBytes(fixture.authority.snapshot())
+        let afterStamp = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(authorityAfterStamp, authorityBeforeStamp)
+        XCTAssertEqual(try agentSessionLinkEvidenceBytes((afterStamp, afterStamp.wakeEligibilityFingerprint)), passiveBeforeStamp)
+        await publishStatus(fixture, .idle, at: 1002)
+        let snapshot = try XCTUnwrap(passiveSnapshot(fixture))
+        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+        let decoration = try XCTUnwrap(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: inventory, baseline: baseline))
+        XCTAssertTrue(decoration.fragment.contains("Research only; do not edit."))
+        let authorityBeforeProof = try await agentSessionLinkEvidenceBytes(fixture.authority.snapshot())
+        let statusBeforeProof = try agentSessionLinkEvidenceBytes((snapshot, snapshot.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: snapshot)))
+        let proof = await fixture.bridge.proveLocalInputRead(decoration, observer: fixture.observer.domainEndpoint)
+        XCTAssertTrue(proof)
+        let publications = fixture.host.passiveNoticePublicationCount
+        XCTAssertTrue(fixture.bridge.consumeLocalInputHandoff(decoration, observer: fixture.observer.domainEndpoint))
+        XCTAssertFalse(fixture.bridge.consumeLocalInputHandoff(decoration, observer: fixture.observer.domainEndpoint))
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, publications)
+        XCTAssertEqual(passiveSnapshot(fixture), snapshot)
+        let authorityAfterProof = try await agentSessionLinkEvidenceBytes(fixture.authority.snapshot())
+        let afterProof = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(authorityAfterProof, authorityBeforeProof)
+        XCTAssertEqual(try agentSessionLinkEvidenceBytes((afterProof, afterProof.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: afterProof))), statusBeforeProof)
+        print("LOCAL_INPUT_AUTHORITY_BYTE_TRACE stamp=identical proof_handoff=identical authority_bytes=\(authorityBeforeProof.count) status_wake_receipt_bytes=\(statusBeforeProof.count)")
+        XCTAssertNil(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: inventory, baseline: baseline))
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        let revokedProof = await fixture.bridge.proveLocalInputRead(decoration, observer: fixture.observer.domainEndpoint)
+        XCTAssertFalse(revokedProof)
+        XCTAssertFalse(fixture.bridge.consumeLocalInputHandoff(decoration, observer: fixture.observer.domainEndpoint))
+        guard case .added = await addLink(fixture) else { return XCTFail("relink failed") }
+        await publishStatus(fixture, .running, at: 1003)
+        await publishStatus(fixture, .idle, at: 1004)
+        let regranted = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        let rebaseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: regranted, passiveNotices: passiveSnapshot(fixture)))
+        XCTAssertNil(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: regranted, baseline: rebaseline), "relink is not catch-up")
+    }
+
+    func testLocalInputKnownRevocationRetiresDisclosureBeforeDurableSettlementHop() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint] = .init()
+        guard case .added = await addLink(fixture) else { return XCTFail("link setup failed") }
+        await publishStatus(fixture, .running, at: 1001)
+        fixture.host.localInputIndexes[fixture.target.domainEndpoint]?.settle(
+            .user("Already proved; now revoked.", sequenceIndex: 0, userInputOrigin: .localComposer), at: 0
+        )
+        await publishStatus(fixture, .idle, at: 1002)
+        let snapshot = try XCTUnwrap(passiveSnapshot(fixture))
+        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+        let decoration = try XCTUnwrap(fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: inventory, baseline: baseline))
+        let proof = await fixture.bridge.proveLocalInputRead(decoration, observer: fixture.observer.domainEndpoint)
+        XCTAssertTrue(proof)
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        let bytes = try agentSessionLinkEvidenceBytes((snapshot, snapshot.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: snapshot)))
+        let gate = TestReleaseFence(name: "known revocation before durable settlement")
+        fixture.bridge.test_beforeDurableIntentSettlement = { _ in await gate.enterAndWait() }
+        let revoke = Task { @MainActor in await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation) }
+        defer { gate.release()
+            fixture.bridge.test_beforeDurableIntentSettlement = nil
+            revoke.cancel()
+        }
+        let entered = await gate.waitUntilEntered()
+        guard entered else { return XCTFail("revocation must reach existing durable settlement seam") }
+        XCTAssertFalse(fixture.bridge.localInputContentIsCurrent(decoration, observer: fixture.observer.domainEndpoint))
+        XCTAssertFalse(fixture.bridge.consumeLocalInputHandoff(decoration, observer: fixture.observer.domainEndpoint))
+        let during = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(try agentSessionLinkEvidenceBytes((during, during.wakeEligibilityFingerprint, AgentSessionLinkPassiveStatusNotices.Receipt(snapshot: during))), bytes)
+        gate.release()
+        await revoke.value
+    }
+
+    func testLocalInputWarm30PreparationDeltaWithTenSaturatedLinksAnd300Chats() async throws {
+        let fixture = makeFixture()
+        let targets = [fixture.target] + (1 ..< 10).map { makeCandidate(windowID: $0 % 3 + 1, displayName: "Alpha \($0)") }
+        let unrelated = (0 ..< 289).map { makeCandidate(windowID: $0 % 3 + 1, displayName: "Unrelated \($0)") }
+        fixture.host.candidates = [fixture.observer] + targets + unrelated
+        let text = String(repeating: "<&'\"e\u{301}", count: 120)
+        for target in targets {
+            fixture.host.localInputIndexes[target.domainEndpoint] = .init()
+            guard case .added = await fixture.bridge.addMonitorLink(observerSessionID: fixture.observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("ten-link setup") }
+            let local = Fixture(
+                authority: fixture.authority,
+                host: fixture.host,
+                bridge: fixture.bridge,
+                observer: fixture.observer,
+                target: target,
+                advertisement: fixture.advertisement
+            )
+            await publishStatus(local, .running, at: 1001)
+            for row in 0 ..< 16 {
+                fixture.host.localInputIndexes[target.domainEndpoint]?.settle(.user(text, sequenceIndex: row, userInputOrigin: .localComposer), at: row)
+            }
+            await publishStatus(local, .idle, at: 1002)
+        }
+        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        let snapshot = try XCTUnwrap(passiveSnapshot(fixture))
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: fixture.observer.domainEndpoint, allowsSupplement: true)
+        let census = fixture.host.candidateReadCount
+        let materializations = fixture.host.transcriptMaterializations
+        let recordVisits = fixture.host.localInputRecordVisits
+        var baselineTimes: [Double] = [], decoratedTimes: [Double] = [], proofTimes: [Double] = []
+        var lastClaim: AgentSessionLinkOutboundPromptClaim?
+        func prepare(decorated: Bool) throws -> Double {
+            let store = AgentSessionLinkOutboundPromptClaimStore()
+            let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+            let start = ProcessInfo.processInfo.systemUptime
+            if decorated {
+                fixture.host.localInputIndexes[fixture.target.domainEndpoint]?.settle(.user(text, sequenceIndex: 100, userInputOrigin: .localComposer), at: 100)
+            }
+            let outcome = store.claimOutcome(
+                dispatchID: dispatch,
+                epoch: epoch,
+                inventory: inventory,
+                passiveNotices: snapshot,
+                decorateLocalInputs: { baseline in
+                    decorated ? fixture.bridge.localInputDecoration(observer: fixture.observer.domainEndpoint, inventory: inventory, baseline: baseline) : nil
+                },
+                render: AgentSessionLinkPrompts.rendered
+            )
+            let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1000
+            let claim = try XCTUnwrap(outcome.claim)
+            if decorated {
+                let decoration = try XCTUnwrap(claim.localInput)
+                XCTAssertLessThanOrEqual(decoration.markupDeltaBytes, 4096)
+                XCTAssertEqual(decoration.requirements.count, 10)
+                lastClaim = claim
+            }
+            return elapsed
+        }
+        for _ in 0 ..< 5 {
+            _ = try prepare(decorated: false)
+            _ = try prepare(decorated: true)
+        }
+        for sample in 0 ..< 30 {
+            // Alternate ordering to avoid crediting cache/thermal drift to either variant.
+            if sample.isMultiple(of: 2) {
+                try baselineTimes.append(prepare(decorated: false))
+                try decoratedTimes.append(prepare(decorated: true))
+            } else {
+                let decorated = try prepare(decorated: true)
+                try baselineTimes.append(prepare(decorated: false))
+                decoratedTimes.append(decorated)
+            }
+            let decoration = try XCTUnwrap(lastClaim?.localInput)
+            let start = ProcessInfo.processInfo.systemUptime
+            let proof = await fixture.bridge.proveLocalInputRead(decoration, observer: fixture.observer.domainEndpoint)
+            proofTimes.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+            XCTAssertTrue(proof)
+        }
+        func distribution(_ values: [Double]) -> String {
+            let sorted = values.sorted()
+            return "p50=\(sorted[14]) p95=\(sorted[28]) max=\(sorted[29])"
+        }
+        let deltas = zip(decoratedTimes, baselineTimes).map { $0.0 - $0.1 }
+        print("LOCAL_INPUT_WARM30 mode=Debug chats=300 windows=3 links=10 records_per_target=16 candidates=40 warmups=5 samples=30 units=ms baseline[\(distribution(baselineTimes))] decorated[\(distribution(decoratedTimes))] delta[\(distribution(deltas))] authority[\(distribution(proofTimes))] budget_p95_delta=5")
+        XCTAssertEqual(fixture.host.candidateReadCount, census)
+        XCTAssertEqual(fixture.host.transcriptMaterializations, materializations)
+        XCTAssertLessThanOrEqual(fixture.host.localInputRecordVisits - recordVisits, (35 + 30) * 10 * 16)
+        print("LOCAL_INPUT_WARM30 full_hot_census=0 transcript_materializations=0 bounded_record_visits=\(fixture.host.localInputRecordVisits - recordVisits)")
+    }
+
+    func testLocalInputRealScale300ChatsThreeWindowsThreeObserversTenLinksNoHotCensus() async throws {
+        let fixture = makeFixture()
+        let observers = [fixture.observer, makeCandidate(windowID: 2, displayName: "Delta"), makeCandidate(windowID: 3, displayName: "Echo")]
+        let targets = [fixture.target] + (1 ..< 10).map { makeCandidate(windowID: $0 % 3 + 1, displayName: "Alpha \($0)") }
+        let unrelated = (0 ..< 287).map { makeCandidate(windowID: $0 % 3 + 1, displayName: "Unrelated \($0)") }
+        fixture.host.candidates = observers + targets + unrelated
+        for target in targets {
+            fixture.host.localInputIndexes[target.domainEndpoint] = AgentSessionLinkRetainedLocalInputIndex()
+        }
+        for (position, target) in targets.enumerated() {
+            let result = await fixture.bridge.addMonitorLink(observerSessionID: observers[position % 3].sessionID, rawTargetSessionID: target.sessionID.uuidString)
+            guard case .added = result else { return XCTFail("setup link failed") }
+        }
+        for target in targets {
+            let localFixture = Fixture(
+                authority: fixture.authority,
+                host: fixture.host,
+                bridge: fixture.bridge,
+                observer: fixture.observer,
+                target: target,
+                advertisement: fixture.advertisement
+            )
+            await publishStatus(localFixture, .running, at: 1001)
+            await publishStatus(localFixture, .idle, at: 1002)
+        }
+        let baselines = try observers.map { observer -> (AgentSessionLinkEndpointCandidate, AgentSessionLinkPromptInventory, AgentSessionLinkPromptRenderResult) in
+            let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[observer.sessionID])
+            let snapshot = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
+            return (observer, inventory, AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot)))
+        }
+        let censusBefore = fixture.host.candidateReadCount
+        let readsBefore = fixture.host.localInputSnapshotReads
+        let visitsBefore = fixture.host.localInputRecordVisits
+        let started = ProcessInfo.processInfo.systemUptime
+        for turn in 0 ..< 100 {
+            for target in targets {
+                fixture.host.localInputIndexes[target.domainEndpoint]?.settle(
+                    AgentChatItem.user("Correction \(turn): research only", sequenceIndex: turn, userInputOrigin: .localComposer), at: turn
+                )
+            }
+            for (observer, inventory, baseline) in baselines {
+                let decoration = try XCTUnwrap(fixture.bridge.localInputDecoration(observer: observer.domainEndpoint, inventory: inventory, baseline: baseline))
+                let proof = await fixture.bridge.proveLocalInputRead(decoration, observer: observer.domainEndpoint)
+                XCTAssertTrue(proof)
+                XCTAssertTrue(fixture.bridge.consumeLocalInputHandoff(decoration, observer: observer.domainEndpoint))
+            }
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let reads = fixture.host.localInputSnapshotReads - readsBefore
+        let visits = fixture.host.localInputRecordVisits - visitsBefore
+        print("LOCAL_INPUT_SCALE chats=300 windows=3 observers=3 links=10 turns=100 seconds=\(elapsed) target_reads=\(reads) bounded_record_visits=\(visits) full_hot_census=\(fixture.host.candidateReadCount - censusBefore)")
+        XCTAssertEqual(fixture.host.candidateReadCount, censusBefore)
+        XCTAssertEqual(reads, 3000, "ten target-local reads per harvest/preproof/handoff, independent of 300 chats")
+        XCTAssertLessThanOrEqual(visits, reads * 16)
+    }
+
     // MARK: - Two-window add/revoke/status integration
 
     /// Publishes one target status and settles the projection pass it triggers.
@@ -7578,7 +7842,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 observerEndpoint: fixture.observer.domainEndpoint,
                 request: laneRequest(fixture, key: scenario.name)
             ) {
-                (windowID: fixture.target.windowID, workspaceID: fixture.target.workspaceID, workspaceName: "Destination")
+                .available(AgentSessionLaneDestination(windowID: fixture.target.windowID, workspaceID: fixture.target.workspaceID, workspaceName: "Destination"))
             }
             if scenario.connected {
                 XCTAssertEqual(receipt.result, .created, "\(scenario.name): a valid destination pin must create the lane")
@@ -7604,14 +7868,30 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             .appendingPathComponent("lane-bridge-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        fixture.bridge.installIntentStore(AgentSessionOversightIntentStore(
+        let store = AgentSessionOversightIntentStore(
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent(
                 AgentSessionOversightIntentStore.backupsDirectoryName, isDirectory: true
             ),
             mode: mode
-        ))
+        )
+        laneIntentStores[directory] = store
+        fixture.bridge.installIntentStore(store)
         return directory
+    }
+
+    private func savedLaneIntents(in directory: URL) async -> [AgentSessionOversightIntent] {
+        await laneIntentStores[directory]?.serializationBarrier()
+        let restored = AgentSessionOversightIntentStore(
+            fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.backupsDirectoryName),
+            mode: .enabled
+        )
+        guard case .ready = await restored.loadForLaunch() else {
+            XCTFail("Saved lane continuity did not load")
+            return []
+        }
+        return await restored.allIntents()
     }
 
     private func laneRequest(_ fixture: Fixture, key: String = "create-1", message: String? = nil)
@@ -7630,7 +7910,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         workspaceName: String = "Original destination"
     ) async -> AgentSessionLaneCreateReceipt {
         await fixture.bridge.createLane(observerEndpoint: observerEndpoint, request: request) {
-            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID, workspaceName: workspaceName)
+            .available(AgentSessionLaneDestination(windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID, workspaceName: workspaceName))
         }
     }
 
@@ -7651,7 +7931,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return lane
     }
 
-    func testLanePersistencePreflightRefusesBeforeAllocating() async {
+    func testLaneWithoutContinuityStoreStillReachesHostAdmission() async {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let receipt = await createLane(
@@ -7659,8 +7939,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture)
         )
-        XCTAssertEqual(receipt.reason, .persistenceUnavailable)
-        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+        XCTAssertEqual(receipt.reason, .hostUnavailable)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1, "Missing continuity is not a live admission veto")
     }
 
     func testMissingLaneCreationHostHasDistinctRefusalFromDestinationUnavailable() async throws {
@@ -7816,12 +8096,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testLanePreallocationRefusalCanRetrySameKey() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
-        let refused = await createLane(
-            fixture,
+        let refused = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "retry")
+            request: laneRequest(fixture, key: "retry"),
+            resolveDestination: { .unavailable(.callerWindowHasNoWorkspace) }
         )
-        XCTAssertEqual(refused.reason, .persistenceUnavailable)
+        XCTAssertEqual(refused.reason, .destinationUnavailable)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
         try installLaneIntentStore(fixture)
         _ = prepareCreatedLane(fixture)
         let retried = await createLane(
@@ -7842,7 +8123,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let request = laneRequest(fixture, key: "workspace-retry")
         let unavailable = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { nil }
+            resolveDestination: { .unavailable(.callerWindowHasNoWorkspace) }
         )
         XCTAssertEqual(unavailable.reason, .destinationUnavailable)
         let resumed = await createLane(
@@ -8070,7 +8351,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let request = laneRequest(fixture, key: "published-hydration-failure")
         let first = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
+            resolveDestination: { .available(.init(windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name)) }
         )
         XCTAssertEqual(first.result, .creationIncomplete)
         XCTAssertNotNil(first.sessionID)
@@ -8091,7 +8372,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         window.agentModeViewModel.test_setAfterDurableChildTabCreation(nil)
         let replay = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
+            resolveDestination: { .available(.init(windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name)) }
         )
         XCTAssertEqual(replay.result, .creationIncomplete)
         XCTAssertEqual(replay.sessionID, first.sessionID)
@@ -8149,11 +8430,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             request: laneRequest(fixture)
         )
         XCTAssertEqual(receipt.result, .created)
-        let data = try Data(contentsOf: directory.appendingPathComponent(
-            AgentSessionOversightIntentStore.filename
-        ))
-        let saved = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: data)
-        XCTAssertTrue(saved.links.contains(AgentSessionOversightIntent(
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertTrue(saved.contains(AgentSessionOversightIntent(
             observerSessionID: fixture.observer.sessionID,
             targetSessionID: lane.sessionID
         )))
@@ -8206,7 +8484,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, key: "create-and-attend", message: "Do the first task")
         ) {
-            (windowID: lane.windowID, workspaceID: lane.workspaceID, workspaceName: "Original destination")
+            .available(AgentSessionLaneDestination(windowID: lane.windowID, workspaceID: lane.workspaceID, workspaceName: "Original destination"))
         }
         XCTAssertEqual(created.result, .created)
         XCTAssertEqual(created.firstTask, .delivered)
@@ -8768,11 +9046,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(retired, .retired(sessionID: fixture.target.sessionID))
         release?.resume()
         await fulfillment(of: [addCompleted], timeout: 3)
-        let data = try Data(contentsOf: directory.appendingPathComponent(
-            AgentSessionOversightIntentStore.filename
-        ))
-        let saved = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: data)
-        XCTAssertFalse(saved.links.contains(AgentSessionOversightIntent(
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertFalse(saved.contains(AgentSessionOversightIntent(
             observerSessionID: fixture.observer.sessionID,
             targetSessionID: fixture.target.sessionID
         )))
@@ -9110,6 +9385,128 @@ private extension AgentSessionLinkRuntimeBridge {
             idempotencyKey: idempotencyKey,
             workflowReference: nil
         )
+    }
+}
+
+/// Uses the existing fake endpoint host with the production shared bridge/authority. The native
+/// adapters' final synchronous consume therefore cannot be replaced by an always-true test hook.
+@MainActor
+final class AgentSessionLinkTransportLocalInputFixture {
+    let viewModel: AgentModeViewModel
+    let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
+    let bridge = AgentSessionLinkRuntimeBridge.shared
+    let observer: DomainAgentSessionLinkEndpointIdentity
+    let target: AgentSessionLinkEndpointCandidate
+    private var tick: TimeInterval = 1000
+    private var lastBaseline: AgentSessionLinkPromptRenderResult?
+
+    private init(viewModel: AgentModeViewModel, observer: DomainAgentSessionLinkEndpointIdentity) {
+        self.viewModel = viewModel
+        self.observer = observer
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, name: String) -> AgentSessionLinkEndpointCandidate {
+            let readiness: AgentSessionRestorationReadiness
+            if let generation = endpoint.persistentBindingGeneration {
+                let token = AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
+                    ),
+                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                )
+                readiness = .authoritative(token, .persistedPayloadApplied)
+            } else {
+                readiness = .unbound
+            }
+            return .init(
+                windowID: endpoint.windowID,
+                workspaceID: endpoint.workspaceID,
+                tabID: endpoint.tabID,
+                sessionID: endpoint.sessionID,
+                persistentBindingGeneration: endpoint.persistentBindingGeneration,
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: name,
+                providerDisplayName: "Fake",
+                locationLabel: nil,
+                restorationReadiness: readiness
+            )
+        }
+        target = candidate(.init(
+            windowID: 702,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        ), name: "Alpha")
+        host.candidates = [candidate(observer, name: "Delta"), target]
+        host.promptViewModel = viewModel
+        host.localInputIndexes[target.domainEndpoint] = .init()
+    }
+
+    static func install(on viewModel: AgentModeViewModel, session: AgentTabSession) async throws -> AgentSessionLinkTransportLocalInputFixture {
+        // These tests exercise existing manually permitted transports, not automatic scheduling.
+        // Explicit fixture state prevents a saved default from launching a competing fake run.
+        session.oversight.autoWakeOnUpdates = false
+        session.oversight.retirePeriodicScheduling()
+        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let fixture = AgentSessionLinkTransportLocalInputFixture(viewModel: viewModel, observer: endpoint)
+        fixture.bridge.attach(host: fixture.host)
+        guard case .added = await fixture.bridge.addMonitorLink(observerSessionID: endpoint.sessionID, rawTargetSessionID: fixture.target.sessionID.uuidString) else {
+            throw NSError(domain: "LocalInputTransportFixture", code: 1)
+        }
+        await fixture.status(.running)
+        return fixture
+    }
+
+    func status(_ status: DomainAgentSessionLinkStatus) async {
+        tick += 1
+        host.snapshotOverrides[target.sessionID] = .init(
+            sessionID: target.sessionID,
+            displayName: "Alpha",
+            providerDisplayName: "Fake",
+            status: status,
+            board: .empty,
+            idleForSend: status == .idle,
+            pendingInteractionKind: nil,
+            latestVisibleAssistantPreview: "Summary complete.",
+            visibleRowCount: Int(tick),
+            lastActivityAt: Date(timeIntervalSince1970: tick)
+        )
+        host.fireObservation(for: target.sessionID)
+        await bridge.test_settleProjections()
+    }
+
+    func correction(_ text: String) async {
+        await status(.running)
+        host.localInputIndexes[target.domainEndpoint]?.settle(.user(text, sequenceIndex: Int(tick), userInputOrigin: .localComposer), at: Int(tick))
+        await status(.idle)
+        if let inventory = host.publishedPromptInventories[observer.sessionID], let snapshot = host.publishedPassiveNoticesByEndpoint[observer] {
+            lastBaseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+            XCTAssertNotNil(bridge.localInputDecoration(observer: observer, inventory: inventory, baseline: lastBaseline!))
+        } else { XCTFail("Expected an existing selected status entry") }
+    }
+
+    func assertConsumed(file: StaticString = #filePath, line: UInt = #line) throws {
+        let inventory = try XCTUnwrap(host.publishedPromptInventories[observer.sessionID], file: file, line: line)
+        // Acceptance may have removed the row. Probe the frozen real baseline so this cannot pass
+        // vacuously simply because the status receipt was accepted.
+        let baseline = try XCTUnwrap(lastBaseline, file: file, line: line)
+        XCTAssertNil(bridge.localInputDecoration(observer: observer, inventory: inventory, baseline: baseline), file: file, line: line)
+    }
+
+    func cleanup() async {
+        let links = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observer.sessionID)
+        for link in links.items {
+            await bridge.revokeLink(linkID: link.linkID, generation: link.generation)
+        }
+        WindowStatesManager.shared.attachAgentSessionLinkBridge()
+        await bridge.test_settleProjections()
     }
 }
 

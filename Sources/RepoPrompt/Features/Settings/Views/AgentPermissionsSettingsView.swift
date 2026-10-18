@@ -42,6 +42,7 @@ struct AgentPermissionsSettingsView: View {
     var onNavigate: ((SettingsTab) -> Void)?
 
     @State private var scope: AgentPermissionSettingsScope = .directAgents
+    @AppStorage(DelegationScopeRuntime.autoApproveAllRequestsKey) private var autoApproveDelegationRequests = false
 
     init(
         apiSettingsVM: APISettingsViewModel,
@@ -100,6 +101,7 @@ struct AgentPermissionsSettingsView: View {
                 AgentPermissionSecureStorageDegradedBanner(diagnostics: diagnosticsVM)
                 scopePicker
                 scopeContent
+                delegationApprovalSection
                 relatedSection
                 Spacer(minLength: 0)
             }
@@ -185,6 +187,32 @@ struct AgentPermissionsSettingsView: View {
                 availability: availability,
                 onNavigate: onNavigate
             )
+        }
+    }
+
+    // MARK: - Delegation approvals
+
+    /// Global standing consent for agent oversight requests. Off by default; user-only (not exposed
+    /// through MCP app_settings). When on, Active delegations shows it and every grant stays revocable.
+    private var delegationApprovalSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Overseer")
+                .font(.headline)
+            Toggle(isOn: $autoApproveDelegationRequests) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Overseer full access (no approvals)")
+                    Text("An Overseer can do everything to every session without asking: observe, organize, control, restructure, spawn, worktrees, retire, and delete sessions. No approval or confirmation cards appear. Its access shows in Active delegations. Turn this off to revoke it immediately.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("agent-permissions-auto-approve-delegation")
+            .onChange(of: autoApproveDelegationRequests) { _, isOn in
+                // Off means off: withdraw every global grant now, not on the next agent call.
+                if !isOn { AgentSessionLinkRuntimeBridge.shared.delegationScopes.reconcileGlobalAutoApprove() }
+            }
         }
     }
 

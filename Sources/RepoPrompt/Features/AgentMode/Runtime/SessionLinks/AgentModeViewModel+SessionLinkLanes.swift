@@ -70,10 +70,15 @@ extension AgentModeViewModel {
         guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
               workspaceManager?.activeWorkspace?.id == expectedWorkspaceID
         else {
-            throw MCPError.invalidParams("The destination workspace is not active.")
+            throw AgentSessionLaneDestinationFailure.destinationChanged
         }
         // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
-        let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        let spawnAdmission: DelegationSpawnAdmission.Admission?
+        do {
+            spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneSpawnAdmissionFailure(detail: detail ?? "Scoped spawn admission was refused. Call session_admin scope_status to inspect authority and placement.")
+        }
         defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target: MCPSessionTarget
         do {
@@ -89,6 +94,18 @@ extension AgentModeViewModel {
             )
         } catch let published as AgentSessionLanePublishedFailure {
             return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
+        } catch let failure as AgentSessionLaneAdmissionFailure {
+            throw AgentSessionLaneDestinationFailure.admissionRejected(failure)
+        } catch let MCPError.internalError(detail) {
+            // Every internal error on this path is app-authored (binding admission, workspace or
+            // prompt-manager availability), so the reason reaches the caller instead of a type name.
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
         }
         guard let sessionID = target.sessionID ?? target.recoveryClaim?.identity.sessionID else {
             throw MCPError.internalError("The new lane has no session ID.")
@@ -344,5 +361,14 @@ extension AgentModeViewModel {
               let workspaceManager
         else { return false }
         return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+    }
+}
+
+extension AgentSessionLinkRuntimeBridge {
+    /// Agent-facing detail for an unclassified lane host error, or nil when the text is internal.
+    static func laneHostAgentFacingDetail(_ error: any Error) -> String? {
+        guard case let MCPError.invalidParams(detail)? = error as? MCPError,
+              let detail, !detail.isEmpty else { return nil }
+        return String(detail.prefix(400))
     }
 }

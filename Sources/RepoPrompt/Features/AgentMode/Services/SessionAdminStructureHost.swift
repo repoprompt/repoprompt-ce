@@ -21,6 +21,7 @@ enum SessionAdminLinkOutcome: Equatable {
     /// The delegated authority behind the operation ended before it committed; nothing was left behind.
     case revoked
     case failed(String)
+    case refused(AgentSessionLinkResolveFailure)
 }
 
 /// A fork crossed its creation boundary but a later required step failed. Its identity must be
@@ -58,6 +59,11 @@ protocol SessionAdminStructureHost: AnyObject {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome
+    /// Exact-target approvals retain their consent dependency across runtime and restoration.
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     /// Stops the active link through the bridge's ordinary Stop. `isStillAuthorized` is evaluated
     /// synchronously after the link lookup and right before the Stop.
     func stopLink(
@@ -80,6 +86,16 @@ protocol SessionAdminStructureHost: AnyObject {
     func fork(
         sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> UUID
+}
+
+extension SessionAdminStructureHost {
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        guard sourceScopeID == nil else { return .failed("source_scope_unavailable: This host cannot retain exact-target consent; nothing was linked.") }
+        return await addLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
+    }
 }
 
 struct SessionAdminWorktreeInfo: Equatable {
@@ -157,8 +173,11 @@ enum SessionAdminHostError: LocalizedError, Equatable {
     case notIdle
     /// Delegated authority (lease or membership) ended before the write; nothing changed.
     case authorityEnded
+    case usageEvidenceUnavailable
     case guardrailExceeded(limit: Int, current: Int)
     case invalid(String)
+    /// A specific, recoverable refusal with its own code and the call that resolves it.
+    case refused(code: String, detail: String, nextCall: Value?)
 
     var errorDescription: String? {
         switch self {
@@ -168,10 +187,59 @@ enum SessionAdminHostError: LocalizedError, Equatable {
             "The target session is busy; worktree bindings change only at an idle boundary."
         case .authorityEnded:
             "Delegated authority over the target ended before the change; nothing was changed."
+        case .usageEvidenceUnavailable:
+            "A configured worktree limit requires complete placement evidence. Resolve ambiguous session bindings or open their workspace, then retry; inspect session_admin scope_status for configured limits."
         case let .guardrailExceeded(limit, current):
             "The worktree binding would exceed max_worktrees (limit \(limit), current \(current))."
         case let .invalid(message):
             message
+        case let .refused(_, detail, _):
+            detail
         }
+    }
+}
+
+/// A host refusal as a structured result, never a bare enum name.
+extension SessionAdminHostError: SessionAdminStructuredRefusal {
+    func refusalValue(op: String, targets: [UUID]) -> Value {
+        let (code, retryable, next): (String, Bool, Value) = switch self {
+        case .sessionUnavailable:
+            ("session_unavailable", false, .object([
+                "tool": .string("become_overseer"),
+                "arguments": .object(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]),
+                "why": .string("Prepares a saved or unvisited session without opening its tab, then retry \(op).")
+            ]))
+        case .notIdle:
+            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object(
+                ["op": .string("wait"), "until": .string("idle")]
+                    .merging(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]) { first, _ in first }
+            )]))
+        case .authorityEnded:
+            ("scope_revoked", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .usageEvidenceUnavailable:
+            ("usage_evidence_unavailable", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .guardrailExceeded:
+            ("guardrail_exceeded", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .invalid:
+            // The detail names the fix; the next call inspects the target it concerns.
+            ("invalid_request", false, targets.first.map { target in
+                .object(["tool": .string("session_admin"), "arguments": .object([
+                    "op": .string("get"), "session_id": .string(target.uuidString)
+                ])])
+            } ?? .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case let .refused(code, _, nextCall):
+            (code, false, nextCall ?? .null)
+        }
+        var object: [String: Value] = [
+            "result": .string("not_applied"),
+            "op": .string(op),
+            "code": .string(code),
+            "subreason": .string(code),
+            "detail": .string(localizedDescription),
+            "affected": .array(targets.map { .string($0.uuidString) }),
+            "retryable": .bool(retryable)
+        ]
+        if next != .null { object["next_call"] = next }
+        return .object(object)
     }
 }

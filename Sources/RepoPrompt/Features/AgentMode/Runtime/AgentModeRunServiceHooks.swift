@@ -142,6 +142,14 @@ extension AgentModeRunService {
         /// respective owners settle them behind this one runner-neutral call.
         let acceptAgentSessionLinkPrompt: (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
+        var proveAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof = { _, claim in
+            await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+        }
+
+        var handoffAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim?, AgentSessionLinkProviderInputRelease.Proof) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext = { _, _, claim, proof in
+            AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed }, isPending: { _ in false }, consume: { _ in false })
+        }
+
         /// Attaches the cross-window oversight supplement to an already-built provider message.
         ///
         /// Applied after history, handoff, attachment, workflow, and file-map composition, so the

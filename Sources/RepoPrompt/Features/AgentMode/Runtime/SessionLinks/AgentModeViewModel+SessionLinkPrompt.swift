@@ -5,10 +5,10 @@ import RepoPromptInstrumentation
 /// Window-local seam between the authoritative link inventory and the provider dispatch adapters.
 ///
 /// The adapters (Codex start/steer/fallback, Claude native, Claude/generic headless, ACP prompt and
-/// active steering, waiting-instruction continuation) all reduce to two synchronous MainActor calls:
-/// compose immediately before the physical dispatch, acknowledge at the provider's acceptance
-/// signal. Keeping the actor hop out of the dispatch path matters — every one of those sites runs
-/// while a user turn is already committed, and none of them may block on the domain actor.
+/// active steering, waiting-instruction continuation) preserve synchronous baseline composition and
+/// acceptance. Optional user-input disclosure adds an exact Read proof after all other preparation
+/// awaits, followed by synchronous MainActor revalidation/consumption at the final provider handoff.
+/// A failed optional proof falls back to the unchanged baseline; it never creates a dispatch.
 /// The authoritative outbound inventory published to one exact incarnation.
 ///
 /// The endpoint is stored alongside the value rather than implied by the map key: an in-place rebind
@@ -749,6 +749,14 @@ extension AgentModeViewModel {
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
             allowsClaimlessAutoWake: periodicAttempt != nil,
+            decorateLocalInputs: { baseline in
+                #if DEBUG
+                    if let decorate = self.test_agentSessionLinkLocalInputDecoration { return decorate(baseline) }
+                #endif
+                return AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
+                    observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
+                )
+            },
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -850,6 +858,34 @@ extension AgentModeViewModel {
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,
             mustAbortDispatch: false
+        )
+    }
+
+    func agentSessionLinkProveProviderInput(
+        for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?
+    ) async -> AgentSessionLinkProviderInputRelease.Proof {
+        await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
+            guard let observer = claim?.observerEndpoint,
+                  self.sessions[session.tabID] === session else { return false }
+            #if DEBUG
+                if let readProof = self.test_agentSessionLinkLocalInputReadProof { return await readProof(decoration) }
+            #endif
+            return await AgentSessionLinkRuntimeBridge.shared.proveLocalInputRead(decoration, observer: observer)
+        }
+    }
+
+    func agentSessionLinkHandoffProviderInput(
+        for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
+        claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
+    ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        AgentSessionLinkProviderInputRelease.handoff(
+            original: claim, proof: proof,
+            current: { self.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID) },
+            isPending: { self.agentSessionLinkPromptClaimStore.isPending($0) },
+            consume: { decoration in
+                guard let observer = claim?.observerEndpoint, self.sessions[session.tabID] === session else { return false }
+                return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
+            }
         )
     }
 

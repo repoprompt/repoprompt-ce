@@ -71,6 +71,30 @@ package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashabl
     }
 }
 
+/// Read-only, process-local input to link authorization. The app's decision owner publishes its
+/// live grants synchronously; storage is never consulted here. Missing/expired consent fails closed.
+package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var grants: [UUID: DomainDelegationScopeGrant] = [:]
+
+    package init() {}
+
+    package func replace(_ grants: [DomainDelegationScopeGrant]) {
+        lock.withLock { self.grants = Dictionary(uniqueKeysWithValues: grants.map { ($0.id, $0) }) }
+    }
+
+    package func permits(scopeID: UUID, observer: UUID, target: UUID, at date: Date) -> Bool {
+        guard let grant = lock.withLock({ grants[scopeID] }), grant.granteeSessionID == observer,
+              grant.capabilities.isSuperset(of: [.observe, .control, .restructure]),
+              grant.guardrails.expiresAt.map({ $0 > date }) ?? true else { return false }
+        switch grant.kind {
+        case let .session(approvedTarget): return approvedTarget == target
+        case .allSessions: return grant.unrestricted
+        case .tree, .workspace: return false
+        }
+    }
+}
+
 // MARK: - Target state
 
 /// App-presented run state of one target, for operations whose requirement depends on it.
@@ -88,6 +112,8 @@ package enum DomainDelegationScopeTargetState: String, Hashable, Sendable {
 /// What a scope covers. Membership is never taken from tool arguments; the app presents a
 /// `DomainDelegationScopeMembershipProof` computed from persisted provenance.
 package enum DomainDelegationScopeKind: Hashable, Sendable {
+    /// The grantee plus exactly one managed target; never its descendants or other workspace sessions.
+    case session(targetSessionID: UUID)
     /// The root plus every session whose organizational parent chain reaches it.
     case tree(rootSessionID: UUID)
     /// Every session in one workspace.
@@ -97,6 +123,7 @@ package enum DomainDelegationScopeKind: Hashable, Sendable {
 
     package var label: String {
         switch self {
+        case .session: "session"
         case .tree: "tree"
         case .workspace: "workspace"
         case .allSessions: "all_sessions"
@@ -108,12 +135,15 @@ extension DomainDelegationScopeKind: Codable {
     private enum CodingKeys: String, CodingKey {
         case type
         case rootSessionID = "root_session_id"
+        case targetSessionID = "target_session_id"
         case workspaceID = "workspace_id"
     }
 
     package init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(String.self, forKey: .type) {
+        case "session":
+            self = try .session(targetSessionID: container.decode(UUID.self, forKey: .targetSessionID))
         case "tree":
             self = try .tree(rootSessionID: container.decode(UUID.self, forKey: .rootSessionID))
         case "workspace":
@@ -133,6 +163,8 @@ extension DomainDelegationScopeKind: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(label, forKey: .type)
         switch self {
+        case let .session(targetSessionID):
+            try container.encode(targetSessionID, forKey: .targetSessionID)
         case let .tree(rootSessionID):
             try container.encode(rootSessionID, forKey: .rootSessionID)
         case let .workspace(workspaceID):
@@ -288,6 +320,10 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
     package let guardrails: DomainDelegationScopeGuardrails
     package let origin: DomainDelegationScopeOrigin
     package let grantedAt: Date
+    /// Minted only by the user's global auto-approve (Overseer yolo) setting: every capability over
+    /// every session, no `.allSessions` capability restriction, and no confirmation cards. Grants
+    /// saved before this flag existed decode as restricted.
+    package let unrestricted: Bool
 
     package init(
         id: UUID,
@@ -296,7 +332,8 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         capabilities: Set<DomainDelegationScopeCapability>,
         guardrails: DomainDelegationScopeGuardrails,
         origin: DomainDelegationScopeOrigin,
-        grantedAt: Date
+        grantedAt: Date,
+        unrestricted: Bool = false
     ) {
         self.id = id
         self.granteeSessionID = granteeSessionID
@@ -305,6 +342,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         self.guardrails = guardrails
         self.origin = origin
         self.grantedAt = grantedAt
+        self.unrestricted = unrestricted
     }
 
     package var parentScopeID: UUID? {
@@ -319,6 +357,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         case guardrails
         case origin
         case grantedAt = "granted_at"
+        case unrestricted
     }
 
     package init(from decoder: any Decoder) throws {
@@ -332,6 +371,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         guardrails = try container.decode(DomainDelegationScopeGuardrails.self, forKey: .guardrails)
         origin = try container.decode(DomainDelegationScopeOrigin.self, forKey: .origin)
         grantedAt = try container.decode(Date.self, forKey: .grantedAt)
+        unrestricted = try container.decodeIfPresent(Bool.self, forKey: .unrestricted) ?? false
     }
 
     package func encode(to encoder: any Encoder) throws {
@@ -343,6 +383,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
         try container.encode(guardrails, forKey: .guardrails)
         try container.encode(origin, forKey: .origin)
         try container.encode(grantedAt, forKey: .grantedAt)
+        if unrestricted { try container.encode(true, forKey: .unrestricted) }
     }
 }
 
@@ -385,6 +426,8 @@ package struct DomainDelegationScopeRecord: Hashable, Sendable {
 /// constructed from tool arguments.
 package struct DomainDelegationScopeMembershipProof: Hashable, Sendable {
     package enum Basis: Hashable, Sendable {
+        /// A uniquely resolved app-owned identity in an exact-target grant.
+        case exactSession
         /// Organizational chain from the target (first) up to the tree root (last), inclusive.
         case treePath([UUID])
         /// The workspace the target currently belongs to.
@@ -513,6 +556,9 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     /// The presented card does not cover this call (different items, arguments, key, or scope
     /// generation). Reported only to the card's grantee, with the approved items.
     case confirmationMismatch
+    /// The caller's live scope covers the target, but no unique session writer is available.
+    /// Emit only after membership and capabilities have been authorized, never from a UUID probe.
+    case mutationOwnerUnavailable
 
     // Uniform (diagnostic only).
     case callerNotAgentSession
@@ -549,6 +595,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .revoked: "scope_revoked"
         case .confirmationRequired: "confirmation_required"
         case .confirmationMismatch: "confirmation_mismatch"
+        case .mutationOwnerUnavailable: "mutation_owner_unavailable"
         default: nil
         }
     }
@@ -572,6 +619,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .selfTarget: "self_target"
         case .operationNotScopeAuthorizable: "operation_not_scope_authorizable"
         case .confirmationMismatch: "confirmation_mismatch"
+        case .mutationOwnerUnavailable: "mutation_owner_unavailable"
         case .duplicateScopeID: "duplicate_scope_id"
         case .approvalExceedsRequest: "approval_exceeds_request"
         case .capabilitiesEmpty: "capabilities_empty"

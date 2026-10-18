@@ -187,12 +187,38 @@ public enum ProfileLocationError: Error, Equatable, LocalizedError {
 
 /// An injected profile boundary for metadata engines. Repository/tool output
 /// paths are deliberately not governed by this value.
-public struct AppMetadataPathPolicy: Sendable {
+public final class AppMetadataPathPolicy: @unchecked Sendable {
     public let locations: AppProfileLocations
-    public let roots: [URL]
+    private let lock = NSLock()
+    private var admittedRoots: [URL]
+    private var profileLease: DebugProfileAccessLease?
+    public var roots: [URL] {
+        lock.withLock { admittedRoots }
+    }
+
     public init(locations: AppProfileLocations, roots: [URL]) {
         self.locations = locations
-        self.roots = roots
+        admittedRoots = roots
+    }
+
+    /// The app's explicit storage-selection boundary calls this before moving bytes.
+    /// Retain old safe roots while in-flight owners settle; admission is not a catalog move.
+    public func admitWorkspaceRoot(_ root: URL) throws {
+        try locations.validateCustomWorkspaceDirectory(root)
+        try locations.validateWritableRoot(root)
+        lock.withLock {
+            if !admittedRoots.contains(root) { admittedRoots.append(root) }
+        }
+    }
+
+    /// Called before a headless runtime opens the default shared debug profile.
+    /// The policy is retained by runtime configuration for the lifetime of its stores.
+    public func acquireProfileAccess() throws {
+        guard locations.identity.buildFlavor == .debug,
+              roots.contains(where: { $0.standardizedFileURL.pathComponents.starts(with: locations.applicationSupportRoot.standardizedFileURL.pathComponents) }) else { return }
+        try lock.withLock {
+            if profileLease == nil { profileLease = try DebugProfileAccessLease.acquire(locations: locations, exclusive: false) }
+        }
     }
 
     public func validate(_ url: URL) throws {

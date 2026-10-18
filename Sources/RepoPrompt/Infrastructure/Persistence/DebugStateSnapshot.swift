@@ -161,18 +161,13 @@ struct DebugStateSnapshot {
         guard code == SQLITE_DONE, finish == SQLITE_OK else { throw Failure.database(code == SQLITE_DONE ? finish : code) }
     }
 
-    func publish(plan: Plan, cleanSlate: Bool, preferences: Data, previousPreferences: Data, startedAt: Date = Date()) throws -> Receipt {
+    func publish(plan: Plan, cleanSlate: Bool, preferences: Data, previousPreferences: Data, startedAt: Date = Date(), profileLease: DebugProfileAccessLease? = nil) throws -> Receipt {
+        let lease = try profileLease ?? DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
+        defer { withExtendedLifetime(lease) {} }
         let root = locations.applicationSupportRoot
         try locations.validateWritableRoot(root)
         let parent = root.deletingLastPathComponent()
         try Self.requireDirectory(parent)
-        let lockURL = parent.appendingPathComponent(".repoprompt-ce-debug-seed.lock")
-        try locations.validateMetadataFile(lockURL)
-        let descriptor = open(lockURL.path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard descriptor >= 0 else { throw Failure.unsafeDestination }
-        defer { close(descriptor) }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw Failure.unsafeDestination }
-        defer { flock(descriptor, LOCK_UN) }
         let recovery = parent.appendingPathComponent("RepoPrompt CE Debug Recovery", isDirectory: true)
         try locations.validateWritableRoot(recovery)
         if fm.fileExists(atPath: recovery.path) { try Self.requireDirectory(recovery) }

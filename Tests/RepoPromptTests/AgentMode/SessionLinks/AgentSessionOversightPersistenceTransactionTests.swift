@@ -141,9 +141,8 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             set { lock.withLock { shouldFail = newValue } }
         }
 
-        func write(_ data: Data, to url: URL) throws {
+        func check() throws {
             if failsNextWrites { throw CocoaError(.fileWriteOutOfSpace) }
-            try data.write(to: url, options: .atomic)
         }
     }
 
@@ -239,7 +238,7 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         )
     }
 
-    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled) -> Fixture {
+    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled, scopes: DelegationScopeRuntime? = nil) -> Fixture {
         let authority = DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -259,7 +258,7 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: mode,
-            writer: { data, url in try gate.write(data, to: url) }
+            beforeCommit: { try gate.check() }
         )
         let bridge = AgentSessionLinkRuntimeBridge(
             authority: authority,
@@ -268,7 +267,8 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
                 await MainActor.run {
                     host?.onToolAdvertisementInvalidation?(sessionID)
                 }
-            }
+            },
+            delegationScopes: scopes
         )
         bridge.installIntentStore(store)
         return Fixture(
@@ -313,6 +313,60 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
 
     // MARK: - Tests
 
+    func testContinuityBootsConsentFirstAndReopenReadsCurrentScopeProvenance() async throws {
+        // Opt into the real production restore mode; the default unit-test owner is ephemeral.
+        let scopes = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        let fixture = makeFixture(scopes: scopes)
+        let scopeStore = DelegationScopeStore(
+            fileURL: directory.appendingPathComponent(DelegationScopeStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled
+        )
+        let seed = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let request = try seed.requestScope(
+            requesterSessionID: fixture.observer.sessionID, requesterTabID: nil,
+            kind: .session(targetSessionID: fixture.target.sessionID), capabilities: [.observe, .control, .restructure],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        let scope = try seed.approve(requestID: request.id).get()
+        XCTAssertEqual(scopeStore.record(operationID: UUID(), grants: [scope.grant], revoked: []), .applied)
+        _ = await fixture.store.loadForLaunch()
+        _ = await fixture.store.insert(fixture.pair) // Coordinator will keep this first-seen unscoped key.
+        await fixture.store.serializationBarrier()
+        var observedIntentBootstrap = false
+        fixture.bridge.test_beforeIntentBootstrap = {
+            observedIntentBootstrap = true
+            XCTAssertTrue(fixture.bridge.delegationScopes.record(id: scope.id)?.isActive == true, "Consent must be restored before intents start")
+        }
+        await fixture.bridge.bootstrapContinuity(scopeStore: scopeStore, intentStore: fixture.store)
+        XCTAssertTrue(observedIntentBootstrap)
+        guard case .added = await add(fixture), let first = await liveReference(fixture) else { return XCTFail("Initial plain link") }
+        _ = await stop(fixture, linkID: first.linkID, generation: first.generation)
+        let scoped = await fixture.bridge.addDelegatedMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint, targetEndpoint: fixture.target.domainEndpoint,
+            authorization: .init(sourceScopeID: scope.id) { fixture.bridge.delegationScopes.record(id: scope.id)?.isActive == true }
+        )
+        XCTAssertNil(scoped.failureMessage)
+        // Real window close first captures ownership of the preserved intent, then invalidates
+        // endpoints. Raw invalidation without that capture intentionally removes the saved row.
+        fixture.bridge.noteOversightWindowClosing(windowID: fixture.target.windowID)
+        await fixture.bridge.invalidateWindow(fixture.target.windowID, reason: .windowClosed)
+        let reopened = makeCandidate(windowID: 3, displayName: "Reopened", sessionID: fixture.target.sessionID)
+        fixture.host.candidates = [fixture.observer, reopened]
+        let currentToken = await fixture.store.token(for: fixture.pair)
+        let token = try XCTUnwrap(currentToken)
+        let generation = await fixture.store.assertionGeneration(for: fixture.pair)
+        let result = await fixture.bridge.launchCoordinatorEstablish(
+            pair: fixture.pair, token: token, assertedAt: generation, proof: nil
+        )
+        XCTAssertNil(result.outcome.failureMessage)
+        let restored = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        XCTAssertEqual(restored.items.first?.sourceScopeID, scope.id, "Never reserve from the coordinator's stale nil-provenance key")
+        _ = fixture.bridge.delegationScopes.revoke(scopeID: scope.id)
+        let afterRevoke = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        XCTAssertTrue(afterRevoke.items.isEmpty, "Reopened link must not outlive the exact consent")
+        await fixture.store.serializationBarrier()
+    }
+
     func testAddPersistsIntentAndStopRemovesItBeforeTheGrantIsRevoked() async throws {
         let fixture = makeFixture()
 
@@ -331,7 +385,7 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         XCTAssertTrue(inventory.items.isEmpty)
     }
 
-    func testAddIsRefusedAndNothingIsGrantedWhenTheDurableWriteFails() async {
+    func testUserBackedAddSucceedsWithAnHonestFailedSaveDiagnostic() async {
         let fixture = makeFixture()
         _ = await fixture.store.loadForLaunch()
         fixture.gate.failsNextWrites = true
@@ -339,28 +393,37 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         let outcome = await add(fixture)
 
         let token = await fixture.store.token(for: fixture.pair)
-        XCTAssertEqual(outcome.failureMessage, AgentSessionOversightPersistenceCopy.addWriteFailed)
-        XCTAssertNil(token)
+        XCTAssertNil(outcome.failureMessage)
+        XCTAssertNotNil(token)
+        await fixture.store.serializationBarrier()
+        let saveState = await fixture.store.saveState
+        XCTAssertEqual(saveState, "failed")
         let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
-        XCTAssertTrue(inventory.items.isEmpty, "Persistence commits before the reservation, so nothing may be granted.")
+        XCTAssertEqual(inventory.items.count, 1, "Saving cannot veto a live user-backed link.")
     }
 
-    func testStopWriteFailureLeavesBothTheGrantAndTheSavedIntentIntact() async throws {
+    func testLiveStopRevokesDespiteFailedSavingAndRetryCommitsRemoval() async throws {
         let fixture = makeFixture()
         guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
         let live = await liveReference(fixture)
         let reference = try XCTUnwrap(live)
-        let currentToken = await fixture.store.token(for: fixture.pair)
-        let token = try XCTUnwrap(currentToken)
+        await fixture.store.serializationBarrier()
         fixture.gate.failsNextWrites = true
 
         let outcome = await stop(fixture, linkID: reference.linkID, generation: reference.generation)
 
         let tokenAfterStop = await fixture.store.token(for: fixture.pair)
-        XCTAssertEqual(outcome, .failed(message: AgentSessionOversightPersistenceCopy.stopWriteFailed))
-        XCTAssertEqual(tokenAfterStop, token)
+        XCTAssertEqual(outcome, .stopped)
+        XCTAssertNil(tokenAfterStop)
         let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
-        XCTAssertEqual(inventory.items.count, 1, "A Stop that could not commit must not report the link gone.")
+        XCTAssertTrue(inventory.items.isEmpty, "Saving cannot undo a live revocation.")
+        await fixture.store.serializationBarrier()
+        let failedState = await fixture.store.saveState
+        XCTAssertEqual(failedState, "failed")
+        fixture.gate.failsNextWrites = false
+        await fixture.store.retrySaving()
+        let savedState = await fixture.store.saveState
+        XCTAssertEqual(savedState, "saved")
     }
 
     func testExactStopEndpointMismatchLeavesTheDurableTokenAndGrantIntact() async throws {
@@ -1177,24 +1240,26 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         XCTAssertEqual(repeated, .alreadyStopped)
     }
 
-    func testSuppressedLaunchRefusesAddWithoutReservingAnything() async {
+    func testSuppressedContinuityStillAllowsUserBackedLiveAdd() async {
         let fixture = makeFixture(mode: .suppressed)
 
         let outcome = await add(fixture)
 
-        XCTAssertEqual(outcome.failureMessage, AgentSessionOversightPersistenceCopy.suppressedLaunch)
+        XCTAssertNil(outcome.failureMessage)
         let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
-        XCTAssertTrue(inventory.items.isEmpty)
+        XCTAssertEqual(inventory.items.count, 1)
+        let saveState = await fixture.store.saveState
+        XCTAssertEqual(saveState, "not_persisted")
     }
 
-    func testBlockedStorePreservesTheFileAndRefusesAdd() async throws {
+    func testUnknownLegacyStorePreservesTheFileWithoutVetoingLiveAdd() async throws {
         let fileURL = directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
         try Data(#"{"version":99,"links":[]}"#.utf8).write(to: fileURL, options: .atomic)
         let fixture = makeFixture()
 
         let outcome = await add(fixture)
 
-        XCTAssertEqual(outcome.failureMessage, AgentSessionOversightPersistenceCopy.futureSchema)
+        XCTAssertNil(outcome.failureMessage)
         XCTAssertEqual(
             try String(data: Data(contentsOf: fileURL), encoding: .utf8),
             #"{"version":99,"links":[]}"#

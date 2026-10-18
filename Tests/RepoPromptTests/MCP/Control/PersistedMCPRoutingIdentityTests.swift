@@ -94,6 +94,132 @@ import RepoPromptSettingsCore
         }
 
         @MainActor
+        func testSharedProviderProcessUsesExactRunAffinityAndRejectsAmbiguousBootstrap() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            let client = AgentProviderKind.openCodeMCPClientID
+            let runA = UUID(), runB = UUID()
+            let firstA = UUID(), firstB = UUID(), unknown = UUID(), reconnectB = UUID(), reconnectAgain = UUID()
+            let tokenA = "shared-process-A-\(runA)", tokenB = "shared-process-B-\(runB)"
+            addTeardownBlock { @MainActor in
+                for runID in [runA, runB] {
+                    await manager.clearExpectedAgentPID(getppid(), for: client, runID: runID)
+                    await manager.clearExpectedAgentPID(getpid(), for: client, runID: runID)
+                    await manager.clearClientConnectionPolicy(for: client, windowID: window.windowID, runID: runID)
+                    await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                }
+                for id in [firstA, firstB, unknown, reconnectB, reconnectAgain] {
+                    await manager.removeConnection(id)
+                }
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            func install(_ runID: UUID, expectedPID: pid_t = getppid()) async {
+                await manager.registerExpectedAgentPID(expectedPID, for: client, runID: runID)
+                await manager.installClientConnectionPolicy(
+                    for: client, windowID: window.windowID, restrictedTools: ["apply_edits"],
+                    oneShot: true, reason: "Shared-process exact run regression", ttl: 60,
+                    runID: runID, purpose: .agentModeRun, requiresExpectedAgentPID: true
+                )
+            }
+            // Establish each route unambiguously, then reuse the same provider process
+            // for both. Their tokens, not ancestry or queue order, identify reconnects.
+            for (run, connection, token) in [(runA, firstA, tokenA), (runB, firstB, tokenB)] {
+                let pid = run == runA ? getpid() : getppid()
+                await install(run, expectedPID: pid)
+                let admitted = await manager.debugApplyPendingPolicy(
+                    clientName: client, connectionID: connection, clientPid: Int(pid), sessionKey: token
+                )
+                XCTAssertEqual(admitted.outcome, "applied")
+                XCTAssertEqual(admitted.runID, run)
+            }
+            await install(runA)
+            await install(runB)
+            let ambiguous = await manager.debugApplyPendingPolicy(
+                clientName: client, connectionID: unknown, clientPid: Int(getpid()), sessionKey: "unknown-\(UUID())"
+            )
+            XCTAssertEqual(ambiguous.outcome, "rejected:ambiguous_run_policy")
+            let unknownRun = await manager.debugCachedRunID(for: unknown)
+            XCTAssertNil(unknownRun)
+            let unconsumed = await manager.debugPendingPolicySnapshot(for: client)
+            XCTAssertEqual(Set(unconsumed.compactMap(\.runID)), [runA, runB])
+
+            let reconnected = await manager.debugApplyPendingPolicy(
+                clientName: client, connectionID: reconnectB, clientPid: Int(getpid()), sessionKey: tokenB
+            )
+            XCTAssertEqual(reconnected.outcome, "applied")
+            XCTAssertEqual(reconnected.runID, runB, "Older A must not capture or deny B's reconnect")
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runA), firstA)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runB), reconnectB)
+            let remaining = await manager.debugPendingPolicySnapshot(for: client)
+            XCTAssertEqual(remaining.compactMap(\.runID), [runA])
+
+            // Even without another B policy, the authenticated B token can reconnect
+            // while A is pending. It must neither consume A nor fall back to its window/run.
+            let again = await manager.debugApplyPendingPolicy(
+                clientName: client, connectionID: reconnectAgain, clientPid: Int(getpid()), sessionKey: tokenB
+            )
+            XCTAssertEqual(again.outcome, "fallback")
+            let againRun = await manager.debugCachedRunID(for: reconnectAgain)
+            XCTAssertEqual(againRun, runB)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runA), firstA)
+
+            // A sole pending B policy is still ambiguous for a fresh token whose PID
+            // also owns active A. Dropping a reconnect token must never capture B.
+            await manager.clearClientConnectionPolicy(for: client, windowID: window.windowID, runID: runA)
+            await install(runB)
+            let lonePending = await manager.debugApplyPendingPolicy(
+                clientName: client, connectionID: unknown, clientPid: Int(getpid()), sessionKey: "fresh-\(UUID())"
+            )
+            XCTAssertEqual(lonePending.outcome, "rejected:ambiguous_run_policy")
+            let stillPending = await manager.debugPendingPolicySnapshot(for: client)
+            XCTAssertEqual(stillPending.compactMap(\.runID), [runB])
+        }
+
+        @MainActor
+        func testTerminalRunCleanupRetiresOnlyItsPendingBootstrapPolicy() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            let client = AgentProviderKind.openCodeMCPClientID
+            let retired = UUID(), next = UUID(), connection = UUID()
+            addTeardownBlock { @MainActor in
+                for runID in [retired, next] {
+                    await manager.clearExpectedAgentPID(getpid(), for: client, runID: runID)
+                    await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                }
+                await manager.removeConnection(connection)
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            for runID in [retired, next] {
+                await manager.registerExpectedAgentPID(getpid(), for: client, runID: runID)
+                await manager.installClientConnectionPolicy(
+                    for: client, windowID: window.windowID, restrictedTools: ["apply_edits"],
+                    oneShot: true, ttl: 60, runID: runID, purpose: .agentModeRun,
+                    requiresExpectedAgentPID: true
+                )
+            }
+            // The route owner can finish before its socket arrives. Normal run cleanup,
+            // not fixture-wide policy clearing, must fence that late bootstrap.
+            await manager.cleanupRunRoutingState(for: retired, windowID: window.windowID)
+            let policies = await manager.debugPendingPolicySnapshot(for: client)
+            XCTAssertEqual(policies.compactMap(\.runID), [next])
+            let admitted = await manager.debugApplyPendingPolicy(
+                clientName: client, connectionID: connection, clientPid: Int(getpid()),
+                sessionKey: "after-terminal-\(UUID())"
+            )
+            XCTAssertEqual(admitted.outcome, "applied")
+            XCTAssertEqual(admitted.runID, next)
+            XCTAssertNil(window.mcpServer.connectionID(forRunID: retired))
+        }
+
+        @MainActor
         func testPreCallBindingRejectsUnrelatedWindowThenRestoresStableWorkspace() async throws {
             let clientName = "Issue862RoutingBoundaryTests"
             let sessionKey = "issue-862-boundary-\(UUID().uuidString)"

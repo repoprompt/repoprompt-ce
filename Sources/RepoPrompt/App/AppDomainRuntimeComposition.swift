@@ -115,7 +115,7 @@ final class AppDomainRuntimeComposition: Sendable {
         let locations = AppProfileLocations.current
         let root = locations.applicationSupportRoot
         let defaults = UserDefaults.standard
-        let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        let customStoragePath = WorkspaceStoragePreference.customStoragePath(defaults: defaults)
         var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
         if let customStoragePath,
            let bytes = try? JSONEncoder().encode(customStoragePath)

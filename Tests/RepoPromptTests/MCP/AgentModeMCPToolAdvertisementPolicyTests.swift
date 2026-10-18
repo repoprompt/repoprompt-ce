@@ -311,7 +311,9 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                     let link = tools.first { $0["name"] as? String == "agent_session_link" }
                     let bootstrap = tools.contains { $0["name"] as? String == "become_overseer" }
                     XCTAssertEqual(link != nil, index < 3, role)
-                    XCTAssertEqual(bootstrap, candidate && index == 3, role)
+                    // Targeted bootstrap stays discoverable for eligible linked/activated roles;
+                    // the excluded role and disabled experiment still must not receive it.
+                    XCTAssertEqual(bootstrap, candidate && index < 4, role)
                     if index == 2, candidate { XCTAssertEqual(operations(link), ["set_waiting_on", "request_attention", "create_lane"]) }
                     if index < 2 || (index == 2 && !candidate) { XCTAssertGreaterThan(operations(link).count, 3, role) }
                 }

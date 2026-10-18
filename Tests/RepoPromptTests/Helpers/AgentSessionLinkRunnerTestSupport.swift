@@ -73,6 +73,8 @@ final class AgentSessionLinkRunnerHarness {
     /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
     /// provider boundary without duplicating runner logic.
     var forcedAutoWakeID: UUID?
+    var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
+    private var workspaces: [WorkspaceManagerViewModel] = []
 
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
@@ -192,7 +194,7 @@ final class AgentSessionLinkRunnerHarness {
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
-                        if let sessionLinkHost {
+                        if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                             return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
@@ -227,11 +229,29 @@ final class AgentSessionLinkRunnerHarness {
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        sessionLinkHost?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
                     }
+                },
+                proveAgentSessionLinkProviderInput: { session, claim in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                    }
+                    return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+                },
+                handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                    }
+                    return AgentSessionLinkProviderInputRelease.handoff(
+                        original: claim,
+                        proof: proof,
+                        current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed },
+                        isPending: { _ in true },
+                        consume: { _ in false }
+                    )
                 }
             ),
             interactions: .init(
@@ -313,6 +333,19 @@ final class AgentSessionLinkRunnerHarness {
                 )
             }
         )
+    }
+
+    func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
+        let tabID = UUID()
+        workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+        let session = host.session(for: tabID)
+        session.selectedAgent = agent
+        session.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        return session
     }
 
     func makeSession(agent: AgentProviderKind) -> AgentModeViewModel.TabSession {

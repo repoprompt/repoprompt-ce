@@ -687,6 +687,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
         /// Test-only suspension point after async route qualification and before Codex's final route fence.
         var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
+        /// Supplies an optional frozen claim component for real native-adapter release tests.
+        var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)?
+        /// Gates only the Read proof, retaining the production claim and synchronous handoff owners.
+        var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -1046,7 +1050,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             TabSession
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
+    weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     private var hasPreparedForWindowClose = false
+    private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     /// The restore service has already loaded and projected all metadata before
     /// it begins yielding preferred rows. Publishing those rows in fixed-size
@@ -2465,6 +2471,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
                 self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
             },
+            proveLocalInput: { [weak self] session, claim in
+                guard let self else { return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false } }
+                return await agentSessionLinkProveProviderInput(for: session, claim: claim)
+            },
+            handoffLocalInput: { [weak self] session, dispatchID, claim, proof in
+                guard let self else { return AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .nothingOwed }, isPending: { _ in false }, consume: { _ in false }) }
+                return agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+            },
             acceptAgentSessionLinkPromptClaim: { [weak self] session, context, claim in
                 self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
@@ -3394,6 +3408,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 acceptAgentSessionLinkPrompt: { [weak self] session, context, claim in
                     self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                },
+                proveAgentSessionLinkProviderInput: { [weak self] session, claim in
+                    guard let self else { return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false } }
+                    return await agentSessionLinkProveProviderInput(for: session, claim: claim)
+                },
+                handoffAgentSessionLinkProviderInput: { [weak self] session, dispatchID, claim, proof in
+                    guard let self else {
+                        return AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .nothingOwed }, isPending: { _ in false }, consume: { _ in false })
+                    }
+                    return agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                 }
             ),
             interactions: .init(
@@ -4676,8 +4700,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        if let task = windowClosePreparationTask { await task.value
+            return
+        }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            await performWindowClosePreparation()
+        }
+        windowClosePreparationTask = task
+        await task.value
+    }
+
+    private func performWindowClosePreparation() async {
         queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
@@ -4797,6 +4833,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // MARK: - Tab Management
 
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
+        // A prepared runtime has no UI selection. Only explicit, consent-fenced preparation may
+        // hydrate it; a projected tab publication must never reconnect its provider.
+        guard workspaceManager?.isSessionRuntimeProjection != true else { return }
         // An actual duplicate of the complete target with live work joins it; it never advances the
         // generation and abandons that work's continuation (§4.5).
         if let tabID, isDuplicateActivationOfLiveTarget(tabID) {
@@ -5557,6 +5596,89 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// An explicitly authorized, targeted load for oversight. Unlike sidebar presentation, this
+    /// may materialize just this saved session, but never selects a tab or reconnects a provider.
+    func finishPreparedOversightRuntime() async -> Bool {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        for session in sessions.values {
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+            flushPendingAssistantDelta(session)
+        }
+        await prepareForWindowClose()
+        var saved = true
+        for session in sessions.values {
+            if let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id) { continue }
+            switch await saveSession(for: session.tabID) {
+            case .saved, .notRequired: saved = saved && !session.isDirty
+            case .deferred, .failed: saved = false
+            }
+        }
+        return saved
+    }
+
+    /// Transfer only a settled idle runtime. A failed save keeps the original in-memory owner;
+    /// visiting a tab must never discard a managed response that has not reached disk.
+    func settlePreparedOversightHandoff() async -> Bool {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        for session in sessions.values {
+            guard !session.runState.isActive, session.permitsBoundOperationAndSave else { return false }
+            flushPendingAssistantDelta(session)
+            switch await saveSession(for: session.tabID) {
+            case .saved, .notRequired:
+                guard !session.isDirty, !session.runState.isActive else { return false }
+            case .deferred, .failed: return false
+            }
+        }
+        return true
+    }
+
+    func prepareSavedOversightSession(
+        tabID: UUID, sessionID: UUID, workspaceID: UUID,
+        isStillAuthorized: @MainActor () -> Bool
+    ) async -> Bool {
+        guard !Task.isCancelled, isStillAuthorized(), let workspaceManager,
+              workspaceManager.activeWorkspaceID == workspaceID,
+              let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+              tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return false }
+        if tab.activeAgentSessionID == nil {
+            guard let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == tabID,
+                  preferredActiveSidebarEntry(for: tabID, tabName: tab.name, workspaceID: workspaceID)?.id == sessionID,
+                  sessions[tabID].map({
+                      $0.activeAgentSessionID == nil && !$0.isDirty && $0.items.isEmpty
+                          && !$0.runState.isActive && !$0.bindingTransitionInProgress
+                          && !bindingHasSynchronousOwnership($0)
+                  }) ?? true,
+                  isStillAuthorized(),
+                  workspaceManager.compareAndSetActiveAgentSessionID(
+                      expected: nil, replacement: sessionID, forTabID: tabID, inWorkspaceID: workspaceID
+                  )
+            else { return false }
+        }
+        let session = session(for: tabID)
+        if session.activeAgentSessionID == nil {
+            guard !session.isDirty, session.items.isEmpty, !session.runState.isActive,
+                  !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session),
+                  isStillAuthorized(), installPersistentSessionBinding(
+                      sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+                  ) != nil
+            else { return false }
+            // The previous unbound/empty payload was not a load of this saved identity.
+            session.hasLoadedPersistedState = false
+        }
+        guard session.activeAgentSessionID == sessionID else { return false }
+        _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+        return !Task.isCancelled && isStillAuthorized() && sessions[tabID] === session
+            && workspaceManager.activeWorkspaceID == workspaceID
+            && workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == sessionID
+            && session.activeAgentSessionID == sessionID && session.permitsBoundOperationAndSave
+            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+    }
+
     private enum PersistentSessionBindingMutationTarget {
         case runtimeOnly
         case compareAndSet(workspaceID: UUID)
@@ -5573,6 +5695,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         invalidateAsyncWork: Bool,
         freshCreation: AgentSessionCreationClaim? = nil
     ) -> AgentPersistentSessionBindingIdentity? {
+        if let sessionID, workspaceManager?.isSessionRuntimeProjection != true,
+           preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true { return nil }
         if session.activeAgentSessionID == sessionID {
             return session.persistentSessionBindingIdentity
         }
@@ -5973,20 +6097,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func authoritativeLiveSessionStates(for sessionIDs: Set<UUID>) -> [UUID: AuthoritativeLiveSessionState] {
-        guard !sessionIDs.isEmpty else { return [:] }
-        let snapshot = makePersistentBindingResolutionSnapshot(for: sessionIDs)
-        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
-            let state: AuthoritativeLiveSessionState
-            do {
-                if let session = try authoritativeLiveSession(for: sessionID, using: snapshot) {
-                    state = session.runState.isActive ? .running : .idle
-                } else {
-                    state = .notFound
-                }
-            } catch {
-                state = .ambiguous
+        authoritativeLiveSessionCensus(for: sessionIDs).states
+    }
+
+    /// Rich liveness values and their states observed from one binding census, for a read that needs
+    /// both (runtime owners and liveness accounting) without building a second census in the same turn.
+    struct AuthoritativeLiveSessionCensus {
+        let sessions: [UUID: Result<TabSession?, Error>]
+        /// Observed when the census is taken, never re-derived later from a mutated session.
+        let states: [UUID: AuthoritativeLiveSessionState]
+    }
+
+    func authoritativeLiveSessionCensus(for sessionIDs: Set<UUID>) -> AuthoritativeLiveSessionCensus {
+        let sessions = authoritativeLiveSessions(for: sessionIDs)
+        return AuthoritativeLiveSessionCensus(sessions: sessions, states: sessions.mapValues { result in
+            switch result {
+            case let .success(session?): session.runState.isActive ? .running : .idle
+            case .success(nil): .notFound
+            case .failure: .ambiguous
             }
-            return (sessionID, state)
         })
     }
 
@@ -6039,6 +6168,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedTransition: PersistentBindingTransitionToken? = nil,
         requiresHydration: Bool = false
     ) async throws -> AgentPersistentSessionBindingIdentity {
+        if workspaceManager?.isSessionRuntimeProjection != true,
+           let owners = preparedSessionRuntimes,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
+        {
+            if let workspace = workspaceManager?.activeWorkspace {
+                let tabID = targetSession.tabID
+                let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+                owners.queuePreparedRuntimeVisit(requestedSessionID) { [weak self, weak targetSession] in
+                    guard let self, let targetSession, !self.hasPreparedForWindowClose,
+                          sessions[tabID] === targetSession,
+                          workspaceManager?.activeWorkspaceID == workspace.id,
+                          workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: requestedSessionID, workspace: workspace)
+                }
+            }
+            throw PersistentBindingMutationError.blockedByOwnership
+        }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
         {
@@ -7267,6 +7413,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
     func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
+        let owners = preparedSessionRuntimes
+        let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+        let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
+            ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return session(for: tabID) }
+        defer {
+            if let preparedVisitID {
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
+            }
+        }
+        if workspaceManager?.isSessionRuntimeProjection != true,
+           let id = workspaceManager?.activeAgentSessionID(forTabID: tabID),
+           let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: id, preparingReplacement: false))
+        {
+            // Keep one writer while the run settles; the user's visit is resumed by the
+            // owner's existing run-state observation, without a second click or polling timer.
+            let workspaceID = workspaceManager?.activeWorkspaceID
+            owners.queuePreparedRuntimeVisit(id) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspaceID,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == id else { return }
+                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders)
+            }
+            return session(for: tabID)
+        }
         let session = session(for: tabID)
 
         // Load persisted session if we haven't already.
@@ -7298,6 +7470,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel
     ) async -> AgentRouteSessionActivationResult {
+        let owners = preparedSessionRuntimes
+        let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
+            ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return .blockedByActiveDifferentSession }
+        defer {
+            if let preparedVisitID {
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
+            }
+        }
+        if let preparedVisitID, let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID, preparingReplacement: false))
+        {
+            let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+            owners.queuePreparedRuntimeVisit(preparedVisitID) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspace.id,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace)
+            }
+            return .blockedByActiveDifferentSession
+        }
         guard let sessionID else {
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
             return sessions[tabID] === session && session.operationAdmissionFailureMessage == nil
@@ -10256,7 +10449,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: intendedSessionID,
                 parentSessionID: parentSessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
             let createdTabID = creation.tabID
             defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
@@ -10432,7 +10626,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID,
         parentSessionID: UUID?,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard promptManager != nil else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10445,7 +10640,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 name: name,
                 sessionID: sessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
         } catch {
             provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
@@ -10457,7 +10653,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         name: String?,
         sessionID: UUID,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard let promptManager else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10504,7 +10701,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 removePendingUIRefresh(for: creation.session.tabID)
             }
         }
-        switch try await promptManager.createDurableBackgroundAgentSessionTab(
+        let admissionResult = try await promptManager.createDurableBackgroundAgentSessionTab(
             name: name,
             sessionID: sessionID,
             expectedWorkspaceID: expectedWorkspaceID,
@@ -10516,7 +10713,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 return true
             }
-        ) {
+        )
+        switch admissionResult {
         case let .created(createdTab, receipt, recoveryClaim):
             let identity = receipt.outcome.workspaceID.map {
                 AgentSessionLifecycleAuthority.Identity(
@@ -10547,24 +10745,60 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 recoveryClaim: recoveryClaim,
                 freshSession: capturedFreshSession
             )
-        case let .rejected(receipt, reason):
+        case let .rejected(receipt, reason), let .recoveryRequired(_, receipt, reason, _):
+            let retainedAdmission: AgentSessionLaneAdmissionFailure.RetainedAdmission?
+            if case let .recoveryRequired(identity, _, _, recovery) = admissionResult {
+                let recoveryValue: AgentSessionLaneAdmissionFailure.RetainedAdmission.Recovery = switch recovery {
+                case .recovered: .recovered
+                case .alreadyRecovered: .alreadyRecovered
+                case .localOnly: .localOnly
+                case .ownershipChanged: .ownershipChanged
+                case .retryablePartial: .retryablePartial
+                case let .failed(category): .failed(category.rawValue)
+                case let .blockedManual(category): .blockedManual(category.rawValue)
+                }
+                retainedAdmission = .init(identity: identity, recovery: recoveryValue)
+            } else {
+                retainedAdmission = nil
+            }
+            let retainedLifecycleIdentity = retainedAdmission.map {
+                AgentSessionLifecycleAuthority.Identity(
+                    workspaceID: $0.identity.workspaceID,
+                    tabID: $0.identity.tabID,
+                    sessionID: $0.identity.sessionID,
+                    persistentBindingGeneration: nil,
+                    bindingTransitionGeneration: 0
+                )
+            }
             sessionLifecycleAuthority.record(.init(
                 caller: .agentRunStart,
                 intent: .createOrContinue,
                 phase: .beforeProviderStart,
                 decision: .rejected,
-                identity: tentativeIdentity,
+                identity: retainedLifecycleIdentity ?? tentativeIdentity,
                 previousSessionID: nil,
                 currentSessionID: sessionID,
                 isPinned: false,
                 isLive: false,
                 isActive: false,
-                isProtected: false,
+                isProtected: retainedAdmission != nil,
                 workspaceSaveResult: receipt.outcome.diagnosticCategory,
                 reason: reason.rawValue
             ))
+            if case .oversightLane = creationKind {
+                throw AgentSessionLaneAdmissionFailure(
+                    reason: reason.rawValue,
+                    saveResult: receipt.outcome.diagnosticCategory,
+                    category: receipt.outcome.normalizedFailureCategory?.rawValue ?? "none",
+                    domainDiagnostic: receipt.outcome.domainDiagnostic,
+                    domainErrorCode: receipt.outcome.domainErrorCode?.rawValue,
+                    workingCommitted: receipt.outcome.workingCommitted || receipt.commitEvidence != .none,
+                    retainedAdmission: retainedAdmission
+                )
+            }
+            if retainedAdmission != nil, Task.isCancelled { throw CancellationError() }
             throw MCPError.internalError(
-                "The Agent session could not be started because its workspace binding was not durably accepted. No provider was started; resolve workspace persistence and retry."
+                "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory), category=\(receipt.outcome.normalizedFailureCategory?.rawValue ?? "none")). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
             )
         }
     }
@@ -14582,6 +14816,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: previousPerformanceSnapshotForBuild,
+            trackedLocalInputIDs: Set(session.localInputIndex.records.map(\.itemID)),
             previousSanitizedTranscript: existingTranscript,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
@@ -15002,6 +15237,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         precomputedEphemeralPayloadRevisionByItemID: [UUID: Int]? = nil,
         selectedAgent: AgentProviderKind,
         previousPerformanceSnapshot: AgentTranscriptPerformanceSnapshot,
+        trackedLocalInputIDs: Set<UUID> = [],
         previousSanitizedTranscript: AgentTranscript? = nil,
         previousBaseProjection: AgentTranscriptProjection? = nil,
         previousTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
@@ -15277,7 +15513,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 performanceSnapshot.lastColdLoadProjectionBuildDurationMS = buildDurationMS
             }
         #endif
+        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: trackedLocalInputIDs)
+        let analytics = AgentTranscriptAnalyticsBuilder.build(
+            from: sanitizedTranscript, selectedAgent: selectedAgent,
+            visitRequest: { localInputSeed.append($0) }
+        )
         return BuiltTranscriptPresentation(
+            localInputSeed: localInputSeed,
             transcript: sanitizedTranscript,
             baseProjection: baseProjection,
             fullProjection: fullProjection,
@@ -15288,10 +15530,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projectionProtection: projectionProtection,
             canonicalVisibleRowCount: canonicalVisibleRowCount,
             projectionCounts: projectionCounts,
-            analyticsSnapshot: AgentTranscriptAnalyticsBuilder.build(
-                from: sanitizedTranscript,
-                selectedAgent: selectedAgent
-            ),
+            analyticsSnapshot: analytics,
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
             rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID
@@ -15421,6 +15660,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         session.transcript = presentation.transcript
+        session.installLocalInputSeed(presentation.localInputSeed)
         session.baseTranscriptProjection = presentation.baseProjection
         session.fullTranscriptProjection = presentation.fullProjection
         session.workingTranscriptProjection = presentation.workingProjection
@@ -15465,6 +15705,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             precomputedEphemeralPayloadRevisionByItemID: canonicalSourceItems == session.items ? session.ephemeralToolResultPayloadRevisionByItemID : nil,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
+            trackedLocalInputIDs: Set(session.localInputIndex.records.map(\.itemID)),
             previousSanitizedTranscript: session.transcript,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
@@ -17140,6 +17381,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             return .notRequired
         }
+        if workspaceManager?.isSessionRuntimeProjection == true,
+           let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
+        {
+            return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
+        }
         var effectiveCreationSave = creationSave
         if let handle = creationSave?.handle {
             guard handle.session === session, freshSessionCreationIsCurrent(handle),
@@ -18341,6 +18587,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
+        composerOrigin: AgentUserInputOrigin? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
@@ -18423,7 +18670,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 appendOptimisticGoalObjectiveUserBubbleIfNeeded(
                     action: goalAction,
                     session: session,
-                    workflow: activeWorkflow
+                    workflow: activeWorkflow,
+                    composerOrigin: isLocalComposerInput && codexAttemptID == nil ? composerOrigin : nil
                 )
                 Task { [weak self] in
                     guard let self else { return }
@@ -18501,6 +18749,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID,
                     rawDraftText: rawDraftText,
+                    composerOrigin: composerOrigin,
                     autoEffortSelection: autoEffortSelection,
                     autoEffortAudit: autoEffortAudit,
                     routerAudit: routerAudit,
@@ -18523,6 +18772,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
+            composerOrigin: composerOrigin,
             autoEffortSelection: autoEffortSelection,
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
@@ -18549,6 +18799,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
+        composerOrigin: AgentUserInputOrigin? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
@@ -18620,6 +18871,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
+            composerOrigin: composerOrigin,
             autoEffortSelection: autoEffortSelection,
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
@@ -18752,7 +19004,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         draftText: String,
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        managedTurn: AgentNoncomposerTurn? = nil
+        managedTurn: AgentNoncomposerTurn? = nil,
+        localComposerCandidate: UUID? = nil
     ) {
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
@@ -18768,13 +19021,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ))
                 return
             }
+            defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
             guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else {
                 managedTurn?.sink.resolve(.unconfirmed(
                     message: "The overseen session stopped dispatching before its waiting instruction was delivered."
                 ))
                 return
             }
-            defer { session.codexDispatchSerialGate.finish(dispatchTicket) }
+            defer {
+                session.codexDispatchSerialGate.finish(dispatchTicket)
+            }
 
             let stillOwnsContinuation = {
                 self.sessions[tabID] === session
@@ -18898,11 +19154,34 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
+            let inputProof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
+            guard monitoring.claim?.localInput == nil || (
+                stillOwnsContinuation() && !Task.isCancelled &&
+                    agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
+            )
+            else {
+                rollbackWaitingInstructionSubmission(
+                    tabID: tabID,
+                    session: session,
+                    userItemID: userItemID,
+                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
+                    draftText: draftText,
+                    images: attachments,
+                    taggedFiles: taggedFiles,
+                    selectedWorkflow: selectedWorkflow,
+                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
+                    managedTurn: managedTurn,
+                    message: "The waiting request changed before dispatch. Your instruction was restored."
+                )
+                return
+            }
             guard resumeWaitingInstructionContinuation(
                 session: session,
                 providerText: monitoring.text,
                 claim: monitoring.claim,
-                origin: .user
+                origin: .user,
+                inputProof: inputProof,
+                undecoratedProviderText: augmentedText
             ) else {
                 // (A managed steer's rollback below settles its sink and skips the composer.)
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
@@ -18996,6 +19275,94 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
+    /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
+    func submitDelegationDecision(
+        _ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence,
+        resuming persisted: AgentSessionLinkSendDelivery? = nil
+    ) async -> DelegationDecisionDeliveryOutcome {
+        let deletion = AgentSessionDeletionRegistry.shared
+        guard !WindowStatesManager.shared.isTerminating,
+              !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
+              !deletion.isDeletionInProgress(sessionID: expectedSessionID) else { return .retry }
+        guard let session = sessions[tabID], session.activeAgentSessionID == expectedSessionID,
+              stopFence.permitsQueuedDelivery(to: session),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return .retry }
+        var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )
+        if session.runState == .waitingForUser, session.instructionContinuation != nil {
+            readiness.runStateIsActive = false
+            readiness.hasWaitingPrompt = false
+        }
+        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return .retry }
+        if persisted != nil, session.runState.isActive { return .retry }
+        if let persisted, !session.items.contains(where: { $0.id == persisted.targetItemID && $0.kind == .user && $0.text == text }) {
+            return .indeterminate // Never recreate an accepted row whose identity can no longer be proved.
+        }
+        // An app-authored decision resumes an idle requester; it is not an active managed steer.
+        // The steer path deliberately withdraws idle input, so use the existing claimed, durable
+        // noncomposer start instead. No draft, workflow, provider permission or link is borrowed.
+        if !session.runState.isActive {
+            guard let target = makeComposerSubmitTarget(tabID: tabID, session: session),
+                  target.route == .existingAgentSession, target.expectedSourceAgentSessionID == expectedSessionID
+            else { return .retry }
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+            )
+            guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return .retry }
+            let isCurrent: @MainActor () -> Bool = {
+                !WindowStatesManager.shared.isTerminating
+                    && WindowStatesManager.shared.allWindows.contains { $0.windowID == endpoint.windowID && !$0.isClosing && $0.agentModeViewModel === self }
+                    && self.sessions[tabID] === session && stopFence.permitsStart(of: session)
+                    && self.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
+                    && self.composerSubmitClaimIsCurrent(claim)
+                    && !deletion.isPermanentlyDeleted(sessionID: expectedSessionID)
+                    && !deletion.isDeletionInProgress(sessionID: expectedSessionID)
+                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                        session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true
+                    )) == nil
+            }
+            let outcome: AgentSessionLinkSendTransactionOutcome = if let persisted {
+                await startPersistedNoncomposerTurn(
+                    session: session, tabID: tabID, claim: claim, savedItemID: persisted.targetItemID,
+                    acceptedAt: persisted.acceptedAt, providerMessage: text, stopFence: stopFence,
+                    dispatchIsCurrent: isCurrent
+                )
+            } else {
+                await persistAndStartNoncomposerTurn(
+                    session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
+                    claim: claim, displayText: text, providerMessage: text, workflow: nil,
+                    attribution: nil, stopFence: stopFence, dispatchIsCurrent: isCurrent
+                )
+            }
+            let result = Self.delegationDecisionOutcome(outcome)
+            if case .indeterminate = result {
+                session.appendItem(.error("The approval notice's save is unconfirmed. It may already be on disk; it will not be duplicated or claimed delivered. Check this session before retrying.", sequenceIndex: session.nextSequenceIndex))
+            }
+            return result
+        }
+        let submission = submitPreparedUserTurn(
+            tabID: tabID, session: session, trimmedText: text,
+            attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
+            managedTurn: AgentNoncomposerTurn(
+                endpoint: endpoint, providerText: text, sink: AgentSessionLinkManagedSteerSink()
+            ),
+            stopFence: AgentRunStartStopFence(session: session), isLocalComposerInput: false
+        )
+        if case .submitted = submission { return .submitted }
+        return .retry
+    }
+
+    static func delegationDecisionOutcome(_ outcome: AgentSessionLinkSendTransactionOutcome) -> DelegationDecisionDeliveryOutcome {
+        switch outcome {
+        case .blocked(.persistenceIndeterminate): .indeterminate
+        case .blocked: .retry
+        case let .delivered(delivery) where delivery.deliveryState == .persisted || delivery.deliveryState == .runStartFailed: .persisted(delivery)
+        case .delivered: .submitted
+        }
+    }
+
     /// Shares prepared submission and provider settlement without borrowing link authority.
     @discardableResult
     func submitNoncomposerSteer(
@@ -19077,6 +19444,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
+        composerOrigin: AgentUserInputOrigin? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
@@ -19198,6 +19566,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        // Only the validated composer ingress supplies this positive token. Shared MCP/API
+        // defaults and attachment-only synthetic bubble labels never qualify.
+        let localComposerCandidate = composerOrigin == .localComposer && isLocalComposerInput
+            && managedTurn == nil && codexAttemptID == nil && !trimmedText.isEmpty
+            ? session.registerLocalComposerCandidate(itemID: userItem.id, at: session.items.count - 1) : nil
         if managedTurn == nil, isLocalComposerInput,
            let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID)
         {
@@ -19303,7 +19676,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorationDraftText,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                managedTurn: managedTurn
+                managedTurn: managedTurn,
+                localComposerCandidate: localComposerCandidate
             )
             return UserTurnSubmissionResult.submitted
         }
@@ -19328,6 +19702,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let managedSteerRunID = session.runID
             let managedSteerAttemptID = session.activeRunAttemptID
             Task {
+                // This producer owns every rollback decision. Close only after those decisions,
+                // including serial-gate cancellation that deliberately retains the row.
+                defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                 var handedOffToSerialDispatch = false
                 defer {
                     if !handedOffToSerialDispatch {
@@ -19473,6 +19850,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
                 Task { [weak self, weak session] in
                     guard let self, let session else { return }
+                    defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     #if DEBUG
                         defer { test_claudeAttachmentRestartFinished?() }
                     #endif
@@ -19517,7 +19895,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence)
+                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -19535,7 +19913,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     draftText: restorationDraftText,
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                    managedTurn: managedTurn
+                    managedTurn: managedTurn,
+                    localComposerCandidate: localComposerCandidate
                 )
                 return UserTurnSubmissionResult.submitted
             }
@@ -19569,7 +19948,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
+                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -19582,7 +19961,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 trimmedText: trimmedText,
                 userItem: userItem,
                 userInputTokenEstimate: userInputTokenEstimate,
-                managedTurn: managedTurn
+                managedTurn: managedTurn,
+                localComposerCandidate: localComposerCandidate
             )
         } else {
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
@@ -19590,6 +19970,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 providerText: wrappedText,
                 localDraftText: managedTurn == nil ? wrappedText : nil
             ))
+            // Accepted retained follow-up ownership: later Stop/provider failure restores drafts,
+            // not this local user row. This is not the optimistic append boundary.
+            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
         }
         return UserTurnSubmissionResult.submitted
     }
@@ -19696,7 +20079,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         trimmedText: String,
         userItem: AgentChatItem,
         userInputTokenEstimate: Int,
-        managedTurn: AgentNoncomposerTurn? = nil
+        managedTurn: AgentNoncomposerTurn? = nil,
+        localComposerCandidate: UUID? = nil
     ) {
         // Steering recovery restores a queued instruction's draft into the composer. A managed
         // steer carries none, so a withdrawn one can never reappear as the target user's draft.
@@ -19729,6 +20113,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             )
             session.pendingACPSteeringInstructions.append(steering)
+            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
             guard !session.isMCPInstructionDispatchInProgress else {
                 Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering flush owned by MCP dispatch tab=\(session.tabID) queue=\(session.pendingACPSteeringInstructions.count)")
@@ -19760,6 +20145,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 supersedingProtectedTurnIDs: []
             )
             session.pendingClaudeSteeringInstructions.append(steering)
+            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             managedTurn?.sink.resolve(.delivered(.queuedInterrupt))
             runService.protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(session: session, steeringID: steering.id)
             Self.steeringDebugLog("[AgentRunSteeringWake] Claude steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingClaudeSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
@@ -19788,7 +20174,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func appendOptimisticGoalObjectiveUserBubbleIfNeeded(
         action: CodexAgentModeCoordinator.GoalSlashAction?,
         session: TabSession,
-        workflow: AgentWorkflowDefinition?
+        workflow: AgentWorkflowDefinition?,
+        composerOrigin: AgentUserInputOrigin? = nil
     ) {
         guard case let .setObjective(objective) = action else { return }
         let userItem = AgentChatItem.user(
@@ -19799,6 +20186,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isLocalControlPlaneEcho: true
         )
         session.appendItem(userItem)
+        if composerOrigin == .localComposer, !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let token = session.registerLocalComposerCandidate(itemID: userItem.id, at: session.items.count - 1)
+            // This control-plane echo is deliberately retained even when the native command fails.
+            session.settleLocalComposerOrigin(token, disposition: .retained)
+        }
         updateBindingsFromSession(session)
         scheduleSave(for: session.tabID)
         requestUIRefresh(tabID: session.tabID, urgent: true)
@@ -20904,6 +21296,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session = self.session(for: tabID)
         }
+        var candidateTransferred = false
+        defer {
+            // Run preparation has no rollback for ordinary non-Codex rows. An explicit retained
+            // startup refusal closes here; a launched runner owns acceptance/terminal settlement.
+            if !candidateTransferred { session.settleLocalComposerOrigin(directStartOptions.localComposerCandidate, disposition: .retained) }
+        }
         guard directStartOptions.stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
             return nil
@@ -21038,6 +21436,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        candidateTransferred = true
         return await runService.startRun(
             tabID: tabID,
             session: session,
@@ -21049,7 +21448,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             providerControlCommand: directStartOptions.providerControlCommand,
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
-            stopFence: stopFence
+            stopFence: stopFence,
+            localComposerCandidate: directStartOptions.localComposerCandidate
         )
     }
 
@@ -22440,13 +22840,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // waiting-instruction dispatch, so it renders the membership revision that is current
             // now. Returning the response *is* the acceptance boundary here: the provider consumes it
             // as this wait's result with no further failure point.
-            let monitoring = agentSessionLinkDecoratedProviderText(
-                text,
-                session: session,
-                dispatchID: .waitingContinuation(waitID: session.instructionWaitID ?? UUID())
-            )
-            acceptAgentSessionLinkPromptClaim(monitoring.claim)
-            return UserInstructionResponse(text: monitoring.text, timedOut: false, elapsedSeconds: 0)
+            let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(waitID: session.instructionWaitID ?? UUID())
+            let monitoring = agentSessionLinkDecoratedProviderText(text, session: session, dispatchID: dispatchID)
+            let inputFence = AgentRunStartStopFence(session: session)
+            var returnedInstruction = false
+            defer {
+                // The new optional proof suspends after this entry left the queue. Until return,
+                // retain its recovery ownership without replaying into a rebound session.
+                if !returnedInstruction, monitoring.claim?.localInput != nil,
+                   sessions[session.tabID] === session,
+                   inputFence.binding == session.persistentSessionBindingIdentity
+                {
+                    if inputFence.permitsStart(of: session) {
+                        session.pendingInstructions.insert(queuedText, at: 0)
+                        session.isDirty = true
+                    } else if let draft = queuedText.localDraftText {
+                        restoreComposerDraft(
+                            tabID: session.tabID, text: draft,
+                            message: "Restored local queued instruction after cancelled Read proof",
+                            strategy: .prependAlways
+                        )
+                    }
+                }
+            }
+            let proof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
+            if monitoring.claim?.localInput != nil {
+                guard !Task.isCancelled, sessions[session.tabID] === session, inputFence.permitsStart(of: session) else { throw CancellationError() }
+                if let lifecycleTarget {
+                    _ = try requireCurrentAgentSessionLifecycleTarget(lifecycleTarget, intent: .waitForInstruction)
+                }
+            }
+            // This immediate return genuinely bypasses the installed continuation's handoff.
+            let released = agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: monitoring.claim, proof: proof)
+            guard !released.mustAbortDispatch else { throw CancellationError() }
+            let response = UserInstructionResponse(text: released.text(text), timedOut: false, elapsedSeconds: 0)
+            acceptAgentSessionLinkPromptClaim(released.claim)
+            returnedInstruction = true
+            return response
         }
 
         // Set waiting state
@@ -22540,9 +22970,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         providerText: String,
         claim: AgentSessionLinkOutboundPromptClaim?,
-        origin: UserInstructionResponse.Origin
+        origin: UserInstructionResponse.Origin,
+        inputProof: AgentSessionLinkProviderInputRelease.Proof? = nil,
+        undecoratedProviderText: String? = nil
     ) -> Bool {
         guard let continuation = session.instructionContinuation else { return false }
+        let released = inputProof.flatMap { proof in
+            claim.map { agentSessionLinkHandoffProviderInput(for: session, dispatchID: $0.dispatchID, claim: $0, proof: proof) }
+        }
+        guard released?.mustAbortDispatch != true else { return false }
+        let providerText = released.flatMap { release in undecoratedProviderText.map(release.text) } ?? providerText
+        let claim = released == nil ? claim : released?.claim
         switch origin {
         case .user:
             // Estimated from the decorated text, not the augmented text: this is what the provider is

@@ -956,6 +956,8 @@ enum AgentMonitorAccessibilityLocationPhrase {
 /// Workspace/worktree labels here are **UI only**; they are never placed in agent-facing snapshots,
 /// inventories, or prompts.
 struct AgentMonitorPillProps: Equatable {
+    /// Explicit, revocable, process-local user policy; independent of management grants.
+    var readOnlyAutoApprovalEnabled = false
     struct Outbound: Equatable, Identifiable {
         let linkID: UUID
         let generation: UInt64
@@ -1721,13 +1723,13 @@ enum AgentSessionOversightPersistenceCopy {
     static let loading = "Saved oversight links are still loading."
     static let suppressedLaunch = "Saved oversight links are unavailable in this launch mode."
     static let autoRestoreDisabled = "Saved oversight links will remain dormant while window restoration is turned off."
-    static let futureSchema = "Saved oversight links were created by a newer RepoPrompt version. The file was preserved, so oversight can’t be changed in this version."
-    static let unreadable = "RepoPrompt couldn’t read or back up saved oversight links. The file was preserved, so oversight can’t be changed."
-    static let quarantined = "RepoPrompt couldn’t read saved oversight links. It backed up the file and started with no saved links."
+    static let futureSchema = "Saved continuity uses a newer format and was preserved. Current approved links still work; use a compatible version to recover those saved records."
+    static let unreadable = "Saved link continuity could not open. Existing data is preserved and current approved links still work. Check local storage permissions and disk space, then retry saving."
+    static let quarantined = "Legacy link data could not be decoded and remains preserved for recovery; no unknown authority was activated."
     static let terminalRestorationSummary = "Some saved oversight links couldn’t be restored and were removed."
-    static let addWriteFailed = "Oversight couldn’t be saved, so it wasn’t started. Check disk space and Application Support permissions, then try again."
+    static let addWriteFailed = "Live oversight and continuity saving have separate results. This change is not saved; check disk space and storage permissions, then retry saving."
     static let addCompensationFailed = "Oversight didn’t start, and RepoPrompt couldn’t clear its saved request. It won’t retry again this launch; check disk space and permissions before relaunching."
-    static let stopWriteFailed = "Oversight couldn’t be removed from saved state, so the link is still active. Check disk space and Application Support permissions, then try again."
+    static let stopWriteFailed = "Saved link removal is pending or failed. The live unlink result is separate; check disk space and storage permissions, then retry saving."
     static let automaticCleanupFailed = "Oversight ended, but RepoPrompt couldn’t update saved oversight links. It may be restored after relaunch."
     static let shutdownBeforeInsert = "RepoPrompt is shutting down, so oversight wasn’t changed."
     static let shutdownAfterInsert = "RepoPrompt is shutting down. Oversight wasn’t started, but its saved request can be reconsidered next launch."
@@ -1772,7 +1774,9 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
         case dormant
         /// Deterministic or persistence-suppressed launch: no production file I/O at all.
         case suppressed
-        /// The file was preserved and mutation is refused. Carries the exact user-facing reason.
+        /// Live changes are usable while their continuity transactions are queued.
+        case saving
+        /// Continuity failed; live user decisions remain usable.
         case blocked(String)
     }
 
@@ -1805,25 +1809,21 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
 
     /// Why Add must stay disabled for persistence reasons, or `nil`.
     ///
-    /// Composed ahead of live endpoint eligibility: a session that is perfectly eligible still cannot
-    /// be granted oversight while the durable record cannot be written.
+    /// Continuity diagnostics never override actual caller/endpoint eligibility.
     var addBlockerMessage: String? {
-        switch availability {
-        case .loading:
-            AgentSessionOversightPersistenceCopy.loading
-        case .ready, .dormant:
-            nil
-        case .suppressed:
-            AgentSessionOversightPersistenceCopy.suppressedLaunch
-        case let .blocked(message):
-            message
-        }
+        nil // Continuity cannot veto an explicit current-session user decision.
     }
 
     /// Informational line rendered even when Add is permitted.
     var noticeMessage: String? {
-        guard case .dormant = availability else { return nil }
-        return AgentSessionOversightPersistenceCopy.autoRestoreDisabled
+        switch availability {
+        case .loading: "Saved link continuity is opening; new explicit live links remain usable."
+        case .ready: nil
+        case .dormant: AgentSessionOversightPersistenceCopy.autoRestoreDisabled
+        case .suppressed: "Continuity saving is disabled for this launch; live links are process-local."
+        case .saving: "Live changes apply now; continuity saving is pending."
+        case let .blocked(message): message + " New explicit live links remain usable; saving will retry."
+        }
     }
 
     /// Appends a warning under the cap, collapsing an existing entry with the same identity.

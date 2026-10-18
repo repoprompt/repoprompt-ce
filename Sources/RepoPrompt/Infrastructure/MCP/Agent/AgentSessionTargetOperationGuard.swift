@@ -25,7 +25,7 @@ enum AgentSessionTargetOperationGuard {
     typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> Bool
 
     static func denialError(reference: String) -> MCPError {
-        MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope.")
+        MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope. For a directly linked lane, use agent_session_link poll/wait/read, or steer/respond/stop with its Manage capability. For scope administration, call session_admin scope_status to inspect grants and operation requirements; request_scope asks the user for missing capabilities. If oversight tools are absent, call become_overseer and retry next turn from the original requesting session.")
     }
 
     static func denialError(sessionID: UUID) -> MCPError {
@@ -183,12 +183,8 @@ enum AgentSessionTargetOperationGuard {
         provenance: DomainAgentSessionTargetProvenance,
         reference: String
     ) throws {
-        let decision = DomainAgentSessionOperationAuthorizer.authorize(
-            operation: operation,
-            caller: caller,
-            target: provenance
-        )
-        guard decision.isAuthorized else {
+        // The decision (full access, direct-child and human-only rules) is the engine's.
+        guard OverseerAuthorizationEngine.current.authorizesTargetOperation(operation, caller: caller, provenance: provenance) else {
             throw denialError(reference: reference)
         }
     }
@@ -221,22 +217,19 @@ enum AgentSessionTargetOperationGuard {
             targetWindow: targetWindow,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID
         )
-        switch caller {
-        case .administrativePrincipal:
-            return
-        case .unresolvedAgentRun:
-            throw denialError(sessionID: targetSessionID)
-        case let .agentSession(callerSessionID):
-            if callerSessionID == targetSessionID { return }
-            if await resolveTargetProvenance(targetSessionID).parentSessionID == callerSessionID { return }
-            if let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
-               endpoint.sessionID == callerSessionID,
-               await hasManageGrant(endpoint, targetSessionID)
-            {
-                return
+        let authorized = await OverseerAuthorizationEngine.current.authorizesWorktreeBinding(
+            caller: caller,
+            targetSessionID: targetSessionID,
+            spawnParentSessionID: { await resolveTargetProvenance(targetSessionID).parentSessionID },
+            callerHoldsManageGrant: {
+                guard case let .agentSession(callerSessionID) = caller,
+                      let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
+                      endpoint.sessionID == callerSessionID
+                else { return false }
+                return await hasManageGrant(endpoint, targetSessionID)
             }
-            throw denialError(sessionID: targetSessionID)
-        }
+        )
+        guard authorized else { throw denialError(sessionID: targetSessionID) }
     }
 
     /// Resolves provenance and authorizes one target in a single step.

@@ -14,15 +14,15 @@ struct SessionAdminHandlerContext {
     /// Presentation-only session titles for card items.
     var displayName: @MainActor (UUID) -> String? = { _ in nil }
 
-    /// The write-time authority check for one target: the lease is current **and** the target is
-    /// still a member of the whole scope chain (placement may have changed since the lease).
+    /// The write-time checkpoint for one target (`OverseerAuthorizationEngine.checkpointTarget`).
     func isStillAuthorized(
         _ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord,
-        requiresMutationOwner: Bool = true
+        requiresMutationOwner: Bool = true,
+        operation: DomainAgentSessionTargetOperation? = nil
     ) -> Bool {
-        !Task.isCancelled && scopes.isCurrent(lease)
-            && (!requiresMutationOwner || projector.pointResolutionState(for: lease.targetSessionID) != .replicated)
-            && isMember(lease.targetSessionID, ofChainFrom: scope)
+        scopes.authorization.checkpointTarget(
+            lease, scope: scope, projector: projector, requiresMutationOwner: requiresMutationOwner, operation: operation
+        )
     }
 
     /// The caller's scope and every ancestor scope.
@@ -30,22 +30,23 @@ struct SessionAdminHandlerContext {
         scopes.scopeChain(from: scope.id)
     }
 
-    func isMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
-        let chain = scopeChain(of: scope)
-        guard !chain.isEmpty else { return false }
-        return chain.allSatisfy { record in
-            guard let proof = projector.membershipProof(for: sessionID, in: record.grant) else { return false }
-            return DomainDelegationScopeAuthority.isValid(proof, for: record.grant, targetSessionID: sessionID)
-        }
+    /// Placement fact (never an authorization gate by itself): `sessionID` is placed in the chain.
+    func isPlacedMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.isPlacedMember(sessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    /// Permission: the operation may reach `sessionID` through `scope` (`scopeMembership`).
+    func permitsMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.permitsMember(sessionID, ofChainFrom: scope, projector: projector)
     }
 
     func memberships(of sessionID: UUID, inChainFrom scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeMembershipProof] {
         scopeChain(of: scope).compactMap { projector.membershipProof(for: sessionID, in: $0.grant) }
     }
 
-    /// Requires `sessionID` to be a member of the whole chain, else the uniform denial.
+    /// Requires the operation to be permitted to reach `sessionID`, else the uniform denial.
     func requireMember(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
-        guard isMember(sessionID, ofChainFrom: batch.scope) else {
+        guard permitsMember(sessionID, ofChainFrom: batch.scope) else {
             throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
         }
     }
@@ -138,8 +139,8 @@ struct SessionAdminItemResult {
         object["result"] = .string(result)
         object["status"] = .string(status)
         if let code {
-            object["code"] = .string(code)
             object["reason"] = .string(code)
+            object = SessionAdminReply.diagnostic(code: code, sessionIDs: [sessionID], fields: object)
         }
         return .object(object)
     }
@@ -158,7 +159,15 @@ enum SessionAdminReply {
         extra: [String: Value] = [:]
     ) -> Value {
         var object = extra
-        object["result"] = .string(preview ? "preview" : "applied")
+        let statuses = items.compactMap { AgentSessionAdminItemResult.Status(rawValue: $0.status) }
+        let committed = extra[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
+            || items.contains { $0.fields[AgentSessionAdminRendering.committedChangesKey] == .bool(true) }
+        object["result"] = .string(preview ? "preview" : AgentSessionAdminRendering.mutationResult(
+            statuses: statuses, requiresControl: !requiresControl.isEmpty, committedChanges: committed,
+            alreadySatisfied: statuses.count == items.count && extra[AgentSessionAdminRendering.stateSatisfiedKey] == .bool(true)
+        ))
+        if object["result"] != .string("applied") { object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey) }
+        if committed { object[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
         object["op"] = .string(op)
         object["items"] = .array(items.map(\.value))
         // The front door's idempotency ledger records (and replays) only calls that changed something.
@@ -166,11 +175,68 @@ enum SessionAdminReply {
         if !requiresControl.isEmpty {
             object["requires_control"] = .array(requiresControl.map { .string($0.uuidString) })
         }
-        return .object(object)
+        return .object(preview ? object : AgentSessionAdminRendering.addingBatchDiagnostic(object))
+    }
+
+    /// Fill missing diagnostics without overwriting more precise host/transport evidence.
+    static func diagnostic(code: String, sessionIDs: [UUID] = [], fields: [String: Value] = [:]) -> [String: Value] {
+        let guidance = switch code {
+        case "scope_revoked", "scope_no_longer_current":
+            "Delegated authority ended before completion. Inspect scope_status and obtain current authority before another mutation."
+        case "target_busy":
+            "The target is busy. Wait until it is idle, or use worktree_bind with apply: next_boundary."
+        case "scope_guardrail_exceeded":
+            "The operation exceeds a configured scope limit. Inspect scope_status; release resources or ask the user to adjust that limit."
+        case "usage_evidence_unavailable", "scope_denied":
+            "A configured limit requires complete placement evidence. Resolve ambiguous session bindings or load the affected workspace, then retry. A new capability grant alone cannot repair this evidence."
+        case "replicated_binding", "ambiguous_binding", "archived_carrier_unavailable", "not_restorable":
+            "No unique writable archived carrier was proved. Inspect this session, open its workspace, and resolve duplicate or changed bindings before retrying undo; no ownership fence was bypassed."
+        case "not_archived":
+            "The current writable carrier is not archived. Inspect the session's current state; nothing was restored."
+        case "compose_flush_rejected":
+            "The active compose draft could not be flushed safely. Ask the user to save or resolve that draft before retrying undo."
+        case "workspace_changed", "target_changed", "tab_id_conflict":
+            "The workspace or tab carrier changed before restoration. Inspect the session and resolve conflicting tab identities before retrying undo."
+        case "persistence_rejected", "persistence_unconfirmed":
+            "The local restore changed state but its workspace save was not acknowledged. Inspect the current session and resolve the save failure; do not blindly repeat the mutation."
+        case "workspace_writer_unavailable":
+            "The groups are readable, but no current workspace writer could accept their order. Ask the user to resolve the workspace's save or duplicate-binding conflict, then inspect the groups again."
+        case "group_state_changed", "group_projection_changed":
+            "The workspace's group carriers or presentation changed while this request ran. Inspect the current group order before submitting another change; any committed_changes reported here remain committed."
+        case "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete":
+            "The workspace owner could not confirm the complete group-order save. Inspect local_changes and committed_changes, resolve the workspace save failure, and read the current order before another mutation."
+        case "no_change":
+            "No item changed. Inspect current state before choosing another operation."
+        default:
+            "The requested operation did not fully complete. Inspect the item reason and current scope before choosing a recovery call."
+        }
+        let visibleIDs = sessionIDs + [fields["session_id"]?.stringValue.flatMap(UUID.init(uuidString:))].compactMap(\.self)
+        var result: [String: Value] = [
+            "code": .string(code), "subreason": .string(code), "detail": .string(guidance),
+            "retryable": .bool(false),
+            "affected": .object(["session_ids": .array(Array(Set(visibleIDs)).sorted { $0.uuidString < $1.uuidString }.map { .string($0.uuidString) })]),
+            "next_call": .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+        ]
+        if code == "target_busy" { result["retryable"] = .bool(true) }
+        // Nothing failed, so there is no recovery call to suggest.
+        if code == "no_change" { result.removeValue(forKey: "next_call") }
+        if ["workspace_writer_unavailable", "group_state_changed", "group_projection_changed", "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete"].contains(code) {
+            result.removeValue(forKey: "next_call")
+            result["recovery"] = .string("manual")
+        }
+        if let sessionID = sessionIDs.first,
+           ["replicated_binding", "ambiguous_binding", "archived_carrier_unavailable", "not_restorable", "not_archived", "compose_flush_rejected", "workspace_changed", "target_changed", "tab_id_conflict", "persistence_rejected", "persistence_unconfirmed"].contains(code)
+        {
+            result["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object([
+                "op": .string("get"), "session_id": .string(sessionID.uuidString)
+            ])])
+        }
+        result.merge(fields, uniquingKeysWith: { _, supplied in supplied })
+        return result
     }
 
     static func refused(code: String, detail: String, fields: [String: Value] = [:]) -> Value {
-        var object = fields
+        var object = diagnostic(code: code, fields: fields)
         object["result"] = .string("denied")
         object["code"] = .string(code)
         object["detail"] = .string(detail)

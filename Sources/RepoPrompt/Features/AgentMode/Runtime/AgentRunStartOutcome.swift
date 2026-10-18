@@ -120,6 +120,8 @@ struct AgentDirectRunStartOptions: Equatable {
 
     /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
     var stopFence: AgentRunStartStopFence?
+    /// Positive, exact retained-row candidate; absent for every non-composer producer.
+    var localComposerCandidate: UUID?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }

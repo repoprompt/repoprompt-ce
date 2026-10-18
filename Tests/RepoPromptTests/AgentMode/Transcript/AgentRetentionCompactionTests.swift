@@ -1,5 +1,6 @@
 #if DEBUG
     import Foundation
+    import MCP
     @_spi(TestSupport) @testable import RepoPromptApp
     import XCTest
 
@@ -188,6 +189,428 @@
 
         private func id(_ value: Int) -> UUID {
             UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+        }
+    }
+
+    /// The Codex fresh-thread recovery notice is an ordinary `.system` row that retention
+    /// demotion discards. These tests pin the typed `recoveryDiagnostics` summary carrier:
+    /// the notice must be captured before trimming, survive every tier transition and
+    /// Codable round-trip, and render exactly once through the compacted projections,
+    /// `get_log`, and history.
+    final class AgentTranscriptRecoveryDiagnosticTests: XCTestCase {
+        private let noticeText =
+            "Codex couldn't resume the previous thread because its history was too large to load. Started a fresh thread."
+
+        // MARK: - Defect A: summary-carried diagnostic survives demotion
+
+        func testZeroToolTurnDiagnosticSurvivesDemotionAcrossSerialization() throws {
+            try assertDiagnosticSurvivesDemotion(includeTools: false)
+        }
+
+        func testToolBearingTurnDiagnosticSurvivesDemotionAcrossSerialization() throws {
+            try assertDiagnosticSurvivesDemotion(includeTools: true)
+        }
+
+        /// A demoted turn that keeps its conclusion activity is *not* structurally
+        /// compacted; the notice must still project exactly once.
+        private func assertDiagnosticSurvivesDemotion(includeTools: Bool) throws {
+            let transcript = recoveryTranscript(includeTools: includeTools)
+            let fullTurn = try XCTUnwrap(transcript.turns.first)
+            let diagnosticActivity = try XCTUnwrap(fullTurn.allActivities.first { $0.itemKind == .system })
+            let expectedDiagnostic = try XCTUnwrap(diagnosticActivity.recoveryDiagnostic)
+            XCTAssertEqual(expectedDiagnostic.id, diagnosticActivity.id)
+            XCTAssertEqual(expectedDiagnostic.sequenceIndex, diagnosticActivity.sequenceIndex)
+
+            var current = transcript
+            for tier in [AgentTranscriptRetentionTier.condensed, .summary, .archived] {
+                current.turns[0].retentionTier = tier
+                current = AgentTranscriptCompactor.compact(current)
+                let turn = try XCTUnwrap(current.turns.first)
+
+                // The conclusion row is retained, so the structurally-compacted predicate
+                // stays false at every tier.
+                XCTAssertFalse(turn.isStructurallyCompacted, "tier \(tier)")
+                let conclusionID = try XCTUnwrap(turn.conclusionActivityID)
+                XCTAssertTrue(turn.allActivities.contains { $0.id == conclusionID }, "tier \(tier)")
+
+                // The notice row itself is trimmed; only the typed record remains.
+                XCTAssertFalse(turn.allActivities.contains { $0.id == diagnosticActivity.id }, "tier \(tier)")
+                XCTAssertEqual(
+                    turn.summary?.recoveryDiagnostics,
+                    [expectedDiagnostic],
+                    "tier \(tier)"
+                )
+
+                let decoded = try JSONDecoder().decode(
+                    AgentTranscript.self,
+                    from: JSONEncoder().encode(current)
+                )
+                XCTAssertEqual(
+                    decoded.turns.first?.summary?.recoveryDiagnostics,
+                    [expectedDiagnostic],
+                    "tier \(tier) round-trip"
+                )
+
+                let projection = AgentTranscriptProjectionBuilder.build(from: current)
+                let noticeRows = (projection.workingRows + projection.archivedRows)
+                    .filter { $0.text == noticeText }
+                XCTAssertEqual(noticeRows.count, 1, "tier \(tier) projection")
+                XCTAssertEqual(noticeRows.first?.kind, .system)
+                XCTAssertEqual(noticeRows.first?.id, expectedDiagnostic.id)
+                XCTAssertEqual(noticeRows.first?.recoveryDiagnostic, expectedDiagnostic)
+
+                let xml = AgentTranscriptIO.buildSpartanLogXML(from: current)
+                XCTAssertEqual(
+                    xml.components(separatedBy: noticeText).count - 1,
+                    1,
+                    "tier \(tier) get_log"
+                )
+            }
+        }
+
+        /// A fully collapsed turn (no retained activities at all) still renders the notice
+        /// exactly once through both the block projection and the spartan log.
+        func testStructurallyCompactedTurnEmitsDiagnosticExactlyOnce() throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            var compacted = AgentTranscriptCompactor.compact(transcript)
+            var turn = try XCTUnwrap(compacted.turns.first)
+            // Simulate the fully-collapsed edge: no activities, no conclusion.
+            turn.responseSpans[0].activities = []
+            turn.conclusionActivityID = nil
+            compacted.turns[0] = turn
+            XCTAssertTrue(turn.isStructurallyCompacted)
+
+            let projection = AgentTranscriptProjectionBuilder.build(from: compacted)
+            let allRows = projection.workingRows + projection.archivedRows
+            let noticeRows = allRows.filter { $0.text == noticeText }
+            XCTAssertEqual(noticeRows.count, 1)
+
+            // Fixed placement contract: request → diagnostics → conclusion, shared by the
+            // row projection, block builders, and history get_session.
+            let requestIndex = allRows.firstIndex { $0.kind == .user }
+            let noticeIndex = allRows.firstIndex { $0.id == turn.summary?.recoveryDiagnostics?.first?.id }
+            let conclusionIndex = allRows.lastIndex { $0.kind == .assistant }
+            XCTAssertTrue(try XCTUnwrap(requestIndex) < XCTUnwrap(noticeIndex))
+            XCTAssertTrue(try XCTUnwrap(noticeIndex) < XCTUnwrap(conclusionIndex))
+
+            let xml = AgentTranscriptIO.buildSpartanLogXML(from: compacted)
+            XCTAssertEqual(xml.components(separatedBy: noticeText).count - 1, 1)
+        }
+
+        // MARK: - Defect B: export rewrites only the generated summary row
+
+        /// The same transcript carries a full-tier turn (genuine `.system` notice in the
+        /// working rows) and an archived turn (generated middle-summary row plus the same
+        /// notice rebuilt from the diagnostic). Export must leave the notice text untouched
+        /// on both while still rewriting the synthetic summary row.
+        func testExportRewritesSyntheticSummaryRowButNotRecoveryDiagnostic() throws {
+            var transcript = recoveryTranscript(includeTools: true)
+            // Second turn: archived demotion of the same shape.
+            let archivedSource = recoveryTranscript(includeTools: true)
+            var archivedTranscript = archivedSource
+            archivedTranscript.turns[0].retentionTier = .archived
+            var archivedTurn = try XCTUnwrap(
+                AgentTranscriptCompactor.compact(archivedTranscript).turns.first
+            )
+            // Re-seat the archived turn after the full turn so both survive in one export.
+            let sequenceBase = transcript.nextSequenceIndex
+            archivedTurn.request?.sequenceIndex += sequenceBase
+            for spanIndex in archivedTurn.responseSpans.indices {
+                for activityIndex in archivedTurn.responseSpans[spanIndex].activities.indices {
+                    archivedTurn.responseSpans[spanIndex].activities[activityIndex].sequenceIndex += sequenceBase
+                }
+            }
+            if var diagnostics = archivedTurn.summary?.recoveryDiagnostics {
+                for index in diagnostics.indices {
+                    diagnostics[index].sequenceIndex += sequenceBase
+                }
+                archivedTurn.summary?.recoveryDiagnostics = diagnostics
+            }
+            transcript.turns.append(archivedTurn)
+
+            // buildForkTranscriptXML exports with no cutoff, covering both turns' rows.
+            let xml = AgentTranscriptIO.buildForkTranscriptXML(from: transcript)
+
+            // The genuine notice rows keep their verbatim text in both turns.
+            XCTAssertEqual(xml.components(separatedBy: noticeText).count - 1, 2)
+            // The archived turn's generated middle-summary row is rewritten to handoff
+            // summary text: its verbatim "1 tool called" form must not appear, while the
+            // handoff rendering still names the tool.
+            let summary = try XCTUnwrap(archivedTurn.summary)
+            XCTAssertEqual(summary.middleSummaryText?.contains("tool called"), true)
+            XCTAssertFalse(xml.contains("tool called"))
+            XCTAssertTrue(xml.contains("read_file"))
+        }
+
+        // MARK: - Defect A: history get_session and search
+
+        /// `get_session`'s default roles exclude `system` rows and its summary entry is gated
+        /// on `isStructurallyCompacted`. The diagnostic must still surface — under the
+        /// "summary" role — for a demoted turn that retains its conclusion, and it must stay
+        /// searchable through the summary contract.
+        func testHistoryExposesDiagnosticForDemotedTurnThatRetainedConclusion() async throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            let compacted = AgentTranscriptCompactor.compact(transcript)
+            let turn = try XCTUnwrap(compacted.turns.first)
+            XCTAssertFalse(turn.isStructurallyCompacted)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: compacted)
+
+            let reply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("get_session"),
+                    "session_id": .string(sessionID.uuidString),
+                    "turn_start": .int(0),
+                    "turn_end": .int(0)
+                ],
+                scanner: scanner
+            )
+            guard case let .getSession(getSession) = reply else {
+                return XCTFail("Expected get_session reply, got \(reply)")
+            }
+            let noticeEntries = getSession.turns
+                .flatMap(\.entries)
+                .filter { $0.text.contains("too large to load") }
+            XCTAssertEqual(noticeEntries.count, 1)
+            XCTAssertEqual(noticeEntries.first?.role, "summary")
+
+            let searchReply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("search"),
+                    "query": .string("too large to load")
+                ],
+                scanner: scanner
+            )
+            guard case let .search(search) = searchReply else {
+                return XCTFail("Expected search reply, got \(searchReply)")
+            }
+            let matches = search.results.filter { $0.snippet.contains("too large to load") }
+            XCTAssertEqual(matches.count, 1)
+            XCTAssertEqual(matches.first?.source, "summary")
+            XCTAssertEqual(matches.first?.role, "system")
+        }
+
+        /// A full-tier turn keeps its live `.system` row *and* carries the summary record;
+        /// search must match the live row once, not once per carrier.
+        func testFullTierSearchMatchesLiveRowWithoutSummaryDuplicate() async throws {
+            let transcript = recoveryTranscript(includeTools: false)
+            let turn = try XCTUnwrap(transcript.turns.first)
+            XCTAssertEqual(turn.retentionTier, .full)
+            XCTAssertNotNil(turn.summary?.recoveryDiagnostics)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: transcript)
+
+            let searchReply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("search"),
+                    "query": .string("too large to load")
+                ],
+                scanner: scanner
+            )
+            guard case let .search(search) = searchReply else {
+                return XCTFail("Expected search reply, got \(searchReply)")
+            }
+            let matches = search.results.filter { $0.snippet.contains("too large to load") }
+            XCTAssertEqual(matches.count, 1)
+            XCTAssertEqual(matches.first?.source, "activity")
+            XCTAssertEqual(matches.first?.role, "system")
+        }
+
+        /// A fully collapsed turn (no activities at all) takes the pre-existing summary-entry
+        /// path as well; the diagnostic is still emitted exactly once.
+        func testHistoryExposesDiagnosticForStructurallyCompactedTurn() async throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            var compacted = AgentTranscriptCompactor.compact(transcript)
+            var turn = try XCTUnwrap(compacted.turns.first)
+            turn.responseSpans[0].activities = []
+            turn.conclusionActivityID = nil
+            compacted.turns[0] = turn
+            XCTAssertTrue(turn.isStructurallyCompacted)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: compacted)
+
+            let reply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("get_session"),
+                    "session_id": .string(sessionID.uuidString),
+                    "turn_start": .int(0),
+                    "turn_end": .int(0)
+                ],
+                scanner: scanner
+            )
+            guard case let .getSession(getSession) = reply else {
+                return XCTFail("Expected get_session reply, got \(reply)")
+            }
+            let noticeEntries = getSession.turns
+                .flatMap(\.entries)
+                .filter { $0.text.contains("too large to load") }
+            XCTAssertEqual(noticeEntries.count, 1)
+            XCTAssertEqual(noticeEntries.first?.role, "summary")
+        }
+
+        /// Recovery diagnostics must not displace the conclusion within the per-turn cap.
+        func testGetSessionCapsCompactedDiagnosticsAndSummaryAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: true)
+        }
+
+        func testGetSessionCapsDemotedDiagnosticsAndConclusionAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: false)
+        }
+
+        private func assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: Bool) async throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            var compacted = AgentTranscriptCompactor.compact(transcript)
+            var turn = try XCTUnwrap(compacted.turns.first)
+            if structurallyCompacted {
+                turn.responseSpans[0].activities = []
+                turn.conclusionActivityID = nil
+            }
+            var summary = try XCTUnwrap(turn.summary)
+            summary.compactConclusionText = "Compacted conclusion."
+            summary.recoveryDiagnostics = (0 ..< AgentTranscriptRecoveryDiagnostic.maximumPerTurn).map { index in
+                AgentTranscriptRecoveryDiagnostic(
+                    sequenceIndex: index,
+                    reason: "resumeFrameTooLarge",
+                    outcome: AgentTranscriptRecoveryDiagnostic.freshThreadStartedOutcome,
+                    text: noticeText
+                )
+            }
+            turn.summary = summary
+            compacted.turns[0] = turn
+            XCTAssertEqual(turn.isStructurallyCompacted, structurallyCompacted)
+            XCTAssertEqual(turn.summary?.normalizedRecoveryDiagnostics.count, 20)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: compacted)
+
+            let reply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("get_session"),
+                    "session_id": .string(sessionID.uuidString),
+                    "turn_start": .int(0),
+                    "turn_end": .int(0)
+                ],
+                scanner: scanner
+            )
+            guard case let .getSession(getSession) = reply else {
+                return XCTFail("Expected get_session reply, got \(reply)")
+            }
+            let rendered = try XCTUnwrap(getSession.turns.first)
+            XCTAssertEqual(rendered.entries.count, 20)
+            XCTAssertEqual(
+                rendered.entries.count(where: { $0.text.contains("too large to load") }),
+                19
+            )
+            XCTAssertEqual(rendered.entries.last?.role, structurallyCompacted ? "summary" : "assistant")
+            XCTAssertEqual(rendered.entries.last?.text, structurallyCompacted ? "Compacted conclusion." : "Done.")
+            XCTAssertEqual(rendered.entriesOmitted, 1)
+            XCTAssertTrue(rendered.truncated)
+        }
+
+        // MARK: - Helpers
+
+        private func makeDiagnostic() -> AgentTranscriptRecoveryDiagnostic {
+            AgentTranscriptRecoveryDiagnostic(
+                reason: "resumeFrameTooLarge",
+                outcome: AgentTranscriptRecoveryDiagnostic.freshThreadStartedOutcome,
+                previousConversationID: "01936F84-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+                replacementConversationID: "01936F85-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+                text: noticeText
+            )
+        }
+
+        /// user → [tool call/result] → system recovery notice → assistant conclusion.
+        private func recoveryTranscript(includeTools: Bool) -> AgentTranscript {
+            var items: [AgentChatItem] = [
+                .user("ship the fix", sequenceIndex: 0)
+            ]
+            var sequence = 1
+            if includeTools {
+                let invocation = UUID()
+                items.append(.toolCall(
+                    name: "read_file",
+                    invocationID: invocation,
+                    argsJSON: #"{"path":"a.swift"}"#,
+                    sequenceIndex: sequence
+                ))
+                sequence += 1
+                items.append(.toolResult(
+                    name: "read_file",
+                    invocationID: invocation,
+                    resultJSON: #"{"ok":true}"#,
+                    isError: false,
+                    sequenceIndex: sequence
+                ))
+                sequence += 1
+            }
+            items.append(.system(
+                noticeText,
+                sequenceIndex: sequence,
+                recoveryDiagnostic: makeDiagnostic()
+            ))
+            sequence += 1
+            items.append(.assistant("Done.", sequenceIndex: sequence))
+            return AgentTranscriptIO.importLegacyItems(items, terminalState: .completed)
+        }
+
+        /// Writes a workspace + session file + metadata index under a fresh temp
+        /// `applicationSupport` root and returns a scanner pointed at it.
+        private func seededScanner(
+            sessionID: UUID,
+            transcript: AgentTranscript
+        ) throws -> HistorySessionScanner {
+            let appSupport = FileManager.default.temporaryDirectory
+                .appendingPathComponent("RecoveryDiagnosticTests-\(UUID().uuidString)", isDirectory: true)
+            let workspaceDir = appSupport
+                .appendingPathComponent("Workspaces", isDirectory: true)
+                .appendingPathComponent("Workspace-Recovery", isDirectory: true)
+            let agentSessionsDir = workspaceDir
+                .appendingPathComponent("AgentSessions", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: agentSessionsDir,
+                withIntermediateDirectories: true
+            )
+            let session = AgentSession(id: sessionID, name: "Recovery session", transcript: transcript)
+            try JSONEncoder().encode(session).write(
+                to: agentSessionsDir.appendingPathComponent("AgentSession-\(sessionID.uuidString).json")
+            )
+            let date = Date(timeIntervalSinceReferenceDate: 1000)
+            let index = AgentSessionMetadataIndex(entries: [
+                AgentSessionMetadataRecord(
+                    id: sessionID,
+                    filename: "AgentSession-\(sessionID.uuidString).json",
+                    workspaceID: nil,
+                    composeTabID: nil,
+                    name: "Recovery session",
+                    savedAt: date,
+                    lastUserMessageAt: nil,
+                    itemCount: 0,
+                    transcriptProjectionCounts: nil,
+                    hasUnknownConversationContent: false,
+                    agentKindRaw: nil,
+                    agentModelRaw: nil,
+                    agentReasoningEffortRaw: nil,
+                    lastRunStateRaw: nil,
+                    autoEditEnabled: true,
+                    parentSessionID: nil,
+                    isMCPOriginated: true,
+                    serializationVersion: nil,
+                    observedFileSize: nil,
+                    observedFileModificationDate: date,
+                    lastIndexedAt: date
+                )
+            ])
+            try JSONEncoder().encode(index).write(
+                to: agentSessionsDir.appendingPathComponent("AgentSessionIndex.json")
+            )
+            return HistorySessionScanner(applicationSupportRoot: appSupport, scanCacheTTL: 0)
         }
     }
 #endif

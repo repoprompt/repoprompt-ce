@@ -28,6 +28,36 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         }
     }
 
+    func testDestructiveCommitFenceRefusesAfterAuthorityEndsAndKeepsTheFile() async throws {
+        for authorityHolds in [false, true] {
+            let fixture = try makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.storageURL) }
+            let filename = agentSessionFilename(for: fixture.sessionID)
+            let fileURL = fixture.agentSessionsFolder.appendingPathComponent(filename)
+            try writeSession(
+                AgentSession(
+                    id: fixture.sessionID, workspaceID: fixture.workspace.id, composeTabID: fixture.tabID,
+                    name: "Fenced deletion", itemCount: 0
+                ),
+                to: fileURL
+            )
+            // The fence runs after admission and writer draining, at the commit point itself.
+            let fence: @Sendable () async -> Bool = { authorityHolds }
+            do {
+                try await AgentSessionDataService.destructiveCommitFence.withValue(fence) {
+                    try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+                }
+                XCTAssertTrue(authorityHolds, "a refused fence must throw")
+            } catch is AgentSessionDestructiveCommitRefused {
+                XCTAssertFalse(authorityHolds)
+            }
+            XCTAssertEqual(
+                FileManager.default.fileExists(atPath: fileURL.path), !authorityHolds,
+                "authority that ended before commit deletes nothing"
+            )
+        }
+    }
+
     func testBatchDeleteIgnoresNestedAndMalformedMetadataIndexFilenames() async throws {
         let cases: [(String, String, String)] = [
             ("nested", "nested/nested-sentinel.json", "nested/nested-sentinel.json"),

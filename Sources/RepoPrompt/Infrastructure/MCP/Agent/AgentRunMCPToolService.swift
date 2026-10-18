@@ -437,6 +437,11 @@ struct AgentRunMCPToolService {
         )
     }
 
+    /// An unrelated managed target uses the exact-link transaction, not child-session authority.
+    /// Production wiring keeps its lease, idempotency ledger, redaction and final dispatch fences.
+    var forwardOversightSteer: (([String: Value], RequestMetadata) async throws -> Value)?
+    private enum OversightSteerRouting: Error { case required(RequestMetadata) }
+
     func execute(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "wait"
         #if DEBUG
@@ -457,7 +462,20 @@ struct AgentRunMCPToolService {
         case "cancel":
             return try await executeCancel(args: args)
         case "steer":
-            return try await executeSteer(args: args)
+            do {
+                return try await executeSteer(args: args)
+            } catch let OversightSteerRouting.required(metadata) {
+                try Task.checkCancellation()
+                guard let forwardOversightSteer else { throw AgentSessionTargetOperationGuard.denialError(reference: "target") }
+                // Validate before any forwarder can deliver; never silently discard child-only options.
+                let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
+                if let rejected = args.keys.sorted().first(where: {
+                    !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
+                }) {
+                    throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
+                }
+                return try await forwardOversightSteer(args, metadata)
+            }
         case "respond":
             return try await executeRespond(args: args)
         default:
@@ -3507,8 +3525,8 @@ struct AgentRunMCPToolService {
 
     /// Common execution-time gate for every target-bearing `agent_run` operation.
     ///
-    /// An oversight grant is never a valid basis here, so a linked observer cannot bypass sanitized read
-    /// and idle-only send by calling poll/wait/cancel/steer/respond on its overseen target.
+    /// Oversight never grants raw child access here. An unrelated steer is redirected before child
+    /// capture to the exact-link transaction; other operations keep their original child authority.
     private func authorizeControlTargets(
         operation: DomainAgentSessionTargetOperation,
         sessionIDs: [UUID],
@@ -3525,14 +3543,21 @@ struct AgentRunMCPToolService {
         guard caller != .administrativePrincipal else { return }
         let workspace = targetWindow.workspaceManager.activeWorkspace
         for sessionID in sessionIDs {
-            try await AgentSessionTargetOperationGuard.require(
-                operation: operation,
-                caller: caller,
-                sessionID: sessionID,
-                reference: sessionIDs.count == 1 ? reference : nil,
-                agentModeVM: agentModeVM,
-                workspace: workspace
-            )
+            do {
+                try await AgentSessionTargetOperationGuard.require(
+                    operation: operation,
+                    caller: caller,
+                    sessionID: sessionID,
+                    reference: sessionIDs.count == 1 ? reference : nil,
+                    agentModeVM: agentModeVM,
+                    workspace: workspace
+                )
+            } catch {
+                if operation == .runSteer, caller.agentSessionID != nil, forwardOversightSteer != nil {
+                    throw OversightSteerRouting.required(metadata)
+                }
+                throw error
+            }
         }
     }
 

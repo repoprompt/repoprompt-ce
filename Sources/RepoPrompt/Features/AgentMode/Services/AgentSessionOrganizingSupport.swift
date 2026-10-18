@@ -164,7 +164,10 @@ struct AgentSessionAdminItemResult {
         var object = detail
         object["session_id"] = .string(sessionID.uuidString)
         object["status"] = .string(status.rawValue)
-        if let reason { object["reason"] = .string(reason) }
+        if let reason {
+            object["reason"] = .string(reason)
+            object = SessionAdminReply.diagnostic(code: reason, sessionIDs: [sessionID], fields: object)
+        }
         return .object(object)
     }
 }
@@ -177,6 +180,8 @@ enum AgentSessionAdminRendering {
     /// Set (to `true`) when a call committed durable side effects that per-item `changed` statuses
     /// do not show, for example a release whose first unlink succeeded before a later one failed.
     static let committedChangesKey = "committed_changes"
+    /// A handler-verified postcondition, still subordinate to every item's completion.
+    static let stateSatisfiedKey = "state_satisfied"
 
     /// Standard reply for a mutating op.
     static func mutationValue(
@@ -189,25 +194,24 @@ enum AgentSessionAdminRendering {
         object["result"] = .string(mutationResult(
             statuses: items.map(\.status),
             requiresControl: !itemsRequiringControl.isEmpty,
-            committedChanges: extra[committedChangesKey] == .bool(true)
+            committedChanges: extra[committedChangesKey] == .bool(true) || extra["local_changes"] == .bool(true),
+            alreadySatisfied: extra[stateSatisfiedKey] == .bool(true)
         ))
+        if object["result"] != .string("applied") { object.removeValue(forKey: stateSatisfiedKey) }
         object["op"] = .string(operation.adminOperationName)
         object["items"] = .array(items.map(\.value))
         object["changed_count"] = .int(items.count(where: { $0.status == .changed }))
         if !itemsRequiringControl.isEmpty {
             object["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
         }
-        return .object(object)
+        return .object(addingBatchDiagnostic(object))
     }
 
-    /// Recompute only the organizing/release receipt family after the front door appends targets.
-    /// Structural replies have their own item/effect semantics and are not interpreted here.
+    /// Recompute any mutation batch after the front door appends refused targets.
+    /// Preview, undo and non-batch operation receipts retain their separate semantics.
     static func refreshingOrganizingResult(_ object: [String: Value]) -> [String: Value] {
-        let operations: Set = [
-            "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups",
-            "archive", "unarchive", "release", "retire"
-        ]
-        guard let operation = object["op"]?.stringValue, operations.contains(operation),
+        guard let outcome = object["result"]?.stringValue,
+              ["applied", "partial", "not_applied", "failed", "unchanged"].contains(outcome),
               let items = object["items"]?.arrayValue else { return object }
         let statuses = items.compactMap { item -> AgentSessionAdminItemResult.Status? in
             guard let status = item.objectValue?["status"]?.stringValue else { return nil }
@@ -218,22 +222,37 @@ enum AgentSessionAdminRendering {
         result["result"] = .string(mutationResult(
             statuses: statuses,
             requiresControl: !(object["requires_control"]?.arrayValue ?? []).isEmpty,
-            committedChanges: object[committedChangesKey] == .bool(true)
+            committedChanges: object[committedChangesKey] == .bool(true) || object["local_changes"] == .bool(true),
+            alreadySatisfied: object[stateSatisfiedKey] == .bool(true)
         ))
+        if result["result"] != .string("applied") { result.removeValue(forKey: stateSatisfiedKey) }
         result["changed_count"] = .int(statuses.count(where: { $0 == .changed }))
-        return result
+        return addingBatchDiagnostic(result)
     }
 
-    private static func mutationResult(
-        statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool
+    static func addingBatchDiagnostic(_ object: [String: Value]) -> [String: Value] {
+        guard let outcome = object["result"]?.stringValue, outcome == "partial" || outcome == "not_applied" else { return object }
+        let items = object["items"]?.arrayValue ?? []
+        let ids = items.compactMap { $0.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)) }
+            + (object["requires_control"]?.arrayValue ?? []).compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }
+        let firstFailure = items.compactMap(\.objectValue).first { ["failed", "skipped"].contains($0["status"]?.stringValue ?? "") }
+        let code = firstFailure?["code"]?.stringValue ?? (outcome == "partial" ? "batch_partial" : "no_change")
+        var fields = firstFailure?.filter { ["subreason", "detail", "next_call", "retryable"].contains($0.key) } ?? [:]
+        fields.merge(object, uniquingKeysWith: { _, supplied in supplied })
+        if outcome == "partial" { fields["retryable"] = .bool(false) }
+        return SessionAdminReply.diagnostic(code: code, sessionIDs: ids, fields: fields)
+    }
+
+    static func mutationResult(
+        statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool,
+        alreadySatisfied: Bool = false
     ) -> String {
         let effects = committedChanges || statuses.contains(.changed)
         let failed = statuses.contains(.failed)
         let incomplete = failed || statuses.contains(.skipped) || requiresControl
         if effects { return incomplete ? "partial" : "applied" }
-        if failed { return "failed" }
-        if incomplete || statuses.isEmpty { return "not_applied" }
-        return "unchanged"
+        if alreadySatisfied, !statuses.isEmpty, !incomplete { return "applied" }
+        return "not_applied"
     }
 }
 
@@ -254,6 +273,8 @@ struct AgentSessionScopeVisibility {
     func isVisible(_ record: DomainAgentSessionInventoryRecord, in snapshot: DomainAgentSessionInventorySnapshot) -> Bool {
         chain.allSatisfy { scope in
             switch scope.grant.kind {
+            case let .session(target):
+                record.sessionID == target || record.sessionID == scope.grant.granteeSessionID
             case .allSessions:
                 true
             case let .workspace(workspaceID):
@@ -263,20 +284,119 @@ struct AgentSessionScopeVisibility {
             }
         }
     }
+
+    func mayDiscloseUnresolved(_ sessionID: UUID) -> Bool {
+        !chain.isEmpty && chain.allSatisfy { scope in
+            switch scope.grant.kind {
+            case .allSessions: true
+            case let .session(target): sessionID == target || sessionID == scope.grant.granteeSessionID
+            case .workspace: false
+            case let .tree(root): sessionID == root
+            }
+        }
+    }
 }
 
 // MARK: - Inventory source
 
 enum AgentSessionInventoryReadFailure: Error, Equatable {
     case budgetExceeded
-    case incomplete
+    case incomplete(Reason)
+
+    /// Which completeness check refused. Every refusal names one, so a caller (and the user) can
+    /// tell a transient race from a filter that needs a complete census or a damaged index.
+    enum Reason: String, Equatable {
+        case ambiguousBinding = "ambiguous_binding"
+        case replicaMismatch = "replica_mismatch"
+        case sessionsChangedDuringRead = "sessions_changed_during_read"
+        case historyLookupFailed = "history_lookup_failed"
+        case historyIndexIncomplete = "history_index_incomplete"
+        case historyRecordMismatch = "history_record_mismatch"
+        case ancestryTooDeep = "ancestry_too_deep"
+        case filterNeedsCompleteCensus = "filter_needs_complete_census"
+        case organizationStateUnknown = "organization_state_unknown"
+        case orphanStatusUnknown = "orphan_status_unknown"
+        case noMatchesWhileInventoryIncomplete = "no_matches_while_inventory_incomplete"
+
+        var retryable: Bool {
+            switch self {
+            case .sessionsChangedDuringRead, .historyLookupFailed: true
+            default: false
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .ambiguousBinding:
+                "More than one physical or runtime binding claims this session."
+            case .replicaMismatch:
+                "Window replicas disagree on this session’s inventory fields."
+            case .sessionsChangedDuringRead:
+                "Open sessions or tabs changed repeatedly while the inventory was read."
+            case .historyLookupFailed:
+                "A saved session index could not be read."
+            case .historyIndexIncomplete:
+                "Some saved session indexes are unreadable or use an unsupported format, so absence cannot be proven."
+            case .historyRecordMismatch:
+                "A saved index entry did not match the session it was looked up for."
+            case .ancestryTooDeep:
+                "The targeted session-and-ancestor lookup exceeded its 256-session limit."
+            case .filterNeedsCompleteCensus:
+                "has_links, role and orphaned filters need every session and link to be known, and some are not."
+            case .organizationStateUnknown:
+                "The organization filter needs known sidebar facts, but some sessions have unresolved bindings or unknown sidebar state."
+            case .orphanStatusUnknown:
+                "The orphaned filter needs complete endpoint and observer archive-state evidence, and some of it is unknown."
+            case .noMatchesWhileInventoryIncomplete:
+                "No resolved session matched, but some of the requested inventory is unknown, so an empty result is not proof."
+            }
+        }
+
+        var nextStep: String {
+            switch self {
+            case .ambiguousBinding:
+                "Ask the user to close duplicate bindings, then call session_admin inventory again."
+            case .replicaMismatch:
+                "Ask the user to reconcile the session’s window replicas, then call session_admin inventory again."
+            case .sessionsChangedDuringRead:
+                "Retry once after current lane/tab changes settle."
+            case .historyLookupFailed:
+                "Retry once; if it repeats, use filter {loaded:true} for open sessions only."
+            case .filterNeedsCompleteCensus, .orphanStatusUnknown:
+                "Remove has_links/role/orphaned and call session_admin inventory with filter {loaded:true}; ask the user if a complete saved-session census is needed."
+            case .organizationStateUnknown:
+                "Call session_admin inventory with filter {loaded:true}; reconcile unresolved bindings or use targets with known sidebar state before retrying."
+            case .noMatchesWhileInventoryIncomplete:
+                "Call session_admin inventory with filter {loaded:true}; inspect unresolved_sessions and ask the user to reconcile conflicting bindings or replicas."
+            case .historyIndexIncomplete, .historyRecordMismatch:
+                "Use filter {loaded:true} for open sessions; ask the user if saved sessions are needed."
+            case .ancestryTooDeep:
+                "Use fewer exact targets or sessions nearer the root, or call session_admin inventory with filter {loaded:true}."
+            }
+        }
+    }
 
     var value: Value {
-        .object([
-            "result": .string("incomplete"),
-            "code": .string(self == .budgetExceeded ? "inventory_budget_exceeded" : "inventory_incomplete"),
-            "retryable": .bool(true)
-        ])
+        switch self {
+        case .budgetExceeded:
+            .object([
+                "result": .string("incomplete"),
+                "code": .string("inventory_budget_exceeded"),
+                "subreason": .string("request_budget_exhausted"),
+                "detail": .string("The read hit the time or work budget for the requested session inventory."),
+                "next_step": .string("Narrow with filter {workspace:<id>} or {loaded:true}, then retry."),
+                "retryable": .bool(false)
+            ])
+        case let .incomplete(reason):
+            .object([
+                "result": .string("incomplete"),
+                "code": .string("inventory_incomplete"),
+                "subreason": .string(reason.rawValue),
+                "detail": .string(reason.detail),
+                "next_step": .string(reason.nextStep),
+                "retryable": .bool(reason.retryable)
+            ])
+        }
     }
 }
 
@@ -310,13 +430,14 @@ struct AgentSessionInventoryRead {
         }
         let needsGlobal = filter?.orphaned != nil || filter?.hasLinks != nil || filter?.role != nil
             || (!isTree && filter?.rootOverseerSessionID != nil)
+        let needsHistory = needsGlobal || filter?.createdBefore != nil || filter?.createdAfter != nil
         let workspace = chain.compactMap { scope -> UUID? in
             if case let .workspace(id) = scope.grant.kind { return id }
             return nil
         }.first ?? (isTree || needsGlobal ? nil : filter?.workspaceID)
         return AgentSessionInventoryRead(
             workspaceID: isTree || needsGlobal ? nil : workspace,
-            loadedOnly: isTree && !needsGlobal
+            loadedOnly: (isTree || filter?.loaded == true) && !needsHistory
         )
     }
 }
@@ -341,18 +462,22 @@ extension AgentSessionInventorySource {
 @MainActor
 final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
     private let scanner: any HistorySessionScanning
+    /// Optional suspension seam for deterministic capture-invalidation tests; never tool-configured.
+    private let loadedProjectionCheckpoint: (@MainActor () async throws -> Void)?
     private let windows: @MainActor () -> [WindowState]
     private let links: @MainActor () async -> (live: [DomainAgentSessionLinkInventoryItem], persisted: [AgentSessionOversightIntent])
 
     init(
         scanner: any HistorySessionScanning = HistorySessionScanner(),
         windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows },
+        loadedProjectionCheckpoint: (@MainActor () async throws -> Void)? = nil,
         links: @escaping @MainActor () async -> (
             live: [DomainAgentSessionLinkInventoryItem],
             persisted: [AgentSessionOversightIntent]
         ) = { await AgentSessionLinkRuntimeBridge.shared.oversightInventory(includeLocation: false) }
     ) {
         self.scanner = scanner
+        self.loadedProjectionCheckpoint = loadedProjectionCheckpoint
         self.windows = windows
         self.links = links
     }
@@ -369,13 +494,14 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         var records: [DomainAgentSessionInventoryRecord] = []
         var isComplete = false
         var recordsComplete = false
+        var historyIssue: String?
         var historyByID: [UUID: (AgentSessionMetadataRecord, String)] = [:]
         if let targets = read.historyTargetIDs {
             var pending = Array(targets)
             var visited: Set<UUID> = []
             while let id = pending.popLast() {
                 guard visited.insert(id).inserted else { continue }
-                guard visited.count <= 256 else { throw AgentSessionInventoryReadFailure.incomplete }
+                guard visited.count <= 256 else { throw AgentSessionInventoryReadFailure.incomplete(.ancestryTooDeep) }
                 try await Self.projectionCheckpoint(projected: visited.count, budget: read.budget)
                 let lookup: HistoryDirectSessionLookup
                 do {
@@ -385,17 +511,17 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 } catch let error as HistorySessionScannerError {
                     try Task.checkCancellation()
                     if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
-                    throw AgentSessionInventoryReadFailure.incomplete
+                    throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
                 } catch {
                     try Task.checkCancellation()
-                    throw AgentSessionInventoryReadFailure.incomplete
+                    throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
                 }
                 try await Self.projectionCheckpoint(projected: visited.count, budget: read.budget)
-                guard lookup.isComplete else { throw AgentSessionInventoryReadFailure.incomplete }
+                guard lookup.isComplete else { throw AgentSessionInventoryReadFailure.incomplete(.historyIndexIncomplete) }
                 guard let location = lookup.location else { continue }
                 let metadata = try await exactMetadata(location: location, sessionID: id, budget: read.budget)
                 let record = metadata.record
-                guard record.id == id else { throw AgentSessionInventoryReadFailure.incomplete }
+                guard record.id == id else { throw AgentSessionInventoryReadFailure.incomplete(.historyRecordMismatch) }
                 historyByID[id] = (record, location.workspaceName)
                 records.append(DomainAgentSessionInventoryRecord(
                     sessionID: id, name: record.name, workspaceID: metadata.workspaceID,
@@ -420,6 +546,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 try Task.checkCancellation()
                 // A workspace-local scan cannot prove that an endpoint in another workspace is gone.
                 recordsComplete = Self.isComplete(scan)
+                if !recordsComplete { historyIssue = AgentSessionInventoryReadFailure.Reason.historyIndexIncomplete.rawValue }
                 isComplete = read.workspaceID == nil && recordsComplete
                 var projected = 0
                 for workspace in scan.workspaces {
@@ -439,19 +566,20 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 try Task.checkCancellation()
                 if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
                 isComplete = false
+                historyIssue = AgentSessionInventoryReadFailure.Reason.historyLookupFailed.rawValue
             } catch {
                 // History I/O/budget failures never prove deletion, and must not expose filesystem
                 // details through the administration surface. Keep the app-owned loaded projection.
                 try Task.checkCancellation()
                 isComplete = false
+                historyIssue = AgentSessionInventoryReadFailure.Reason.historyLookupFailed.rawValue
             }
         }
         try Task.checkCancellation()
+        let (live, persisted) = await links()
         let loaded = try await loadedRecords(historyByID: historyByID, read: read)
         records.append(contentsOf: loaded.records)
-        isComplete = isComplete && loaded.isComplete
-        try await Self.projectionCheckpoint(projected: records.count, budget: read.budget)
-        let (live, persisted) = await links()
+        isComplete = isComplete && loaded.unresolved.isEmpty
         try Task.checkCancellation()
         guard read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil else {
             throw AgentSessionInventoryReadFailure.budgetExceeded
@@ -464,7 +592,9 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         let snapshot = DomainAgentSessionInventorySnapshot(
             records: records, edges: edges,
             isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil,
-            recordsComplete: recordsComplete && loaded.isComplete
+            recordsComplete: (read.loadedOnly || recordsComplete) && loaded.unresolved.isEmpty,
+            unresolvedSessions: loaded.unresolved,
+            historyIssue: read.loadedOnly ? nil : historyIssue
         )
         try Task.checkCancellation()
         // The immutable snapshot's dictionary/edge indexing is synchronous. Never hand back a
@@ -472,6 +602,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         guard read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil else {
             throw AgentSessionInventoryReadFailure.budgetExceeded
         }
+        try Task.checkCancellation()
         return snapshot
     }
 
@@ -496,17 +627,17 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         } catch let error as HistorySessionScannerError {
             try Task.checkCancellation()
             if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
-            throw AgentSessionInventoryReadFailure.incomplete
+            throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
         } catch {
             try Task.checkCancellation()
-            throw AgentSessionInventoryReadFailure.incomplete
+            throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
         }
         try await Self.projectionCheckpoint(projected: 0, budget: budget)
-        guard Self.isComplete(scan),
-              let workspace = scan.workspaces.first(where: { $0.workspaceDir.standardizedFileURL == location.workspaceDir.standardizedFileURL }),
+        guard Self.isComplete(scan) else { throw AgentSessionInventoryReadFailure.incomplete(.historyIndexIncomplete) }
+        guard let workspace = scan.workspaces.first(where: { $0.workspaceDir.standardizedFileURL == location.workspaceDir.standardizedFileURL }),
               let record = workspace.records.first(where: { $0.id == sessionID })
         else {
-            throw AgentSessionInventoryReadFailure.incomplete
+            throw AgentSessionInventoryReadFailure.incomplete(.historyRecordMismatch)
         }
         return (record, record.workspaceID ?? workspace.workspaceID)
     }
@@ -569,25 +700,21 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
     private struct LoadedRuntimeEvidence {
         var liveStates: Set<DomainAgentSessionInventoryRunState> = []
         var fallbackStates: Set<DomainAgentSessionInventoryRunState> = []
-        var hasBindingConflict = false
 
         mutating func observe(_ observation: LoadedRuntimeObservation) {
             switch observation {
             case let .live(state): liveStates.insert(state)
             case let .fallback(state): fallbackStates.insert(state)
-            case .bindingConflict: hasBindingConflict = true
+            case .bindingConflict: break
             }
         }
 
-        func resolved() throws -> DomainAgentSessionInventoryRunState {
-            guard !hasBindingConflict, liveStates.count <= 1 else {
-                throw AgentSessionInventoryReadFailure.incomplete
-            }
+        func resolved() -> DomainAgentSessionInventoryRunState {
+            // Binding conflicts are excluded before this runtime-only reduction. Conflicting
+            // states are uncertainty, not a reason to discard a proven physical identity.
+            if liveStates.count > 1 { return .unknown }
             if let live = liveStates.first { return live }
-            guard fallbackStates.count == 1, let fallback = fallbackStates.first else {
-                throw AgentSessionInventoryReadFailure.incomplete
-            }
-            return fallback
+            return fallbackStates.count == 1 ? (fallbackStates.first ?? .unknown) : .unknown
         }
     }
 
@@ -599,13 +726,14 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
 
         mutating func merge(
             record: DomainAgentSessionInventoryRecord, observation: LoadedRuntimeObservation
-        ) throws {
-            guard self.record == record else { throw AgentSessionInventoryReadFailure.incomplete }
+        ) -> Bool {
+            guard self.record == record else { return false }
             runtime.observe(observation)
+            return true
         }
 
-        func resolvedRecord() throws -> DomainAgentSessionInventoryRecord {
-            try DomainAgentSessionInventoryRecord(
+        func resolvedRecord() -> DomainAgentSessionInventoryRecord {
+            DomainAgentSessionInventoryRecord(
                 sessionID: record.sessionID, name: record.name,
                 workspaceID: record.workspaceID, workspaceName: record.workspaceName,
                 isLoaded: record.isLoaded, organizationStateIsKnown: record.organizationStateIsKnown,
@@ -625,8 +753,20 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
     private func loadedRecords(
         historyByID: [UUID: (AgentSessionMetadataRecord, String)],
         read: AgentSessionInventoryRead
-    ) async throws -> (records: [DomainAgentSessionInventoryRecord], isComplete: Bool) {
-        try Task.checkCancellation()
+    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String]) {
+        // Exactly two total attempts, sharing the invocation's original deadline/work budget.
+        do {
+            return try await captureLoadedRecords(historyByID: historyByID, read: read)
+        } catch AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) {
+            try Task.checkCancellation()
+            return try await captureLoadedRecords(historyByID: historyByID, read: read)
+        }
+    }
+
+    private func captureLoadedRecords(
+        historyByID: [UUID: (AgentSessionMetadataRecord, String)], read: AgentSessionInventoryRead
+    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String]) {
+        try await Self.projectionCheckpoint(projected: 0, budget: read.budget)
         let capture = AgentSessionCarrierResolver.capture(windows: windows(), sessionIDs: read.sessionIDs)
         let rows = capture.rows.filter { read.workspaceID == nil || $0.workspaceID == read.workspaceID }
         var affectedIDs = read.sessionIDs ?? Set(rows.map(\.sessionID))
@@ -636,9 +776,9 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 affectedIDs.insert(id)
             }
         }
-        guard capture.ambiguousSessionIDs.isDisjoint(with: affectedIDs) else {
-            throw AgentSessionInventoryReadFailure.incomplete
-        }
+        var unresolved = Dictionary(uniqueKeysWithValues: capture.ambiguousSessionIDs.intersection(affectedIDs).map {
+            ($0, AgentSessionInventoryReadFailure.Reason.ambiguousBinding.rawValue)
+        })
         let rowsByWindow = Dictionary(grouping: rows) { ObjectIdentifier($0.window) }
         var bindingStates: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
         for (windowID, windowRows) in rowsByWindow {
@@ -664,13 +804,18 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             }
             return .fallback(fallback)
         }
+        try await loadedProjectionCheckpoint?()
         var projections: [UUID: LoadedCarrierProjection] = [:]
         var projected = 0
         for (row, observation) in zip(rows, observations) {
             try await Self.projectionCheckpoint(projected: projected, budget: read.budget)
-            guard capture.isCurrent() else { throw AgentSessionInventoryReadFailure.incomplete }
+            guard capture.isCurrent() else { throw AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) }
             projected += 1
             let sessionID = row.sessionID
+            if case .bindingConflict = observation {
+                unresolved[sessionID] = AgentSessionInventoryReadFailure.Reason.ambiguousBinding.rawValue
+            }
+            guard unresolved[sessionID] == nil else { continue }
             let tab = row.tab
             let entry = row.entry
             let candidateHistory = historyByID[sessionID]?.0
@@ -698,24 +843,74 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 worktreeCount: entry?.worktreeBindingSummaries.count ?? history?.worktreeBindingSummaries.count ?? 0
             )
             if var existing = projections[sessionID] {
-                try existing.merge(record: record, observation: observation)
-                projections[sessionID] = existing
+                if existing.merge(record: record, observation: observation) {
+                    projections[sessionID] = existing
+                } else {
+                    unresolved[sessionID] = AgentSessionInventoryReadFailure.Reason.replicaMismatch.rawValue
+                }
             } else {
                 var projection = LoadedCarrierProjection(record: record)
                 projection.runtime.observe(observation)
                 projections[sessionID] = projection
             }
         }
-        return try (projections.values.map { try $0.resolvedRecord() }, true)
+        try await Self.projectionCheckpoint(projected: 0, budget: read.budget)
+        guard capture.isCurrent() else { throw AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) }
+        return (projections.filter { unresolved[$0.key] == nil }.values.map { $0.resolvedRecord() }, unresolved)
     }
 }
 
 // MARK: - Inventory rendering
 
 /// Renders inventory from a scope-restricted snapshot (`DomainAgentSessionInventorySnapshot.restricted`):
-/// any session ID that is not a record of that view is either outside the scope (never rendered) or
-/// known to be deleted (rendered as `missing`, without its ID).
+/// edges render only known visible records or proven-missing endpoints. Unresolved identities are
+/// rendered separately after scope redaction, and never treated as deleted sessions.
 enum AgentSessionInventoryRendering {
+    static func unresolvedFields(_ snapshot: DomainAgentSessionInventorySnapshot) -> [String: Value] {
+        guard snapshot.unresolvedSessionCount > 0 else { return historyIssueFields(snapshot) }
+        return [
+            "result": .string("partial"),
+            "code": .string("inventory_incomplete"),
+            "subreason": .string("unresolved_sessions"),
+            "detail": .string("Some session bindings or replicas could not be resolved; totals are lower bounds."),
+            "next_step": .string("Inspect unresolved_sessions; ask the user to reconcile duplicate bindings or disagreeing window replicas before retrying."),
+            "retryable": .bool(false),
+            "total_complete": .bool(false),
+            "unresolved_session_count": .int(snapshot.unresolvedSessionCount),
+            "unresolved_sessions_redacted_count": .int(snapshot.unresolvedSessionCount - snapshot.unresolvedSessions.count),
+            "unresolved_sessions": .array(snapshot.unresolvedSessions.sorted { $0.key.uuidString < $1.key.uuidString }.map {
+                unresolvedValue(id: $0.key, reason: $0.value)
+            })
+        ]
+    }
+
+    /// Healthy rows stay usable; the result says why saved history is incomplete and what to do.
+    static func historyIssueFields(_ snapshot: DomainAgentSessionInventorySnapshot) -> [String: Value] {
+        guard let raw = snapshot.historyIssue,
+              let reason = AgentSessionInventoryReadFailure.Reason(rawValue: raw) else { return [:] }
+        return [
+            "result": .string("partial"),
+            "code": .string("inventory_incomplete"),
+            "subreason": .string(reason.rawValue),
+            "detail": .string(reason.detail + " Open sessions are listed; saved sessions may be missing."),
+            "next_step": .string(reason.nextStep),
+            "retryable": .bool(reason.retryable),
+            "total_complete": .bool(false)
+        ]
+    }
+
+    static func unresolvedValue(id: UUID, reason: String) -> Value {
+        let reason = AgentSessionInventoryReadFailure.Reason(rawValue: reason) ?? .ambiguousBinding
+        return .object([
+            "session_id": .string(id.uuidString),
+            "code": .string(reason.rawValue),
+            "subreason": .string(reason.rawValue),
+            "detail": .string(reason.detail),
+            "next_step": .string(reason.nextStep),
+            "retryable": .bool(reason.retryable)
+        ])
+    }
+
     static func row(
         _ record: DomainAgentSessionInventoryRecord,
         snapshot: DomainAgentSessionInventorySnapshot,

@@ -130,6 +130,36 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
+    func testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession() throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let unrelated = DomainAgentSessionTargetProvenance.known(targetSessionID: UUID(), parentSessionID: nil)
+        let caller = DomainAgentSessionCallerIdentity.agentSession(callerSessionID)
+        let operations: [DomainAgentSessionTargetOperation] = [.runSteer, .runCancel, .runRespond, .manageStop, .manageCleanup]
+
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        for operation in operations {
+            XCTAssertThrowsError(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): off keeps the direct-child and human-only rules"
+            )
+        }
+
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        for operation in operations {
+            XCTAssertNoThrow(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): global on removes the barrier, including session deletion"
+            )
+        }
+        XCTAssertThrowsError(
+            try AgentSessionTargetOperationGuard.require(
+                operation: .runSteer, caller: .unresolvedAgentRun, provenance: unrelated, reference: "x"
+            ),
+            "unresolved routing is not a caller and still fails closed"
+        )
+    }
+
     func testAgentOriginCallerCannotTargetItsOwnSession() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -436,7 +466,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             deleted: deleted
         )
 
-        await assertUniformDenial(reference: child.uuidString) {
+        await assertHumanOnlyCleanupDenial {
             try await service.execute(args: [
                 "op": .string("cleanup_sessions"),
                 "session_ids": .array([.string(child.uuidString), .string(sibling.uuidString)])
@@ -447,13 +477,35 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             "Agent Mode must not delete any saved conversation"
         )
 
-        await assertUniformDenial(reference: child.uuidString) {
+        await assertHumanOnlyCleanupDenial {
             try await service.execute(args: [
                 "op": .string("cleanup_sessions"),
                 "session_ids": .array([.string(child.uuidString)])
             ])
         }
         XCTAssertTrue(deleted.sessionIDs.isEmpty, "Direct spawn provenance does not authorize deletion")
+    }
+
+    func testLoadingLiveCarrierCannotErasePersistedSpawnParentFromChildCount() async throws {
+        let window = try await makeWindow(waitForInitialization: true)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let child = UUID()
+        try await persistSession(id: child, workspace: workspace, parentSessionID: callerSessionID)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let loading = window.agentModeViewModel.session(for: tabID)
+        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: child, on: loading, updateWorkspaceMetadata: true))
+        loading.hasLoadedPersistedState = false
+        XCTAssertNil(loading.parentSessionID)
+        let service = makeManageService(window: window, callerSessionID: callerSessionID)
+        let reply = try await service.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(reply.objectValue?["matching_child_count"], .int(1))
+        let ids = try await sessionIDs(in: service.execute(args: ["op": .string("list_sessions")]))
+        XCTAssertEqual(ids, [child.uuidString])
+        loading.hasLoadedPersistedState = true
+        loading.parentSessionID = nil
+        let loadedReply = try await service.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(loadedReply.objectValue?["matching_child_count"], .int(0), "A hydrated carrier's nil remains authoritative; stale metadata grants no child access")
     }
 
     func testListSessionsScopesDiscoveryToDirectChildrenAndFailsClosedWhenUnrouted() async throws {
@@ -520,6 +572,32 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertEqual(unresolved.objectValue?["sessions"], .array([]))
         XCTAssertNil(unresolved.objectValue?["workspace_id"])
         XCTAssertNil(unresolved.objectValue?["matching_child_count"])
+    }
+
+    func testListSessionsNoteResamplesFullAccess() async throws {
+        let original = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = original }
+        var fullAccess = false
+        OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+        let window = try await makeWindow(waitForInitialization: true)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let service = makeManageService(window: window, callerSessionID: callerSessionID)
+        for enabled in [false, true, false] {
+            fullAccess = enabled
+            let reply = try await service.execute(args: ["op": .string("list_sessions")])
+            let note = try XCTUnwrap(reply.objectValue?["note"]?.stringValue)
+            XCTAssertTrue(note.contains("not a workspace inventory"))
+            if enabled {
+                XCTAssertTrue(note.contains("Overseer full access: ON"))
+                XCTAssertTrue(note.contains("session_admin inventory"))
+                XCTAssertFalse(note.contains("request_scope"))
+                XCTAssertFalse(note.contains("scope card"))
+            } else {
+                XCTAssertTrue(note.contains("when no current grant covers"))
+                XCTAssertTrue(note.contains("standing consent"))
+                XCTAssertTrue(note.contains("session_admin request_scope"))
+            }
+        }
     }
 
     func testListSessionsRejectsWorkspaceChangeAfterMetadataRead() async throws {
@@ -607,6 +685,272 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    func testCleanupFullAccessDeletesNonMCPOriginsAndReportsMixedDiagnostics() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let lane = UUID(), fork = UUID(), absent = UUID(), active = UUID(), broken = UUID()
+        let deleted = DeletionRecorder()
+        let service = cleanupService(window: window, deleted: deleted, metadata: { id in
+            if id == absent { return nil }
+            if id == broken { throw CocoaError(.fileReadCorruptFile) }
+            return self.makeMeta(
+                id: id,
+                parentSessionID: nil,
+                isMCPOriginated: false,
+                lastRunState: id == active ? .running : .completed
+            )
+        })
+        let value = try await service.execute(args: cleanupArgs([lane, fork, absent, active, broken]))
+        let result = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(Set(deleted.sessionIDs), Set([lane, fork]))
+        XCTAssertEqual(result["result"], .string("partial"))
+        let skipped = try XCTUnwrap(result["skipped_sessions"]?.arrayValue)
+        XCTAssertEqual(skipped.count, 3)
+        for item in skipped {
+            assertCleanupDiagnostic(item)
+        }
+        let text = ToolOutputFormatter.formatAgentManage(args: cleanupArgs([]), value: value).compactMap { content -> String? in
+            if case let .text(text, _, _) = content { return text }
+            return nil
+        }.joined(separator: "\n")
+        XCTAssertTrue(text.contains(active.uuidString))
+        XCTAssertTrue(text.contains("skipped_active"))
+        XCTAssertTrue(text.contains("Next"))
+        // Successful deletions are listed by ID too, not only counted.
+        XCTAssertTrue(text.contains(lane.uuidString) && text.contains(fork.uuidString), text)
+        XCTAssertTrue(text.contains("deleted"))
+        for id in [absent, active, broken] {
+            XCTAssertTrue(text.contains(id.uuidString), "skipped \(id) must be listed")
+        }
+    }
+
+    func testCleanupRechecksModeAndCallerAfterResolutionBeforeDeletion() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        for changeCaller in [false, true] {
+            var enabled = true
+            var caller = callerSessionID
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let target = UUID(), deleted = DeletionRecorder()
+            let service = cleanupService(window: window, deleted: deleted, caller: { caller }, metadata: { id in
+                self.makeMeta(id: id, parentSessionID: nil, isMCPOriginated: false)
+            }, load: {
+                if changeCaller { caller = UUID() } else { enabled = false }
+            })
+            let result = try await service.execute(args: cleanupArgs([target]))
+            XCTAssertTrue(deleted.sessionIDs.isEmpty)
+            XCTAssertEqual(result.objectValue?["result"], .string("not_applied"))
+            for item in result.objectValue?["skipped_sessions"]?.arrayValue ?? [] {
+                assertCleanupDiagnostic(item)
+            }
+        }
+    }
+
+    func testCleanupCommitFenceRevalidatesCallerAndModeWhileDeletionIsParked() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        for change in ["none", "mode_off", "caller_changed"] {
+            var enabled = true
+            var caller = callerSessionID
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let target = UUID(), deleted = DeletionRecorder()
+            let service = cleanupService(window: window, deleted: deleted, caller: { caller }, metadata: { id in
+                self.makeMeta(id: id, parentSessionID: nil, isMCPOriginated: false)
+            }, atStorageCommit: {
+                switch change {
+                case "mode_off": enabled = false
+                case "caller_changed": caller = UUID()
+                default: break
+                }
+            })
+            let result = try await service.execute(args: cleanupArgs([target]))
+            if change == "none" {
+                XCTAssertEqual(deleted.sessionIDs, [target], "unchanged authority deletes")
+            } else {
+                XCTAssertTrue(deleted.sessionIDs.isEmpty, "\(change): authority that ended at commit deletes nothing")
+                let skipped = result.objectValue?["skipped_sessions"]?.arrayValue ?? []
+                XCTAssertEqual(skipped.first?.objectValue?["reason"], .string("authority_changed_before_commit"), change)
+            }
+        }
+    }
+
+    func testCleanupOffRefusesExplicitlyAndCancellationHasActionableItems() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        let target = UUID(), deleted = DeletionRecorder()
+        let service = cleanupService(window: window, deleted: deleted, metadata: { self.makeMeta(id: $0, parentSessionID: nil) })
+        let denied = try await service.execute(args: cleanupArgs([target]))
+        XCTAssertEqual(denied.objectValue?["code"], .string("human_only_operation"))
+        XCTAssertEqual(denied.objectValue?["retryable"], .bool(false))
+        XCTAssertTrue(deleted.sessionIDs.isEmpty)
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        let cancelled = cleanupService(window: window, deleted: deleted, metadata: { self.makeMeta(id: $0, parentSessionID: nil) }, cancellation: { throw CancellationError() })
+        let result = try await cancelled.execute(args: cleanupArgs([target, UUID()]))
+        XCTAssertEqual(result.objectValue?["result"], .string("not_applied"))
+        let items = try XCTUnwrap(result.objectValue?["unprocessed_sessions"]?.arrayValue)
+        XCTAssertEqual(items.count, 2)
+        for item in items {
+            assertCleanupDiagnostic(item)
+        }
+        let text = ToolOutputFormatter.formatAgentManage(args: cleanupArgs([]), value: result).compactMap { content -> String? in
+            if case let .text(text, _, _) = content { return text }
+            return nil
+        }.joined(separator: "\n")
+        XCTAssertTrue(text.contains(target.uuidString))
+        XCTAssertTrue(text.contains("cancelled_before_processing"))
+    }
+
+    func testCleanupAllFailedAbsentAndPostDurableFailureReceipts() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let target = UUID(), deleted = DeletionRecorder()
+        let failed = cleanupService(window: window, deleted: deleted, metadata: { _ in throw CocoaError(.fileReadCorruptFile) })
+        let failure = try await failed.execute(args: cleanupArgs([target]))
+        XCTAssertEqual(failure.objectValue?["result"], .string("not_applied"))
+        XCTAssertEqual(failure.objectValue?["retry_session_ids"], .array([]))
+        for item in failure.objectValue?["skipped_sessions"]?.arrayValue ?? [] {
+            assertCleanupDiagnostic(item)
+        }
+        let absent = cleanupService(window: window, deleted: deleted, metadata: { _ in nil })
+        let absentResult = try await absent.execute(args: cleanupArgs([target]))
+        XCTAssertEqual(absentResult.objectValue?["result"], .string("not_applied"))
+        XCTAssertEqual(absentResult.objectValue?["status"], .string("completed"))
+        let postCommit = cleanupService(window: window, deleted: deleted, metadata: {
+            self.makeMeta(id: $0, parentSessionID: nil)
+        }, cancellation: {
+            if !deleted.sessionIDs.isEmpty { throw CocoaError(.fileWriteUnknown) }
+        })
+        let committed = try await postCommit.execute(args: cleanupArgs([target]))
+        XCTAssertEqual(committed.objectValue?["result"], .string("partial"))
+        XCTAssertEqual(committed.objectValue?["deleted_count"], .int(1))
+        XCTAssertEqual(committed.objectValue?["retry_session_ids"], .array([]))
+        let receipt = try XCTUnwrap(committed.objectValue?["deleted_sessions"]?.arrayValue?.first)
+        XCTAssertEqual(receipt.objectValue?["durable"], .bool(true))
+        XCTAssertEqual(receipt.objectValue?["retryable"], .bool(false))
+        assertCleanupDiagnostic(receipt)
+    }
+
+    func testCleanupFinalFenceRejectsNewActivityAndReboundTab() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let tab = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let vm = window.agentModeViewModel
+        let session = vm.session(for: tab)
+        session.hasLoadedPersistedState = true
+        for rebind in [false, true] {
+            let target = UUID(), deleted = DeletionRecorder()
+            session.runState = .idle
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: target, on: session, updateWorkspaceMetadata: true))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            var callerReads = 0
+            let service = cleanupService(window: window, deleted: deleted, caller: {
+                callerReads += 1
+                if callerReads == 4 {
+                    if rebind {
+                        _ = vm.test_installPersistentSessionBinding(sessionID: self.callerSessionID, on: session, updateWorkspaceMetadata: true)
+                    } else { session.runState = .running }
+                }
+                return self.callerSessionID
+            }, metadata: { _ in nil })
+            let result = try await service.execute(args: cleanupArgs([target]))
+            XCTAssertTrue(deleted.sessionIDs.isEmpty)
+            XCTAssertEqual(result.objectValue?["result"], .string("not_applied"))
+            let receipt = try XCTUnwrap(result.objectValue?["skipped_sessions"]?.arrayValue?.first)
+            XCTAssertEqual(receipt.objectValue?["code"], .string(rebind ? "target_binding_changed" : "skipped_active"))
+        }
+        session.runState = .idle
+    }
+
+    func testCleanupSelfTargetDoesNotMislabelOtherBatchItemsAndRequiresRoutedConnection() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let other = UUID(), deleted = DeletionRecorder()
+        let service = cleanupService(window: window, deleted: deleted, metadata: { _ in nil })
+        let result = try await service.execute(args: cleanupArgs([other, callerSessionID]))
+        let items = try XCTUnwrap(result.objectValue?["skipped_sessions"]?.arrayValue)
+        XCTAssertEqual(items[0].objectValue?["code"], .string("batch_preflight_not_applied"))
+        XCTAssertEqual(items[1].objectValue?["code"], .string("self_target"))
+        let unidentified = cleanupService(window: window, deleted: deleted, connectionID: nil, metadata: { _ in nil })
+        let refused = try await unidentified.execute(args: cleanupArgs([other]))
+        XCTAssertEqual(refused.objectValue?["code"], .string("caller_routing_unresolved"))
+        XCTAssertTrue(deleted.sessionIDs.isEmpty)
+    }
+
+    private func assertHumanOnlyCleanupDenial(_ operation: () async throws -> Value) async {
+        do {
+            let result = try await operation()
+            XCTAssertEqual(result.objectValue?["result"], .string("not_applied"))
+            XCTAssertEqual(result.objectValue?["code"], .string("human_only_operation"))
+        } catch { XCTFail("Expected an actionable human-only receipt, got \(error)") }
+    }
+
+    private func cleanupArgs(_ ids: [UUID]) -> [String: Value] {
+        ["op": .string("cleanup_sessions"), "session_ids": .array(ids.map { .string($0.uuidString) })]
+    }
+
+    private func assertCleanupDiagnostic(_ value: Value, file: StaticString = #filePath, line: UInt = #line) {
+        for key in ["session_id", "code", "subreason", "detail", "next_step", "retryable"] {
+            XCTAssertNotNil(value.objectValue?[key], key, file: file, line: line)
+        }
+    }
+
+    private func cleanupService(
+        window: WindowState, deleted: DeletionRecorder,
+        caller: (() -> UUID)? = nil,
+        connectionID: UUID? = UUID(),
+        metadata: @escaping (UUID) throws -> AgentSessionMeta?,
+        load: @escaping () -> Void = {},
+        cancellation: @escaping () throws -> Void = {},
+        atStorageCommit: @escaping @MainActor () -> Void = {}
+    ) -> AgentManageMCPToolService {
+        AgentManageMCPToolService(
+            toolName: MCPWindowToolName.agentManage,
+            captureRequestMetadata: { .init(connectionID: connectionID, clientName: "cleanup-regression", windowID: window.windowID, runPurpose: .agentModeRun) },
+            requireTargetWindow: { window }, resolveSpawnSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in caller?() ?? self.callerSessionID },
+            bindCurrentRequestToTab: { _, _ in },
+            cleanupDependencies: .init(
+                loadPersistedMetadata: { id, _ in try metadata(id) },
+                loadPersistedSession: { _, _ in load()
+                    return nil
+                },
+                deleteOpenSession: { vm, tab, _ in
+                    if let id = vm.sessions[tab]?.activeAgentSessionID { deleted.sessionIDs.append(id) }
+                    return nil
+                },
+                deletePersistedSession: { id, _ in
+                    // Mirror AgentSessionDataService: authority can change while deletion is parked,
+                    // and the caller-supplied fence is evaluated at the commit point.
+                    atStorageCommit()
+                    if let fence = AgentSessionDataService.destructiveCommitFence.get(), await !fence() {
+                        throw AgentSessionDestructiveCommitRefused()
+                    }
+                    deleted.sessionIDs.append(id)
+                },
+                finalizePersistedReferences: { _, _, _ in 0 }, checkCancellation: cancellation
+            )
+        )
+    }
 
     private final class DeletionRecorder {
         var sessionIDs: [UUID] = []
@@ -698,7 +1042,10 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         )
     }
 
-    private func makeMeta(id: UUID, parentSessionID: UUID?) -> AgentSessionMeta {
+    private func makeMeta(
+        id: UUID, parentSessionID: UUID?, isMCPOriginated: Bool = true,
+        lastRunState: AgentSessionRunState = .completed
+    ) -> AgentSessionMeta {
         AgentSessionMeta(
             id: id,
             composeTabID: nil,
@@ -707,11 +1054,11 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             itemCount: 0,
             agentKind: AgentProviderKind.codexExec.rawValue,
             agentModel: "codex",
-            lastRunState: AgentSessionRunState.completed.rawValue,
+            lastRunState: lastRunState.rawValue,
             acpModelParameterSelections: [],
             parentSessionID: parentSessionID,
             createdByOverseerSessionID: nil,
-            isMCPOriginated: true,
+            isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
         )
@@ -1655,7 +2002,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: creator, target: .newSession,
             scopes: fixture.scopes, administration: fixture.core, projector: projector
-        ), .denied(.usageProofMissing), "A missing safe placement is not evidence that this creator is unscoped")
+        ), .creatorPlacementUnresolved(projector.pointResolutionState(for: creator) == .replicated ? "creator_replicated" : "creator_ancestry_conflict"), "A missing safe placement is not evidence that this creator is unscoped")
         let after = fixture.scopes.usageIncludingReservations(emptyUsage)
         XCTAssertEqual(after.liveSessionCount, before.liveSessionCount)
         XCTAssertEqual(after.worktreeCount, before.worktreeCount)
@@ -1675,6 +2022,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let source = OpenWindowsDelegationProvenanceSource(windows: { [window] })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
         let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let unscopedCore = AgentSessionAdministrationCore(scopes: scopes, projector: projector)
+        XCTAssertEqual(DelegationSpawnAdmission.admit(
+            creatorSessionID: child, target: .newSession, scopes: scopes, administration: unscopedCore, projector: projector
+        ), .unscoped, "With no live delegation anywhere, scope provenance cannot revoke the creation surface's own authority")
         let pending = try scopes.requestScope(
             requesterSessionID: child, requesterTabID: nil, kind: .tree(rootSessionID: root),
             capabilities: [.observe, .spawn], guardrails: .init(maxLiveSessions: 10), reason: nil, idempotencyKey: nil
@@ -1687,7 +2038,20 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let emptyUsage = DomainDelegationScopeUsage(scopeID: scope.id, liveSessionCount: 0, worktreeCount: 0)
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: child, target: .newSession, scopes: scopes, administration: core, projector: projector
-        ), .denied(.usageProofMissing))
+        ), .creatorPlacementUnresolved("creator_ancestry_conflict"))
+        for subreason in ["creator_ancestry_conflict", "creator_replicated"] {
+            guard case let .invalidParams(message) = DelegationSpawnAdmission.error(for: .usageProofMissing, subreason: subreason),
+                  let message, let start = message.firstIndex(of: "{"),
+                  let fields = try JSONSerialization.jsonObject(with: Data(message[start...].utf8)) as? [String: Any]
+            else { return XCTFail("placement refusal must stay a structured invalid-params error") }
+            XCTAssertEqual(fields["reason"] as? String, "placement_unresolved")
+            XCTAssertEqual(fields["subreason"] as? String, subreason)
+            XCTAssertEqual(fields["retryable"] as? Bool, false)
+            XCTAssertEqual(fields["recovery"] as? String, "manual")
+            XCTAssertNil(fields["next_call"], "no executable call repairs placement; a generic scope_status is not a repair")
+            XCTAssertEqual(fields["detail"] as? String, DelegationSpawnAdmission.placementUnresolvedDetail(subreason: subreason))
+        }
+        XCTAssertTrue(DelegationSpawnAdmission.placementUnresolvedDetail(subreason: "creator_replicated").contains("duplicate presentation"))
         XCTAssertEqual(scopes.usageIncludingReservations(emptyUsage), emptyUsage)
 
         // An actually unloaded root retains the existing ancestry contract; it is distinct from a

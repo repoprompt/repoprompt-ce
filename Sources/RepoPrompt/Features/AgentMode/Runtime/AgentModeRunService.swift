@@ -187,8 +187,13 @@ final class AgentModeRunService {
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        localComposerCandidate: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        var candidateTransferred = false
+        defer {
+            if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+        }
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
             return nil
@@ -287,6 +292,7 @@ final class AgentModeRunService {
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {
+            candidateTransferred = true
             await claudeRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -297,12 +303,14 @@ final class AgentModeRunService {
                 autoEffortSelection: autoEffortSelection,
                 providerControlCommand: providerControlCommand,
                 selfCompactDispatchID: selfCompactDispatchID,
-                stopFence: stopFence
+                stopFence: stopFence,
+                localComposerCandidate: localComposerCandidate
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
         }
         if let acpRunRequest {
+            candidateTransferred = true
             await acpRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -312,11 +320,13 @@ final class AgentModeRunService {
                 runRequest: acpRunRequest,
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
-                stopFence: stopFence
+                stopFence: stopFence,
+                localComposerCandidate: localComposerCandidate
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
         }
+        candidateTransferred = true
         await headlessRunner.startRun(
             tabID: tabID,
             session: session,
@@ -324,7 +334,8 @@ final class AgentModeRunService {
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             makeLease: makeLease,
-            stopFence: stopFence
+            stopFence: stopFence,
+            localComposerCandidate: localComposerCandidate
         )
         recordNonCodexStartOutcome(startOutcome, session: session)
         return nil

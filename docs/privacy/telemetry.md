@@ -56,7 +56,11 @@ helper folder or sign in themselves. A clearly styled **Finish Claude setup…**
 available beside unavailable readings, with another setup action under Details. Each uses that
 same isolated folder/configuration, sends no model message, and opens Terminal only after an
 explicit user confirmation. The first Connect defers collection until the user chooses
-**Check usage after setup**; setup completion starts a new generation so a pre-setup failure
+**Check usage after setup**. Pending setup remains visible after a restart and is not reported as
+completed collection. Preparing setup requires profile-scoped consent, not completed setup;
+background collection still requires both. If Terminal cannot open the prepared helper, the
+setup sheet shows the concrete error and a selectable, copyable manual command with trust/sign-in
+and completion instructions. Setup completion starts a new generation so a pre-setup failure
 cannot consume the ordinary Refresh cooldown. Normal refreshes remain hidden.
 
 Claude checks once when usage is first demanded after launch/enable, plus manual Refresh with a

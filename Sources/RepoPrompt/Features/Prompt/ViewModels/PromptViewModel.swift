@@ -273,6 +273,12 @@ class PromptViewModel: ObservableObject {
             AgentAdmissionPersistenceReceipt,
             AgentSessionLifecycleAuthority.RejectionReason
         )
+        case recoveryRequired(
+            AgentProvisionalAdmissionIdentity,
+            AgentAdmissionPersistenceReceipt,
+            AgentSessionLifecycleAuthority.RejectionReason,
+            AgentAdmissionRecoveryOutcome
+        )
     }
 
     typealias ComposeTabsWillCloseListener = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> Void
@@ -2531,6 +2537,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$autoCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2541,6 +2552,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$manualCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -3282,6 +3298,12 @@ class PromptViewModel: ObservableObject {
             admissionID: UUID(),
             refreshCanonicalState: true
         ) {
+            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID) {
+                return .rejected(
+                    AgentAdmissionPersistenceReceipt(outcome: rejection, commitEvidence: .none),
+                    .workspacePersistenceRejected
+                )
+            }
             guard manager.activeWorkspaceID == expectedWorkspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == expectedWorkspaceID })
             else {
@@ -3397,14 +3419,9 @@ class PromptViewModel: ObservableObject {
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
                 guard recoveryClaim.beginWorkspaceRecovery() else {
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
-                    )
-                    if isCancelled {
-                        throw CancellationError()
-                    }
-                    return .rejected(receipt, reason)
+                    // A changed claim does not prove that the canonical identity was removed.
+                    // Preserve its evidence instead of authorizing a second allocation.
+                    return .recoveryRequired(provisionalIdentity, receipt, reason, .ownershipChanged)
                 }
                 let recoveryOutcome = await settleProvisionalAgentAdmissionRecovery(
                     provisionalIdentity,
@@ -3413,18 +3430,23 @@ class PromptViewModel: ObservableObject {
                     manager: manager
                 )
                 let shouldRollbackLocally: Bool
+                let requiresRecoveryEvidence: Bool
                 switch recoveryOutcome {
                 case .recovered, .alreadyRecovered, .localOnly:
                     recoveryClaim.markWorkspaceRecovered()
                     recoveryClaim.markComplete()
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = false
                 case .ownershipChanged:
                     recoveryClaim.markComplete()
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = true
                 case .retryablePartial:
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = true
                 case .failed, .blockedManual:
                     shouldRollbackLocally = false
+                    requiresRecoveryEvidence = true
                 }
                 await notifyAgentAdmissionRecoveryCompletedForTesting(
                     provisionalIdentity,
@@ -3435,6 +3457,11 @@ class PromptViewModel: ObservableObject {
                         checkpoint: rollbackCheckpoint,
                         manager: manager
                     )
+                }
+                if requiresRecoveryEvidence {
+                    // Cancellation cannot erase an unproven rollback. Callers must retain this
+                    // identity even when local projection removal has already completed.
+                    return .recoveryRequired(provisionalIdentity, receipt, reason, recoveryOutcome)
                 }
                 if isCancelled {
                     throw CancellationError()
@@ -5162,8 +5189,9 @@ class PromptViewModel: ObservableObject {
             dirtyTabIDs.insert(activeID)
             manager.markWorkspaceDirty()
         } else if !isDirty, wasDirty {
+            // Clearing a presentation-only dirty badge changes no workspace bytes.
+            // Bumping the save version here can exhaust an unrelated in-flight save.
             dirtyTabIDs.remove(activeID)
-            manager.markWorkspaceDirty()
         }
     }
 

@@ -586,7 +586,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 14 supersedes"))
         XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
@@ -2374,6 +2374,53 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             selectedTargetIndices: [0]
         )
         XCTAssertNotNil(fixture.session.oversight.pendingAutoWake)
+    }
+
+    /// This cancellation test owns wake scheduling; positive exact-Read/frontier and physical
+    /// waiting-resume coverage uses the shared real-authority fixture in the adapter suite.
+    func testLocalInputCancelledWaitingAutoWakeDuringReadProofDoesNotResumeOrConsume() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let gate = TestReleaseFence(name: "waiting Auto-wake optional Read cancellation")
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { baseline in
+            .init(fragment: baseline.fragment + "\n<user_input>must not escape</user_input>", markupDeltaBytes: 43, requirements: [])
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+            await gate.enterAndWait()
+            return false
+        }
+        let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        defer { gate.release()
+            let continuation = fixture.session.instructionContinuation
+            fixture.session.instructionContinuation = nil
+            fixture.session.instructionWaitID = nil
+            continuation?.resume(throwing: CancellationError())
+            waiting.cancel()
+        }
+        try await AsyncTestWait.waitUntil("waiting continuation installed before wake") {
+            await MainActor.run { fixture.session.instructionContinuation != nil }
+        }
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let entered = await gate.waitUntilEntered()
+        guard entered else { return XCTFail("waiting Auto-wake never entered optional Read proof") }
+        let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let task = try XCTUnwrap(wake.task)
+        let snapshot = fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+        task.cancel()
+        gate.release()
+        await task.value
+        XCTAssertNotNil(fixture.session.instructionContinuation)
+        XCTAssertFalse(fixture.session.items.contains { $0.id == wake.wakeID && $0.kind == .system })
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake?.attemptedFingerprint)
+        XCTAssertNotEqual(fixture.session.oversight.pendingAutoWake?.physicalOutcome, .accepted)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID], snapshot)
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let continuation = fixture.session.instructionContinuation
+        fixture.session.instructionContinuation = nil
+        fixture.session.instructionWaitID = nil
+        continuation?.resume(throwing: CancellationError())
+        _ = try? await waiting.value
     }
 
     /// Drives the real waiting-instruction continuation from suspension through lane acceptance.

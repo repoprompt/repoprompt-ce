@@ -1,12 +1,11 @@
 import Foundation
-import RepoPromptC
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptShared
 
 extension DebugStateBootstrap.Builder {
-    /// A production baseline is not a revocation of this profile's explicit
-    /// approvals. Keep the owning workspace and backing sessions together: a DB
-    /// row alone cannot restore an endpoint whose compose tab disappeared.
+    /// Keep same-profile approvals and their intact carriers together. Retention never
+    /// activates authority; the live owners still revalidate every restored record.
     mutating func preserveDebugContinuity() throws {
         let fm = FileManager.default
         let root = locations.applicationSupportRoot
@@ -16,11 +15,17 @@ extension DebugStateBootstrap.Builder {
             try plan.add(database, as: "Overseer/continuity.sqlite", database: true)
             identities = try DebugStateSnapshot.continuityIdentities(database)
         }
-        for name in ["agentSessionOversightLinks.json", "delegationScopes.json", "delegationWorktreeOwnership.json"] {
+        let legacyFiles: [(String, OverseerContinuityKind)] = [
+            (AgentSessionOversightIntentStore.filename, .link),
+            (DelegationScopeStore.filename, .scope),
+            (WorktreeOwnershipStore.filename, .worktree)
+        ]
+        for (name, kind) in legacyFiles {
             let url = root.appendingPathComponent(name)
             if fm.fileExists(atPath: url.path) {
-                let document = try object(url)
-                identities.collectLegacy(document)
+                let legacy = try OverseerContinuityRepository.legacyBackingIdentities(plan.read(url), kind: kind)
+                identities.sessions.formUnion(legacy.sessions)
+                identities.workspaces.formUnion(legacy.workspaces)
                 try plan.add(url, as: name)
             }
         }
@@ -34,8 +39,6 @@ extension DebugStateBootstrap.Builder {
               let productionIndexData = plan.generated["Workspaces/workspacesIndex.json"] else { throw DebugStateSnapshot.Failure.unsafeFile }
         let retainedIndex = try JSONSerialization.jsonObject(with: retainedIndexData) as? [[String: Any]] ?? []
         let productionIndex = try JSONSerialization.jsonObject(with: productionIndexData) as? [[String: Any]] ?? []
-        // Same workspace UUID means the same authority context. Prefer its intact
-        // debug-owned document, not production tabs with coincident session IDs.
         let replacedDirectories = productionIndex.compactMap { row -> String? in
             guard let id = row["id"] as? String, retained.retainedWorkspaceIDs.contains(id),
                   let uuid = UUID(uuidString: id), let name = row["name"] as? String else { return nil }
@@ -79,73 +82,11 @@ extension DebugStateBootstrap.Builder {
 }
 
 extension DebugStateSnapshot {
-    struct ContinuityIdentities {
-        var sessions = Set<String>()
-        var workspaces = Set<String>()
+    typealias ContinuityIdentities = OverseerContinuityStore.BackingIdentities
 
-        mutating func collectLegacy(_ value: Any) {
-            if let object = value as? [String: Any] {
-                for (key, child) in object {
-                    if let string = child as? String, let id = UUID(uuidString: string) {
-                        if ["observerSessionID", "targetSessionID", "granteeSessionID", "createdBySessionID"].contains(key) {
-                            sessions.insert(id.uuidString)
-                        }
-                    }
-                    if key == "workspace", let payload = child as? [String: String],
-                       let value = payload["_0"], let id = UUID(uuidString: value) { workspaces.insert(id.uuidString) }
-                    if key == "tree", let payload = child as? [String: String],
-                       let value = payload["_0"], let id = UUID(uuidString: value) { sessions.insert(id.uuidString) }
-                    collectLegacy(child)
-                }
-            } else if let array = value as? [Any] {
-                for child in array {
-                    collectLegacy(child)
-                }
-            }
-        }
-    }
-
-    /// Read only the existing debug authority's profile and endpoint columns.
-    /// This does not migrate, activate, normalize or rewrite its records. Future
-    /// or wrong-profile DBs stay intact and are rejected by the owning store.
     static func continuityIdentities(_ url: URL) throws -> ContinuityIdentities {
         _ = try stamp(url)
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let header = try handle.read(upToCount: 100) ?? Data()
-        guard header.count == 100, header.prefix(16) == Data("SQLite format 3\0".utf8) else { throw Failure.unsafeFile }
-        guard header[18] != 2 else { throw Failure.unsupportedWAL }
-        var db: OpaquePointer?
-        let code = try sqlite3_open_v2(physicalPath(url), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW, nil)
-        guard code == SQLITE_OK, let db else { if let db { sqlite3_close_v2(db) }
-            throw Failure.database(code)
-        }
-        defer { sqlite3_close_v2(db) }
-        sqlite3_busy_timeout(db, 250)
-        func rows(_ sql: String) throws -> [[String?]] {
-            var statement: OpaquePointer?
-            let prepare = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
-            guard prepare == SQLITE_OK, let statement else { throw Failure.database(prepare) }
-            defer { sqlite3_finalize(statement) }
-            var result: [[String?]] = []
-            while true {
-                let step = sqlite3_step(statement)
-                if step == SQLITE_DONE { return result }
-                guard step == SQLITE_ROW else { throw Failure.database(step) }
-                result.append((0 ..< sqlite3_column_count(statement)).map { column in
-                    sqlite3_column_text(statement, column).map { String(cString: $0) }
-                })
-            }
-        }
-        guard try rows("PRAGMA user_version").first?.first == "1",
-              try rows("SELECT profile FROM profile_state WHERE singleton=1").first?.first == "repoprompt-ce-debug-overseer-v1" else { return .init() }
-        var result = ContinuityIdentities()
-        for row in try rows("SELECT owner_id,anchor_id,workspace_id FROM continuity_rows WHERE terminal=0") {
-            for value in row.prefix(2) {
-                if let value, let id = UUID(uuidString: value) { result.sessions.insert(id.uuidString) }
-            }
-            if let value = row[2], let id = UUID(uuidString: value) { result.workspaces.insert(id.uuidString) }
-        }
-        return result
+        return try OverseerContinuityStore(databaseURL: url, profile: OverseerContinuityRepository.productionProfile)
+            .readOnlyBackingIdentities()
     }
 }
