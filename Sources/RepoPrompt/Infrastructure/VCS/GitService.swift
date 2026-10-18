@@ -4064,6 +4064,15 @@ actor GitService {
 
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        // The passive status fence suppresses Git's recursive submodule status:
+        // children have independent executable configuration that has not been
+        // validated. Never interpret that deliberately partial view as clean.
+        // Index metadata is safe to read without entering those repositories.
+        let (index, indexError, indexExit) = try await runGit(["ls-files", "--stage", "-z", "--", ":/"], at: repoURL)
+        guard indexExit == 0 else { throw GitError(message: "Could not determine status completeness: \(indexError)") }
+        if index.split(separator: "\0").contains(where: { $0.hasPrefix("160000 ") }) {
+            throw GitError(message: "Working-tree status is incomplete: tracked submodules cannot be safely inspected by passive Git reads. Cleanliness is unknown; inspect submodules with Git outside RepoPrompt before merging. RepoPrompt cannot approve a worktree merge from this partial status.")
+        }
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -8046,10 +8055,11 @@ actor GitService {
         commandTimeout: Duration
     ) async throws -> ([String], [String: String]) {
         guard GitReadSafety.isRead(args) else { return (args, environment) }
+        try GitReadSafety.validateSupportedRead(args)
         let safeEnvironment = GitReadSafety.environment(environment)
         if GitReadSafety.needsDriverCheck(args), let commandIndex = GitReadSafety.commandIndex(in: args) {
             let query = Array(args.prefix(commandIndex)) + GitReadSafety.driverQuery
-            let (configuration, _, exitCode) = try await runAdmittedGitData(
+            let (configuration, diagnostic, exitCode) = try await runAdmittedGitData(
                 query, at: repoURL, environment: safeEnvironment, stdin: nil,
                 diagnosticRepositoryPath: diagnosticRepositoryPath,
                 processQueueWaitMicroseconds: 0,
@@ -8057,8 +8067,8 @@ actor GitService {
                 admissionPriority: admissionPriority, commandFamily: .repositoryRead,
                 commandTimeout: commandTimeout
             )
-            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty) else {
-                throw GitError(message: "Git inspection could not validate driver configuration")
+            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
+                throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
             }
             try GitReadSafety.validateDriverConfiguration(configuration, for: args)
         }

@@ -113,6 +113,145 @@ final class GitProcessPipeDrainTests: XCTestCase {
             XCTAssertFalse(GitReadSafety.needsDriverCheck(["diff-tree", "HEAD"]))
         }
 
+        func testNonconvertingReadsRemainAvailableWithRepositoryDrivers() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
+            let (script, marker) = try makeMarkerScript(fixture)
+            for key in ["filter.inspection.clean", "filter.inspection.smudge", "merge.inspection.driver"] {
+                try fixture.runGit(["config", key, shellCommand(script.path)], at: repo)
+            }
+            try fixture.write("*.txt filter=inspection merge=inspection\n", to: ".git/info/attributes", at: repo)
+            let service = GitService()
+            let commands = [
+                ["show", "-s", "--format=%H", "HEAD"],
+                ["log", "-1", "--format=%H"],
+                ["cat-file", "blob", "HEAD:file.txt"],
+                ["cat-file", "-s", "HEAD:file.txt"],
+                ["ls-files", "--stage", "-z"],
+                ["ls-files", "--others", "--exclude-standard"],
+                ["ls-files", "--eol"]
+            ]
+            for args in commands {
+                XCTAssertFalse(GitReadSafety.needsDriverCheck(args), "\(args)")
+                let expected = try fixture.runGit(args, at: repo)
+                let (output, _, code) = try await service.runGitDataForTesting(args, at: repo)
+                XCTAssertEqual(code, 0, "\(args)")
+                XCTAssertEqual(String(decoding: output, as: UTF8.self), expected, "\(args)")
+                let (spool, _, spoolCode, _) = try await service.runGitSpoolingForTesting(args, at: repo)
+                XCTAssertEqual(spoolCode, 0, "\(args)")
+                XCTAssertEqual(try readLease(spool), output, "\(args)")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
+            for args in [["ls-files", "--modified"], ["ls-files", "-vm"], ["cat-file", "--filters", "HEAD:file.txt"], ["log", "--remerge-diff"], ["show", "--diff-merges=r"], ["log", "-m", "-p"], ["show", "--diff-merges", "remerge"]] {
+                XCTAssertTrue(GitReadSafety.needsDriverCheck(args), "\(args)")
+                do {
+                    _ = try await service.runGitDataForTesting(args, at: repo)
+                    XCTFail("Converting/remerge read should refuse local drivers: \(args)")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("repository-configured executable"))
+                    XCTAssertFalse(error.localizedDescription.contains("explicitly trusted Git workflow"))
+                }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
+            _ = try fixture.runGit(["cat-file", "--filters", "HEAD:file.txt"], at: repo)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "cat-file smudge positive control")
+            try FileManager.default.removeItem(at: marker)
+            try fixture.runGit(["config", "diff.inspection.textconv", shellCommand(script.path)], at: repo)
+            try fixture.write("*.txt diff=inspection\n", to: ".git/info/attributes", at: repo)
+            _ = try fixture.runGit(["cat-file", "--textconv", "HEAD:file.txt"], at: repo)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "cat-file textconv positive control")
+            try FileManager.default.removeItem(at: marker)
+            do {
+                _ = try await service.runGitSpoolingForTesting(["cat-file", "--textconv", "HEAD:file.txt"], at: repo)
+                XCTFail("Textconv must not execute")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("raw object"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        }
+
+        func testDirtySubmoduleStatusAndMergeInspectionFailAsIncompleteWithoutChildHelpers() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let childSource = try fixture.makeRepository(named: "child-source", files: ["tracked.txt": "original\n"])
+            let repo = try fixture.makeRepository(named: "repo", files: ["parent.txt": "parent\n"])
+            try fixture.runGit(["-c", "protocol.file.allow=always", "submodule", "add", childSource.path, "child"], at: repo)
+            try fixture.commit("Add submodule", at: repo)
+            let linked = fixture.sandbox.appendingPathComponent("linked")
+            try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+            try fixture.write("source\n", to: "new.txt", at: linked)
+            try fixture.stage("new.txt", at: linked)
+            try fixture.commit("Source change", at: linked)
+            let service = GitService()
+            let descriptors = try await service.listWorktrees(at: repo)
+            let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+            let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+            let child = repo.appendingPathComponent("child")
+            let (script, marker) = try makeMarkerScript(fixture)
+            for untracked in [false, true] {
+                try fixture.write(untracked ? "original\n" : "changed tracked content\n", to: "tracked.txt", at: child)
+                if untracked { try fixture.write("untracked\n", to: "untracked.txt", at: child) }
+                let control = try fixture.runGit(["status", "--porcelain", "--ignore-submodules=none"], at: repo)
+                XCTAssertTrue(control.contains("child"), "actual dirty submodule positive control")
+                try fixture.runGit(["config", "core.fsmonitor", shellCommand(script.path)], at: child)
+                let partial = try await service.runGitDataForTesting(["status", "--porcelain"], at: repo)
+                XCTAssertEqual(partial.2, 0)
+                XCTAssertTrue(partial.0.isEmpty, "the fenced low-level view alone is partial, not authoritative")
+                do {
+                    _ = try await service.getWorkingStatus(at: repo)
+                    XCTFail("Submodule dirtiness must not be reported clean")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("status is incomplete"))
+                }
+                do {
+                    _ = try await service.inspectWorktreeMerge(.init(source: source, target: target))
+                    XCTFail("An incomplete cleanliness check must not authorize merge")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("status is incomplete"))
+                }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "child fsmonitor must not run")
+                try fixture.runGit(["config", "--unset", "core.fsmonitor"], at: child)
+            }
+        }
+
+        func testDriverQueryFailurePreservesOnlyBoundedRedactedDiagnostics() async throws {
+            let stderr = Data(("fatal: bad config line 42 in file /secret/path?token=private\n" + String(repeating: "sensitive-value\n", count: 2000)).utf8)
+            let diagnostic = GitReadSafety.driverQueryFailure(exitCode: 128, stderr: stderr)
+            XCTAssertTrue(diagnostic.contains("exit 128"))
+            XCTAssertTrue(diagnostic.contains("bad config line 42"))
+            XCTAssertLessThan(diagnostic.utf8.count, 1024)
+            for secret in ["/secret", "private", "sensitive-value"] {
+                XCTAssertFalse(diagnostic.contains(secret))
+            }
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
+            try fixture.write("[invalid-secret-payload\n", to: ".git/config", at: repo)
+            for spool in [false, true] {
+                do {
+                    if spool {
+                        _ = try await GitService().runGitSpoolingForTesting(["diff", "HEAD"], at: repo)
+                    } else {
+                        _ = try await GitService().runGitDataForTesting(["diff", "HEAD"], at: repo)
+                    }
+                    XCTFail("Malformed driver query must fail closed")
+                } catch {
+                    let message = error.localizedDescription
+                    XCTAssertTrue(message.contains("bad config line 1"), message)
+                    XCTAssertTrue(message.contains("git config exit"), message)
+                    XCTAssertFalse(message.contains(fixture.sandbox.path))
+                    XCTAssertFalse(message.contains("invalid-secret-payload"))
+                }
+            }
+        }
+
+        private func readLease(_ lease: GitRawOutputSpoolLease) throws -> Data {
+            var output = Data()
+            let reader = try lease.makeReader()
+            while let chunk = try reader.nextChunk() {
+                output.append(chunk)
+            }
+            return output
+        }
+
         func testHookPathInspectionReportsConfiguredPathWithoutExecutingHook() async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])

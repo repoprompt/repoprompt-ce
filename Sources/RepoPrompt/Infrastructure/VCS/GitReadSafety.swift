@@ -57,10 +57,60 @@ enum GitReadSafety {
         }
     }
 
+    /// Classify the capabilities of our builders, not just the command verb.
+    /// Only options before the path/end-of-options separator participate.
+    private static func driverCapabilities(_ arguments: [String]) -> (filters: Bool, merge: Bool) {
+        guard isRead(arguments), let index = commandIndex(in: arguments) else { return (false, false) }
+        let options = arguments.dropFirst(index + 1).prefix { $0 != "--" && $0 != "--end-of-options" }
+        switch arguments[index] {
+        case "status", "diff", "blame": return (true, false)
+        case "merge-tree": return (true, true)
+        case "ls-files":
+            // Plain index/untracked listings and --eol do not convert content.
+            // --modified can hash worktree content through clean/process filters.
+            let modified = options.contains("--modified") || options.contains { $0.hasPrefix("-") && !$0.hasPrefix("--") && $0.dropFirst().contains("m") }
+            return (modified, false)
+        case "cat-file": return (options.contains("--filters"), false)
+        case "log", "show":
+            // Metadata and ordinary diffs cannot execute merge drivers. Remerge
+            // diffs can also run conversion filters through merge.renormalize.
+            let remerge = options.contains("--remerge-diff") || options.contains("-m")
+                || options.contains("--diff-merges")
+                || options.contains { ["--diff-merges=remerge", "--diff-merges=r", "--diff-merges=m", "--diff-merges=on"].contains($0) }
+            return (remerge, remerge)
+        default: return (false, false)
+        }
+    }
+
     static func needsDriverCheck(_ arguments: [String]) -> Bool {
-        guard isRead(arguments), let index = commandIndex(in: arguments) else { return false }
-        return ["status", "ls-files", "diff", "log", "show", "blame", "cat-file", "merge-tree"]
-            .contains(arguments[index])
+        let capabilities = driverCapabilities(arguments)
+        return capabilities.filters || capabilities.merge
+    }
+
+    static func validateSupportedRead(_ arguments: [String]) throws {
+        guard let index = commandIndex(in: arguments), arguments[index] == "cat-file" else { return }
+        let options = arguments.dropFirst(index + 1).prefix { $0 != "--" && $0 != "--end-of-options" }
+        if options.contains("--textconv") {
+            throw GitService.GitError(message: "Passive Git inspection does not run cat-file text conversion. Read the raw object instead.")
+        }
+    }
+
+    /// Git config errors may echo arbitrary config values and paths. Preserve
+    /// known failure categories/line numbers, never those untrusted payloads.
+    static func driverQueryFailure(exitCode: Int32, stderr: Data) -> String {
+        let input = String(decoding: stderr.prefix(4096), as: UTF8.self)
+        let diagnostics = input.split(whereSeparator: \.isNewline).prefix(4).map { line -> String in
+            let text = String(line)
+            if let range = text.range(of: #"bad config line [0-9]+"#, options: .regularExpression) {
+                return String(text[range]) + " in file <redacted>"
+            }
+            for category in ["unable to read config file", "exceeded maximum include depth", "invalid key", "invalid config"] where text.contains(category) {
+                return category + " <redacted>"
+            }
+            return "<redacted Git diagnostic>"
+        }
+        let detail = diagnostics.isEmpty ? "no diagnostic output" : diagnostics.joined(separator: "; ")
+        return "Git inspection could not validate driver configuration (git config exit \(exitCode)): \(detail). Check the repository's Git configuration with Git outside RepoPrompt."
     }
 
     static func environment(_ environment: [String: String]) -> [String: String] {
@@ -105,12 +155,9 @@ enum GitReadSafety {
     /// Includes inherit their including file's scope. System/global-only
     /// drivers remain user-managed. Malformed output fails closed.
     static func validateDriverConfiguration(_ data: Data, for arguments: [String]? = nil) throws {
-        let command = arguments.flatMap { args in commandIndex(in: args).map { args[$0] } }
-        // Merge renormalization can run filters. Conservatively refuse local
-        // filters for merge-tree even when renormalization is currently off;
-        // callers receive the same explicit trusted-workflow error as other reads.
-        let checksFilters = command.map { ["status", "ls-files", "diff", "blame", "cat-file", "merge-tree"].contains($0) } ?? true
-        let checksMergeDrivers = command.map { ["log", "show", "merge-tree"].contains($0) } ?? true
+        let capabilities = arguments.map(driverCapabilities) ?? (filters: true, merge: true)
+        let checksFilters = capabilities.filters
+        let checksMergeDrivers = capabilities.merge
         guard data.isEmpty || data.last == 0,
               let text = String(data: data, encoding: .utf8)
         else { throw GitService.GitError(message: "Git inspection could not validate driver configuration") }
@@ -133,7 +180,7 @@ enum GitReadSafety {
                 || (checksMergeDrivers && key.hasPrefix("merge."))
             if relevant, scope == "local" || scope == "worktree" {
                 guard entry.count == 2, entry[1].isEmpty else {
-                    throw GitService.GitError(message: "Passive Git inspection is unavailable for repository-configured executable filters or merge drivers. Use an explicitly trusted Git workflow for this repository.")
+                    throw GitService.GitError(message: "Passive Git inspection is unavailable for repository-configured executable filters or merge drivers. RepoPrompt has no trust override for these programs. Inspect and run the required Git operation outside RepoPrompt only after reviewing the repository configuration.")
                 }
             }
         }
