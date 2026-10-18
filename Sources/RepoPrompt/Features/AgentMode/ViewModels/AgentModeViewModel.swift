@@ -402,6 +402,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard selectedReasoningEffortRaw != oldValue, !isRestoringState else { return }
             defer {
                 syncComposerUIState()
+                syncStatusPillsUIState()
                 syncRunInteractionUIState()
             }
             guard let session = activeSession else { return }

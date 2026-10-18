@@ -469,6 +469,56 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertNil(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName)
     }
 
+    func testCodexEffortSelectionRefreshesRoutedModelPillWithoutManualSync() async throws {
+        let (viewModel, store) = try await makeRoutingViewModel(backend: ComposerRoutingBackend(outcome: .selectLast))
+        store.setAutoEffortEnabled(false)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        viewModel.selectedAgent = .codexExec
+        viewModel.selectedModelRaw = "gpt-6.1-sol"
+        viewModel.selectReasoningEffort(.high)
+        session.appendAutomationAudit(AgentAutomationTurnAudit(
+            turnID: UUID(),
+            createdAt: Date(),
+            router: .init(
+                configured: true, eligible: true, judgmentRequested: true, decision: .selected,
+                chosenModelRaw: session.selectedModelRaw, chosenEffortRaw: "high"
+            ),
+            autoEffort: .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled),
+            acceptedProviderRaw: session.selectedAgent.rawValue,
+            acceptedModelRaw: session.selectedModelRaw,
+            acceptedEffortRaw: "high"
+        ))
+        viewModel.syncStatusPillsUIState()
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) High"
+        )
+
+        // Exercise the same action as the effort picker, without manually publishing status pills.
+        viewModel.selectReasoningEffort(.low)
+        XCTAssertEqual(session.selectedReasoningEffortRaw, "low")
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) Low"
+        )
+
+        store.setAutoEffortEnabled(true)
+        viewModel.selectReasoningEffort(.high)
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            viewModel.selectedModelDisplayName,
+            "Auto Effort hides the manual fallback effort"
+        )
+        store.setAutoEffortEnabled(false)
+        viewModel.selectReasoningEffort(.low)
+        XCTAssertEqual(
+            viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
+            "\(viewModel.selectedModelDisplayName) Low"
+        )
+    }
+
     func testFakeRouterAbstentionSubmitsWithCurrentSelection() async throws {
         let backend = ComposerRoutingBackend(outcome: .abstain)
         let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
