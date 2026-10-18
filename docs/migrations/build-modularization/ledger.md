@@ -1312,3 +1312,78 @@ separately owned reliability source was modified.
 
 
 **2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.
+
+## M6 / #1403 — Stage 0 implementation checkpoint (2026-10-18)
+
+Base: `a1368cbbf16565834740a3199964adb19519a9d4`, branch
+`wt/1401-milestone-1`. This is a partial implementing checkpoint, **not** M6
+completion or permission to treat the #1402 readiness gate as passed.
+
+### Existing owners and selected retirement
+
+| Boundary | Existing owner | Preserved invariant |
+| --- | --- | --- |
+| App MCP ingress | `ServerNetworkManager` → `MCPDomainHost.invoke` | Captured invocation and exact route ownership remain independent of tool arguments |
+| Service composition | `MCPServerViewModel` and its SessionAdmin extension | Caller endpoints come from installed run routing, not caller-supplied identity |
+| Administration | Bridge-owned production administration core/front door | Single authorization engine, canonical writer selection and durable-effect receipts remain intact |
+| Link/cursor authority | `DomainAgentSessionLinkAuthority` | Bare cursors select only exact authorized outbound targets; successors remain opaque |
+| Transcript filtering | `AgentTranscriptIO` + `AgentTranscriptImportPolicy` | Active refresh/import path retains pending-question and hidden-tool filtering |
+
+Retired `AgentModeViewModel.shouldDisplayInTranscript` and its sole-use
+`isAskUserToolName` helper: **32 lines removed, zero successor lines**. Both were
+private and had no live callers; the wrapper's diagnostic/alternate question-name
+route was unreachable. The active `refreshDerivedTranscriptState` path continues
+to construct the live-session import policy and consume `AgentTranscriptIO`.
+No state, subscriptions, schemas, leases, consent checks, cancellation owners or
+persistence fences were removed. This bounded dead-route retirement does not
+claim that other manager/bridge state is redundant.
+
+### Executable contract work
+
+- Added `AgentSessionLinkToolServiceTests.testActivatedTwoLaneJourneyReplaysBareCursorsAndRetiresOwnedLanes`.
+  It assembles the real tool services, bridge, authority and temporary intent
+  store with the existing controlled endpoint host. It activates Overseer,
+  creates two explore lanes without a workspace selector, acknowledges first-task
+  `LANE_OK` delivery, replays returned bare wait handles and successors, retires
+  both lanes and checks live/durable intent and waiter cleanup without changing
+  the foreground workspace/tab. The host does not execute a provider; this is
+  **not** packaged ingress or real-provider completion evidence.
+- Strengthened `testCursorOnlyWaitRejectsForeignAndUnknownHandlesWithExecutableRecovery`:
+  each returned list call now supplies the target for a fresh poll and two waits
+  using actual returned handles. No earlier target identity or reconstructed
+  target/cursor record completes the recovery.
+- Reuse the existing production organizer group-order recovery/no-op tests and
+  real temporary-Git unopened model/effort, bind/release and conflicting-writer
+  suites; do not duplicate those effect-level assertions in the controlled host.
+
+### Validation status
+
+- Local Oracle diff review: no actionable findings; not the milestone's pinned
+  independent review at push.
+- Test ticket `1f88d989-c888-4210-b1ec-acb3a5ffaa57`: timed out at the
+  one-hour job limit after 21m 31s of global wait, near the end of compilation;
+  no passing test receipt. Rerun `a3b4e4bd-ec17-403d-a50d-ab69d9420165`
+  (`issue1401-stage0-contract-v2`) completed successfully, exit 0: **126 tests,
+  zero failures** (98 link-tool service, 19 production organizer, 4 real-Git
+  worktree recovery, 5 canonical transcript). Heavy admission took 22ms;
+  execution including build/post-test work took 21m 25s, and the selected tests
+  themselves took 42.18s. Auxiliary module bundles executed zero matching tests
+  and are not additional coverage. This is controlled-host/app-service coverage,
+  not packaged-process or real-provider proof.
+- Lint ticket `dd21c72b-8174-423c-a522-f32b3e9dcb0c`: failed, exit 70,
+  after 31m 55s. SwiftFormat timed out in redundantPublic/wrapArguments rules
+  across six files, including unchanged source/test files. This is not a pass
+  or evidence that SwiftLint ran.
+- Earlier test ticket `4ac2b6e2-d741-4356-9875-83f3ffe527b6`: canceled before
+  global heavy admission; no tests executed.
+- Pinned formatter installed via successful ticket
+  `ba1b3fd0-ef64-40a4-99f6-6b9b4ef48117`. Broad format ticket
+  `94841811-4ed4-4649-b2b2-12487ed0f240` was canceled; inspection showed only the
+  intended source/test files changed. Scoped formatting subsequently reported a
+  `wrapArguments` timeout on the giant existing AgentModeViewModel file; this is
+  **not** a passing style receipt.
+
+Still required before C3 extraction: complete assembled production-ingress
+coverage and Stage 0 validation, reconcile exact source/test claims and dependency
+closure, then perform audited moves and app-free module/test validation. No files
+have moved, no module/ratchet limits changed, and no live app action occurred.
