@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptC
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
@@ -16,10 +17,46 @@ enum DebugStateBootstrap {
     private static let fm = FileManager.default
     @MainActor private static var appProfileLease: DebugProfileAccessLease?
 
-    @MainActor static func runIfNeeded() throws {
+    /// SIGTERM is how conductor, `kill` and logout stop the app. Before AppKit runs (and before
+    /// `AppTerminationSignalRouter` is installed) its default disposition would kill the process
+    /// mid-publication and orphan a partial stage. While preparing, an async-signal-safe
+    /// handler records SIGTERM synchronously (atomic `sigaction` swap, so no install window
+    /// or pending callback can lose it) and preparation stops at the next safe point.
+    /// `finish()` reinstates the previous disposition before reading the request, then
+    /// delivers it, so the process still terminates; a later SIGTERM uses the old disposition.
+    struct TerminationRequest {
+        static func install() -> TerminationRequest? {
+            rpce_startup_sigterm_install() == 0 ? TerminationRequest() : nil
+        }
+
+        var isRequested: Bool {
+            rpce_startup_sigterm_requested() != 0
+        }
+
+        func finish(deliver: () -> Void = { raise(SIGTERM) }) {
+            _ = rpce_startup_sigterm_restore()
+            if isRequested { deliver() }
+        }
+    }
+
+    /// Whether an isolated empty profile can recover from a failed launch: production-source
+    /// capture failures, yes. A live debug owner, unsafe destination/profile location or a
+    /// cancellation would fail identically in clean mode, so Start Empty is not offered.
+    static func startEmptyCanRecover(from error: Error) -> Bool {
+        guard let failure = error as? DebugStateSnapshot.Failure else { return false }
+        switch failure {
+        case .sourceChanged, .unsafeFile, .duplicateDestination, .database, .unsupportedWAL: return true
+        case .cancelled, .unsafeDestination: return false
+        }
+    }
+
+    @MainActor static func runIfNeeded(forceCleanSlate: Bool = false) throws {
         guard MCPFilesystemIdentity.current.buildFlavor == .debug,
               !AppLaunchConfiguration.isUnitTestProcess,
               !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects else { return }
+        // If the handler cannot be installed, SIGTERM keeps its default (immediate) behavior.
+        let termination = TerminationRequest.install()
+        defer { termination?.finish() }
         // The short startup lock protects concurrent seeds; an already-running
         // debug app must also be absent, because its ordinary stores are live.
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: AppProfileLocations.current.preferencesDomain)
@@ -32,7 +69,7 @@ enum DebugStateBootstrap {
         let defaults = UserDefaults.standard
         let release = AppProfileLocations(identity: .repoPromptCE(.release))
         let prior = defaults.persistentDomain(forName: AppProfileLocations.current.preferencesDomain) ?? [:]
-        let clean = ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
+        let clean = forceCleanSlate || ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
         let preferenceDirectory = release.homeDirectory.appendingPathComponent("Library/Preferences")
         let sourcePreferencesURL = preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")
         let priorPreferencesURL = preferenceDirectory.appendingPathComponent(AppProfileLocations.current.preferencesDomain + ".plist")
@@ -49,7 +86,8 @@ enum DebugStateBootstrap {
             previousPreferences: prior,
             preferenceSourceURL: clean ? nil : sourcePreferencesURL,
             previousPreferenceFileURL: priorPreferencesURL,
-            profileLease: lease
+            profileLease: lease,
+            cancellation: termination.map { request in .init { request.isRequested } }
         )
         let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
         let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
@@ -69,6 +107,7 @@ enum DebugStateBootstrap {
         profileLease: DebugProfileAccessLease? = nil,
         captureCache: DebugStateSnapshot.CaptureCache = .init(),
         retryDelay: TimeInterval = captureRetryDelay,
+        cancellation: DebugStateSnapshot.Cancellation? = nil,
         afterCapture: ((Int) throws -> Void)? = nil
     ) throws -> DebugStateSnapshot.Receipt {
         let startedAt = Date()
@@ -85,9 +124,11 @@ enum DebugStateBootstrap {
         var lastError: Error = DebugStateSnapshot.Failure.sourceChanged
         for attempt in 0 ..< captureAttempts {
             if attempt > 0, retryDelay > 0 { Thread.sleep(forTimeInterval: retryDelay) }
+            try cancellation?.check()
             do {
                 var builder = Builder(locations: locations, releasePreferences: releasePreferences ?? [:], previousPreferences: previousPreferences)
                 builder.plan.cache = captureCache
+                builder.plan.cancellation = cancellation
                 var hasReleasePreferences = releasePreferences != nil
                 if !cleanSlate, let url = preferenceSourceURL, fm.fileExists(atPath: url.path) {
                     let bytes = try builder.plan.read(url)
@@ -110,7 +151,9 @@ enum DebugStateBootstrap {
                 // debug profile, not back into its production custom directory.
                 preferences.removeValue(forKey: "GlobalCustomStorageURL")
                 let preferencesData = try PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0)
-                let plan = try cleanSlate ? DebugStateSnapshot.Plan() : builder.build()
+                var plan = try cleanSlate ? DebugStateSnapshot.Plan() : builder.build()
+                // Clean mode publishes too: its swap must honor the same stop request.
+                plan.cancellation = cancellation
                 try afterCapture?(attempt)
                 return try DebugStateSnapshot(locations: locations).publish(
                     plan: plan, cleanSlate: cleanSlate, preferences: preferencesData, previousPreferences: priorData, startedAt: startedAt, profileLease: lease
@@ -373,19 +416,21 @@ enum DebugStateBootstrap {
             plan.generated["debugSeedUnavailableWorkspaces.json"] = try json(unavailable)
         }
 
+        /// Never seeded from an app-owned tree: locks/claims, source backups and recovery
+        /// trees, and the rebuildable session index (copied records would retain stale
+        /// file size/mtime and runtime summaries after handle detachment).
+        static let ownedTreeExclusions: Set<String> = ["locks", "claims", "Backups", ".self-compact-recovery", "AgentSessionIndex.json"]
+
         mutating func addTree(_ directory: URL, relative: String, excluding: Set<String> = []) throws {
             guard fm.fileExists(atPath: directory.path) else { return }
-            // children() already omits Finder metadata and atomic-write/lock temporaries.
-            for url in try plan.children(directory) {
+            // The same selection governs enumeration and verification: skipped names can
+            // neither be published nor invalidate the capture when production churns them.
+            let selection = DebugStateSnapshot.Selection(excluding: excluding.union(Self.ownedTreeExclusions))
+            for url in try plan.children(directory, selection: selection) {
                 let name = url.lastPathComponent
-                guard !excluding.contains(name), name != "locks", name != "claims", name != "Backups", name != ".self-compact-recovery" else { continue }
                 let target = relative + "/" + name
                 if try DebugStateSnapshot.kind(url) == .directory { try addTree(url, relative: target) }
-                else if name == "AgentSessionIndex.json" {
-                    // A rebuildable projection; copied records would retain stale
-                    // file size/mtime and runtime summaries after handle detachment.
-                    continue
-                } else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
+                else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
                     let baseline = retainedIdentities == nil
                     let data = try derived(url, kind: baseline ? "agent-session-baseline" : "agent-session-retained") { builder, bytes in
                         guard var session = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }

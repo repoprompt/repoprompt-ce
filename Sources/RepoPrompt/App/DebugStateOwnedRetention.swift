@@ -18,7 +18,7 @@ extension DebugStateBootstrap.Builder {
         }
         for workspaceRoot in workspaceRoots where FileManager.default.fileExists(atPath: workspaceRoot.path) {
             // Debug-owned enumeration is verbatim: a workspace name may itself look temporary.
-            for workspace in try plan.children(workspaceRoot, ignoringTransientArtifacts: false) where workspace.lastPathComponent.hasPrefix("Workspace-") {
+            for workspace in try plan.children(workspaceRoot, selection: .verbatim) where workspace.lastPathComponent.hasPrefix("Workspace-") {
                 let recovery = workspace.appendingPathComponent("AgentSessions/.self-compact-recovery")
                 try preserveTree(recovery, relative: "Workspaces/" + workspace.lastPathComponent + "/AgentSessions/.self-compact-recovery")
             }
@@ -29,7 +29,7 @@ extension DebugStateBootstrap.Builder {
         guard FileManager.default.fileExists(atPath: directory.path) else { return }
         try locations.validateMetadataFile(directory)
         // Verbatim: debug-owned recovery bytes keep every name, temporaries included.
-        for url in try plan.children(directory, ignoringTransientArtifacts: false) {
+        for url in try plan.children(directory, selection: .verbatim) {
             let target = relative + "/" + url.lastPathComponent
             let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard values.isSymbolicLink != true else { throw DebugStateSnapshot.Failure.unsafeFile }

@@ -241,9 +241,18 @@ bounded but convergent rather than requiring an idle release: up to ten attempts
 share a stamp-keyed cache of captured bytes and derived records, so only the first
 attempt reads and transforms the whole profile and each retry re-reads only what
 changed. A source removed mid-capture is a retryable change, not an unsafe alias.
-Finder metadata and atomic-write/lock temporaries in production trees are neither
-seeded nor treated as state changes. If production never settles, startup fails
-closed without staging or replacing anything. Database snapshots use SQLite's backup API, never an
+Each directory listing records the selection rule it consumed (caller exclusions,
+locks/claims/backups/recovery trees, the rebuildable session index, and exactly
+recognized Finder metadata and atomic-write/lock temporaries), and verification
+re-applies every rule to one fresh listing, so excluded names are neither seeded nor
+treated as state changes while names derived from user repositories or workspaces
+are kept. If production never settles, startup fails closed without staging or
+replacing anything. SQLite backups copy in bounded page batches; a source write or
+lock contention between batches ends that attempt as a retryable change rather than
+letting a restarting backup run unbounded. SIGTERM (conductor
+stop, `kill`, logout) received during preparation stops at the next safe point —
+before staging, between staged entries or backup batches, never after the swap —
+removes any partial stage, and then terminates the process. Database snapshots use SQLite's backup API, never an
 uncoordinated live database-file copy, source migration or checkpoint. The current
 rollback-journal continuity store is supported. WAL sources currently fail closed
 rather than risk a write to production SHM read marks; they are not silently
@@ -262,7 +271,10 @@ bytes intact. Prior debug-only work and its preferences are recoverable under
 `RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
 snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
 deleted. Normal startup is silent. Failure presents an actionable debug-only error
-and exits instead of opening a partial mixture. `debugSeed.json` and the redacted
+instead of opening a partial mixture: Quit, Retry, or — for production-capture
+failures — Start Empty, which runs this launch in clean mode (prior debug profile
+and preferences archived, not deleted). The prior debug profile is never reused
+automatically while release may be writing. `debugSeed.json` and the redacted
 startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
 preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
 CLI requests do not re-seed a running app. Explicit standalone headless profiles
