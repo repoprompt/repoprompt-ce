@@ -676,6 +676,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
         var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
         var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
+        /// Replaces only the provider start of a self worktree relocation's continuation turn.
+        var test_selfWorktreeRelocationContinuationStarter: (@MainActor (TabSession, String) async -> Void)?
 
         /// Test-only live-authority seam for prompt readiness orchestration.
         var test_agentSessionLinkHasActiveOutboundLink:
@@ -3465,6 +3467,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 onSelfCompactTerminalSettled: { [weak self] session, revision, result, teardownSettled in
                     self?.agentSelfCompactTerminalSettled(
+                        session: session,
+                        revision: revision,
+                        publication: result,
+                        teardownSettled: teardownSettled
+                    )
+                    // Same post-publication seam: a session's own worktree switch applies only
+                    // at its origin turn's settled terminal boundary.
+                    self?.selfWorktreeRelocationTerminalSettled(
                         session: session,
                         revision: revision,
                         publication: result,
@@ -9468,12 +9478,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
         }
         let previousBindings = session.worktreeBindings
-        let previousDestination = executionDestinationIdentity(in: previousBindings)
-        let nextDestination = executionDestinationIdentity(in: desiredBindings)
-        // Secondary bindings are execution authority too: changing only a secondary root must
-        // not reroute MCP tools beneath a still-running native provider.
-        let executionRootsChanged = previousDestination != nextDestination
-            || Self.executionRootMappings(previousBindings) != Self.executionRootMappings(desiredBindings)
+        let executionRootsChanged = worktreeBindingsChangeExecutionRoots(from: previousBindings, to: desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
 
         if changedDuringActiveRun, executionRootsChanged {
@@ -9663,6 +9668,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
+    }
+
+    /// Whether replacing `previous` with `desired` changes where the provider or MCP tools execute.
+    /// Secondary bindings are execution authority too: changing only a secondary root must not
+    /// reroute MCP tools beneath a still-running native provider.
+    func worktreeBindingsChangeExecutionRoots(
+        from previous: [AgentSessionWorktreeBinding],
+        to desired: [AgentSessionWorktreeBinding]
+    ) -> Bool {
+        executionDestinationIdentity(in: previous) != executionDestinationIdentity(in: desired)
+            || Self.executionRootMappings(previous) != Self.executionRootMappings(desired)
     }
 
     private static func executionRootMappings(_ bindings: [AgentSessionWorktreeBinding]) -> [String: ExecutionDestinationIdentity] {

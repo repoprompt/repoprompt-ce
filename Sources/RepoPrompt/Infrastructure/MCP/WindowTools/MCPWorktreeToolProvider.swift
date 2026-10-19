@@ -87,6 +87,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
             **Session binding and merge source**:
             - `bind` and `select` persist a binding for one Agent session. Destination changes require an idle provider with no queued work or pending interactions; they restart/handoff the runtime, never reroute an active turn.
+            - A session may switch its own worktree from its running turn (`create` with `bind=true`, `bind`, `select`, or `unbind` targeting itself). The reply carries `pending_application`: the current turn keeps its existing location, the switch applies when the turn completes, and the session then continues automatically in the new location. End the turn after requesting it. Stop, failure, or queued input cancels it.
             - If settlement is indeterminate, inspect the current binding and session transcript before retrying; recovery details may be recorded in the transcript rather than the tool error.
             - Selecting the logical checkout itself (normally `@main`) removes only its binding and preserves secondary-root bindings; omit visual arguments for this unbind. Other folders already loaded with workspace ownership must be removed before session binding.
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
@@ -357,6 +358,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
         var bindingDTO: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?
         var previousDTO: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?
+        var pendingDTO: ToolResultDTOs.ManageWorktreeReplyDTO.PendingApplicationDTO?
         var bindingWarning: String?
         if let sessionID {
             do {
@@ -371,6 +373,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 )
                 bindingDTO = bindingResult.binding
                 previousDTO = bindingResult.previous
+                pendingDTO = bindingResult.pending.map(Self.pendingApplicationDTO)
             } catch {
                 bindingWarning = "Worktree was created, but session binding failed: \(error.localizedDescription)"
             }
@@ -389,6 +392,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             createdWorktree: createdDTO,
             binding: bindingDTO,
             previousBinding: previousDTO,
+            pendingApplication: pendingDTO,
             warning: warning
         )
     }
@@ -432,7 +436,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             worktree: dto,
             worktrees: [dto],
             binding: bindingResult.binding,
-            previousBinding: bindingResult.previous
+            previousBinding: bindingResult.previous,
+            pendingApplication: bindingResult.pending.map(Self.pendingApplicationDTO)
         )
     }
 
@@ -476,11 +481,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         if !authorizationRoots.isEmpty {
             try await admitLogicalMutationRoots(authorizationRoots)
         }
+        var pending: AgentSelfWorktreeRelocation?
         if !removed.isEmpty {
-            _ = try await agentModeVM.transitionWorktreeBindings(
+            pending = try await transitionOrScheduleBindings(
                 remaining,
-                forSessionID: sessionID,
-                intent: .externalManagement,
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
                 invocation: bindingRequest.invocation,
                 beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
             )
@@ -488,12 +494,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             // A successful authorized no-op still owns an applied journal receipt.
             // Do not transition or retire the provider merely to settle that receipt.
             try await MCPDomainMutationCommitContext.willCommit()
+            supersedeSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
         }
 
         return ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "unbind",
             binding: removed.first.map(bindingDTO),
             bindings: removed.map(bindingDTO),
+            pendingApplication: pending.map(Self.pendingApplicationDTO),
             warning: removed.isEmpty ? "No matching worktree binding was present for session \(sessionID.uuidString)." : nil
         )
     }
@@ -509,7 +517,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         source: String,
         invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?,
         persistsVisualIdentity: Bool = false
-    ) async throws -> (binding: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?, previous: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?) {
+    ) async throws -> (
+        binding: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?,
+        previous: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?,
+        pending: AgentSelfWorktreeRelocation?
+    ) {
         let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let logicalRoot = try await logicalRoot(for: context)
@@ -521,18 +533,20 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             existing, logicalRootPath: normalizedRoot, selectedWorktreePath: worktree.path
         ) {
             try Self.validateLogicalCheckoutVisualArguments(args)
+            var pending: AgentSelfWorktreeRelocation?
             if previous != nil {
-                _ = try await agentModeVM.transitionWorktreeBindings(
+                pending = try await transitionOrScheduleBindings(
                     localBindings,
-                    forSessionID: sessionID,
-                    intent: .externalManagement,
+                    sessionID: sessionID,
+                    agentModeVM: agentModeVM,
                     invocation: invocation,
                     beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
                 )
             } else {
                 try await MCPDomainMutationCommitContext.willCommit()
+                supersedeSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
             }
-            return (nil, previous.map(bindingDTO))
+            return (nil, previous.map(bindingDTO), pending)
         }
 
         if let previous,
@@ -548,7 +562,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
                 )
             }
-            return (bindingDTO(previous), nil)
+            // Selecting the current binding withdraws a still-scheduled self switch elsewhere.
+            supersedeSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
+            return (bindingDTO(previous), nil, nil)
         }
 
         let binding = AgentSessionWorktreeBinding(
@@ -581,12 +597,13 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             try Self.persistPlannedVisualIdentity(
                 visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
             )
-            return (bindingDTO(binding), nil)
+            supersedeSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
+            return (bindingDTO(binding), nil, nil)
         }
-        _ = try await agentModeVM.transitionWorktreeBindings(
+        let pending = try await transitionOrScheduleBindings(
             desiredBindings,
-            forSessionID: sessionID,
-            intent: .externalManagement,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
             invocation: invocation,
             beforeCommit: {
                 try await MCPDomainMutationCommitContext.willCommit()
@@ -598,7 +615,70 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             }
         )
         let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
-        return (bindingDTO(binding), previousDTO)
+        return (bindingDTO(binding), previousDTO, pending)
+    }
+
+    // MARK: - Self relocation
+
+    /// The calling turn's registration-time identity, only when it targets its own session.
+    private func selfRunOrigin(for sessionID: UUID) -> AgentSelfMCPCallOrigin? {
+        guard let origin = AgentSelfMCPCallOrigin.current, origin.endpoint.sessionID == sessionID else { return nil }
+        return origin
+    }
+
+    /// Applies a binding change now, or, when a session moves its own execution roots from its own
+    /// live turn, schedules it for that turn's completed terminal boundary. The provider for the
+    /// running turn cannot change cwd, so tools are never rerouted beneath it; the switch and an
+    /// automatic continuation turn follow the boundary instead.
+    private func transitionOrScheduleBindings(
+        _ desiredBindings: [AgentSessionWorktreeBinding],
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?,
+        beforeCommit: @escaping @MainActor () async throws -> Void
+    ) async throws -> AgentSelfWorktreeRelocation? {
+        if let origin = selfRunOrigin(for: sessionID),
+           let scheduled = try await agentModeVM.scheduleSelfWorktreeRelocation(
+               desiredBindings,
+               forSessionID: sessionID,
+               originRunID: origin.runID,
+               originRunAttemptID: origin.runAttemptID,
+               beforeRecord: beforeCommit
+           )
+        {
+            return scheduled
+        }
+        _ = try await agentModeVM.transitionWorktreeBindings(
+            desiredBindings,
+            forSessionID: sessionID,
+            intent: .externalManagement,
+            invocation: invocation,
+            beforeCommit: beforeCommit
+        )
+        supersedeSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
+        return nil
+    }
+
+    /// A newer completed self request from the same turn replaces any still-scheduled one.
+    private func supersedeSelfRelocation(sessionID: UUID, agentModeVM: AgentModeViewModel) {
+        guard let origin = selfRunOrigin(for: sessionID) else { return }
+        agentModeVM.supersedeSelfWorktreeRelocation(forSessionID: sessionID, originRunAttemptID: origin.runAttemptID)
+    }
+
+    static func pendingApplicationDTO(
+        _ relocation: AgentSelfWorktreeRelocation
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO.PendingApplicationDTO {
+        .init(
+            state: "scheduled",
+            appliesAfter: "current_turn_completes",
+            continuation: "automatic",
+            relocationID: relocation.id.uuidString,
+            detail: """
+            This binding targets the session running this turn, so it is not applied mid-turn: until this turn ends, your shell, file edits, and RepoPrompt tools keep using the previous location. \
+            End your turn now without further edits. When the turn completes, RepoPrompt applies the binding, restarts the provider in the new location with a handoff of this conversation, \
+            and starts a continuation turn automatically; no user action is needed. Stop, a failed turn, or queued user input cancels the switch and leaves a transcript note.
+            """
+        )
     }
 
     static func bindingForLogicalRoot(

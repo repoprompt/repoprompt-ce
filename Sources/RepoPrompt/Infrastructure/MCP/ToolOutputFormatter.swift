@@ -4718,6 +4718,13 @@ extension ToolOutputFormatter {
         default:
             break
         }
+        if let pending = dto.pendingApplication {
+            out.append("")
+            out.append("### Pending Switch")
+            out.append("- **State**: \(pending.state) (applies after: \(pending.appliesAfter); continuation: \(pending.continuation))")
+            out.append("- **Relocation ID**: `\(pending.relocationID)`")
+            out.append("- \(pending.detail)")
+        }
 
         if let graph = dto.graph {
             out.append("")

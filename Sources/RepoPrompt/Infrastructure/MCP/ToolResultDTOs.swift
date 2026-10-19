@@ -1640,6 +1640,9 @@ enum ToolResultDTOs {
         let binding: BindingDTO?
         let bindings: [BindingDTO]?
         let previousBinding: BindingDTO?
+        /// Present when a session changed its own execution worktree from its live turn: the binding
+        /// applies after that turn completes and the session then continues automatically.
+        let pendingApplication: PendingApplicationDTO?
         let graph: GraphDTO?
         let merge: MergeDTO?
         let warning: String?
@@ -1658,6 +1661,7 @@ enum ToolResultDTOs {
             binding: BindingDTO? = nil,
             bindings: [BindingDTO]? = nil,
             previousBinding: BindingDTO? = nil,
+            pendingApplication: PendingApplicationDTO? = nil,
             graph: GraphDTO? = nil,
             merge: MergeDTO? = nil,
             warning: String? = nil,
@@ -1675,6 +1679,7 @@ enum ToolResultDTOs {
             self.binding = binding
             self.bindings = bindings
             self.previousBinding = previousBinding
+            self.pendingApplication = pendingApplication
             self.graph = graph
             self.merge = merge
             self.warning = warning
@@ -1687,6 +1692,24 @@ enum ToolResultDTOs {
             case nextOffset = "next_offset"
             case createdWorktree = "created_worktree"
             case previousBinding = "previous_binding"
+            case pendingApplication = "pending_application"
+        }
+
+        struct PendingApplicationDTO: Codable, Equatable {
+            /// `scheduled`: recorded, nothing about execution has changed yet.
+            let state: String
+            /// `current_turn_completes`: the boundary at which the binding is applied.
+            let appliesAfter: String
+            /// `automatic`: the session starts its own continuation turn in the new location.
+            let continuation: String
+            let relocationID: String
+            let detail: String
+
+            private enum CodingKeys: String, CodingKey {
+                case state, continuation, detail
+                case appliesAfter = "applies_after"
+                case relocationID = "relocation_id"
+            }
         }
 
         struct RepositoryDTO: Codable, Equatable {
