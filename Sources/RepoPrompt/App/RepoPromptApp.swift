@@ -208,16 +208,37 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
+    /// Each attempt re-runs the full bootstrap: exclusive profile lease, running-app guard,
+    /// verified publication, and debug preferences replaced only after a successful publish.
+    /// The existing debug profile is never silently reused while release may be writing.
     private static func checkDebugStateBoundary() {
-        do {
-            try DebugStateBootstrap.runIfNeeded()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Debug state snapshot could not be prepared"
-            alert.informativeText = "\(error.localizedDescription)\nProduction and prior debug state were preserved. Retry when release is idle, or launch with --debug-clean-slate for an isolated empty profile."
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-            exit(EXIT_FAILURE)
+        var startEmpty = false
+        while true {
+            do {
+                try DebugStateBootstrap.runIfNeeded(forceCleanSlate: startEmpty)
+                return
+            } catch {
+                let cleanRequested = startEmpty || ProcessInfo.processInfo.arguments.contains(DebugStateBootstrap.cleanSlateArgument)
+                let offerStartEmpty = !cleanRequested && DebugStateBootstrap.startEmptyCanRecover(from: error)
+                let alert = NSAlert()
+                alert.messageText = "Debug state snapshot could not be prepared"
+                var details = "\(error.localizedDescription)\nProduction and prior debug state were preserved."
+                if offerStartEmpty {
+                    details += "\n\nRetry attempts another capture. If production changed during capture, a retry may succeed once its writes pause briefly."
+                        + "\n\nStart Empty opens this launch with an isolated, empty debug profile. The current debug profile and"
+                        + " its preferences are archived, not deleted, under “RepoPrompt CE Debug Recovery”. Production state is"
+                        + " never modified, and the next normal launch captures production again."
+                }
+                alert.informativeText = details
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Retry")
+                if offerStartEmpty { alert.addButton(withTitle: "Start Empty") }
+                switch alert.runModal() {
+                case .alertSecondButtonReturn: continue
+                case .alertThirdButtonReturn where offerStartEmpty: startEmpty = true
+                default: exit(EXIT_FAILURE)
+                }
+            }
         }
     }
 

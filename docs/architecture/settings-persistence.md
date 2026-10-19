@@ -232,8 +232,27 @@ Rebuildable session indexes, locks/PIDs/runtime claims, Git data, workspace fold
 history/recovery files remain at their original locations; an omitted unavailable
 workspace cannot be reconstructed from an absent source document.
 
-Source files and directory membership must remain stable across the capture, with
-three bounded attempts. Database snapshots use SQLite's backup API, never an
+The published snapshot is point-in-time: every captured source byte and captured
+directory membership must match its source during one verification pass taken
+before anything is staged. Publication writes only those verified captured bytes
+(SQLite backups are re-verified after copying), so production writes after that
+pass cannot tear the snapshot. A running release app keeps writing, so capture is
+bounded but convergent rather than requiring an idle release: up to ten attempts
+share a stamp-keyed cache of captured bytes and derived records, so only the first
+attempt reads and transforms the whole profile and each retry re-reads only what
+changed. A source removed mid-capture is a retryable change, not an unsafe alias.
+Each directory listing records the selection rule it consumed (caller exclusions,
+locks/claims/backups/recovery trees, the rebuildable session index, and exactly
+recognized Finder metadata and atomic-write/lock temporaries), and verification
+re-applies every rule to one fresh listing, so excluded names are neither seeded nor
+treated as state changes while names derived from user repositories or workspaces
+are kept. If production never settles, startup fails closed without staging or
+replacing anything. SQLite backups copy in bounded page batches; a source write or
+lock contention between batches ends that attempt as a retryable change rather than
+letting a restarting backup run unbounded. SIGTERM (conductor
+stop, `kill`, logout) received during preparation stops at the next safe point —
+before staging, between staged entries or backup batches, never after the swap —
+removes any partial stage, and then terminates the process. Database snapshots use SQLite's backup API, never an
 uncoordinated live database-file copy, source migration or checkpoint. The current
 rollback-journal continuity store is supported. WAL sources currently fail closed
 rather than risk a write to production SHM read marks; they are not silently
@@ -246,13 +265,16 @@ production grants/continuity are preserved separately in `ProductionContinuity`,
 not promoted into debug authority. Automatic wakes and active merge/compact claims
 are not revived. No provider mode is disabled.
 
-Preparation and validation happen in staging. A same-volume atomic directory swap
+Verified bytes are prepared in staging. A same-volume atomic directory swap
 publishes the complete profile; a failed preparation leaves prior debug and source
 bytes intact. Prior debug-only work and its preferences are recoverable under
 `RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
 snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
 deleted. Normal startup is silent. Failure presents an actionable debug-only error
-and exits instead of opening a partial mixture. `debugSeed.json` and the redacted
+instead of opening a partial mixture: Quit, Retry, or — for production-capture
+failures — Start Empty, which runs this launch in clean mode (prior debug profile
+and preferences archived, not deleted). The prior debug profile is never reused
+automatically while release may be writing. `debugSeed.json` and the redacted
 startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
 preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
 CLI requests do not re-seed a running app. Explicit standalone headless profiles

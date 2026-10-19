@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptC
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
@@ -8,13 +9,54 @@ import RepoPromptShared
 /// clean mode is an argument, never a persisted preference.
 enum DebugStateBootstrap {
     static let cleanSlateArgument = "--debug-clean-slate"
+    /// A live release app keeps writing. Only the first attempt captures the whole
+    /// profile; later attempts reuse unchanged captured bytes and derived records, so
+    /// each retry costs roughly one stat/listing pass instead of a full re-capture.
+    static let captureAttempts = 10
+    static let captureRetryDelay: TimeInterval = 0.25
     private static let fm = FileManager.default
     @MainActor private static var appProfileLease: DebugProfileAccessLease?
 
-    @MainActor static func runIfNeeded() throws {
+    /// SIGTERM is how conductor, `kill` and logout stop the app. Before AppKit runs (and before
+    /// `AppTerminationSignalRouter` is installed) its default disposition would kill the process
+    /// mid-publication and orphan a partial stage. While preparing, an async-signal-safe
+    /// handler records SIGTERM synchronously (atomic `sigaction` swap, so no install window
+    /// or pending callback can lose it) and preparation stops at the next safe point.
+    /// `finish()` reinstates the previous disposition before reading the request, then
+    /// delivers it, so the process still terminates; a later SIGTERM uses the old disposition.
+    struct TerminationRequest {
+        static func install() -> TerminationRequest? {
+            rpce_startup_sigterm_install() == 0 ? TerminationRequest() : nil
+        }
+
+        var isRequested: Bool {
+            rpce_startup_sigterm_requested() != 0
+        }
+
+        func finish(deliver: () -> Void = { raise(SIGTERM) }) {
+            _ = rpce_startup_sigterm_restore()
+            if isRequested { deliver() }
+        }
+    }
+
+    /// Whether an isolated empty profile can recover from a failed launch: production-source
+    /// capture failures, yes. A live debug owner, unsafe destination/profile location or a
+    /// cancellation would fail identically in clean mode, so Start Empty is not offered.
+    static func startEmptyCanRecover(from error: Error) -> Bool {
+        guard let failure = error as? DebugStateSnapshot.Failure else { return false }
+        switch failure {
+        case .sourceChanged, .unsafeFile, .duplicateDestination, .database, .unsupportedWAL: return true
+        case .cancelled, .unsafeDestination: return false
+        }
+    }
+
+    @MainActor static func runIfNeeded(forceCleanSlate: Bool = false) throws {
         guard MCPFilesystemIdentity.current.buildFlavor == .debug,
               !AppLaunchConfiguration.isUnitTestProcess,
               !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects else { return }
+        // If the handler cannot be installed, SIGTERM keeps its default (immediate) behavior.
+        let termination = TerminationRequest.install()
+        defer { termination?.finish() }
         // The short startup lock protects concurrent seeds; an already-running
         // debug app must also be absent, because its ordinary stores are live.
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: AppProfileLocations.current.preferencesDomain)
@@ -27,7 +69,7 @@ enum DebugStateBootstrap {
         let defaults = UserDefaults.standard
         let release = AppProfileLocations(identity: .repoPromptCE(.release))
         let prior = defaults.persistentDomain(forName: AppProfileLocations.current.preferencesDomain) ?? [:]
-        let clean = ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
+        let clean = forceCleanSlate || ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
         let preferenceDirectory = release.homeDirectory.appendingPathComponent("Library/Preferences")
         let sourcePreferencesURL = preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")
         let priorPreferencesURL = preferenceDirectory.appendingPathComponent(AppProfileLocations.current.preferencesDomain + ".plist")
@@ -44,7 +86,8 @@ enum DebugStateBootstrap {
             previousPreferences: prior,
             preferenceSourceURL: clean ? nil : sourcePreferencesURL,
             previousPreferenceFileURL: priorPreferencesURL,
-            profileLease: lease
+            profileLease: lease,
+            cancellation: termination.map { request in .init { request.isRequested } }
         )
         let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
         let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
@@ -61,7 +104,11 @@ enum DebugStateBootstrap {
         previousPreferences: [String: Any] = [:],
         preferenceSourceURL: URL? = nil,
         previousPreferenceFileURL: URL? = nil,
-        profileLease: DebugProfileAccessLease? = nil
+        profileLease: DebugProfileAccessLease? = nil,
+        captureCache: DebugStateSnapshot.CaptureCache = .init(),
+        retryDelay: TimeInterval = captureRetryDelay,
+        cancellation: DebugStateSnapshot.Cancellation? = nil,
+        afterCapture: ((Int) throws -> Void)? = nil
     ) throws -> DebugStateSnapshot.Receipt {
         let startedAt = Date()
         guard locations.identity.buildFlavor == .debug else { throw DebugStateSnapshot.Failure.unsafeDestination }
@@ -75,9 +122,13 @@ enum DebugStateBootstrap {
             priorData = try PropertyListSerialization.data(fromPropertyList: previousPreferences, format: .binary, options: 0)
         }
         var lastError: Error = DebugStateSnapshot.Failure.sourceChanged
-        for _ in 0 ..< 3 {
+        for attempt in 0 ..< captureAttempts {
+            if attempt > 0, retryDelay > 0 { Thread.sleep(forTimeInterval: retryDelay) }
+            try cancellation?.check()
             do {
                 var builder = Builder(locations: locations, releasePreferences: releasePreferences ?? [:], previousPreferences: previousPreferences)
+                builder.plan.cache = captureCache
+                builder.plan.cancellation = cancellation
                 var hasReleasePreferences = releasePreferences != nil
                 if !cleanSlate, let url = preferenceSourceURL, fm.fileExists(atPath: url.path) {
                     let bytes = try builder.plan.read(url)
@@ -100,7 +151,10 @@ enum DebugStateBootstrap {
                 // debug profile, not back into its production custom directory.
                 preferences.removeValue(forKey: "GlobalCustomStorageURL")
                 let preferencesData = try PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0)
-                let plan = try cleanSlate ? DebugStateSnapshot.Plan() : builder.build()
+                var plan = try cleanSlate ? DebugStateSnapshot.Plan() : builder.build()
+                // Clean mode publishes too: its swap must honor the same stop request.
+                plan.cancellation = cancellation
+                try afterCapture?(attempt)
                 return try DebugStateSnapshot(locations: locations).publish(
                     plan: plan, cleanSlate: cleanSlate, preferences: preferencesData, previousPreferences: priorData, startedAt: startedAt, profileLease: lease
                 )
@@ -119,7 +173,11 @@ enum DebugStateBootstrap {
         var retainedIdentities: DebugStateSnapshot.ContinuityIdentities?
         var retainedWorkspaceIDs = Set<String>()
         var plan = DebugStateSnapshot.Plan()
-        var mappings: [(URL, URL)] = []
+        var mappings: [(URL, URL)] = [] {
+            didSet { mappingsContextID = nil }
+        }
+
+        var mappingsContextID: Int?
         var source: AppProfileLocations {
             sourceOverride ?? AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: locations.homeDirectory)
         }
@@ -171,6 +229,25 @@ enum DebugStateBootstrap {
             try JSONSerialization.jsonObject(with: plan.read(url))
         }
 
+        /// Rebased records depend on the mapping table, which grows as workspaces are added.
+        mutating func mappingsContext() -> Int {
+            if let id = mappingsContextID { return id }
+            let id = plan.cache.context(mappings.flatMap { [$0.0.absoluteString, $0.1.absoluteString] })
+            mappingsContextID = id
+            return id
+        }
+
+        /// Parse/rebase/re-encode work dominates a capture; retries reuse an unchanged
+        /// source's record instead of transforming every session again.
+        mutating func derived(_ url: URL, kind: String, transform: (Self, Data) throws -> Data) throws -> Data {
+            let context = mappingsContext()
+            if let data = try plan.cachedDerivation(url, kind: kind, context: context) { return data }
+            let source = try plan.capture(url, retain: false)
+            let data = try transform(self, source.data)
+            plan.cache.storeDerived(data, kind: kind, url: url, stamp: source.stamp, context: context)
+            return data
+        }
+
         mutating func addWorkspaces() throws {
             let workspaceRoot = (releasePreferences["GlobalCustomStorageURL"] as? String).map {
                 URL(fileURLWithPath: $0, isDirectory: true)
@@ -217,6 +294,7 @@ enum DebugStateBootstrap {
             }
             let journalDirectory = runtime.appendingPathComponent("working-journals")
             var journals: [String: [String: Any]] = [:]
+            var journalURLs: [String: URL] = [:]
             if fm.fileExists(atPath: journalDirectory.path) {
                 for url in try plan.children(journalDirectory) where url.pathExtension == "json" {
                     guard let record = try object(url) as? [String: Any], (record["version"] as? Int) == 1,
@@ -226,6 +304,7 @@ enum DebugStateBootstrap {
                         throw DebugStateSnapshot.Failure.unsafeFile
                     }
                     journals[id] = record
+                    journalURLs[id] = url
                     if files[id] == nil { files[id] = file }
                 }
             }
@@ -236,27 +315,57 @@ enum DebugStateBootstrap {
             var seededIndex: [[String: Any]] = []
             for (id, url) in files.sorted(by: { $0.key < $1.key }) {
                 if retainedIdentities != nil { try locations.validateCustomWorkspaceDirectory(url.deletingLastPathComponent()) }
-                var working: Data?
-                if let encoded = journals[id]?["workingDocument"] as? String {
-                    guard let data = Data(base64Encoded: encoded) else { throw DebugStateSnapshot.Failure.unsafeFile }
-                    working = data
-                }
+                let encodedWorking = journals[id]?["workingDocument"] as? String
                 // Stale index rows can reference an already-removed workspace;
                 // omit only that unavailable row, not its surviving history files.
-                let bytes: Data
-                if fm.fileExists(atPath: url.path) { bytes = try plan.read(url) }
-                else if let working { bytes = working }
-                else { unavailable.append(id)
+                let saved = fm.fileExists(atPath: url.path) ? try plan.read(url) : nil
+                guard saved != nil || encodedWorking != nil else {
+                    unavailable.append(id)
                     continue
                 }
-                guard var workspace = try JSONSerialization.jsonObject(with: working ?? bytes) as? [String: Any],
-                      let actualID = workspace["id"] as? String, UUID(uuidString: actualID) == UUID(uuidString: id),
-                      let uuid = UUID(uuidString: id), let name = workspace["name"] as? String
-                else {
+                // A working journal supersedes the saved document; the stamp of whichever
+                // carrier supplied the bytes identifies the parsed, decoded and rebased results.
+                let documentURL = encodedWorking == nil ? url : journalURLs[id]
+                guard let uuid = UUID(uuidString: id), let documentURL, let documentStamp = plan.observed[documentURL] else {
                     throw DebugStateSnapshot.Failure.unsafeFile
                 }
+                var documentBytes: Data?
+                func document() throws -> Data {
+                    if let cached = documentBytes { return cached }
+                    let data: Data
+                    if let encodedWorking {
+                        guard let decoded = Data(base64Encoded: encodedWorking) else { throw DebugStateSnapshot.Failure.unsafeFile }
+                        data = decoded
+                    } else if let saved {
+                        data = saved
+                    } else {
+                        throw DebugStateSnapshot.Failure.unsafeFile
+                    }
+                    documentBytes = data
+                    return data
+                }
+                let recordKey = documentURL.path + "\u{0}" + url.path + "\u{0}" + id
+                var parsed: [String: Any]?
+                var record: DebugStateSnapshot.CaptureCache.WorkspaceRecord
+                if let cached = plan.cache.workspaceRecord(recordKey, stamp: documentStamp) {
+                    record = cached
+                } else {
+                    guard let workspace = try JSONSerialization.jsonObject(with: document()) as? [String: Any],
+                          let actualID = workspace["id"] as? String, UUID(uuidString: actualID) == uuid,
+                          let name = workspace["name"] as? String
+                    else {
+                        throw DebugStateSnapshot.Failure.unsafeFile
+                    }
+                    record = .init(
+                        name: name,
+                        isSystemWorkspace: workspace["isSystemWorkspace"] as? Bool ?? false,
+                        isHiddenInMenus: workspace["isHiddenInMenus"] as? Bool ?? false,
+                        activeAgentSessionIDs: (workspace["composeTabs"] as? [[String: Any]] ?? []).compactMap { $0["activeAgentSessionID"] as? String }
+                    )
+                    parsed = workspace
+                    plan.cache.storeWorkspaceRecord(record, recordKey, stamp: documentStamp)
+                }
                 if let retainedIdentities {
-                    let tabs = workspace["composeTabs"] as? [[String: Any]] ?? []
                     let sessionsDirectory = url.deletingLastPathComponent().appendingPathComponent("AgentSessions")
                     let savedSessions = fm.fileExists(atPath: sessionsDirectory.path) ? try plan.children(sessionsDirectory) : []
                     let hasSavedEndpoint = savedSessions.contains { file in
@@ -265,26 +374,39 @@ enum DebugStateBootstrap {
                               let sessionID = UUID(uuidString: String(name.dropFirst("AgentSession-".count))) else { return false }
                         return retainedIdentities.sessions.contains(sessionID.uuidString)
                     }
-                    guard retainedIdentities.workspaces.contains(id) || hasSavedEndpoint || tabs.contains(where: {
-                        ($0["activeAgentSessionID"] as? String).map { retainedIdentities.sessions.contains($0) } ?? false
-                    }) else { continue }
+                    guard retainedIdentities.workspaces.contains(id) || hasSavedEndpoint
+                        || record.activeAgentSessionIDs.contains(where: { retainedIdentities.sessions.contains($0) }) else { continue }
                     retainedWorkspaceIDs.insert(id)
                 }
                 // Decode against this binary before any publish or normalization.
-                _ = try DomainWorkspaceDocument.decode(documentBytes: working ?? bytes, fileURL: url)
-                let directory = DomainWorkspaceStoragePath.directoryName(name: name, id: uuid)
+                if !record.decoded {
+                    _ = try DomainWorkspaceDocument.decode(documentBytes: document(), fileURL: url)
+                    record.decoded = true
+                    plan.cache.storeWorkspaceRecord(record, recordKey, stamp: documentStamp)
+                }
+                let directory = DomainWorkspaceStoragePath.directoryName(name: record.name, id: uuid)
                 let relative = "Workspaces/" + directory
                 let destination = locations.workspaceRoot.appendingPathComponent(directory)
                 mappings.insert((url.deletingLastPathComponent(), destination), at: 0)
-                workspace.removeValue(forKey: "customStoragePath")
-                let data = try json(rebase(workspace))
-                if fm.fileExists(atPath: url.path) { try plan.add(url, as: relative + "/workspace.json", replacement: data) }
+                let context = mappingsContext()
+                let data: Data
+                if let cached = plan.cache.derived(kind: "workspace-document", url: documentURL, stamp: documentStamp, context: context) {
+                    data = cached
+                } else {
+                    guard var workspace = try parsed ?? (JSONSerialization.jsonObject(with: document()) as? [String: Any]) else {
+                        throw DebugStateSnapshot.Failure.unsafeFile
+                    }
+                    workspace.removeValue(forKey: "customStoragePath")
+                    data = try json(rebase(workspace))
+                    plan.cache.storeDerived(data, kind: "workspace-document", url: documentURL, stamp: documentStamp, context: context)
+                }
+                if saved != nil { try plan.add(url, as: relative + "/workspace.json", replacement: data) }
                 else { plan.generated[relative + "/workspace.json"] = data }
                 try addTree(url.deletingLastPathComponent(), relative: relative, excluding: ["workspace.json", "_git_data"])
                 seededIndex.append([
-                    "id": id, "name": name,
-                    "isSystemWorkspace": workspace["isSystemWorkspace"] as? Bool ?? false,
-                    "isHiddenInMenus": workspace["isHiddenInMenus"] as? Bool ?? false
+                    "id": id, "name": record.name,
+                    "isSystemWorkspace": record.isSystemWorkspace,
+                    "isHiddenInMenus": record.isHiddenInMenus
                 ])
             }
             index = seededIndex
@@ -294,34 +416,41 @@ enum DebugStateBootstrap {
             plan.generated["debugSeedUnavailableWorkspaces.json"] = try json(unavailable)
         }
 
+        /// Never seeded from an app-owned tree: locks/claims, source backups and recovery
+        /// trees, and the rebuildable session index (copied records would retain stale
+        /// file size/mtime and runtime summaries after handle detachment).
+        static let ownedTreeExclusions: Set<String> = ["locks", "claims", "Backups", ".self-compact-recovery", "AgentSessionIndex.json"]
+
         mutating func addTree(_ directory: URL, relative: String, excluding: Set<String> = []) throws {
             guard fm.fileExists(atPath: directory.path) else { return }
-            for url in try plan.children(directory) {
+            // The same selection governs enumeration and verification: skipped names can
+            // neither be published nor invalidate the capture when production churns them.
+            let selection = DebugStateSnapshot.Selection(excluding: excluding.union(Self.ownedTreeExclusions))
+            for url in try plan.children(directory, selection: selection) {
                 let name = url.lastPathComponent
-                guard !excluding.contains(name), name != "locks", name != "claims", name != "Backups", name != ".self-compact-recovery",
-                      !name.hasSuffix(".lock"), !name.contains(".sb-"), !name.hasSuffix(".tmp") else { continue }
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                guard values.isSymbolicLink != true else { throw DebugStateSnapshot.Failure.unsafeFile }
                 let target = relative + "/" + name
-                if values.isDirectory == true { try addTree(url, relative: target) }
-                else if name == "AgentSessionIndex.json" {
-                    // A rebuildable projection; copied records would retain stale
-                    // file size/mtime and runtime summaries after handle detachment.
-                    continue
-                } else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
-                    guard var session = try object(url) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
-                    if retainedIdentities == nil {
-                        for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
-                            session.removeValue(forKey: key)
+                if try DebugStateSnapshot.kind(url) == .directory { try addTree(url, relative: target) }
+                else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
+                    let baseline = retainedIdentities == nil
+                    let data = try derived(url, kind: baseline ? "agent-session-baseline" : "agent-session-retained") { builder, bytes in
+                        guard var session = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
+                        if baseline {
+                            for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
+                                session.removeValue(forKey: key)
+                            }
+                            for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {
+                                session[key] = false
+                            }
+                            session["worktreeMergeOperations"] = []
                         }
-                        for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {
-                            session[key] = false
-                        }
-                        session["worktreeMergeOperations"] = []
+                        return try builder.json(builder.rebaseManagedAttachments(in: builder.rebase(session) as? [String: Any] ?? session))
                     }
-                    try plan.add(url, as: target, replacement: json(rebaseManagedAttachments(in: rebase(session) as? [String: Any] ?? session)))
+                    try plan.add(url, as: target, replacement: data)
                 } else if url.pathExtension == "json", relative.contains("/Chats") {
-                    try plan.add(url, as: target, replacement: json(rebase(object(url))))
+                    let data = try derived(url, kind: "chat") { builder, bytes in
+                        try builder.json(builder.rebase(JSONSerialization.jsonObject(with: bytes)))
+                    }
+                    try plan.add(url, as: target, replacement: data)
                 } else {
                     try plan.add(url, as: target)
                 }

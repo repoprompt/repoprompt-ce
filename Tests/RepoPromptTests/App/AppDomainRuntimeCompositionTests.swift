@@ -596,3 +596,371 @@ final class DebugStorageRootAdmissionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), sourceBytes)
     }
 }
+
+/// A running release app keeps writing while a debug launch captures it. Startup must
+/// converge on one verified point-in-time snapshot instead of demanding an idle release,
+/// and must still fail closed, never publishing torn state, when production never settles.
+extension DebugStateBootstrapTests {
+    private func liveProductionWorkspace(_ f: Fixture, sessions: Int) throws -> (directory: URL, sessions: [URL]) {
+        let id = UUID()
+        let directory = f.release.workspaceRoot.appendingPathComponent("Workspace-Live-" + id.uuidString)
+        try f.writeJSON([["id": id.uuidString, "name": "Live"]], f.release.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+        try f.writeJSON(["id": id.uuidString, "name": "Live"], directory.appendingPathComponent("workspace.json"))
+        let urls = try (0 ..< sessions).map { index -> URL in
+            let url = directory.appendingPathComponent("AgentSessions/AgentSession-" + UUID().uuidString + ".json")
+            try f.writeJSON(["items": [["text": "session \(index) turn 0"]]], url)
+            return url
+        }
+        return (directory, urls)
+    }
+
+    func testLiveTranscriptWritesBeyondTheOldRetryBudgetConvergeOnLatestVerifiedBytes() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 6)
+        let cache = DebugStateSnapshot.CaptureCache()
+        var derivationsAtCapture: [Int] = []
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], captureCache: cache, retryDelay: 0) { attempt in
+            derivationsAtCapture.append(cache.derivations)
+            // An active release agent saves its transcript after each of the first four captures.
+            if attempt < 4 { try f.writeJSON(["items": [["text": "turn \(attempt + 1)"]]], sessions[0]) }
+        }
+        XCTAssertEqual(derivationsAtCapture.count, 5)
+        let copy = f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent + "/AgentSessions/" + sessions[0].lastPathComponent)
+        XCTAssertEqual(try f.object(copy)["items"] as? [[String: String]], [["text": "turn 4"]])
+        XCTAssertEqual(try f.object(sessions[0])["items"] as? [[String: String]], [["text": "turn 4"]])
+        // Each retry re-derived only the rewritten transcript, not every record again.
+        XCTAssertEqual(zip(derivationsAtCapture.dropFirst(), derivationsAtCapture).map { $0 - $1 }, [1, 1, 1, 1])
+    }
+
+    func testWorkspaceDocumentChangedBetweenAttemptsIsReparsedNotServedFromCache() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 1)
+        let workspaceURL = directory.appendingPathComponent("workspace.json")
+        let id = try XCTUnwrap(f.object(workspaceURL)["id"] as? String)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try f.writeJSON(["id": id, "name": "Renamed", "isHiddenInMenus": true], workspaceURL) }
+        }
+        XCTAssertEqual(captures, 2)
+        let index = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: f.debug.workspaceRoot.appendingPathComponent("workspacesIndex.json"))) as? [[String: Any]])
+        XCTAssertEqual(index.count, 1)
+        XCTAssertEqual(index.first?["name"] as? String, "Renamed")
+        XCTAssertEqual(index.first?["isHiddenInMenus"] as? Bool, true)
+        let renamed = f.debug.workspaceRoot.appendingPathComponent("Workspace-Renamed-" + id)
+        XCTAssertEqual(try f.object(renamed.appendingPathComponent("workspace.json"))["name"] as? String, "Renamed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: renamed.appendingPathComponent("AgentSessions/" + sessions[0].lastPathComponent).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent).path))
+    }
+
+    func testChangedWorkingJournalIsReparsedWhileItsSavedDocumentStaysUnchanged() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, _) = try liveProductionWorkspace(f, sessions: 1)
+        let workspaceURL = directory.appendingPathComponent("workspace.json")
+        let id = try XCTUnwrap(f.object(workspaceURL)["id"] as? String)
+        let savedBytes = try Data(contentsOf: workspaceURL)
+        let runtime = f.release.applicationSupportRoot.appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: f.release.profileIdentifier))
+        let journal = runtime.appendingPathComponent("working-journals/" + id + ".json")
+        func writeJournal(_ name: String) throws {
+            let working = try JSONSerialization.data(withJSONObject: ["id": id, "name": name])
+            try f.writeJSON(["version": 1, "workspaceID": id, "fileURL": workspaceURL.absoluteString, "workingDocument": working.base64EncodedString()], journal)
+        }
+        try writeJournal("Draft")
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try writeJournal("Redrafted") }
+        }
+        XCTAssertEqual(captures, 2)
+        let copy = f.debug.workspaceRoot.appendingPathComponent("Workspace-Redrafted-" + id + "/workspace.json")
+        XCTAssertEqual(try f.object(copy)["name"] as? String, "Redrafted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.workspaceRoot.appendingPathComponent("Workspace-Draft-" + id).path))
+        XCTAssertEqual(try Data(contentsOf: workspaceURL), savedBytes)
+    }
+
+    func testOneSourceCapturedTwiceAcrossAChangeIsRejectedRatherThanPublishedAsTwoVersions() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        try f.write(Data("first".utf8), source)
+        var plan = DebugStateSnapshot.Plan()
+        try plan.add(source, as: "Settings/a.json")
+        try f.write(Data("second".utf8), source)
+        XCTAssertThrowsError(try plan.add(source, as: "Settings/b.json")) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testDebugOwnedRecoveryUnderTemporaryLookingNamesIsRetainedVerbatim() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let relative = "Workspaces/Workspace-Research.sb-tools-" + UUID().uuidString + "/AgentSessions/.self-compact-recovery/partial.tmp"
+        let bytes = Data("debug-owned recovery".utf8)
+        try f.write(bytes, f.debug.applicationSupportRoot.appendingPathComponent(relative))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0)
+        XCTAssertEqual(try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent(relative)), bytes)
+    }
+
+    func testProductionThatNeverSettlesFailsClosedWithoutStagingOrReplacingDebugState() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (_, sessions) = try liveProductionWorkspace(f, sessions: 1)
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        var captures = 0
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            try f.writeJSON(["items": [["text": "write \(attempt)"]]], sessions[0])
+        }) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(captures, DebugStateBootstrap.captureAttempts)
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: f.recovery.path)) ?? []
+        XCTAssertTrue(leftovers.isEmpty, "Unverified attempts must not stage or archive anything: \(leftovers)")
+    }
+
+    func testFinderMetadataAndAtomicWriteTemporariesNeitherSeedNorInvalidateCapture() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, _) = try liveProductionWorkspace(f, sessions: 1)
+        let settings = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+        try f.writeJSON(["value": "production"], settings.appendingPathComponent("globalSettings.json"))
+        let finderMetadata = [directory.appendingPathComponent(".DS_Store"), settings.appendingPathComponent(".DS_Store")]
+        for url in finderMetadata {
+            try f.write(Data("view".utf8), url)
+        }
+        try f.write(Data("abandoned".utf8), directory.appendingPathComponent(".dat.nosync0001.AbCdEf"))
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            for url in finderMetadata {
+                try f.write(Data("view \(attempt)".utf8), url)
+            }
+            try f.write(Data("in flight".utf8), directory.appendingPathComponent(".dat.nosync\(attempt).Tmp"))
+        }
+        XCTAssertEqual(captures, 1, "Non-state churn must not force a re-capture")
+        let names = try FileManager.default.contentsOfDirectory(atPath: f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent).path)
+        XCTAssertEqual(names.filter { $0 == ".DS_Store" || $0.hasPrefix(".dat.nosync") }, [])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Settings").path), ["globalSettings.json"])
+    }
+
+    func testSourceDeletedDuringCaptureIsRetriedRatherThanReportedUnsafe() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 2)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try FileManager.default.removeItem(at: sessions[1]) }
+        }
+        XCTAssertEqual(captures, 2)
+        let copies = f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent + "/AgentSessions")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: copies.path), [sessions[0].lastPathComponent])
+    }
+}
+
+/// Enumeration and verification share one selection rule per listing; cooperative
+/// cancellation stops only at safe points and leaves no partial state behind.
+extension DebugStateBootstrapTests {
+    func testOwnedTreeExclusionChurnNeitherSeedsNorInvalidatesCapture() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, _) = try liveProductionWorkspace(f, sessions: 1)
+        let settings = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+        try f.writeJSON(["value": "production"], settings.appendingPathComponent("globalSettings.json"))
+        let index = directory.appendingPathComponent("AgentSessions/AgentSessionIndex.json")
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            // Production rebuilds its index and takes locks/backups while the debug launch captures.
+            try f.writeJSON(["rebuilt": attempt], index)
+            try f.write(Data("pid".utf8), directory.appendingPathComponent("locks/owner"))
+            try f.write(Data("claim".utf8), directory.appendingPathComponent("claims/\(attempt)"))
+            try f.write(Data("backup".utf8), settings.appendingPathComponent("Backups/\(attempt).json"))
+        }
+        XCTAssertEqual(captures, 1, "Excluded names must not force a re-capture")
+        let copy = f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: copy.path).sorted(), ["AgentSessions", "workspace.json"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.appendingPathComponent("AgentSessions/AgentSessionIndex.json").path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Settings").path), ["globalSettings.json"])
+    }
+
+    func testTransientRecognitionIsExactAndKeepsUserDerivedNames() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let root = f.release.applicationSupportRoot
+        let partition = "Partitions/client.sb-tools-0123abcd4567/selection.json"
+        try f.write(Data("selection".utf8), root.appendingPathComponent(partition))
+        try f.writeJSON(["value": "production"], root.appendingPathComponent("Settings/globalSettings.json"))
+        try f.write(Data("safe-save".utf8), root.appendingPathComponent("Settings/globalSettings.json.sb-4993fc53-J85yTY"))
+        try f.write(Data("atomic".utf8), root.appendingPathComponent("Settings/.globalSettings.json.\(UUID().uuidString).tmp"))
+        try f.write(Data("lock".utf8), root.appendingPathComponent("Settings/globalSettings.json.lock"))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0)
+        XCTAssertEqual(try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent(partition)), Data("selection".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Settings").path), ["globalSettings.json"])
+    }
+
+    func testOverlappingSelectionsMustAgreeOnTheMembershipEachConsumed() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let directory = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+        try f.write(Data("a".utf8), directory.appendingPathComponent("a.json"))
+        try f.write(Data("skip".utf8), directory.appendingPathComponent("skip.json"))
+        let filtered = DebugStateSnapshot.Selection(excluding: ["skip.json"])
+        var plan = DebugStateSnapshot.Plan()
+        XCTAssertEqual(try plan.children(directory, selection: filtered).map(\.lastPathComponent), ["a.json"])
+        // A change confined to names the first selection skipped keeps both views consistent.
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("skip.json"))
+        XCTAssertEqual(try plan.children(directory, selection: .verbatim).map(\.lastPathComponent), ["a.json"])
+        try plan.verify()
+        // Reverse order: a verbatim view then a filtered view of a changed membership.
+        var reversed = DebugStateSnapshot.Plan()
+        _ = try reversed.children(directory, selection: .verbatim)
+        try f.write(Data("skip".utf8), directory.appendingPathComponent("skip.json"))
+        XCTAssertThrowsError(try reversed.children(directory, selection: filtered))
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("skip.json"))
+        // A name the first selection consumes cannot appear between enumerations or before verification.
+        var racing = DebugStateSnapshot.Plan()
+        _ = try racing.children(directory, selection: filtered)
+        try f.write(Data("b".utf8), directory.appendingPathComponent("b.json"))
+        XCTAssertThrowsError(try racing.children(directory, selection: .verbatim)) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        try f.write(Data("late".utf8), directory.appendingPathComponent("late.json"))
+        XCTAssertThrowsError(try plan.verify())
+    }
+
+    func testPagedSQLiteBackupHonorsCancellationBetweenBatchesAndCompletesOtherwise() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(source.path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "PRAGMA page_size=4096; CREATE TABLE fixture(value BLOB); INSERT INTO fixture VALUES (zeroblob(1500000));", nil, nil, nil), SQLITE_OK)
+        sqlite3_close_v2(db)
+        let stamp = try DebugStateSnapshot.stamp(source)
+        let destinations = f.home.appendingPathComponent("Copies")
+        try FileManager.default.createDirectory(at: destinations, withIntermediateDirectories: true)
+        var checks = 0
+        let cancelled = destinations.appendingPathComponent("cancelled.sqlite")
+        XCTAssertThrowsError(try DebugStateSnapshot.copyDatabase(from: source, to: cancelled, cancellation: .init {
+            checks += 1
+            return checks > 1
+        })) { error in
+            guard case DebugStateSnapshot.Failure.cancelled = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(checks, 2, "One page batch ran before the stop request was honored")
+        var batches = 0
+        let complete = destinations.appendingPathComponent("complete.sqlite")
+        try DebugStateSnapshot.copyDatabase(from: source, to: complete, cancellation: .init {
+            batches += 1
+            return false
+        })
+        XCTAssertGreaterThan(batches, 2, "A multi-batch source is copied in bounded page steps")
+        XCTAssertEqual(try DebugStateSnapshot.stamp(source), stamp)
+        // A production write between batches would restart the backup; the attempt ends as a
+        // retryable source change instead of looping against a busy source.
+        var calls = 0
+        XCTAssertThrowsError(try DebugStateSnapshot.copyDatabase(from: source, to: destinations.appendingPathComponent("raced.sqlite"), expectedStamp: stamp, cancellation: .init {
+            calls += 1
+            if calls == 2 {
+                var writer: OpaquePointer?
+                XCTAssertEqual(sqlite3_open(source.path, &writer), SQLITE_OK)
+                XCTAssertEqual(sqlite3_exec(writer, "INSERT INTO fixture VALUES (x'01');", nil, nil, nil), SQLITE_OK)
+                sqlite3_close_v2(writer)
+            }
+            return false
+        })) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        var copy: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(complete.path, &copy, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close_v2(copy) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(copy, "SELECT length(value) FROM fixture", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 1_500_000)
+    }
+
+    func testCancellationAfterStagedEntriesRemovesTheStageAndALaterLaunchSucceeds() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        for name in ["a.json", "b.json", "c.json"] {
+            try f.writeJSON(["value": name], f.release.applicationSupportRoot.appendingPathComponent("Settings/" + name))
+        }
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        let recovery = f.recovery
+        // The stop request arrives once publication has already written a staged entry.
+        let stagedEntryWritten: () -> Bool = {
+            let stages = ((try? FileManager.default.contentsOfDirectory(atPath: recovery.path)) ?? []).filter { UUID(uuidString: $0) != nil }
+            return stages.contains { stage in
+                ((try? FileManager.default.contentsOfDirectory(atPath: recovery.appendingPathComponent(stage + "/Settings").path)) ?? []).isEmpty == false
+            }
+        }
+        var captures = 0
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0, cancellation: .init(stagedEntryWritten)) { _ in
+            captures += 1
+        }) { error in
+            guard case DebugStateSnapshot.Failure.cancelled = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(captures, 1, "Cancellation is not retried")
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: recovery.path)) ?? [], [])
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Settings").path).sorted(), ["a.json", "b.json", "c.json"])
+    }
+
+    func testStartEmptyCleanPublicationHonorsCancellationAndKeepsTheProfile() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        var stop = false
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:], retryDelay: 0, cancellation: .init { stop }) { _ in
+            stop = true
+        }) { error in
+            guard case DebugStateSnapshot.Failure.cancelled = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: f.recovery.path)) ?? [], [])
+    }
+
+    func testStartupSIGTERMIsRecordedThenRestoredAndDelivered() throws {
+        func disposition() -> Int {
+            var current = sigaction()
+            sigaction(SIGTERM, nil, &current)
+            return unsafeBitCast(current.__sigaction_u.__sa_handler, to: Int.self)
+        }
+        let original = disposition()
+        let request = try XCTUnwrap(DebugStateBootstrap.TerminationRequest.install())
+        XCTAssertFalse(request.isRequested)
+        XCTAssertNotEqual(disposition(), original)
+        raise(SIGTERM) // Recorded by the startup handler, not delivered to the default action.
+        XCTAssertTrue(request.isRequested)
+        XCTAssertThrowsError(try DebugStateSnapshot.Cancellation { request.isRequested }.check())
+        var delivered = false
+        request.finish { delivered = true }
+        XCTAssertTrue(delivered, "A recorded stop request is delivered after preparation")
+        XCTAssertEqual(disposition(), original, "The previous disposition is reinstated before delivery")
+        let next = try XCTUnwrap(DebugStateBootstrap.TerminationRequest.install())
+        XCTAssertFalse(next.isRequested, "Each preparation starts without a stale request")
+        next.finish { XCTFail("No request was made") }
+        XCTAssertEqual(disposition(), original)
+    }
+
+    func testStartEmptyIsOfferedOnlyWhereAnEmptyProfileCanRecover() {
+        let recoverable: [Error] = [DebugStateSnapshot.Failure.sourceChanged, DebugStateSnapshot.Failure.unsafeFile, DebugStateSnapshot.Failure.database(SQLITE_BUSY), DebugStateSnapshot.Failure.unsupportedWAL]
+        let unrecoverable: [Error] = [DebugStateSnapshot.Failure.cancelled, DebugStateSnapshot.Failure.unsafeDestination, DebugProfileAccessLease.Failure.busy, ProfileLocationError.releaseAlias("/fixture")]
+        XCTAssertEqual(recoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: true, count: recoverable.count))
+        XCTAssertEqual(unrecoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: false, count: unrecoverable.count))
+    }
+}

@@ -34,6 +34,8 @@ extension DebugStateBootstrap.Builder {
             locations: locations, releasePreferences: previousPreferences,
             sourceOverride: locations, retainedIdentities: identities
         )
+        retained.plan.cache = plan.cache
+        retained.plan.cancellation = plan.cancellation
         try retained.addWorkspaces()
         guard let retainedIndexData = retained.plan.generated["Workspaces/workspacesIndex.json"],
               let productionIndexData = plan.generated["Workspaces/workspacesIndex.json"] else { throw DebugStateSnapshot.Failure.unsafeFile }
@@ -49,8 +51,14 @@ extension DebugStateBootstrap.Builder {
             plan.generated.removeValue(forKey: key)
         }
         plan.entries += retained.plan.entries
-        plan.observed.merge(retained.plan.observed) { old, _ in old }
-        plan.directories.merge(retained.plan.directories) { old, _ in old }
+        for (url, stamp) in retained.plan.observed {
+            try plan.record(stamp, for: url)
+        }
+        for (url, listings) in retained.plan.directories {
+            for listing in listings {
+                try plan.record(listing, for: url)
+            }
+        }
         for (key, data) in retained.plan.generated where key.hasPrefix("Workspaces/") && key != "Workspaces/workspacesIndex.json" {
             plan.generated[key] = data
         }
