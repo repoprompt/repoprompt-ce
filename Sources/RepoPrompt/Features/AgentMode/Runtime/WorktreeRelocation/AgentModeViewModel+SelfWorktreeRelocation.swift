@@ -61,6 +61,7 @@ extension AgentModeViewModel {
                 && !session.terminalCommitInProgress
         }
         guard originTurnIsLive() else { return nil }
+        try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
         let previousBindings = session.worktreeBindings
         guard worktreeBindingsChangeExecutionRoots(from: previousBindings, to: desiredBindings) else { return nil }
         if !desiredBindings.isEmpty {
@@ -76,6 +77,8 @@ extension AgentModeViewModel {
                 "The turn that requested this worktree switch ended before the switch could be scheduled. Nothing was changed; inspect the session's current binding before retrying."
             )
         }
+        // A concurrent request from the same turn may have recorded first while the fence awaited.
+        try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
         let relocation = AgentSelfWorktreeRelocation(
             id: UUID(),
             originRunID: originRunID,
@@ -84,20 +87,29 @@ extension AgentModeViewModel {
             desiredBindings: desiredBindings,
             stopFence: AgentRunStartStopFence(session: session)
         )
-        // Latest self request wins; a still-scheduled earlier request has not touched execution.
         session.pendingSelfWorktreeRelocation = relocation
         return relocation
     }
 
-    /// A newer self request from the same live turn supersedes a still-scheduled one, including a
-    /// request that returns to the current bindings (which needs no transition at all).
-    func supersedeSelfWorktreeRelocation(forSessionID sessionID: UUID, originRunAttemptID: UUID) {
-        guard let session = try? authoritativeLiveSession(for: sessionID),
-              let pending = session.pendingSelfWorktreeRelocation,
-              pending.phase == .scheduled,
+    /// One execution-root relocation per turn. Once a turn has scheduled a switch, every later
+    /// self-targeted binding mutation from that same turn (bind, select, unbind, create with bind,
+    /// including no-op and presentation-only requests) is refused before it can mutate anything, so
+    /// the scheduled switch is never silently replaced or cancelled. Desired bindings are computed
+    /// from the current, pre-switch bindings, so composing a second request would discard the
+    /// first's roots; further changes belong in the continuation turn, which runs after the switch.
+    func requireNoPendingSelfWorktreeRelocation(forSessionID sessionID: UUID, originRunAttemptID: UUID) throws {
+        guard let session = try authoritativeLiveSession(for: sessionID) else { return }
+        try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
+    }
+
+    private func requireNoPendingSelfWorktreeRelocation(in session: TabSession, originRunAttemptID: UUID) throws {
+        guard let pending = session.pendingSelfWorktreeRelocation,
               pending.originRunAttemptID == originRunAttemptID
         else { return }
-        session.pendingSelfWorktreeRelocation = nil
+        let location = Self.selfWorktreeRelocationLocationSummary(pending.desiredBindings)
+        throw MCPError.invalidParams(
+            "This turn already scheduled a worktree switch (relocation \(pending.id.uuidString)) to \(location). Only one switch is allowed per turn, and it is unchanged. End this turn now; the switch applies when the turn completes and the session continues automatically, where any further worktree changes can be requested."
+        )
     }
 
     /// Terminal boundary of the origin turn. Called after publication and successor arbitration;
@@ -220,7 +232,7 @@ extension AgentModeViewModel {
                     // Retried only within the monotonic budget below.
                     lastRefusal = error.localizedDescription
                 } catch is CancellationError where session.worktreeBindings == pending.previousBindings {
-                    // The commit fence saw Stop or a superseded request; the guards above settle it.
+                    // The commit fence saw Stop or an already-settled request; the guards above settle it.
                     lastRefusal = nil
                 } catch {
                     releaseSelfWorktreeRelocationReservation(session, reserved: reservedContinuation)

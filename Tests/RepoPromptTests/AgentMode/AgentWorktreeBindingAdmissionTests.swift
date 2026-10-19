@@ -636,6 +636,56 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation)
     }
 
+    func testSecondSelfRequestInSameTurnIsRefusedAndFirstPendingSwitchIsPreserved() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        // Two logical roots: A (the fixture's primary) and B, both currently in the same checkout.
+        let rootA = fixture.session.worktreeBindings[0]
+        let rootB = Self.copyBinding(rootA, id: "secondary", logicalRootPath: "/tmp/second-project")
+        fixture.session.worktreeBindings = [rootA, rootB]
+        let turn = try await liveSelfTurn(fixture)
+        let next = try makeNextBinding(fixture)
+        let movedA = [next, rootB]
+        let first = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            movedA, forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+        )
+        let pending = try XCTUnwrap(first)
+
+        let movedB = [rootA, Self.copyBinding(next, id: rootB.id, logicalRootPath: rootB.logicalRootPath)]
+        let followUps: [(String, [AgentSessionWorktreeBinding])] = [
+            ("other logical root", movedB),
+            ("same root repeated", movedA),
+            ("return to current bindings", [rootA, rootB])
+        ]
+        for (label, desired) in followUps {
+            var committed = false
+            do {
+                _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+                    desired, forSessionID: fixture.sessionID,
+                    originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
+                    beforeRecord: { committed = true }
+                )
+                XCTFail("A second self request in the same turn must be refused (\(label))")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("Only one switch is allowed per turn"), "\(label): \(error)")
+                XCTAssertTrue(error.localizedDescription.contains(pending.id.uuidString), label)
+                XCTAssertFalse(committed, "Refused before the mutation fence (\(label))")
+            }
+            XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation, pending, "First switch unchanged (\(label))")
+        }
+
+        // The provider's no-op and presentation-only paths use the same owner guard before committing.
+        XCTAssertThrowsError(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
+            forSessionID: fixture.sessionID, originRunAttemptID: turn.ownership.attemptID
+        ))
+        XCTAssertNoThrow(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
+            forSessionID: fixture.sessionID, originRunAttemptID: UUID()
+        ), "Only the turn that scheduled the switch is limited")
+        XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation?.desiredBindings, movedA)
+        XCTAssertEqual(fixture.session.worktreeBindings, [rootA, rootB], "Nothing applies before the turn ends")
+    }
+
     func testPendingApplicationIsReportedInReplyAndFormattedOutput() throws {
         let relocation = AgentSelfWorktreeRelocation(
             id: UUID(), originRunID: UUID(), originRunAttemptID: UUID(),
