@@ -4,14 +4,25 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 
 /// Runs once per *process launch*, before settings, windows, catalogs or agents
-/// acquire their stores. A normal launch is always a fresh production snapshot;
-/// clean mode is an argument, never a persisted preference.
+/// acquire their stores. Automatic refresh can reuse a previously seeded debug
+/// profile when production is busy; explicit refresh and clean mode are one-launch arguments.
 enum DebugStateBootstrap {
     static let cleanSlateArgument = "--debug-clean-slate"
+    static let refreshArgument = "--debug-refresh-from-release"
+    static let automaticRefreshBudgetSeconds: TimeInterval = 10
     private static let fm = FileManager.default
     @MainActor private static var appProfileLease: DebugProfileAccessLease?
 
-    @MainActor static func runIfNeeded() throws {
+    enum ReusedReason: String {
+        case productionRunning, refreshUnavailable
+    }
+
+    enum Preparation {
+        case seeded(DebugStateSnapshot.Receipt)
+        case reused(ReusedReason)
+    }
+
+    @MainActor static func runIfNeeded(forceCleanSlate: Bool = false) throws {
         guard MCPFilesystemIdentity.current.buildFlavor == .debug,
               !AppLaunchConfiguration.isUnitTestProcess,
               !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects else { return }
@@ -27,7 +38,8 @@ enum DebugStateBootstrap {
         let defaults = UserDefaults.standard
         let release = AppProfileLocations(identity: .repoPromptCE(.release))
         let prior = defaults.persistentDomain(forName: AppProfileLocations.current.preferencesDomain) ?? [:]
-        let clean = ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
+        let clean = forceCleanSlate || ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
+        let refreshRequested = ProcessInfo.processInfo.arguments.contains(refreshArgument)
         let preferenceDirectory = release.homeDirectory.appendingPathComponent("Library/Preferences")
         let sourcePreferencesURL = preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")
         let priorPreferencesURL = preferenceDirectory.appendingPathComponent(AppProfileLocations.current.preferencesDomain + ".plist")
@@ -37,21 +49,79 @@ enum DebugStateBootstrap {
         {
             throw DebugStateSnapshot.Failure.unsafeDestination
         }
-        let receipt = try seed(
+        let preparation = try prepareForLaunch(
             locations: .current,
             cleanSlate: clean,
-            releasePreferences: nil,
+            refreshRequested: refreshRequested,
+            releaseIsRunning: !NSRunningApplication.runningApplications(withBundleIdentifier: release.preferencesDomain).isEmpty,
             previousPreferences: prior,
             preferenceSourceURL: clean ? nil : sourcePreferencesURL,
             previousPreferenceFileURL: priorPreferencesURL,
-            profileLease: lease
+            profileLease: lease,
+            captureBudget: clean || refreshRequested ? nil : DebugStateSnapshot.CaptureBudget(seconds: automaticRefreshBudgetSeconds)
         )
-        let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
-        let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
-        defaults.setPersistentDomain(preferences, forName: AppProfileLocations.current.preferencesDomain)
+        if case .seeded = preparation {
+            let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
+            let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
+            defaults.setPersistentDomain(preferences, forName: AppProfileLocations.current.preferencesDomain)
+        }
         try lease.allowWriters()
         appProfileLease = lease
-        print("[DebugStateSeed] schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
+        switch preparation {
+        case let .seeded(receipt):
+            print("[DebugStateSeed] schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
+        case let .reused(reason):
+            print("[DebugStateSeed] mode=existing reason=\(reason.rawValue) preferences=preserved refreshArgument=\(refreshArgument) totalSeconds=\(Date().timeIntervalSince(start))")
+        }
+    }
+
+    static func hasReusableProfile(locations: AppProfileLocations) throws -> Bool {
+        guard locations.identity.buildFlavor == .debug else { throw DebugStateSnapshot.Failure.unsafeDestination }
+        try locations.validateWritableRoot(locations.applicationSupportRoot)
+        let marker = locations.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+        try locations.validateMetadataFile(marker)
+        guard fm.fileExists(atPath: marker.path) else { return false }
+        let before = try DebugStateSnapshot.stamp(marker)
+        guard before.size <= 65_536 else { return false }
+        let data = try Data(contentsOf: marker)
+        guard try DebugStateSnapshot.stamp(marker) == before else { throw DebugStateSnapshot.Failure.unsafeDestination }
+        guard let receipt = try? JSONDecoder().decode(DebugStateSnapshot.Receipt.self, from: data) else { return false }
+        return receipt.version == 1 && receipt.profile == locations.preferencesDomain
+    }
+
+    static func prepareForLaunch(
+        locations: AppProfileLocations,
+        cleanSlate: Bool,
+        refreshRequested: Bool = false,
+        releaseIsRunning: Bool = false,
+        releasePreferences: [String: Any]? = nil,
+        previousPreferences: [String: Any] = [:],
+        preferenceSourceURL: URL? = nil,
+        previousPreferenceFileURL: URL? = nil,
+        profileLease: DebugProfileAccessLease? = nil,
+        captureBudget: DebugStateSnapshot.CaptureBudget? = nil
+    ) throws -> Preparation {
+        let lease = try profileLease ?? DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
+        defer { withExtendedLifetime(lease) {} }
+        let mayReuse: Bool
+        if cleanSlate || refreshRequested { mayReuse = false }
+        else { mayReuse = try hasReusableProfile(locations: locations) }
+        if mayReuse, releaseIsRunning { return .reused(.productionRunning) }
+        do {
+            return try .seeded(seed(
+                locations: locations,
+                cleanSlate: cleanSlate,
+                releasePreferences: releasePreferences,
+                previousPreferences: previousPreferences,
+                preferenceSourceURL: preferenceSourceURL,
+                previousPreferenceFileURL: previousPreferenceFileURL,
+                profileLease: lease,
+                captureBudget: cleanSlate ? nil : captureBudget
+            ))
+        } catch let failure as DebugStateSnapshot.Failure {
+            guard mayReuse, failure.canReuseExistingProfile, try hasReusableProfile(locations: locations) else { throw failure }
+            return .reused(.refreshUnavailable)
+        }
     }
 
     static func seed(
@@ -61,7 +131,8 @@ enum DebugStateBootstrap {
         previousPreferences: [String: Any] = [:],
         preferenceSourceURL: URL? = nil,
         previousPreferenceFileURL: URL? = nil,
-        profileLease: DebugProfileAccessLease? = nil
+        profileLease: DebugProfileAccessLease? = nil,
+        captureBudget: DebugStateSnapshot.CaptureBudget? = nil
     ) throws -> DebugStateSnapshot.Receipt {
         let startedAt = Date()
         guard locations.identity.buildFlavor == .debug else { throw DebugStateSnapshot.Failure.unsafeDestination }
@@ -77,7 +148,13 @@ enum DebugStateBootstrap {
         var lastError: Error = DebugStateSnapshot.Failure.sourceChanged
         for _ in 0 ..< 3 {
             do {
-                var builder = Builder(locations: locations, releasePreferences: releasePreferences ?? [:], previousPreferences: previousPreferences)
+                try captureBudget?.check()
+                var builder = Builder(
+                    locations: locations,
+                    releasePreferences: releasePreferences ?? [:],
+                    previousPreferences: previousPreferences,
+                    plan: DebugStateSnapshot.Plan(budget: captureBudget)
+                )
                 var hasReleasePreferences = releasePreferences != nil
                 if !cleanSlate, let url = preferenceSourceURL, fm.fileExists(atPath: url.path) {
                     let bytes = try builder.plan.read(url)
@@ -296,19 +373,13 @@ enum DebugStateBootstrap {
 
         mutating func addTree(_ directory: URL, relative: String, excluding: Set<String> = []) throws {
             guard fm.fileExists(atPath: directory.path) else { return }
-            for url in try plan.children(directory) {
+            for url in try plan.children(directory, excluding: excluding, excludingTransientMetadata: true) {
                 let name = url.lastPathComponent
-                guard !excluding.contains(name), name != "locks", name != "claims", name != "Backups", name != ".self-compact-recovery",
-                      !name.hasSuffix(".lock"), !name.contains(".sb-"), !name.hasSuffix(".tmp") else { continue }
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 guard values.isSymbolicLink != true else { throw DebugStateSnapshot.Failure.unsafeFile }
                 let target = relative + "/" + name
                 if values.isDirectory == true { try addTree(url, relative: target) }
-                else if name == "AgentSessionIndex.json" {
-                    // A rebuildable projection; copied records would retain stale
-                    // file size/mtime and runtime summaries after handle detachment.
-                    continue
-                } else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
+                else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
                     guard var session = try object(url) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
                     if retainedIdentities == nil {
                         for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {

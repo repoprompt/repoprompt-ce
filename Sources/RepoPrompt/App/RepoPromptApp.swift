@@ -209,15 +209,25 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     private static func checkDebugStateBoundary() {
-        do {
-            try DebugStateBootstrap.runIfNeeded()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Debug state snapshot could not be prepared"
-            alert.informativeText = "\(error.localizedDescription)\nProduction and prior debug state were preserved. Retry when release is idle, or launch with --debug-clean-slate for an isolated empty profile."
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-            exit(EXIT_FAILURE)
+        var cleanSlate = false
+        while true {
+            do {
+                try DebugStateBootstrap.runIfNeeded(forceCleanSlate: cleanSlate)
+                return
+            } catch {
+                let canStartEmpty = !cleanSlate && !ProcessInfo.processInfo.arguments.contains(DebugStateBootstrap.cleanSlateArgument)
+                let alert = NSAlert()
+                alert.messageText = "Debug state snapshot could not be prepared"
+                alert.informativeText = "\(error.localizedDescription)\nProduction and prior debug data were preserved."
+                if canStartEmpty {
+                    alert.informativeText += "\nQuit the release app and retry to capture production state. Start Empty opens an isolated empty debug profile and archives existing debug data."
+                }
+                alert.addButton(withTitle: "Quit")
+                if canStartEmpty { alert.addButton(withTitle: "Start Empty") }
+                let response = alert.runModal()
+                guard canStartEmpty, response == .alertSecondButtonReturn else { exit(EXIT_FAILURE) }
+                cleanSlate = true
+            }
         }
     }
 

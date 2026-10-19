@@ -4,8 +4,22 @@ import RepoPromptC
 import RepoPromptShared
 
 /// Bounded, read-only source capture followed by a same-volume atomic publish.
-/// No live app store may be opened until this startup operation succeeds.
+/// Live app stores remain closed throughout staging and publication.
 struct DebugStateSnapshot {
+    struct CaptureBudget {
+        private let deadline: TimeInterval
+        private let uptime: () -> TimeInterval
+
+        init(seconds: TimeInterval, uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+            self.uptime = uptime
+            deadline = uptime() + max(0, seconds)
+        }
+
+        func check() throws {
+            guard uptime() < deadline else { throw Failure.captureTimedOut }
+        }
+    }
+
     struct Stamp: Equatable {
         let inode: UInt64
         let size: Int64
@@ -21,27 +35,46 @@ struct DebugStateSnapshot {
     }
 
     struct Plan {
+        struct DirectoryObservation {
+            let names: [String]
+            let excluding: Set<String>
+            let excludingTransientMetadata: Bool
+
+            static func selectedNames(_ names: [String], excluding: Set<String>, excludingTransientMetadata: Bool) -> [String] {
+                names.filter {
+                    !excluding.contains($0) && (!excludingTransientMetadata || !DebugStateSnapshot.isTransientMetadataName($0))
+                }
+            }
+        }
+
         var entries: [Entry] = []
         var generated: [String: Data] = [:]
         var observed: [URL: Stamp] = [:]
-        var directories: [URL: [String]] = [:]
+        var directories: [URL: [DirectoryObservation]] = [:]
+        var budget: CaptureBudget?
 
         mutating func read(_ url: URL) throws -> Data {
+            try budget?.check()
             let before = try DebugStateSnapshot.stamp(url)
             let bytes = try Data(contentsOf: url)
+            try budget?.check()
             guard try DebugStateSnapshot.stamp(url) == before else { throw Failure.sourceChanged }
             observed[url] = before
             return bytes
         }
 
-        mutating func children(_ url: URL) throws -> [URL] {
+        mutating func children(_ url: URL, excluding: Set<String> = [], excludingTransientMetadata: Bool = false) throws -> [URL] {
+            try budget?.check()
             try DebugStateSnapshot.requireDirectory(url)
-            let names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
-            directories[url] = names
+            let allNames = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
+            let names = DirectoryObservation.selectedNames(allNames, excluding: excluding, excludingTransientMetadata: excludingTransientMetadata)
+            try budget?.check()
+            directories[url, default: []].append(DirectoryObservation(names: names, excluding: excluding, excludingTransientMetadata: excludingTransientMetadata))
             return names.map { url.appendingPathComponent($0) }
         }
 
         mutating func add(_ source: URL, as relativePath: String, replacement: Data? = nil, database: Bool = false) throws {
+            try budget?.check()
             if observed[source] == nil { observed[source] = try DebugStateSnapshot.stamp(source) }
             entries.append(Entry(source: source, relativePath: relativePath, replacement: replacement, database: database))
             if database {
@@ -55,12 +88,23 @@ struct DebugStateSnapshot {
         }
 
         func verify() throws {
+            try budget?.check()
             for (url, expected) in observed {
+                try budget?.check()
                 guard try DebugStateSnapshot.stamp(url) == expected else { throw Failure.sourceChanged }
             }
-            for (url, expected) in directories {
-                guard try FileManager.default.contentsOfDirectory(atPath: url.path).sorted() == expected else { throw Failure.sourceChanged }
+            for (url, observations) in directories {
+                try budget?.check()
+                try DebugStateSnapshot.requireDirectory(url)
+                let names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
+                for expected in observations {
+                    try budget?.check()
+                    guard DirectoryObservation.selectedNames(names, excluding: expected.excluding, excludingTransientMetadata: expected.excludingTransientMetadata) == expected.names else {
+                        throw Failure.sourceChanged
+                    }
+                }
             }
+            try budget?.check()
         }
     }
 
@@ -81,10 +125,20 @@ struct DebugStateSnapshot {
     }
 
     enum Failure: Error, LocalizedError {
-        case sourceChanged, unsafeFile, unsafeDestination, duplicateDestination, database(Int32), unsupportedWAL
+        case sourceChanged, captureTimedOut, unsafeFile, unsafeDestination, duplicateDestination, database(Int32), unsupportedWAL
+
+        var canReuseExistingProfile: Bool {
+            switch self {
+            case .sourceChanged, .captureTimedOut, .unsupportedWAL: true
+            case let .database(code): (code & 0xFF) == SQLITE_BUSY || (code & 0xFF) == SQLITE_LOCKED
+            case .unsafeFile, .unsafeDestination, .duplicateDestination: false
+            }
+        }
+
         var errorDescription: String? {
             switch self {
             case .sourceChanged: "Production state changed during capture. Retry when release is idle; no profile was replaced."
+            case .captureTimedOut: "Debug state capture exceeded its time budget at a safe stopping point; no profile was replaced."
             case .unsafeFile: "A snapshot source is missing, aliased, or not a regular metadata file. Original state was preserved."
             case .unsafeDestination: "Debug snapshot destination or recovery ownership is unsafe. Original state was preserved."
             case .duplicateDestination: "Snapshot metadata references conflict. Original state was preserved."
@@ -96,6 +150,11 @@ struct DebugStateSnapshot {
 
     let locations: AppProfileLocations
     private let fm = FileManager.default
+
+    static func isTransientMetadataName(_ name: String) -> Bool {
+        ["locks", "claims", "Backups", ".self-compact-recovery", "AgentSessionIndex.json"].contains(name)
+            || name.hasSuffix(".lock") || name.contains(".sb-") || name.hasSuffix(".tmp")
+    }
 
     static func requireDirectory(_ url: URL) throws {
         var info = stat()
@@ -130,7 +189,8 @@ struct DebugStateSnapshot {
 
     /// Online backup of a rollback-journal source. READONLY never recovers or
     /// checkpoints the live source. Refuse WAL rather than write its SHM read marks.
-    static func copyDatabase(from source: URL, to destination: URL) throws {
+    static func copyDatabase(from source: URL, to destination: URL, budget: CaptureBudget? = nil) throws {
+        try budget?.check()
         let handle = try FileHandle(forReadingFrom: source)
         defer { try? handle.close() }
         let header = try handle.read(upToCount: 100) ?? Data()
@@ -156,14 +216,23 @@ struct DebugStateSnapshot {
         guard let backup = sqlite3_backup_init(output, "main", input, "main") else {
             throw Failure.database(sqlite3_errcode(output))
         }
-        code = sqlite3_backup_step(backup, -1)
-        let finish = sqlite3_backup_finish(backup)
+        let pages: Int32 = budget == nil ? -1 : 128
+        var finish: Int32 = SQLITE_OK
+        do {
+            defer { finish = sqlite3_backup_finish(backup) }
+            repeat {
+                try budget?.check()
+                code = sqlite3_backup_step(backup, pages)
+                try budget?.check()
+            } while code == SQLITE_OK
+        }
         guard code == SQLITE_DONE, finish == SQLITE_OK else { throw Failure.database(code == SQLITE_DONE ? finish : code) }
     }
 
     func publish(plan: Plan, cleanSlate: Bool, preferences: Data, previousPreferences: Data, startedAt: Date = Date(), profileLease: DebugProfileAccessLease? = nil) throws -> Receipt {
         let lease = try profileLease ?? DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
         defer { withExtendedLifetime(lease) {} }
+        try plan.verify()
         let root = locations.applicationSupportRoot
         try locations.validateWritableRoot(root)
         let parent = root.deletingLastPathComponent()
@@ -189,11 +258,12 @@ struct DebugStateSnapshot {
         var seen = Set<String>()
         var bytes = 0
         for entry in plan.entries {
+            try plan.budget?.check()
             let target = stage.appendingPathComponent(entry.relativePath).standardizedFileURL
             guard target.pathComponents.starts(with: stage.pathComponents), target.path != stage.path,
                   seen.insert(target.path).inserted else { throw Failure.duplicateDestination }
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            if entry.database { try Self.copyDatabase(from: entry.source, to: target) }
+            if entry.database { try Self.copyDatabase(from: entry.source, to: target, budget: plan.budget) }
             else {
                 let data = try entry.replacement ?? Data(contentsOf: entry.source)
                 try data.write(to: target, options: .withoutOverwriting)
@@ -202,6 +272,7 @@ struct DebugStateSnapshot {
             try bytes += Int(Self.stamp(target).size)
         }
         for (relative, data) in plan.generated {
+            try plan.budget?.check()
             let target = stage.appendingPathComponent(relative).standardizedFileURL
             guard target.pathComponents.starts(with: stage.pathComponents), target.path != stage.path, seen.insert(target.path).inserted else { throw Failure.duplicateDestination }
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -219,6 +290,7 @@ struct DebugStateSnapshot {
             seconds: Date().timeIntervalSince(startedAt)
         )
         try JSONEncoder().encode(receipt).write(to: stage.appendingPathComponent("debugSeed.json"), options: .withoutOverwriting)
+        try plan.budget?.check()
         if fm.fileExists(atPath: root.path) {
             try Self.requireDirectory(root)
             guard renameatx_np(AT_FDCWD, stage.path, AT_FDCWD, root.path, UInt32(RENAME_SWAP)) == 0 else {

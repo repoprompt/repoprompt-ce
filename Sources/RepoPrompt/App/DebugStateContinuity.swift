@@ -32,7 +32,8 @@ extension DebugStateBootstrap.Builder {
         guard !identities.sessions.isEmpty || !identities.workspaces.isEmpty else { return }
         var retained = Self(
             locations: locations, releasePreferences: previousPreferences,
-            sourceOverride: locations, retainedIdentities: identities
+            sourceOverride: locations, retainedIdentities: identities,
+            plan: DebugStateSnapshot.Plan(budget: plan.budget)
         )
         try retained.addWorkspaces()
         guard let retainedIndexData = retained.plan.generated["Workspaces/workspacesIndex.json"],
@@ -50,7 +51,7 @@ extension DebugStateBootstrap.Builder {
         }
         plan.entries += retained.plan.entries
         plan.observed.merge(retained.plan.observed) { old, _ in old }
-        plan.directories.merge(retained.plan.directories) { old, _ in old }
+        plan.directories.merge(retained.plan.directories) { old, new in old + new }
         for (key, data) in retained.plan.generated where key.hasPrefix("Workspaces/") && key != "Workspaces/workspacesIndex.json" {
             plan.generated[key] = data
         }

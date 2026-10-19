@@ -566,6 +566,233 @@ extension DebugStateBootstrapTests {
     }
 }
 
+extension DebugStateBootstrapTests {
+    func testIgnoredMetadataCreationAndRemovalDoNotInvalidateCapture() throws {
+        for removeExisting in [false, true] {
+            let f = Fixture()
+            defer { f.cleanup() }
+            let source = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+            let bytes = Data("selected metadata".utf8)
+            try f.write(bytes, source.appendingPathComponent("selected.json"))
+            let ignored = ["locks", "claims", "Backups", ".self-compact-recovery", "AgentSessionIndex.json", "active.lock", "atomic.sb-write", "pending.tmp", "excluded.json"]
+            if removeExisting {
+                for name in ignored { try f.write(Data("ignored".utf8), source.appendingPathComponent(name)) }
+            }
+            var builder = DebugStateBootstrap.Builder(locations: f.debug, releasePreferences: [:])
+            try builder.addTree(source, relative: "Settings", excluding: ["excluded.json"])
+            for name in ignored {
+                let url = source.appendingPathComponent(name)
+                if removeExisting { try FileManager.default.removeItem(at: url) }
+                else { try f.write(Data("ignored".utf8), url) }
+            }
+            _ = try DebugStateSnapshot(locations: f.debug).publish(plan: builder.plan, cleanSlate: false, preferences: Data(), previousPreferences: Data())
+            let destination = f.debug.applicationSupportRoot.appendingPathComponent("Settings")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destination.path), ["selected.json"])
+            XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("selected.json")), bytes)
+            XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("selected.json")), bytes)
+        }
+    }
+
+    func testSelectedMetadataChangesFailBeforeCreatingRecoveryStaging() throws {
+        for mutateSelected in [false, true] {
+            let f = Fixture()
+            defer { f.cleanup() }
+            let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+            try f.write(Data("prior".utf8), sentinel)
+            let source = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+            try f.write(Data("selected".utf8), source.appendingPathComponent("selected.json"))
+            var builder = DebugStateBootstrap.Builder(locations: f.debug, releasePreferences: [:])
+            try builder.addTree(source, relative: "Settings")
+            let changed = source.appendingPathComponent(mutateSelected ? "selected.json" : "new.json")
+            try f.write(Data("changed".utf8), changed)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.recovery.path))
+            XCTAssertThrowsError(try DebugStateSnapshot(locations: f.debug).publish(plan: builder.plan, cleanSlate: false, preferences: Data(), previousPreferences: Data())) { error in
+                guard let failure = error as? DebugStateSnapshot.Failure, case .sourceChanged = failure else { return XCTFail("Unexpected error: \(error)") }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.recovery.path))
+            XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+            XCTAssertEqual(try Data(contentsOf: changed), Data("changed".utf8))
+        }
+    }
+
+    func testFilteredDirectoryObservationCannotRelaxAnUnfilteredObservation() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+        try f.write(Data("selected".utf8), source.appendingPathComponent("selected.json"))
+        for filteredFirst in [false, true] {
+            var plan = DebugStateSnapshot.Plan()
+            _ = try plan.children(source, excludingTransientMetadata: filteredFirst)
+            _ = try plan.children(source, excludingTransientMetadata: !filteredFirst)
+            let transient = source.appendingPathComponent("pending.tmp")
+            try f.write(Data("temporary".utf8), transient)
+            XCTAssertThrowsError(try plan.verify()) { error in
+                guard let failure = error as? DebugStateSnapshot.Failure, case .sourceChanged = failure else { return XCTFail("Unexpected error: \(error)") }
+            }
+            try FileManager.default.removeItem(at: transient)
+        }
+    }
+
+    func testExpiredCaptureReusesPriorProfileButExplicitRefreshAndMissingReceiptFail() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        let archives = try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).sorted()
+        var elapsed: TimeInterval = 0
+        let budget = DebugStateSnapshot.CaptureBudget(seconds: 1, uptime: { elapsed })
+        elapsed = 2
+        let preparation = try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: false, captureBudget: budget)
+        guard case .reused(.refreshUnavailable) = preparation else { return XCTFail("Expired capture must reuse the prior debug profile") }
+        XCTAssertThrowsError(try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: false, refreshRequested: true, captureBudget: budget)) { error in
+            guard let failure = error as? DebugStateSnapshot.Failure, case .captureTimedOut = failure else { return XCTFail("Unexpected error: \(error)") }
+        }
+        try FileManager.default.removeItem(at: f.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json"))
+        XCTAssertThrowsError(try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: false, captureBudget: budget)) { error in
+            guard let failure = error as? DebugStateSnapshot.Failure, case .captureTimedOut = failure else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).sorted(), archives)
+    }
+
+    func testRunningReleaseReusesDebugWithoutReadingBrokenProductionPreferences() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("current debug state".utf8), sentinel)
+        let seedPreferences = f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
+        let originalSeed = try Data(contentsOf: seedPreferences)
+        let priorPreferences = f.home.appendingPathComponent("Library/Preferences/debug.plist")
+        let priorBytes = try PropertyListSerialization.data(fromPropertyList: ["fontSize": 23], format: .xml, options: 0)
+        try f.write(priorBytes, priorPreferences)
+        let sourcePreferences = f.home.appendingPathComponent("Library/Preferences/release.plist")
+        let invalidBytes = Data("invalid production preferences".utf8)
+        try f.write(invalidBytes, sourcePreferences)
+        let archives = try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).sorted()
+        let preparation = try DebugStateBootstrap.prepareForLaunch(
+            locations: f.debug, cleanSlate: false, releaseIsRunning: true, previousPreferences: ["fontSize": 23],
+            preferenceSourceURL: sourcePreferences, previousPreferenceFileURL: priorPreferences
+        )
+        guard case .reused(.productionRunning) = preparation else { return XCTFail("A running release must preserve the prepared debug profile") }
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("current debug state".utf8))
+        XCTAssertEqual(try Data(contentsOf: seedPreferences), originalSeed)
+        XCTAssertEqual(try Data(contentsOf: priorPreferences), priorBytes)
+        XCTAssertEqual(try Data(contentsOf: sourcePreferences), invalidBytes)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).sorted(), archives)
+    }
+
+    func testInvalidWrongProfileAndSymlinkReceiptsDoNotAuthorizeReuse() throws {
+        for kind in ["invalid", "wrong-profile", "symlink"] {
+            let f = Fixture()
+            defer { f.cleanup() }
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])
+            let receiptURL = f.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+            let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+            try f.write(Data("prior".utf8), sentinel)
+            if kind == "symlink" {
+                let target = f.home.appendingPathComponent("foreign-seed.json")
+                try f.write(Data(contentsOf: receiptURL), target)
+                try FileManager.default.removeItem(at: receiptURL)
+                try FileManager.default.createSymbolicLink(at: receiptURL, withDestinationURL: target)
+            } else if kind == "wrong-profile" {
+                let receipt = DebugStateSnapshot.Receipt(version: 1, profile: f.release.preferencesDomain, cleanSlate: false, copiedFiles: 0, copiedBytes: 0, seconds: 0)
+                try f.write(JSONEncoder().encode(receipt), receiptURL)
+            } else {
+                try f.write(Data("invalid receipt".utf8), receiptURL)
+            }
+            let sourcePreferences = f.home.appendingPathComponent("release.plist")
+            try f.write(Data("invalid production preferences".utf8), sourcePreferences)
+            XCTAssertThrowsError(try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: false, releaseIsRunning: true, preferenceSourceURL: sourcePreferences))
+            XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        }
+    }
+
+    func testReuseCannotBypassSharedProfileAdmission() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])
+        let policy = AppMetadataPathPolicy(locations: f.debug, roots: [f.debug.applicationSupportRoot])
+        try policy.acquireProfileAccess()
+        withExtendedLifetime(policy) {
+            XCTAssertThrowsError(try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: false, releaseIsRunning: true)) { error in
+                guard let failure = error as? DebugProfileAccessLease.Failure, case .busy = failure else { return XCTFail("Unexpected error: \(error)") }
+            }
+        }
+    }
+
+    func testCleanSlateDoesNotSpendTheProductionCaptureBudget() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        var elapsed: TimeInterval = 0
+        let budget = DebugStateSnapshot.CaptureBudget(seconds: 1, uptime: { elapsed })
+        elapsed = 2
+        let preparation = try DebugStateBootstrap.prepareForLaunch(locations: f.debug, cleanSlate: true, releaseIsRunning: true, captureBudget: budget)
+        guard case let .seeded(receipt) = preparation else { return XCTFail("Explicit clean launch must prepare an isolated empty profile") }
+        XCTAssertTrue(receipt.cleanSlate)
+        let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")), format: nil) as? [String: Any]
+        XCTAssertEqual(preferences?.count, 0)
+    }
+
+    func testSQLiteCaptureTimeoutReleasesLocksAndAllowsSubsequentBackup() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            var connection: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(source.path, &connection), SQLITE_OK)
+            let database = try XCTUnwrap(connection)
+            defer { XCTAssertEqual(sqlite3_close(database), SQLITE_OK) }
+            let sql = """
+            PRAGMA page_size=1024;
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE fixture(payload BLOB);
+            WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 600)
+            INSERT INTO fixture(payload) SELECT zeroblob(4096) FROM rows;
+            """
+            XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
+        }
+        let sourceBytes = try Data(contentsOf: source)
+        let sourceStamp = try DebugStateSnapshot.stamp(source)
+        XCTAssertGreaterThan(sourceBytes.count, 1024 * 512)
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior debug state".utf8), sentinel)
+        let destination = f.home.appendingPathComponent("captured.sqlite")
+        var uptime: TimeInterval = 0
+        let budget = DebugStateSnapshot.CaptureBudget(seconds: 5, uptime: {
+            defer { uptime += 1 }
+            return uptime
+        })
+        XCTAssertThrowsError(try DebugStateSnapshot.copyDatabase(from: source, to: destination, budget: budget)) { error in
+            guard let failure = error as? DebugStateSnapshot.Failure, case .captureTimedOut = failure else { return XCTFail("Expected capture timeout, received: \(error)") }
+        }
+        for url in [source, destination] {
+            var connection: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(url.path, &connection, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            let database = try XCTUnwrap(connection)
+            defer { XCTAssertEqual(sqlite3_close(database), SQLITE_OK) }
+            XCTAssertEqual(sqlite3_exec(database, "BEGIN EXCLUSIVE; ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        try DebugStateSnapshot.copyDatabase(from: source, to: destination)
+        var connection: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(destination.path, &connection, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        let database = try XCTUnwrap(connection)
+        defer { XCTAssertEqual(sqlite3_close(database), SQLITE_OK) }
+        var query: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database, "SELECT COUNT(*), MIN(LENGTH(payload)) FROM fixture", -1, &query, nil), SQLITE_OK)
+        let statement = try XCTUnwrap(query)
+        defer { XCTAssertEqual(sqlite3_finalize(statement), SQLITE_OK) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 600)
+        XCTAssertEqual(sqlite3_column_int(statement, 1), 4096)
+        XCTAssertEqual(try Data(contentsOf: source), sourceBytes)
+        XCTAssertEqual(try DebugStateSnapshot.stamp(source), sourceStamp)
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior debug state".utf8))
+    }
+}
+
 @MainActor
 final class DebugStorageRootAdmissionTests: XCTestCase {
     func testAppClientAdmitsSafeSelectionBeforeRuntimeCreateAndRejectsAliasesBeforeMove() async throws {
