@@ -232,8 +232,18 @@ Rebuildable session indexes, locks/PIDs/runtime claims, Git data, workspace fold
 history/recovery files remain at their original locations; an omitted unavailable
 workspace cannot be reconstructed from an absent source document.
 
-Source files and directory membership must remain stable across the capture, with
-three bounded attempts. Database snapshots use SQLite's backup API, never an
+The published snapshot is point-in-time: every captured source byte and captured
+directory membership must match its source during one verification pass taken
+before anything is staged. Publication writes only those verified captured bytes
+(SQLite backups are re-verified after copying), so production writes after that
+pass cannot tear the snapshot. A running release app keeps writing, so capture is
+bounded but convergent rather than requiring an idle release: up to ten attempts
+share a stamp-keyed cache of captured bytes and derived records, so only the first
+attempt reads and transforms the whole profile and each retry re-reads only what
+changed. A source removed mid-capture is a retryable change, not an unsafe alias.
+Finder metadata and atomic-write/lock temporaries in production trees are neither
+seeded nor treated as state changes. If production never settles, startup fails
+closed without staging or replacing anything. Database snapshots use SQLite's backup API, never an
 uncoordinated live database-file copy, source migration or checkpoint. The current
 rollback-journal continuity store is supported. WAL sources currently fail closed
 rather than risk a write to production SHM read marks; they are not silently
@@ -246,7 +256,7 @@ production grants/continuity are preserved separately in `ProductionContinuity`,
 not promoted into debug authority. Automatic wakes and active merge/compact claims
 are not revived. No provider mode is disabled.
 
-Preparation and validation happen in staging. A same-volume atomic directory swap
+Verified bytes are prepared in staging. A same-volume atomic directory swap
 publishes the complete profile; a failed preparation leaves prior debug and source
 bytes intact. Prior debug-only work and its preferences are recoverable under
 `RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery

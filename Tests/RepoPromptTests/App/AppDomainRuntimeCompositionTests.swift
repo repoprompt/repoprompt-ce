@@ -596,3 +596,170 @@ final class DebugStorageRootAdmissionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), sourceBytes)
     }
 }
+
+/// A running release app keeps writing while a debug launch captures it. Startup must
+/// converge on one verified point-in-time snapshot instead of demanding an idle release,
+/// and must still fail closed, never publishing torn state, when production never settles.
+extension DebugStateBootstrapTests {
+    private func liveProductionWorkspace(_ f: Fixture, sessions: Int) throws -> (directory: URL, sessions: [URL]) {
+        let id = UUID()
+        let directory = f.release.workspaceRoot.appendingPathComponent("Workspace-Live-" + id.uuidString)
+        try f.writeJSON([["id": id.uuidString, "name": "Live"]], f.release.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+        try f.writeJSON(["id": id.uuidString, "name": "Live"], directory.appendingPathComponent("workspace.json"))
+        let urls = try (0 ..< sessions).map { index -> URL in
+            let url = directory.appendingPathComponent("AgentSessions/AgentSession-" + UUID().uuidString + ".json")
+            try f.writeJSON(["items": [["text": "session \(index) turn 0"]]], url)
+            return url
+        }
+        return (directory, urls)
+    }
+
+    func testLiveTranscriptWritesBeyondTheOldRetryBudgetConvergeOnLatestVerifiedBytes() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 6)
+        let cache = DebugStateSnapshot.CaptureCache()
+        var derivationsAtCapture: [Int] = []
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], captureCache: cache, retryDelay: 0) { attempt in
+            derivationsAtCapture.append(cache.derivations)
+            // An active release agent saves its transcript after each of the first four captures.
+            if attempt < 4 { try f.writeJSON(["items": [["text": "turn \(attempt + 1)"]]], sessions[0]) }
+        }
+        XCTAssertEqual(derivationsAtCapture.count, 5)
+        let copy = f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent + "/AgentSessions/" + sessions[0].lastPathComponent)
+        XCTAssertEqual(try f.object(copy)["items"] as? [[String: String]], [["text": "turn 4"]])
+        XCTAssertEqual(try f.object(sessions[0])["items"] as? [[String: String]], [["text": "turn 4"]])
+        // Each retry re-derived only the rewritten transcript, not every record again.
+        XCTAssertEqual(zip(derivationsAtCapture.dropFirst(), derivationsAtCapture).map { $0 - $1 }, [1, 1, 1, 1])
+    }
+
+    func testWorkspaceDocumentChangedBetweenAttemptsIsReparsedNotServedFromCache() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 1)
+        let workspaceURL = directory.appendingPathComponent("workspace.json")
+        let id = try XCTUnwrap(f.object(workspaceURL)["id"] as? String)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try f.writeJSON(["id": id, "name": "Renamed", "isHiddenInMenus": true], workspaceURL) }
+        }
+        XCTAssertEqual(captures, 2)
+        let index = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: f.debug.workspaceRoot.appendingPathComponent("workspacesIndex.json"))) as? [[String: Any]])
+        XCTAssertEqual(index.count, 1)
+        XCTAssertEqual(index.first?["name"] as? String, "Renamed")
+        XCTAssertEqual(index.first?["isHiddenInMenus"] as? Bool, true)
+        let renamed = f.debug.workspaceRoot.appendingPathComponent("Workspace-Renamed-" + id)
+        XCTAssertEqual(try f.object(renamed.appendingPathComponent("workspace.json"))["name"] as? String, "Renamed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: renamed.appendingPathComponent("AgentSessions/" + sessions[0].lastPathComponent).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent).path))
+    }
+
+    func testChangedWorkingJournalIsReparsedWhileItsSavedDocumentStaysUnchanged() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, _) = try liveProductionWorkspace(f, sessions: 1)
+        let workspaceURL = directory.appendingPathComponent("workspace.json")
+        let id = try XCTUnwrap(f.object(workspaceURL)["id"] as? String)
+        let savedBytes = try Data(contentsOf: workspaceURL)
+        let runtime = f.release.applicationSupportRoot.appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: f.release.profileIdentifier))
+        let journal = runtime.appendingPathComponent("working-journals/" + id + ".json")
+        func writeJournal(_ name: String) throws {
+            let working = try JSONSerialization.data(withJSONObject: ["id": id, "name": name])
+            try f.writeJSON(["version": 1, "workspaceID": id, "fileURL": workspaceURL.absoluteString, "workingDocument": working.base64EncodedString()], journal)
+        }
+        try writeJournal("Draft")
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try writeJournal("Redrafted") }
+        }
+        XCTAssertEqual(captures, 2)
+        let copy = f.debug.workspaceRoot.appendingPathComponent("Workspace-Redrafted-" + id + "/workspace.json")
+        XCTAssertEqual(try f.object(copy)["name"] as? String, "Redrafted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.workspaceRoot.appendingPathComponent("Workspace-Draft-" + id).path))
+        XCTAssertEqual(try Data(contentsOf: workspaceURL), savedBytes)
+    }
+
+    func testOneSourceCapturedTwiceAcrossAChangeIsRejectedRatherThanPublishedAsTwoVersions() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        try f.write(Data("first".utf8), source)
+        var plan = DebugStateSnapshot.Plan()
+        try plan.add(source, as: "Settings/a.json")
+        try f.write(Data("second".utf8), source)
+        XCTAssertThrowsError(try plan.add(source, as: "Settings/b.json")) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testDebugOwnedRecoveryUnderTemporaryLookingNamesIsRetainedVerbatim() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let relative = "Workspaces/Workspace-Research.sb-tools-" + UUID().uuidString + "/AgentSessions/.self-compact-recovery/partial.tmp"
+        let bytes = Data("debug-owned recovery".utf8)
+        try f.write(bytes, f.debug.applicationSupportRoot.appendingPathComponent(relative))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0)
+        XCTAssertEqual(try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent(relative)), bytes)
+    }
+
+    func testProductionThatNeverSettlesFailsClosedWithoutStagingOrReplacingDebugState() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (_, sessions) = try liveProductionWorkspace(f, sessions: 1)
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("prior.txt")
+        try f.write(Data("prior".utf8), sentinel)
+        var captures = 0
+        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            try f.writeJSON(["items": [["text": "write \(attempt)"]]], sessions[0])
+        }) { error in
+            guard case DebugStateSnapshot.Failure.sourceChanged = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(captures, DebugStateBootstrap.captureAttempts)
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("prior".utf8))
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: f.recovery.path)) ?? []
+        XCTAssertTrue(leftovers.isEmpty, "Unverified attempts must not stage or archive anything: \(leftovers)")
+    }
+
+    func testFinderMetadataAndAtomicWriteTemporariesNeitherSeedNorInvalidateCapture() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, _) = try liveProductionWorkspace(f, sessions: 1)
+        let settings = f.release.applicationSupportRoot.appendingPathComponent("Settings")
+        try f.writeJSON(["value": "production"], settings.appendingPathComponent("globalSettings.json"))
+        let finderMetadata = [directory.appendingPathComponent(".DS_Store"), settings.appendingPathComponent(".DS_Store")]
+        for url in finderMetadata {
+            try f.write(Data("view".utf8), url)
+        }
+        try f.write(Data("abandoned".utf8), directory.appendingPathComponent(".dat.nosync0001.AbCdEf"))
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            for url in finderMetadata {
+                try f.write(Data("view \(attempt)".utf8), url)
+            }
+            try f.write(Data("in flight".utf8), directory.appendingPathComponent(".dat.nosync\(attempt).Tmp"))
+        }
+        XCTAssertEqual(captures, 1, "Non-state churn must not force a re-capture")
+        let names = try FileManager.default.contentsOfDirectory(atPath: f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent).path)
+        XCTAssertEqual(names.filter { $0 == ".DS_Store" || $0.hasPrefix(".dat.nosync") }, [])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.debug.applicationSupportRoot.appendingPathComponent("Settings").path), ["globalSettings.json"])
+    }
+
+    func testSourceDeletedDuringCaptureIsRetriedRatherThanReportedUnsafe() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let (directory, sessions) = try liveProductionWorkspace(f, sessions: 2)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { attempt in
+            captures += 1
+            if attempt == 0 { try FileManager.default.removeItem(at: sessions[1]) }
+        }
+        XCTAssertEqual(captures, 2)
+        let copies = f.debug.workspaceRoot.appendingPathComponent(directory.lastPathComponent + "/AgentSessions")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: copies.path), [sessions[0].lastPathComponent])
+    }
+}

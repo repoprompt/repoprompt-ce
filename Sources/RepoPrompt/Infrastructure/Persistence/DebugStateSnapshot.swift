@@ -16,50 +16,179 @@ struct DebugStateSnapshot {
     struct Entry {
         let source: URL
         let relativePath: String
+        /// Bytes captured under the source's observed stamp; nil only for SQLite
+        /// entries, which are copied by an online backup during publication.
         var replacement: Data?
         var database = false
     }
 
+    /// Bytes and derived records captured by earlier attempts of one bootstrap. Reuse
+    /// requires the source to still carry the exact stamp it was read under, so a retry
+    /// re-reads and re-derives only what production changed since the prior attempt.
+    final class CaptureCache {
+        /// Facts parsed from one workspace document, plus whether this binary decoded it.
+        struct WorkspaceRecord {
+            let name: String
+            let isSystemWorkspace: Bool
+            let isHiddenInMenus: Bool
+            let activeAgentSessionIDs: [String]
+            var decoded = false
+        }
+
+        private var capturedBytes: [String: (stamp: Stamp, data: Data)] = [:]
+        private var derivedRecords: [String: (stamp: Stamp, context: Int, data: Data)] = [:]
+        private var workspaceRecords: [String: (stamp: Stamp, record: WorkspaceRecord)] = [:]
+        private var contexts: [[String]: Int] = [:]
+        /// Derived records actually computed rather than reused.
+        private(set) var derivations = 0
+
+        func workspaceRecord(_ key: String, stamp: Stamp) -> WorkspaceRecord? {
+            workspaceRecords[key].flatMap { $0.stamp == stamp ? $0.record : nil }
+        }
+
+        func storeWorkspaceRecord(_ record: WorkspaceRecord, _ key: String, stamp: Stamp) {
+            workspaceRecords[key] = (stamp, record)
+        }
+
+        func bytes(_ url: URL, stamp: Stamp) -> Data? {
+            capturedBytes[url.path].flatMap { $0.stamp == stamp ? $0.data : nil }
+        }
+
+        func store(_ data: Data, _ url: URL, stamp: Stamp) {
+            capturedBytes[url.path] = (stamp, data)
+        }
+
+        func derived(kind: String, url: URL, stamp: Stamp, context: Int) -> Data? {
+            derivedRecords[kind + "\u{0}" + url.path].flatMap { $0.stamp == stamp && $0.context == context ? $0.data : nil }
+        }
+
+        func storeDerived(_ data: Data, kind: String, url: URL, stamp: Stamp, context: Int) {
+            derivations += 1
+            derivedRecords[kind + "\u{0}" + url.path] = (stamp, context, data)
+        }
+
+        /// A stable identifier for one transform input table (for example path mappings).
+        func context(_ signature: [String]) -> Int {
+            if let id = contexts[signature] { return id }
+            let id = contexts.count
+            contexts[signature] = id
+            return id
+        }
+    }
+
     struct Plan {
+        struct Listing {
+            let names: [String]
+            let ignoresTransientArtifacts: Bool
+        }
+
         var entries: [Entry] = []
         var generated: [String: Data] = [:]
         var observed: [URL: Stamp] = [:]
-        var directories: [URL: [String]] = [:]
+        var directories: [URL: Listing] = [:]
+        var cache = CaptureCache()
+        /// Ancestor chains proven during this capture pass.
+        var validatedDirectories = Set<String>()
 
         mutating func read(_ url: URL) throws -> Data {
-            let before = try DebugStateSnapshot.stamp(url)
-            let bytes = try Data(contentsOf: url)
-            guard try DebugStateSnapshot.stamp(url) == before else { throw Failure.sourceChanged }
-            observed[url] = before
-            return bytes
+            try capture(url, retain: true).data
         }
 
-        mutating func children(_ url: URL) throws -> [URL] {
-            try DebugStateSnapshot.requireDirectory(url)
-            let names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
-            directories[url] = names
+        mutating func observe(_ url: URL) throws -> Stamp {
+            try DebugStateSnapshot.observe(url, validated: &validatedDirectories)
+        }
+
+        /// One plan holds one version of each source. A source captured again under a
+        /// different stamp changed mid-capture; never let the later stamp bless both.
+        mutating func record(_ stamp: Stamp, for url: URL) throws {
+            if let prior = observed[url], prior != stamp { throw Failure.sourceChanged }
+            observed[url] = stamp
+        }
+
+        /// Stamp-bracketed read; unchanged bytes from an earlier attempt are reused.
+        mutating func capture(_ url: URL, retain: Bool) throws -> (stamp: Stamp, data: Data) {
+            let before = try observe(url)
+            if let data = cache.bytes(url, stamp: before) {
+                try record(before, for: url)
+                return (before, data)
+            }
+            let bytes: Data
+            do { bytes = try Data(contentsOf: url) } catch where DebugStateSnapshot.isMissing(url) { throw Failure.sourceChanged }
+            guard try observe(url) == before else { throw Failure.sourceChanged }
+            try record(before, for: url)
+            if retain { cache.store(bytes, url, stamp: before) }
+            return (before, bytes)
+        }
+
+        /// A derived record is reused only for the exact source stamp and transform context.
+        mutating func cachedDerivation(_ url: URL, kind: String, context: Int) throws -> Data? {
+            let stamp = try observe(url)
+            guard let data = cache.derived(kind: kind, url: url, stamp: stamp, context: context) else { return nil }
+            try record(stamp, for: url)
+            return data
+        }
+
+        /// Production listings omit Finder metadata and atomic-write/lock temporaries.
+        /// Verbatim retention of debug-owned trees passes `false` to keep every name.
+        mutating func children(_ url: URL, ignoringTransientArtifacts: Bool = true) throws -> [URL] {
+            let names = try DebugStateSnapshot.listing(url, ignoringTransientArtifacts: ignoringTransientArtifacts, validated: &validatedDirectories)
+            try record(Listing(names: names, ignoresTransientArtifacts: ignoringTransientArtifacts), for: url)
             return names.map { url.appendingPathComponent($0) }
         }
 
+        /// Same one-version rule for membership; the verbatim (unfiltered) listing is the
+        /// stricter check when one directory is enumerated both ways.
+        mutating func record(_ listing: Listing, for url: URL) throws {
+            guard let prior = directories[url] else {
+                directories[url] = listing
+                return
+            }
+            if prior.ignoresTransientArtifacts == listing.ignoresTransientArtifacts {
+                guard prior.names == listing.names else { throw Failure.sourceChanged }
+            } else if !listing.ignoresTransientArtifacts {
+                directories[url] = listing
+            }
+        }
+
         mutating func add(_ source: URL, as relativePath: String, replacement: Data? = nil, database: Bool = false) throws {
-            if observed[source] == nil { observed[source] = try DebugStateSnapshot.stamp(source) }
-            entries.append(Entry(source: source, relativePath: relativePath, replacement: replacement, database: database))
+            // Capture plain bytes now: publication writes only verified captured bytes and
+            // never re-reads a production source after the consistency check.
+            var bytes = replacement
+            if bytes == nil, !database { bytes = try read(source) }
+            if observed[source] == nil { try record(observe(source), for: source) }
+            entries.append(Entry(source: source, relativePath: relativePath, replacement: bytes, database: database))
             if database {
                 for suffix in ["-wal", "-shm", "-journal"] {
                     let companion = URL(fileURLWithPath: source.path + suffix)
                     if FileManager.default.fileExists(atPath: companion.path) {
-                        observed[companion] = try DebugStateSnapshot.stamp(companion)
+                        try record(observe(companion), for: companion)
                     }
                 }
             }
         }
 
+        /// The snapshot instant: every captured byte and listing still matches its source.
         func verify() throws {
+            var validated = Set<String>()
             for (url, expected) in observed {
-                guard try DebugStateSnapshot.stamp(url) == expected else { throw Failure.sourceChanged }
+                guard try DebugStateSnapshot.observe(url, validated: &validated) == expected else { throw Failure.sourceChanged }
             }
             for (url, expected) in directories {
-                guard try FileManager.default.contentsOfDirectory(atPath: url.path).sorted() == expected else { throw Failure.sourceChanged }
+                let names = try DebugStateSnapshot.listing(url, ignoringTransientArtifacts: expected.ignoresTransientArtifacts, validated: &validated)
+                guard names == expected.names else { throw Failure.sourceChanged }
+            }
+        }
+
+        /// SQLite backups are the only publication-time source reads; prove each
+        /// database and its observed sidecars stayed at the verified snapshot.
+        func verifyDatabaseReads() throws {
+            var validated = Set<String>()
+            for entry in entries where entry.database {
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    let url = suffix.isEmpty ? entry.source : URL(fileURLWithPath: entry.source.path + suffix)
+                    guard let expected = observed[url] else { continue }
+                    guard try DebugStateSnapshot.observe(url, validated: &validated) == expected else { throw Failure.sourceChanged }
+                }
             }
         }
     }
@@ -98,19 +227,35 @@ struct DebugStateSnapshot {
     private let fm = FileManager.default
 
     static func requireDirectory(_ url: URL) throws {
+        var validated = Set<String>()
+        try requireDirectory(url, validated: &validated)
+    }
+
+    /// `validated` lives for one capture or verification pass: the directory itself is
+    /// always re-checked, but an ancestor chain already proven free of app-owned
+    /// symlink components is not walked again for every sibling file.
+    static func requireDirectory(_ url: URL, validated: inout Set<String>) throws {
         var info = stat()
         guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { throw Failure.unsafeFile }
         // Resolve OS aliases, not app-owned symlink components.
         var parent = url.standardizedFileURL
-        while parent.path != "/" {
+        var proven: [String] = []
+        while parent.path != "/", !validated.contains(parent.path) {
             guard lstat(parent.path, &info) == 0, info.st_mode & S_IFMT != S_IFLNK
                 || ["/tmp", "/var"].contains(parent.path) else { throw Failure.unsafeFile }
+            proven.append(parent.path)
             parent.deleteLastPathComponent()
         }
+        validated.formUnion(proven)
     }
 
     static func stamp(_ url: URL) throws -> Stamp {
-        try requireDirectory(url.deletingLastPathComponent())
+        var validated = Set<String>()
+        return try stamp(url, validated: &validated)
+    }
+
+    static func stamp(_ url: URL, validated: inout Set<String>) throws -> Stamp {
+        try requireDirectory(url.deletingLastPathComponent(), validated: &validated)
         var info = stat()
         guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw Failure.unsafeFile }
         return Stamp(
@@ -119,6 +264,46 @@ struct DebugStateSnapshot {
             seconds: info.st_mtimespec.tv_sec,
             nanoseconds: info.st_mtimespec.tv_nsec
         )
+    }
+
+    /// A live production app deletes and renames files while it runs. A source that
+    /// disappears after enumeration is a concurrent change to retry, not an alias.
+    static func observe(_ url: URL, validated: inout Set<String>) throws -> Stamp {
+        do { return try stamp(url, validated: &validated) } catch Failure.unsafeFile where isMissing(url) { throw Failure.sourceChanged }
+    }
+
+    static func isMissing(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) != 0 && errno == ENOENT
+    }
+
+    enum SourceKind { case directory, file }
+
+    static func kind(_ url: URL) throws -> SourceKind {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { throw errno == ENOENT ? Failure.sourceChanged : Failure.unsafeFile }
+        switch info.st_mode & S_IFMT {
+        case S_IFDIR: return .directory
+        case S_IFREG: return .file
+        default: throw Failure.unsafeFile
+        }
+    }
+
+    /// Finder view metadata and atomic-write/lock temporaries are never application
+    /// state; their churn must not invalidate a capture of a live production profile.
+    static func isTransientArtifact(_ name: String) -> Bool {
+        name == ".DS_Store" || name.hasPrefix(".dat.nosync") || name.contains(".sb-")
+            || name.hasSuffix(".tmp") || name.hasSuffix(".lock")
+    }
+
+    static func listing(_ url: URL, ignoringTransientArtifacts: Bool, validated: inout Set<String>) throws -> [String] {
+        do {
+            try requireDirectory(url, validated: &validated)
+            let names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
+            return ignoringTransientArtifacts ? names.filter { !isTransientArtifact($0) } : names
+        } catch where isMissing(url) {
+            throw Failure.sourceChanged
+        }
     }
 
     static func physicalPath(_ url: URL) throws -> String {
@@ -172,6 +357,9 @@ struct DebugStateSnapshot {
         try locations.validateWritableRoot(recovery)
         if fm.fileExists(atPath: recovery.path) { try Self.requireDirectory(recovery) }
         else { try fm.createDirectory(at: recovery, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
+        // Prove consistency before staging anything. Publication below writes only these
+        // verified captured bytes, so later production writes cannot tear the snapshot.
+        try plan.verify()
         // Temporary staging/recovery shares the destination's volume. Never copy
         // or follow an existing debug root while protecting it from replacement.
         let stage = recovery.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -195,7 +383,7 @@ struct DebugStateSnapshot {
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             if entry.database { try Self.copyDatabase(from: entry.source, to: target) }
             else {
-                let data = try entry.replacement ?? Data(contentsOf: entry.source)
+                guard let data = entry.replacement else { throw Failure.unsafeFile }
                 try data.write(to: target, options: .withoutOverwriting)
             }
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
@@ -209,7 +397,7 @@ struct DebugStateSnapshot {
             bytes += data.count
         }
         try preferences.write(to: stage.appendingPathComponent("seedPreferences.plist"), options: .withoutOverwriting)
-        try plan.verify()
+        try plan.verifyDatabaseReads()
         let receipt = Receipt(
             version: 1,
             profile: locations.preferencesDomain,
