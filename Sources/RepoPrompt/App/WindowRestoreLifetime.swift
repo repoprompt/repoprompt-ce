@@ -8,7 +8,7 @@ import Foundation
 ///   (explicit intent or close), or by displacement through a newer acceptance.
 /// - **Protection** — the entry session capture preserves instead of a nil/System fallback. It is
 ///   armed at acceptance and released only by a real selection *published after* that acceptance,
-///   by a newer acceptance, or by its own dispatch resolving to a System workspace. Retiring
+///   by a newer acceptance, or by its own dispatch successfully selecting a System workspace. Retiring
 ///   execution never releases it: explicit intent wins over dispatch, not over the preserved
 ///   session identity.
 ///
@@ -73,10 +73,9 @@ struct WindowRestoreLifetime {
         acceptanceSequence &+= 1
         let displaced = pending?.completion
         pending = Dispatch(entry: entry, completion: completion, acceptanceSequence: acceptanceSequence)
-        // A System-intended entry needs no protection: its fallback and intended state coincide.
-        protection = entry.isSystemWorkspace
-            ? nil
-            : Protection(entry: entry, acceptanceSequence: acceptanceSequence)
+        // Even a System entry can name an unavailable UUID. Protect it until the exact
+        // identity is selected, rather than assuming the provisional Default is equivalent.
+        protection = Protection(entry: entry, acceptanceSequence: acceptanceSequence)
         return displaced
     }
 
@@ -102,7 +101,7 @@ struct WindowRestoreLifetime {
         self.protection = nil
     }
 
-    /// The dispatched acceptance resolved to a System workspace, so there is nothing to protect.
+    /// The dispatched acceptance successfully selected its System workspace.
     /// Never releases a newer acceptance's protection.
     mutating func releaseProtection(forDispatchedAcceptance sequence: UInt64) {
         guard protection?.acceptanceSequence == sequence else { return }
