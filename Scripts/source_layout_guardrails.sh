@@ -827,6 +827,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
+  "docs/plans/agent-mode-reprompter-2026-10-20.md"
   "docs/plans/openai-decisions-contract-2026-10-07.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"

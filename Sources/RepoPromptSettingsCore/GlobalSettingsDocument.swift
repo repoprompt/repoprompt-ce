@@ -96,7 +96,8 @@ package struct GlobalSettingsDocument: Codable {
     package static let oracleReconciliationGuidanceSchemaVersion = 11
     package static let autoEffortServiceSchemaVersion = 12
     package static let routingProfileUpdatePreferenceSchemaVersion = 12
-    package static let currentSchemaVersion = 12
+    package static let agentRepromptGuidanceSchemaVersion = 13
+    package static let currentSchemaVersion = 13
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -181,6 +182,15 @@ package struct GlobalSettingsDocument: Codable {
         }
         if hasGlobalGuidance || hasWorkspaceGuidance {
             requiredVersion = max(requiredVersion, Self.oracleReconciliationGuidanceSchemaVersion)
+        }
+        let hasGlobalReprompt = AgentRepromptGuidance.normalizedOverride(scalarPreferences?.modelSelection?.agentRepromptGuidance) != nil
+            || scalarPreferences?.modelSelection?.agentRepromptContextPolicy != nil
+        let hasWorkspaceReprompt = agentModelsSettings.values.contains {
+            AgentRepromptGuidance.normalizedOverride($0.profile?.agentRepromptGuidance) != nil
+                || $0.profile?.agentRepromptContextPolicy != nil
+        }
+        if hasGlobalReprompt || hasWorkspaceReprompt {
+            requiredVersion = max(requiredVersion, Self.agentRepromptGuidanceSchemaVersion)
         }
         let hasGlobalParameterPins = globalDefaults.mcpAgentRoleModelParameters?.isEmpty == false
             || globalDefaults.contextBuilderModelParametersByAgent?.isEmpty == false
@@ -308,6 +318,8 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
     package var additionalOracleModelRaws: [String]
     /// Nil uses the delivery contract's built-in guidance, not a per-field global inheritance.
     package var oracleReconciliationGuidance: String?
+    package var agentRepromptGuidance: String?
+    package var agentRepromptContextPolicy: AgentRepromptContextPolicy?
     package var preferredComposeModelRaw: String?
     package var syncChatModelWithOracle: Bool
     package var contextBuilderAgentRaw: String?
@@ -326,6 +338,8 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
         planningModelRaw: String? = nil,
         additionalOracleModelRaws: [String] = [],
         oracleReconciliationGuidance: String? = nil,
+        agentRepromptGuidance: String? = nil,
+        agentRepromptContextPolicy: AgentRepromptContextPolicy? = nil,
         preferredComposeModelRaw: String? = nil,
         syncChatModelWithOracle: Bool = false,
         contextBuilderAgentRaw: String? = nil,
@@ -338,6 +352,8 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
         self.additionalOracleModelRaws = sanitizedAdditionalOracleModelRaws(additionalOracleModelRaws)
         self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
+        self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
+        self.agentRepromptContextPolicy = agentRepromptContextPolicy
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
@@ -360,6 +376,8 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
         case planningModelRaw
         case additionalOracleModelRaws
         case oracleReconciliationGuidance
+        case agentRepromptGuidance
+        case agentRepromptContextPolicy
         case preferredComposeModelRaw
         case syncChatModelWithOracle
         case contextBuilderAgentRaw
@@ -383,6 +401,8 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
         oracleReconciliationGuidance = try OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
             container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
         )
+        agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
+        agentRepromptContextPolicy = try container.decodeIfPresent(AgentRepromptContextPolicy.self, forKey: .agentRepromptContextPolicy)
         preferredComposeModelRaw = try Self.normalizedChatModelRaw(
             container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw)
         )
@@ -905,6 +925,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var planningModel: String?
         package var additionalOracleModels: [String]?
         package var oracleReconciliationGuidance: String?
+        package var agentRepromptGuidance: String?
+        package var agentRepromptContextPolicy: AgentRepromptContextPolicy?
         package var syncChatModelWithOracle: Bool?
 
         package init(
@@ -912,12 +934,16 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             planningModel: String? = nil,
             additionalOracleModels: [String]? = nil,
             oracleReconciliationGuidance: String? = nil,
+            agentRepromptGuidance: String? = nil,
+            agentRepromptContextPolicy: AgentRepromptContextPolicy? = nil,
             syncChatModelWithOracle: Bool? = nil
         ) {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
             self.additionalOracleModels = additionalOracleModels
             self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
+            self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
+            self.agentRepromptContextPolicy = agentRepromptContextPolicy
             self.syncChatModelWithOracle = syncChatModelWithOracle
         }
 
@@ -926,6 +952,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             case planningModel
             case additionalOracleModels
             case oracleReconciliationGuidance
+            case agentRepromptGuidance
+            case agentRepromptContextPolicy
             case syncChatModelWithOracle
         }
 
@@ -936,6 +964,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             oracleReconciliationGuidance = try OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
                 container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
             )
+            agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
+            agentRepromptContextPolicy = try container.decodeIfPresent(AgentRepromptContextPolicy.self, forKey: .agentRepromptContextPolicy)
             if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {
                 additionalOracleModels = try strictAdditionalOracleModelRaws(
                     values,
