@@ -523,11 +523,23 @@ Two windows preparing independently; new window doesn't re-show disclosure; new-
 
 ### Step-6 validation
 
+- Step-6 checkpoint: `57898aef9`; staged secret scan and repository guardrails passed. Final unfiltered `make dev-test` is ticket `4c987b21-a257-444f-8b60-aa2bf1ce22a3`; final product build is queued behind it as `c81f574d-f227-4983-b161-f7dd034d5388`. Final committed-source `make dev-lint` ticket `f3afbf58-c225-4f93-bf15-f8ed3eda8f12` completed successfully.
+
 - `make dev-test FILTER=AgentReprompt`: ticket `288f9d32-b415-4a11-b9bd-9233af452fa8` passed all nine requested suites: 34 app tests plus 3 settings-core tests, zero failures. Earlier presentation assertion incorrectly equated “no preselection” with an empty draft dictionary; the shared wizard creates empty records per question, and the corrected assertion checks their actual option/custom/skip values.
 - `make dev-lint`: ticket `3d9d98c9-8c1a-4f3b-9716-e0fba69581be` passed pinned SwiftFormat and strict SwiftLint (0/1845 files require formatting). The final two small recovery/test edits were subsequently formatted with the same pinned formatter; full final checks follow.
 - Added eager source-session observation and direct draft-write invalidation (draft text itself is not published). Stop preserves reviewed text without manufacturing an idle run cancellation. Immediate submission and asynchronous manual-dispatch rejection preserve the original draft and recover the approved brief separately. Explicit brief replacement acknowledges the existing restoration ledger so old fragments cannot reappear on the next editor write.
 - Command-provenance correction: a user may edit a brief to begin with `/`; it remains data. Original text owns command eligibility, and Auto Effort explicitly permits slash-like approved replacements. Normal non-Re-prompt command handling remains unchanged.
 - Still unverified/incomplete polish: per-consult completion status is consolidated after clarification, not updated independently while a question is open; native-sheet interaction with underlying model controls needs manual verification. Queued runtime-failure recovery beyond the manual submission rollback path is not yet separately covered. These do not have a completed acceptance claim.
+
+### Final verification results
+
+- **PASS** `make dev-test FILTER=AgentReprompt`: 37 tests across all nine named suites (ticket `288f9d32-b415-4a11-b9bd-9233af452fa8`).
+- **PASS** `make dev-lint`: pinned SwiftFormat 0.61.1 plus strict SwiftLint (final ticket `f3afbf58-c225-4f93-bf15-f8ed3eda8f12`).
+- **PASS** `make dev-swift-build PRODUCT=RepoPrompt`: final ticket `c81f574d-f227-4983-b161-f7dd034d5388`, exit 0. This supersedes the earlier dependency-resolution failure; `Package.resolved` is unchanged.
+- **NOT GREEN / INCOMPLETE** `make dev-test`: ticket `4c987b21-a257-444f-8b60-aa2bf1ce22a3` reached its 3,600-second timeout after 5,455 passing cases. It recorded assertion failures in three existing test methods, then timed out during `WorkspaceRootReconciliationTests.testBlockedDirectoryProbeDoesNotBlockWindowCloseOrSwitch`. A full-suite pass has not been established.
+- All three recorded failing methods **passed isolated reruns**, without source/test changes: `AgentSessionLinkRuntimeBridgeTests/testBusyTargetHoldsOneEntryAndDeliversOnTheNextReadinessPublication` (ticket `dfc1e450-92e1-4a4c-a0a7-388c6df481da`, 1 test); `AgentTranscriptPaneSnapshotPublicationTests/testTargetReplacementDropsOutgoingRowsFromPublishedSnapshot` and `AgentTranscriptRestorationLifecycleTests/testCancelledCurrentLoadWithLocalContentPresentsTranscriptWithoutLatchOrProof` (ticket `5981f0f3-c363-4a89-bad4-d609fdd32ed3`, 2 tests). Timing/order sensitivity is plausible, but no baseline attribution or unrelated repair is claimed.
+- Checkpoint commits were created after mandatory staged-index secret scans and repository preflight: step 2 `ae32ef1aa`, step 3b `ced6330b0`, step 5b `520e38a39`, step 6 `57898aef9`.
+- Main checkout untouched; no other worktrees, merges, pushes, visible app launches/relaunches, or live-provider requests. Live smoke/manual checks, the actual-provider-family capture/child-termination matrix, independent Oracle review, and the polish/coverage gaps listed above remain open. This branch does **not** claim full release acceptance yet.
 
 ### Changed-file inventory (relative to d9d0f21)
 
