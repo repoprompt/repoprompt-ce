@@ -349,8 +349,13 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             [context.repo.rootURL.standardizedFileURL.path, physicalTargetPath],
             rootMappings: mutationRootMappings
         )
-        try await MCPDomainMutationCommitContext.willCommit()
-        let createResult = try await vcsService.createGitWorktreeWithResult(request: plan.createRequest, at: context.repo.rootURL)
+        // Commit at the backend's final fence: deterministic Git refusals (existing branch,
+        // unresolvable base, occupied destination) settle before it as not-applied.
+        let createResult = try await vcsService.createGitWorktreeWithResult(
+            request: plan.createRequest,
+            at: context.repo.rootURL,
+            beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
+        )
         let created = createResult.descriptor
         let identity = try persistOrResolveVisualIdentity(
             for: created,
@@ -952,7 +957,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         if let explicitLogicalRoot = context.explicitLogicalRoot {
             return explicitLogicalRoot
         }
-        return try await logicalRoot(for: context.repo, visibleRoots: context.visibleRoots)
+        return try await logicalRoot(for: context.repo, context: context)
     }
 
     private func logicalRoot(
@@ -960,26 +965,40 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         context: RepositoryContext
     ) async throws -> WorkspaceRootRef {
         if let repo = context.allRepos.first(where: { $0.repoKey == worktree.repository.repoKey }) {
-            return try await logicalRoot(for: repo, visibleRoots: context.visibleRoots)
+            return try await logicalRoot(for: repo, context: context)
         }
         return try await logicalRoot(for: context)
     }
 
     private func logicalRoot(
         for repo: GitRepoDescriptor,
-        visibleRoots: [WorkspaceRootRef]
+        context: RepositoryContext
     ) async throws -> WorkspaceRootRef {
-        for root in visibleRoots {
+        for root in context.visibleRoots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)),
                GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
             {
-                return root
+                return Self.logicalRootRef(projecting: root, lookupContext: context.lookupContext)
             }
         }
-        if let exact = visibleRoots.first(where: { standardizedPath($0.standardizedFullPath) == standardizedPath(repo.rootPath) }) {
-            return exact
+        if let exact = context.visibleRoots.first(where: {
+            standardizedPath($0.standardizedFullPath) == standardizedPath(repo.rootPath)
+        }) {
+            return Self.logicalRootRef(projecting: exact, lookupContext: context.lookupContext)
         }
         throw MCPError.invalidParams("Resolved repository is not attached to a visible workspace root.")
+    }
+
+    /// Under a session binding projection the lookup roots are the bound physical worktrees. The
+    /// logical root (used for authorization scope and binding identity) is the binding's own logical
+    /// root, exactly as `domainMutationPhysicalRootMappings` maps it; never the physical spelling.
+    private static func logicalRootRef(
+        projecting lookupRoot: WorkspaceRootRef,
+        lookupContext: WorkspaceLookupContext
+    ) -> WorkspaceRootRef {
+        lookupContext.bindingProjection?.boundRootsForMetadata.first {
+            $0.physicalRoot.standardizedFullPath == lookupRoot.standardizedFullPath
+        }?.logicalRoot ?? lookupRoot
     }
 
     private func admitLogicalMutationRoots(_ rawRoots: [String]) async throws {

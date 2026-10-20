@@ -636,6 +636,90 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        func testCreateRefusesExistingBranchAsNotAppliedAndFreshBranchCommitsAtBackendFence() async throws {
+            try await withProvider { fixture in
+                let base = try fixture.git.runGit(["rev-parse", "HEAD"], at: fixture.logical)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                _ = try fixture.git.runGit(["branch", "taken", base], at: fixture.logical)
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let registrationsBefore = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.logical)
+                let settlements = OSAllocatedUnfairLock<[DomainProtectedMutationSettlement]>(initialState: [])
+                do {
+                    _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                        settlements.withLock { $0.append(settlement) }
+                    }) {
+                        try await fixture.call([
+                            "op": .string("create"), "branch": .string("taken"), "base_ref": .string(base)
+                        ], includeWorktree: false)
+                    }
+                    XCTFail("Creating an existing branch must be refused")
+                } catch {
+                    XCTAssertNil(error as? DomainProtectedMutationError, "Refusal must not be indeterminate: \(error)")
+                    XCTAssertTrue(
+                        error.localizedDescription.contains("a branch named 'taken' already exists"),
+                        error.localizedDescription
+                    )
+                }
+                XCTAssertEqual(settlements.withLock { $0.last?.state }, .notApplied)
+                XCTAssertEqual(
+                    try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.logical),
+                    registrationsBefore
+                )
+
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("fresh"), "base_ref": .string(base)
+                ], includeWorktree: false)
+                let createdPath = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue?["path"]?.stringValue)
+                XCTAssertEqual(
+                    try fixture.git.runGit(["rev-parse", "HEAD"], at: URL(fileURLWithPath: createdPath))
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                    base
+                )
+                let journal = try await fixture.driver.fixture.runtime.mutationJournal.snapshot()
+                XCTAssertEqual(
+                    journal.recordSnapshots.map(\.status).sorted { $0.rawValue < $1.rawValue },
+                    [.applied, .failedBeforeCommit]
+                )
+            }
+        }
+
+        func testRelocatedSessionDefaultSelectorCreateIsCoveredByLogicalRootGrantOnly() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let bound = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                // A live run's grant covers the workspace's logical roots only, never the physical
+                // worktree its session is relocated to; omitting repo_root uses the bound root.
+                let logicalOnly: Set<String> = [fixture.logical.resolvingSymlinksInPath().path]
+                let reply = try await fixture.call(
+                    ["op": .string("create"), "branch": .string("relocated-fresh")],
+                    includeWorktree: false,
+                    includeRepoRoot: false,
+                    projectSession: true,
+                    authorizedCanonicalRoots: logicalOnly
+                )
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue?["path"]?.stringValue)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: created))
+                XCTAssertEqual(fixture.session.worktreeBindings, [bound])
+
+                // Unbinding by the default selector resolves the same logical root identity.
+                _ = try await fixture.call(
+                    ["op": .string("unbind")],
+                    includeWorktree: false,
+                    includeRepoRoot: false,
+                    projectSession: true,
+                    authorizedCanonicalRoots: logicalOnly
+                )
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+            }
+        }
+
         // MARK: - List paging through the provider boundary (#1091)
 
         func testListPagesNonPrunableWorktreesThroughProvider() async throws {
@@ -723,11 +807,13 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             func call(
                 _ extra: [String: Value],
                 includeWorktree: Bool = true,
+                includeRepoRoot: Bool = true,
                 projectSession: Bool = false,
-                runPurpose: MCPRunPurpose? = nil
+                runPurpose: MCPRunPurpose? = nil,
+                authorizedCanonicalRoots: Set<String>? = nil
             ) async throws -> Value {
                 var args = extra
-                args["repo_root"] = .string(logical.path)
+                if includeRepoRoot { args["repo_root"] = .string(logical.path) }
                 args["session_id"] = .string(sessionID.uuidString)
                 if includeWorktree { args["worktree"] = .string(physical.path) }
                 let metadata = MCPRequestMetadata(
@@ -742,7 +828,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     principal: security.principal,
                     connectionID: security.connectionID, connectionGeneration: security.connectionGeneration,
                     invocationID: UUID(), runtimeID: security.runtimeID, runtimeGeneration: security.runtimeGeneration,
-                    authorizedCanonicalRoots: security.authorizedCanonicalRoots,
+                    authorizedCanonicalRoots: authorizedCanonicalRoots ?? security.authorizedCanonicalRoots,
                     hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
                 )
                 return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {

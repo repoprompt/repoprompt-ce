@@ -843,6 +843,9 @@ actor GitService {
                         throw error
                     }
                 }
+                // Deterministic Git refusals settle here, before any creation side effect and
+                // before the caller's commit fence, so a protected caller can report not-applied.
+                try await validateWorktreeCreatePreconditions(mutationRequest, at: repoURL)
                 var parentEvidence: (
                     lease: GitWorkspaceAuthorityLease,
                     snapshot: WorkspaceRootReusableSnapshot,
@@ -2129,6 +2132,61 @@ actor GitService {
                 message: "worktree checkout fallback left \(destinationPath) unclean after tracked clone failure (\(reason)): \(statusSummary)\(statusError)"
             )
         }
+    }
+
+    /// Refuses requests that `git worktree add` would deterministically reject. Runs under the
+    /// repository's worktree mutation lock and before any creation side effect, so a refusal here
+    /// proves this request created nothing. Races with Git processes outside RepoPrompt still
+    /// surface from `git worktree add` itself, after the commit fence.
+    private func validateWorktreeCreatePreconditions(
+        _ request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : $0 }
+        if let branch {
+            // `-b` never overwrites an existing branch, with or without `--force`.
+            let (_, _, exitCode) = try await runGit(
+                ["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"],
+                at: repoURL
+            )
+            if exitCode == 0 {
+                throw GitError(message: Self.worktreeCreateRefusal(
+                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out"
+                ))
+            }
+        }
+        // Without `-b`/`--detach`, Git may DWIM a remote-tracking branch name; leave that to Git.
+        if let baseRef = request.baseRef, !baseRef.isEmpty, branch != nil || request.detach {
+            // Like `git worktree add`, a lone "-" names the previously checked-out ref.
+            let resolvableRef = baseRef == "-" ? "@{-1}" : baseRef
+            let resolves: Bool
+            if resolvableRef.hasPrefix("-") {
+                resolves = false
+            } else {
+                let (_, _, exitCode) = try await runGit(
+                    ["rev-parse", "--verify", "--quiet", "\(resolvableRef)^{commit}"],
+                    at: repoURL
+                )
+                resolves = exitCode == 0
+            }
+            guard resolves else {
+                throw GitError(message: Self.worktreeCreateRefusal("base ref '\(baseRef)' does not resolve to a commit"))
+            }
+        }
+        // Git accepts an existing empty directory; anything else at the destination is refused.
+        let destinationPath = request.path.standardizedFileURL.path
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: destinationPath) {
+            let isDirectory = (attributes[.type] as? FileAttributeType) == .typeDirectory
+            let isEmptyDirectory = isDirectory
+                && ((try? FileManager.default.contentsOfDirectory(atPath: destinationPath).isEmpty) ?? false)
+            guard isEmptyDirectory else {
+                throw GitError(message: Self.worktreeCreateRefusal("destination path is occupied: \(destinationPath)"))
+            }
+        }
+    }
+
+    private static func worktreeCreateRefusal(_ detail: String) -> String {
+        "git worktree add refused before creation: \(detail). Nothing was created."
     }
 
     private static func canonicalizedAppManagedRequestAtMutationBoundary(
