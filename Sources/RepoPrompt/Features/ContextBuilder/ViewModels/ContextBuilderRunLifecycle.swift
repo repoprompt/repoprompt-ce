@@ -6,7 +6,9 @@ enum ContextBuilderRunOrigin: Equatable {
     case mcp(controlToken: UUID)
 
     var isMCP: Bool {
-        if case .mcp = self { return true }
+        if case .mcp = self {
+            return true
+        }
         return false
     }
 }
@@ -75,7 +77,9 @@ enum ContextBuilderResponseDeliveryDrainResolver {
         isAuthoritativeDetached: @MainActor () -> Bool,
         awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
     ) async -> ContextBuilderResponseDeliveryDrainOutcome {
-        if !initiallyDetached, await awaitDrain() { return .drained }
+        if !initiallyDetached, await awaitDrain() {
+            return .drained
+        }
 
         let publication = await awaitTeardownPublication()
         guard publication.completedDiscoveryCanCommit,
@@ -168,6 +172,8 @@ struct ContextBuilderRunBehavior: Equatable {
     let questionTimeoutSeconds: TimeInterval
     let allowClarifyingQuestions: Bool
     let automaticFollowUp: ContextBuilderFollowUpType?
+    /// Re-prompt discovery must not apply tool-authored prompts or the empty-prompt fallback.
+    var preservesPromptExactly: Bool = false
 
     static func ui(
         settings: ContextBuilderBehaviorSettings,
@@ -219,6 +225,8 @@ struct ContextBuilderMCPRunConfiguration {
     let responseType: String?
     let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
     let isSystemWorkspace: Bool
+    /// Called synchronously at the canonical selection write, before UI projection awaits.
+    var selectionCommitObserver: ((StoredSelection) -> Void)?
 
     var effectiveTokenBudget: Int {
         runBehavior.tokenBudget
@@ -469,7 +477,9 @@ final class ContextBuilderRunRecord {
     }
 
     func awaitTeardownSettlement() async {
-        if teardownFinishedAt != nil { return }
+        if teardownFinishedAt != nil {
+            return
+        }
         await withCheckedContinuation { continuation in
             if teardownFinishedAt != nil {
                 continuation.resume()

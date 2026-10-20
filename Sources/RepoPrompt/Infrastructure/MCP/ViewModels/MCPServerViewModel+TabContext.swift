@@ -127,7 +127,9 @@ extension MCPServerViewModel {
             timeoutSeconds: TimeInterval
         ) async -> ContextBuilderTeardownPublicationOutcome {
             let key = Key(runID: runID, connectionID: connectionID)
-            if let outcome = retainedOutcomes[key] { return outcome }
+            if let outcome = retainedOutcomes[key] {
+                return outcome
+            }
 
             let waiterID = UUID()
             return await withTaskCancellationHandler {
@@ -580,7 +582,9 @@ extension MCPServerViewModel {
 
     @MainActor
     private func beginMirroringForConnection(_ connectionID: UUID, context: MCPTabContextSnapshot) {
-        if tabContextCancellablesByConnectionID[connectionID] != nil { return }
+        if tabContextCancellablesByConnectionID[connectionID] != nil {
+            return
+        }
 
         guard let manager = workspaceManager else {
             tabContextLog("beginMirroring skipped - no workspace manager connectionID=\(connectionID)")
@@ -969,7 +973,9 @@ extension MCPServerViewModel {
         flushActiveSelection: Bool
     ) -> MCPTabContextSnapshot {
         let resolvedWorkspaceID: UUID? = {
-            if let requestedWorkspaceID { return requestedWorkspaceID }
+            if let requestedWorkspaceID {
+                return requestedWorkspaceID
+            }
             return workspaceManager?.workspaces.first(where: { workspace in
                 workspace.composeTabs.contains(where: { $0.id == composeSnapshot.id })
             })?.id ?? workspaceManager?.activeWorkspace?.id
@@ -3339,13 +3345,6 @@ extension MCPServerViewModel {
             "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
     }
 
-    static func hint(_ hint: MCPTabContextHint, matches context: MCPTabContextSnapshot) -> Bool {
-        guard hint.tabID == context.tabID else { return false }
-        if let workspaceID = hint.workspaceID, context.workspaceID != workspaceID { return false }
-        if let windowID = hint.windowID, context.windowID != windowID { return false }
-        return true
-    }
-
     @MainActor
     private func resolveRunHandoverIfPossible(
         connectionID: UUID,
@@ -3383,7 +3382,9 @@ extension MCPServerViewModel {
         tabContextByConnectionID[connectionID] = rebound
         presentationWindowByConnection[connectionID] = rebound.windowID
         let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
-        if let clientName { recordLastContext(clientName: clientName, context: rebound) }
+        if let clientName {
+            recordLastContext(clientName: clientName, context: rebound)
+        }
         beginMirroringForConnection(connectionID, context: rebound)
         tabContextLog("resolveTabContext handover: runID=\(runID) \(previousConnection) -> \(connectionID) mappingOK=\(mappingOK) window=\(providedWindowID?.description ?? "nil")")
         return rebound
@@ -4241,7 +4242,9 @@ extension MCPServerViewModel {
         activateReadFileAutoSelection(&inherited)
         tabContextByConnectionID[token.connectionID] = inherited
         publishDomainRoutingBinding(connectionID: token.connectionID, context: inherited)
-        if let clientName { recordLastContext(clientName: clientName, context: inherited) }
+        if let clientName {
+            recordLastContext(clientName: clientName, context: inherited)
+        }
         beginMirroringForConnection(token.connectionID, context: inherited)
         tabContextLog("registerPendingPolicyRunIDMapping inherited run context runID=\(token.runID) \(displacedConnectionID) -> \(token.connectionID)")
     }
@@ -4577,7 +4580,9 @@ extension MCPServerViewModel {
         isStillCurrent: @MainActor () -> Bool,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         deferRunMappingCleanupUntilCaller: Bool = false,
-        promptFallback: String? = nil
+        promptFallback: String? = nil,
+        preservePromptExactly: Bool = false,
+        onSelectionCommitted: ((StoredSelection) -> Void)? = nil
     ) async -> ContextBuilderTabContextCommitResult {
         guard isStillCurrent(), !Task.isCancelled else {
             discardDetachedContextBuilderTabContext(runID: expectedRunID)
@@ -4606,16 +4611,9 @@ extension MCPServerViewModel {
             )
         }
 
-        if var finalContext = tabContextByConnectionID[connectionID],
-           finalContext.runID == expectedRunID,
-           finalContext.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let promptFallback,
-           !promptFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            finalContext.promptText = promptFallback
-            finalContext.usedAgentOutputAsPrompt = true
-            tabContextByConnectionID[connectionID] = finalContext
-        }
+        tabContextByConnectionID[connectionID] = tabContextByConnectionID[connectionID]?.applyingPromptCommitPolicy(
+            expectedRunID: expectedRunID, fallback: promptFallback, preserveExactly: preservePromptExactly
+        )
 
         let committedWrite = await commitAndClearTabContextSnapshot(
             connectionID: connectionID,
@@ -4623,7 +4621,8 @@ extension MCPServerViewModel {
             isStillCurrent: isStillCurrent,
             progressReporter: progressReporter,
             deferRunMappingCleanupUntilCaller: deferRunMappingCleanupUntilCaller,
-            readFileAutoSelectionAlreadyFinished: alreadyFinishedAutoSelection
+            readFileAutoSelectionAlreadyFinished: alreadyFinishedAutoSelection,
+            onSelectionCommitted: onSelectionCommitted
         )
 
         // Peer EOF may have transferred the live context while its auto-selection lane
@@ -4685,7 +4684,8 @@ extension MCPServerViewModel {
         isStillCurrent: @MainActor () -> Bool = { true },
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         deferRunMappingCleanupUntilCaller: Bool = false,
-        readFileAutoSelectionAlreadyFinished: Bool = false
+        readFileAutoSelectionAlreadyFinished: Bool = false,
+        onSelectionCommitted: ((StoredSelection) -> Void)? = nil
     ) async -> CommittedTabWrite? {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
@@ -4743,17 +4743,11 @@ extension MCPServerViewModel {
         await progressReporter?(.tabContextCommit)
         guard let committedTab = await commitTabContext(
             commitOwnedContext,
-            isStillCurrent: isStillCurrent
+            isStillCurrent: isStillCurrent,
+            onSelectionCommitted: onSelectionCommitted
         ), isStillCurrent(), !Task.isCancelled else { return nil }
 
-        if !committedTab.tab.name.isEmpty {
-            let tabName = committedTab.tab.name
-            NotificationService.shared.notifyContextBuilderComplete(
-                tabName: tabName,
-                tabID: committedTab.tab.id,
-                fallbackToDockBounce: true
-            )
-        }
+        notifyContextBuilderCommit(committedTab.tab)
 
         // End-of-run flush: persist this run's final state to disk (coalesced by DiskWriter)
         guard let manager = workspaceManager else { return nil }
@@ -4899,7 +4893,8 @@ extension MCPServerViewModel {
     @MainActor
     private func commitTabContext(
         _ context: MCPTabContextSnapshot,
-        isStillCurrent: @MainActor () -> Bool = { true }
+        isStillCurrent: @MainActor () -> Bool = { true },
+        onSelectionCommitted: ((StoredSelection) -> Void)? = nil
     ) async -> CommittedTabWrite? {
         guard isStillCurrent(), !Task.isCancelled else { return nil }
         guard let manager = workspaceManager else {
@@ -4928,8 +4923,10 @@ extension MCPServerViewModel {
         } else {
             updatedTab.selection = context.selection
         }
-        updatedTab.promptText = context.promptText
-        if context.usedAgentOutputAsPrompt {
+        if !context.preservesPromptOnCommit {
+            updatedTab.promptText = context.promptText
+        }
+        if context.usedAgentOutputAsPrompt, !context.preservesPromptOnCommit {
             updatedTab.contextOverrides.useOverridePrompt = false
             updatedTab.contextOverrides.overridePromptText = ""
         }
@@ -4951,6 +4948,7 @@ extension MCPServerViewModel {
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }
+        if !canonicalSelectionAdvanced { onSelectionCommitted?(storedTab.selection) }
         selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
             storedTab.selection,
             for: identity

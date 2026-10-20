@@ -19,7 +19,9 @@ enum AgentRunState: Equatable {
     case failed(String)
 
     var isRunning: Bool {
-        if case .running = self { return true }
+        if case .running = self {
+            return true
+        }
         return false
     }
 
@@ -2249,6 +2251,43 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
+    /// Local pre-submission discovery: private run ownership, context-only output, and no prompt mutation.
+    @MainActor
+    func runContextBuilderForReprompt(
+        identity: WorkspaceSelectionIdentity,
+        nestedTabContext: MCPTabContextSnapshot,
+        instructions: String,
+        workspaceContext: ContextBuilderWorkspaceContext? = nil,
+        onSelectionCommitted: ((StoredSelection) -> Void)? = nil
+    ) async throws -> MCPContextBuilderRunCompletion {
+        let resolved = try await resolveMCPRunAuthority(
+            identity: identity, nestedTabContext: nestedTabContext,
+            workspaceContext: workspaceContext, responseType: "clarify", oraclePreset: nil
+        )
+        try Task.checkCancellation()
+        let base = resolved.configuration
+        let behavior = ContextBuilderRunBehavior(
+            tokenBudget: base.runBehavior.tokenBudget, enhancementMode: .preserve,
+            questionTimeoutSeconds: base.runBehavior.questionTimeoutSeconds,
+            allowClarifyingQuestions: false, automaticFollowUp: nil, preservesPromptExactly: true
+        )
+        let configuration = ContextBuilderMCPRunConfiguration(
+            identity: identity, nestedTabContext: nestedTabContext,
+            providerWorkspacePath: base.providerWorkspacePath, runBehavior: behavior,
+            responseType: "clarify", generatedResponseAuthority: .contextOnly,
+            isSystemWorkspace: base.isSystemWorkspace, selectionCommitObserver: onSelectionCommitted
+        )
+        let token = try beginMCPControlledRun(forTabID: identity.tabID, workspaceID: identity.workspaceID, responseType: "clarify", planModelName: nil)
+        defer { clearMCPControlledRun(forTabID: identity.tabID, controlToken: token) }
+        return try await runContextBuilderForMCP(
+            authority: ContextBuilderResolvedRunAuthority(
+                configuration: configuration, agentKind: resolved.agentKind, modelRaw: resolved.modelRaw,
+                modelParameterSelections: resolved.modelParameterSelections
+            ),
+            instructionsOverride: instructions, workspaceContext: workspaceContext, mcpControlToken: token
+        )
+    }
+
     #if DEBUG
         @MainActor
         func runContextBuilderForMCP(
@@ -2551,7 +2590,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         let didClaimTerminal = record.claimTerminal(.cancelled)
         #if DEBUG
-            if didClaimTerminal { observeStartupBoundary(.runTerminal, record: record) }
+            if didClaimTerminal {
+                observeStartupBoundary(.runTerminal, record: record)
+            }
         #endif
         record.session.endRunAttempt(ifCurrent: record.ownership, source: "\(source).staleRetirement")
         if runRegistry.releaseActiveSlot(for: record) {
@@ -3478,7 +3519,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             activeSession
         }
         guard let session else { return false }
-        if session.isCancelling { return false }
+        if session.isCancelling {
+            return false
+        }
         session.isCancelling = true
         session.didUserCancelActiveContextBuilderRun = true
         updateRuntimeBindings(from: session)
@@ -3634,7 +3677,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         )
                     }
                     var usedAgentOutputAsPrompt = false
-                    if tab.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    if record.session.runStartBehavior?.preservesPromptExactly != true,
+                       tab.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                        let promptFallback = record.session.lastAgentOutput,
                        !promptFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     {
@@ -3842,7 +3886,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     },
                     progressReporter: record.progressReporter,
                     deferRunMappingCleanupUntilCaller: true,
-                    promptFallback: record.session.lastAgentOutput
+                    promptFallback: record.session.lastAgentOutput,
+                    preservePromptExactly: record.session.runStartBehavior?.preservesPromptExactly == true,
+                    onSelectionCommitted: record.mcpConfiguration?.selectionCommitObserver
                 )
                 contextCommitResult = result
                 #if DEBUG
@@ -3890,7 +3936,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         )
         guard finalizedConnections else {
-            if let contextCommitResult { return contextCommitResult }
+            if let contextCommitResult {
+                return contextCommitResult
+            }
             if !acceptsEvents(from: record) {
                 return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                     outcome: .staleOrNoLongerCurrent,
@@ -4894,7 +4942,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         task?.cancel()
         // Each captured lane releases its exact stream/waiter before its task joins. Never
         // look up whatever query a member session happens to host after this await.
-        if let task { _ = await task.result }
+        if let task {
+            _ = await task.result
+        }
         let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
         if stillOwnsCleanup {
             session.followUpOracleGroupTask = nil
@@ -6046,7 +6096,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Cancel any pending question for a session (internal helper).
     private func cancelPendingQuestion(for session: TabSession, expectedRunID: UUID? = nil) {
-        if let expectedRunID, session.pendingAskUserRunID != expectedRunID { return }
+        if let expectedRunID, session.pendingAskUserRunID != expectedRunID {
+            return
+        }
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil
@@ -6194,8 +6246,12 @@ extension ContextBuilderAgentViewModel.TabSession {
 
     @MainActor
     var planStatus: ContextBuilderPlanStatus {
-        if isBackgroundPlanGenerating { return .generating }
-        if let error = backgroundPlanError { return .error(error) }
+        if isBackgroundPlanGenerating {
+            return .generating
+        }
+        if let error = backgroundPlanError {
+            return .error(error)
+        }
         if let route = generatedAnswerRoute {
             return .ready(route: route, previewText: backgroundPlanResponsePreviewText ?? backgroundPlanResponseText)
         }

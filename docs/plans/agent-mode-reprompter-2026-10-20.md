@@ -487,6 +487,21 @@ Two windows preparing independently; new window doesn't re-show disclosure; new-
 - Formatter deviation: conductor's `format` command does not accept file paths. Used `swiftformat <explicit changed paths> --config .swiftformat` rather than reformatting the whole repository; final lint remains daemon-coordinated.
 - Step 3b correction: `.preserve` controls generated instructions but terminal Context Builder commit still installs tool-authored prompt text and an empty-prompt output fallback. Re-prompt adds an internal per-run exact-preservation commit policy; ordinary Context Builder behavior remains unchanged. Its non-MCP wrapper uses a private token internally to reuse existing generation-safe run ownership, never a caller-supplied MCP token.
 
+### Validation ledger
+
+- Step-2 checkpoint: `ae32ef1aa` (`feat(agent): persist scoped Re-prompt settings with schema 13`); staged-index secret scan and repository preflight passed. Settings suites passed 3/3 in coordinated ticket `c3dd3a91-c2ea-46ca-92e7-64db0846f464`.
+- `make dev-swift-build PRODUCT=RepoPrompt`: ticket `ad9f17b6-5941-42d5-825e-f4b4f14e3034` failed before app compilation: pinned `swift-http-types` 1.5.1 declares no traits but `swift-nio-extras` requests `FoundationURL`. Coordinated Xcode test backend resolves 1.8.0; its lockfile changes are validation-only and must be restored before checkpointing. No dependency change is intended in this feature branch.
+- Compiler iteration: fixed `ConversationEntry.Role.user` typing and split a ternary out of a guard because SwiftFormat's `andOperator` rule converted its `&&` expressions into invalid guard commas.
+- Provenance deviation: shared queued steering crosses the run service's input-assembly hook. Correct slash-expansion suppression therefore requires a default-false, non-content provenance bit on queued instructions and the assembly hook, including a small `AgentModeRunService` change; the service still never invokes or observes Re-prompt preparation. ACP batches separate ordinary input from approved replacements.
+- Extracted the existing pure MCP context-hint matcher into its own small extension so the existing 5,000-line source-file ratchet remains unchanged after formatting the modified context owner.
+
+### Automation and privacy corrections
+
+- Candidate opaque keys are freshly randomized on every builder call. Speculation therefore retains the exact staged opaque-key/target pairs and validates their authoritative metadata snapshot, role defaults, configuration/backend, and usage revision instead of regenerating different keys for comparison. It also replays the captured usage-balancing arithmetic before reuse, including time-sensitive quota changes. Ownership, stale checks, application and rollback still use the normal composer path.
+- Speculative Auto Effort uses a separate request ID and does not publish `session.autoEffortJudgmentID` or a spinner while review is open. Approved-text size fallback uses the original raw draft; source command classification and draft restoration remain original-only.
+- The plan's sentence that review edits go “only to the implementing agent” conflicts with its requirement that enabled Router/Auto Effort judge the approved edited brief. Privacy copy is explicit: edits are never sent back to the rewrite model, but opted-in decision services receive their ordinary approved-text judgment input.
+- Ticket `6728835b-2ccc-43fd-9960-d7cce49fbdf3` compiled the app and ran 14 focused tests: all five consultant tests passed; five service/operation cases failed because their fixture referenced removed catalog model `gpt-4o`. Replaced that fixture with the current built-in `gpt61Sol`; rerun is required.
+
 ### Step 1 — owner verification (2026-10-20)
 
 - Settings authority: `Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift` (`globalAgentModelsProfile`, `setGlobalAgentModelsProfile`, `normalizedAgentModelsProfile`); profile/scalar codecs in `GlobalSettingsDocument.swift`. Schema 13 is unclaimed in this base (current is 12); open-PR file checks are recorded with subsequent validation.

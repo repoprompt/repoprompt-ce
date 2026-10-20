@@ -34,16 +34,36 @@ struct ClaudeCLIOptions {
 
     func toTokens() -> [String] {
         var tokens: [String] = []
-        if printMode { tokens.append("-p") }
-        if verbose { tokens.append("--verbose") }
-        if let maxTurns { tokens.append(contentsOf: ["--max-turns", String(maxTurns)]) }
-        if !allowedTools.isEmpty { tokens.append(contentsOf: ["--allowedTools", allowedTools.joined(separator: ",")]) }
-        if !disallowedTools.isEmpty { tokens.append(contentsOf: ["--disallowedTools", disallowedTools.joined(separator: ",")]) }
-        if let permissionPromptToolName { tokens.append(contentsOf: ["--permission-prompt-tool", permissionPromptToolName]) }
-        if let permissionMode { tokens.append(contentsOf: ["--permission-mode", permissionMode]) }
-        if let model { tokens.append(contentsOf: ["--model", model]) }
-        if let systemPromptOverride { tokens.append(contentsOf: ["--system-prompt", systemPromptOverride]) }
-        if let inputFormat { tokens.append(contentsOf: ["--input-format", inputFormat]) }
+        if printMode {
+            tokens.append("-p")
+        }
+        if verbose {
+            tokens.append("--verbose")
+        }
+        if let maxTurns {
+            tokens.append(contentsOf: ["--max-turns", String(maxTurns)])
+        }
+        if !allowedTools.isEmpty {
+            tokens.append(contentsOf: ["--allowedTools", allowedTools.joined(separator: ",")])
+        }
+        if !disallowedTools.isEmpty {
+            tokens.append(contentsOf: ["--disallowedTools", disallowedTools.joined(separator: ",")])
+        }
+        if let permissionPromptToolName {
+            tokens.append(contentsOf: ["--permission-prompt-tool", permissionPromptToolName])
+        }
+        if let permissionMode {
+            tokens.append(contentsOf: ["--permission-mode", permissionMode])
+        }
+        if let model {
+            tokens.append(contentsOf: ["--model", model])
+        }
+        if let systemPromptOverride {
+            tokens.append(contentsOf: ["--system-prompt", systemPromptOverride])
+        }
+        if let inputFormat {
+            tokens.append(contentsOf: ["--input-format", inputFormat])
+        }
         if let mcpConfigPath {
             tokens.append(contentsOf: ["--mcp-config", mcpConfigPath])
             // Use strict mode to ignore project-level MCP configs from ~/.claude.json
@@ -143,7 +163,17 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
-        let nativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
+        try await completeMessage(
+            aiMessage, model: model, maxTokens: maxTokens,
+            promptDelivery: ClaudeAgentToolPreferences.agentModePromptDelivery()
+        )
+    }
+
+    /// Request-scoped delivery; isolated callers must not mutate the user's preference.
+    func completeMessage(
+        _ aiMessage: AIMessage, model: AIModel, maxTokens: Int?,
+        promptDelivery nativePromptMode: ClaudeAgentToolPreferences.AgentModePromptDelivery
+    ) async throws -> AICompletionResult {
         let basePrompt = buildPrompt(from: aiMessage)
         let prompt = nativePromptMode.sendsRepoPromptAsUserMessage
             ? ClaudeCodePromptDelivery.decoratedUserMessage(basePrompt, instructions: aiMessage.systemPrompt)
@@ -323,15 +353,31 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     private func shouldRetry(exitCode: Int32, stderr: String, timedOut: Bool, attempt _: Int) -> Bool {
-        if timedOut { return true }
+        if timedOut {
+            return true
+        }
         let lower = stderr.lowercased()
-        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") { return true }
-        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") { return true }
-        if lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("gateway") { return true }
-        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("context deadline exceeded") { return true }
-        if lower.contains("econnreset") || lower.contains("connection reset") { return true }
-        if lower.contains("network") || lower.contains("unreachable") { return true }
-        if exitCode == 1 { return true }
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
+            return true
+        }
+        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") {
+            return true
+        }
+        if lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("gateway") {
+            return true
+        }
+        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("context deadline exceeded") {
+            return true
+        }
+        if lower.contains("econnreset") || lower.contains("connection reset") {
+            return true
+        }
+        if lower.contains("network") || lower.contains("unreachable") {
+            return true
+        }
+        if exitCode == 1 {
+            return true
+        }
         return false
     }
 
@@ -442,7 +488,9 @@ final class ClaudeCodeProvider: AIProvider {
         case let string as String:
             return string
         case let dict as [String: Any]:
-            if let text = dict["text"] as? String { return text }
+            if let text = dict["text"] as? String {
+                return text
+            }
             return nil
         case let array as [Any]:
             return array.compactMap { extractString($0) }.joined(separator: "")

@@ -169,6 +169,23 @@ typealias MCPToolInvocationValidator = @Sendable (
     _ expectedServerViewModelIdentity: ObjectIdentifier
 ) async -> Bool
 
+extension MCPTabContextSnapshot {
+    func applyingPromptCommitPolicy(expectedRunID: UUID, fallback: String?, preserveExactly: Bool) -> Self {
+        guard runID == expectedRunID else { return self }
+        var context = self
+        if preserveExactly {
+            context.preservesPromptOnCommit = true
+            context.usedAgentOutputAsPrompt = false
+        } else if context.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let fallback, !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            context.promptText = fallback
+            context.usedAgentOutputAsPrompt = true
+        }
+        return context
+    }
+}
+
 struct MCPTabContextSnapshot {
     let tabID: UUID
     let windowID: Int
@@ -176,6 +193,8 @@ struct MCPTabContextSnapshot {
     var promptText: String
     /// True when terminal commit copied assistant output into an otherwise empty prompt.
     var usedAgentOutputAsPrompt: Bool
+    /// Internal terminal-commit policy, never supplied by an MCP client.
+    var preservesPromptOnCommit = false
     var selection: StoredSelection
     /// Monotonic canonical selection revision observed when this snapshot last synchronized.
     /// A final commit uses it to avoid overwriting selection persisted by a newer connection.
@@ -275,7 +294,9 @@ enum MCPTabContextResolution {
     case tabContextSnapshot(MCPTabContextSnapshot, source: MCPTabContextSnapshotSource)
 
     var snapshot: MCPTabContextSnapshot? {
-        if case let .tabContextSnapshot(snapshot, _) = self { return snapshot }
+        if case let .tabContextSnapshot(snapshot, _) = self {
+            return snapshot
+        }
         return nil
     }
 }

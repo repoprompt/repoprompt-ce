@@ -552,13 +552,19 @@ extension OracleViewModel {
                 return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
             }
             guard let agentModeRunID else { return 0 }
-            if session.agentModeRunID == agentModeRunID { return 0 }
-            if session.agentModeRunID == nil, allowUnownedLegacy { return 1 }
+            if session.agentModeRunID == agentModeRunID {
+                return 0
+            }
+            if session.agentModeRunID == nil, allowUnownedLegacy {
+                return 1
+            }
             return nil
         }
 
         if let agentModeRunID {
-            if session.agentModeRunID == agentModeRunID { return 0 }
+            if session.agentModeRunID == agentModeRunID {
+                return 0
+            }
             return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
         }
 
@@ -834,6 +840,7 @@ extension OracleViewModel {
     ) async throws
         -> [String: Value]
     {
+        try Task.checkCancellation()
         try contextBuilderScope?.checkpoint()
         // ────────── 1. Validate & extract parameters ──────────
         try Self.validateRawImageDispatchInvariant(args)
@@ -882,7 +889,9 @@ extension OracleViewModel {
         }
         let selectedModel = resolvedExecution.models[resolvedLaneIndex]
         #if DEBUG
-            if let contextBuilderScope { await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel) }
+            if let contextBuilderScope {
+                await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel)
+            }
         #endif
         try contextBuilderScope?.checkpoint()
         let selectionLabel = switch resolvedExecution.selection {
@@ -974,6 +983,7 @@ extension OracleViewModel {
                 onProgress: onProgress
             )
         }
+        try Task.checkCancellation()
         let queryId: UUID?
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
@@ -989,7 +999,11 @@ extension OracleViewModel {
             clearMCPSessionUIState(for: chatID)
             throw OracleContextBuilderCompletionError.missingExactQuery
         }
-        let response = try await waitForContextBuilderCompletion(queryId)
+        let response = try await withTaskCancellationHandler {
+            try await waitForContextBuilderCompletion(queryId)
+        } onCancel: {
+            Task { @MainActor [weak self] in await self?.cancelStreaming(in: chatID) }
+        }
         try contextBuilderScope?.admitSuccess()
 
         // ────────── 6. Build typed reply ──────────
