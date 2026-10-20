@@ -1,8 +1,8 @@
 import Foundation
 import RepoPromptSettingsCore
 
-struct AgentRepromptRequest: Encodable, Sendable {
-    struct Answer: Codable, Equatable, Sendable {
+struct AgentRepromptRequest: Encodable {
+    struct Answer: Codable, Equatable {
         let question: String
         var selectedOption: String?
         var customText: String?
@@ -32,7 +32,7 @@ struct AgentRepromptRequest: Encodable, Sendable {
     }
 }
 
-struct AgentRepromptConsultResult: Codable, Equatable, Sendable {
+struct AgentRepromptConsultResult: Codable, Equatable {
     let kind: AgentRepromptContextRequest.Kind
     let status: String
     let text: String
@@ -40,8 +40,8 @@ struct AgentRepromptConsultResult: Codable, Equatable, Sendable {
     var selectedFileCount: Int?
 }
 
-struct AgentRepromptContextRequest: Codable, Equatable, Sendable {
-    enum Kind: String, Codable, Sendable { case oracle, contextBuilder }
+struct AgentRepromptContextRequest: Codable, Equatable {
+    enum Kind: String, Codable { case oracle, contextBuilder }
     let kind: Kind
     var question: String?
     var instructions: String?
@@ -51,8 +51,8 @@ struct AgentRepromptContextRequest: Codable, Equatable, Sendable {
     }
 }
 
-struct AgentRepromptResult: Codable, Equatable, Sendable {
-    struct Brief: Codable, Equatable, Sendable {
+struct AgentRepromptResult: Codable, Equatable {
+    struct Brief: Codable, Equatable {
         let goal: String
         let constraints: [String]
         let acceptanceCriteria: [String]
@@ -60,8 +60,8 @@ struct AgentRepromptResult: Codable, Equatable, Sendable {
         let assumptions: [String]
     }
 
-    struct Question: Codable, Equatable, Sendable {
-        struct Option: Codable, Equatable, Sendable {
+    struct Question: Codable, Equatable {
+        struct Option: Codable, Equatable {
             let label: String
             var description: String?
         }
@@ -131,12 +131,13 @@ struct AgentRepromptResult: Codable, Equatable, Sendable {
     }
 }
 
-enum AgentRepromptError: Error, LocalizedError, Equatable, Sendable {
+enum AgentRepromptError: Error, LocalizedError, Equatable {
     case missingPrimaryModel, unknownPrimaryModel, unconfiguredPrimaryModel
-    case sizeLimit, timeout, invalidResponse, provider
+    case sizeLimit, timeout, invalidResponse, provider, disclosureRequired
 
     var errorDescription: String? {
         switch self {
+        case .disclosureRequired: "The primary Oracle provider changed. Cancel and click Re-prompt to review its disclosure before retrying."
         case .missingPrimaryModel: "Choose a primary Oracle model in Agent Models settings."
         case .unknownPrimaryModel: "The primary Oracle model is unavailable. Choose another in Agent Models settings."
         case .unconfiguredPrimaryModel: "Configure credentials for the primary Oracle model in Settings."

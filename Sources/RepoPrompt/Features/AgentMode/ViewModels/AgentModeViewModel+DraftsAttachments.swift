@@ -65,6 +65,7 @@ extension AgentModeViewModel {
     /// rejections each restore exactly once even when restoration events
     /// coalesce in the UI.
     func restoreRejectedManualSubmissionComposerState(
+        repromptedText: String? = nil,
         tabID: UUID,
         session: TabSession,
         draftText: String,
@@ -125,6 +126,12 @@ extension AgentModeViewModel {
             strategy: .replaceAlways,
             operation: operation
         )
+        if let repromptedText {
+            repromptUIStore.recoveries[tabID] = .init(
+                text: repromptedText, originalDraft: draftText, reason: message,
+                draftAtInvalidation: retrieveDraftText(for: tabID)
+            )
+        }
     }
 
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
@@ -164,6 +171,7 @@ extension AgentModeViewModel {
                 tabDraftText[tabID] = text
             }
         }
+        invalidateRepromptIfNeeded()
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)

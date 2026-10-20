@@ -504,6 +504,14 @@ Two windows preparing independently; new window doesn't re-show disclosure; new-
 
 - Step-3b checkpoint: `ced6330b0`; mandatory staged-index preflight passed. Ticket `10bc8153-422e-4a56-82ff-a2d6d4a6d70a` compiled the application and all tests, and passed service (6), consultant (5), session-link isolation (3), settings-core (3), and most submission/routing cases. Two fixture failures were corrected: active steering needs a real persistent session binding before minting a composer target; Auto Effort must choose a model supported by its policy, not merely one advertising effort controls. Focused rerun pending.
 
+### UI and final verification in progress
+
+- Step-5b checkpoint: `520e38a39`; staged-index commit preflight passed. Routing integration passed all five cases in ticket `8239b9fc-835c-4cdd-93c4-057790c8790b`. Active-steering fixture additionally required `recordRestorationAuthoritative(.persistedPayloadApplied)` after installing a persistent binding; the next combined run includes this correction.
+- Step 6 adds a transient pill, locally persisted provider disclosure acknowledgement (not enablement), mandatory composer sheet, timeout-free shared wizard, review validation, recovery restore/confirmation, scoped guidance/policy editor, and privacy documentation. A primary-provider change blocks the next rewrite pending renewed disclosure, rather than silently transmitting to a new provider.
+- Initial `make dev-lint` could not run because the system SwiftFormat was 0.63.1 while the repository requires 0.61.1. `make dev-install-format-tools` installed the pinned release successfully; coordinated lint is being rerun. Explicit changed-file formatting was initially performed with the system binary; pinned validation remains authoritative.
+- Oracle review was attempted twice with the prepared diff artifacts and selected live feature files. Both sends aborted before model execution because RepoPrompt's context reader insists on resolving a stale main-checkout plan path, despite removing it from selection. The main checkout is deliberately untouched; this is not a completed independent review.
+- Remaining evidence gaps: manual/two-window/accessibility checks, actual factory-provider-family payload captures and real CLI child-termination checks have not yet been performed. The message-level privacy boundary and cancellation-ignoring fake are covered. No visible app launch/relaunch or live provider requests have been made.
+
 ### Step 1 — owner verification (2026-10-20)
 
 - Settings authority: `Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift` (`globalAgentModelsProfile`, `setGlobalAgentModelsProfile`, `normalizedAgentModelsProfile`); profile/scalar codecs in `GlobalSettingsDocument.swift`. Schema 13 is unclaimed in this base (current is 12); open-PR file checks are recorded with subsequent validation.
@@ -512,6 +520,74 @@ Two windows preparing independently; new window doesn't re-show disclosure; new-
 - Context Builder's `ContextBuilderRunBehavior` already has an enhancement mode, and its DEBUG convenience entry demonstrates constructing `.preserve` per run. Production entry takes resolved authority and a control token, so a non-MCP wrapper must reuse that core with private ownership.
 - Oracle `OracleSendTabContext` supports `.background`; `tool_chatSend` already accepts `chat_name`, so no title-hint API addition is needed.
 - Maintainer-guidance check: mandatory review is the user-intent authority; held composer claim and captured context protect state; side calls must be bounded/observable and must not acquire noncomposer authority. Validation targets the actual settings and composer boundaries, not a parallel submission path.
+
+### Step-6 validation
+
+- `make dev-test FILTER=AgentReprompt`: ticket `288f9d32-b415-4a11-b9bd-9233af452fa8` passed all nine requested suites: 34 app tests plus 3 settings-core tests, zero failures. Earlier presentation assertion incorrectly equated “no preselection” with an empty draft dictionary; the shared wizard creates empty records per question, and the corrected assertion checks their actual option/custom/skip values.
+- `make dev-lint`: ticket `3d9d98c9-8c1a-4f3b-9716-e0fba69581be` passed pinned SwiftFormat and strict SwiftLint (0/1845 files require formatting). The final two small recovery/test edits were subsequently formatted with the same pinned formatter; full final checks follow.
+- Added eager source-session observation and direct draft-write invalidation (draft text itself is not published). Stop preserves reviewed text without manufacturing an idle run cancellation. Immediate submission and asynchronous manual-dispatch rejection preserve the original draft and recover the approved brief separately. Explicit brief replacement acknowledges the existing restoration ledger so old fragments cannot reappear on the next editor write.
+- Command-provenance correction: a user may edit a brief to begin with `/`; it remains data. Original text owns command eligibility, and Auto Effort explicitly permits slash-like approved replacements. Normal non-Re-prompt command handling remains unchanged.
+- Still unverified/incomplete polish: per-consult completion status is consolidated after clarification, not updated independently while a question is open; native-sheet interaction with underlying model controls needs manual verification. Queued runtime-failure recovery beyond the manual submission rollback path is not yet separately covered. These do not have a completed acceptance claim.
+
+### Changed-file inventory (relative to d9d0f21)
+
+```text
+Scripts/source_layout_guardrails.sh
+Sources/RepoPrompt/App/WindowStateComposition.swift
+Sources/RepoPrompt/Features/AgentMode/Models/AgentRepromptModels.swift
+Sources/RepoPrompt/Features/AgentMode/Routing/AgentAutomationTurnAudit.swift
+Sources/RepoPrompt/Features/AgentMode/Routing/UsageBalancing/AgentUsageBalancer.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunService.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunServiceHooks.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptContextConsultant.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptService.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunPendingInstruction.swift
+Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunStartOutcome.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+DraftsAttachments.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Reprompt.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RepromptAutomation.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RepromptUI.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Routing.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+StatusPillsUI.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+UsageBalancing.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentTabSession.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentModelsSettingsViewModel.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentRepromptUIStore.swift
+Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentStatusPillsUIStore.swift
+Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift
+Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptPill.swift
+Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptSheet.swift
+Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentStatusPillsRow.swift
+Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/AgentAskUserWizardCard.swift
+Sources/RepoPrompt/Features/Chat/ViewModels/Oracle/OracleViewModel+MCP.swift
+Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift
+Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderRunLifecycle.swift
+Sources/RepoPrompt/Features/Settings/Views/AgentModelsSettingsView.swift
+Sources/RepoPrompt/Features/Settings/Views/AgentRepromptSettingsEditor.swift
+Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift
+Sources/RepoPrompt/Infrastructure/MCP/MCPInvocationContext.swift
+Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+ContextHint.swift
+Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift
+Sources/RepoPromptSettingsCore/AgentRepromptContextPolicy.swift
+Sources/RepoPromptSettingsCore/AgentRepromptGuidance.swift
+Sources/RepoPromptSettingsCore/GlobalSettingsDocument.swift
+Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift
+Tests/RepoPromptSettingsCoreTests/AgentRepromptGuidanceTests.swift
+Tests/RepoPromptSettingsCoreTests/AgentRepromptSchemaTests.swift
+Tests/RepoPromptTests/AgentMode/AgentRepromptContextConsultantTests.swift
+Tests/RepoPromptTests/AgentMode/AgentRepromptServiceTests.swift
+Tests/RepoPromptTests/AgentMode/AgentRepromptSubmissionTests.swift
+Tests/RepoPromptTests/AgentMode/Routing/AgentRepromptRoutingIntegrationTests.swift
+Tests/RepoPromptTests/AgentMode/SessionLinks/AgentRepromptSessionLinkIsolationTests.swift
+Tests/RepoPromptTests/AgentMode/ToolCards/AgentRepromptPresentationTests.swift
+Tests/RepoPromptTests/Helpers/AgentSessionLinkRunnerTestSupport.swift
+Tests/RepoPromptTests/Settings/AgentRepromptSettingsTests.swift
+docs/migrations/build-modularization/ratchets.json
+docs/plans/agent-mode-reprompter-2026-10-20.md
+docs/privacy/telemetry.md
+```
 
 ## 9. Open questions
 

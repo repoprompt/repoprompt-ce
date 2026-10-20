@@ -50,7 +50,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
             fixture.session.selectedModelRaw = option.rawValue
             let claim = try fixture.claim(text: "Original raw draft")
             defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
-            let approved = oversized ? String(repeating: "x", count: 4001) : "Approved parser requirement"
+            let approved = oversized ? String(repeating: "x", count: 4001) : "/review Approved parser requirement"
             let result = await fixture.viewModel.submitUserTurnAfterAutoEffort(text: "Original raw draft", claim: claim, session: fixture.session, destinationTabID: fixture.session.tabID, repromptedText: approved)
             XCTAssertEqual(result, .submitted)
             let requests = await fixture.backend.requests

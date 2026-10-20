@@ -4948,7 +4948,10 @@ extension MCPServerViewModel {
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }
-        if !canonicalSelectionAdvanced { onSelectionCommitted?(storedTab.selection) }
+        if !canonicalSelectionAdvanced {
+            onSelectionCommitted?(storedTab.selection)
+        }
+        guard manager.composeTab(for: identity)?.selection == storedTab.selection else { return nil }
         selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
             storedTab.selection,
             for: identity

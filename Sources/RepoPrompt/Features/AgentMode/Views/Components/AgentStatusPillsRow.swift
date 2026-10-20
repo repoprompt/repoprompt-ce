@@ -63,6 +63,14 @@ struct AgentStatusPillsRow: View {
                     onToggle: { agentModeVM.toggleInterviewFirst() }
                 )
 
+                AgentRepromptPill(
+                    props: snapshot.reprompt,
+                    setEnabled: { agentModeVM.setRepromptEnabled($0, acknowledgingProviderID: $1) },
+                    openSettings: {
+                        NotificationCenter.default.post(name: .showAgentModelsSettingsTab, object: nil, userInfo: ["windowID": windowID])
+                    }
+                )
+
                 AgentModelRouterPill(
                     props: snapshot.modelRouter,
                     onToggle: { agentModeVM.toggleGlobalModelRouter() },

@@ -89,7 +89,9 @@ final class AgentRepromptContextConsultant {
         }
     }
 
-    var resultsSnapshot: [AgentRepromptConsultResult] { currentResults }
+    var resultsSnapshot: [AgentRepromptConsultResult] {
+        currentResults
+    }
 
     func results() async -> [AgentRepromptConsultResult] {
         if isCancelled || settled.count == tasks.count {
@@ -109,7 +111,9 @@ final class AgentRepromptContextConsultant {
 
     func noteCommittedSelection(_ selection: StoredSelection) {
         committedSelection = selection
-        if isCancelled { restoreIfUnchanged() }
+        if isCancelled {
+            restoreIfUnchanged()
+        }
     }
 
     func restoreIfUnchanged() {
@@ -169,6 +173,10 @@ final class AgentRepromptContextConsultant {
                 guard var tab = workspace.composeTab(for: identity) else { return }
                 tab.selection = selection
                 workspace.updateComposeTab(tab, workspaceID: identity.workspaceID, markDirty: true)
+                Task { @MainActor in
+                    guard workspace.composeTab(for: identity)?.selection == selection else { return }
+                    _ = await workspace.applyStoredSelectionMirrorForReadFileAutoSelection(for: identity)
+                }
             }
         )
         observer.owner = consultant

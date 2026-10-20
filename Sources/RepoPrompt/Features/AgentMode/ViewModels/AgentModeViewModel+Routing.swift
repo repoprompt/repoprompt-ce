@@ -339,10 +339,10 @@ extension AgentModeViewModel {
             if reusableRepromptEffort(claim: claim, approved: repromptedText, session: session) != nil {
                 choice = staged
             } else {
-                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow)
+                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil)
             }
         } else {
-            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow)
+            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil)
         }
         let selection = choice.selection
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
@@ -384,7 +384,8 @@ extension AgentModeViewModel {
         session: TabSession,
         workflow: AgentWorkflowDefinition?,
         requestID: UUID = UUID(),
-        isSpeculative: Bool = false
+        isSpeculative: Bool = false,
+        isRepromptReplacement: Bool = false
     ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
         let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
         guard autoEffortConfiguration.enabled else {
@@ -392,7 +393,7 @@ extension AgentModeViewModel {
         }
         guard !session.runState.isActive,
               AutoEffortModelPolicy.shouldJudgeWorkflow(workflow),
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
+              isRepromptReplacement || !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
               let maskedExcerpt = AutoEffortTaskSummary.make(from: text)
         else {
             return (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))

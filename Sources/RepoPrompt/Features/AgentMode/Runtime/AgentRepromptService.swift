@@ -2,7 +2,7 @@ import Foundation
 import RepoPromptSettingsCore
 
 /// A stateless, tool-less side call. This type never packages workspace contents or history.
-struct AgentRepromptService: Sendable {
+struct AgentRepromptService {
     typealias Transport = @Sendable (AIMessage, AIModel) async throws -> String
     let transport: Transport
     var timeoutOverride: TimeInterval?

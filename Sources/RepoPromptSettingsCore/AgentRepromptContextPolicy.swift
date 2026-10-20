@@ -1,6 +1,6 @@
 import Foundation
 
-package enum AgentRepromptContextPolicy: String, Codable, Sendable, CaseIterable {
+package enum AgentRepromptContextPolicy: String, Codable, CaseIterable {
     case automatic
     case never
 

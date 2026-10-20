@@ -13,6 +13,8 @@ final class AgentRepromptUIStore: ObservableObject {
         var questions: [AgentRepromptResult.Question] = []
         var consults: [AgentRepromptConsultResult] = []
         var isGatheringContext = false
+        var consultKinds: [AgentRepromptContextRequest.Kind] = []
+        var contextStartedAt = Date()
         var error: String?
         var hasUnresolvedQuestions = false
     }
@@ -21,6 +23,7 @@ final class AgentRepromptUIStore: ObservableObject {
         let text: String
         let originalDraft: String
         let reason: String
+        var draftAtInvalidation: String = ""
     }
 
     @Published var presentation: Presentation?
@@ -34,8 +37,8 @@ final class AgentRepromptUIStore: ObservableObject {
             && reviewText.utf8.count <= 64 * 1024
     }
 
-    func recover(tabID: UUID, originalDraft: String, reason: String) {
+    func recover(tabID: UUID, originalDraft: String, reason: String, currentDraft: String? = nil) {
         guard presentation?.phase == .reviewing, !reviewText.isEmpty else { return }
-        recoveries[tabID] = .init(text: reviewText, originalDraft: originalDraft, reason: reason)
+        recoveries[tabID] = .init(text: reviewText, originalDraft: originalDraft, reason: reason, draftAtInvalidation: currentDraft ?? originalDraft)
     }
 }

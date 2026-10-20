@@ -111,9 +111,22 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.repromptOperation?.validate() == true)
         XCTAssertEqual(fixture.viewModel.repromptUIStore.presentation?.phase, .reviewing)
         fixture.viewModel.storeDraftText(for: fixture.session.tabID, "A new local draft")
-        _ = fixture.viewModel.repromptOperation?.validate()
+        XCTAssertNil(fixture.viewModel.repromptUIStore.presentation, "Draft writes eagerly invalidate without a review action.")
         guard case .cancelled = await task.value else { return XCTFail("Draft change must cancel") }
         XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, "Keep my review edits")
+    }
+
+    func testNaturalRunBoundaryEagerlyInvalidatesReview() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let claim = try fixture.claim(text: "Original")
+        defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+        let task = Task { await fixture.viewModel.prepareComposerReprompt(text: "Original", claim: claim) }
+        try await waitForReview(fixture.viewModel.repromptUIStore)
+        fixture.session.runState = .completed
+        try await AsyncTestWait.waitUntil("run boundary invalidates review", timeout: 3) { fixture.viewModel.repromptUIStore.presentation == nil }
+        guard case .cancelled = await task.value else { return XCTFail("Run boundary must cancel") }
     }
 
     func testOnlyCapturedEffectiveSettingsScopeInvalidates() async throws {

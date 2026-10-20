@@ -99,6 +99,9 @@ extension AgentModeViewModel {
         let operation = AgentRepromptOperation(
             sourceTabID: tabID, rawDraft: claim.attempt.rawDraftSnapshot, request: request,
             model: model, service: available ? repromptService : nil, store: repromptUIStore, consultant: consultant,
+            initialError: profile.planningModelRaw != nil && model == nil ? .unknownPrimaryModel :
+                (repromptAvailability == nil && available && repromptPillProps().requiresDisclosure ? .disclosureRequired : nil),
+            currentDraft: { [weak self] in self?.retrieveDraftText(for: tabID) },
             isCurrent: { [weak self, weak consultant] in
                 guard let self else { return false }
                 let live = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
@@ -135,6 +138,7 @@ extension AgentModeViewModel {
             }
         }
         objectWillChange.sink { _ in check() }.store(in: &operation.observations)
+        session.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         modelRouterSettingsStore.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         workspaceManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         promptManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
@@ -152,7 +156,8 @@ extension AgentModeViewModel {
     }
 
     func cancelReprompt() {
-        repromptOperation?.finish(.cancelled)
+        guard let operation = repromptOperation, operation.validate() else { return }
+        operation.finish(.cancelled)
     }
 }
 
@@ -167,6 +172,8 @@ final class AgentRepromptOperation {
     private let model: AIModel?
     private let service: AgentRepromptService?
     private let isCurrent: () -> Bool
+    private let initialError: AgentRepromptError?
+    private let currentDraft: () -> String?
     let consultant: AgentRepromptContextConsultant?
     private var request: AgentRepromptRequest
     private var firstResult: AgentRepromptResult?
@@ -180,7 +187,8 @@ final class AgentRepromptOperation {
     init(
         sourceTabID: UUID, rawDraft: String, request: AgentRepromptRequest,
         model: AIModel?, service: AgentRepromptService?, store: AgentRepromptUIStore,
-        consultant: AgentRepromptContextConsultant?, isCurrent: @escaping () -> Bool
+        consultant: AgentRepromptContextConsultant?, initialError: AgentRepromptError? = nil,
+        currentDraft: @escaping () -> String? = { nil }, isCurrent: @escaping () -> Bool
     ) {
         self.sourceTabID = sourceTabID
         self.rawDraft = rawDraft
@@ -190,6 +198,8 @@ final class AgentRepromptOperation {
         self.store = store
         self.consultant = consultant
         self.isCurrent = isCurrent
+        self.initialError = initialError
+        self.currentDraft = currentDraft
     }
 
     func prepare() async -> Outcome {
@@ -226,6 +236,9 @@ final class AgentRepromptOperation {
         store.presentation?.error = nil
         task = Task { [self] in
             do {
+                if let initialError {
+                    throw initialError
+                }
                 guard let model else { throw AgentRepromptError.missingPrimaryModel }
                 guard let service else { throw AgentRepromptError.unconfiguredPrimaryModel }
                 let result = try await service.generate(request: request, model: model)
@@ -237,6 +250,8 @@ final class AgentRepromptOperation {
                 }
                 firstResult = result
                 consultant?.start(result.contextRequests)
+                store.presentation?.consultKinds = result.contextRequests.map(\.kind)
+                store.presentation?.contextStartedAt = Date()
                 store.presentation?.isGatheringContext = !result.contextRequests.isEmpty
                 if result.openQuestions.isEmpty {
                     completeQuestions(skipAll: true)
@@ -324,7 +339,7 @@ final class AgentRepromptOperation {
     }
 
     func invalidate(reason: String) {
-        store.recover(tabID: sourceTabID, originalDraft: rawDraft, reason: reason)
+        store.recover(tabID: sourceTabID, originalDraft: rawDraft, reason: reason, currentDraft: currentDraft())
         finish(.cancelled)
     }
 

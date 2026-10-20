@@ -156,7 +156,9 @@ final class AgentModeRunService {
         _ command: AgentProviderControlCommand,
         for session: AgentTabSession
     ) -> Bool {
-        if session.selectedAgent == .claudeCode { return true }
+        if session.selectedAgent == .claudeCode {
+            return true
+        }
         return AgentProviderControlCommand.acpSession(
             session,
             advertises: command.kind,
@@ -192,7 +194,9 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         var candidateTransferred = false
         defer {
-            if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+            if !candidateTransferred {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+            }
         }
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
@@ -906,7 +910,9 @@ final class AgentModeRunService {
             for instruction in current {
                 if groups.last?.first?.skipsSlashExpansion == instruction.skipsSlashExpansion {
                     groups[groups.count - 1].append(instruction)
-                } else { groups.append([instruction]) }
+                } else {
+                    groups.append([instruction])
+                }
             }
             let startsTypedFollowUp = session.runState == .completed && session.acpController != nil
             for group in startsTypedFollowUp ? groups : Array(groups.reversed()) {
@@ -1282,7 +1288,9 @@ final class AgentModeRunService {
     ) {
         if let stopFence, let session,
            !hooks.queuedWorkRecovery.isCurrentSessionBinding(session, stopFence)
-        { return }
+        {
+            return
+        }
         let drafts = instructions.filter { $0.managed == nil }
             .map(\.draftText)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }

@@ -76,6 +76,37 @@ automated usage monitoring; using documented CLI features is not a compliance gu
 identities, credentials and raw terminal output are not logged or sent to diagnostic telemetry. Legacy
 Claude run-event telemetry remains separate and cannot authorize usage collection.
 
+## Agent Mode Re-prompt (model requests, not telemetry)
+
+Re-prompt is off by default and enabled separately in each window. With consent, each eligible
+local composer message is sent to the effective workspace profile's primary Oracle model for a
+stateless, tool-less rewrite. The request contains only the message text, rewrite guidance, and
+(optionally) a bounded manifest of workspace root names and selected relative file paths. It does
+not include conversation history, attachments, attachment names, or attachment paths. The primary
+Oracle may use a different provider from the implementing agent and has that provider's retention
+terms. Do not include secrets you do not want that provider to receive.
+
+The rewriter may request one ordinary background Oracle consult and/or one Context Builder run.
+These use the workspace's normal selected-context and discovery paths, including repository
+contents where applicable; their ordinary chat/run history persists. Results and clarification
+answers may be sent with the original message in one refinement request. **Gather repository
+context: Never** omits the manifest and disables both consults. Context gathering can also be
+skipped per preparation. Context Builder never changes the tab prompt in this flow; its selected
+files are kept on approval, and cancellation restores its selection only if the user has not
+changed it since the commit.
+
+Every rewrite requires editable review and explicit approval before the implementing agent receives
+anything. Review edits are not sent back to the rewrite model. If Model Router or Auto Effort is
+enabled, its opted-in decision service judges the approved brief under its normal masking/size
+rules (Auto Effort may use the original for an oversized brief). A speculative judgment can start
+while review is open; cancelling or editing afterward cannot undo data already sent to that
+service. No implementing turn is sent speculatively.
+
+Rewrite drafts and answers remain in memory; approved text becomes an ordinary transcript row.
+Local automation audit records contain only outcomes, consult statuses, and reuse/fallback flags,
+not message text, guidance, answers, paths, or generated briefs. These model calls are independent
+of **Share crash reports and diagnostics**.
+
 ## What is collected
 
 When active, RepoPrompt can send:

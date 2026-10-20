@@ -90,7 +90,7 @@ extension AgentModeViewModel {
                 await chooseAutoEffortForUserTurn(
                     text: Self.automationJudgingText(original: claim.attempt.rawDraftSnapshot, reprompted: text),
                     session: session, workflow: session.selectedWorkflow,
-                    requestID: speculation.requestID, isSpeculative: true
+                    requestID: speculation.requestID, isSpeculative: true, isRepromptReplacement: true
                 )
             }
         } else {

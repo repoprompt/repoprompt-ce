@@ -111,6 +111,10 @@ struct AgentInputBar: View {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
         }
+        .modifier(AgentRepromptPresentationHost(
+            viewModel: agentModeVM, store: agentModeVM.repromptUIStore, tabID: currentTabID,
+            returnFocus: { isFocused = true }
+        ))
     }
 
     private var composerActions: AgentComposerActions {

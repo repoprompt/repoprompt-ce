@@ -378,6 +378,8 @@ struct AgentModelsSettingsView: View {
 
                 Divider()
                 oracleReconciliationGuidanceEditor
+                Divider()
+                AgentRepromptSettingsEditor(viewModel: viewModel)
             }
         }
     }
