@@ -29,7 +29,8 @@ extension AgentModeViewModel {
         claim: AgentComposerSubmitClaim,
         session: TabSession,
         destinationTabID: UUID,
-        routerAudit: AgentAutomationTurnAudit.Feature? = nil
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
         let baseline = executableTarget(for: session)
         let effectiveEffort: String? = switch session.selectedAgent {
@@ -43,14 +44,14 @@ extension AgentModeViewModel {
               let decision = localUsageDecision(basedOn: balancingBaseline, scope: .primarySession, surface: .general),
               applyRoutingTarget(decision.candidate, to: session)
         else {
-            return await submitUserTurnAfterAutoEffort(text: text, claim: claim, session: session, destinationTabID: destinationTabID, routerAudit: routerAudit)
+            return await submitUserTurnAfterAutoEffort(text: text, claim: claim, session: session, destinationTabID: destinationTabID, routerAudit: routerAudit, repromptedText: repromptedText)
         }
         var audit = routerAudit ?? AgentAutomationTurnAudit.Feature(configured: false, eligible: true, judgmentRequested: false, decision: .selected)
         audit.chosenModelRaw = decision.candidate.target.modelRaw
         audit.chosenEffortRaw = decision.candidate.target.reasoningEffortRaw
         audit.usageBalancingReason = decision.reason
         audit.usageBalancingProviderRaw = decision.candidate.target.agentRaw
-        let result = await submitUserTurnAfterAutoEffort(text: text, claim: claim, session: session, destinationTabID: destinationTabID, routerAudit: audit)
+        let result = await submitUserTurnAfterAutoEffort(text: text, claim: claim, session: session, destinationTabID: destinationTabID, routerAudit: audit, repromptedText: repromptedText)
         if result != .submitted, executableTarget(for: session) == decision.candidate.target {
             restoreUsageStartingTarget(baseline, on: session)
         } else if result == .submitted {

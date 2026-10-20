@@ -58,6 +58,7 @@ final class AgentUsageBalancer {
     }
 
     private let core = ProviderUsageBalancer()
+    private(set) var revision: UInt64 = 0
 
     var onRoutingActivity: (() -> Void)? {
         get { core.onRoutingActivity }
@@ -66,10 +67,12 @@ final class AgentUsageBalancer {
 
     func update(_ snapshot: ProviderQuotaSnapshot?, provider: String) {
         core.update(snapshot, provider: provider)
+        revision &+= 1
     }
 
     func clear() {
         core.clear()
+        revision &+= 1
     }
 
     func choose(

@@ -502,6 +502,8 @@ Two windows preparing independently; new window doesn't re-show disclosure; new-
 - The plan's sentence that review edits go “only to the implementing agent” conflicts with its requirement that enabled Router/Auto Effort judge the approved edited brief. Privacy copy is explicit: edits are never sent back to the rewrite model, but opted-in decision services receive their ordinary approved-text judgment input.
 - Ticket `6728835b-2ccc-43fd-9960-d7cce49fbdf3` compiled the app and ran 14 focused tests: all five consultant tests passed; five service/operation cases failed because their fixture referenced removed catalog model `gpt-4o`. Replaced that fixture with the current built-in `gpt61Sol`; rerun is required.
 
+- Step-3b checkpoint: `ced6330b0`; mandatory staged-index preflight passed. Ticket `10bc8153-422e-4a56-82ff-a2d6d4a6d70a` compiled the application and all tests, and passed service (6), consultant (5), session-link isolation (3), settings-core (3), and most submission/routing cases. Two fixture failures were corrected: active steering needs a real persistent session binding before minting a composer target; Auto Effort must choose a model supported by its policy, not merely one advertising effort controls. Focused rerun pending.
+
 ### Step 1 — owner verification (2026-10-20)
 
 - Settings authority: `Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift` (`globalAgentModelsProfile`, `setGlobalAgentModelsProfile`, `normalizedAgentModelsProfile`); profile/scalar codecs in `GlobalSettingsDocument.swift`. Schema 13 is unclaimed in this base (current is 12); open-PR file checks are recorded with subsequent validation.

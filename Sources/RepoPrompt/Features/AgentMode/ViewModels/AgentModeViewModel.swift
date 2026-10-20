@@ -804,6 +804,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let sourceTabID: UUID
         let destinationTabID: UUID
         let task: Task<StagedTaskRoutingResult, Never>
+        var cancellationRequestID: UUID?
     }
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
@@ -2419,7 +2420,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - Initialization
 
-    private weak var oracleViewModel: OracleViewModel?
+    weak var oracleViewModel: OracleViewModel?
+    weak var repromptContextBuilder: ContextBuilderAgentViewModel?
+    var repromptService: AgentRepromptService?
+    let repromptUIStore = AgentRepromptUIStore()
+    var repromptEnabled = false
+    var repromptOperation: AgentRepromptOperation?
+    var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
+    var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
+    var repromptAvailability: ((AIModel) -> Bool)?
 
     private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
         ClaudeAgentModeCoordinator.HostCapabilities(
@@ -3370,14 +3379,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                         ?? AgentMessage(systemPrompt: "", userMessage: initialMessage)
                 },
-                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session in
+                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion in
                     guard let self else { return text }
                     return await augmentUserMessageForProviderSend(
                         text,
                         attachments: attachments,
                         taggedFileAttachments: taggedFileAttachments,
                         agent: session?.selectedAgent,
-                        session: session
+                        session: session,
+                        skipsSlashExpansion: skipsSlashExpansion
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
@@ -3497,7 +3507,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         await startFollowUpRun(
                             for: session,
                             initialMessage: instruction.providerText,
-                            stopFence: stopFence
+                            stopFence: stopFence,
+                            skipsSlashExpansion: instruction.skipsSlashExpansion
                         )
                     }
                 },
@@ -3570,7 +3581,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let startOutcome = AgentRunStartOutcomeRecorder()
             _ = await startAgentRun(
                 tabID: session.tabID, initialMessage: instruction.providerText,
-                directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
+                directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: stopFence),
                 startOutcome: startOutcome
             )
             guard let settled = session.scheduledACPFollowUp, settled.id == scheduled.id else { return }
@@ -3627,7 +3638,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func startFollowUpRun(
         for session: TabSession,
         initialMessage: String,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        skipsSlashExpansion: Bool = false
     ) async {
         guard sessions[session.tabID] === session else {
             session.mcpFollowUpRunPending = false
@@ -3645,7 +3657,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await startAgentRun(
             tabID: session.tabID,
             initialMessage: initialMessage,
-            directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence)
+            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: skipsSlashExpansion, stopFence: stopFence)
         )
     }
 
@@ -4509,7 +4521,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return customWorkflows.first(where: { $0.customID == customID }) ?? selectedWorkflow
     }
 
-    private static func pendingUserTurnState(from session: TabSession?) -> PendingUserTurnState {
+    static func pendingUserTurnState(from session: TabSession?) -> PendingUserTurnState {
         PendingUserTurnState(
             workflow: session?.selectedWorkflow,
             imageAttachments: session?.pendingImageAttachments ?? [],
@@ -4711,6 +4723,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        cancelReprompt()
+        repromptUIStore.recoveries.removeAll()
         if let task = windowClosePreparationTask { await task.value
             return
         }
@@ -17998,6 +18012,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
+            cancelRepromptSpeculation(claimID: claim.attempt.id)
+            repromptAudits[claim.attempt.id] = nil
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18021,6 +18037,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
+            if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: preparedSession) { return blocked }
+            let repromptedText: String?
+            switch await prepareComposerReprompt(text: text, claim: claim) {
+            case .original: repromptedText = nil
+            case let .approved(brief): repromptedText = brief
+            case .cancelled: return .blocked(message: "Re-prompt cancelled.")
+            }
             let pendingState = Self.pendingUserTurnState(from: preparedSession)
             guard let initialLocation = target.expectedInitialStartLocation,
                   initialLocation != .local,
@@ -18030,7 +18053,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     text: text,
                     claim: claim,
                     session: preparedSession,
-                    destinationTabID: target.tabID
+                    destinationTabID: target.tabID,
+                    repromptedText: repromptedText
                 )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
@@ -18098,7 +18122,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 text: text,
                 claim: claim,
                 session: preparedSession,
-                destinationTabID: target.tabID
+                destinationTabID: target.tabID,
+                repromptedText: repromptedText
             )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
@@ -18106,6 +18131,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return result
         case .createAgentSessionFromSourceTab:
             let sourceSession = claimedSourceSession
+            if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: sourceSession) { return blocked }
+            let repromptedText: String?
+            switch await prepareComposerReprompt(text: text, claim: claim) {
+            case .original: repromptedText = nil
+            case let .approved(brief): repromptedText = brief
+            case .cancelled: return .blocked(message: "Re-prompt cancelled.")
+            }
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: sourceSession,
                 fallbackSelectedAgent: selectedAgent,
@@ -18237,7 +18269,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 text: text,
                 claim: claim,
                 session: destinationSession,
-                destinationTabID: destinationTabID
+                destinationTabID: destinationTabID,
+                repromptedText: repromptedText
             )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
@@ -18259,7 +18292,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         text: String,
         claim: AgentComposerSubmitClaim,
         session: TabSession,
-        destinationTabID: UUID
+        destinationTabID: UUID,
+        repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
@@ -18277,7 +18311,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             text: text,
             claim: claim,
             session: session,
-            destinationTabID: destinationTabID
+            destinationTabID: destinationTabID,
+            repromptedText: repromptedText,
+            precomputedRouting: repromptSpeculations[claim.attempt.id]
         )
     }
 
@@ -18604,10 +18640,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        repromptedText: String? = nil,
+        repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard repromptedText == nil || isLocalComposerInput else { return .blocked(message: "Re-prompt is local composer input only.") }
+        assert(repromptedText == nil || !trimmedText.hasPrefix("/"), "Re-prompt must bypass slash input")
         let attachmentsToSend = session.pendingImageAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
@@ -18766,6 +18806,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     autoEffortSelection: autoEffortSelection,
                     autoEffortAudit: autoEffortAudit,
                     routerAudit: routerAudit,
+                    repromptedText: repromptedText,
+                    repromptAudit: repromptAudit,
                     restorationSelectedWorkflow: activeWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
@@ -18789,6 +18831,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEffortSelection: autoEffortSelection,
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
+            repromptedText: repromptedText,
+            repromptAudit: repromptAudit,
             restorationSelectedWorkflow: activeWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput
@@ -18816,6 +18860,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        repromptedText: String? = nil,
+        repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         stopFence: AgentRunStartStopFence,
@@ -18888,6 +18934,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEffortSelection: autoEffortSelection,
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
+            repromptedText: repromptedText,
+            repromptAudit: repromptAudit,
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             stopFence: stopFence,
@@ -19018,7 +19066,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
         managedTurn: AgentNoncomposerTurn? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        skipsSlashExpansion: Bool = false
     ) {
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
@@ -19073,7 +19122,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 attachments: attachments,
                 taggedFileAttachments: taggedFiles,
                 agent: session.selectedAgent,
-                session: session
+                session: session,
+                skipsSlashExpansion: skipsSlashExpansion
             )
             guard stillOwnsContinuation() else {
                 rollbackWaitingInstructionSubmission(
@@ -19450,7 +19500,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func submitPreparedUserTurn(
         tabID: UUID,
         session: TabSession,
-        trimmedText: String,
+        trimmedText originalText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
@@ -19461,12 +19511,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        repromptedText: String? = nil,
+        repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         managedTurn: AgentNoncomposerTurn? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
+        guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
+        assert(repromptedText == nil || !originalText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"))
+        let trimmedText = repromptedText ?? originalText
         if let message = session.operationAdmissionFailureMessage {
             return .blocked(message: message)
         }
@@ -19486,13 +19541,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A managed cross-session steer has no composer draft and must never restore one: an empty
         // restoration draft keeps every rollback path from writing the overseer's words into the
         // target user's composer.
-        let restorationDraftText = managedTurn == nil ? (rawDraftText ?? trimmedText) : ""
+        let restorationDraftText = managedTurn == nil ? (rawDraftText ?? originalText) : ""
 
         let bubbleText: String
         if !trimmedText.isEmpty {
             // When a slash-skill is active, strip the `/skillname` prefix from the bubble
             // so the user sees only their arguments (the skill pill shows the command name).
-            if let workflow = activeWorkflow, workflow.displayName.hasPrefix("/") {
+            if repromptedText == nil, let workflow = activeWorkflow, workflow.displayName.hasPrefix("/") {
                 let tokens = Self.extractSlashSkillTokens(from: trimmedText)
                 if let token = tokens.first {
                     let argsText = (trimmedText as NSString)
@@ -19513,7 +19568,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Prepend interview instruction to the user message if enabled (first message only).
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
-        var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
+        var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? repromptedText ?? originalText
         if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
             effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
         }
@@ -19555,7 +19610,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if managedTurn == nil {
             autoSelectTaggedFilesForTurn(
                 tabID: tabID,
-                text: trimmedText,
+                text: originalText,
                 taggedFileAttachments: taggedFilesToSend
             )
         }
@@ -19575,7 +19630,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
             crossSessionAttribution: managedTurn?.attribution,
-            dispatchedProviderText: managedTurn != nil ? wrappedText : nil
+            dispatchedProviderText: managedTurn != nil || repromptedText != nil ? wrappedText : nil
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
@@ -19615,7 +19670,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 autoEffort: autoEffortAudit ?? defaultAutoAudit,
                 acceptedProviderRaw: session.selectedAgent.rawValue,
                 acceptedModelRaw: session.selectedModelRaw,
-                acceptedEffortRaw: session.selectedReasoningEffortRaw
+                acceptedEffortRaw: session.selectedReasoningEffortRaw,
+                reprompt: repromptAudit
             )
         )
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
@@ -19631,7 +19687,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
 
-        let steeringMessage = trimmedText.isEmpty ? nil : trimmedText
+        let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : wrappedText)
         if session.runState == .running,
            !session.isMCPInstructionDispatchInProgress
         {
@@ -19690,7 +19746,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                 managedTurn: managedTurn,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                skipsSlashExpansion: repromptedText != nil
             )
             return UserTurnSubmissionResult.submitted
         }
@@ -19766,7 +19823,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFilesToSend,
                         codexFallbackContext: fallbackContext,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence)
                     )
                 } else {
                     .preDispatchRejected(
@@ -19908,7 +19965,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -19927,7 +19984,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     managedTurn: managedTurn,
-                    localComposerCandidate: localComposerCandidate
+                    localComposerCandidate: localComposerCandidate,
+                skipsSlashExpansion: repromptedText != nil
                 )
                 return UserTurnSubmissionResult.submitted
             }
@@ -19961,7 +20019,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -19971,17 +20029,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 wrappedText: wrappedText,
                 attachmentsToSend: attachmentsToSend,
                 taggedFilesToSend: taggedFilesToSend,
-                trimmedText: trimmedText,
+                trimmedText: repromptedText == nil ? trimmedText : restorationDraftText,
                 userItem: userItem,
                 userInputTokenEstimate: userInputTokenEstimate,
                 managedTurn: managedTurn,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                skipsSlashExpansion: repromptedText != nil
             )
         } else {
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
             session.pendingInstructions.append(.init(
                 providerText: wrappedText,
-                localDraftText: managedTurn == nil ? wrappedText : nil
+                localDraftText: managedTurn == nil ? (repromptedText == nil ? wrappedText : restorationDraftText) : nil,
+                skipsSlashExpansion: repromptedText != nil
             ))
             // Accepted retained follow-up ownership: later Stop/provider failure restores drafts,
             // not this local user row. This is not the optimistic append boundary.
@@ -20093,7 +20153,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         userItem: AgentChatItem,
         userInputTokenEstimate: Int,
         managedTurn: AgentNoncomposerTurn? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        skipsSlashExpansion: Bool = false
     ) {
         // Steering recovery restores a queued instruction's draft into the composer. A managed
         // steer carries none, so a withdrawn one can never reappear as the target user's draft.
@@ -20123,7 +20184,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         endpoint: $0.endpoint,
                         attribution: $0.attribution
                     )
-                }
+                },
+                skipsSlashExpansion: skipsSlashExpansion
             )
             session.pendingACPSteeringInstructions.append(steering)
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
@@ -20155,7 +20217,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorableDraftText,
                 optimisticUserItemID: userItem.id,
                 createdAt: Date(),
-                supersedingProtectedTurnIDs: []
+                supersedingProtectedTurnIDs: [],
+                skipsSlashExpansion: skipsSlashExpansion
             )
             session.pendingClaudeSteeringInstructions.append(steering)
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
@@ -21029,10 +21092,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         agent: AgentProviderKind? = nil,
         session: TabSession? = nil,
-        ignoresPendingHandoff: Bool = false
+        ignoresPendingHandoff: Bool = false,
+        skipsSlashExpansion: Bool = false
     ) async -> String {
         let effectiveAgent = session?.selectedAgent ?? agent ?? activeSession?.selectedAgent ?? selectedAgent
-        let withSkillExpansion = await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
+        let withSkillExpansion = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
         let lookupContext: WorkspaceLookupContext = if let session {
             await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
         } else if let tabID = currentTabID {
@@ -21418,7 +21482,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFileAttachments: taggedFileAttachments,
                 agent: session.selectedAgent,
                 session: session,
-                ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff
+                ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
+                  skipsSlashExpansion: directStartOptions.skipsSlashExpansion
             )
 
         // A provider control command is exactly its fixed native text: prepending initial-thread
@@ -22317,6 +22382,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
+        if let operation = repromptOperation, operation.sourceTabID == tabID {
+            operation.finish(.cancelled)
+            if !session.runState.isActive { return }
+        }
         retireTimedOutManagedStopIfEligible(session)
         await runService.cancelRun(tabID: tabID, session: session, completion: completion, origin: origin)
     }
@@ -22842,7 +22911,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let text = await augmentUserMessageForProviderSend(
                 queuedText.providerText,
                 agent: session.selectedAgent,
-                session: session
+                session: session,
+                skipsSlashExpansion: queuedText.skipsSlashExpansion
             )
             guard sessions[tabID] === session, session.currentRestorationBindingToken == bindingToken,
                   session.operationAdmissionFailureMessage == nil
