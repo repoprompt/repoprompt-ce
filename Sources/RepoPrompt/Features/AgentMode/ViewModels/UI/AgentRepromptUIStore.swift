@@ -3,42 +3,59 @@ import Foundation
 
 @MainActor
 final class AgentRepromptUIStore: ObservableObject {
-    enum Phase: Equatable { case generating, clarifying, gatheringContext, refining, reviewing, failed }
+    enum Phase: Equatable {
+        case generating, clarifying, refining, completed, failed
+        var isBusy: Bool {
+            self == .generating || self == .clarifying || self == .refining
+        }
+    }
+
     struct Presentation: Identifiable, Equatable {
         let id: UUID
         let sourceTabID: UUID
         let original: String
         var modelName: String
         var phase: Phase = .generating
-        var questions: [AgentRepromptResult.Question] = []
-        var consults: [AgentRepromptConsultResult] = []
-        var isGatheringContext = false
-        var consultKinds: [AgentRepromptContextRequest.Kind] = []
-        var contextStartedAt = Date()
+        var startedAt = Date()
+        var usesChatContext = false
         var error: String?
-        var hasUnresolvedQuestions = false
+    }
+
+    struct PublicationIdentity: Equatable {
+        let operationID: UUID
+        let revision: UInt64
+    }
+
+    struct DraftUpdate: Equatable {
+        let operationID: UUID
+        let tabID: UUID
+        let revision: UInt64
+        let text: String
+        var identity: PublicationIdentity {
+            .init(operationID: operationID, revision: revision)
+        }
+    }
+
+    /// Pending publications own the canonical draft; acknowledged publications no longer suppress final user-edit flushing.
+    static func shouldFlushDraftOnDeparture(tabID: UUID, presentation: Presentation?, publication: DraftUpdate?, acknowledged: PublicationIdentity?) -> Bool {
+        if presentation?.sourceTabID == tabID, presentation?.phase.isBusy == true { return false }
+        return publication?.tabID != tabID || publication?.identity == acknowledged
     }
 
     struct Recovery: Equatable {
         let text: String
         let originalDraft: String
         let reason: String
-        var draftAtInvalidation: String = ""
+        var draftAtInvalidation = ""
     }
 
     @Published var presentation: Presentation?
+    @Published var draftUpdate: DraftUpdate?
     @Published var pendingQuestions: AgentAskUserPendingState?
-    @Published var reviewText = ""
     @Published var recoveries: [UUID: Recovery] = [:]
 
-    var canApprove: Bool {
-        presentation?.phase == .reviewing
-            && !reviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && reviewText.utf8.count <= 64 * 1024
-    }
-
-    func recover(tabID: UUID, originalDraft: String, reason: String, currentDraft: String? = nil) {
-        guard presentation?.phase == .reviewing, !reviewText.isEmpty else { return }
-        recoveries[tabID] = .init(text: reviewText, originalDraft: originalDraft, reason: reason, draftAtInvalidation: currentDraft ?? originalDraft)
+    func recover(tabID: UUID, text: String, originalDraft: String, reason: String, currentDraft: String) {
+        guard !text.isEmpty, text != originalDraft else { return }
+        recoveries[tabID] = .init(text: text, originalDraft: originalDraft, reason: reason, draftAtInvalidation: currentDraft)
     }
 }

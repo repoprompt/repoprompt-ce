@@ -1,18 +1,10 @@
 import Foundation
+import RepoPromptSettingsCore
 
-/// Versioned receipts are per recipient configuration, not a single last-provider preference.
-/// V1 understated consult exposure and must never authorize the expanded disclosure.
+/// V3 acknowledges one rewrite billing route plus the optional recent-chat exposure.
+/// Receipts from the removed consult flow cannot authorize this disclosure.
 enum AgentRepromptDisclosure {
-    static let key = "agentReprompt.acknowledgedProviders.v2."
-
-    static func identity(primaryProvider: String?, oracleProviders: [String], contextBuilderProvider: String?, allowsContext: Bool) -> String? {
-        guard let primaryProvider else { return nil }
-        let recipients = allowsContext
-            ? [primaryProvider, Set(oracleProviders).sorted().joined(separator: ","), contextBuilderProvider ?? "configured", "automatic"]
-            : [primaryProvider, "never"]
-        return recipients.map { Data($0.utf8).base64EncodedString() }.joined(separator: ".")
-    }
-
+    static let key = "agentReprompt.rewriteRecipient.v3."
     static func isAcknowledged(providerID: String?, defaults: UserDefaults) -> Bool {
         guard let providerID else { return false }
         return defaults.bool(forKey: key + providerID)
@@ -24,22 +16,65 @@ enum AgentRepromptDisclosure {
 }
 
 extension AgentModeViewModel {
-    func repromptPillProps() -> AgentRepromptPillProps {
+    func configuredRepromptModels() -> [AIModel] {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
-        let model = profile.planningModelRaw.flatMap(AIModel.fromModelName)
-        let available = model.map { repromptAvailability?($0) ?? (promptManager?.mcpOracleIsProviderConfigured(for: $0) == true) } ?? false
-        let oracleProviders = ([profile.planningModelRaw].compactMap(\.self) + profile.additionalOracleModelRaws)
-            .compactMap(AIModel.fromModelName).map { String(describing: $0.providerType) }
-        let providerID = AgentRepromptDisclosure.identity(
-            primaryProvider: model.map { String(describing: $0.providerType) }, oracleProviders: oracleProviders,
-            contextBuilderProvider: profile.contextBuilderAgentRaw ?? repromptContextBuilder?.selectedAgent.rawValue,
-            allowsContext: profile.agentRepromptContextPolicy != .never
+        var candidates = AIModel.allModels()
+        for model in promptManager?.availableModels ?? [] where !candidates.contains(model) {
+            candidates.append(model)
+        }
+        for model in [profile.agentRepromptModelRaw, profile.planningModelRaw].compactMap(\.self).compactMap(AIModel.fromModelName) where !candidates.contains(model) {
+            candidates.append(model)
+        }
+        return candidates.filter { model in
+            AgentRepromptModelPolicy.supportsSideCall(model) && model.canStream
+                && (repromptAvailability?(model) ?? (promptManager?.mcpOracleIsProviderConfigured(for: model) == true))
+        }
+    }
+
+    func repromptModelSelectionRaw() -> String {
+        modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID).agentRepromptModelRaw ?? ""
+    }
+
+    func resolvedRepromptModel(session: TabSession? = nil) -> AIModel? {
+        let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
+        return AgentRepromptModelPolicy.resolve(
+            selection: profile.agentRepromptModelRaw, primary: profile.planningModelRaw.flatMap(AIModel.fromModelName),
+            currentProvider: (session ?? activeSession)?.selectedAgent, configured: configuredRepromptModels()
         )
+    }
+
+    func setRepromptModelRaw(_ raw: String) {
+        let workspaceID = workspaceManager?.activeWorkspaceID
+        var profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        profile.agentRepromptModelRaw = raw.isEmpty ? nil : raw
+        let mode = workspaceID.map { modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode } ?? .useGlobalSettings
+        switch AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: mode) {
+        case .global: modelRouterSettingsStore.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+        case let .workspace(id): modelRouterSettingsStore.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
+        }
+        invalidateRepromptIfNeeded()
+        syncStatusPillsUIState()
+    }
+
+    func setRepromptIncludesRecentChat(_ enabled: Bool) {
+        repromptOperation?.invalidate(reason: "Recent chat context preference changed.")
+        objectWillChange.send()
+        repromptIncludesRecentChat = enabled
+        syncStatusPillsUIState()
+    }
+
+    func repromptPillProps() -> AgentRepromptPillProps {
+        let model = resolvedRepromptModel()
+        let recipient = model.map { model in
+            let route = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model).map { String(describing: $0.backendID) }
+                ?? String(describing: model.providerType)
+            return route + (repromptIncludesRecentChat ? ".recent-chat" : ".no-chat")
+        }
         return .init(
-            isOn: repromptEnabled, isAvailable: available, isPreparing: repromptOperation != nil,
-            modelDisplayName: model?.displayName, providerID: providerID,
-            requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: providerID, defaults: .standard),
-            unavailableReason: available ? nil : "Configure the primary Oracle in Agent Models settings."
+            isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isBusy == true,
+            modelDisplayName: model?.displayName, providerID: recipient,
+            requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: recipient, defaults: .standard),
+            unavailableReason: model == nil ? "Connect or choose a Re-prompt model in Agent Models settings." : nil
         )
     }
 
@@ -52,7 +87,7 @@ extension AgentModeViewModel {
                 AgentRepromptDisclosure.acknowledge(providerID: providerID, defaults: .standard)
             }
             guard AgentRepromptDisclosure.isAcknowledged(providerID: providerID, defaults: .standard) else { return }
-        }
+        } else if repromptOperation?.phase.isBusy == true { cancelReprompt() }
         repromptEnabled = enabled
         syncStatusPillsUIState()
     }
@@ -61,10 +96,9 @@ extension AgentModeViewModel {
     func restoreRepromptRecovery(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
         guard let recovery = repromptUIStore.recoveries[tabID] else { return false }
         guard confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
-        // Explicit replacement consumes restoration fragments already present in this draft.
-        // Otherwise the next editor store could prepend the rejected original again.
+        repromptOperation?.cancel(restoreOriginal: false, recover: false)
         _ = loadDraftSnapshotForComposer(for: tabID)
-        restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt brief.", strategy: .replaceAlways)
+        restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt draft.", strategy: .replaceAlways)
         repromptUIStore.recoveries[tabID] = nil
         return true
     }

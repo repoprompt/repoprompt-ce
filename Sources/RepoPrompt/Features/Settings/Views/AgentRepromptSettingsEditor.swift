@@ -7,13 +7,12 @@ struct AgentRepromptSettingsEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Re-prompt guidance").font(.callout.weight(.medium))
-            Text("The primary Oracle turns each eligible local message into a balanced task brief. You review and approve every result. It may consult Oracle or Context Builder for repository context. These settings apply to the selected global/workspace scope; they do not enable Re-prompt.")
+            Text("Re-prompt streams a Markdown rewrite into the composer. First Send prepares; the next Send dispatches your edited draft. Automatic prefers a connected Claude Code or Codex subscription; explicit models never fall back to another billing route. No repository consults or tools are used. These settings apply to the selected global/workspace scope; they do not enable Re-prompt.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Picker("Gather repository context", selection: $viewModel.repromptContextPolicyDraft) {
-                Text("Automatic").tag(AgentRepromptContextPolicy.automatic)
-                Text("Never").tag(AgentRepromptContextPolicy.never)
-            }
-            .pickerStyle(.segmented)
+            AgentRepromptModelPicker(
+                selection: $viewModel.repromptModelDraft,
+                availableModels: viewModel.apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream }
+            )
             TextEditor(text: $viewModel.repromptGuidanceDraft)
                 .font(.body).frame(height: 180).padding(6)
                 .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))

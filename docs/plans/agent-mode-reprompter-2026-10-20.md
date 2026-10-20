@@ -619,6 +619,80 @@ docs/privacy/telemetry.md
   - `make dev-lint`: pinned SwiftFormat (0/1845 files require formatting) and strict SwiftLint; ticket `b8ffb1a0-a5e9-4755-b388-08bc834914ad`.
 - Static comparison against base confirms no whitespace-only replacement hunks remain in the seven named files. No visible-app lifecycle actions, live-provider requests, pushes or main-checkout edits were performed. The earlier unfiltered-suite/manual acceptance gaps remain outside this focused review-fix validation.
 
+## v2 — inline, streaming preparation (2026-10-21)
+
+This user-approved rework supersedes the v1 modal/consult design and its UI acceptance requirements above.
+
+- First Send prepares without acquiring/latching a composer submit claim. A preparation UUID, per-call revision, operation-owned draft generation and 40 ms coalesced publications fence every stream update. The second Send obtains a fresh local composer claim and atomically adopts the completed draft/speculation. Composer text is the only editable authority; attachments/tagged files and workflows remain on their ordinary owner.
+- Removed `AgentRepromptSheet` and its host. Inline status/elapsed time, Cancel/Esc, Show original, Undo and recoverable partial/edited text use the existing composer. Read-only streaming uses its existing capped-height scroll view; one native undo action represents the replacement rather than one action per token. Send original becomes available after five seconds as a second explicit Send action: it restores the original and dispatches through ordinary fresh-claim admission, without waiting for generation. Completing generation itself never dispatches.
+- Before sending questions use a transient transcript slot with the existing timeout-free ask_user wizard. They never enter implementing/provider history or runtime ask_user state. Skips do not refine; substantive answers cause at most one refinement rebuilt from original text + answers.
+- New profile-scoped `agentRepromptModelRaw` extends schema 13: nil is Automatic, `primary-oracle` opts into the primary Oracle, and any other raw selection is explicit (unknown/disconnected values do not silently fall back). Guidance/model values retain requiredSchemaVersion feature fencing and scoped copy/reset/conflict behavior. The removed context-policy field is safely ignored on decode and not written back.
+- Automatic uses the current catalog's Sonnet 5.5 Low and Codex GPT-6.1 Sol Low tiers, preferring the current agent's connected native subscription, then the other subscription, then configured API models, with Oracle last. Resolution is frozen for the operation/retries. Settings and the pill's right-click menu share an OptimizedModelPicker binding-backed selector, filtered to configured streaming side-call models. The resolved model is visible. Auto Effort uses its existing masked summary/decision policy/backend/coordinator for the rewriter's supported effort variants, without mutating implementing-session settings.
+- Genuine provider streaming replaces complete-string rewriting. Native Claude print mode now has a request-scoped NDJSON partial-message path with strict empty MCP config, no tools and no global preference mutation; other side calls use provider.streamMessage. The 60/120-second safety race remains. Markdown is emitted directly; an explicit framed trailing question block is withheld incrementally (including delimiter prefixes), bounded and validated only when complete. Truncated/error output stays recoverable and cannot unlock Send as a success.
+- Deleted consultant, consultant tests, context request/result types, context-policy type/editor, separate review text/approval authority, frozen lookup/git packaging, Oracle chat links, selection commit/rollback and prompt-preservation/consult notification suppression plumbing. Generic Oracle cancellation checks/cleanup are retained: they protect ordinary Oracle/MCP calls independently of the removed consultant.
+- Router/turn-effort speculation is keyed to preparation UUID + complete content, starts only after a complete brief, transfers to the fresh local claim and is discarded on edits/stale policy. Audits retain outcomes and speculation/fallback flags only; no consult branches remain.
+
+### v2 recent-chat addendum
+
+- Include recent chat context defaults **on, transient per window**, like enablement. Only at least two previously completed user turns qualify. The projection uses canonical completion identities, user bubble text (approved rewrite where applicable), and only the final assistant text; never provider workflow envelopes, tools, attachments, reasoning or diffs.
+- Last up to three prior turns, assistant replies trimmed UTF-8-safely to 1.5 KiB (start + end), serialized total capped at 8 KiB by dropping oldest first. Only post-compaction rows qualify. The composer strip says with chat context only when excerpts were actually included; the pill menu exposes the toggle. Session-link/noncomposer submission paths never invoke preparation/history packaging.
+- Fixed service contract, not editable guidance, marks history as background for vocabulary/intent only: current message wins, assistant statements are unverified, and corrections/frustration/redirects must abandon rather than perpetuate prior failed approaches. Updated recipient disclosure and privacy documentation mention excerpts; version-3 disclosure receipts do not reuse consult-era acknowledgements.
+
+### v2 implementation findings / deviations
+
+- Providers without a catalogued, transport-supported effort variant retain their provider-native effort behavior. In particular the current Anthropic API SDK does not expose an effort/output-config field; no unsupported request parameter is invented. Native subscription and supported API variants use Low by default and the existing Auto Effort decision path when enabled, while preserving explicit billing/service tiers.
+- Independent static review (`untitled-chat-1AAF50`) found four issues, verified and corrected: composer publications now have revision acknowledgements so final user edits flush on tab departure; Claude whole-message fallback rejects truncated stop reasons; Automatic includes configured Claude-compatible API routes before Oracle; history strips indented/quoted backtick and tilde diff/patch fences and conservatively omits replies containing raw/unlabelled unified-patch signatures. Focused regressions cover each.
+- Preflight's app-test-import-file ratchet rejected separate new history and model-policy test files (341 > 340). The two suites share `AgentRepromptHistoryTests.swift`; no baseline was loosened and no tests were removed.
+- The existing composer height cap/internal scroll was reused rather than introducing a second text editor. Native undo registers one completed replacement action rather than holding an undo group open across asynchronous streaming.
+
+### v2 changed-file inventory
+
+Paths are relative to their indicated owner. 50 files: 9 added, 36 modified, 5 deleted.
+
+| Owner | Added / modified files |
+| --- | --- |
+| `Sources/RepoPrompt/App` | `WindowStateComposition.swift` |
+| `Sources/RepoPrompt/Features/AgentMode/Models` | `AgentRepromptModels.swift`, **new** `AgentRepromptHistory.swift`, **new** `AgentRepromptModelPolicy.swift` |
+| `…/AgentMode/Runtime` | `AgentRepromptService.swift`, **new** `AgentRepromptOperation.swift` |
+| `…/AgentMode/Routing` | `AgentAutomationTurnAudit.swift` |
+| `…/AgentMode/ViewModels` | `AgentModeViewModel.swift`, `AgentModeViewModel+DraftsAttachments.swift`, `AgentModeViewModel+Reprompt.swift`, `AgentModeViewModel+RepromptAutomation.swift`, **new** `AgentModeViewModel+RepromptEffort.swift`, `AgentModeViewModel+RepromptUI.swift`, `AgentModeViewModel+Routing.swift`, `UI/AgentModelsSettingsViewModel.swift`, `UI/AgentRepromptUIStore.swift` |
+| `…/AgentMode/Views` | `AgentInputBar.swift`, `AgentModeView.swift`, `Components/AgentRepromptPill.swift`, `Components/AgentStatusPillsRow.swift`, **new** `Components/AgentRepromptComposerStrip.swift` |
+| `Sources/RepoPrompt/Features/ContextBuilder/ViewModels` | `ContextBuilderAgentViewModel.swift`, `ContextBuilderRunLifecycle.swift` |
+| `Sources/RepoPrompt/Features/Settings/Views` | `AgentRepromptSettingsEditor.swift`, **new** `AgentRepromptModelPicker.swift` |
+| `Sources/RepoPrompt/Infrastructure/AI/Providers` | `ClaudeCodeProvider.swift`, **new** `ClaudeCode/ClaudeCLITextStreamDecoder.swift` |
+| `Sources/RepoPrompt/Infrastructure/MCP` | `MCPInvocationContext.swift`, `ViewModels/MCPServerViewModel+TabContext.swift` |
+| `Sources/RepoPrompt/Infrastructure/UI/TextField` | `ResizableTextField.swift` |
+| `Sources/RepoPromptSettingsCore` | `AgentRepromptGuidance.swift`, `GlobalSettingsDocument.swift`, `GlobalSettingsStore.swift`, **new** `AgentRepromptModelPreference.swift` |
+| `Tests/RepoPromptTests/AgentMode` | `AgentRepromptServiceTests.swift`, `AgentRepromptSubmissionTests.swift`, **new** `AgentRepromptHistoryTests.swift` (history and model-policy suites), `Routing/AgentRepromptRoutingIntegrationTests.swift`, `SessionLinks/AgentRepromptSessionLinkIsolationTests.swift`, `ToolCards/AgentRepromptPresentationTests.swift` |
+| `Tests/RepoPromptTests/Settings` | `AgentRepromptSettingsTests.swift` |
+| `Tests/RepoPromptSettingsCoreTests` | `AgentRepromptGuidanceTests.swift`, `AgentRepromptSchemaTests.swift` |
+| `docs` | `plans/agent-mode-reprompter-2026-10-20.md`, `privacy/telemetry.md` |
+
+Deleted:
+- `Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptContextConsultant.swift`
+- `Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptSheet.swift` (including its host)
+- `Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+ContextHint.swift` (ordinary helpers restored to their existing TabContext owner)
+- `Sources/RepoPromptSettingsCore/AgentRepromptContextPolicy.swift`
+- `Tests/RepoPromptTests/AgentMode/AgentRepromptContextConsultantTests.swift`
+
+### v2 verification
+
+Final coordinated validation (2026-10-21), all exit 0:
+
+| Command | Result | Conductor ticket |
+| --- | --- | --- |
+| `make dev-test FILTER=AgentReprompt` | 53 tests, 0 failures (50 app + 3 settings-core), including both consolidated new suites | `6de9c6f1-c84e-42bd-ab9b-d25496e99751` |
+| `make dev-test FILTER=AgentSessionLink` | 1,273 tests, 0 failures | `0d60bb1b-8389-4026-82f2-35990e25cc08` |
+| `make dev-test FILTER=ContextBuilder` | 213 tests, 0 failures | `492fc46e-4b99-46a1-9b02-d1830c3dce1e` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | Product build passed; no packaging/launch | `4a77389a-4a1d-45ed-a540-edc9bf90b5fe` |
+| `make dev-lint` | SwiftFormat 0/1,849 files need formatting; strict SwiftLint passed | `5cfa3247-de5c-422e-90bd-fdca48a332f9` |
+
+Changed Swift files were formatted with the pinned SwiftFormat 0.61.1 only; no repository-wide mutation. Independent static review was performed once and all four verified findings were corrected. Earlier attempts exposed a missing explicit `self`, a native-undo test-harness grouping exception, and a prohibited `.help` modifier; these were fixed before the final green runs. Session-link validation was repeated on a frozen source snapshot after an earlier successful run reported changed source freshness.
+
+Staged-index commit preflight passed after test consolidation (secret scan: no leaks; guardrails and all 15 guardrail tests passed), and must be rerun after staging this final documentation update. Remaining modularization growth messages are advisory, not ratchet failures; no baseline was relaxed.
+
+Not run: unfiltered/release validation or live-provider/manual UI smoke testing. No visible app lifecycle action, push or main-checkout mutation was performed; those remain outside this request.
+
 ## 9. Open questions
 
 None that block implementation. Step 1 verifications (Claude Code cwd, per-run Context Builder enhancement override, Oracle background activation/title) can each widen a work item but don't change the design.

@@ -168,8 +168,6 @@ struct ContextBuilderRunBehavior: Equatable {
     let questionTimeoutSeconds: TimeInterval
     let allowClarifyingQuestions: Bool
     let automaticFollowUp: ContextBuilderFollowUpType?
-    /// Re-prompt discovery must not apply tool-authored prompts or the empty-prompt fallback.
-    var preservesPromptExactly: Bool = false
 
     static func ui(
         settings: ContextBuilderBehaviorSettings,
@@ -221,8 +219,6 @@ struct ContextBuilderMCPRunConfiguration {
     let responseType: String?
     let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
     let isSystemWorkspace: Bool
-    /// Called synchronously at the canonical selection write, before UI projection awaits.
-    var selectionCommitObserver: ((StoredSelection) -> Void)?
 
     var effectiveTokenBudget: Int {
         runBehavior.tokenBudget

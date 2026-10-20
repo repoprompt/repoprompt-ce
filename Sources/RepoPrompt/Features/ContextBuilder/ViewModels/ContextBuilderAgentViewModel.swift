@@ -2249,43 +2249,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    /// Local pre-submission discovery: private run ownership, context-only output, and no prompt mutation.
-    @MainActor
-    func runContextBuilderForReprompt(
-        identity: WorkspaceSelectionIdentity,
-        nestedTabContext: MCPTabContextSnapshot,
-        instructions: String,
-        workspaceContext: ContextBuilderWorkspaceContext? = nil,
-        onSelectionCommitted: ((StoredSelection) -> Void)? = nil
-    ) async throws -> MCPContextBuilderRunCompletion {
-        let resolved = try await resolveMCPRunAuthority(
-            identity: identity, nestedTabContext: nestedTabContext,
-            workspaceContext: workspaceContext, responseType: "clarify", oraclePreset: nil
-        )
-        try Task.checkCancellation()
-        let base = resolved.configuration
-        let behavior = ContextBuilderRunBehavior(
-            tokenBudget: base.runBehavior.tokenBudget, enhancementMode: .preserve,
-            questionTimeoutSeconds: base.runBehavior.questionTimeoutSeconds,
-            allowClarifyingQuestions: false, automaticFollowUp: nil, preservesPromptExactly: true
-        )
-        let configuration = ContextBuilderMCPRunConfiguration(
-            identity: identity, nestedTabContext: nestedTabContext,
-            providerWorkspacePath: base.providerWorkspacePath, runBehavior: behavior,
-            responseType: "clarify", generatedResponseAuthority: .contextOnly,
-            isSystemWorkspace: base.isSystemWorkspace, selectionCommitObserver: onSelectionCommitted
-        )
-        let token = try beginMCPControlledRun(forTabID: identity.tabID, workspaceID: identity.workspaceID, responseType: "clarify", planModelName: nil)
-        defer { clearMCPControlledRun(forTabID: identity.tabID, controlToken: token) }
-        return try await runContextBuilderForMCP(
-            authority: ContextBuilderResolvedRunAuthority(
-                configuration: configuration, agentKind: resolved.agentKind, modelRaw: resolved.modelRaw,
-                modelParameterSelections: resolved.modelParameterSelections
-            ),
-            instructionsOverride: instructions, workspaceContext: workspaceContext, mcpControlToken: token
-        )
-    }
-
     #if DEBUG
         @MainActor
         func runContextBuilderForMCP(
@@ -3671,8 +3634,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         )
                     }
                     var usedAgentOutputAsPrompt = false
-                    if record.session.runStartBehavior?.preservesPromptExactly != true,
-                       tab.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    if tab.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                        let promptFallback = record.session.lastAgentOutput,
                        !promptFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     {
@@ -3880,9 +3842,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     },
                     progressReporter: record.progressReporter,
                     deferRunMappingCleanupUntilCaller: true,
-                    promptFallback: record.session.lastAgentOutput,
-                    preservePromptExactly: record.session.runStartBehavior?.preservesPromptExactly == true,
-                    onSelectionCommitted: record.mcpConfiguration?.selectionCommitObserver
+                    promptFallback: record.session.lastAgentOutput
                 )
                 contextCommitResult = result
                 #if DEBUG

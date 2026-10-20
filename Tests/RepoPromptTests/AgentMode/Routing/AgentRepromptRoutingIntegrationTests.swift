@@ -17,7 +17,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         let claim = try fixture.claim(text: "Vague original")
         defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
         let approved = "Implement the explicitly requested parser outcome."
-        fixture.viewModel.startRepromptSpeculation(claim: claim, operationID: UUID(), text: approved)
+        fixture.viewModel.startRepromptSpeculation(session: fixture.session, operationID: claim.attempt.id, text: approved, originalText: claim.attempt.rawDraftSnapshot)
         let speculation = try XCTUnwrap(fixture.viewModel.repromptSpeculations[claim.attempt.id])
         _ = await speculation.routingTask?.value
         let before = await fixture.backend.requests
@@ -66,7 +66,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
             defer { fixture.cleanUp() }
             let claim = try fixture.claim(text: "Original")
             defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
-            fixture.viewModel.startRepromptSpeculation(claim: claim, operationID: UUID(), text: "Generated")
+            fixture.viewModel.startRepromptSpeculation(session: fixture.session, operationID: claim.attempt.id, text: "Generated", originalText: claim.attempt.rawDraftSnapshot)
             let speculation = try XCTUnwrap(fixture.viewModel.repromptSpeculations[claim.attempt.id])
             _ = await speculation.routingTask?.value
             if !edited {
@@ -81,28 +81,22 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         }
     }
 
-    func testCancellationReleasesComposerClaimAndCancelsSpeculation() async throws {
+    func testPreparationSpeculationAdoptsIntoFreshLocalClaimAndCancellationHasNoClaim() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
-        fixture.viewModel.repromptEnabled = true
-        fixture.viewModel.repromptAvailability = { _ in true }
-        fixture.viewModel.repromptService = .init(transport: { _, _ in AgentRepromptServiceTests.valid })
-        var profile = fixture.store.globalAgentModelsProfile()
-        profile.planningModelRaw = AIModel.gpt61Sol.rawValue
-        fixture.store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-        let claim = try fixture.claim(text: "Original")
-        let task = Task {
-            await fixture.viewModel.executeComposerSubmitAttempt(text: "Original", claim: claim, createAndActivateSessionTab: {
-                XCTFail("Cancellation must precede destination creation")
-                return nil
-            })
-        }
-        try await AsyncTestWait.waitUntil("Re-prompt review", timeout: 5) { fixture.viewModel.repromptUIStore.presentation?.phase == .reviewing }
-        fixture.viewModel.cancelReprompt()
-        guard case let .blocked(message) = await task.value else { return XCTFail("Cancelled preparation submitted") }
-        XCTAssertTrue(message.isEmpty, "User cancellation must not display an error notice.")
-        XCTAssertFalse(fixture.viewModel.composerSubmitClaimIsCurrent(claim))
-        XCTAssertNil(fixture.viewModel.repromptSpeculations[claim.attempt.id])
+        fixture.enableReprompt()
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        try await AsyncTestWait.waitUntil("prepared draft", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        let operationID = try XCTUnwrap(fixture.viewModel.repromptOperation?.id)
+        let staged = try XCTUnwrap(fixture.viewModel.repromptSpeculations[operationID])
+        _ = await staged.routingTask?.value
+        let claim = try fixture.claim(text: fixture.session.draftText, local: true)
+        defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+        XCTAssertNil(fixture.viewModel.repromptOperation)
+        XCTAssertNil(fixture.viewModel.repromptSpeculations[operationID])
+        XCTAssertTrue(fixture.viewModel.repromptSpeculations[claim.attempt.id] === staged)
+        XCTAssertEqual(fixture.viewModel.repromptDispatchTexts[claim.attempt.id], AgentRepromptServiceTests.valid)
         XCTAssertTrue(fixture.session.items.isEmpty)
     }
 }
@@ -147,17 +141,23 @@ final class AgentRepromptTestFixture {
 
     func enableReprompt() {
         viewModel.repromptEnabled = true
-        viewModel.repromptAvailability = { _ in true }
-        viewModel.repromptService = .init(transport: { _, _ in AgentRepromptServiceTests.valid })
+        viewModel.repromptAvailability = { $0 == .gpt61SolLow }
+        viewModel.repromptService = .init(transport: { _, _, publish in try await publish(AgentRepromptServiceTests.valid) })
         var profile = store.globalAgentModelsProfile()
-        profile.planningModelRaw = AIModel.gpt61Sol.rawValue
+        profile.agentRepromptModelRaw = AIModel.gpt61SolLow.rawValue
         store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
     }
 
-    func claim(text: String) throws -> AgentModeViewModel.AgentComposerSubmitClaim {
+    func begin(text: String) throws -> Bool {
+        viewModel.storeDraftText(for: session.tabID, text)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        return viewModel.beginComposerReprompt(target: target, text: text)
+    }
+
+    func claim(text: String, local: Bool = false) throws -> AgentModeViewModel.AgentComposerSubmitClaim {
         let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
         let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: text)
-        guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false)
+        guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: local)
         else { throw CancellationError() }
         return claim
     }

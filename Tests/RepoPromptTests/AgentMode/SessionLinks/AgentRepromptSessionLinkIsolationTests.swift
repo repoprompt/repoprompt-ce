@@ -9,7 +9,7 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         fixture.viewModel.repromptEnabled = true
-        fixture.viewModel.repromptService = .init(transport: { _, _ in XCTFail("Noncomposer input must not rewrite")
+        fixture.viewModel.repromptService = .init(transport: { _, _, _ in XCTFail("Noncomposer input must not rewrite")
             throw CancellationError()
         })
         fixture.session.installRunID(UUID())
@@ -29,7 +29,7 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         defer { fixture.cleanUp() }
         fixture.viewModel.repromptEnabled = true
         fixture.viewModel.interviewFirst = true
-        fixture.viewModel.repromptService = .init(transport: { _, _ in XCTFail("Managed steer must not rewrite")
+        fixture.viewModel.repromptService = .init(transport: { _, _, _ in XCTFail("Managed steer must not rewrite")
             throw CancellationError()
         })
         fixture.session.installRunID(UUID())

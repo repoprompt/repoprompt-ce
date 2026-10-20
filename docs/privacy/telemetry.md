@@ -78,45 +78,47 @@ Claude run-event telemetry remains separate and cannot authorize usage collectio
 
 ## Agent Mode Re-prompt (model requests, not telemetry)
 
-Re-prompt is off by default and enabled separately in each window. With consent, each eligible
-local composer message is sent to the effective workspace profile's primary Oracle model for a
-stateless, tool-less rewrite. The request contains only the message text, rewrite guidance, and
-(optionally) a bounded manifest of workspace root names and selected relative file paths. It does
-not include conversation history, attachments, attachment names, or attachment paths. The primary
-Oracle may use a different provider from the implementing agent and has that provider's retention
-terms. Do not include secrets you do not want that provider to receive.
+Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
+sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
+relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Automatic
+prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
+when possible, then the other subscription, then configured API providers, with the primary Oracle
+last. Explicit models and Use primary Oracle never silently fall back. A call freezes its billing
+route; a failure or retry cannot switch it. The resolved model is displayed. The provider's retention
+and billing terms apply; do not send secrets you do not want that recipient to receive.
 
-With automatic context gathering, the rewriter may request one ordinary background Oracle consult
-and/or one Context Builder run. **The Oracle consult uses the configured roster (primary plus
-additional Oracles), not only the primary rewrite model.** Its normal selected-context packaging
-includes selected file contents, the tab prompt and frozen git review context. **Context Builder
-uses its own configured agent/provider** and repository-reading tools, so repository contents may
-also be sent to that provider. Ordinary consult chat/run history persists. Consult results and
-clarification answers may be sent with the original message to the primary Oracle in one refinement
-request. Each recipient has its own retention terms and may differ from the implementing agent.
-The enable disclosure covers these recipients; versioned acknowledgements are stored separately
-per primary/roster-provider/Context Builder-provider configuration and context policy. Changing
-that recipient configuration or enabling automatic gathering requires a matching acknowledgement;
-older acknowledgements of the incomplete disclosure do not count.
+**Include recent chat context** is on by default and transient per window (available in the pill's
+right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
+the last up to three prior user bubble texts (the rewritten text when applicable) and each turn's
+final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized
+excerpt budget is 8 KiB; oldest turns are dropped first. Only post-compaction turns qualify.
+Tool calls/results, thinking, diffs, attachment payloads and system/workflow envelopes are excluded.
+The strip says **with chat context** when excerpts are actually used. Fixed, non-editable framing
+makes history background for vocabulary/intent only: the current message always wins, assistant
+claims are unverified, and corrections/redirections must abandon rather than perpetuate failed
+approaches. Turn history never creates new requirements unless the current message restates them.
 
-**Gather repository context: Never** omits the manifest and disables both consults. Unknown stored
-context-policy values fail closed to Never (an absent setting retains the Automatic default).
-Context gathering can also be
-skipped per preparation. Context Builder never changes the tab prompt in this flow; its selected
-files are kept on approval, and cancellation restores its selection only if the user has not
-changed it since the commit.
+Calls are stateless and tool-less: **no Oracle consults, Context Builder, repository file contents,
+git review packaging or selection mutations**. Composer attachments/tagged files are preserved
+locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
+provider-history rows. Substantive answers may cause one refinement from original text plus answers;
+skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
+chat exposure; old consult-flow receipts do not authorize v2.
 
-Every rewrite requires editable review and explicit approval before the implementing agent receives
-anything. Review edits are not sent back to the rewrite model. If Model Router or Auto Effort is
-enabled, its opted-in decision service judges the approved brief under its normal masking/size
-rules (Auto Effort may use the original for an oversized brief). A speculative judgment can start
-while review is open; cancelling or editing afterward cannot undo data already sent to that
-service. No implementing turn is sent speculatively.
+The brief streams into the existing composer, read-only during preparation. Nothing auto-sends:
+a successful preparation unlocks editing and the next Send dispatches the current draft without
+rewriting it again. After five seconds, Send original is an explicit second Send action through
+fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
+recovery banner. Truncated output is recoverable but cannot be sent as a successful preparation.
+Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.
 
-Rewrite drafts and answers remain in memory; approved text becomes an ordinary transcript row.
-Local automation audit records contain only outcomes, consult statuses, and reuse/fallback flags,
-not message text, guidance, answers, paths, or generated briefs. These model calls are independent
-of **Share crash reports and diagnostics**.
+Enabled Auto Effort can judge the rewriter's effort using its existing masked decision service.
+Router/implementing-turn Auto Effort speculation starts only after a complete brief, never partial
+tokens, and is discarded on edits or stale policy. These opted-in services may have received the
+complete draft even if it is later undone. Composer edits are never sent back to the rewrite model.
+No implementing turn is sent speculatively. Minimal local automation audits store outcomes and
+reuse/fallback flags, not message text, guidance, excerpts, answers, paths or generated briefs.
+These model calls are independent of **Share crash reports and diagnostics**.
 
 ## What is collected
 

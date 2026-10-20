@@ -281,7 +281,6 @@ enum WindowStateCompositionFactory {
             perfRecorder: AppAgentModePerfRecorder()
         )
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
-        agentModeViewModel.repromptContextBuilder = contextBuilderAgentViewModel
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

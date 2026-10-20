@@ -65,6 +65,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentRepromptPill(
                     props: snapshot.reprompt,
+                    viewModel: agentModeVM,
                     setEnabled: { agentModeVM.setRepromptEnabled($0, acknowledgingProviderID: $1) },
                     openSettings: {
                         NotificationCenter.default.post(name: .showAgentModelsSettingsTab, object: nil, userInfo: ["windowID": windowID])

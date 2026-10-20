@@ -231,7 +231,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             additionalOracleModelRaws: scalarPreferences.modelSelection?.additionalOracleModels ?? [],
             oracleReconciliationGuidance: scalarPreferences.modelSelection?.oracleReconciliationGuidance,
             agentRepromptGuidance: scalarPreferences.modelSelection?.agentRepromptGuidance,
-            agentRepromptContextPolicy: scalarPreferences.modelSelection?.agentRepromptContextPolicy,
+            agentRepromptModelRaw: scalarPreferences.modelSelection?.agentRepromptModelRaw,
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
@@ -256,7 +256,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             : normalized.additionalOracleModelRaws
         modelSelection.oracleReconciliationGuidance = normalized.oracleReconciliationGuidance
         modelSelection.agentRepromptGuidance = normalized.agentRepromptGuidance
-        modelSelection.agentRepromptContextPolicy = normalized.agentRepromptContextPolicy
+        modelSelection.agentRepromptModelRaw = normalized.agentRepromptModelRaw
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
@@ -1920,7 +1920,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             additionalOracleModelRaws: profile.additionalOracleModelRaws,
             oracleReconciliationGuidance: profile.oracleReconciliationGuidance,
             agentRepromptGuidance: profile.agentRepromptGuidance,
-            agentRepromptContextPolicy: profile.agentRepromptContextPolicy,
+            agentRepromptModelRaw: profile.agentRepromptModelRaw,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,

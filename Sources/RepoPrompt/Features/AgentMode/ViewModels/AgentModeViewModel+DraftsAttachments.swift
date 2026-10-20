@@ -163,6 +163,9 @@ extension AgentModeViewModel {
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
+            if repromptOperation?.sourceTabID == tabID {
+                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {

@@ -16,17 +16,17 @@ final class AgentRepromptSettingsTests: XCTestCase {
             }
             let vm = AgentModelsSettingsViewModel(apiSettingsVM: api, workspaceID: workspaceID, settingsManager: store, settingsStore: store, notificationCenter: NotificationCenter())
             vm.repromptGuidanceDraft = "  My voice\nKeep uncertainty. \n"
-            vm.repromptContextPolicyDraft = .never
+            vm.repromptModelDraft = "specific-model"
             XCTAssertTrue(vm.isRepromptDraftDirty)
-            XCTAssertNotEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptContextPolicy, .never)
+            XCTAssertNotEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model")
             XCTAssertTrue(vm.saveRepromptDraft())
             XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptGuidance, "My voice\nKeep uncertainty.")
-            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptContextPolicy, .never)
+            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model")
             vm.setOracleModel(raw: AIModel.gpt61Sol.rawValue)
-            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptContextPolicy, .never)
+            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model")
             XCTAssertTrue(vm.restoreDefaultRepromptGuidance())
             XCTAssertEqual(vm.repromptGuidanceDraft, AgentRepromptGuidance.defaultText)
-            XCTAssertNil(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptContextPolicy)
+            XCTAssertNil(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw)
             if workspaceID != nil {
                 XCTAssertEqual(store.globalAgentModelsProfile(), global)
             }

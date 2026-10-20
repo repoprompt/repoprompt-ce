@@ -51,10 +51,9 @@ extension AgentModeViewModel {
         }
     }
 
-    func startRepromptSpeculation(claim: AgentComposerSubmitClaim, operationID: UUID, text: String) {
-        cancelRepromptSpeculation(claimID: claim.attempt.id)
-        guard let runtime = modelRouterRuntime, composerSubmitClaimIsCurrent(claim) else { return }
-        let session = claim.sourceSession
+    func startRepromptSpeculation(session: TabSession, operationID: UUID, text: String, originalText: String) {
+        cancelRepromptSpeculation(claimID: operationID)
+        guard let runtime = modelRouterRuntime, sessions[session.tabID] === session else { return }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let allowed = providers(for: .primarySession, configuration: configuration)
         let routesFresh = configuration.enabled && configuration.validity == .valid
@@ -88,7 +87,7 @@ extension AgentModeViewModel {
         {
             speculation.effortTask = Task {
                 await chooseAutoEffortForUserTurn(
-                    text: Self.automationJudgingText(original: claim.attempt.rawDraftSnapshot, reprompted: text),
+                    text: Self.automationJudgingText(original: originalText, reprompted: text),
                     session: session, workflow: session.selectedWorkflow,
                     requestID: speculation.requestID, isSpeculative: true, isRepromptReplacement: true
                 )
@@ -96,7 +95,7 @@ extension AgentModeViewModel {
         } else {
             return
         }
-        repromptSpeculations[claim.attempt.id] = speculation
+        repromptSpeculations[operationID] = speculation
     }
 
     func reusableRepromptRouting(
@@ -152,30 +151,6 @@ extension AgentModeViewModel {
         }
         speculation.reuse = .reused
         return speculation
-    }
-
-    func recordRepromptOutcome(claim: AgentComposerSubmitClaim, operation: AgentRepromptOperation, outcome: AgentRepromptOperation.Outcome) {
-        let accepted: AgentAutomationTurnAudit.Reprompt.Outcome
-        switch outcome {
-        case .approved: accepted = .approved
-        case .original: accepted = .sentOriginal
-        case .cancelled:
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-            return
-        }
-        var audit = AgentAutomationTurnAudit.Reprompt(outcome: accepted)
-        for result in operation.consultant?.resultsSnapshot ?? [] {
-            let status = AgentAutomationTurnAudit.Reprompt.ConsultStatus(rawValue: result.status) ?? .failed
-            if result.kind == .oracle {
-                audit.oracle = status
-            } else {
-                audit.contextBuilder = status
-            }
-        }
-        repromptAudits[claim.attempt.id] = audit
-        if case .original = outcome {
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-        }
     }
 
     func repromptAuditForClaim(_ claim: AgentComposerSubmitClaim, judgedText: AgentAutomationTurnAudit.Reprompt.JudgedText? = nil) -> AgentAutomationTurnAudit.Reprompt? {

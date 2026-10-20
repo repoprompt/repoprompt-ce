@@ -2421,10 +2421,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // MARK: - Initialization
 
     weak var oracleViewModel: OracleViewModel?
-    weak var repromptContextBuilder: ContextBuilderAgentViewModel?
     var repromptService: AgentRepromptService?
     let repromptUIStore = AgentRepromptUIStore()
     var repromptEnabled = false
+    var repromptIncludesRecentChat = true
+    var repromptDispatchTexts: [UUID: String] = [:]
+    var repromptDispatchOriginals: [UUID: String] = [:]
     var repromptOperation: AgentRepromptOperation?
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
@@ -18066,6 +18068,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         claim: AgentComposerSubmitClaim,
         createAndActivateSessionTab: () async -> UUID?
     ) async -> UserTurnSubmissionResult {
+        // The reviewed composer is the fresh claim snapshot; command/workflow classification
+        // still belongs to the original pre-rewrite message, never to generated slash-like text.
+        let text = repromptDispatchOriginals[claim.attempt.id] ?? text
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         var approvedBriefForRecovery: String?
@@ -18083,6 +18088,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             cancelRepromptSpeculation(claimID: claim.attempt.id)
             repromptAudits[claim.attempt.id] = nil
+            repromptDispatchTexts[claim.attempt.id] = nil
+            repromptDispatchOriginals[claim.attempt.id] = nil
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18109,14 +18116,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
                 return blocked
             }
-            let repromptedText: String?
-            switch await prepareComposerReprompt(text: text, claim: claim) {
-            case .original: repromptedText = nil
-            case let .approved(brief):
-                repromptedText = brief
-                approvedBriefForRecovery = brief
-            case .cancelled: return .blocked(message: "")
-            }
+            let repromptedText = repromptDispatchTexts[claim.attempt.id]
+            approvedBriefForRecovery = repromptedText
             let pendingState = Self.pendingUserTurnState(from: preparedSession)
             guard let initialLocation = target.expectedInitialStartLocation,
                   initialLocation != .local,
@@ -18209,14 +18210,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: sourceSession) {
                 return blocked
             }
-            let repromptedText: String?
-            switch await prepareComposerReprompt(text: text, claim: claim) {
-            case .original: repromptedText = nil
-            case let .approved(brief):
-                repromptedText = brief
-                approvedBriefForRecovery = brief
-            case .cancelled: return .blocked(message: "")
-            }
+            let repromptedText = repromptDispatchTexts[claim.attempt.id]
+            approvedBriefForRecovery = repromptedText
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: sourceSession,
                 fallbackSelectedAgent: selectedAgent,
@@ -18729,7 +18724,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard repromptedText == nil || isLocalComposerInput else { return .blocked(message: "Re-prompt is local composer input only.") }
-        assert(repromptedText == nil || !trimmedText.hasPrefix("/"), "Re-prompt must bypass slash input")
         let attachmentsToSend = session.pendingImageAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
@@ -19620,7 +19614,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
-        assert(repromptedText == nil || !originalText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"))
         let trimmedText = repromptedText ?? originalText
         if let message = session.operationAdmissionFailureMessage {
             return .blocked(message: message)
@@ -22647,6 +22640,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireActiveTabOwnership: Bool
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
+        if requireActiveTabOwnership, let operation = repromptOperation,
+           operation.sourceTabID == target.tabID, operation.phase != .completed
+        {
+            return .rejected(.activeAttemptExists(activeAttemptID: operation.id))
+        }
         if requireActiveTabOwnership, currentTabID != target.tabID {
             let rejection = AgentComposerSubmitClaimRejection.targetRejected(reason: "inactive_composer_tab")
             logRejectedSubmitTarget(
@@ -22719,6 +22717,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sourceSession: session,
             draftMutationGeneration: session.draftMutationGeneration
         )
+        if requireActiveTabOwnership { adoptRepromptPreparation(into: claim) }
         if currentTabID == target.tabID {
             syncComposerUIState(tabID: target.tabID)
         }

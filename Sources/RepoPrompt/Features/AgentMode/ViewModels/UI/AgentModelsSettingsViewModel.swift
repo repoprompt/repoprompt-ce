@@ -41,10 +41,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
     @Published var repromptGuidanceDraft: String
-    @Published var repromptContextPolicyDraft: AgentRepromptContextPolicy
+    @Published var repromptModelDraft: String
     private var repromptDraftScope: AgentModelsEditingScope
     private var repromptGuidanceBaseline: String?
-    private var repromptPolicyBaseline: AgentRepromptContextPolicy?
+    private var repromptModelBaseline: String?
     @Published var oracleReconciliationGuidanceDraft: String
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
@@ -117,10 +117,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
         repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(initialProfile.agentRepromptGuidance)
-        repromptContextPolicyDraft = initialProfile.agentRepromptContextPolicy ?? .automatic
+        repromptModelDraft = initialProfile.agentRepromptModelRaw ?? ""
         repromptDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
         repromptGuidanceBaseline = initialProfile.agentRepromptGuidance
-        repromptPolicyBaseline = initialProfile.agentRepromptContextPolicy
+        repromptModelBaseline = initialProfile.agentRepromptModelRaw
         oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(initialProfile.oracleReconciliationGuidance)
         oracleGuidanceDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
         oracleGuidanceDraftBaseline = initialProfile.oracleReconciliationGuidance
@@ -314,13 +314,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     var isRepromptDraftDirty: Bool {
         repromptGuidanceDraft != AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
-            || repromptContextPolicyDraft != (repromptPolicyBaseline ?? .automatic)
+            || repromptModelDraft != (repromptModelBaseline ?? "")
     }
 
     var repromptDraftHasConflict: Bool {
         repromptDraftScope != editingScope
             || repromptGuidanceBaseline != profileSnapshot.agentRepromptGuidance
-            || repromptPolicyBaseline != profileSnapshot.agentRepromptContextPolicy
+            || repromptModelBaseline != profileSnapshot.agentRepromptModelRaw
     }
 
     var repromptGuidanceIsWithinLimit: Bool {
@@ -332,7 +332,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard isRepromptDraftDirty, repromptGuidanceIsWithinLimit else { return false }
         return persistRepromptDraft(
             guidance: AgentRepromptGuidance.normalizedOverride(repromptGuidanceDraft),
-            policy: repromptContextPolicyDraft == .automatic ? nil : repromptContextPolicyDraft
+            policy: repromptModelDraft.isEmpty ? nil : repromptModelDraft
         )
     }
 
@@ -350,16 +350,16 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     private func loadRepromptDraft() {
         repromptDraftScope = editingScope
         repromptGuidanceBaseline = profileSnapshot.agentRepromptGuidance
-        repromptPolicyBaseline = profileSnapshot.agentRepromptContextPolicy
+        repromptModelBaseline = profileSnapshot.agentRepromptModelRaw
         repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
-        repromptContextPolicyDraft = repromptPolicyBaseline ?? .automatic
+        repromptModelDraft = repromptModelBaseline ?? ""
     }
 
-    private func persistRepromptDraft(guidance: String?, policy: AgentRepromptContextPolicy?) -> Bool {
+    private func persistRepromptDraft(guidance: String?, policy: String?) -> Bool {
         guard !repromptDraftHasConflict else { return false }
         let accepted = updateSelectedProfile(reason: "agent_models.reprompt_guidance") { profile in
             profile.agentRepromptGuidance = guidance
-            profile.agentRepromptContextPolicy = policy
+            profile.agentRepromptModelRaw = policy
         }
         if accepted {
             loadRepromptDraft()

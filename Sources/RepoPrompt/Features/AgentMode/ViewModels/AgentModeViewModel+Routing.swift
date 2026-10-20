@@ -332,7 +332,7 @@ extension AgentModeViewModel {
                 repromptAudit: repromptAuditForClaim(claim, judgedText: routerAudit?.judgmentRequested == true ? (repromptedText == nil ? .originalFallback : .approved) : nil)
             )
         }
-        let judgingText = Self.automationJudgingText(original: claim.attempt.rawDraftSnapshot, reprompted: repromptedText)
+        let judgingText = Self.automationJudgingText(original: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot, reprompted: repromptedText)
         let choice: (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature)
         if let speculation = reusableRepromptEffort(claim: claim, approved: repromptedText, session: session), let task = speculation.effortTask {
             let staged = await task.value

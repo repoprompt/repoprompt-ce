@@ -50,12 +50,9 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
 
     struct Reprompt: Codable, Equatable {
         enum Outcome: String, Codable { case approved, sentOriginal, bypassed }
-        enum ConsultStatus: String, Codable { case success, skipped, failed }
         enum JudgedText: String, Codable { case approved, originalFallback }
         enum Speculation: String, Codable { case none, reused, discardedEdited, discardedStale }
         var outcome: Outcome
-        var oracle: ConsultStatus?
-        var contextBuilder: ConsultStatus?
         var automationJudgedText: JudgedText?
         var routerSpeculation: Speculation = .none
     }
