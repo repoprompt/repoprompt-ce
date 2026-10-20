@@ -24,7 +24,17 @@ final class AgentRepromptContextConsultant {
     private let originalSelection: StoredSelection?
     private(set) var committedSelection: StoredSelection?
     private var tasks: [AgentRepromptContextRequest.Kind: Task<AgentRepromptConsultResult, Never>] = [:]
-    private var isCancelled = false
+    private enum SelectionDisposition {
+        case active, restore, keep
+    }
+
+    // The first terminal decision owns late commits too. In particular, approval cannot
+    // be turned into rollback by a later cancellation/cleanup callback.
+    private var selectionDisposition = SelectionDisposition.active
+    private var isCancelled: Bool {
+        selectionDisposition != .active
+    }
+
     private var settled: [AgentRepromptContextRequest.Kind: AgentRepromptConsultResult] = [:]
     private var waiters: [CheckedContinuation<[AgentRepromptConsultResult], Never>] = []
 
@@ -101,12 +111,12 @@ final class AgentRepromptContextConsultant {
     }
 
     func cancel(keepSelection: Bool = false) {
-        isCancelled = true
+        if !isCancelled {
+            selectionDisposition = keepSelection ? .keep : .restore
+        }
         tasks.values.forEach { $0.cancel() }
         resolveWaitersIfReady()
-        if !keepSelection {
-            restoreIfUnchanged()
-        }
+        restoreIfUnchanged()
     }
 
     func noteCommittedSelection(_ selection: StoredSelection) {
@@ -117,7 +127,8 @@ final class AgentRepromptContextConsultant {
     }
 
     func restoreIfUnchanged() {
-        guard let originalSelection, let committedSelection,
+        guard selectionDisposition != .keep,
+              let originalSelection, let committedSelection,
               readSelection() == committedSelection else { return }
         restoreSelection(originalSelection)
         self.committedSelection = nil

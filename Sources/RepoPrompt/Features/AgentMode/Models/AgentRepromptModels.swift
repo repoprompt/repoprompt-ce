@@ -137,7 +137,7 @@ enum AgentRepromptError: Error, LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .disclosureRequired: "The primary Oracle provider changed. Cancel and click Re-prompt to review its disclosure before retrying."
+        case .disclosureRequired: "Re-prompt recipients or context policy changed. Cancel and click Re-prompt to review its disclosure before retrying."
         case .missingPrimaryModel: "Choose a primary Oracle model in Agent Models settings."
         case .unknownPrimaryModel: "The primary Oracle model is unavailable. Choose another in Agent Models settings."
         case .unconfiguredPrimaryModel: "Configure credentials for the primary Oracle model in Settings."

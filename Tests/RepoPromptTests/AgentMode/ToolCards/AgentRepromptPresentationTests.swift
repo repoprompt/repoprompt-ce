@@ -4,17 +4,31 @@ import XCTest
 
 @MainActor
 final class AgentRepromptPresentationTests: XCTestCase {
-    func testDisclosurePersistsAcrossWindowsButNotProviderChanges() throws {
+    func testDisclosurePersistsPerRecipientConfigurationAndInvalidatesV1() throws {
         let suite = "AgentRepromptDisclosureTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("one", forKey: "agentReprompt.acknowledgedProvider.v1")
         XCTAssertFalse(AgentRepromptDisclosure.isAcknowledged(providerID: "one", defaults: defaults))
         AgentRepromptDisclosure.acknowledge(providerID: "one", defaults: defaults)
         let anotherWindow = try XCTUnwrap(UserDefaults(suiteName: suite))
         XCTAssertTrue(AgentRepromptDisclosure.isAcknowledged(providerID: "one", defaults: anotherWindow))
         XCTAssertFalse(AgentRepromptDisclosure.isAcknowledged(providerID: "two", defaults: anotherWindow))
         AgentRepromptDisclosure.acknowledge(providerID: "two", defaults: anotherWindow)
-        XCTAssertFalse(AgentRepromptDisclosure.isAcknowledged(providerID: "one", defaults: defaults))
+        XCTAssertTrue(AgentRepromptDisclosure.isAcknowledged(providerID: "one", defaults: defaults))
+    }
+
+    func testDisclosureIdentityCoversRosterBuilderAndContextPolicy() throws {
+        func identity(_ roster: [String] = ["primary", "extra"], builder: String = "claude", allowsContext: Bool = true) throws -> String {
+            try XCTUnwrap(AgentRepromptDisclosure.identity(primaryProvider: "primary", oracleProviders: roster, contextBuilderProvider: builder, allowsContext: allowsContext))
+        }
+        let baseline = try identity()
+        XCTAssertEqual(baseline, try identity(["extra", "primary", "extra"]))
+        XCTAssertNotEqual(baseline, try identity(["primary", "another"]))
+        XCTAssertNotEqual(baseline, try identity(builder: "codex"))
+        XCTAssertNotEqual(baseline, try identity(allowsContext: false))
+        XCTAssertEqual(try identity(allowsContext: false), try identity(["unexposed"], builder: "unexposed", allowsContext: false))
+        XCTAssertNil(AgentRepromptDisclosure.identity(primaryProvider: nil, oracleProviders: [], contextBuilderProvider: nil, allowsContext: true))
     }
 
     func testReviewValidationAndTimeoutFreeWizardPulse() {

@@ -97,6 +97,44 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         }
     }
 
+    func testRejectedACPSteeringPreservesApprovedSlashText() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.session.runState = .running
+        let queued = AgentTabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID, targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "/review approved brief", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "Original words",
+            optimisticUserItemID: nil, createdAt: Date(), skipsSlashExpansion: true
+        )
+        fixture.session.pendingACPSteeringInstructions.append(queued)
+        fixture.viewModel.test_settleRejectedACPSteeringSubmission(
+            id: queued.id, session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session)
+        )
+        let pending = try XCTUnwrap(fixture.session.pendingInstructions.first)
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertEqual(pending.providerText, queued.providerText)
+        XCTAssertEqual(pending.localDraftText, queued.draftText)
+        XCTAssertTrue(pending.skipsSlashExpansion, "The rejected steer must not reinterpret approved text as a slash command.")
+    }
+
+    func testBypassedSubmissionsPreserveRecovery() async throws {
+        for (enabled, text) in [(false, "Ordinary draft"), (true, "/review"), (true, " \n")] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.viewModel.repromptEnabled = enabled
+            let claim = try fixture.claim(text: text)
+            defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+            fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID] = .init(
+                text: "Recovered brief", originalDraft: "Original", reason: "Context changed", draftAtInvalidation: "Original"
+            )
+            guard case .original = await fixture.viewModel.prepareComposerReprompt(text: text, claim: claim) else {
+                return XCTFail("Expected bypass")
+            }
+            XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, "Recovered brief")
+        }
+    }
+
     func testImplementingModelAndStreamingDoNotInvalidateButDraftChangeDoes() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }

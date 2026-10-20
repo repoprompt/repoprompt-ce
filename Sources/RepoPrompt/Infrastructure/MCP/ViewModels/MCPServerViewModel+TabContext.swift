@@ -127,9 +127,7 @@ extension MCPServerViewModel {
             timeoutSeconds: TimeInterval
         ) async -> ContextBuilderTeardownPublicationOutcome {
             let key = Key(runID: runID, connectionID: connectionID)
-            if let outcome = retainedOutcomes[key] {
-                return outcome
-            }
+            if let outcome = retainedOutcomes[key] { return outcome }
 
             let waiterID = UUID()
             return await withTaskCancellationHandler {
@@ -582,9 +580,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func beginMirroringForConnection(_ connectionID: UUID, context: MCPTabContextSnapshot) {
-        if tabContextCancellablesByConnectionID[connectionID] != nil {
-            return
-        }
+        if tabContextCancellablesByConnectionID[connectionID] != nil { return }
 
         guard let manager = workspaceManager else {
             tabContextLog("beginMirroring skipped - no workspace manager connectionID=\(connectionID)")
@@ -973,9 +969,7 @@ extension MCPServerViewModel {
         flushActiveSelection: Bool
     ) -> MCPTabContextSnapshot {
         let resolvedWorkspaceID: UUID? = {
-            if let requestedWorkspaceID {
-                return requestedWorkspaceID
-            }
+            if let requestedWorkspaceID { return requestedWorkspaceID }
             return workspaceManager?.workspaces.first(where: { workspace in
                 workspace.composeTabs.contains(where: { $0.id == composeSnapshot.id })
             })?.id ?? workspaceManager?.activeWorkspace?.id
@@ -3382,9 +3376,7 @@ extension MCPServerViewModel {
         tabContextByConnectionID[connectionID] = rebound
         presentationWindowByConnection[connectionID] = rebound.windowID
         let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
-        if let clientName {
-            recordLastContext(clientName: clientName, context: rebound)
-        }
+        if let clientName { recordLastContext(clientName: clientName, context: rebound) }
         beginMirroringForConnection(connectionID, context: rebound)
         tabContextLog("resolveTabContext handover: runID=\(runID) \(previousConnection) -> \(connectionID) mappingOK=\(mappingOK) window=\(providedWindowID?.description ?? "nil")")
         return rebound
@@ -4242,9 +4234,7 @@ extension MCPServerViewModel {
         activateReadFileAutoSelection(&inherited)
         tabContextByConnectionID[token.connectionID] = inherited
         publishDomainRoutingBinding(connectionID: token.connectionID, context: inherited)
-        if let clientName {
-            recordLastContext(clientName: clientName, context: inherited)
-        }
+        if let clientName { recordLastContext(clientName: clientName, context: inherited) }
         beginMirroringForConnection(token.connectionID, context: inherited)
         tabContextLog("registerPendingPolicyRunIDMapping inherited run context runID=\(token.runID) \(displacedConnectionID) -> \(token.connectionID)")
     }
@@ -4747,7 +4737,9 @@ extension MCPServerViewModel {
             onSelectionCommitted: onSelectionCommitted
         ), isStillCurrent(), !Task.isCancelled else { return nil }
 
-        notifyContextBuilderCommit(committedTab.tab)
+        if Self.shouldNotifyContextBuilderCommit(preservesPrompt: commitOwnedContext.preservesPromptOnCommit, hasSelectionObserver: onSelectionCommitted != nil) {
+            notifyContextBuilderCommit(committedTab.tab)
+        }
 
         // End-of-run flush: persist this run's final state to disk (coalesced by DiskWriter)
         guard let manager = workspaceManager else { return nil }

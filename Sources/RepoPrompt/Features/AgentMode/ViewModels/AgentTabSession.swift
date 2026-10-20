@@ -118,9 +118,7 @@ final class AgentTabSession: ObservableObject {
         var previousItemsByID: [UUID: AgentChatItem] = [:]
         for item in previousItems where trackedIDs.contains(item.id) {
             previousItemsByID[item.id] = item
-            if newItemsByID[item.id] == nil {
-                removedTrackedIDs.insert(item.id)
-            }
+            if newItemsByID[item.id] == nil { removedTrackedIDs.insert(item.id) }
         }
         if !removedTrackedIDs.isEmpty {
             localInputIndex.markDeleted(removedTrackedIDs)
@@ -133,9 +131,7 @@ final class AgentTabSession: ObservableObject {
             guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
             // Unchanged rows skip re-projection: relies on `AgentChatItem.==` covering every
             // field `Content.project` reads (kind, userInputOrigin, crossSessionAttribution, text).
-            if previousItemsByID[record.itemID] == item {
-                continue
-            }
+            if previousItemsByID[record.itemID] == item { continue }
             localInputIndex.replace(item, at: position)
         }
     }
@@ -454,9 +450,7 @@ final class AgentTabSession: ObservableObject {
     /// exact session may act as an oversight observer.
     var mcpControlContext: AgentModeViewModel.AgentMCPControlContext? {
         didSet {
-            if mcpControlContext != nil {
-                oversight.overseerActivation = nil
-            }
+            if mcpControlContext != nil { oversight.overseerActivation = nil }
             guard oldValue?.taskLabelKind != mcpControlContext?.taskLabelKind
                 || (oldValue == nil) != (mcpControlContext == nil)
             else {
@@ -494,12 +488,8 @@ final class AgentTabSession: ObservableObject {
     /// Whether this session was originally created by an MCP client.
     var isMCPOriginated: Bool = false {
         didSet {
-            if isMCPOriginated {
-                oversight.overseerActivation = nil
-            }
-            if oldValue != isMCPOriginated {
-                AgentSessionLinkCandidateReadinessSignal.didChange()
-            }
+            if isMCPOriginated { oversight.overseerActivation = nil }
+            if oldValue != isMCPOriginated { AgentSessionLinkCandidateReadinessSignal.didChange() }
         }
     }
 
@@ -956,9 +946,7 @@ final class AgentTabSession: ObservableObject {
             try Task.checkCancellation()
             guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
             // Input accepted during this suspension installs a newer forwarding barrier.
-            if observerWaitRelease?.task == release.task {
-                break
-            }
+            if observerWaitRelease?.task == release.task { break }
         }
         try Task.checkCancellation()
         guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
@@ -1138,9 +1126,7 @@ final class AgentTabSession: ObservableObject {
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
-            if contextCompactedAt != oldValue {
-                vouchedContextCount = nil
-            }
+            if contextCompactedAt != oldValue { vouchedContextCount = nil }
         }
     }
 
@@ -1158,9 +1144,7 @@ final class AgentTabSession: ObservableObject {
     private(set) var vouchedContextCount: ContextUsageVouch? {
         didSet {
             contextCountVouchRevision &+= 1
-            if vouchedContextCount == nil {
-                vouchedContextCountConfidence = nil
-            }
+            if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
             noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
             selfCompactNativeCompletion?.noteVouchedContextCount(vouchedContextCount?.tokens)
         }
@@ -1482,9 +1466,7 @@ final class AgentTabSession: ObservableObject {
     /// Session-owned self-compaction state. No restored attempt is executable.
     var selfCompactState = AgentSelfCompactState() {
         didSet {
-            if oldValue != selfCompactState {
-                isDirty = true
-            }
+            if oldValue != selfCompactState { isDirty = true }
             noteMonitorObservationInputsChanged()
         }
     }
@@ -1511,9 +1493,7 @@ final class AgentTabSession: ObservableObject {
     /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
     var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator? {
         didSet {
-            if oldValue !== selfCompactNativeCompletion {
-                oldValue?.cancelRuntimeWork()
-            }
+            if oldValue !== selfCompactNativeCompletion { oldValue?.cancelRuntimeWork() }
         }
     }
 
@@ -1539,9 +1519,7 @@ final class AgentTabSession: ObservableObject {
             if oldValue != bindingTransitionInProgress {
                 noteMonitorObservationInputsChanged()
                 AgentSessionLinkCandidateReadinessSignal.didChange()
-                if !bindingTransitionInProgress {
-                    onBindingTransitionSettled?(self)
-                }
+                if !bindingTransitionInProgress { onBindingTransitionSettled?(self) }
             }
         }
     }
@@ -1550,20 +1528,14 @@ final class AgentTabSession: ObservableObject {
     var saveRequestGeneration: UInt64 = 0
     var parentSessionID: UUID? {
         didSet {
-            if parentSessionID != nil {
-                oversight.overseerActivation = nil
-            }
-            if (oldValue == nil) != (parentSessionID == nil) {
-                AgentSessionLinkCandidateReadinessSignal.didChange()
-            }
+            if parentSessionID != nil { oversight.overseerActivation = nil }
+            if (oldValue == nil) != (parentSessionID == nil) { AgentSessionLinkCandidateReadinessSignal.didChange() }
         }
     }
 
     var createdByOverseerSessionID: UUID? {
         didSet {
-            if createdByOverseerSessionID != nil {
-                oversight.overseerActivation = nil
-            }
+            if createdByOverseerSessionID != nil { oversight.overseerActivation = nil }
         }
     }
 
@@ -1591,9 +1563,7 @@ final class AgentTabSession: ObservableObject {
     /// Binding-qualified hydration proof for automatic oversight restoration.
     private(set) var restorationReadiness: AgentSessionRestorationReadiness = .unbound {
         willSet {
-            if newValue != restorationReadiness {
-                objectWillChange.send()
-            }
+            if newValue != restorationReadiness { objectWillChange.send() }
         }
         didSet {
             if oldValue != restorationReadiness {
@@ -2656,9 +2626,7 @@ final class AgentTabSession: ObservableObject {
     ) {
         switch mutation {
         case let .replace(index, _, _), let .mutate(index, _):
-            if items.indices.contains(index) {
-                localInputIndex.replace(items[index], at: index)
-            }
+            if items.indices.contains(index) { localInputIndex.replace(items[index], at: index) }
         default: break
         }
         sourceItemsRevision &+= 1
@@ -3005,9 +2973,8 @@ final class AgentTabSession: ObservableObject {
         localInputIndex.remove(at: index, itemID: removed.id)
         for token in Array(localComposerCandidates.keys) {
             guard var candidate = localComposerCandidates[token] else { continue }
-            if candidate.itemID == removed.id {
-                localComposerCandidates.removeValue(forKey: token)
-            } else if let position = candidate.position, position > index {
+            if candidate.itemID == removed.id { localComposerCandidates.removeValue(forKey: token) }
+            else if let position = candidate.position, position > index {
                 candidate.position = position - 1
                 localComposerCandidates[token] = candidate
             }

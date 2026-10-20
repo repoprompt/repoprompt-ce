@@ -27,13 +27,14 @@ extension AgentModeViewModel {
 
     func prepareComposerReprompt(text: String, claim: AgentComposerSubmitClaim) async -> AgentRepromptOperation.Outcome {
         let tabID = claim.attempt.sourceTabID
-        repromptUIStore.recoveries[tabID] = nil
         guard repromptEnabled else { return .original }
         guard Self.isRepromptEligible(text: text, hasStagedCommand: stagedSlashCommandProps(tabID: tabID) != nil) else {
             repromptAudits[claim.attempt.id] = .init(outcome: .bypassed)
             return .original
         }
         guard repromptOperation == nil, composerSubmitClaimIsCurrent(claim) else { return .cancelled }
+        repromptUIStore.recoveries[tabID] = nil
+        let disclosureID = repromptPillProps().providerID
         let session = claim.sourceSession
         let workspaceID = workspaceManager?.activeWorkspaceID
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
@@ -119,6 +120,7 @@ extension AgentModeViewModel {
                     && session.runID == runID && session.activeRunAttemptID == attemptID && session.runState == runState
                     && session.operationAdmissionFailureMessage == nil
                     && liveMode == mode && live.planningModelRaw == profile.planningModelRaw
+                    && repromptPillProps().providerID == disclosureID
                     && live.agentRepromptGuidance == profile.agentRepromptGuidance && live.agentRepromptContextPolicy == profile.agentRepromptContextPolicy
                     && (selection == initialSelection || consultant?.committedSelection.map { selection == $0 } == true)
             }

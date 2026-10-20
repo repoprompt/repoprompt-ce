@@ -6,9 +6,7 @@ enum ContextBuilderRunOrigin: Equatable {
     case mcp(controlToken: UUID)
 
     var isMCP: Bool {
-        if case .mcp = self {
-            return true
-        }
+        if case .mcp = self { return true }
         return false
     }
 }
@@ -77,9 +75,7 @@ enum ContextBuilderResponseDeliveryDrainResolver {
         isAuthoritativeDetached: @MainActor () -> Bool,
         awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
     ) async -> ContextBuilderResponseDeliveryDrainOutcome {
-        if !initiallyDetached, await awaitDrain() {
-            return .drained
-        }
+        if !initiallyDetached, await awaitDrain() { return .drained }
 
         let publication = await awaitTeardownPublication()
         guard publication.completedDiscoveryCanCommit,
@@ -477,9 +473,7 @@ final class ContextBuilderRunRecord {
     }
 
     func awaitTeardownSettlement() async {
-        if teardownFinishedAt != nil {
-            return
-        }
+        if teardownFinishedAt != nil { return }
         await withCheckedContinuation { continuation in
             if teardownFinishedAt != nil {
                 continuation.resume()

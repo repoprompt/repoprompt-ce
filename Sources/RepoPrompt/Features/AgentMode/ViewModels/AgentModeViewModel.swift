@@ -18115,7 +18115,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case let .approved(brief):
                 repromptedText = brief
                 approvedBriefForRecovery = brief
-            case .cancelled: return .blocked(message: "Re-prompt cancelled.")
+            case .cancelled: return .blocked(message: "")
             }
             let pendingState = Self.pendingUserTurnState(from: preparedSession)
             guard let initialLocation = target.expectedInitialStartLocation,
@@ -18215,7 +18215,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case let .approved(brief):
                 repromptedText = brief
                 approvedBriefForRecovery = brief
-            case .cancelled: return .blocked(message: "Re-prompt cancelled.")
+            case .cancelled: return .blocked(message: "")
             }
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: sourceSession,
@@ -20227,7 +20227,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let instruction = TabSession.PendingInstruction(
             providerText: queued.providerText,
             localDraftText: queued.managed == nil ? queued.draftText : nil,
-            stopFence: stopFence
+            stopFence: stopFence,
+            skipsSlashExpansion: queued.skipsSlashExpansion
         )
         if session.runState.isActive {
             session.pendingInstructions.insert(instruction, at: 0)

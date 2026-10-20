@@ -601,6 +601,24 @@ docs/plans/agent-mode-reprompter-2026-10-20.md
 docs/privacy/telemetry.md
 ```
 
+### Static-review corrections (2026-10-20)
+
+- Verified and fixed rejected ACP steering losing `skipsSlashExpansion` when rebuilt as a pending instruction. Added a regression at the real settlement boundary.
+- Re-prompt Context Builder commits suppress ordinary completion notifications/dock bounce whenever prompt preservation or a selection observer identifies the preparation consult. Ordinary Builder completions retain notifications.
+- Corrected disclosure and privacy documentation: Oracle consults use the configured roster with selected file contents, tab prompt and frozen git review context; Context Builder uses its own configured agent/provider and repository-reading tools. Roster behavior is unchanged. Version-2 receipts are per recipient configuration/context policy (and persist independently across provider switches), invalidating the old incomplete disclosure. Changes to that identity invalidate an active preparation.
+- Unknown stored context-policy values now fail closed to Never; an absent setting still defaults to Automatic. This intentionally tightens the original fallback.
+- Consultant selection disposition is fixed by the first terminal decision. Approval-kept state never restores on late selection observation, late task return or repeated cleanup; a skipped/cancelled consult still restores its own late commit. Added deterministic regressions.
+- User cancellation uses the composer's existing silent empty-blocked result, retaining the draft rather than reporting an error or pretending submission succeeded. Submissions bypassing Re-prompt no longer consume an existing recovery.
+- Removed only whitespace-only differences from the seven named existing files relative to base `d9d0f21`; functional changes are retained. Newly edited feature/test files were formatted with pinned SwiftFormat 0.61.1, without repository-wide mutation.
+- Independent Oracle static review completed successfully (`untitled-chat-18ABBC`), no findings. This supersedes the earlier failed review attempts but does not close the manual/live-provider acceptance gaps above.
+- Review-fix validation: **all requested commands passed** (exit 0):
+  - `make dev-test FILTER=AgentReprompt`: 43 cases across all nine feature suites; ticket `576b9b94-a5e4-4eae-8096-bcd2a0ed4b61`.
+  - `make dev-test FILTER=AgentSessionLink`: 1,273 cases (1,125 app + 148 supporting-target cases); ticket `0847d72c-30e9-4ded-8118-d381a8a86023`.
+  - `make dev-test FILTER=ContextBuilder`: 213 cases (204 app + 9 MCP-core); ticket `7b6ed46f-62fe-4c02-b7ba-25824a709bd7`.
+  - `make dev-swift-build PRODUCT=RepoPrompt`: ticket `0dee7ba9-e934-47df-8c92-22e9fb073c0b`.
+  - `make dev-lint`: pinned SwiftFormat (0/1845 files require formatting) and strict SwiftLint; ticket `b8ffb1a0-a5e9-4755-b388-08bc834914ad`.
+- Static comparison against base confirms no whitespace-only replacement hunks remain in the seven named files. No visible-app lifecycle actions, live-provider requests, pushes or main-checkout edits were performed. The earlier unfiltered-suite/manual acceptance gaps remain outside this focused review-fix validation.
+
 ## 9. Open questions
 
 None that block implementation. Step 1 verifications (Claude Code cwd, per-run Context Builder enhancement override, Oracle background activation/title) can each widen a work item but don't change the design.

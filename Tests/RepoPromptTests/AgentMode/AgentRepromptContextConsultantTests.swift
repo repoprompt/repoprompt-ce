@@ -83,6 +83,59 @@ final class AgentRepromptContextConsultantTests: XCTestCase {
         XCTAssertTrue(ordinary.usedAgentOutputAsPrompt)
     }
 
+    func testApprovalKeepsSelectionAcrossLateCommitAndRepeatedCleanup() async throws {
+        let original = StoredSelection(selectedPaths: ["original.swift"])
+        let committed = StoredSelection(selectedPaths: ["discovered.swift"])
+        var selection = original
+        var resume: CheckedContinuation<Void, Never>?
+        var didReturn = false
+        let consultant = AgentRepromptContextConsultant(
+            oracle: { _ in throw CancellationError() },
+            contextBuilder: { _ in
+                await withCheckedContinuation { resume = $0 }
+                selection = committed
+                didReturn = true
+                return .init(result: .init(kind: .contextBuilder, status: "success", text: "late"), committedSelection: committed)
+            },
+            readSelection: { selection }, restoreSelection: { selection = $0 }
+        )
+        consultant.start([.init(kind: .contextBuilder, instructions: "find")])
+        try await AsyncTestWait.waitUntil("consult started", timeout: 3) { resume != nil }
+        consultant.cancel(keepSelection: true)
+        // Canonical selection observation can race with the async consult returning.
+        selection = committed
+        consultant.noteCommittedSelection(committed)
+        XCTAssertEqual(selection, committed)
+        consultant.cancel()
+        consultant.restoreIfUnchanged()
+        resume?.resume()
+        try await AsyncTestWait.waitUntil("late consult returned", timeout: 3) { didReturn }
+        await Task.yield()
+        XCTAssertEqual(selection, committed, "Approval-kept selection must never be rolled back.")
+    }
+
+    func testCancelledLateCommitRestoresAndCannotBePromotedToKeep() {
+        let original = StoredSelection(selectedPaths: ["original.swift"])
+        let committed = StoredSelection(selectedPaths: ["discovered.swift"])
+        var selection = original
+        let consultant = AgentRepromptContextConsultant(
+            oracle: { _ in throw CancellationError() }, contextBuilder: { _ in throw CancellationError() },
+            readSelection: { selection }, restoreSelection: { selection = $0 }
+        )
+        consultant.cancel()
+        consultant.cancel(keepSelection: true)
+        selection = committed
+        consultant.noteCommittedSelection(committed)
+        XCTAssertEqual(selection, original, "A skipped/cancelled consult still owns rollback of late commits.")
+    }
+
+    func testRepromptCommitDoesNotNotifyButOrdinaryBuilderStillDoes() {
+        XCTAssertTrue(MCPServerViewModel.shouldNotifyContextBuilderCommit(preservesPrompt: false, hasSelectionObserver: false))
+        for (preservesPrompt, hasObserver) in [(true, false), (false, true), (true, true)] {
+            XCTAssertFalse(MCPServerViewModel.shouldNotifyContextBuilderCommit(preservesPrompt: preservesPrompt, hasSelectionObserver: hasObserver))
+        }
+    }
+
     func testManifestAndConsultResultBounds() {
         let paths = (0 ..< 100).map { "file\($0).swift" }
         let manifest = AgentRepromptContextConsultant.manifest(rootNames: ["Project"], selectedPaths: paths)

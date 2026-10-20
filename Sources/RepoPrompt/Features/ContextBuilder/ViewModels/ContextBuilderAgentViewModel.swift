@@ -19,9 +19,7 @@ enum AgentRunState: Equatable {
     case failed(String)
 
     var isRunning: Bool {
-        if case .running = self {
-            return true
-        }
+        if case .running = self { return true }
         return false
     }
 
@@ -2590,9 +2588,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         let didClaimTerminal = record.claimTerminal(.cancelled)
         #if DEBUG
-            if didClaimTerminal {
-                observeStartupBoundary(.runTerminal, record: record)
-            }
+            if didClaimTerminal { observeStartupBoundary(.runTerminal, record: record) }
         #endif
         record.session.endRunAttempt(ifCurrent: record.ownership, source: "\(source).staleRetirement")
         if runRegistry.releaseActiveSlot(for: record) {
@@ -3519,9 +3515,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             activeSession
         }
         guard let session else { return false }
-        if session.isCancelling {
-            return false
-        }
+        if session.isCancelling { return false }
         session.isCancelling = true
         session.didUserCancelActiveContextBuilderRun = true
         updateRuntimeBindings(from: session)
@@ -3936,9 +3930,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         )
         guard finalizedConnections else {
-            if let contextCommitResult {
-                return contextCommitResult
-            }
+            if let contextCommitResult { return contextCommitResult }
             if !acceptsEvents(from: record) {
                 return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                     outcome: .staleOrNoLongerCurrent,
@@ -4942,9 +4934,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         task?.cancel()
         // Each captured lane releases its exact stream/waiter before its task joins. Never
         // look up whatever query a member session happens to host after this await.
-        if let task {
-            _ = await task.result
-        }
+        if let task { _ = await task.result }
         let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
         if stillOwnsCleanup {
             session.followUpOracleGroupTask = nil
@@ -6096,9 +6086,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Cancel any pending question for a session (internal helper).
     private func cancelPendingQuestion(for session: TabSession, expectedRunID: UUID? = nil) {
-        if let expectedRunID, session.pendingAskUserRunID != expectedRunID {
-            return
-        }
+        if let expectedRunID, session.pendingAskUserRunID != expectedRunID { return }
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil
@@ -6246,12 +6234,8 @@ extension ContextBuilderAgentViewModel.TabSession {
 
     @MainActor
     var planStatus: ContextBuilderPlanStatus {
-        if isBackgroundPlanGenerating {
-            return .generating
-        }
-        if let error = backgroundPlanError {
-            return .error(error)
-        }
+        if isBackgroundPlanGenerating { return .generating }
+        if let error = backgroundPlanError { return .error(error) }
         if let route = generatedAnswerRoute {
             return .ready(route: route, previewText: backgroundPlanResponsePreviewText ?? backgroundPlanResponseText)
         }

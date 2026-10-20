@@ -1078,9 +1078,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: false) { $0.autoEffortBackendRawValue = raw }
         autoEffortSettingsRevision &+= 1
         publishRouterDemand()
-        if commit {
-            save()
-        }
+        if commit { save() }
     }
 
     package func autoEffortEnabled() -> Bool {
@@ -1095,9 +1093,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
         autoEffortSettingsRevision &+= 1
         publishRouterDemand()
-        if commit {
-            save()
-        }
+        if commit { save() }
     }
 
     package func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
@@ -1156,9 +1152,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     package nonisolated static func resolvedUsageLimitsDisplayEnabled(
         _ settings: GlobalScalarPreferences.AgentModeSettings?
     ) -> Bool {
-        if let explicit = settings?.usageLimitsDisplayEnabled {
-            return explicit
-        }
+        if let explicit = settings?.usageLimitsDisplayEnabled { return explicit }
         return settings?.codexUsageQuotaEnabled == true || settings?.claudeUsageQuotaEnabled == true
     }
 
@@ -2015,9 +2009,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         let oldEnabled = autoEffortEnabled()
         let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
         defer {
-            if oldRouterSettings != scalarPreferences.modelRouter {
-                modelRouterSettingsRevision &+= 1
-            }
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
             if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
                 autoEffortSettingsRevision &+= 1
             }
@@ -2144,9 +2136,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         let oldEnabled = autoEffortEnabled()
         let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
         defer {
-            if oldRouterSettings != scalarPreferences.modelRouter {
-                modelRouterSettingsRevision &+= 1
-            }
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
             if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
                 autoEffortSettingsRevision &+= 1
             }

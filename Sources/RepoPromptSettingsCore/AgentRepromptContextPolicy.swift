@@ -6,6 +6,6 @@ package enum AgentRepromptContextPolicy: String, Codable, CaseIterable {
 
     package init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        self = Self(rawValue: raw) ?? .automatic
+        self = Self(rawValue: raw) ?? .never
     }
 }

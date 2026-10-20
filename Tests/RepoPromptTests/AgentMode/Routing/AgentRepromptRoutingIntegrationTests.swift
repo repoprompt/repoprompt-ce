@@ -99,7 +99,8 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         }
         try await AsyncTestWait.waitUntil("Re-prompt review", timeout: 5) { fixture.viewModel.repromptUIStore.presentation?.phase == .reviewing }
         fixture.viewModel.cancelReprompt()
-        guard case .blocked = await task.value else { return XCTFail("Cancelled preparation submitted") }
+        guard case let .blocked(message) = await task.value else { return XCTFail("Cancelled preparation submitted") }
+        XCTAssertTrue(message.isEmpty, "User cancellation must not display an error notice.")
         XCTAssertFalse(fixture.viewModel.composerSubmitClaimIsCurrent(claim))
         XCTAssertNil(fixture.viewModel.repromptSpeculations[claim.attempt.id])
         XCTAssertTrue(fixture.session.items.isEmpty)

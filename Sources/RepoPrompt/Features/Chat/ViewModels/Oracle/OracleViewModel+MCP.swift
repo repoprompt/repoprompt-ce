@@ -552,19 +552,13 @@ extension OracleViewModel {
                 return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
             }
             guard let agentModeRunID else { return 0 }
-            if session.agentModeRunID == agentModeRunID {
-                return 0
-            }
-            if session.agentModeRunID == nil, allowUnownedLegacy {
-                return 1
-            }
+            if session.agentModeRunID == agentModeRunID { return 0 }
+            if session.agentModeRunID == nil, allowUnownedLegacy { return 1 }
             return nil
         }
 
         if let agentModeRunID {
-            if session.agentModeRunID == agentModeRunID {
-                return 0
-            }
+            if session.agentModeRunID == agentModeRunID { return 0 }
             return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
         }
 
@@ -889,9 +883,7 @@ extension OracleViewModel {
         }
         let selectedModel = resolvedExecution.models[resolvedLaneIndex]
         #if DEBUG
-            if let contextBuilderScope {
-                await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel)
-            }
+            if let contextBuilderScope { await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel) }
         #endif
         try contextBuilderScope?.checkpoint()
         let selectionLabel = switch resolvedExecution.selection {

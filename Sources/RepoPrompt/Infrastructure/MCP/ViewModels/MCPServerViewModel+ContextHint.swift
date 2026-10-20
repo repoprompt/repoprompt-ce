@@ -1,6 +1,11 @@
 import Foundation
 
 extension MCPServerViewModel {
+    static func shouldNotifyContextBuilderCommit(preservesPrompt: Bool, hasSelectionObserver: Bool) -> Bool {
+        // Re-prompt discovery is a preparation subtask, not a user-requested Builder completion.
+        !preservesPrompt && !hasSelectionObserver
+    }
+
     @MainActor
     func notifyContextBuilderCommit(_ tab: ComposeTabState) {
         guard !tab.name.isEmpty else { return }

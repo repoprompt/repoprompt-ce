@@ -86,11 +86,22 @@ not include conversation history, attachments, attachment names, or attachment p
 Oracle may use a different provider from the implementing agent and has that provider's retention
 terms. Do not include secrets you do not want that provider to receive.
 
-The rewriter may request one ordinary background Oracle consult and/or one Context Builder run.
-These use the workspace's normal selected-context and discovery paths, including repository
-contents where applicable; their ordinary chat/run history persists. Results and clarification
-answers may be sent with the original message in one refinement request. **Gather repository
-context: Never** omits the manifest and disables both consults. Context gathering can also be
+With automatic context gathering, the rewriter may request one ordinary background Oracle consult
+and/or one Context Builder run. **The Oracle consult uses the configured roster (primary plus
+additional Oracles), not only the primary rewrite model.** Its normal selected-context packaging
+includes selected file contents, the tab prompt and frozen git review context. **Context Builder
+uses its own configured agent/provider** and repository-reading tools, so repository contents may
+also be sent to that provider. Ordinary consult chat/run history persists. Consult results and
+clarification answers may be sent with the original message to the primary Oracle in one refinement
+request. Each recipient has its own retention terms and may differ from the implementing agent.
+The enable disclosure covers these recipients; versioned acknowledgements are stored separately
+per primary/roster-provider/Context Builder-provider configuration and context policy. Changing
+that recipient configuration or enabling automatic gathering requires a matching acknowledgement;
+older acknowledgements of the incomplete disclosure do not count.
+
+**Gather repository context: Never** omits the manifest and disables both consults. Unknown stored
+context-policy values fail closed to Never (an absent setting retains the Automatic default).
+Context gathering can also be
 skipped per preparation. Context Builder never changes the tab prompt in this flow; its selected
 files are kept on approval, and cancellation restores its selection only if the user has not
 changed it since the commit.

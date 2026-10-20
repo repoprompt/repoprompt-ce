@@ -1,15 +1,25 @@
 import Foundation
 
-/// Only the most recently acknowledged provider is remembered. Changing it requires consent again.
+/// Versioned receipts are per recipient configuration, not a single last-provider preference.
+/// V1 understated consult exposure and must never authorize the expanded disclosure.
 enum AgentRepromptDisclosure {
-    static let key = "agentReprompt.acknowledgedProvider.v1"
+    static let key = "agentReprompt.acknowledgedProviders.v2."
+
+    static func identity(primaryProvider: String?, oracleProviders: [String], contextBuilderProvider: String?, allowsContext: Bool) -> String? {
+        guard let primaryProvider else { return nil }
+        let recipients = allowsContext
+            ? [primaryProvider, Set(oracleProviders).sorted().joined(separator: ","), contextBuilderProvider ?? "configured", "automatic"]
+            : [primaryProvider, "never"]
+        return recipients.map { Data($0.utf8).base64EncodedString() }.joined(separator: ".")
+    }
+
     static func isAcknowledged(providerID: String?, defaults: UserDefaults) -> Bool {
         guard let providerID else { return false }
-        return defaults.string(forKey: key) == providerID
+        return defaults.bool(forKey: key + providerID)
     }
 
     static func acknowledge(providerID: String, defaults: UserDefaults) {
-        defaults.set(providerID, forKey: key)
+        defaults.set(true, forKey: key + providerID)
     }
 }
 
@@ -18,7 +28,13 @@ extension AgentModeViewModel {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
         let model = profile.planningModelRaw.flatMap(AIModel.fromModelName)
         let available = model.map { repromptAvailability?($0) ?? (promptManager?.mcpOracleIsProviderConfigured(for: $0) == true) } ?? false
-        let providerID = model.map { String(describing: $0.providerType) }
+        let oracleProviders = ([profile.planningModelRaw].compactMap(\.self) + profile.additionalOracleModelRaws)
+            .compactMap(AIModel.fromModelName).map { String(describing: $0.providerType) }
+        let providerID = AgentRepromptDisclosure.identity(
+            primaryProvider: model.map { String(describing: $0.providerType) }, oracleProviders: oracleProviders,
+            contextBuilderProvider: profile.contextBuilderAgentRaw ?? repromptContextBuilder?.selectedAgent.rawValue,
+            allowsContext: profile.agentRepromptContextPolicy != .never
+        )
         return .init(
             isOn: repromptEnabled, isAvailable: available, isPreparing: repromptOperation != nil,
             modelDisplayName: model?.displayName, providerID: providerID,
