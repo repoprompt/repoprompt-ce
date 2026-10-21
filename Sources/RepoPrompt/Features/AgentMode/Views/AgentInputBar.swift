@@ -383,6 +383,18 @@ struct AgentComposerView: View, Equatable {
         repromptStore.presentation.flatMap { $0.sourceTabID == currentTabID ? $0 : nil }
     }
 
+    private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
+        guard repromptPresentation == nil, let tabID = currentTabID,
+              let recovery = repromptStore.recoveries[tabID], recovery.reason == "Original restored",
+              localInputText == recovery.originalDraft else { return nil }
+        return recovery
+    }
+
+    private var repromptEditTransaction: TextFieldExternalEditTransaction? {
+        if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
+        return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
+    }
+
     private var isRepromptBlockingSend: Bool {
         repromptPresentation.map { $0.phase != .completed } ?? false
     }
@@ -560,6 +572,12 @@ struct AgentComposerView: View, Equatable {
             // @Published delivers before the stored property changes; acknowledge the incoming revision.
             acknowledgedRepromptPublicationsByTab[update.tabID] = update.identity
         }
+        .onReceive(repromptStore.$autoSendRequest) { request in
+            guard let request, request.tabID == currentTabID,
+                  let operation = repromptViewModel?.repromptOperation, operation.id == request.operationID,
+                  operation.consumeAutoSend(request), localInputText == request.text else { return }
+            sendMessage() // Same fresh local claim and attachment/workflow admission as an explicit Send.
+        }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
             isSyncingDraftFromSession = true
@@ -691,12 +709,19 @@ struct AgentComposerView: View, Equatable {
                 ),
                 externalUpdateTick: externalTextUpdateTick,
                 isReadOnly: repromptPresentation?.phase.isBusy == true,
-                externalEditTransaction: repromptPresentation.map { .init(id: $0.id, isComplete: $0.phase == .completed) },
-                onUndoExternalEdit: { [id = repromptPresentation?.id] in undoRepromptDraft(expectedID: id) },
-                onEscape: { [id = repromptPresentation?.id] in
-                    guard let id, repromptViewModel?.repromptOperation?.id == id else { return }
-                    repromptViewModel?.cancelReprompt()
+                externalEditTransaction: repromptEditTransaction,
+                onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
+                    if let id { undoRepromptDraft(expectedID: id) }
+                    else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
+                        _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
+                    }
                 },
+                onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
+                    guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
+                    if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
+                    else { operation.cancel() }
+                },
+                onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -1707,12 +1732,20 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func undoRepromptDraft(expectedID: UUID?) {
-        guard let expectedID, repromptViewModel?.repromptOperation?.id == expectedID else { return }
+        guard let expectedID, let viewModel = repromptViewModel, let operation = viewModel.repromptOperation,
+              operation.id == expectedID, viewModel.currentTabID == operation.sourceTabID else { return }
         // Flush a last keystroke even if SwiftUI's onChange has not run yet.
         if let tabID = currentTabID {
             actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
         repromptViewModel?.undoReprompt()
+    }
+
+    private func repromptAgain() -> Bool {
+        guard !isRepromptBlockingSend, !submissionLatch.isLatched(for: currentTabID), props.canSendWithCurrentProvider,
+              let target = renderedSubmitTarget, let repromptViewModel else { return false }
+        actions.storeDraft(target.tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[target.tabID] ?? 0)
+        return repromptViewModel.requestComposerRepromptAgain(target: target, text: localInputText)
     }
 
     private func sendMessage() {

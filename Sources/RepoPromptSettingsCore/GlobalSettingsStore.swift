@@ -232,6 +232,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             oracleReconciliationGuidance: scalarPreferences.modelSelection?.oracleReconciliationGuidance,
             agentRepromptGuidance: scalarPreferences.modelSelection?.agentRepromptGuidance,
             agentRepromptModelRaw: scalarPreferences.modelSelection?.agentRepromptModelRaw,
+            agentRepromptMode: scalarPreferences.modelSelection?.agentRepromptMode,
+            agentRepromptIncludesRecentChat: scalarPreferences.modelSelection?.agentRepromptIncludesRecentChat,
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
@@ -257,6 +259,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         modelSelection.oracleReconciliationGuidance = normalized.oracleReconciliationGuidance
         modelSelection.agentRepromptGuidance = normalized.agentRepromptGuidance
         modelSelection.agentRepromptModelRaw = normalized.agentRepromptModelRaw
+        modelSelection.agentRepromptMode = normalized.agentRepromptMode
+        modelSelection.agentRepromptIncludesRecentChat = normalized.agentRepromptIncludesRecentChat
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
@@ -1921,6 +1925,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             oracleReconciliationGuidance: profile.oracleReconciliationGuidance,
             agentRepromptGuidance: profile.agentRepromptGuidance,
             agentRepromptModelRaw: profile.agentRepromptModelRaw,
+            agentRepromptMode: profile.agentRepromptMode,
+            agentRepromptIncludesRecentChat: profile.agentRepromptIncludesRecentChat,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,

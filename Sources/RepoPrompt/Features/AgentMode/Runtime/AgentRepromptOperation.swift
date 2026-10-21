@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptSettingsCore
 
 /// Preparation owns draft revisions, never a submit claim or provider-history row.
 @MainActor
@@ -28,6 +29,10 @@ final class AgentRepromptOperation {
     private(set) var isClosed = false
     private(set) var lastGeneratedText = ""
     private(set) var usedOriginal = false
+    private(set) var hadQuestions = false
+    private(set) var autoSendConsumed = false
+    let mode: AgentRepromptMode
+    var onStateChange: (() -> Void)?
     var observations = Set<AnyCancellable>()
     var onComplete: ((String) -> Void)?
     var onClose: (() -> Void)?
@@ -39,14 +44,15 @@ final class AgentRepromptOperation {
     init(
         id: UUID = UUID(), sourceTabID: UUID, rawDraft: String, draftGeneration: UInt64,
         request: AgentRepromptRequest, model: AIModel?, service: AgentRepromptService?, store: AgentRepromptUIStore,
-        initialError: AgentRepromptError? = nil,
+        initialError: AgentRepromptError? = nil, initialDraft: String? = nil, mode: AgentRepromptMode = .review,
         currentDraft: @escaping () -> String, applyDraft: @escaping (String) -> UInt64?,
         chooseEffort: @escaping (AIModel) async -> AIModel = { $0 }, isCurrent: @escaping () -> Bool
     ) {
         self.id = id
         self.sourceTabID = sourceTabID
         self.rawDraft = rawDraft
-        expectedDraft = rawDraft
+        expectedDraft = initialDraft ?? rawDraft
+        self.mode = mode
         expectedDraftGeneration = draftGeneration
         self.request = request
         self.model = model
@@ -85,7 +91,7 @@ final class AgentRepromptOperation {
         guard validate(), task == nil, phase != .completed else { return }
         let revision = callRevision &+ 1
         callRevision = revision
-        store.presentation?.phase = request.answers == nil ? .generating : .refining
+        setPhase(request.answers == nil ? .generating : .refining)
         store.presentation?.error = nil
         task = Task { [self] in
             do {
@@ -111,12 +117,13 @@ final class AgentRepromptOperation {
                 lastGeneratedText = result.body
                 task = nil
                 if request.answers == nil, !result.openQuestions.isEmpty {
+                    hadQuestions = true
                     firstResult = result
                     let interaction = AgentAskUserInteraction(title: "Before sending", questions: result.openQuestions.map {
                         .init(id: $0.id, question: $0.question, options: $0.options.map { .init(label: $0.label, description: $0.description) })
                     })
                     store.pendingQuestions = .init(interaction: interaction)
-                    store.presentation?.phase = .clarifying
+                    setPhase(.clarifying)
                 } else { complete() }
             } catch {
                 guard validate(), !Task.isCancelled, revision == callRevision else { return }
@@ -125,7 +132,7 @@ final class AgentRepromptOperation {
                 if let pendingBody { install(pendingBody) }
                 pendingBody = nil
                 task = nil
-                store.presentation?.phase = .failed
+                setPhase(.failed)
                 store.presentation?.error = (error as? AgentRepromptError)?.errorDescription ?? AgentRepromptError.provider.errorDescription
                 store.recover(
                     tabID: sourceTabID,
@@ -208,10 +215,28 @@ final class AgentRepromptOperation {
         }
     }
 
+    private func setPhase(_ phase: AgentRepromptUIStore.Phase) {
+        store.presentation?.phase = phase
+        onStateChange?()
+    }
+
+    /// One terminal auto-send intent. Any clarification, edit, cancellation or stale generation fences it.
+    func consumeAutoSend(_ request: AgentRepromptUIStore.AutoSendRequest) -> Bool {
+        guard request.operationID == id, request.tabID == sourceTabID, !autoSendConsumed else { return false }
+        autoSendConsumed = true
+        return mode == .sendAutomatically && !hadQuestions && !usedOriginal && phase == .completed
+            && request.operationID == id && request.tabID == sourceTabID
+            && request.text == expectedDraft && request.text == lastGeneratedText
+            && request.generation == expectedDraftGeneration && validate()
+    }
+
     private func complete() {
         guard validate() else { return }
-        store.presentation?.phase = .completed
+        setPhase(.completed)
         onComplete?(expectedDraft)
+        if mode == .sendAutomatically, !hadQuestions, !isClosed {
+            store.autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
+        }
     }
 
     func useOriginal() {
@@ -232,7 +257,7 @@ final class AgentRepromptOperation {
         store.pendingQuestions = nil
         usedOriginal = true
         install(rawDraft)
-        store.presentation?.phase = .completed
+        setPhase(.completed)
         onEdit?()
     }
 
@@ -257,6 +282,7 @@ final class AgentRepromptOperation {
         task = nil
         observations.removeAll()
         store.pendingQuestions = nil
+        store.autoSendRequest = nil
         store.presentation = nil
         onClose?()
     }

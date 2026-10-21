@@ -2424,7 +2424,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var repromptService: AgentRepromptService?
     let repromptUIStore = AgentRepromptUIStore()
     var repromptEnabled = false
-    var repromptIncludesRecentChat = true
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
     var repromptOperation: AgentRepromptOperation?

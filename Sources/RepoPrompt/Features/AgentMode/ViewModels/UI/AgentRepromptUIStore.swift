@@ -5,6 +5,10 @@ import Foundation
 final class AgentRepromptUIStore: ObservableObject {
     enum Phase: Equatable {
         case generating, clarifying, refining, completed, failed
+        var isStreaming: Bool {
+            self == .generating || self == .refining
+        }
+
         var isBusy: Bool {
             self == .generating || self == .clarifying || self == .refining
         }
@@ -42,13 +46,30 @@ final class AgentRepromptUIStore: ObservableObject {
         return publication?.tabID != tabID || publication?.identity == acknowledged
     }
 
+    struct AutoSendRequest: Equatable {
+        let operationID: UUID
+        let tabID: UUID
+        let text: String
+        let generation: UInt64
+    }
+
+    struct OneShotDisclosureRequest: Identifiable {
+        let id = UUID()
+        let target: AgentComposerSubmitTarget
+        let text: String
+        let generation: UInt64
+    }
+
     struct Recovery: Equatable {
+        let id = UUID()
         let text: String
         let originalDraft: String
         let reason: String
         var draftAtInvalidation = ""
     }
 
+    @Published var autoSendRequest: AutoSendRequest?
+    @Published var oneShotDisclosureRequest: OneShotDisclosureRequest?
     @Published var presentation: Presentation?
     @Published var draftUpdate: DraftUpdate?
     @Published var pendingQuestions: AgentAskUserPendingState?

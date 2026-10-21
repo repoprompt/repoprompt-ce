@@ -1,9 +1,138 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
 final class AgentRepromptSubmissionTests: XCTestCase {
+    func testRepeatUsesEditedTextOrFirstOriginalWithoutHoldingAClaim() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let probe = AgentRepromptStreamProbe()
+        fixture.viewModel.repromptService = .init(transport: { message, _, publish in
+            await probe.append(message.conversationMessages[0].content)
+            try await publish("Generated brief")
+        })
+        XCTAssertTrue(try fixture.begin(text: "First original"))
+        try await ready(fixture)
+        let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        XCTAssertTrue(fixture.viewModel.requestComposerRepromptAgain(target: target, text: fixture.session.draftText))
+        try await ready(fixture)
+        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "Edited rewrite")
+        XCTAssertTrue(fixture.viewModel.requestComposerRepromptAgain(target: target, text: "Edited rewrite"))
+        try await ready(fixture)
+        let values = await probe.values
+        let sources = try values.map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])["originalText"] as? String }
+        XCTAssertEqual(sources, ["First original", "First original", "Edited rewrite"])
+        XCTAssertEqual(fixture.viewModel.repromptUIStore.presentation?.original, "First original")
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        fixture.viewModel.cancelReprompt()
+        XCTAssertEqual(fixture.session.draftText, "First original")
+    }
+
+    func testRepeatOfGeneratedSlashTextRemainsLocalData() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let probe = AgentRepromptStreamProbe()
+        fixture.viewModel.repromptService = .init(transport: { message, _, publish in
+            await probe.append(message.conversationMessages[0].content)
+            try await publish("/compact Generated literal text")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original request"))
+        try await ready(fixture)
+        let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        XCTAssertTrue(fixture.viewModel.requestComposerRepromptAgain(target: target, text: fixture.session.draftText))
+        try await ready(fixture)
+        let values = await probe.values
+        XCTAssertEqual(values.count, 2)
+        XCTAssertFalse(values[1].contains("Generated literal text"), "Unedited generated slash text repeats the first original")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        fixture.viewModel.cancelReprompt()
+        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "/compact")
+        XCTAssertFalse(fixture.viewModel.requestComposerRepromptAgain(target: target, text: "/compact"), "Unowned slash commands still bypass")
+    }
+
+    func testAutoSendPublishesOnlyAtSuccessAndUsesFreshDispatchClaimOnce() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.isMCPInstructionDispatchInProgress = true
+        fixture.session.hasLoadedPersistedState = true
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+            try await publish("Prepared")
+            _ = await gate.wait()
+            try await publish(" brief")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Prepared" }
+        XCTAssertNil(fixture.viewModel.repromptUIStore.autoSendRequest)
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        await gate.release()
+        try await ready(fixture)
+        let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+        let request = try XCTUnwrap(fixture.viewModel.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(operation.consumeAutoSend(request))
+        XCTAssertFalse(operation.consumeAutoSend(request))
+        let claim = try fixture.claim(text: request.text, local: true)
+        let result = await fixture.viewModel.executeComposerSubmitAttempt(text: request.text, claim: claim, createAndActivateSessionTab: { nil })
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(fixture.session.items.last(where: { $0.kind == .user })?.text, "Prepared brief")
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, "Prepared brief")
+    }
+
+    func testQuestionsAndOneShotFallBackToReviewEvenInAutoMode() async throws {
+        for oneShot in [false, true] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            fixture.viewModel.setRepromptMode(.sendAutomatically)
+            fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+                try await publish(oneShot ? "One-shot brief" : "Body" + AgentRepromptStreamParser.delimiter + AgentRepromptServiceTests.questions + AgentRepromptStreamParser.endDelimiter)
+            })
+            if oneShot {
+                fixture.viewModel.setRepromptEnabled(false)
+                XCTAssertFalse(try fixture.begin(text: "Original"), "Pill-off Return is ordinary send")
+                let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+                XCTAssertTrue(fixture.viewModel.requestComposerRepromptAgain(target: target, text: "Original"))
+            } else {
+                XCTAssertTrue(try fixture.begin(text: "Original"))
+                try await AsyncTestWait.waitUntil("questions", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .clarifying }
+                fixture.viewModel.repromptOperation?.completeQuestions(skipAll: true)
+            }
+            try await ready(fixture)
+            XCTAssertNil(fixture.viewModel.repromptUIStore.autoSendRequest)
+            XCTAssertTrue(fixture.session.items.isEmpty)
+            XCTAssertFalse(try fixture.begin(text: fixture.session.draftText), "Prepared Return sends, not rewrites")
+            if oneShot { XCTAssertFalse(fixture.viewModel.repromptEnabled) }
+        }
+    }
+
+    func testAutoIntentRejectsEditsAndCancel() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await ready(fixture)
+        let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+        let request = try XCTUnwrap(fixture.viewModel.repromptUIStore.autoSendRequest)
+        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "User edit wins")
+        XCTAssertFalse(operation.consumeAutoSend(request))
+        fixture.viewModel.cancelReprompt()
+        XCTAssertFalse(operation.consumeAutoSend(request))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+    }
+
     func testFirstSendPreparesWithoutClaimAndSecondSendAdoptsEditedDraft() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }

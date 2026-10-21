@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -17,6 +18,8 @@ final class AgentRepromptSettingsTests: XCTestCase {
             let vm = AgentModelsSettingsViewModel(apiSettingsVM: api, workspaceID: workspaceID, settingsManager: store, settingsStore: store, notificationCenter: NotificationCenter())
             vm.repromptGuidanceDraft = "  My voice\nKeep uncertainty. \n"
             vm.repromptModelDraft = "specific-model"
+            vm.repromptModeDraft = .sendAutomatically
+            vm.repromptRecentChatDraft = false
             XCTAssertTrue(vm.isRepromptDraftDirty)
             XCTAssertNotEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model")
             XCTAssertTrue(vm.saveRepromptDraft())
@@ -26,11 +29,44 @@ final class AgentRepromptSettingsTests: XCTestCase {
             XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model")
             XCTAssertTrue(vm.restoreDefaultRepromptGuidance())
             XCTAssertEqual(vm.repromptGuidanceDraft, AgentRepromptGuidance.defaultText)
-            XCTAssertNil(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw)
+            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptModelRaw, "specific-model", "Restoring guidance must not reset model or mode")
+            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptMode, .sendAutomatically)
+            XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID).agentRepromptIncludesRecentChat, false)
             if workspaceID != nil {
                 XCTAssertEqual(store.globalAgentModelsProfile(), global)
             }
         }
+    }
+
+    func testDefaultPickerPresentsConcreteConnectedSubscriptionWithoutPersistingAChoice() async throws {
+        let (store, api) = try fixture()
+        api.isClaudeCodeConnected = true
+        await api.updateAvailableModels()
+        let vm = AgentModelsSettingsViewModel(apiSettingsVM: api, settingsManager: store, settingsStore: store)
+        XCTAssertEqual(vm.resolvedRepromptDraftModel, AgentRepromptModelPolicy.preferredClaude)
+        let picker = AgentRepromptModelPicker(selection: Binding(get: { vm.repromptModelDraft }, set: { vm.repromptModelDraft = $0 }), availableModels: api.availableModels, resolvedModel: vm.resolvedRepromptDraftModel)
+        XCTAssertEqual(picker.concreteSelection.wrappedValue, AgentRepromptModelPolicy.preferredClaude.rawValue)
+        XCTAssertTrue(vm.repromptModelDraft.isEmpty)
+        XCTAssertFalse(vm.isRepromptDraftDirty)
+        picker.concreteSelection.wrappedValue = AIModel.gpt61SolLow.rawValue
+        XCTAssertEqual(vm.repromptModelDraft, AIModel.gpt61SolLow.rawValue)
+        XCTAssertTrue(vm.isRepromptDraftDirty)
+    }
+
+    func testModeAndHistoryConflictsRefuseStaleSaves() throws {
+        let (store, api) = try fixture()
+        let vm = AgentModelsSettingsViewModel(apiSettingsVM: api, settingsManager: store, settingsStore: store)
+        XCTAssertEqual(vm.repromptModeDraft, .review)
+        XCTAssertTrue(vm.repromptRecentChatDraft)
+        vm.repromptModeDraft = .sendAutomatically
+        var external = store.globalAgentModelsProfile()
+        external.agentRepromptIncludesRecentChat = false
+        store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+        XCTAssertFalse(vm.saveRepromptDraft())
+        XCTAssertTrue(vm.repromptDraftHasConflict)
+        vm.reloadRepromptDraft()
+        XCTAssertFalse(vm.repromptRecentChatDraft)
+        XCTAssertEqual(vm.repromptModeDraft, .review)
     }
 
     func testStaleScopeAndExternalGuidanceCannotOverwriteWithoutReload() throws {

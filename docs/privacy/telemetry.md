@@ -80,15 +80,16 @@ Claude run-event telemetry remains separate and cannot authorize usage collectio
 
 Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
 sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
-relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Automatic
+relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Default resolution
 prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
 when possible, then the other subscription, then configured API providers, with the primary Oracle
-last. Explicit models and Use primary Oracle never silently fall back. A call freezes its billing
+last. The UI always names the concrete model. Explicit models never silently fall back; legacy
+Use primary Oracle settings migrate to the then-current concrete Oracle model. A call freezes its billing
 route; a failure or retry cannot switch it. The resolved model is displayed. The provider's retention
 and billing terms apply; do not send secrets you do not want that recipient to receive.
 
-**Include recent chat context** is on by default and transient per window (available in the pill's
-right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
+**Include recent chat context** is on by default and persisted in the selected Agent Models
+profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
 the last up to three prior user bubble texts (the rewritten text when applicable) and each turn's
 final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized
 excerpt budget is 8 KiB; oldest turns are dropped first. Only post-compaction turns qualify.
@@ -105,9 +106,14 @@ provider-history rows. Substantive answers may cause one refinement from origina
 skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
 chat exposure; old consult-flow receipts do not authorize v2.
 
-The brief streams into the existing composer, read-only during preparation. Nothing auto-sends:
-a successful preparation unlocks editing and the next Send dispatches the current draft without
-rewriting it again. After five seconds, Send original is an explicit second Send action through
+The brief streams into the existing composer, read-only during preparation. **Review before
+sending** is the default: successful preparation unlocks editing and Return dispatches the current
+draft without rewriting it again. The opt-in, profile-scoped **Send automatically** mode dispatches
+a successful rewrite through ordinary fresh-claim admission on completion; any clarification questions
+force Review for that turn, even if skipped. Cmd+Return always prepares for Review (including a
+one-shot when the pill is off), using current edited text or the first original when unchanged.
+The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
+the edited rewrite stays available through undo/recovery. After five seconds, Send original is an explicit second Send action through
 fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
 recovery banner. Truncated output is recoverable but cannot be sent as a successful preparation.
 Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.

@@ -693,6 +693,47 @@ Staged-index commit preflight passed after test consolidation (secret scan: no l
 
 Not run: unfiltered/release validation or live-provider/manual UI smoke testing. No visible app lifecycle action, push or main-checkout mutation was performed; those remain outside this request.
 
+### v2.1 — composer usability refinement (2026-10-21)
+
+User live validation confirmed native Claude Code Sonnet 5.5 Low rewriting works. This refinement supersedes v2's Review-only UI, transient history toggle and special model-menu choices.
+
+- **Spinner root cause (confirmed):** `AgentStatusPillsRow` consumes a cached value snapshot. Preparation refreshed it at start/close, but phase completion/clarification/refinement did not refresh it. The operation now publishes a post-mutation state-change callback to rebuild that snapshot. Only generating/refining phases spin; neither questions, completed drafts nor router speculation do.
+- Completed header is compact and left-aligned: resolved model, dimmed/struck single-line first original (click to expand), adjacent Revert icon, then a subtle right-hand keyboard hint. Removed Show original/Undo buttons from the far right.
+- Return retains existing Send admission: prepare when enabled/unprepared, dispatch exact edited composer text when prepared. Cmd+Return is explicit Review preparation/re-preparation, even with the pill off; unchanged rewrites regenerate from the first original, edits become the new source, and the reference/restoration text remains the first original. Esc cancels streaming or reverts completed text. Revert registers one native undo action restoring its edited recovery; attachments/workflows remain untouched. Undo/recovery checks the live active tab, so a retained native undo callback cannot restore an inactive tab. The final focused/build/lint rerun covers this additional ownership fence.
+- **Shortcut audit:** the generic local editor previously treated Cmd+Return like Return (no distinct composer command). An edit-review card owns Cmd+Return for Accept. Re-prompt only intercepts the first-responder local editor, and refuses while any pending interactive review/input exists, preserving that card's shortcut. Shift+Return and Cmd+Shift+Return remain newline; noncomposer fields keep existing behavior. No alternate chord is necessary in the eligible local composer.
+- Persisted `agentRepromptMode` (Review default / opt-in Send automatically) and `agentRepromptIncludesRecentChat` (on default) extend schema 13 and its required-version fence across global/workspace profiles, copies, conflict checks and restarts. Unknown mode values fail closed to Review. Auto dispatch uses a one-use, operation/generation-fenced completion intent and a fresh ordinary composer claim; any questions, including skip-all, force Review. Explicit Cmd+Return always requests Review.
+- Model row/menu now uses the standard concrete model picker directly; no named default mode or Use primary Oracle choice. Nil remains an internal subscription-first default, presented as the actual resolved model. Legacy Oracle linkage decodes to the concrete Oracle model (an unresolved missing Oracle remains unavailable rather than switching routes). Settings show the requested subscription caption and effort sentence. Guidance is collapsed under Rewrite guidance (advanced); Restore Default affects guidance only.
+- Recent-history preference now persists in the same profile and is available in Settings and the pill menu. One-shot preparation uses the same recipient disclosure, without enabling the pill. Privacy copy documents opt-in auto dispatch.
+
+**Maintainer-guidance check:** user impact is explicit, predictable preparation/send ownership and no stuck busy indicator; confidence in snapshot root cause is confirmed by code and a cached-snapshot regression. Authorities remain canonical composer draft, operation identity/revisions, scoped settings and existing submit claims. Safety boundaries are cancellation, late completion, user edits, question fallback and disclosure; no new repository scanning or provider work is introduced by UI projection. Scope is this cohesive refinement now, with focused suites/build/lint and one independent static review; live UI/provider validation remains user-run because app launch is prohibited.
+
+Independent static review (`untitled-chat-D33323`) identified two verified edge cases, corrected with regressions: missing legacy Oracle settings now migrate to a stable unavailable marker (cannot bind to a later Oracle), and owned generated slash-prefixed drafts repeat using the first original while unowned/staged commands continue to bypass. No second review pass was requested. The in-flight initial test compilation was explicitly cancelled before applying these fixes so final validation can run on frozen sources.
+
+Changed files (24 modified; no additions/deletions):
+- Agent Mode runtime/VM: `AgentRepromptOperation.swift`, `AgentModeViewModel+Reprompt.swift`, `AgentModeViewModel+RepromptUI.swift`, `AgentModeViewModel.swift`, `UI/AgentModelsSettingsViewModel.swift`, `UI/AgentRepromptUIStore.swift`.
+- Composer/pills: `AgentInputBar.swift`, `Components/AgentRepromptComposerStrip.swift`, `Components/AgentRepromptPill.swift`, `Components/AgentStatusPillsRow.swift`.
+- Settings views: `AgentModelsSettingsView.swift`, `AgentRepromptModelPicker.swift`, `AgentRepromptSettingsEditor.swift`, `SettingsView.swift`.
+- Shared editor: `Infrastructure/UI/TextField/ResizableTextField.swift`.
+- Settings core: `AgentRepromptModelPreference.swift`, `GlobalSettingsDocument.swift`, `GlobalSettingsStore.swift`.
+- Tests: `AgentRepromptSchemaTests.swift`, `AgentRepromptSubmissionTests.swift`, `AgentRepromptPresentationTests.swift`, `AgentRepromptSettingsTests.swift` (extended existing suites; no new app-importing files).
+- Documentation: this plan and `docs/privacy/telemetry.md`.
+
+v2.1 verification, all final commands exit 0:
+
+| Command | Result | Conductor ticket |
+| --- | --- | --- |
+| `make dev-test FILTER=AgentReprompt` | 65 tests, 0 failures (61 app + 4 settings-core); includes final active-tab undo fence | `bbceb9d9-36ee-4e65-baf6-ceb9dfa6277c` |
+| `make dev-test FILTER=AgentSessionLink` | 1,273 tests, 0 failures | `a09c6b0e-6e15-494f-b837-448a6afb024a` |
+| `make dev-test FILTER=AgentModelsSettings` | 11 tests, 0 failures | `e8a6a574-4f25-4d75-9056-2bf32e7b3c3b` |
+| `make dev-test FILTER=GlobalSettings` | 37 tests, 0 failures | `9cfd8ed7-0d01-4753-b1d9-a73b5a151cd9` |
+| `make dev-test FILTER=ResizableTextField` | 7 tests, 0 failures | `64a78fe7-8f0d-4502-a13f-0a15857557a4` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | Product build passed (repeated after final undo fence) | `a04b4c7a-4ec6-464b-a9be-a1d0db78bf23` |
+| `make dev-lint` | SwiftFormat 0/1,849 need formatting; strict SwiftLint passed | `6df6cf1e-e68c-4fd0-b928-2e222248cfa6` |
+
+The first compilation was cancelled to apply review findings. One model-picker binding comma error was then corrected before the green runs. Only changed files were formatted with the pinned formatter; no formatting baseline was changed. The last active-tab fence was revalidated with the owning Re-prompt suite, product build and lint after the broader boundary suites passed. Staged-index commit preflight is run after staging this final report, before the local commit. No tests or guardrail baselines were weakened.
+
+Not performed: visible app launch/relaunch, live-provider/manual UI testing, unfiltered/release validation, push or main-checkout changes. User-run live v2.1 testing remains the final usability check.
+
 ## 9. Open questions
 
 None that block implementation. Step 1 verifications (Claude Code cwd, per-run Context Builder enhancement override, Oracle background activation/title) can each widen a work item but don't change the design.

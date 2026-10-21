@@ -42,6 +42,18 @@ enum ImagePasteboardTypes {
 final class ImageAwareTextView: NSTextView {
     var imagePasteHandler: ((NSPasteboard) -> Bool)?
     var enablesImagePasteHandling = false
+    var commandReturnHandler: (() -> Bool)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
+           commandReturnHandler?() == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    static func isCommandReturn(_ event: NSEvent) -> Bool {
+        (event.keyCode == 36 || event.keyCode == 76) && event.modifierFlags.contains(.command)
+            && !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.option) && !event.modifierFlags.contains(.control)
+    }
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
         var types = super.readablePasteboardTypes
@@ -191,6 +203,7 @@ struct ResizableTextField: View {
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onCommandReturn: (() -> Bool)?
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -253,6 +266,7 @@ struct ResizableTextField: View {
             externalEditTransaction: externalEditTransaction,
             onUndoExternalEdit: onUndoExternalEdit,
             onEscape: onEscape,
+            onCommandReturn: onCommandReturn,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -291,6 +305,7 @@ struct CustomTextField: NSViewRepresentable {
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onCommandReturn: (() -> Bool)?
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -358,6 +373,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.layoutManager?.usesFontLeading = true
 
         textView.delegate = context.coordinator
+        textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
         context.coordinator.configureFileTagSupport(
@@ -392,6 +408,7 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.isEditable = !isReadOnly
         context.coordinator.beginExternalEditIfNeeded()
+        textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
         if textView.font != fontPreset.nsFont {
@@ -466,6 +483,7 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.delegate = nil
         textView.imagePasteHandler = nil
+        textView.commandReturnHandler = nil
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -562,11 +580,17 @@ struct CustomTextField: NSViewRepresentable {
             ) {
                 return true
             }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)), let onEscape = parent.onEscape {
+                onEscape()
+                return true
+            }
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 // Use the *current* event to read modifier flags (more reliable)
                 let flags = textView.window?.currentEvent?.modifierFlags ?? []
                 if flags.contains(.shift) {
                     textView.insertNewline(nil) // Shift+Return → newline
+                } else if flags.contains(.command), !flags.contains(.option), !flags.contains(.control), let action = parent.onCommandReturn {
+                    return action()
                 } else {
                     parent.onReturn() // Plain Return → send
                 }
@@ -627,7 +651,7 @@ struct CustomTextField: NSViewRepresentable {
         func beginExternalEditIfNeeded() {
             let id = parent.externalEditTransaction?.id
             guard id != externalEditID else { return }
-            if !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing {
+            if id != nil, !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing {
                 textViewUndoManager.removeAllActions()
             }
             externalEditID = id
@@ -637,7 +661,8 @@ struct CustomTextField: NSViewRepresentable {
         func completeExternalEditIfNeeded() {
             guard parent.externalEditTransaction?.isComplete == true, !externalEditUndoRegistered else { return }
             externalEditUndoRegistered = true
-            textViewUndoManager.registerUndo(withTarget: self) { target in target.parent.onUndoExternalEdit?() }
+            let undo = parent.onUndoExternalEdit
+            textViewUndoManager.registerUndo(withTarget: self) { _ in undo?() }
             textViewUndoManager.setActionName("Re-prompt")
         }
 

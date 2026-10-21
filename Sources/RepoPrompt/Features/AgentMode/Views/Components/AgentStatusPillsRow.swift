@@ -65,6 +65,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentRepromptPill(
                     props: snapshot.reprompt,
+                    store: agentModeVM.repromptUIStore,
                     viewModel: agentModeVM,
                     setEnabled: { agentModeVM.setRepromptEnabled($0, acknowledgingProviderID: $1) },
                     openSettings: {

@@ -27,17 +27,23 @@ extension AgentModeViewModel {
 
     /// Returns true when this Send is preparation (or is blocked by an unfinished preparation).
     /// No composer attempt, submission token, history row or runtime claim is acquired here.
-    func beginComposerReprompt(target: AgentComposerSubmitTarget, text: String) -> Bool {
+    func beginComposerReprompt(target: AgentComposerSubmitTarget, text: String, forceReview: Bool = false, reprepare: Bool = false) -> Bool {
+        var original = text
+        var source = text
         if let operation = repromptOperation, operation.sourceTabID == target.tabID {
             guard operation.validate() else { return true }
-            return operation.phase != .completed
+            if !reprepare || operation.phase != .completed { return operation.phase != .completed }
+            original = operation.rawDraft
+            source = text == operation.lastGeneratedText ? original : text
+            operation.cancel(restoreOriginal: false, recover: false)
         }
-        guard repromptEnabled,
-              Self.isRepromptEligible(text: text, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
+        guard repromptEnabled || forceReview,
+              Self.isRepromptEligible(text: original, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
               !isMCPControlled(tabID: target.tabID) else { return false }
         guard let session = sessions[target.tabID], currentTabID == target.tabID,
               makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return true }
         repromptOperation?.invalidate(reason: "Another composer began preparation.")
+        let rewriteSource = source
         let id = UUID()
         let workspaceID = workspaceManager?.activeWorkspaceID
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
@@ -59,16 +65,17 @@ extension AgentModeViewModel {
             completedUserItemIDs: Set(session.transcript.turns.filter { $0.terminalState == .completed }.compactMap { $0.request?.id })
         ) : []
         let request = AgentRepromptRequest(
-            originalText: text,
+            originalText: rewriteSource,
             manifest: AgentRepromptModelPolicy.manifest(rootNames: roots.map { URL(fileURLWithPath: $0).lastPathComponent }, selectedPaths: relativePaths),
             guidance: AgentRepromptGuidance.effectiveText(profile.agentRepromptGuidance), recentChat: history
         )
         let model = resolvedRepromptModel(session: session)
-        let disclosed = repromptAvailability != nil || !repromptPillProps().requiresDisclosure
+        let disclosed = model == nil || repromptAvailability != nil || !repromptPillProps().requiresDisclosure
         let operation = AgentRepromptOperation(
-            id: id, sourceTabID: target.tabID, rawDraft: text, draftGeneration: session.draftMutationGeneration,
+            id: id, sourceTabID: target.tabID, rawDraft: original, draftGeneration: session.draftMutationGeneration,
             request: request, model: model, service: repromptService, store: repromptUIStore,
             initialError: disclosed ? nil : .disclosureRequired,
+            initialDraft: text, mode: forceReview ? .review : (profile.agentRepromptMode ?? .review),
             currentDraft: { [weak session] in session?.draftText ?? "" },
             applyDraft: { [weak self, weak session] value in
                 guard let self, let session, repromptOperation?.id == id,
@@ -77,7 +84,7 @@ extension AgentModeViewModel {
                 return session.draftMutationGeneration
             },
             chooseEffort: { [weak self] model in
-                await self?.chooseRepromptEffort(model: model, text: text, requestID: id) ?? model
+                await self?.chooseRepromptEffort(model: model, text: rewriteSource, requestID: id) ?? model
             },
             isCurrent: { [weak self, weak session] in
                 guard let self, let session, let operation = repromptOperation, operation.id == id else { return false }
@@ -93,6 +100,8 @@ extension AgentModeViewModel {
                     && session.operationAdmissionFailureMessage == nil
                     && liveMode == mode && live.agentRepromptModelRaw == profile.agentRepromptModelRaw
                     && live.agentRepromptGuidance == profile.agentRepromptGuidance
+                    && live.agentRepromptMode == profile.agentRepromptMode
+                    && live.agentRepromptIncludesRecentChat == profile.agentRepromptIncludesRecentChat
                     && (profile.agentRepromptModelRaw != AgentRepromptModelPolicy.primaryOracle || live.planningModelRaw == profile.planningModelRaw)
                     && (workspaceManager?.activeWorkspace?.repoPaths ?? []) == roots
             }
@@ -102,6 +111,7 @@ extension AgentModeViewModel {
             guard let self, let operation, let session else { return }
             startRepromptSpeculation(session: session, operationID: operation.id, text: brief, originalText: operation.rawDraft)
         }
+        operation.onStateChange = { [weak self] in self?.syncStatusPillsUIState() }
         operation.onEdit = { [weak self] in self?.cancelRepromptSpeculation(claimID: id) }
         operation.onClose = { [weak self] in
             guard let self else { return }
@@ -121,6 +131,36 @@ extension AgentModeViewModel {
         operation.start()
         syncStatusPillsUIState()
         return true
+    }
+
+    /// Cmd-Return is local, explicit Review preparation even when the pill is off.
+    /// Pending interactive reviews retain ownership of their existing keyboard shortcuts.
+    @discardableResult
+    func requestComposerRepromptAgain(target: AgentComposerSubmitTarget, text: String) -> Bool {
+        let eligibilityText: String = if let owned = repromptOperation, owned.sourceTabID == target.tabID, owned.phase == .completed {
+            owned.rawDraft // Generated/edited slash-like data is not a staged command.
+        } else { text }
+        guard let session = sessions[target.tabID], currentTabID == target.tabID,
+              makeComposerSubmitTarget(tabID: target.tabID, session: session) == target,
+              !isMCPControlled(tabID: target.tabID),
+              !Self.repromptBlockingInteractions(session).contains(true),
+              Self.isRepromptEligible(text: eligibilityText, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
+              repromptOperation?.phase.isBusy != true else { return false }
+        if repromptAvailability == nil, repromptPillProps().isAvailable, repromptPillProps().requiresDisclosure {
+            repromptUIStore.oneShotDisclosureRequest = .init(target: target, text: text, generation: session.draftMutationGeneration)
+            return true
+        }
+        return beginComposerReprompt(target: target, text: text, forceReview: true, reprepare: true)
+    }
+
+    func confirmOneShotReprompt(requestID: UUID, providerID: String) {
+        guard let request = repromptUIStore.oneShotDisclosureRequest, request.id == requestID else { return }
+        repromptUIStore.oneShotDisclosureRequest = nil
+        guard let session = sessions[request.target.tabID], currentTabID == request.target.tabID,
+              session.draftText == request.text, session.draftMutationGeneration == request.generation,
+              repromptPillProps().providerID == providerID else { return }
+        AgentRepromptDisclosure.acknowledge(providerID: providerID, defaults: .standard)
+        _ = requestComposerRepromptAgain(target: request.target, text: request.text)
     }
 
     /// Synchronous transfer at the real, local composer claim boundary, before token publication.
@@ -145,7 +185,8 @@ extension AgentModeViewModel {
     }
 
     func undoReprompt() {
-        repromptOperation?.cancel()
+        guard let operation = repromptOperation, currentTabID == operation.sourceTabID else { return }
+        operation.cancel()
     }
 
     /// "Send original" prepares the unchanged draft for the next Send; it never auto-dispatches.

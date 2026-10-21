@@ -6,6 +6,43 @@ import XCTest
 
 @MainActor
 final class AgentRepromptPresentationTests: XCTestCase {
+    func testPillSnapshotStopsSpinningAtCompletionNotAtDispatch() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+            try await publish("A partial")
+            _ = await gate.wait()
+            try await publish(" brief")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        XCTAssertTrue(fixture.viewModel.ui.statusPills.snapshot.reprompt.isPreparing)
+        await gate.release()
+        try await AsyncTestWait.waitUntil("complete", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.reprompt.isPreparing, "The value-only pill snapshot must refresh when streaming ends")
+        XCTAssertNotNil(fixture.viewModel.repromptOperation, "Completion is not dispatch or close")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+    }
+
+    func testCommandReturnIsScopedAndShiftReturnKeepsNewline() throws {
+        func event(_ flags: NSEvent.ModifierFlags, code: UInt16 = 36) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: code))
+        }
+        XCTAssertTrue(try ImageAwareTextView.isCommandReturn(event(.command)))
+        XCTAssertTrue(try ImageAwareTextView.isCommandReturn(event(.command, code: 76)))
+        let otherFlags: [NSEvent.ModifierFlags] = [[], .shift, [.command, .shift], [.command, .option], [.command, .control]]
+        for flags in otherFlags {
+            XCTAssertFalse(try ImageAwareTextView.isCommandReturn(event(flags)))
+        }
+        var escapes = 0
+        let field = CustomTextField(text: .constant("prepared"), placeholder: "", onReturn: {}, onEscape: { escapes += 1 }, currentHeightPresetIndex: .constant(0), onHeightChange: { _ in })
+        let coordinator = CustomTextField.Coordinator(field)
+        XCTAssertTrue(coordinator.textView(NSTextView(), doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        XCTAssertEqual(escapes, 1, "Esc must also work after streaming unlocks editing")
+    }
+
     func testAcknowledgedPublicationResumesFinalDraftFlushing() {
         let tabID = UUID()
         let update = AgentRepromptUIStore.DraftUpdate(operationID: UUID(), tabID: tabID, revision: 7, text: "brief")
@@ -44,6 +81,7 @@ final class AgentRepromptPresentationTests: XCTestCase {
         try await AsyncTestWait.waitUntil("inline questions", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .clarifying }
         let store = fixture.viewModel.repromptUIStore
         XCTAssertEqual(store.pendingQuestions?.interaction.title, "Before sending")
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.reprompt.isPreparing, "Questions are not provider streaming")
         XCTAssertTrue(store.pendingQuestions?.draftsByQuestionID.values.allSatisfy { $0.selectedOptionLabels.isEmpty && $0.customResponse.isEmpty && !$0.skipped } == true)
         XCTAssertEqual(fixture.session.draftText, "Generated body")
         XCTAssertNil(fixture.session.pendingAskUser)
@@ -70,6 +108,7 @@ final class AgentRepromptPresentationTests: XCTestCase {
         draft.selectedOptionLabels = ["Small"]
         fixture.viewModel.repromptOperation?.updateDraft(questionID: "scope", draft: draft)
         fixture.viewModel.repromptOperation?.completeQuestions()
+        XCTAssertTrue(fixture.viewModel.ui.statusPills.snapshot.reprompt.isPreparing)
         try await AsyncTestWait.waitUntil("refined", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
         let inputs = await probe.values
         XCTAssertEqual(inputs.count, 2)
@@ -110,6 +149,44 @@ final class AgentRepromptPresentationTests: XCTestCase {
         XCTAssertEqual(undos, 1)
         XCTAssertFalse(manager.canUndo)
         XCTAssertEqual(ResizableTextField.presetIndex(forVisibleLineFragmentCount: 1000), ResizableTextField.heightPresets.count - 1)
+    }
+
+    func testRevertCreatesOneUndoActionThatRecoversEditedRewrite() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        XCTAssertTrue(try fixture.begin(text: "First original"))
+        try await AsyncTestWait.waitUntil("prepared", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "Edited rewrite")
+        fixture.viewModel.undoReprompt()
+        XCTAssertEqual(fixture.session.draftText, "First original")
+        let recovery = try XCTUnwrap(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID])
+        let field = CustomTextField(
+            text: .constant("First original"), placeholder: "", onReturn: {},
+            externalEditTransaction: .init(id: recovery.id, isComplete: true),
+            onUndoExternalEdit: { _ = fixture.viewModel.restoreRepromptRecovery(tabID: fixture.session.tabID) },
+            currentHeightPresetIndex: .constant(0), onHeightChange: { _ in }
+        )
+        let coordinator = CustomTextField.Coordinator(field)
+        let manager = try XCTUnwrap(coordinator.undoManager(for: NSTextView()))
+        manager.groupsByEvent = false
+        coordinator.beginExternalEditIfNeeded()
+        manager.beginUndoGrouping()
+        coordinator.completeExternalEditIfNeeded()
+        manager.endUndoGrouping()
+        manager.undo()
+        XCTAssertEqual(fixture.session.draftText, "Edited rewrite")
+        XCTAssertFalse(manager.canUndo)
+    }
+
+    func testOldNativeUndoCannotRestoreAnInactiveTab() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let inactiveTabID = UUID()
+        fixture.viewModel.repromptUIStore.recoveries[inactiveTabID] = .init(text: "Old rewrite", originalDraft: "Original", reason: "Original restored", draftAtInvalidation: "Original")
+        XCTAssertFalse(fixture.viewModel.restoreRepromptRecovery(tabID: inactiveTabID, confirmedReplacement: true))
+        XCTAssertNotNil(fixture.viewModel.repromptUIStore.recoveries[inactiveTabID], "A stale action cannot consume another tab's recovery")
+        XCTAssertTrue(fixture.session.draftText.isEmpty)
     }
 
     func testRecoveryNeverReplacesNewDraftWithoutExplicitConfirmation() async throws {

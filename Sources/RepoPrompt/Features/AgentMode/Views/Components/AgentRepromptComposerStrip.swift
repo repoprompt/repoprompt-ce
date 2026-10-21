@@ -19,17 +19,27 @@ struct AgentRepromptComposerStrip: View {
                     HStack(spacing: 6) {
                         Image(systemName: "wand.and.sparkles")
                         Text("\(presentation.phase == .completed ? "Re-prompted" : "Re-prompting") · \(presentation.modelName)\(presentation.usesChatContext ? " · with chat context" : "")")
-                            .lineLimit(2)
+                            .lineLimit(1).layoutPriority(1)
                         if presentation.phase != .completed {
                             Text("\(Int(max(0, context.date.timeIntervalSince(presentation.startedAt))))s").monospacedDigit()
                         }
-                        Spacer(minLength: 4)
                         if presentation.phase == .completed {
-                            Button(showingOriginal ? "Hide original" : "Show original") { showingOriginal.toggle() }
-                            Button("Undo") {
-                                if let onUndo { onUndo(presentation.id) } else { operation?.cancel() }
+                            Button { showingOriginal.toggle() } label: {
+                                Text("Original: \(presentation.original.replacingOccurrences(of: "\n", with: " "))")
+                                    .foregroundStyle(.secondary).strikethrough().lineLimit(1).truncationMode(.tail)
                             }
+                            .buttonStyle(.plain)
+                            .hoverTooltip("Expand the original message", .top)
+                            Button {
+                                if let onUndo { onUndo(presentation.id) } else { operation?.cancel() }
+                            } label: { Image(systemName: "arrow.uturn.backward") }
+                                .buttonStyle(.plain).accessibilityLabel("Revert to original")
+                                .hoverTooltip("Revert to original (Esc)", .top)
+                            Spacer(minLength: 4)
+                            Text("↩ send · ⌘↩ re-prompt again · esc revert")
+                                .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                         } else {
+                            Spacer(minLength: 4)
                             if presentation.phase == .failed { Button("Retry") { operation?.retry() } }
                             if context.date.timeIntervalSince(presentation.startedAt) >= 5 || presentation.phase == .failed {
                                 Button("Send original") {

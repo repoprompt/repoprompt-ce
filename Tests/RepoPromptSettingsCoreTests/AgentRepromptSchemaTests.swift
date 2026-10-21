@@ -4,6 +4,25 @@ import XCTest
 
 @MainActor
 final class AgentRepromptSchemaTests: XCTestCase {
+    func testModeHistoryFeatureFenceAndLegacyOracleMigration() throws {
+        let decoder = JSONDecoder()
+        let profile = try decoder.decode(AgentModelsSettingsProfile.self, from: Data(#"{"planningModelRaw":"chosen-oracle","agentRepromptModelRaw":"primary-oracle","agentRepromptMode":"future-mode"}"#.utf8))
+        XCTAssertEqual(profile.agentRepromptModelRaw, "chosen-oracle")
+        XCTAssertEqual(profile.agentRepromptMode, .review, "Unknown modes never authorize auto-send")
+        let scalar = try decoder.decode(GlobalScalarPreferences.ModelSelectionSettings.self, from: Data(#"{"planningModel":"scalar-oracle","agentRepromptModelRaw":"primary-oracle"}"#.utf8))
+        XCTAssertEqual(scalar.agentRepromptModelRaw, "scalar-oracle")
+        var unavailable = try decoder.decode(AgentModelsSettingsProfile.self, from: Data(#"{"agentRepromptModelRaw":"primary-oracle"}"#.utf8))
+        XCTAssertEqual(unavailable.agentRepromptModelRaw, AgentRepromptModelPreference.unavailableLegacyOracle)
+        unavailable.planningModelRaw = "later-oracle"
+        let reconstructed = AgentModelsSettingsProfile(planningModelRaw: unavailable.planningModelRaw, agentRepromptModelRaw: unavailable.agentRepromptModelRaw)
+        let reloaded = try decoder.decode(AgentModelsSettingsProfile.self, from: JSONEncoder().encode(reconstructed))
+        XCTAssertEqual(reloaded.agentRepromptModelRaw, AgentRepromptModelPreference.unavailableLegacyOracle, "A missing legacy recipient must never acquire a later Oracle")
+        XCTAssertEqual(GlobalSettingsDocument(scalarPreferences: .init(modelSelection: .init(agentRepromptMode: .sendAutomatically))).requiredSchemaVersion, 13)
+        XCTAssertEqual(GlobalSettingsDocument(scalarPreferences: .init(modelSelection: .init(agentRepromptIncludesRecentChat: false))).requiredSchemaVersion, 13)
+        let scoped = GlobalSettingsDocument(agentModelsSettings: [UUID(): .init(inheritanceMode: .useGlobalSettings, profile: .init(agentRepromptMode: .sendAutomatically, agentRepromptIncludesRecentChat: false))])
+        XCTAssertEqual(scoped.requiredSchemaVersion, 13)
+    }
+
     func testOldDecodeAndFeatureFence() throws {
         let profile = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: Data("{}".utf8))
         XCTAssertNil(profile.agentRepromptGuidance)
@@ -39,6 +58,8 @@ final class AgentRepromptSchemaTests: XCTestCase {
         var profile = store.globalAgentModelsProfile()
         profile.agentRepromptGuidance = "  My voice.\n"
         profile.agentRepromptModelRaw = "specific-model"
+        profile.agentRepromptMode = .sendAutomatically
+        profile.agentRepromptIncludesRecentChat = false
         store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
         let workspaceID = UUID()
         store.copyAgentModelsProfile(from: .global, to: .workspace(workspaceID))
@@ -51,6 +72,10 @@ final class AgentRepromptSchemaTests: XCTestCase {
         XCTAssertNil(fresh.globalAgentModelsProfile().agentRepromptGuidance)
         XCTAssertEqual(fresh.workspaceAgentModelsProfile(for: workspaceID)?.agentRepromptGuidance, "My voice.")
         XCTAssertEqual(fresh.workspaceAgentModelsProfile(for: workspaceID)?.agentRepromptModelRaw, "specific-model")
+        XCTAssertEqual(fresh.globalAgentModelsProfile().agentRepromptMode, .sendAutomatically)
+        XCTAssertEqual(fresh.globalAgentModelsProfile().agentRepromptIncludesRecentChat, false)
+        XCTAssertEqual(fresh.workspaceAgentModelsProfile(for: workspaceID)?.agentRepromptMode, .sendAutomatically)
+        XCTAssertEqual(fresh.workspaceAgentModelsProfile(for: workspaceID)?.agentRepromptIncludesRecentChat, false)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         XCTAssertEqual(json["schemaVersion"] as? Int, 13)
         fresh.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)

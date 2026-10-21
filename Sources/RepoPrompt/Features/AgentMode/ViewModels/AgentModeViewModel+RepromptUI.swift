@@ -16,6 +16,31 @@ enum AgentRepromptDisclosure {
 }
 
 extension AgentModeViewModel {
+    var repromptIncludesRecentChat: Bool {
+        modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID).agentRepromptIncludesRecentChat ?? true
+    }
+
+    var repromptMode: AgentRepromptMode {
+        modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID).agentRepromptMode ?? .review
+    }
+
+    func setRepromptMode(_ mode: AgentRepromptMode) {
+        updateRepromptPreferences { $0.agentRepromptMode = mode == .review ? nil : mode }
+    }
+
+    private func updateRepromptPreferences(_ update: (inout AgentModelsSettingsProfile) -> Void) {
+        let workspaceID = workspaceManager?.activeWorkspaceID
+        var profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        update(&profile)
+        let mode = workspaceID.map { modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode } ?? .useGlobalSettings
+        switch AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: mode) {
+        case .global: modelRouterSettingsStore.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+        case let .workspace(id): modelRouterSettingsStore.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
+        }
+        invalidateRepromptIfNeeded()
+        syncStatusPillsUIState()
+    }
+
     func configuredRepromptModels() -> [AIModel] {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
         var candidates = AIModel.allModels()
@@ -57,10 +82,7 @@ extension AgentModeViewModel {
     }
 
     func setRepromptIncludesRecentChat(_ enabled: Bool) {
-        repromptOperation?.invalidate(reason: "Recent chat context preference changed.")
-        objectWillChange.send()
-        repromptIncludesRecentChat = enabled
-        syncStatusPillsUIState()
+        updateRepromptPreferences { $0.agentRepromptIncludesRecentChat = enabled ? nil : false }
     }
 
     func repromptPillProps() -> AgentRepromptPillProps {
@@ -71,7 +93,7 @@ extension AgentModeViewModel {
             return route + (repromptIncludesRecentChat ? ".recent-chat" : ".no-chat")
         }
         return .init(
-            isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isBusy == true,
+            isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isStreaming == true,
             modelDisplayName: model?.displayName, providerID: recipient,
             requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: recipient, defaults: .standard),
             unavailableReason: model == nil ? "Connect or choose a Re-prompt model in Agent Models settings." : nil
@@ -94,7 +116,7 @@ extension AgentModeViewModel {
 
     @discardableResult
     func restoreRepromptRecovery(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
-        guard let recovery = repromptUIStore.recoveries[tabID] else { return false }
+        guard currentTabID == tabID, let recovery = repromptUIStore.recoveries[tabID] else { return false }
         guard confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
         _ = loadDraftSnapshotForComposer(for: tabID)
