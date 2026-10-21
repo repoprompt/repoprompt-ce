@@ -36,6 +36,48 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         }
     }
 
+    func testCanonicalGitAndWorktreeDescriptionsAdvertiseAppBackedDefaultRepositoryElection() throws {
+        for name in [MCPWindowToolName.git, MCPWindowToolName.manageWorktree] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            for phrase in [
+                "app-backed",
+                "sole applicable worktree binding",
+                "declared PRIMARY",
+                "Multiple bindings require an explicit repository or identifying worktree selector",
+                "relative to the default repository and do not choose one",
+                "Direct headless backend"
+            ] {
+                XCTAssertTrue(definition.description.contains(phrase), "\(name) lacks '\(phrase)':\n\(definition.description)")
+            }
+            let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+            let repoRoot = try XCTUnwrap(properties["repo_root"]?.objectValue?["description"]?.stringValue)
+            XCTAssertTrue(repoRoot.contains("sole worktree binding"), "\(name) repo_root: \(repoRoot)")
+            XCTAssertTrue(repoRoot.contains("declared PRIMARY"), "\(name) repo_root: \(repoRoot)")
+            let encoded = try String(decoding: JSONEncoder().encode(definition), as: UTF8.self)
+            XCTAssertFalse(encoded.localizedCaseInsensitiveContains("first loaded"), "\(name) still advertises a load-order default")
+        }
+
+        let git = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.git)).description
+        XCTAssertTrue(git.contains("frozen selected repository target"), git)
+        XCTAssertTrue(git.contains("inspects every loaded Git root"), git)
+        let worktree = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.manageWorktree)).description
+        XCTAssertTrue(worktree.contains("Merge ops use the session's bound source worktree"), worktree)
+        XCTAssertTrue(worktree.contains("`all=true` removes bindings by identity"), worktree)
+        XCTAssertTrue(worktree.contains("uses its first Git root"), worktree)
+    }
+
+    func testDefaultRepositoryElectionAdvertisementIsIdempotentAndScoped() throws {
+        for name in [MCPWindowToolName.git, MCPWindowToolName.manageWorktree, MCPWindowToolName.agentRun] {
+            let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_advertiseDefaultRepositoryElection(current), current, name)
+        }
+        let worktree = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.manageWorktree))
+        XCTAssertEqual(worktree.description.components(separatedBy: "**Default repository**").count, 2)
+        let git = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.git))
+        XCTAssertEqual(git.description.components(separatedBy: "- Default repository (app-backed)").count, 2)
+        XCTAssertTrue(git.description.contains("log/show/blame run on the first listed repository only"), git.description)
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
