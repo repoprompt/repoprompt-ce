@@ -394,6 +394,270 @@ private final class ExecutionCounter: @unchecked Sendable {
 
 #if DEBUG
     final class MCPConnectionAdmissionTests: XCTestCase {
+        private func principal(pid: Int32 = 400, start: UInt64 = 1, parent: Int32 = 200) -> MCPApprovalProcessIdentity {
+            MCPApprovalProcessIdentity(
+                pid: pid, parentPID: parent, effectiveUID: geteuid(),
+                startSeconds: start, startMicroseconds: 5, executablePath: "/test/launcher"
+            )
+        }
+
+        func testSessionApprovalCoversReconnectsButNotSameNameOrRecycledPID() async {
+            let controller = ServerController(installNetworkCallbacks: false, processIsCurrent: { _ in true })
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, path in
+                XCTAssertEqual(path, "/test/launcher")
+                events.prompt(generation)
+            }
+            let launcher = principal()
+            for _ in 0 ..< 2 {
+                await controller.test_requestApproval(
+                    clientID: "external-test-client", principal: launcher,
+                    approve: { events.decide("allowed") }, deny: { events.decide("denied") }
+                )
+            }
+            await controller.resolvePendingApproval(allow: true, generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["allowed", "allowed"])
+            await controller.test_requestApproval(
+                clientID: "different-self-reported-name", principal: launcher,
+                approve: { events.decide("reconnected") }, deny: { events.decide("denied") }
+            )
+            XCTAssertEqual(events.decisions.last, "reconnected")
+            XCTAssertEqual(events.generations.count, 1)
+            await controller.test_requestApproval(
+                clientID: "external-test-client", principal: principal(start: 2),
+                approve: {}, deny: {}
+            )
+            XCTAssertEqual(events.generations.count, 2)
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[1])
+        }
+
+        func testDenialCooldownDrainsQueuedRetriesAndDoesNotSlide() async {
+            let clock = AdmissionClock()
+            let controller = ServerController(
+                installNetworkCallbacks: false, monotonicNow: { clock.now }, processIsCurrent: { _ in true }
+            )
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            for _ in 0 ..< 2 {
+                await controller.test_requestApproval(
+                    clientID: "same-name", principal: principal(),
+                    approve: { events.decide("allowed") }, deny: { events.decide("denied") }
+                )
+            }
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["denied", "denied"])
+            clock.advance(59)
+            await controller.test_requestApproval(
+                clientID: "same-name", principal: principal(),
+                approve: {}, deny: { events.decide("cooldown") }
+            )
+            XCTAssertEqual(events.decisions.last, "cooldown")
+            XCTAssertEqual(events.generations.count, 1)
+            clock.advance(2)
+            await controller.test_requestApproval(clientID: "same-name", principal: principal(), approve: {}, deny: {})
+            XCTAssertEqual(events.generations.count, 2)
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[1])
+            await controller.test_requestApproval(
+                clientID: "same-name", principal: principal(pid: 401), approve: {}, deny: {}
+            )
+            XCTAssertEqual(events.generations.count, 3)
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[2])
+        }
+
+        func testBundledHelperUsesImmediateParentButUnverifiedPeerCannot() {
+            let launcher = principal()
+            let helper = principal(pid: 500, parent: launcher.pid)
+            let replacement = principal(pid: 501, parent: launcher.pid)
+            let processes = [launcher.pid: launcher, helper.pid: helper, replacement.pid: replacement]
+            XCTAssertEqual(MCPApprovalProcessIdentity.resolve(peerPID: helper.pid, bundledHelper: true, read: { processes[$0] }), launcher)
+            XCTAssertEqual(MCPApprovalProcessIdentity.resolve(peerPID: replacement.pid, bundledHelper: true, read: { processes[$0] }), launcher)
+            XCTAssertEqual(MCPApprovalProcessIdentity.resolve(peerPID: helper.pid, bundledHelper: false, read: { processes[$0] }), helper)
+            XCTAssertNil(MCPApprovalProcessIdentity.resolve(peerPID: 999, bundledHelper: true, read: { processes[$0] }))
+            XCTAssertNil(MCPApprovalProcessIdentity.resolve(peerPID: helper.pid, bundledHelper: true, read: { $0 == helper.pid ? helper : nil }))
+            var reads = 0
+            XCTAssertNil(MCPApprovalProcessIdentity.resolve(peerPID: helper.pid, bundledHelper: true, read: {
+                reads += 1
+                return reads == 3 ? replacement : processes[$0]
+            }))
+        }
+
+        func testCapacityRetiresDeadEntriesBeforeLongLivedLauncherConsent() async throws {
+            let lifetimes = AdmissionLiveness()
+            let controller = ServerController(
+                installNetworkCallbacks: false,
+                processIsCurrent: { $0.pid == 400 || $0.pid == 656 || lifetimes.isLive }
+            )
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            for pid in Int32(400) ..< Int32(656) {
+                await controller.test_requestApproval(clientID: "client", principal: principal(pid: pid), approve: {}, deny: {})
+                let generation = try XCTUnwrap(events.generations.last)
+                await controller.resolvePendingApproval(allow: true, generation: generation)
+            }
+            lifetimes.close()
+            await controller.test_requestApproval(clientID: "client", principal: principal(pid: 656), approve: {}, deny: {})
+            let generation = try XCTUnwrap(events.generations.last)
+            await controller.resolvePendingApproval(allow: true, generation: generation)
+            await controller.test_requestApproval(
+                clientID: "long-lived-client", principal: principal(),
+                approve: { events.decide("remembered") }, deny: { events.decide("denied") }
+            )
+            XCTAssertEqual(events.generations.count, 257)
+            XCTAssertEqual(events.decisions, ["remembered"])
+        }
+
+        func testApprovalQueueIsBoundedAndResolvesOverflow() async {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            for _ in 0 ..< 33 {
+                await controller.test_requestApproval(clientID: "peer", approve: {}, deny: { events.decide("denied") })
+            }
+            XCTAssertEqual(events.generations.count, 1)
+            XCTAssertEqual(events.decisions, ["denied"])
+            for index in 0 ..< 32 {
+                await controller.resolvePendingApproval(allow: false, generation: events.generations[index])
+            }
+            XCTAssertEqual(events.decisions.count, 33)
+        }
+
+        func testVanishedHelperRetainsConsentForLiveLauncherButCannotUseDeadConnection() async {
+            let controller = ServerController(installNetworkCallbacks: false, processIsCurrent: { _ in true })
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            await controller.test_requestApproval(
+                clientID: "external", principal: principal(), validate: { false },
+                approve: { events.decide("unexpected") }, deny: { events.decide("gone") }
+            )
+            await controller.test_requestApproval(
+                clientID: "external", principal: principal(),
+                approve: { events.decide("allowed") }, deny: { events.decide("denied") }
+            )
+            await controller.resolvePendingApproval(allow: true, generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["gone", "allowed"])
+            XCTAssertEqual(events.generations.count, 1)
+            await controller.test_requestApproval(
+                clientID: "external", principal: principal(), validate: { false },
+                approve: { events.decide("unexpected") }, deny: { events.decide("rejected") }
+            )
+            XCTAssertEqual(events.decisions, ["gone", "allowed", "rejected"])
+            XCTAssertEqual(events.generations.count, 1)
+        }
+
+        /// Uses real OS child lifetimes to exercise process resolution and consent;
+        /// bundled-executable verification and the MCP socket path are separate boundaries.
+        func testRealChildRespawnsShareLauncherConsentEvenAfterPromptingChildExits() async throws {
+            for allow in [true, false] {
+                let controller = ServerController(installNetworkCallbacks: false)
+                let events = AdmissionEvents()
+                await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+                let first = Process()
+                first.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                first.arguments = ["60"]
+                try first.run()
+                defer { if first.isRunning { first.terminate()
+                    first.waitUntilExit()
+                } }
+                let firstPID = first.processIdentifier
+                let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
+                let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
+                XCTAssertEqual(launcher.pid, getpid())
+                await controller.test_requestApproval(
+                    clientID: "external-test-client", principal: launcher,
+                    validate: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                    approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
+                )
+                first.terminate()
+                first.waitUntilExit()
+                let second = Process()
+                second.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                second.arguments = ["60"]
+                try second.run()
+                defer { if second.isRunning { second.terminate()
+                    second.waitUntilExit()
+                } }
+                let secondPID = second.processIdentifier
+                let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
+                let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
+                XCTAssertEqual(secondLauncher, launcher)
+                await controller.test_requestApproval(
+                    clientID: "external-test-client", principal: secondLauncher,
+                    validate: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                    approve: { events.decide("new-helper-allowed") }, deny: { events.decide("new-helper-denied") }
+                )
+                await controller.resolvePendingApproval(allow: allow, generation: events.generations[0])
+                XCTAssertEqual(events.generations.count, 1)
+                XCTAssertEqual(events.decisions, ["old-helper-denied", allow ? "new-helper-allowed" : "new-helper-denied"])
+            }
+        }
+
+        func testClosedQueuedConnectionNeverPresentsAnotherDialog() async {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let events = AdmissionEvents()
+            let liveness = AdmissionLiveness()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            await controller.test_requestApproval(clientID: "active", approve: { events.decide("active") }, deny: {})
+            await controller.test_requestApproval(
+                clientID: "closed", isConnectionLive: { liveness.isLive },
+                approve: { events.decide("unexpected") }, deny: { events.decide("closed") }
+            )
+            liveness.close()
+            await controller.resolvePendingApproval(allow: true, generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["active", "closed"])
+            XCTAssertEqual(events.generations.count, 1)
+            await controller.test_requestApproval(
+                clientID: "already-closed", isConnectionLive: { false }, approve: {}, deny: { events.decide("discarded") }
+            )
+            XCTAssertEqual(events.decisions.last, "discarded")
+            XCTAssertEqual(events.generations.count, 1)
+        }
+
+        func testUnverifiedTimeoutDrainsOnlySameNameUnverifiedRequests() async {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            for _ in 0 ..< 2 {
+                await controller.test_requestApproval(clientID: "unknown", approve: {}, deny: { events.decide("timed-out") })
+            }
+            await controller.test_requestApproval(clientID: "other", approve: {}, deny: { events.decide("other") })
+            await controller.test_timeoutApproval(generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["timed-out", "timed-out"])
+            XCTAssertEqual(events.generations.count, 2)
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[1])
+        }
+
+        func testTimeoutCreatesCooldownAndDrainsOnlyMatchingProcess() async {
+            let controller = ServerController(installNetworkCallbacks: false, processIsCurrent: { _ in true })
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+            for _ in 0 ..< 2 {
+                await controller.test_requestApproval(
+                    clientID: "external", principal: principal(), approve: {}, deny: { events.decide("timeout") }
+                )
+            }
+            await controller.test_requestApproval(
+                clientID: "external", principal: principal(pid: 401), approve: {}, deny: { events.decide("other") }
+            )
+            await controller.test_timeoutApproval(generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["timeout", "timeout"])
+            XCTAssertEqual(events.generations.count, 2)
+            await controller.test_timeoutApproval(generation: events.generations[0])
+            XCTAssertEqual(events.decisions.count, 2)
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[1])
+        }
+
+        func testProcessIdentityComesFromKernelAndDoesNotDependOnLauncherAncestry() throws {
+            let observed = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: getpid()))
+            XCTAssertEqual(observed.pid, getpid())
+            XCTAssertEqual(observed.effectiveUID, geteuid())
+            XCTAssertGreaterThan(observed.startSeconds, 0)
+            XCTAssertFalse(observed.executablePath.isEmpty)
+            XCTAssertEqual(principal(), principal(parent: 999))
+            XCTAssertEqual(Set([principal(), principal(parent: 999)]).count, 1)
+        }
+
         func testUnverifiedNamesNeverAuthorizeAdmission() {
             let names = [
                 "claude-code", "codex-mcp-client", "gemini-cli-mcp-client",
@@ -426,7 +690,7 @@ private final class ExecutionCounter: @unchecked Sendable {
         func testOneTimeApprovalDoesNotTransferToSameNamePeerOrStaleResponse() async {
             let controller = ServerController(installNetworkCallbacks: false)
             let events = AdmissionEvents()
-            await controller.setApprovalCallback { _, generation in events.prompt(generation) }
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
             await controller.test_requestApproval(
                 clientID: "same-name", approve: { events.decide("first-allowed") }, deny: { events.decide("first-denied") }
             )
@@ -455,8 +719,8 @@ private final class ExecutionCounter: @unchecked Sendable {
             let (windowA, streamA) = await service.subscribeToStateUpdates()
             let (windowB, streamB) = await service.subscribeToStateUpdates()
             let events = AdmissionEvents()
-            await controller.setApprovalCallback { name, generation in
-                await service.setPendingApprovalForTesting(name, generation: generation)
+            await controller.setApprovalCallback { name, generation, executablePath in
+                await service.setPendingApprovalForTesting(name, generation: generation, executablePath: executablePath)
                 events.prompt(generation)
             }
             for peer in ["first", "second"] {
@@ -495,7 +759,7 @@ private final class ExecutionCounter: @unchecked Sendable {
         func testExplicitDenialRemainsConnectionSpecific() async {
             let controller = ServerController(installNetworkCallbacks: false)
             let events = AdmissionEvents()
-            await controller.setApprovalCallback { _, generation in events.prompt(generation) }
+            await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
             for peer in ["first", "second"] {
                 await controller.test_requestApproval(
                     clientID: "same-name", approve: { events.decide("\(peer)-allowed") }, deny: { events.decide("\(peer)-denied") }
@@ -505,6 +769,30 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(events.decisions, ["first-denied"])
             await controller.resolvePendingApproval(allow: true, generation: events.generations[1])
             XCTAssertEqual(events.decisions, ["first-denied", "second-allowed"])
+        }
+    }
+
+    private final class AdmissionLiveness: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = true
+        var isLive: Bool {
+            lock.withLock { value }
+        }
+
+        func close() {
+            lock.withLock { value = false }
+        }
+    }
+
+    private final class AdmissionClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: TimeInterval = 0
+        var now: TimeInterval {
+            lock.withLock { value }
+        }
+
+        func advance(_ seconds: TimeInterval) {
+            lock.withLock { value += seconds }
         }
     }
 
@@ -527,6 +815,159 @@ private final class ExecutionCounter: @unchecked Sendable {
 
         func decide(_ decision: String) {
             lock.withLock { storedDecisions.append(decision) }
+        }
+    }
+
+    /// Isolated socket-level coverage: real MCP initialize, kernel peer credentials,
+    /// production admission/identity/liveness, and connection removal. No app launch.
+    final class MCPConnectionApprovalTransportTests: XCTestCase {
+        func testAllowSurvivesSocketCloseBeforeClickAndAdmitsReconnectWithoutPrompt() async throws {
+            try await exerciseDecisionAfterSocketCloses(allow: true)
+        }
+
+        func testDenySurvivesSocketCloseBeforeClickAndRejectsReconnectWithoutPrompt() async throws {
+            try await exerciseDecisionAfterSocketCloses(allow: false)
+        }
+
+        private func exerciseDecisionAfterSocketCloses(allow: Bool) async throws {
+            let network = ServerNetworkManager()
+            let controller = ServerController(networkManager: network, installNetworkCallbacks: false)
+            let autoApprove = await controller.getAutoApproveAllClients()
+            XCTAssertFalse(autoApprove, "This regression must exercise manual approval, not the global bypass")
+            let prompted = expectation(description: "External initialize requests manual approval")
+            let events = ApprovalEvents()
+            await controller.setApprovalCallback { [weak controller] name, generation, path in
+                XCTAssertEqual(name, "external-test-client")
+                XCTAssertEqual(path, MCPApprovalProcessIdentity.read(pid: getpid())?.executablePath)
+                events.prompt(generation)
+                if events.generations.count == 1 {
+                    prompted.fulfill()
+                } else {
+                    XCTFail("A replacement connection unexpectedly prompted again")
+                    await controller?.resolvePendingApproval(allow: false, generation: generation)
+                }
+            }
+            let first = try await makeConnection(network: network, controller: controller)
+            let initialize = Task { try await first.client.connect(transport: first.transport) }
+            await fulfillment(of: [prompted], timeout: 5)
+            guard let generation = events.generations.first else {
+                initialize.cancel()
+                await first.close()
+                await network.stop()
+                return XCTFail("Production admission never presented an approval")
+            }
+
+            // Model a host abandoning initialize while the user is reading the dialog.
+            // The OS principal remains alive, but the actual network lifecycle is gone.
+            await first.close()
+            let firstIsLive = await network.isConnectionLiveForApproval(first.id)
+            XCTAssertFalse(firstIsLive)
+            await controller.resolvePendingApproval(allow: allow, generation: generation)
+            initialize.cancel()
+            _ = await initialize.result
+            let removed = await network.debugDirectAdmissionStateForTesting(connectionID: first.id)
+            XCTAssertNil(removed.pendingClientID)
+
+            let second = try await makeConnection(network: network, controller: controller)
+            do {
+                do {
+                    _ = try await second.client.connect(transport: second.transport)
+                    XCTAssertTrue(allow, "A remembered denial must reject the replacement connection")
+                } catch {
+                    if allow { throw error }
+                }
+                XCTAssertEqual(events.generations.count, 1, "Replacement sockets from the same process must not prompt again")
+                if !allow {
+                    let deniedIsLive = await network.isConnectionLiveForApproval(second.id)
+                    let denied = await network.debugDirectAdmissionStateForTesting(connectionID: second.id)
+                    XCTAssertFalse(deniedIsLive)
+                    XCTAssertNil(denied.pendingClientID, "Cooldown rejection must release the reserved admission slot")
+                }
+            } catch {
+                await second.close()
+                await controller.setApprovalCallback { _, _, _ in }
+                await network.stop()
+                throw error
+            }
+            await second.close()
+            await controller.setApprovalCallback { _, _, _ in }
+            await network.stop()
+        }
+
+        private func makeConnection(
+            network: ServerNetworkManager,
+            controller: ServerController
+        ) async throws -> SocketConnection {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENFILE)
+            }
+            defer {
+                for fd in descriptors where fd >= 0 {
+                    Darwin.close(fd)
+                }
+            }
+            var peerPID: pid_t = 0
+            var length = socklen_t(MemoryLayout<pid_t>.size)
+            guard getsockopt(descriptors[0], SOL_LOCAL, LOCAL_PEERPID, &peerPID, &length) == 0, peerPID > 1 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ESRCH)
+            }
+            XCTAssertEqual(peerPID, getpid())
+            let id = UUID()
+            let token = UUID().uuidString
+            let server = try BootstrapSocketConnectionManager(
+                connectionID: id, sessionToken: token, clientPid: Int(peerPID),
+                observedKernelPeerPID: Int(peerPID), clientName: "external-test-client",
+                purpose: .unknown, codeMapsDisabled: true, connectedFD: descriptors[0], parentManager: network
+            )
+            descriptors[0] = -1
+            let transport = try UnixSocketMCPTransport(connectedFD: descriptors[1], connectionID: id, correlationConnectionID: token)
+            descriptors[1] = -1
+            await network.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: server, pendingClientID: "external-test-client"
+            )
+            _ = await network.debugInstallConnectionLimiterForTesting(connectionID: id)
+            do {
+                try await server.start { info in
+                    await controller.test_authorizeConnection(connectionID: id, clientName: info.name)
+                }
+            } catch {
+                await transport.disconnect()
+                await server.stop()
+                await network.debugRemoveConnection(id)
+                throw error
+            }
+            return SocketConnection(
+                id: id, client: Client(name: "external-test-client", version: "1.0"),
+                transport: transport, server: server, network: network
+            )
+        }
+
+        private struct SocketConnection {
+            let id: UUID
+            let client: Client
+            let transport: UnixSocketMCPTransport
+            let server: BootstrapSocketConnectionManager
+            let network: ServerNetworkManager
+
+            func close() async {
+                await client.disconnect()
+                await transport.disconnect()
+                await server.stop()
+                await network.debugRemoveConnection(id)
+            }
+        }
+
+        private final class ApprovalEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var values: [UInt64] = []
+            var generations: [UInt64] {
+                lock.withLock { values }
+            }
+
+            func prompt(_ generation: UInt64) {
+                lock.withLock { values.append(generation) }
+            }
         }
     }
 #endif

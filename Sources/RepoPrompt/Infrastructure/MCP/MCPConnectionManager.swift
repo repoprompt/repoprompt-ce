@@ -16579,6 +16579,13 @@ actor ServerNetworkManager {
         return (fingerprint, nil)
     }
 
+    /// Liveness fence for queued approval UI; process identity may be unavailable
+    /// even for a live connection, so a missing peer PID is not a close signal.
+    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
+    }
+
     /// Returns the verified peer PID for a bootstrap socket connection, if available.
     func peerPID(for connectionID: UUID) async -> Int? {
         guard let connection = connections[connectionID] else { return nil }

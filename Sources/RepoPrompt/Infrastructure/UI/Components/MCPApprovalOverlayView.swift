@@ -17,6 +17,7 @@ struct MCPApprovalOverlayView: View {
 
     let clientID: String
     let generation: UInt64
+    let executablePath: String?
 
     var body: some View {
         ZStack {
@@ -156,7 +157,23 @@ struct MCPApprovalOverlayView: View {
             // Client info card
             clientInfoCard
 
-            Text("Client names are self-reported. Approval applies only to this connection; future connections require approval again.")
+            if let executablePath {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Requesting process (observed locally)")
+                        .font(.caption.weight(.semibold))
+                    Text(executablePath)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                    Text("Allow Session covers this running process, including reconnects and other client names it uses. Deny suppresses its requests for one minute. Choices reset when RepoPrompt quits.")
+                        .font(.caption)
+                }
+                .foregroundColor(.secondary)
+            } else {
+                Text("The launching process could not be verified. Approval applies only to this connection.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Text("Client names are self-reported.")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -239,7 +256,7 @@ struct MCPApprovalOverlayView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Allow Once")
+                    Text(executablePath == nil ? "Allow Once" : "Allow Session")
                         .font(.subheadline.weight(.medium))
                 }
                 .frame(maxWidth: .infinity)
