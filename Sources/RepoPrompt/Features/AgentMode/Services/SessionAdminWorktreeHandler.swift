@@ -237,9 +237,14 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             ])])
         ]
         if bindAfter {
+            // An omitted `repo_root` becomes the repository creation elected (the one `next_call` replays) for the
+            // bind, any deferred continuation, and their recovery calls: an unqualified `@id:` of the new checkout is
+            // ambiguous when the target's workspace holds several checkouts of its repository. An explicit token is
+            // kept, so a relative one still binds under the logical root it elects.
             let binding: SessionAdminItemResult = if context.scopes.isCurrent(lease) {
                 await bindOne(
-                    lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
+                    lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)",
+                    repoRoot: repoRoot ?? info.repoRootPath, mode: mode
                 )
             } else {
                 .revoked(target)
@@ -332,7 +337,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
                         "op": .string("worktree_bind"), "scope_id": .string(scope.id.uuidString),
                         "session_id": .string(target.uuidString), "worktree": .string(worktree), "apply": .string("next_boundary")
-                    ])])
+                    ].merging(repoRoot.map { ["repo_root": Value.string($0)] } ?? [:]) { current, _ in current })])
                 ]
             )
         } catch {
