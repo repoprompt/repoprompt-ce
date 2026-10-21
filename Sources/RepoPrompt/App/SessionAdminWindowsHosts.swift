@@ -646,10 +646,18 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let existing = try await vcsService.listGitWorktrees(at: target.repo.rootURL)
         try authorize()
         let mainRoot = existing.first(where: \.isMain)?.path ?? target.repo.rootPath
+        // Refusals name the checkout Git runs in, plus the workspace root it serves when that differs.
+        let executionRepository = target.repo.rootURL.standardizedFileURL.path
+        let servedWorkspaceRoot = target.logicalRoot.map(\.standardizedFullPath).flatMap { root in
+            GitRepoRootAuthorization.canonicalPath(root) == GitRepoRootAuthorization.canonicalPath(executionRepository) ? nil : root
+        }
         if let branch, let holder = existing.first(where: { $0.branch.map(Self.shortBranch) == Self.shortBranch(branch) }) {
             throw SessionAdminHostError.refused(
                 code: "branch_exists",
-                detail: Self.branchExistsDetail(branch, checkedOutAt: holder.path),
+                detail: Self.branchExistsDetail(
+                    branch, repository: executionRepository, workspaceRoot: servedWorkspaceRoot,
+                    checkedOutAt: holder.path, provenBeforeCreation: true
+                ),
                 nextCall: .object(["tool": .string("session_admin"), "arguments": .object([
                     "op": .string("worktree_bind"), "session_id": .string(sessionID.uuidString), "worktree": .string(holder.path)
                 ])])
@@ -701,10 +709,20 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                     request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
                 )
             }
-        } catch let error where branch != nil && String(describing: error).contains("already exists") {
-            throw SessionAdminHostError.refused(
-                code: "branch_exists", detail: Self.branchExistsDetail(branch ?? "", checkedOutAt: nil), nextCall: nil
-            )
+        } catch let error as GitService.GitError where error.worktreeCreateFailure != nil {
+            // The Git service classifies its creation failures where the evidence is. Only its preflight refusal
+            // proves nothing was created; Git's own failure past the commit fence does not.
+            if let branch, let failure = error.worktreeCreateFailure, failure.branchExists {
+                throw SessionAdminHostError.refused(
+                    code: "branch_exists",
+                    detail: Self.branchExistsDetail(
+                        branch, repository: executionRepository, workspaceRoot: servedWorkspaceRoot,
+                        checkedOutAt: nil, provenBeforeCreation: failure.refusedBeforeCreation
+                    ),
+                    nextCall: nil
+                )
+            }
+            throw servedWorkspaceRoot.map { error.naming(workspaceRoot: $0, servedBy: executionRepository) } ?? error
         }
         let created = result.descriptor
         return SessionAdminWorktreeInfo(
@@ -721,11 +739,23 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         name.hasPrefix("refs/heads/") ? String(name.dropFirst("refs/heads/".count)) : name
     }
 
-    static func branchExistsDetail(_ branch: String, checkedOutAt path: String?) -> String {
+    /// `repository` is the checkout Git runs in; `workspaceRoot` is the root it serves, given only when it differs.
+    /// "Nothing was created" is claimed only for a refusal proven before creation.
+    static func branchExistsDetail(
+        _ branch: String,
+        repository: String,
+        workspaceRoot: String?,
+        checkedOutAt path: String?,
+        provenBeforeCreation: Bool
+    ) -> String {
+        let location = workspaceRoot.map { "repository \(repository) (for workspace root \($0))" } ?? "repository \(repository)"
+        let outcome = provenBeforeCreation
+            ? "Nothing was created."
+            : "Git reported this while adding the worktree, after the pre-creation checks passed; inspect that repository's worktrees before retrying."
         if let path {
-            return "Branch '\(branch)' already exists and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. Nothing was created."
+            return "Branch '\(branch)' already exists in \(location) and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. \(outcome)"
         }
-        return "Branch '\(branch)' already exists. Pass a new branch name, or omit branch to get a generated one. Nothing was created."
+        return "Branch '\(branch)' already exists in \(location). Pass a new branch name, or omit branch to get a generated one. \(outcome)"
     }
 
     // MARK: - Bind / unbind

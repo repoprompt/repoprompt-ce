@@ -1034,6 +1034,50 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        func testElectionInvalidRequestedRefNamesTheExecutionCheckoutAndSettlesNotApplied() async throws {
+            try await withElectionFixture { fixture in
+                // The sole binding B->B' elects checkout B', which differs from its logical root B.
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                let bindings = fixture.session.worktreeBindings
+                let registrations = try fixture.worktreeRegistrations()
+                let container = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.beta)
+                let checkoutsBefore = Self.checkouts(in: container)
+                // A lone "-" keeps the caller's spelling; the context explains Git's @{-1} meaning.
+                for (branch, baseRef) in [("bad-base", "no-such-ref"), ("bad-previous", "-")] {
+                    let settlements = OSAllocatedUnfairLock<[DomainProtectedMutationSettlement]>(initialState: [])
+                    do {
+                        let reply = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                            settlements.withLock { $0.append(settlement) }
+                        }) {
+                            try await fixture.manage([
+                                "op": .string("create"), "branch": .string(branch), "base_ref": .string(baseRef)
+                            ])
+                        }
+                        XCTFail("An unresolvable base ref must be refused: \(Self.json(reply))")
+                    } catch {
+                        XCTAssertNil(error as? DomainProtectedMutationError, "Refusal must not be indeterminate: \(error)")
+                        let text = Self.errorText(error)
+                        XCTAssertTrue(Self.names(text, "repository ", fixture.betaPrime), "names the execution checkout: \(text)")
+                        XCTAssertTrue(Self.names(text, "Workspace root ", fixture.beta), "keeps the logical root legible: \(text)")
+                        XCTAssertTrue(text.contains("base ref '\(baseRef)' does not resolve to a commit"), text)
+                        XCTAssertTrue(text.contains("branch '\(branch)'"), text)
+                        XCTAssertTrue(text.contains("Nothing was created."), text)
+                        if baseRef == "-" {
+                            XCTAssertTrue(text.contains("@{-1}"), text)
+                        }
+                    }
+                    XCTAssertEqual(settlements.withLock { $0.last?.state }, .notApplied, baseRef)
+                    XCTAssertThrowsError(
+                        try fixture.repos.runGit(["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"], at: fixture.betaPrime),
+                        "no branch is created for base ref \(baseRef)"
+                    )
+                }
+                XCTAssertEqual(try fixture.worktreeRegistrations(), registrations)
+                XCTAssertEqual(Self.checkouts(in: container), checkoutsBefore, "no checkout under the app-managed container")
+                XCTAssertEqual(fixture.session.worktreeBindings, bindings)
+            }
+        }
+
         func testElectionDeclaredRootsCollapseIdenticalPathsButKeepAliasesInOrder() {
             let home = ("~" as NSString).expandingTildeInPath
             let roots = WorkspaceDefaultGitRepositoryElection.Snapshot.declaredRoots([
@@ -1059,6 +1103,24 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
 
         private static func errorText(_ error: Error) -> String {
             "\(error) \(error.localizedDescription)"
+        }
+
+        /// Whether `text` names `url` after `label`, in its given, symlink-resolved, or realpath spelling.
+        private static func names(_ text: String, _ label: String, _ url: URL) -> Bool {
+            var spellings = [url.standardizedFileURL.path, canonicalPath(url)]
+            if let resolved = realpath(url.path, nil) {
+                spellings.append(String(cString: resolved))
+                free(resolved)
+            }
+            return spellings.contains { text.contains(label + $0) }
+        }
+
+        /// Entries of `container` that hold a Git checkout, rather than every directory a create may prepare.
+        private static func checkouts(in container: URL) -> [String] {
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: container.path)) ?? []
+            return entries.filter {
+                FileManager.default.fileExists(atPath: container.appendingPathComponent($0).appendingPathComponent(".git").path)
+            }.sorted()
         }
 
         private static func statusBranch(_ reply: Value) -> String? {

@@ -516,6 +516,139 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         }
     }
 
+    // MARK: - Error context (#1431)
+
+    // The sole target binding beta -> beta' elects checkout beta', which differs from its logical root beta: each
+    // failure names the checkout Git ran in, the requested branch/ref, and keeps the logical root legible.
+
+    func testBranchExistsRefusalsNameTheExecutionCheckoutAndKeepReplayableRecovery() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            let registrations = try fixture.registrations()
+
+            // No checkout holds the branch: the Git service refuses it before creation, and no bind is offered.
+            try fixture.git.runGit(["branch", "e2e/no-checkout"], at: repos.beta)
+            let bare = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/no-checkout"), "idempotency_key": .string("context-bare-branch")
+            ])
+            XCTAssertEqual(bare["code"], .string("branch_exists"), Self.json(bare))
+            XCTAssertNil(bare["next_call"], Self.json(bare))
+            let bareDetail = bare["detail"]?.stringValue ?? ""
+            for fragment in ["Branch 'e2e/no-checkout' already exists", "new branch name", "Nothing was created."] {
+                XCTAssertTrue(bareDetail.contains(fragment), bareDetail)
+            }
+            XCTAssertTrue(Self.names(bareDetail, "repository ", repos.betaPrime), bareDetail)
+            XCTAssertTrue(Self.names(bareDetail, "workspace root ", repos.beta), bareDetail)
+
+            // A checkout holds the branch: refused before creation, with a bind of that checkout as the recovery.
+            let held = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string(ElectionRepositories.topicBranch), "idempotency_key": .string("context-held-branch")
+            ])
+            XCTAssertEqual(held["code"], .string("branch_exists"), Self.json(held))
+            let heldDetail = held["detail"]?.stringValue ?? ""
+            for fragment in ["Branch '\(ElectionRepositories.topicBranch)' already exists", "Nothing was created."] {
+                XCTAssertTrue(heldDetail.contains(fragment), heldDetail)
+            }
+            XCTAssertTrue(Self.names(heldDetail, "checked out at ", repos.betaTopic), heldDetail)
+            XCTAssertTrue(Self.names(heldDetail, "repository ", repos.betaPrime), heldDetail)
+            XCTAssertTrue(Self.names(heldDetail, "workspace root ", repos.beta), heldDetail)
+            XCTAssertEqual(try fixture.registrations(), registrations, "neither refusal registers a checkout")
+            XCTAssertTrue(fixture.ownership.records.isEmpty)
+
+            // The recovery replays verbatim and binds the holding checkout under the same logical root.
+            let next = try XCTUnwrap(held["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(held))
+            let bound = try await fixture.call(next)
+            XCTAssertEqual(bound["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), Self.json(bound))
+            XCTAssertEqual(fixture.targetBindingMap(), try [Self.canonical(repos.beta): fixture.worktreeID(repos.betaTopic)])
+        }
+    }
+
+    func testInvalidBaseRefRefusesBeforeCreationWhileAnActualAddFailureClaimsNothingCreated() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            let bindings = fixture.session.worktreeBindings
+            let registrations = try fixture.registrations()
+
+            // An unresolvable base ref is refused by the Git service's preflight, before the commit fence.
+            let invalid = await Self.failure {
+                try await fixture.call([
+                    "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                    "branch": .string("e2e/bad-base"), "base_ref": .string("no-such-ref"),
+                    "idempotency_key": .string("context-bad-base")
+                ])
+            }
+            for fragment in [
+                "refused before creation", "base ref 'no-such-ref' does not resolve to a commit", "branch 'e2e/bad-base'",
+                "Nothing was created."
+            ] {
+                XCTAssertTrue(invalid.contains(fragment), invalid)
+            }
+            XCTAssertTrue(Self.names(invalid, "repository ", repos.betaPrime), invalid)
+            XCTAssertTrue(Self.names(invalid, "Workspace root ", repos.beta), invalid)
+            XCTAssertThrowsError(try fixture.git.runGit(["show-ref", "--verify", "--quiet", "refs/heads/e2e/bad-base"], at: repos.beta))
+            XCTAssertEqual(try fixture.registrations(), registrations, "the refusal registers no checkout")
+
+            // A ref whose text contains "already exists" is still an invalid ref, not a branch conflict: the Git
+            // service classifies the failure rather than the host searching a message that carries refs and paths.
+            let oddRef = await Self.failure {
+                try await fixture.call([
+                    "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                    "branch": .string("e2e/odd-base"), "base_ref": .string("already exists"),
+                    "idempotency_key": .string("context-odd-base")
+                ])
+            }
+            XCTAssertTrue(oddRef.contains("base ref 'already exists' does not resolve to a commit"), oddRef)
+            XCTAssertFalse(oddRef.contains("branch_exists"), oddRef)
+
+            // `refs/heads/e2e/topic` exists, so Git cannot create `e2e/topic/child`; the preflight cannot know that.
+            // The failure is Git's own, from `git worktree add` past the commit fence, so it claims nothing about
+            // what was created.
+            let addFailure = await Self.failure {
+                try await fixture.call([
+                    "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                    "branch": .string("e2e/topic/child"), "idempotency_key": .string("context-add-failure")
+                ])
+            }
+            for fragment in ["git worktree add failed", "refs/heads/e2e/topic", "branch 'e2e/topic/child'", "omitted; Git default"] {
+                XCTAssertTrue(addFailure.contains(fragment), addFailure)
+            }
+            XCTAssertTrue(Self.names(addFailure, "repository ", repos.betaPrime), addFailure)
+            XCTAssertTrue(Self.names(addFailure, "Workspace root ", repos.beta), addFailure)
+            let container = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: repos.beta)
+            XCTAssertTrue(Self.names(addFailure, "destination ", container), addFailure)
+            XCTAssertFalse(addFailure.contains("Nothing was created"), addFailure)
+            XCTAssertFalse(addFailure.contains("refused before creation"), addFailure)
+            XCTAssertTrue(fixture.ownership.records.isEmpty, "neither failure returned a worktree to own")
+            XCTAssertEqual(fixture.session.worktreeBindings, bindings)
+        }
+    }
+
+    func testDirectHeadAndRefLookupsNameTheRepositoryAndRequestedRevision() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            let service = GitService()
+            let missingRef = await Self.failure { try await service.getRefSHA(at: repos.betaPrime, ref: "no-such-ref") }
+            XCTAssertTrue(missingRef.contains("requested ref 'no-such-ref'"), missingRef)
+            XCTAssertTrue(Self.names(missingRef, "repository ", repos.betaPrime), missingRef)
+
+            let unborn = fixture.git.sandbox.appendingPathComponent("unborn", isDirectory: true)
+            try fixture.git.initializeRepository(at: unborn)
+            let missingHead = await Self.failure { try await service.getHeadSHA(at: unborn) }
+            XCTAssertTrue(missingHead.contains("requested HEAD"), missingHead)
+            XCTAssertTrue(Self.names(missingHead, "repository ", unborn), missingHead)
+
+            // Resolvable revisions still return their object IDs.
+            let head = try await service.getHeadSHA(at: repos.betaPrime)
+            XCTAssertEqual(head, try fixture.head(repos.betaPrime))
+            let topic = try await service.getRefSHA(at: repos.betaPrime, ref: ElectionRepositories.topicBranch)
+            XCTAssertEqual(topic, try fixture.head(repos.betaTopic))
+        }
+    }
+
     @MainActor
     private struct Fixture {
         let git: ReviewGitRepositoryFixture
@@ -903,6 +1036,29 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
 
     private static func json(_ value: [String: Value]) -> String {
         json(.object(value))
+    }
+
+    /// Whether `text` names `url` after `label`, in its given, symlink-resolved, or `/private` realpath spelling.
+    private static func names(_ text: String, _ label: String, _ url: URL) -> Bool {
+        var spellings = [url.standardizedFileURL.path, canonical(url)]
+        if let resolved = realpath(url.path, nil) {
+            spellings.append(String(cString: resolved))
+            free(resolved)
+        }
+        return spellings.contains { text.contains(label + $0) }
+    }
+
+    /// The description of the error `body` throws; fails the test if it returns instead.
+    private static func failure(
+        _ body: () async throws -> some Any, file: StaticString = #filePath, line: UInt = #line
+    ) async -> String {
+        do {
+            let value = try await body()
+            XCTFail("expected a thrown failure, got \(value)", file: file, line: line)
+            return ""
+        } catch {
+            return "\(error) \(error.localizedDescription)"
+        }
     }
 
     private static func json(_ value: Value) -> String {

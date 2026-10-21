@@ -354,11 +354,21 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
         // Commit at the backend's final fence: deterministic Git refusals (existing branch,
         // unresolvable base, occupied destination) settle before it as not-applied.
-        let createResult = try await vcsService.createGitWorktreeWithResult(
-            request: plan.createRequest,
-            at: context.repo.rootURL,
-            beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
-        )
+        let createResult: GitWorktreeCreateResult
+        do {
+            createResult = try await vcsService.createGitWorktreeWithResult(
+                request: plan.createRequest,
+                at: context.repo.rootURL,
+                beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
+            )
+        } catch let error as GitService.GitError where error.worktreeCreateFailure != nil {
+            // Keep the logical root legible beside the checkout Git ran in; every other failure passes through.
+            let checkout = context.repo.rootURL.standardizedFileURL.path
+            guard GitRepoRootAuthorization.canonicalPath(logicalRootPath) != GitRepoRootAuthorization.canonicalPath(checkout) else {
+                throw error
+            }
+            throw error.naming(workspaceRoot: logicalRootPath, servedBy: checkout)
+        }
         let created = createResult.descriptor
         let identity = try persistOrResolveVisualIdentity(
             for: created,

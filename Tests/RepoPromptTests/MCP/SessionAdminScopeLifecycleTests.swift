@@ -690,10 +690,23 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
 
     func testExistingBranchRefusalNamesTheWorktreeAndNextStep() {
         XCTAssertEqual(SessionAdminWindowsWorktreeHost.shortBranch("refs/heads/e2e/1392"), "e2e/1392")
-        let held = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: "/tmp/wt")
+        let held = SessionAdminWindowsWorktreeHost.branchExistsDetail(
+            "e2e/1392", repository: "/tmp/repo-wt", workspaceRoot: "/tmp/repo", checkedOutAt: "/tmp/wt", provenBeforeCreation: true
+        )
         XCTAssertTrue(held.contains("/tmp/wt") && held.contains("worktree_bind"), held)
-        let bare = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: nil)
+        XCTAssertTrue(held.contains("repository /tmp/repo-wt (for workspace root /tmp/repo)"), held)
+        XCTAssertTrue(held.contains("Nothing was created."), held)
+        let bare = SessionAdminWindowsWorktreeHost.branchExistsDetail(
+            "e2e/1392", repository: "/tmp/repo", workspaceRoot: nil, checkedOutAt: nil, provenBeforeCreation: true
+        )
         XCTAssertTrue(bare.contains("new branch name"), bare)
+        XCTAssertTrue(bare.contains("already exists in repository /tmp/repo.") && !bare.contains("workspace root"), bare)
+        // Git's own failure past the commit fence keeps the branch_exists text but proves nothing about creation.
+        let raced = SessionAdminWindowsWorktreeHost.branchExistsDetail(
+            "e2e/1392", repository: "/tmp/repo", workspaceRoot: nil, checkedOutAt: nil, provenBeforeCreation: false
+        )
+        XCTAssertTrue(raced.contains("Branch 'e2e/1392' already exists in repository /tmp/repo"), raced)
+        XCTAssertFalse(raced.contains("Nothing was created"), raced)
     }
 
     func testHostErrorsRenderAsStructuredRefusalsNotBareEnumNames() throws {
