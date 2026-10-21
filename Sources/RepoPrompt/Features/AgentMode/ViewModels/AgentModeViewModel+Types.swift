@@ -1039,6 +1039,9 @@ extension AgentModeViewModel {
         let projection: AgentTranscriptProjection
         let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         let archivedSnapshot: AgentArchivedTranscriptSnapshot
+        /// Semantic reuse evidence from the existing validated sanitizer prefix, not a claim
+        /// that building the archive projection avoided traversal or reused its storage.
+        let reusesPreviousArchive: Bool
         let projectionProtection: AgentTranscriptProjectionProtection
         let canonicalVisibleRowCount: Int
         let projectionCounts: AgentTranscriptProjectionCounts

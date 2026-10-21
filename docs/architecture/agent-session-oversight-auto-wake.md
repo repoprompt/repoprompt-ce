@@ -840,6 +840,79 @@ the canonical passive queue and the wake coordinator described above, never side
 location repaint before claim reservation may affect the claim's local display provenance described
 below, but it still cannot enqueue, authorize, or alter the Auto-wake itself.
 
+## Quiet routine settlement and accepted coverage
+
+Quietness and delivery have different owners. `AgentTabSession` owns one exact run-attempt ledger.
+A normal drained terminal barrier seals the finished range synchronously, after its second ownership
+check and before teardown. A positively routine first physical dispatch may be quiet only when no
+accepted task input, tool, interaction, recovery, uncertainty, incomplete range, or queued successor
+occurred. Finished assistant messages may be silent or exactly `[ack]` (ASCII padding/case and one
+trailing full stop); plain `ack` is ordinary. Acceptance is not required to seal, and completion
+notifications are unchanged. Unsupported providers, natural/manual/periodic/waiting/control work,
+watchdog completion, and replay onto a new owner are ordinary.
+
+The single frozen `routineQuietCheckIn` claim/render Boolean records initial idle-follow-up routine
+qualification, including Codex. Actual rendered attention makes it false. Only qualified Claude Code
+gets `Nothing needed? Reply [ack].` in that dispatch's lane guidance, inside the existing 24 KiB
+budget and deterministic subset selection. Codex gets no sentence. Devin's classification and copy
+remain disabled together until its raw negative-evidence qualification closes. No standing guidance
+revision, autonomy rule, public field, provider protocol, or saved state changes.
+
+Same-owner/same-wake physical reentry is intentionally idempotent, not a new qualification. Every
+real non-routine input or recovery on a reused owner must continue to latch its accepted occurrence;
+future provider paths must preserve that dependency rather than infer inactivity from final text.
+A replay can retain previously frozen prompt bytes without acquiring quiet permission on a new owner.
+
+Every known attempt end advances checked `settledThrough`; ordinary ends also advance
+`ordinaryThrough`. These process-local facts never wrap or reset under a surviving binding. The
+bridge captures facts with the snapshot's **own** coarse status: an active frame sees its attempt's
+opening cutoff, while the first idle frame sees settlement even before ownership ends. Its private
+frame travels through the existing serial target-publication chain with full endpoint, source sequence,
+public snapshot, and accepted/unchanged result. Facts-only advancement refreshes indexed inbound
+observers without forging public `change_sequence`, activity, or send readiness. A sample can use
+only its captured frame after chain/endpoint/source/canonical/status revalidation across the authority
+await. Unknown is never zero, and cached facts never supply fresh closing or payment proof.
+
+The passive reducer owns one delivered settlement position per exact live reference/target,
+independently of pending rows. First valid paired facts baseline a genuinely new lane at settlement.
+An ordinary close can create one truthful `idle → idle` row even when all intermediate samples were
+missed; it does not count missed events. Unpaid ordinary coverage survives net reversion and carries
+the current running/waiting metadata. A coverage-only running/equal-waiting row can hitchhike but
+cannot independently wake the observer. A real new waiting edge still admits under pristine waiting
+coalescing policy. A proven quiet interval refreshes the old occurrence without erasing old debt or
+rearming its failed identity. Unexplained closes fail open; fresh paired idle proof reacquisition runs
+before same-status handling and may conservatively redisclose once after an unknown gap.
+
+Admission reads a scalar value projection of that sole live delivered position on the existing
+bounded snapshot entries; it owns no second position or per-claim map. This matters when an older
+receipt pays debt after a quiet close has already refreshed the pending row: the newer row remains
+available to hitchhike, but cannot independently admit another wake for paid quiet coverage.
+
+An immutable rendered status receipt captures the full target endpoint and that row's settled cutoff.
+On valid acceptance, payment happens **before** looking for the current pending row or comparing its
+status/sequence: cutoff 9 can pay 9 during running successor 10 or after row eviction, never ordinary
+10. Cleanup then independently preserves newer actionable edges, attention, and unpaid coverage.
+An exact accepted unknown-only status clears without invented payment. When known debt has no
+payable cutoff, acceptance settles the shown status by rebasing it to an inert equal-state hitchhiker;
+only fresh paired idle proof can independently redisclose it. Metadata-only unpaired refreshes may
+pay an older already-frozen cutoff, not a newer cache value.
+
+The sixteen-row bound and attention queue are unchanged. Eviction represents debt in existing
+anonymous overflow, never pays a target; overflow acceptance acknowledges only its own watermark.
+Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed. A new ordinary
+watermark or real new edge changes failure identity; quiet refresh/rebase does not. The existing
+single failure slot holds fingerprint plus producer wake identity. A late W1 may append its canonical
+marker and pay its frozen receipt, but only W2 can clear W2's suppression, even for identical shapes.
+
+These are not durable notification or quiet-result fields. Temporary target unreadability keeps its
+exact delivered position and resumes at fresh proof; observer ineligibility, Read retirement, unlink,
+and endpoint replacement still retire their queues/claims. Cold restart restores existing intent and
+preferences through the ordinary readiness/durability owners, but creates fresh grants and baselines:
+no quiet verdict, delivered position, in-flight wake, suppression, or callback is restored, and no
+history catch-up is invented. Losing live verdict proof makes canonical rows visible again; it does
+not lose saved link intent. Local display masking is a separate projection boundary; canonical rows,
+Read, replay/export, and assistant preview remain unchanged.
+
 ## Purposeful attention is an inverse signal, not reverse send
 
 `request_attention` is an operation on the existing `agent_session_link` tool, not a new tool or
@@ -1366,3 +1439,28 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Local quiet transcript display
+
+Quiet verdicts mask only the local transcript UI. The session's canonical items, structured
+transcript/projections, Read/replay/save/export, previews and completion notifications remain intact.
+The UI synchronization owner prepares one derived presentation keyed by exact session/binding,
+base presentation revision and internal display-mask revision. Getters never rebuild it. Every
+archive install/reset invalidates it; unchanged reads reuse the same archived array buffer.
+Terminal sealing only changes membership/revision and requests the existing transcript-runtime
+refresh. Inline UI synchronization during the terminal barrier waits for its existing phase-end
+signal before preparing a mask; hiding never bumps the canonical presentation revision.
+
+Masks follow positively retained source anchors, including a synthetic conclusion's original source
+ID. Mixed groups retain ordinary siblings and rebuild counts/narration/anchors with the existing
+formatters. Aggregate-only groups carry lightweight, nonpersisted summary inputs in their existing
+materialized render-block values: identities/count facts and independently copied narration under
+the existing 120-character policy, never full source/tool payloads. Full groups reuse their sections;
+only a buffered leading narration source omitted from those sections needs summary metadata.
+Those inputs share the projection/cache lifetime, not a separate history store or ID index.
+Reload without materialized verdict proof shows those rows again. A still-admissible unmaterialized
+marker instead retains its exclusion until its last producer or exact source binding retires.
+
+The passive reducer's existing value also suppresses equal queue publications and duplicate receipts.
+This is not an admission cache: readiness waiters, catalog readiness, selection changes and the
+existing shared snooze/interval deadline continue to reevaluate genuinely owed work independently.

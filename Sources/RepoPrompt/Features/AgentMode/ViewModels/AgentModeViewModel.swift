@@ -95,6 +95,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var activeTranscriptPresentation: AgentTranscriptPresentationSnapshot = .empty {
         didSet {
+            // Hydration/performance can change without a revision, including during batched sync.
+            if let tabID = activeTranscriptPresentation.tabID {
+                sessions[tabID]?.quietTranscriptDisplayCache = nil
+            }
             guard !isActiveUISyncSuppressed else { return }
             syncTranscriptUIState()
         }
@@ -122,7 +126,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func syncTranscriptUIState() {
-        ui.transcript.update(makeTranscriptUISnapshot())
+        if prepareQuietTranscriptDisplay() { ui.transcript.update(makeTranscriptUISnapshot()) }
         // The same publication point reports the initial selected restoration to the sidebar join and
         // propagates owner-pending transitions to the sidebar projection (§5.3/§5.5).
         synchronizeSidebarRestoreSelectedSide()
@@ -5052,6 +5056,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+        }
+        newSession.onQuietDisplayMaskChanged = { [weak self] session in
+            self?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
         }
         newSession.onOverseerActivationRetired = { [weak self] session, retired in
             self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)
@@ -14839,9 +14846,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isColdLoad: reason == .coldLoad,
             trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
         )
+        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
+            from: existingTranscript,
+            to: builtPresentation.transcript
+        )
         applyBuiltTranscriptPresentation(
             builtPresentation,
             sourceItems: workingItemsSnapshot,
+            reconcilesQuietSourceRetirement: pendingMutationSummary?.containsStructuralMutation != false
+                || fullDetailTurnEnvelopeChanged || builtPresentation.sanitizedActivityCount > 0,
+            isLiveRefresh: reason == .liveMutation,
             to: session
         )
         let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
@@ -14850,10 +14864,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let containsExcludedLegacyItems = AgentTranscriptIO.containsExcludedLegacyItems(
             workingItemsSnapshot,
             policy: importPolicy
-        )
-        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-            from: existingTranscript,
-            to: builtPresentation.transcript
         )
         let shouldReconcileWorkingItems: Bool = {
             guard session.items == workingItemsSnapshot,
@@ -15233,6 +15243,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projection: session.transcriptProjection,
             turnProjectionCaches: session.turnProjectionCaches,
             archivedSnapshot: session.archivedTranscriptSnapshot,
+            reusesPreviousArchive: false,
             projectionProtection: session.transcriptProjectionProtection,
             canonicalVisibleRowCount: session.transcriptCanonicalVisibleRowCount,
             projectionCounts: session.transcriptProjectionCounts,
@@ -15432,6 +15443,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let workingProjection = AgentTranscriptProjectionBuilder.workingProjection(from: fullProjection)
         let archivedSnapshot = AgentTranscriptProjectionBuilder.archivedSnapshot(from: fullProjection)
+        // The sanitizer already validated the equal prefix. With the same turn envelope and
+        // protection, a changed final full-detail turn cannot change any archived projection.
+        // Forward that existing proof; do not compare/scan the archive a second time here.
+        let reusesPreviousArchive = !isColdLoad
+            && trustedIncrementalFinalTurnStartSequenceIndex != nil
+            && previousBaseProjection != nil
+            && projectionProtection == previousProjectionProtection
+            && sanitizeMetrics.reusedTurnCount > 0
+            && sanitizeMetrics.reusedTurnCount == sanitizedTranscript.turns.count - 1
+            && previousSanitizedTranscript?.turns.count == sanitizedTranscript.turns.count
+            && previousSanitizedTranscript?.turns.last?.id == sanitizedTranscript.turns.last?.id
+            && previousSanitizedTranscript?.turns.last?.retentionTier == .full
+            && sanitizedTranscript.turns.last?.retentionTier == .full
         let projection = isCompressedHistoryRevealed ? fullProjection : workingProjection
         let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: baseProjection)
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
@@ -15540,6 +15564,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projection: projection,
             turnProjectionCaches: updatedTurnProjectionCaches,
             archivedSnapshot: archivedSnapshot,
+            reusesPreviousArchive: reusesPreviousArchive,
             projectionProtection: projectionProtection,
             canonicalVisibleRowCount: canonicalVisibleRowCount,
             projectionCounts: projectionCounts,
@@ -15663,6 +15688,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func applyBuiltTranscriptPresentation(
         _ presentation: BuiltTranscriptPresentation,
         sourceItems: [AgentChatItem]? = nil,
+        reconcilesQuietSourceRetirement: Bool = true,
+        isLiveRefresh: Bool = false,
         to session: TabSession
     ) {
         if let sourceItems, sourceItems != session.items {
@@ -15672,14 +15699,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
             return
         }
+        let previousQuietSourceAnchors = reconcilesQuietSourceRetirement ? session.fullTranscriptProjection.rowAnchorIndex : [:]
         session.transcript = presentation.transcript
         session.installLocalInputSeed(presentation.localInputSeed)
         session.baseTranscriptProjection = presentation.baseProjection
         session.fullTranscriptProjection = presentation.fullProjection
         session.workingTranscriptProjection = presentation.workingProjection
         session.turnProjectionCaches = presentation.turnProjectionCaches
-        session.archivedTranscriptSnapshot = presentation.archivedSnapshot
+        // Only this synchronous live-refresh path may retain an installed archive. Explicit
+        // apply/hydration (including same-revision A3), replacement and reset remain writers.
+        if !isLiveRefresh || !presentation.reusesPreviousArchive {
+            session.archivedTranscriptSnapshot = presentation.archivedSnapshot
+        } else {
+            #if DEBUG
+                assert(presentation.archivedSnapshot == session.archivedTranscriptSnapshot, "Live refresh archive reuse must preserve the installed snapshot")
+            #endif
+        }
         session.transcriptProjection = materializedTranscriptProjection(for: session)
+        if reconcilesQuietSourceRetirement { session.reconcileQuietSourceIDs(previousAnchors: previousQuietSourceAnchors) }
         session.transcriptProjectionProtection = presentation.projectionProtection
         session.transcriptCanonicalVisibleRowCount = presentation.canonicalVisibleRowCount
         session.transcriptProjectionCounts = presentation.projectionCounts
@@ -19020,6 +19057,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         managedTurn: AgentNoncomposerTurn? = nil,
         localComposerCandidate: UUID? = nil
     ) {
+        let expectedOwnership = session.activeRunOwnership
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
         let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
@@ -19047,6 +19085,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
             let stillOwnsContinuation = {
                 self.sessions[tabID] === session
+                    && (
+                        expectedOwnership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) }
+                            ?? (session.activeRunOwnership == nil)
+                    )
                     && session.instructionContinuation != nil
                     && session.instructionWaitID == expectedWaitID
                     && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
@@ -19188,7 +19230,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
-            guard resumeWaitingInstructionContinuation(
+            guard stillOwnsContinuation(), resumeWaitingInstructionContinuation(
                 session: session,
                 providerText: monitoring.text,
                 claim: monitoring.claim,
@@ -19568,6 +19610,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // An accepted local or managed steer owns the boundary before its user row is published.
         agentSelfCompactCancelForAcceptedLocalInput(session)
+        session.noteAcceptedTaskInput()
         let userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,
@@ -20191,6 +20234,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         composerOrigin: AgentUserInputOrigin? = nil
     ) {
         guard case let .setObjective(objective) = action else { return }
+        session.noteAcceptedTaskInput()
         let userItem = AgentChatItem.user(
             objective,
             sequenceIndex: session.nextSequenceIndex,
@@ -21752,7 +21796,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         await MainActor.run {
             guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID else { return }
+                  session.activeRunAttemptID == runAttemptID,
+                  let owner = session.activeRunOwnership,
+                  session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
+            session.noteAcceptedStream(result, owner: owner)
+            let usesMessageIdentity = session.quietLedger.usesQuietMessageBoundaries(owner: owner)
+            let startsNewMessage = usesMessageIdentity && result.contentMessageID != nil && result.contentMessageID != session.nonCodexContentMessageID
+            if usesMessageIdentity, result.type == "content" || result.type == "final_content",
+               let messageID = result.contentMessageID, messageID != session.nonCodexContentMessageID
+            {
+                flushPendingAssistantDelta(session)
+                endActiveAssistantSegment(session)
+                session.nonCodexContentMessageID = messageID
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -21774,6 +21830,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
+                    guard !startsNewMessage else { return nil }
                     if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
                         return streamingAssistantIndex
                     }
@@ -22101,7 +22158,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func finalizeStreamingItems(in session: TabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
+        // This owner changes streaming flags only, never membership, keys or completed text.
+        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
             for index in items.indices where items[index].isStreaming {
                 items[index].isStreaming = false
             }
@@ -22243,7 +22301,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func endActiveAssistantSegment(_ session: TabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
+        // Only streaming flags change here; source identity, text and order remain complete.
+        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
             for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
                 items[index].isStreaming = false
             }
@@ -22988,6 +23047,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         undecoratedProviderText: String? = nil
     ) -> Bool {
         guard let continuation = session.instructionContinuation else { return false }
+        session.noteAcceptedTaskInput() // User and lane-update continuations reuse, never reset, the attempt.
         let released = inputProof.flatMap { proof in
             claim.map { agentSessionLinkHandoffProviderInput(for: session, dispatchID: $0.dispatchID, claim: $0, proof: proof) }
         }

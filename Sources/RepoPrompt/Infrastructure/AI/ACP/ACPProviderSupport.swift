@@ -177,7 +177,7 @@ enum ACPDefaultSessionUpdateNormalizer {
         providerID: ACPProviderID
     ) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
-            return []
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         }
 
         switch sessionUpdate {
@@ -203,10 +203,14 @@ enum ACPDefaultSessionUpdateNormalizer {
                 return [.stream(AIStreamResult(type: "status", text: title))]
             }
             return []
-        case "available_commands_update", "plan", "user_message_chunk":
+        case "available_commands_update", "config_option_update":
             return []
+        case "plan", "user_message_chunk":
+            // No retained exact sent-block proof exists for own echoes (including fragments).
+            // Fresh task/echo ambiguity is ordinary; other ACP providers remain byte/timing-identical.
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         default:
-            return []
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         }
     }
 

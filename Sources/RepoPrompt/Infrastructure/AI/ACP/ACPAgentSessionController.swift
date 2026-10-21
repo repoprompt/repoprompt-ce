@@ -540,6 +540,23 @@ actor ACPAgentSessionController {
         private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
         private var testSteeringInterruptGate: CheckedContinuation<Void, Never>?
 
+        func test_replayQuietNotifications(
+            _ packets: [(String, [String: Any])], sessionID: String, loadReplay: Bool, activePrompt: Bool = true
+        ) async -> [NormalizedAgentRuntimeEvent] {
+            self.sessionID = sessionID
+            suppressSessionLoadReplayUpdates = loadReplay
+            activePromptTurnID = activePrompt ? UUID() : nil
+            for (method, params) in packets {
+                handleNotification(method: method, params: params, inboundSequence: 1)
+            }
+            finishEventsIfNeeded()
+            var results: [NormalizedAgentRuntimeEvent] = []
+            for await event in eventsStream {
+                results.append(event)
+            }
+            return results
+        }
+
         func test_rejectNextTurnPreparation() {
             testRejectNextTurnPreparation = true
         }
@@ -2015,7 +2032,10 @@ actor ACPAgentSessionController {
     }
 
     private func handleNotification(method: String, params: [String: Any], inboundSequence: UInt64) {
-        guard method == "session/update" else { return }
+        guard method == "session/update" else {
+            emitDevinQuietUncertaintyIfCurrent(params: params)
+            return
+        }
         #if DEBUG
             captureRawACPEvent(
                 kind: "session.update.params",
@@ -2025,7 +2045,10 @@ actor ACPAgentSessionController {
                 ]
             )
         #endif
-        guard let update = params["update"] as? [String: Any] else { return }
+        guard let update = params["update"] as? [String: Any] else {
+            emitDevinQuietUncertaintyIfCurrent(params: params)
+            return
+        }
         let sessionID = (params["sessionId"] as? String) ?? sessionID ?? ""
         #if DEBUG
             captureRawACPEvent(
@@ -2051,6 +2074,12 @@ actor ACPAgentSessionController {
             )
             return
         }
+
+        // Administrative metadata has its own session/retirement fences and may arrive while
+        // bootstrap has not installed sessionID yet. Quiet semantic ingress must not discard it.
+        if provider.providerID == .devin,
+           let currentSession = self.sessionID,
+           let incomingSession = params["sessionId"] as? String, incomingSession != currentSession { return }
 
         if shouldSuppressSessionLoadReplayUpdate(update) {
             #if DEBUG
@@ -2100,11 +2129,21 @@ actor ACPAgentSessionController {
         #endif
         recordActivePromptTraceUpdate(sourceUpdate: update, normalizedEvents: normalizedEvents)
         for event in normalizedEvents {
+            if provider.providerID == .devin, case let .stream(result) = event,
+               result.type == "event", result.text == nil,
+               activePromptTurnID == nil || suppressSessionLoadReplayUpdates { continue }
             if shouldSuppressACPEvent(event) {
                 continue
             }
             emit(event)
         }
+    }
+
+    private func emitDevinQuietUncertaintyIfCurrent(params: [String: Any]) {
+        guard provider.providerID == .devin, activePromptTurnID != nil,
+              !suppressSessionLoadReplayUpdates else { return }
+        if let incomingSession = params["sessionId"] as? String, incomingSession != sessionID { return }
+        emit(.stream(AIStreamResult(type: "event", text: nil)))
     }
 
     /// Replaces the advertised command list for the notification's own session. An update without a

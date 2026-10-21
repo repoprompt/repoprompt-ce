@@ -4581,3 +4581,195 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNotNil(reissued.claim)
     }
 }
+
+extension AgentSessionLinkPromptClaimStoreTests {
+    func testRoutineBooleanIsDefaultFalseAndPartOfRenderClaimCopyAndReuseIdentity() throws {
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        for provider in [AgentSessionLinkPromptProviderContext.codexExec, .claudeCode, .devin, .unselected] {
+            let store = AgentSessionLinkOutboundPromptClaimStore()
+            let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: provider)
+            let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID())
+            var renderedBits: [Bool] = []
+            let render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult = {
+                renderedBits.append($0.routineQuietCheckIn)
+                return self.render($0)
+            }
+            let ordinary = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+            XCTAssertFalse(ordinary.routineQuietCheckIn)
+            let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
+            let supports = provider == .codexExec || provider == .claudeCode
+            XCTAssertEqual(routine.routineQuietCheckIn, supports)
+            XCTAssertEqual(routine.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
+            if provider != .claudeCode { XCTAssertEqual(routine.fragment, ordinary.fragment) }
+            XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
+            XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
+            let retry = store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render)
+            XCTAssertEqual(retry, routine)
+            XCTAssertEqual(renderedBits.count, supports ? 2 : 1)
+            let natural = try XCTUnwrap(store.claim(dispatchID: .codexNativeSend(UUID()), epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
+            XCTAssertFalse(natural.routineQuietCheckIn, "ordinary dispatch family cannot qualify")
+        }
+    }
+
+    func testActuallyRenderedAttentionDisqualifiesWhileOmittedAttentionDoesNot() throws {
+        let live = inventory(revision: 1, targetCount: 1)
+        let queueEpoch = UUID()
+        let attention = attentionRequest(targetSessionID: grantedTargetID(0), reference: grantedReference(0), queueEpoch: queueEpoch)
+        let batch = passiveSnapshot(linkSetRevision: 1, queueEpoch: queueEpoch, targetIDs: [grantedTargetID(0)], attentionRequests: [attention])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .claudeCode)
+        for includesAttention in [true, false] {
+            let store = AgentSessionLinkOutboundPromptClaimStore()
+            let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: UUID()), epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true) { request in
+                guard !includesAttention, let offered = request.passiveNotices else { return self.render(request) }
+                // Simulate a renderer choosing only the status subset. Render those actual bytes,
+                // rather than falsely removing attention from the receipt while leaving it in copy.
+                let subset = AgentSessionLinkPassiveStatusNotices.Snapshot(
+                    observerEndpoint: offered.observerEndpoint, queueEpoch: offered.queueEpoch,
+                    queueRevision: offered.queueRevision, linkSetRevision: offered.linkSetRevision,
+                    isEnabled: offered.isEnabled, isDeliverable: offered.isDeliverable,
+                    entries: offered.entries, attentionRequests: [],
+                    unacknowledgedOverflowCount: offered.unacknowledgedOverflowCount,
+                    overflowProduced: offered.overflowProduced
+                )
+                return self.render(.init(
+                    membershipKind: request.membershipKind, inventory: request.inventory,
+                    passiveNotices: subset, toolReference: request.toolReference,
+                    laneGuidanceMode: request.laneGuidanceMode, routineQuietCheckIn: request.routineQuietCheckIn,
+                    providerContext: request.providerContext
+                ))
+            })
+            XCTAssertEqual(claim.routineQuietCheckIn, !includesAttention)
+            XCTAssertEqual(claim.passive?.receipt.deliveredAttentionOccurrences.isEmpty, !includesAttention)
+        }
+    }
+}
+
+extension AgentSessionLinkPromptClaimStoreTests {
+    func testQuietCopyWholeEnvelopesAcrossProvidersBasesGuidanceAndBudgetFreezeRenderedReceipts() throws {
+        let literal = "Nothing needed? Reply [ack]."
+        let modes = ["routine", "overflow", "attention", "manual", "periodic", "natural", "task", "piggyback", "waiting"]
+        for provider in AgentSessionLinkPromptProviderContext.allCases {
+            for reminder in [false, true] {
+                for nearCap in [false, true] {
+                    // Other providers are byte-identical controls; Claude/Codex exercise every basis.
+                    let bases = provider == .claudeCode || provider == .codexExec ? modes : ["routine"]
+                    for basis in bases {
+                        var live = inventory(revision: 1, targetCount: nearCap ? 16 : 1)
+                        if nearCap {
+                            live = AgentSessionLinkPromptInventory(
+                                observerSessionID: live.observerSessionID, linkSetRevision: live.linkSetRevision,
+                                items: live.items + (16 ..< 200).map { index in
+                                    AgentSessionLinkPromptInventoryItem(
+                                        targetSessionID: UUID(uuidString: String(format: "20000000-0000-0000-0000-%012d", index))!,
+                                        displayName: String(repeating: "<lane & context>", count: 8),
+                                        capabilityNames: ["poll", "read", "send_when_idle", "wait"]
+                                    )
+                                }
+                            )
+                        }
+                        let primerInventory = live
+                        if reminder && nearCap {
+                            // New membership is owed while the accepted lane guidance still uses its
+                            // reminder. This makes both full/reminder genuinely share the near cap.
+                            live = AgentSessionLinkPromptInventory(
+                                observerSessionID: live.observerSessionID,
+                                linkSetRevision: 2,
+                                items: live.items
+                            )
+                        }
+                        let queueEpoch = UUID()
+                        let attention = basis == "attention" ? [attentionRequest(
+                            targetSessionID: grantedTargetID(0), reference: grantedReference(0), queueEpoch: queueEpoch
+                        )] : []
+                        let offered = passiveSnapshot(
+                            linkSetRevision: live.linkSetRevision, queueRevision: 2, queueEpoch: queueEpoch,
+                            targetIDs: basis == "overflow" ? [] : (0 ..< (nearCap ? 16 : 1)).map(grantedTargetID),
+                            attentionRequests: attention, overflow: basis == "overflow" ? 1 : 0
+                        )
+                        let batch = AgentSessionLinkPassiveStatusNotices.Snapshot(
+                            observerEndpoint: offered.observerEndpoint, queueEpoch: offered.queueEpoch,
+                            queueRevision: offered.queueRevision, linkSetRevision: offered.linkSetRevision,
+                            isEnabled: offered.isEnabled, isDeliverable: offered.isDeliverable,
+                            entries: offered.entries.map { row in
+                                .init(
+                                    reference: row.reference,
+                                    targetEndpoint: row.targetEndpoint,
+                                    targetSessionID: row.targetSessionID,
+                                    displayName: nearCap ? String(repeating: "&", count: DomainAgentSessionLinkTextBudget.displayNameMaxBytes) : row.displayName,
+                                    fromStatus: row.fromStatus,
+                                    toStatus: row.toStatus,
+                                    observedAt: row.observedAt,
+                                    latestVisibleAssistantPreview: nearCap ? String(repeating: "&", count: DomainAgentSessionLinkTextBudget.assistantPreviewMaxBytes) : nil,
+                                    changeSequence: row.changeSequence,
+                                    edgeSequence: row.edgeSequence
+                                )
+                            }, attentionRequests: offered.attentionRequests,
+                            unacknowledgedOverflowCount: offered.unacknowledgedOverflowCount,
+                            overflowProduced: offered.overflowProduced
+                        )
+                        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: provider)
+                        func makeClaim(offersQuiet: Bool) throws -> AgentSessionLinkOutboundPromptClaim {
+                            let store = AgentSessionLinkOutboundPromptClaimStore()
+                            if reminder {
+                                let primer = try XCTUnwrap(store.claim(
+                                    dispatchID: .claudeNativeSend(UUID()), epoch: epoch, inventory: primerInventory,
+                                    passiveNotices: passiveSnapshot(linkSetRevision: 1, queueRevision: 1, targetIDs: [grantedTargetID(0)]),
+                                    render: AgentSessionLinkPrompts.rendered
+                                ))
+                                store.accept(primer)
+                            }
+                            let dispatch: AgentSessionLinkPromptDispatchID = switch basis {
+                            case "natural", "piggyback": .claudeNativeSend(UUID())
+                            case "task": .headlessRun(runID: UUID())
+                            case "waiting": .waitingContinuation(waitID: UUID())
+                            default: .autoWake(wakeID: UUID())
+                            }
+                            let claim = try XCTUnwrap(store.claim(
+                                dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch,
+                                routineQuietCheckIn: offersQuiet, render: AgentSessionLinkPrompts.rendered
+                            ))
+                            XCTAssertEqual(store.pendingClaim(dispatchID: dispatch, observerSessionID: endpoint.sessionID), claim)
+                            XCTAssertLessThanOrEqual(claim.fragment.utf8.count, AgentSessionLinkPrompts.maximumRenderedBytes)
+                            return claim
+                        }
+                        let before = try makeClaim(offersQuiet: false)
+                        let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
+                        let qualifies = provider == .claudeCode && (basis == "routine" || basis == "overflow")
+                        XCTAssertEqual(
+                            after.fragment.components(separatedBy: literal).count - 1,
+                            qualifies ? 1 : 0,
+                            "\(provider)/\(basis)/\(reminder)/\(nearCap)"
+                        )
+                        if !qualifies { XCTAssertEqual(before.fragment, after.fragment) }
+                        if basis == "attention" {
+                            XCTAssertFalse(after.routineQuietCheckIn)
+                            XCTAssertEqual(after.passive?.receipt.deliveredAttentionOccurrences.count, 1)
+                        }
+                        let receipt = try XCTUnwrap(after.passive?.receipt)
+                        XCTAssertEqual(after.fragment.components(separatedBy: "<change ").count - 1, receipt.deliveredStatuses.count)
+                        XCTAssertEqual(after.fragment.components(separatedBy: "<attention_request ").count - 1, receipt.deliveredAttentionOccurrences.count)
+                        for delivered in receipt.deliveredStatuses {
+                            XCTAssertTrue(after.fragment.contains("<change session_id=\"\(delivered.targetEndpoint.sessionID.uuidString)\""))
+                            XCTAssertTrue(batch.entries.contains { $0.reference == delivered.reference })
+                        }
+                        // Capture whole adapter-facing bytes, not the isolated literal's guessed BPE
+                        // delta. A scoped test log consumer measures cl100k/estimator values offline.
+                        let beforeText = AgentSessionLinkPromptComposer.decorated("fixture input", with: before)
+                        let afterText = AgentSessionLinkPromptComposer.decorated("fixture input", with: after)
+                        let measurement: [String: Any] = [
+                            "provider": provider.rawValue, "basis": basis, "guidance": reminder ? "reminder" : "full",
+                            "budget": nearCap ? "near-cap" : "generous", "before": beforeText, "after": afterText,
+                            "beforeFragmentBytes": before.fragment.utf8.count, "afterFragmentBytes": after.fragment.utf8.count,
+                            "renderedRows": receipt.deliveredStatuses.map(\.targetEndpoint.sessionID.uuidString),
+                            "renderedAttention": receipt.deliveredAttentionOccurrences.count,
+                            "overflow": receipt.overflowProducedThrough
+                        ]
+                        let data = try JSONSerialization.data(withJSONObject: measurement, options: [.sortedKeys])
+                        print("QUIET_C4_ENVELOPE " + data.base64EncodedString())
+                    }
+                }
+            }
+        }
+    }
+}

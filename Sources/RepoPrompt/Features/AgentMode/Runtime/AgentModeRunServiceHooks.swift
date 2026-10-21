@@ -165,6 +165,7 @@ extension AgentModeRunService {
             let captured = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatchID)
             let outcome = claimAgentSessionLinkPrompt(session, dispatchID)
             return AgentSessionLinkDecoratedAgentMessage(
+                quietMarkerProducerLifetime: session.retainQuietMarkerProducer(for: outcome.claim),
                 dispatchContext: captured,
                 message: AgentSessionLinkPromptComposer.decorated(message, with: outcome.claim),
                 claim: outcome.claim,
@@ -178,6 +179,7 @@ extension AgentModeRunService {
     /// Named for the same reason its text-shaped sibling is: a tuple would let a call site keep
     /// compiling while silently ignoring the abort.
     struct AgentSessionLinkDecoratedAgentMessage {
+        var quietMarkerProducerLifetime: AgentQuietMarkerProducerLifetime?
         var dispatchContext: AgentSessionLinkDispatchContext?
         let message: AgentMessage
         let claim: AgentSessionLinkOutboundPromptClaim?
@@ -268,6 +270,9 @@ extension AgentModeRunService.Hooks {
             tabID: tabID,
             lifecycle: session.runLifecycle,
             hooks: .init(
+                sealQuietCheckIn: { owner, state, normal, successor in
+                    session.sealQuietCheckIn(owner: owner, terminalState: state, normal: normal, hasSuccessor: successor)
+                },
                 flushPendingAssistantDelta: {
                     transcript.flushPendingAssistantDelta(session)
                 },
