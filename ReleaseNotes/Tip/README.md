@@ -36,6 +36,14 @@ python3 -B Scripts/tip_history.py lint-fragments --root .
 python3 -B Scripts/test_tip_history.py
 ```
 
-The history contracts are being implemented separately from publication. No
-catalog is published until admission, seed provenance, retention and signing
-validation are in place; these fragments do not change the existing appcast.
+Publication wiring collects these fragments from the full-history approved-source
+checkout in the token-free signing job. It never executes staged build source to
+generate notes. Display notes may fall back to the candidate commit for a long
+or discontinuous range, but the separate barrier scan covers the entire interval;
+unprovable continuity blocks downgrade acquisition.
+
+History publication remains explicitly inactive until the reviewed admission/UI
+floors, activation tag, 29-seed archive/barrier audit, and retention evidence are
+provided. These fragments do not activate history or change the existing appcast.
+See [the release runbook](../../docs/releasing.md#tip-history-signing-activation-and-retention)
+for activation, signed catalog inventory, and stale-parent draft recovery.

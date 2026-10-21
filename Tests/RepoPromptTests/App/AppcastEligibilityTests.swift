@@ -1,4 +1,7 @@
+import CryptoKit
+import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 /// Passive appcast selection must tolerate sibling identity-transition items
@@ -359,5 +362,257 @@ final class AppcastEligibilityTests: XCTestCase {
         let selected = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "1")))
         XCTAssertEqual(selected.version, "1.10.0")
         XCTAssertNil(selected.buildNumber)
+    }
+}
+
+// MARK: - TipHistoryCatalogTests
+
+enum TipHistoryTestFixture {
+    static let repository = TipHistoryRepository(feedURL: URL(string: "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml"))!
+
+    static func entry(_ number: Int, successor: Bool = false) -> [String: Any] {
+        let sha = String(format: "%012llx", UInt64(number))
+        let identity: OfficialApplicationIdentity = successor ? .successor : .legacy
+        return [
+            "tag": "tip-" + sha, "releaseCommit": sha + String(repeating: "0", count: 28), "shortSHA": sha,
+            "commitDate": "2026-10-22T00:00:00Z", "buildNumber": String(number), "marketingVersion": "1.6.0",
+            "hasHistoryUI": true, "origin": "catalog", "role": successor ? "successor" : "preparer",
+            "signingIdentity": identity.rawValue, "bundleIdentifier": identity.bundleIdentifier,
+            "teamIdentifier": identity.teamIdentifier, "migrationPhase": successor ? "disabled" : "legacy-preparer",
+            "installationType": "application", "minimumSystemVersion": "14.0", "architectures": ["arm64", "x86_64"],
+            "title": "Readable build \(number)", "titleSource": "reviewed", "notes": [["text": "A reviewed change", "source": "reviewed"]],
+            "omittedCount": 0, "commitRange": ["fromCommit": NSNull(), "count": 1],
+            "downgradeBarrier": false, "downgradeBarrierReasons": [String](), "historyCatalogSha256": NSNull(),
+            "download": ["name": "RepoPrompt.zip", "url": "https://github.com/\(repository.path)/releases/download/tip-\(sha)/RepoPrompt.zip", "size": 123, "expandedSize": 456, "sha256": String(repeating: "a", count: 64), "edSignature": Data(repeating: 0, count: 64).base64EncodedString()]
+        ]
+    }
+
+    static func envelope(_ entries: [[String: Any]], key: Curve25519.Signing.PrivateKey, changes: [String: Any] = [:]) throws -> Data {
+        var page: [String: Any] = ["schemaVersion": 1, "channel": "tip", "updateRepository": repository.path, "generatedForTag": entries[0]["tag"]!, "windowSize": 30, "entries": entries, "olderPage": NSNull(), "archiveTail": NSNull()]
+        page.merge(changes) { _, new in new }
+        let payload = try JSONSerialization.data(withJSONObject: page, options: [.sortedKeys])
+        return try envelope(payload: payload, key: key)
+    }
+
+    static func envelope(payload: Data, key: Curve25519.Signing.PrivateKey) throws -> Data {
+        let signature = try key.signature(for: TipHistoryCatalogDecoder.domain + payload)
+        return try JSONSerialization.data(withJSONObject: ["format": "repoprompt-tip-history", "schemaVersion": 1, "payload": payload.base64EncodedString(), "signature": signature.base64EncodedString()])
+    }
+
+    static func page(_ entries: [[String: Any]]) throws -> TipHistoryPage {
+        let key = Curve25519.Signing.PrivateKey()
+        return try TipHistoryCatalogDecoder.decodePage(envelopeData: envelope(entries, key: key), expectedTag: nil, expectedSHA256: nil, publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: repository)
+    }
+}
+
+final class TipHistoryCatalogTests: XCTestCase {
+    func testValidSignedPageAndUnknownAdditiveFields() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let raw = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3), TipHistoryTestFixture.entry(2)], key: key, changes: ["futureAdditiveField": "ignored"])
+        let page = try TipHistoryCatalogDecoder.decodePage(envelopeData: raw, expectedTag: "tip-000000000003", expectedSHA256: TipHistorySignatureVerifier.sha256(raw), publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: TipHistoryTestFixture.repository)
+        XCTAssertEqual(page.entries.count, 2)
+        XCTAssertNil(page.entries[0].metadataProblem)
+        XCTAssertEqual(page.entries[0].title, "Readable build 3")
+    }
+
+    func testRawEnvelopeDuplicateKeysAreRejectedIncludingEscapedAndNestedKeys() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let valid = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key)
+        let remainder = String(decoding: valid.dropFirst(), as: UTF8.self)
+        let additions = [
+            #""schemaVersion":2,"#,
+            #""schema\u0056ersion":2,"#,
+            #""future":{"downgradeBarrier":true,"downgradeBarrier":false},"#,
+            #""future":[{"a\"b":1,"a\u0022b":2}],"#
+        ]
+        for addition in additions {
+            let raw = Data(("{" + addition + remainder).utf8)
+            XCTAssertThrowsError(try decode(raw, key: key)) {
+                XCTAssertEqual($0 as? TipHistoryLoadError, .malformed, addition)
+            }
+        }
+    }
+
+    func testAuthenticatedPayloadRejectsConflictingRecursiveSafetyKeys() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let valid = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        let encodedPayload = try XCTUnwrap(envelope["payload"] as? String)
+        let payload = try XCTUnwrap(Data(base64Encoded: encodedPayload))
+        let text = String(decoding: payload, as: UTF8.self)
+        let replacements = [
+            (#""downgradeBarrier":false"#, #""downgradeBarrier":true,"downgradeBarrier":false"#),
+            (#""downgradeBarrier":false"#, #""downgradeBarrier":true,"downgrade\u0042arrier":false"#),
+            (#""expandedSize":456"#, #""expandedSize":1,"expanded\u0053ize":456"#)
+        ]
+        for (original, replacement) in replacements {
+            XCTAssertTrue(text.contains(original))
+            let conflicting = Data(text.replacingOccurrences(of: original, with: replacement).utf8)
+            // Re-sign the conflicting raw bytes: this must be a structural
+            // rejection of authenticated metadata, not a signature failure.
+            let raw = try TipHistoryTestFixture.envelope(payload: conflicting, key: key)
+            XCTAssertThrowsError(try decode(raw, key: key)) {
+                XCTAssertEqual($0 as? TipHistoryLoadError, .malformed, replacement)
+            }
+        }
+        let nestedUnknown = Data((#"{"future":[{"n":1,"\u006e":2}],"# + String(text.dropFirst())).utf8)
+        let raw = try TipHistoryTestFixture.envelope(payload: nestedUnknown, key: key)
+        XCTAssertThrowsError(try decode(raw, key: key)) { XCTAssertEqual($0 as? TipHistoryLoadError, .malformed) }
+    }
+
+    func testUniqueKeysAndEscapedStringContentsRemainValid() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let future: [String: Any] = [
+            "first": "Escaped quote \" and slash \\ and punctuation {[]},:",
+            "second": ["first": "Different object"]
+        ]
+        let raw = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key, changes: ["future": future])
+        let page = try decode(raw, key: key)
+        XCTAssertEqual(page.entries.count, 1)
+        XCTAssertNil(page.entries[0].metadataProblem)
+    }
+
+    func testExcessiveJSONNestingIsRejectedInEnvelopeAndAuthenticatedPayload() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let valid = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key)
+        let nesting = String(repeating: "[", count: 128) + "0" + String(repeating: "]", count: 128)
+        let rawEnvelope = Data((#"{"future":"# + nesting + "," + String(decoding: valid.dropFirst(), as: UTF8.self)).utf8)
+        XCTAssertThrowsError(try decode(rawEnvelope, key: key)) { XCTAssertEqual($0 as? TipHistoryLoadError, .malformed) }
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        let encodedPayload = try XCTUnwrap(envelope["payload"] as? String)
+        let payload = try XCTUnwrap(Data(base64Encoded: encodedPayload))
+        let nestedPayload = Data((#"{"future":"# + nesting + "," + String(decoding: payload.dropFirst(), as: UTF8.self)).utf8)
+        let raw = try TipHistoryTestFixture.envelope(payload: nestedPayload, key: key)
+        XCTAssertThrowsError(try decode(raw, key: key)) { XCTAssertEqual($0 as? TipHistoryLoadError, .malformed) }
+    }
+
+    private func decode(_ raw: Data, key: Curve25519.Signing.PrivateKey) throws -> TipHistoryPage {
+        try TipHistoryCatalogDecoder.decodePage(envelopeData: raw, expectedTag: nil, expectedSHA256: nil, publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: TipHistoryTestFixture.repository)
+    }
+
+    func testPaginationCannotJumpPastAnUnboundTail() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let digest = String(repeating: "a", count: 64)
+        let repository = TipHistoryTestFixture.repository
+        func decode(_ entries: [[String: Any]], older: [String: String], anchor: [String: String]? = nil) throws -> TipHistoryPage {
+            var changes: [String: Any] = ["olderPage": older, "archiveTail": NSNull()]
+            if let anchor { changes["archiveTail"] = anchor }
+            let bytes = try TipHistoryTestFixture.envelope(entries, key: key, changes: changes)
+            return try TipHistoryCatalogDecoder.decodePage(envelopeData: bytes, expectedTag: nil, expectedSHA256: nil, publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: repository)
+        }
+        var tail = TipHistoryTestFixture.entry(3)
+        tail["historyCatalogSha256"] = digest
+        let direct = ["tag": "tip-000000000003", "sha256": digest]
+        XCTAssertNoThrow(try decode([TipHistoryTestFixture.entry(6), tail], older: direct))
+        XCTAssertThrowsError(try decode([TipHistoryTestFixture.entry(6), tail], older: ["tag": "tip-000000000001", "sha256": digest]))
+        var seed = TipHistoryTestFixture.entry(2)
+        seed["origin"] = "seed"
+        XCTAssertNoThrow(try decode([TipHistoryTestFixture.entry(6), tail, seed], older: direct, anchor: direct))
+        XCTAssertThrowsError(try decode([TipHistoryTestFixture.entry(6), tail, seed], older: direct))
+        XCTAssertThrowsError(try decode([TipHistoryTestFixture.entry(6), seed], older: direct, anchor: direct))
+    }
+
+    func testTrustFailuresRejectWholePage() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let raw = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key)
+        let wrong = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
+        XCTAssertThrowsError(try TipHistoryCatalogDecoder.decodePage(envelopeData: raw, expectedTag: nil, expectedSHA256: nil, publicKeyBase64: wrong, repository: TipHistoryTestFixture.repository)) { XCTAssertEqual($0 as? TipHistoryLoadError, .invalidSignature) }
+        XCTAssertThrowsError(try TipHistoryCatalogDecoder.decodePage(envelopeData: raw, expectedTag: nil, expectedSHA256: String(repeating: "0", count: 64), publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: TipHistoryTestFixture.repository)) { XCTAssertEqual($0 as? TipHistoryLoadError, .integrityMismatch) }
+        XCTAssertThrowsError(try TipHistoryCatalogDecoder.decodePage(envelopeData: Data(repeating: 0, count: 1_048_577), expectedTag: nil, expectedSHA256: nil, publicKeyBase64: wrong, repository: TipHistoryTestFixture.repository))
+    }
+
+    func testUnknownRolesAndMalformedDownloadsStayVisibleButDisabled() throws {
+        for change: [String: Any] in [["role": "future"], ["teamIdentifier": "OTHER"], ["architectures": ["future-cpu"]], ["minimumSystemVersion": "unknown"], ["download": ["url": "https://evil.invalid/a.zip"]], ["downgradeBarrier": "false"], ["downgradeBarrier": false, "downgradeBarrierReasons": ["Irreversible change"]], ["marketingVersion": ""]] {
+            var entry = TipHistoryTestFixture.entry(3)
+            entry.merge(change) { _, new in new }
+            let page = try TipHistoryTestFixture.page([entry])
+            XCTAssertEqual(page.entries.count, 1)
+            XCTAssertNotNil(page.entries[0].metadataProblem, "\(change)")
+        }
+    }
+
+    func testOrderingDuplicateTagsRepositoryAndSchemaArePageFatal() throws {
+        XCTAssertThrowsError(try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(2), TipHistoryTestFixture.entry(3)]))
+        XCTAssertThrowsError(try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(3), TipHistoryTestFixture.entry(3)]))
+        var bad = TipHistoryTestFixture.entry(3)
+        bad["buildNumber"] = "not-orderable"
+        XCTAssertThrowsError(try TipHistoryTestFixture.page([bad]))
+        let key = Curve25519.Signing.PrivateKey()
+        for changes: [String: Any] in [["schemaVersion": 2], ["updateRepository": "other/repository"], ["channel": "stable"]] {
+            let raw = try TipHistoryTestFixture.envelope([TipHistoryTestFixture.entry(3)], key: key, changes: changes)
+            XCTAssertThrowsError(try TipHistoryCatalogDecoder.decodePage(envelopeData: raw, expectedTag: nil, expectedSHA256: nil, publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(), repository: TipHistoryTestFixture.repository))
+        }
+    }
+
+    func testExactInitialURLTrustAndTextSanitization() throws {
+        XCTAssertFalse(TipHistoryRepository.validTag("tip-000000000003\n"))
+        XCTAssertFalse(TipHistoryRepository.matches("123\n", #"^[0-9]+$"#))
+        let repo = TipHistoryTestFixture.repository
+        let prefix = "https://github.com/\(repo.path)/releases/download/tip-000000000003/"
+        XCTAssertTrue(repo.trustsDownload(URL(string: prefix + "RepoPrompt.zip")!, tag: "tip-000000000003", name: "RepoPrompt.zip"))
+        for url in [prefix + "RepoPrompt.zip?token=x", prefix + "RepoPrompt.zip#fragment", prefix + "%2FRepoPrompt.zip", prefix.replacingOccurrences(of: "github.com", with: "github.com.evil.invalid") + "RepoPrompt.zip"] {
+            XCTAssertFalse(try repo.trustsDownload(XCTUnwrap(URL(string: url)), tag: "tip-000000000003", name: "RepoPrompt.zip"))
+        }
+        XCTAssertNil(repo.historyPageURL(tag: "../escape"))
+        XCTAssertEqual(TipHistoryCatalogDecoder.sanitize("e\u{202e}\u{301}  title", limit: 200), "é title")
+        XCTAssertEqual(TipHistoryCatalogDecoder.sanitize("👩‍👩‍👧‍👦suffix", limit: 1), "👩‍👩‍👧‍👦")
+    }
+}
+
+// MARK: - TipHistoryCompatibilityTests
+
+final class TipHistoryCompatibilityTests: XCTestCase {
+    private func context(_ build: String = "5", identity: TipHistoryRunningIdentity = .legacy, os: String = "15", architecture: String = "arm64", blocked: String? = nil, valid: Bool = true) -> TipHistoryInstallationContext {
+        TipHistoryInstallationContext(installedBuild: SparkleBuildVersion(build), installedBuildString: build, runningIdentity: identity, osVersion: SparkleBuildVersion(os)!, architecture: architecture, migrationBlockedMessage: blocked, sparkleConfigurationValid: valid)
+    }
+
+    func testInstalledRequiresOfficialMatchingIdentityAndVerifiedConfiguration() throws {
+        let entry = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(5)]).entries[0]
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(entry, in: [entry], context: context("5.0.0")), .installed)
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(entry, in: [entry], context: context(identity: .successor)), .unavailable(.crossesIdentityBackward))
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(entry, in: [entry], context: context(identity: .nonOfficial)), .unavailable(.nonOfficialRunningBuild))
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(entry, in: [entry], context: context(valid: false)), .unavailable(.updatesDisabled))
+    }
+
+    func testDowngradeEnforcesEveryKnownBarrierEvenWhenInstalledBuildIsAbsent() throws {
+        var barrier = TipHistoryTestFixture.entry(4)
+        barrier["downgradeBarrier"] = true
+        barrier["downgradeBarrierReasons"] = ["Changed database format"]
+        let page = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(6), barrier, TipHistoryTestFixture.entry(2)])
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(page.entries[2], in: page.entries, context: context()), .unavailable(.downgradeBarrier(atBuild: "4", reasons: ["Changed database format"])))
+        // Rolling back TO the build introducing a format is not crossing it.
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(page.entries[1], in: page.entries, context: context("4")), .installed)
+    }
+
+    func testUnknownCoverageAndStaleHeadCannotClaimSafety() throws {
+        let page = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(6), TipHistoryTestFixture.entry(2)])
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(page.entries[1], in: page.entries, context: context()), .available(direction: .older, cautions: [.dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory]))
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(page.entries[1], in: page.entries, context: context("10")), .unavailable(.historyBehindInstalled))
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(page.entries[1], in: page.entries, context: context("unknown")), .unavailable(.unorderableInstalledBuild))
+    }
+
+    func testIdentityOSArchitectureAndMigrationCautions() throws {
+        let page = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(6), TipHistoryTestFixture.entry(5), TipHistoryTestFixture.entry(2)])
+        let target = page.entries[2]
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(target, in: page.entries, context: context(architecture: "future")), .unavailable(.unsupportedArchitecture))
+        if case .unavailable(.unsupportedOS) = TipHistoryCompatibility.evaluate(target, in: page.entries, context: context(os: "13")) {} else { XCTFail("OS gate not enforced") }
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(target, in: page.entries, context: context(blocked: "paused")), .available(direction: .older, cautions: [.dataCompatibilityNotGuaranteed, .credentialMigrationPaused]))
+        let successor = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(6, successor: true)]).entries[0]
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(successor, in: [successor], context: context()), .unavailable(.crossesIdentityForward))
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(successor, in: [successor], context: context(identity: .successor)), .available(direction: .newer, cautions: []))
+    }
+
+    func testTransitionPackageAndInvalidCoveredMetadataRemainBlocked() throws {
+        var transition = TipHistoryTestFixture.entry(6, successor: true)
+        transition["role"] = "transition"
+        transition["installationType"] = "package"
+        transition["download"] = NSNull()
+        let package = try TipHistoryTestFixture.page([transition]).entries[0]
+        XCTAssertNil(package.metadataProblem)
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(package, in: [package], context: context()), .unavailable(.transitionInstaller))
+        var malformed = TipHistoryTestFixture.entry(4)
+        malformed["downgradeBarrier"] = "false"
+        let page = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(5), malformed, TipHistoryTestFixture.entry(2)])
+        XCTAssertFalse(TipHistoryCompatibility.evaluate(page.entries[2], in: page.entries, context: context()).canDownload)
     }
 }

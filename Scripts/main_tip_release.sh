@@ -1,6 +1,286 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Shared read-only history boundary. The publisher sources only this section so
+# signing and publication resolve the SAME releases/latest API snapshot, never a
+# second releases/latest/download pointer. No credentials are needed for signing.
+tip_history_context() {
+    HISTORY_SCRIPTS_DIR="$1"
+    HISTORY_TOOL="$1/tip_history.py"
+    HISTORY_ADMISSION_TOOL="$1/tip_history_admission.py"
+    HISTORY_APPLE_POLICY="$1/apple_identity_policy.json"
+    HISTORY_POLICY="$1/tip_history_policy.json"
+    [[ -f "$HISTORY_POLICY" ]] || HISTORY_POLICY="$1/tip_history_policy.example.json"
+    [[ -f "$HISTORY_POLICY" && ! -L "$HISTORY_POLICY" ]] || {
+        printf 'ERROR: missing reviewed or explicitly inactive Tip history policy\n' >&2; return 1;
+    }
+    HISTORY_ACTIVE="$(python3 - "$HISTORY_POLICY" <<'PY'
+import json, re, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+if p.get("schemaVersion") != 1 or "historyEnabledSinceTag" not in p:
+    raise SystemExit("ERROR: malformed Tip history activation policy")
+tag = p["historyEnabledSinceTag"]
+if tag is not None and (not isinstance(tag, str) or not re.fullmatch(r"tip-[0-9a-f]{12}", tag)):
+    raise SystemExit("ERROR: malformed Tip history activation tag")
+print("false" if tag is None else "true")
+PY
+)" || return 1
+}
+
+tip_history_verify_signature() {
+    local envelope="$1" work="$2"
+    mkdir -p "$work" || return 1
+    python3 "$HISTORY_TOOL" extract --envelope "$envelope" \
+        --message-output "$work/message" --signature-output "$work/signature" || return 1
+    python3 - "$HISTORY_APPLE_POLICY" > "$work/public-key" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["sparkle"]["sparklePublicEdDSAValue"])
+PY
+    xcrun swift "$HISTORY_SCRIPTS_DIR/verify_sparkle_signature.swift" \
+        "$work/public-key" "$(cat "$work/signature")" "$work/message"
+}
+
+# Optional second argument is the exact API response already used for rollout
+# progression by the publisher. JSON null means a confirmed API 404, not bootstrap
+# permission. Write a pinned versioned parent, or leave it absent for admission to
+# require the reviewed activation/bootstrap evidence.
+tip_history_resolve_parent() {
+    local work="$1" snapshot="${2:-}" status report tag url size digest actual
+    mkdir -p "$work" || return 1
+    rm -f "$work/parent-envelope.json" || return 1
+    if [[ -z "$snapshot" ]]; then
+        snapshot="$work/release.json"
+        status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            --output "$snapshot" --write-out '%{http_code}' \
+            "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/latest")" || return 1
+        case "$status" in
+            200) ;;
+            404) printf 'null\n' > "$snapshot" ;;
+            *) printf 'ERROR: Tip history parent lookup HTTP %s\n' "$status" >&2; return 1 ;;
+        esac
+    fi
+    cp "$snapshot" "$work/resolved-release.json" || return 1
+    report="$(python3 - "$snapshot" "$TIP_UPDATE_REPOSITORY" <<'PY'
+import json, re, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+if r is None:
+    print("none||||")
+    raise SystemExit(0)
+if not isinstance(r, dict) or r.get("draft") is not False or r.get("prerelease") is not False:
+    raise SystemExit("ERROR: history parent must be a public non-prerelease")
+tag = r.get("tag_name")
+if not isinstance(tag, str) or not re.fullmatch(r"tip-[0-9a-f]{12}", tag):
+    raise SystemExit("ERROR: malformed history parent release tag")
+assets = r.get("assets")
+if not isinstance(assets, list):
+    raise SystemExit("ERROR: malformed history parent assets")
+a = [a for a in assets if isinstance(a, dict) and a.get("name") == "tip-history.json"]
+if len(a) > 1:
+    raise SystemExit("ERROR: duplicate live tip-history.json")
+if not a:
+    print(f"{tag}||||")
+    raise SystemExit(0)
+a = a[0]
+url = f"https://github.com/{sys.argv[2]}/releases/download/{tag}/tip-history.json"
+if a.get("state") != "uploaded" or a.get("browser_download_url") != url:
+    raise SystemExit("ERROR: invalid versioned history parent asset")
+size = a.get("size")
+if type(size) is not int or not 0 < size <= 1024 * 1024:
+    raise SystemExit("ERROR: history parent exceeds envelope bounds")
+digest = a.get("digest")
+if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)):
+    raise SystemExit("ERROR: malformed history parent asset digest")
+print(f"{tag}|{url}|{size}|{(digest or '').removeprefix('sha256:')}|")
+PY
+)" || return 1
+    IFS='|' read -r tag url size digest actual <<< "$report"
+    printf '%s\n' "$tag" > "$work/live-tag"
+    if [[ -z "$url" ]]; then
+        return 0
+    fi
+    [[ "$HISTORY_ACTIVE" == true ]] || {
+        printf 'ERROR: live Tip history exists but activation policy is inactive; never reset history\n' >&2; return 1;
+    }
+    curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+        --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+        "$url" --output "$work/parent-envelope.json" || return 1
+    actual="$(wc -c < "$work/parent-envelope.json" | tr -d '[:space:]')"
+    [[ "$actual" == "$size" ]] || { printf 'ERROR: history parent size mismatch\n' >&2; return 1; }
+    actual="$(shasum -a 256 "$work/parent-envelope.json" | awk '{print $1}')"
+    [[ -z "$digest" || "$actual" == "$digest" ]] || {
+        printf 'ERROR: history parent digest mismatch\n' >&2; return 1;
+    }
+    tip_history_verify_signature "$work/parent-envelope.json" "$work/verify-parent" || return 1
+    python3 "$HISTORY_ADMISSION_TOOL" verify-parent --envelope "$work/parent-envelope.json" \
+        --tag "$tag" --sha256 "$actual"
+}
+
+# Resolve only a policy-pinned file inside the approved source. This is an audit
+# input, not an API-enumeration shortcut or a fabricated no-history assertion.
+tip_history_bootstrap_path() {
+    python3 - "$HISTORY_POLICY" "$1" <<'PY'
+import json, pathlib, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+root = pathlib.Path(sys.argv[2]).resolve()
+name = p.get("bootstrapEvidenceFile")
+if not isinstance(name, str) or not name or pathlib.Path(name).is_absolute():
+    raise SystemExit("ERROR: reviewed bootstrapEvidenceFile required")
+path = (root / name).resolve()
+if not path.is_relative_to(root) or not path.is_file():
+    raise SystemExit("ERROR: bootstrap evidence must exist inside approved source")
+print(path)
+PY
+}
+
+tip_history_require_bootstrap_parent() {
+    local bootstrap="$1" snapshot="$2"
+    python3 - "$HISTORY_POLICY" "$bootstrap" "$snapshot" "$TIP_TAG" <<'PY'
+import hashlib, json, sys
+policy, bootstrap, live = (json.load(open(p, encoding="utf-8")) for p in sys.argv[1:4])
+if sys.argv[4] != policy.get("historyEnabledSinceTag"):
+    raise SystemExit("ERROR: activated Tip history is missing its parent catalog; recovery required, never bootstrap")
+canonical = json.dumps(bootstrap, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+if hashlib.sha256(canonical).hexdigest() != policy.get("bootstrapEvidenceSha256") or bootstrap.get("historyNeverEnabled") is not True:
+    raise SystemExit("ERROR: bootstrap evidence is not the reviewed never-enabled snapshot")
+# The mutable API response is NOT hashed (download counts can change). The
+# approved immutable release tag must still be the authoritative latest parent.
+expected = bootstrap.get("liveParent")
+if "liveParent" not in bootstrap or (None if live is None else live.get("tag_name")) != expected:
+    raise SystemExit("ERROR: Tip history parent superseded: bootstrap liveParent mismatch")
+PY
+}
+
+# An already-public exact candidate is a read-only reconciliation, not a new
+# child of itself. Recover its original hash-pinned parent for full re-derivation.
+tip_history_reaudit_parent() {
+    local envelope="$1" source="$2" work="$3" reference tag digest status bootstrap
+    [[ "$(cat "$work/live-tag")" == "$TIP_TAG" ]] || return 0
+    cmp "$envelope" "$work/parent-envelope.json" || {
+        printf 'ERROR: already-public Tip catalog differs from candidate bytes\n' >&2; return 1;
+    }
+    reference="$(python3 - "$envelope" <<'PY'
+import base64, json, sys
+p = json.loads(base64.b64decode(json.load(open(sys.argv[1]))["payload"], validate=True))
+e = p["entries"][1] if len(p["entries"]) > 1 else None
+if e and e.get("historyCatalogSha256"):
+    print(e["tag"] + "|" + e["historyCatalogSha256"])
+else:
+    print("|")
+PY
+)" || return 1
+    IFS='|' read -r tag digest <<< "$reference"
+    if [[ -z "$tag" ]]; then
+        bootstrap="$(tip_history_bootstrap_path "$source")" || return 1
+        tag="$(python3 - "$bootstrap" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+if "liveParent" not in p:
+    raise SystemExit("ERROR: bootstrap requires explicit liveParent")
+print(p["liveParent"] or "none")
+PY
+)" || return 1
+    fi
+    if [[ "$tag" == none ]]; then
+        printf 'null\n' > "$work/original-release.json"
+    else
+        [[ "$tag" =~ ^tip-[0-9a-f]{12}$ && "$tag" != "$TIP_TAG" ]] || return 1
+        status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' --output "$work/original-release.json" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/tags/$tag")" || return 1
+        [[ "$status" == 200 ]] || { printf 'ERROR: original history parent unavailable\n' >&2; return 1; }
+        python3 - "$work/original-release.json" "$tag" <<'PY' || return 1
+import json, sys
+if json.load(open(sys.argv[1])).get("tag_name") != sys.argv[2]:
+    raise SystemExit("ERROR: original history parent tag mismatch")
+PY
+    fi
+    tip_history_resolve_parent "$work/original" "$work/original-release.json" || return 1
+    if [[ -n "$digest" ]]; then
+        [[ -f "$work/original/parent-envelope.json" ]] || return 1
+        [[ "$(shasum -a 256 "$work/original/parent-envelope.json" | awk '{print $1}')" == "$digest" ]] || {
+            printf 'ERROR: original history parent digest mismatch\n' >&2; return 1;
+        }
+    else
+        [[ ! -f "$work/original/parent-envelope.json" ]] || return 1
+    fi
+    rm -f "$work/parent-envelope.json" || return 1
+    if [[ -f "$work/original/parent-envelope.json" ]]; then
+        cp "$work/original/parent-envelope.json" "$work/parent-envelope.json" || return 1
+    fi
+    cp "$work/original/resolved-release.json" "$work/resolved-release.json"
+}
+
+tip_history_archive_expanded_size() {
+    python3 - "$1" <<'PY'
+import pathlib, sys, zipfile
+path = pathlib.Path(sys.argv[1])
+if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= 2 * 1024**3:
+    raise SystemExit("ERROR: history ZIP archive bounds invalid")
+with zipfile.ZipFile(path) as z:
+    entries = z.infolist()
+    if len(entries) > 100000:
+        raise SystemExit("ERROR: history ZIP entry limit exceeded")
+    total = 0
+    for i in entries:
+        name = i.filename
+        parts = pathlib.PurePosixPath(name).parts
+        if not parts or parts[0] != "RepoPrompt CE.app" or name.startswith("/") or ".." in parts or "\\" in name or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
+            raise SystemExit("ERROR: history ZIP layout is not the expected app")
+        if not i.is_dir():
+            total += i.file_size
+    if not 0 < total <= 8 * 1024**3:
+        raise SystemExit("ERROR: history ZIP expanded bounds invalid")
+    print(total)
+PY
+}
+
+tip_history_verify_candidate() {
+    local envelope="$1" manifest="$2" artifact="$3" metadata="$4" source="$5" work="$6"
+    local bootstrap expanded_size enclosure_path
+    [[ "$(git -C "$source" rev-parse HEAD)" == "$TIP_COMMIT" ]] || {
+        printf 'ERROR: history validation requires approved source HEAD\n' >&2; return 1;
+    }
+    [[ "$(git -C "$source" rev-parse --is-shallow-repository)" == false ]] || {
+        printf 'ERROR: history validation requires full approved source history\n' >&2; return 1;
+    }
+    local verify_args=(--envelope "$envelope")
+    if [[ -f "$work/parent-envelope.json" ]]; then
+        verify_args+=(--parent-envelope "$work/parent-envelope.json")
+    else
+        bootstrap="$(tip_history_bootstrap_path "$source")" || return 1
+        tip_history_require_bootstrap_parent "$bootstrap" "$work/resolved-release.json" || return 1
+        verify_args+=(--bootstrap "$bootstrap")
+    fi
+    # Metadata is independently bound; expanded size is re-measured from the
+    # actual checksum/manifest-bound ZIP, never trusted from the signed head.
+    enclosure_path="$(python3 - "$manifest" "$metadata" <<'PY'
+import json, pathlib, sys
+m, metadata = (json.load(open(p, encoding="utf-8")) for p in sys.argv[1:])
+for key, expected in {"commit": m["releaseCommit"], "short_sha": m["releaseCommit"][:12], "tag": m["sourceTag"], "marketing_version": m["marketingVersion"], "build_number": m["buildNumber"], "rollout_role": m["currentRole"], "signing_identity": m["signingIdentity"], "migration_phase": m["migrationPhase"]}.items():
+    if metadata.get(key) != expected:
+        raise SystemExit(f"ERROR: history metadata binding mismatch: {key}")
+head = m["appcastItems"][0]
+name = head["enclosureName"]
+if not isinstance(name, str) or pathlib.Path(name).name != name or "/" in name or "\\" in name:
+    raise SystemExit("ERROR: invalid history enclosure filename")
+print(pathlib.Path(sys.argv[1]).parent / name if head["installationType"] == "application" else "")
+PY
+)" || return 1
+    expanded_size=0
+    if [[ -n "$enclosure_path" ]]; then
+        expanded_size="$(tip_history_archive_expanded_size "$enclosure_path")" || return 1
+    fi
+    python3 "$HISTORY_ADMISSION_TOOL" verify-candidate "${verify_args[@]}" \
+        --apple-policy "$HISTORY_APPLE_POLICY" --policy "$HISTORY_POLICY" --source "$source" \
+        --manifest "$manifest" --app-artifact-manifest "$artifact" --expanded-size "$expanded_size"
+}
+
+if [[ "${REPOPROMPT_TIP_HISTORY_LIBRARY_ONLY:-0}" == 1 ]]; then
+    return 0
+fi
+
 MODE="${1:-stage}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -63,6 +343,8 @@ SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 ROLLOUT_MANIFEST="$DIST_DIR/identity-rollout.json"
+HISTORY_ENVELOPE="$DIST_DIR/tip-history.json"
+tip_history_context "$CONTROL_PLANE_SCRIPTS_DIR"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
@@ -150,6 +432,26 @@ validate_distribution_zip() {
     local extracted_app="$extract_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
     [[ -d "$extracted_app" ]] || fail "$label ZIP must contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     validate_public_app "$extracted_app" "$manifest" "$label extracted app" "$signed_team_identifier"
+    if [[ "$HISTORY_ACTIVE" == true ]]; then
+        local actual_expanded_size expected_expanded_size
+        actual_expanded_size="$(python3 - "$extracted_app" <<'PY'
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+total = 0
+for directory, dirs, files in os.walk(root, followlinks=False):
+    for name in files:
+        total += (pathlib.Path(directory) / name).lstat().st_size
+    for name in dirs:
+        path = pathlib.Path(directory) / name
+        if path.is_symlink():
+            total += path.lstat().st_size
+print(total)
+PY
+)"
+        expected_expanded_size="$(tip_history_archive_expanded_size "$archive")"
+        [[ "$actual_expanded_size" == "$expected_expanded_size" ]] ||
+            fail "$label extracted app byte count differs from its final ZIP"
+    fi
 }
 
 resolve_without_lockfile_drift() {
@@ -410,6 +712,61 @@ generate_tip_rollout_appcast() {
         "$public_key_file" "$enclosure_signature" "$ENCLOSURE"
 }
 
+generate_tip_history_catalog() {
+    if [[ "$HISTORY_ACTIVE" != true ]]; then
+        printf 'OK: Tip history explicitly inactive; existing release inventory unchanged.\n'
+        return
+    fi
+    require_env REPOPROMPT_APPROVED_SOURCE_ROOT
+    require_env SPARKLE_PRIVATE_KEY
+    [[ "$(git -C "$APPROVED_SOURCE_ROOT" rev-parse HEAD)" == "$TIP_COMMIT" ]] ||
+        fail "Tip history source must be the approved candidate commit"
+    [[ "$(git -C "$APPROVED_SOURCE_ROOT" rev-parse --is-shallow-repository)" == false ]] ||
+        fail "Tip history requires full approved-source history"
+    local work="$TMP_DIR/history" bootstrap from_commit expanded_size signature
+    tip_history_resolve_parent "$work" || fail "Unable to resolve verified Tip history parent"
+    local parent_args=(--policy "$HISTORY_POLICY")
+    if [[ -f "$work/parent-envelope.json" ]]; then
+        parent_args+=(--parent-envelope "$work/parent-envelope.json")
+        from_commit="$(python3 - "$work/parent-envelope.json" <<'PY'
+import base64, json, sys
+p = json.loads(base64.b64decode(json.load(open(sys.argv[1]))["payload"], validate=True))
+print(p["entries"][0]["releaseCommit"])
+PY
+)"
+    else
+        bootstrap="$(tip_history_bootstrap_path "$APPROVED_SOURCE_ROOT")"
+        tip_history_require_bootstrap_parent "$bootstrap" "$work/resolved-release.json"
+        parent_args+=(--bootstrap "$bootstrap")
+        from_commit="$(python3 - "$bootstrap" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["entries"][0]["releaseCommit"])
+PY
+)"
+    fi
+    python3 "$HISTORY_TOOL" collect-notes --repo "$APPROVED_SOURCE_ROOT" \
+        --from "$from_commit" --to "$TIP_COMMIT" --output "$work/notes.json"
+    # The ZIP has already been extracted and its final app validated by the
+    # application phase. Bind the catalog to that archive's bounded byte count.
+    expanded_size=0
+    if [[ "$ROLLOUT_INSTALLATION_TYPE" == application ]]; then
+        expanded_size="$(tip_history_archive_expanded_size "$UPDATE_ZIP")"
+    fi
+    python3 "$HISTORY_ADMISSION_TOOL" build-payload "${parent_args[@]}" \
+        --apple-policy "$APPLE_IDENTITY_POLICY" --source "$APPROVED_SOURCE_ROOT" \
+        --manifest "$ROLLOUT_MANIFEST" --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
+        --notes "$work/notes.json" --expanded-size "$expanded_size" --output "$work/payload.json"
+    python3 "$HISTORY_TOOL" signed-message --payload "$work/payload.json" --output "$work/message"
+    signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+        "$RUN_WITHOUT_GITHUB_TOKENS" "$SIGN_UPDATE" --ed-key-file - -p "$work/message" | tr -d '\r\n')"
+    [[ -n "$signature" ]] || fail "Unable to sign Tip history catalog"
+    python3 "$HISTORY_TOOL" wrap --payload "$work/payload.json" --signature "$signature" \
+        --output "$HISTORY_ENVELOPE"
+    tip_history_verify_signature "$HISTORY_ENVELOPE" "$work/verify-candidate"
+    tip_history_verify_candidate "$HISTORY_ENVELOPE" "$ROLLOUT_MANIFEST" \
+        "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA" "$APPROVED_SOURCE_ROOT" "$work"
+}
+
 require_application_rollout() {
     [[ "$ROLLOUT_INSTALLATION_TYPE" == "application" ]] ||
         fail "Application notarization requires a policy-derived application rollout"
@@ -519,6 +876,7 @@ sign_tip_application_phase() {
     hdiutil create -volname "$DISPLAY_NAME Tip" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
     notarize_application_dmg
     generate_tip_rollout_appcast
+    generate_tip_history_catalog
     local checksum_assets=(
         "$(basename "$UPDATE_ZIP")"
         "$(basename "$DMG")"
@@ -527,6 +885,7 @@ sign_tip_application_phase() {
         "$(basename "$FINAL_METADATA")"
         "$(basename "$ROLLOUT_MANIFEST")"
     )
+    if [[ "$HISTORY_ACTIVE" == true ]]; then checksum_assets+=("$(basename "$HISTORY_ENVELOPE")"); fi
     (cd "$DIST_DIR" && shasum -a 256 "${checksum_assets[@]}" > "$(basename "$CHECKSUMS")")
     printf 'OK: signed and notarized Tip %s application artifact %s.\n' "$ROLLOUT_ROLE" "$TIP_TAG"
 }
@@ -566,6 +925,7 @@ validate_tip_package_phase() {
         "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" validate \
         "$TRANSITION_PKG" --expected-app "$APP_BUNDLE"
     generate_tip_rollout_appcast
+    generate_tip_history_catalog
     local checksum_assets=(
         "$(basename "$TRANSITION_PKG")"
         "$(basename "$APPCAST")"
@@ -573,6 +933,7 @@ validate_tip_package_phase() {
         "$(basename "$FINAL_METADATA")"
         "$(basename "$ROLLOUT_MANIFEST")"
     )
+    if [[ "$HISTORY_ACTIVE" == true ]]; then checksum_assets+=("$(basename "$HISTORY_ENVELOPE")"); fi
     (cd "$DIST_DIR" && shasum -a 256 "${checksum_assets[@]}" > "$(basename "$CHECKSUMS")")
     printf 'OK: signed, notarized, stapled, and validated Tip package artifact %s.\n' "$TIP_TAG"
 }
@@ -589,6 +950,7 @@ sign_tip() {
 
 tip_publish_assets() {
     TIP_PUBLISH_ASSETS=("$APPCAST" "$CHECKSUMS" "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA" "$ROLLOUT_MANIFEST")
+    if [[ "$HISTORY_ACTIVE" == true ]]; then TIP_PUBLISH_ASSETS+=("$HISTORY_ENVELOPE"); fi
     case "$TIP_PUBLISH_INSTALLATION_TYPE" in
         package) TIP_PUBLISH_ASSETS+=("$TRANSITION_PKG") ;;
         application) TIP_PUBLISH_ASSETS+=("$UPDATE_ZIP" "$DMG") ;;

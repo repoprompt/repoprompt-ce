@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "title": "Prepare verified Tip build history and guided reinstall",
+  "notes": [
+    "Adds history, verified-download and manual-reinstall controls; activation awaits an audited release catalog.",
+    "Preserves automatic-check preferences and blocks unsupported signing-identity transitions.",
+    "Adds signed history publishing and audited bootstrap tooling for maintainers."
+  ],
+  "breaksDowngrade": false
+}
