@@ -57,7 +57,7 @@ struct WorkspaceDefaultGitRepositoryElection {
 
         /// Trims, expands `~`, and standardizes with the lexical rules of loaded root references.
         static func standardizedPath(_ raw: String) -> String? {
-            AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(raw).map(StandardizedPath.absolute)
+            WorkspaceExactRootPath(raw).map { StandardizedPath.absolute($0.normalizedPath) }
         }
 
         /// Declared order (PRIMARY moves on reorder) and binding authority still match this capture.
@@ -186,7 +186,7 @@ struct WorkspaceDefaultGitRepositoryElection {
     /// Every captured row, in declared order. The lookup context must be the validated projection of exactly
     /// these rows: `AgentWorkspaceLookupContextResolver.requiredLookupContext` already refuses duplicates,
     /// unavailable identities, and logical-equals-physical rows. Election adds declared-root membership.
-    private func applicableBindings(in snapshot: Snapshot) throws -> [AgentSessionWorktreeBinding] {
+    private func applicableBindings(in snapshot: Snapshot) throws -> [WorkspaceSessionWorktreeBinding] {
         guard let source = snapshot.bindingSource else {
             throw WorkspaceLookupContextResolutionError.unknownBindingState
         }
@@ -194,7 +194,7 @@ struct WorkspaceDefaultGitRepositoryElection {
         guard lookupContext != AgentWorkspaceLookupContextResolver.failClosedLookupContext else {
             throw WorkspaceLookupContextResolutionError.unavailableProjection
         }
-        var bindings: [AgentSessionWorktreeBinding] = []
+        var bindings: [WorkspaceSessionWorktreeBinding] = []
         if source.activeAgentSessionID != nil {
             guard case let .hydrated(hydrated) = source.worktreeBindingState else {
                 throw WorkspaceLookupContextResolutionError.unknownBindingState
@@ -220,7 +220,7 @@ struct WorkspaceDefaultGitRepositoryElection {
             snapshot.declaredRoots.enumerated().map { ($1.path, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let indexed = try bindings.map { binding -> (index: Int, binding: AgentSessionWorktreeBinding) in
+        let indexed = try bindings.map { binding -> (index: Int, binding: WorkspaceSessionWorktreeBinding) in
             guard let logicalPath = Snapshot.standardizedPath(binding.logicalRootPath),
                   let index = declaredIndex[logicalPath]
             else {
@@ -255,7 +255,7 @@ struct WorkspaceDefaultGitRepositoryElection {
     }
 
     private func electSoleBinding(
-        _ binding: AgentSessionWorktreeBinding,
+        _ binding: WorkspaceSessionWorktreeBinding,
         in snapshot: Snapshot
     ) async throws -> Selection {
         let subject = Failure.Subject.soleBinding(

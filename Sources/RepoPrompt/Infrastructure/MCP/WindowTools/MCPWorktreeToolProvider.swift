@@ -473,8 +473,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
         let removeAll = parseBool(args["all"]) ?? false
 
-        let remaining: [AgentSessionWorktreeBinding]
-        let removed: [AgentSessionWorktreeBinding]
+        let remaining: [WorkspaceSessionWorktreeBinding]
+        let removed: [WorkspaceSessionWorktreeBinding]
         let authorizationRoots: [String]
         if removeAll {
             remaining = []
@@ -590,7 +590,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             return (bindingDTO(previous), nil, nil)
         }
 
-        let binding = AgentSessionWorktreeBinding(
+        let binding = WorkspaceSessionWorktreeBinding(
             id: previous?.id ?? UUID().uuidString,
             repositoryID: worktree.repository.repositoryID,
             repoKey: worktree.repository.repoKey,
@@ -654,7 +654,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// running turn cannot change cwd, so tools are never rerouted beneath it; the switch and an
     /// automatic continuation turn follow the boundary instead.
     private func transitionOrScheduleBindings(
-        _ desiredBindings: [AgentSessionWorktreeBinding],
+        _ desiredBindings: [WorkspaceSessionWorktreeBinding],
         sessionID: UUID,
         agentModeVM: AgentModeViewModel,
         invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?,
@@ -713,8 +713,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     static func bindingForLogicalRoot(
-        _ bindings: [AgentSessionWorktreeBinding], logicalRootPath: String
-    ) -> AgentSessionWorktreeBinding? {
+        _ bindings: [WorkspaceSessionWorktreeBinding], logicalRootPath: String
+    ) -> WorkspaceSessionWorktreeBinding? {
         let logicalPath = GitRepoRootAuthorization.canonicalPath(logicalRootPath)
         return bindings.first { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == logicalPath }
     }
@@ -743,10 +743,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// Selecting the logical checkout is the inverse of this root's binding, not an
     /// ownership conversion of an arbitrary folder that happens to be visible.
     static func bindingsReturningToLogicalCheckout(
-        _ existing: [AgentSessionWorktreeBinding],
+        _ existing: [WorkspaceSessionWorktreeBinding],
         logicalRootPath: String,
         selectedWorktreePath: String
-    ) -> [AgentSessionWorktreeBinding]? {
+    ) -> [WorkspaceSessionWorktreeBinding]? {
         let logicalPath = GitRepoRootAuthorization.canonicalPath(logicalRootPath)
         guard GitRepoRootAuthorization.canonicalPath(selectedWorktreePath) == logicalPath else { return nil }
         return existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != logicalPath }
@@ -1258,7 +1258,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
     }
 
-    private func bindingDTO(_ binding: AgentSessionWorktreeBinding) -> ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO {
+    private func bindingDTO(_ binding: WorkspaceSessionWorktreeBinding) -> ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO {
         ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO(
             id: binding.id,
             repositoryID: binding.repositoryID,

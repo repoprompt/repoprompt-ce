@@ -252,7 +252,7 @@ final class MCPGitToolProvider {
     nonisolated static func selectedGitDiffPathsForPublication(
         logicalSelection: StoredSelection,
         physicalSelection: StoredSelection,
-        worktreeBindings: [AgentSessionWorktreeBinding]
+        worktreeBindings: [WorkspaceSessionWorktreeBinding]
     ) -> [String] {
         let boundRoots = worktreeBindings.compactMap { binding -> (logical: String, physical: String)? in
             guard let logical = standardizedAbsoluteSelectionPath(binding.logicalRootPath),
@@ -409,18 +409,12 @@ final class MCPGitToolProvider {
         }
     }
 
-    /// Default for an omitted or relative selector under an available frozen Context Builder target: its
-    /// primary checkout, never the ambient workspace election. A target whose primary checkout is no longer
-    /// discovered is a discovery refusal. Nil when no frozen target governs the request (no Context Builder
-    /// run, or a deferred/unavailable target admitting explicit read-only inspection), leaving the election.
+    /// Default for an omitted or relative selector under an available frozen Context Builder target; see
+    /// `MCPContextBuilderGitReviewAdmission.frozenDefaultRepository()`.
     nonisolated static func frozenDefaultRepository(
         for admission: MCPContextBuilderGitReviewAdmission
     ) throws -> GitRepoDescriptor? {
-        guard admission.target != nil else { return nil }
-        guard let preferredDefaultRepository = admission.preferredDefaultRepository else {
-            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.checkoutIdentityChanged)
-        }
-        return preferredDefaultRepository
+        try admission.frozenDefaultRepository()
     }
 
     /// The repository an omitted or relative selector resolves against: an available frozen Context Builder
@@ -430,8 +424,7 @@ final class MCPGitToolProvider {
         admission: MCPContextBuilderGitReviewAdmission,
         election snapshot: WorkspaceDefaultGitRepositoryElection.Snapshot,
         vcsService: VCSService,
-        currentDeclaredRepoPaths: () -> [String]?,
-        currentBindingSource: () -> AgentWorkspaceLookupContextSource?
+        isCurrent: (WorkspaceDefaultGitRepositoryElection.Snapshot) -> Bool
     ) async throws -> GitRepoDescriptor {
         do {
             if let frozen = try Self.frozenDefaultRepository(for: admission) {
@@ -442,7 +435,7 @@ final class MCPGitToolProvider {
         }
         do {
             let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: vcsService).elect(in: snapshot)
-            guard snapshot.isCurrent(declaredRepoPaths: currentDeclaredRepoPaths(), bindingSource: currentBindingSource()) else {
+            guard isCurrent(snapshot) else {
                 throw WorkspaceDefaultGitRepositoryElection.Failure.superseded
             }
             return selection.repository
@@ -621,14 +614,17 @@ final class MCPGitToolProvider {
                             lookupRoots: visibleRoots
                         ),
                         vcsService: vcsService,
-                        currentDeclaredRepoPaths: { workspaceManager.workspaces.first { $0.id == workspace.id }?.repoPaths },
-                        currentBindingSource: {
+                        isCurrent: { snapshot in
                             // A domain read keeps its captured tab as the request's authority; the legacy
                             // route re-reads routing so a changed binding set supersedes the selection.
-                            guard appContext == nil else { return electionBindingSource }
-                            return WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
-                                routed: try? dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.git),
-                                runPurpose: metadata.runPurpose
+                            snapshot.isCurrent(
+                                declaredRepoPaths: workspaceManager.workspaces.first { $0.id == workspace.id }?.repoPaths,
+                                bindingSource: appContext == nil
+                                    ? WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
+                                        routed: try? dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.git),
+                                        runPurpose: metadata.runPurpose
+                                    )
+                                    : electionBindingSource
                             )
                         }
                     )
