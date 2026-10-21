@@ -441,18 +441,18 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Do not use any tools"))
     }
 
-    func testOracleImageRequestCarriesImagesThroughToolLessACPMessage() {
-        let image = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+    func testOracleAttachmentsCarryThroughToolLessACPMessage() {
+        let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
         let message = DevinCLIProvider.test_makeImageAgentMessage(from: AIMessage(
             systemPrompt: "Return Markdown.",
             conversationMessages: [.init(role: .user, content: "Describe the image.")],
-            transientImages: [image],
+            attachments: [image],
             temperature: nil,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: []
         ))
 
-        XCTAssertEqual(message.transientImages, [image])
+        XCTAssertEqual(message.attachments, [image])
         XCTAssertTrue(message.systemPrompt.contains("Return Markdown."))
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
         XCTAssertTrue(message.userMessage.contains("Describe the image."))

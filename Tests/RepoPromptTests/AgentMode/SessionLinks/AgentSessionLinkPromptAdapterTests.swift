@@ -627,7 +627,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
             let existing = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
             fixture.session.appendItem(existing)
-            let image = AgentImageAttachment(
+            let image = AgentFileAttachment(
                 source: .localFile(path: "/tmp/superseded-catalog-image.png"),
                 title: "superseded-catalog-image.png"
             )
@@ -640,7 +640,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 displayName: "Superseded Workflow",
                 template: "Wrapped: $ARGUMENTS"
             )
-            fixture.session.pendingImageAttachments = [image]
+            fixture.session.pendingFileAttachments = [image]
             fixture.session.pendingTaggedFileAttachments = [taggedFile]
             fixture.session.selectedWorkflow = workflow
             let rawDraft = "  restore exact superseded input  "
@@ -667,7 +667,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             }
             XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), [existing.id])
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
-            XCTAssertEqual(fixture.session.pendingImageAttachments, [image])
+            XCTAssertEqual(fixture.session.pendingFileAttachments, [image])
             XCTAssertEqual(fixture.session.pendingTaggedFileAttachments, [taggedFile])
             XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
             XCTAssertEqual(fixture.viewModel.selectedWorkflow, workflow)
@@ -855,7 +855,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let workflow = AgentWorkflowDefinition(
             customID: UUID(), displayName: "Keep workflow", template: "keep"
         )
-        let attachment = AgentImageAttachment(
+        let attachment = AgentFileAttachment(
             source: .localFile(path: "/tmp/self-compact-keep.png"),
             title: "self-compact-keep.png"
         )
@@ -864,7 +864,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         fixture.session.lastUserMessageAt = Date(timeIntervalSince1970: 9)
         fixture.session.draftText = "unsent draft"
         fixture.session.selectedWorkflow = workflow
-        fixture.session.pendingImageAttachments = [attachment]
+        fixture.session.pendingFileAttachments = [attachment]
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
 
         let outcome = await fixture.coordinator.sendCodexNativeMessage(
@@ -882,7 +882,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.session.lastUserMessageAt, Date(timeIntervalSince1970: 9))
         XCTAssertEqual(fixture.session.draftText, "unsent draft")
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
-        XCTAssertEqual(fixture.session.pendingImageAttachments, [attachment])
+        XCTAssertEqual(fixture.session.pendingFileAttachments, [attachment])
         XCTAssertFalse(fixture.startedTurns.contains { $0.contains("keep staged handoff") })
     }
 
@@ -3854,7 +3854,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
 
     func startUserTurn(
         text: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
@@ -3868,7 +3868,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
 
     func steerUserTurn(
         text: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         if let steerHandler {

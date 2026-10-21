@@ -777,7 +777,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         AgentTabSession.CodexFallbackQueueEntry(
             id: UUID(),
             providerText: "queued follow-up",
-            images: [],
+            attachments: [],
             taggedFileAttachments: [],
             model: nil,
             reasoningEffort: nil,

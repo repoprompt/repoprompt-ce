@@ -1127,7 +1127,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
-            .map(advertiseOracleImageAttachments)
+            .map(advertiseOracleAttachments)
             .map(advertiseWorktreeListPagination)
             .map(advertiseSessionDiscovery)
     }
@@ -1227,46 +1227,25 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
-    /// The vendored Oracle send definitions predate image attachments, so
-    /// canonicalization advertises the app-backend `images` contract here instead of
-    /// re-vendoring the blob. The direct headless backend cannot resolve workspace
-    /// images and rejects the argument at execution time rather than dropping it.
-    private static func advertiseOracleImageAttachments(
+    /// The vendored Oracle send definitions predate file attachments, so canonicalization
+    /// advertises the app-backend `attachments` contract here instead of re-vendoring the blob.
+    private static func advertiseOracleAttachments(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        guard [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend].contains(definition.name),
+        typealias Contract = OracleAttachmentContract
+        guard Contract.oracleToolNames.contains(definition.name),
               case var .object(schema) = definition.inputSchema,
               case var .object(properties)? = schema["properties"],
-              properties["images"] == nil
+              properties[Contract.argumentName] == nil
         else { return definition }
 
-        let limits = OracleImageAttachmentLimits.production
-        properties["images"] = .object([
-            "type": .string("array"),
-            "description": .string("Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` inside a loaded workspace root (including screenshots saved under a workspace root) or the exact path of an image the user attached to this agent session, and may include transient `title`. Unsupported transports, remote URLs, sibling attachments, and arbitrary paths outside loaded roots are rejected. Max \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."),
-            "items": .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "path": .object([
-                        "type": .string("string"),
-                        "description": .string("Canonical absolute path inside a currently loaded workspace root, or the exact path of an image attached to this agent session")
-                    ]),
-                    "title": .object([
-                        "type": .string("string"),
-                        "description": .string("Optional transient image title"),
-                        "maxLength": .int(200)
-                    ])
-                ]),
-                "required": .array([.string("path")])
-            ]),
-            "maxItems": .int(limits.maxCount)
-        ])
+        properties[Contract.argumentName] = Contract.schemaProperty(headlessLimitation: true)
         schema["properties"] = .object(properties)
 
         var description = definition.description
-        let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."
-        if !description.contains(imageUsage) {
-            description += "\n\n\(imageUsage)"
+        let usage = Contract.usageDescription() + Contract.headlessLimitationNote
+        if !description.contains(usage) {
+            description += "\n\n\(usage)"
         }
 
         return MCPDomainToolDefinition(

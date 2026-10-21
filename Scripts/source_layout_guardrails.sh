@@ -810,6 +810,7 @@ allowed_tracked_docs=(
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
   "docs/architecture/modules.md"
+  "docs/architecture/oracle-attachments.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/routing-profile-publication.md"

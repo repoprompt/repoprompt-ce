@@ -291,7 +291,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var contextUsageSnapshot: ContextUsageSnapshot?
-    @Published var pendingImageAttachments: [AgentImageAttachment] = []
+    @Published var pendingFileAttachments: [AgentFileAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
@@ -4512,7 +4512,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private static func pendingUserTurnState(from session: TabSession?) -> PendingUserTurnState {
         PendingUserTurnState(
             workflow: session?.selectedWorkflow,
-            imageAttachments: session?.pendingImageAttachments ?? [],
+            attachments: session?.pendingFileAttachments ?? [],
             taggedFileAttachments: session?.pendingTaggedFileAttachments ?? [],
             initialStartLocation: session?.pendingInitialStartLocation ?? .local
         )
@@ -4522,20 +4522,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             assert(
                 destinationSession.selectedWorkflow == nil
-                    && destinationSession.pendingImageAttachments.isEmpty
+                    && destinationSession.pendingFileAttachments.isEmpty
                     && destinationSession.pendingTaggedFileAttachments.isEmpty,
                 "installPendingUserTurnState should only target a fresh destination session"
             )
         #endif
         destinationSession.selectedWorkflow = pendingState.workflow
-        destinationSession.pendingImageAttachments = pendingState.imageAttachments
+        destinationSession.pendingFileAttachments = pendingState.attachments
         destinationSession.pendingTaggedFileAttachments = pendingState.taggedFileAttachments
         destinationSession.pendingInitialStartLocation = pendingState.initialStartLocation
     }
 
     private func clearPendingUserTurnState(on session: TabSession?) {
         session?.selectedWorkflow = nil
-        session?.pendingImageAttachments.removeAll()
+        session?.pendingFileAttachments.removeAll()
         session?.pendingTaggedFileAttachments.removeAll()
         session?.pendingInitialStartLocation = .local
     }
@@ -7683,7 +7683,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.queuedUserInputRequests.removeAll()
         session.queuedMCPElicitationRequests.removeAll()
         session.pendingInstructions.removeAll()
-        session.pendingImageAttachments.removeAll()
+        session.pendingFileAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
@@ -13765,8 +13765,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 contextUsageSnapshot = session.contextUsageSnapshot
             }
             syncActiveTranscriptFollowBindings(from: session)
-            if pendingImageAttachments != session.pendingImageAttachments {
-                pendingImageAttachments = session.pendingImageAttachments
+            if pendingFileAttachments != session.pendingFileAttachments {
+                pendingFileAttachments = session.pendingFileAttachments
             }
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
                 pendingTaggedFileAttachments = session.pendingTaggedFileAttachments
@@ -13821,7 +13821,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditPermissionGuidance = nil
             contextUsage = nil
             contextUsageSnapshot = nil
-            pendingImageAttachments = []
+            pendingFileAttachments = []
             pendingTaggedFileAttachments = []
             selectedWorkflow = nil
         }
@@ -14347,8 +14347,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if activeTranscriptFollowBindingState != previousFollowBindingState {
                 invalidation.insert(.transcript)
             }
-            if pendingImageAttachments != session.pendingImageAttachments {
-                pendingImageAttachments = session.pendingImageAttachments
+            if pendingFileAttachments != session.pendingFileAttachments {
+                pendingFileAttachments = session.pendingFileAttachments
                 invalidation.insert(.composer)
             }
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
@@ -18306,7 +18306,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let acpModelParameterSelections: [ACPModelParameterSelection]
         let autoEditEnabled: Bool
         let selectedWorkflow: AgentWorkflowDefinition?
-        let imageAttachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
 
@@ -18324,7 +18324,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             acpModelParameterSelections = session?.acpModelParameterSelections ?? []
             autoEditEnabled = session?.autoEditEnabled ?? fallbackAutoEditEnabled
             selectedWorkflow = session?.selectedWorkflow
-            imageAttachments = session?.pendingImageAttachments ?? []
+            attachments = session?.pendingFileAttachments ?? []
             taggedFileAttachments = session?.pendingTaggedFileAttachments ?? []
             initialStartLocation = session?.pendingInitialStartLocation ?? .local
         }
@@ -18338,7 +18338,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 && acpModelParameterSelections == session.acpModelParameterSelections
                 && autoEditEnabled == session.autoEditEnabled
                 && selectedWorkflow == session.selectedWorkflow
-                && imageAttachments == session.pendingImageAttachments
+                && attachments == session.pendingFileAttachments
                 && taggedFileAttachments == session.pendingTaggedFileAttachments
                 && initialStartLocation == session.pendingInitialStartLocation
         }
@@ -18359,14 +18359,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
             && session.transcript.turns.isEmpty
-            && session.pendingImageAttachments.isEmpty
+            && session.pendingFileAttachments.isEmpty
             && session.pendingTaggedFileAttachments.isEmpty
             && session.selectedWorkflow == nil
     }
 
     private func preflightInitialUserTurn(text: String, session: TabSession) -> UserTurnSubmissionResult? {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = session.pendingImageAttachments
+        let attachments = session.pendingFileAttachments
         let taggedFiles = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
             return .blocked(message: "")
@@ -18608,7 +18608,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachmentsToSend = session.pendingImageAttachments
+        let attachmentsToSend = session.pendingFileAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
@@ -18741,7 +18741,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Capture and clear workflow before sending
         session.selectedWorkflow = nil
         selectedWorkflow = nil
-        session.pendingImageAttachments.removeAll()
+        session.pendingFileAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
@@ -18806,7 +18806,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         originalSession: TabSession,
         originalBinding: AgentPersistentSessionBindingIdentity?,
         trimmedText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
@@ -18833,7 +18833,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 tabID: tabID,
                 session: session,
                 draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend,
+                attachments: attachmentsToSend,
                 taggedFiles: taggedFilesToSend,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -18849,7 +18849,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 tabID: tabID,
                 session: session,
                 draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend,
+                attachments: attachmentsToSend,
                 taggedFiles: taggedFilesToSend,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -18867,7 +18867,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let message = hydratedSession.operationAdmissionFailureMessage {
             restoreRejectedManualSubmissionComposerState(
                 tabID: tabID, session: session, draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                 message: message
@@ -18970,7 +18970,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         userItemID: UUID,
         turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
         draftText: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
@@ -18998,7 +18998,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: tabID,
             session: session,
             draftText: draftText,
-            images: images,
+            attachments: attachments,
             taggedFiles: taggedFiles,
             selectedWorkflow: selectedWorkflow,
             selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19010,7 +19010,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         session: TabSession,
         text: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         userItemID: UUID,
         turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
@@ -19058,7 +19058,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19082,7 +19082,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19101,7 +19101,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19118,7 +19118,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19135,7 +19135,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19158,7 +19158,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19179,7 +19179,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19204,7 +19204,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19451,7 +19451,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         session: TabSession,
         trimmedText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
@@ -19506,7 +19506,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 bubbleText = trimmedText
             }
         } else if !attachmentsToSend.isEmpty {
-            bubbleText = "Sent \(attachmentsToSend.count) image\(attachmentsToSend.count == 1 ? "" : "s")"
+            bubbleText = "Sent \(attachmentsToSend.count) attachment\(attachmentsToSend.count == 1 ? "" : "s")"
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
         }
@@ -19701,7 +19701,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let fallbackContext = TabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(),
                 providerText: wrappedText,
-                images: attachmentsToSend,
+                attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: restorationDraftText,
                 optimisticUserItemID: userItem.id,
@@ -19809,7 +19809,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             tabID: tabID,
                             session: authoritativeSession,
                             draftText: fallbackContext.draftText,
-                            images: attachmentsToSend,
+                            attachments: attachmentsToSend,
                             taggedFiles: taggedFilesToSend,
                             selectedWorkflow: restorationSelectedWorkflow,
                             selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -19878,7 +19878,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             tabID: tabID,
                             session: session,
                             draftText: restorationDraftText,
-                            images: attachmentsToSend,
+                            attachments: attachmentsToSend,
                             taggedFiles: taggedFilesToSend,
                             selectedWorkflow: restorationSelectedWorkflow,
                             selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -20013,7 +20013,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func activeProviderSteeringRoute(
         for session: TabSession,
-        attachments: [AgentImageAttachment] = []
+        attachments: [AgentFileAttachment] = []
     ) -> ActiveProviderSteeringRoute? {
         guard session.runState == .running,
               session.pendingApproval == nil else { return nil }
@@ -20028,7 +20028,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func activeACPPromptIsAvailable(
         for session: TabSession,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) -> Bool {
         guard session.selectedAgent.acpProviderID != nil,
               session.runState == .running,
@@ -20087,7 +20087,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ route: ActiveProviderSteeringRoute,
         session: TabSession,
         wrappedText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         trimmedText: String,
         userItem: AgentChatItem,
@@ -20365,7 +20365,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func validateNativeSlashCommandUsage(
         _ invocation: ResolvedNativeSlashCommand,
         session: TabSession,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?
     ) -> UserTurnSubmissionResult? {
@@ -20555,7 +20555,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func renderProviderMessage(
         text: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         agent: AgentProviderKind
     ) -> String {
         guard !attachments.isEmpty else { return text }
@@ -20570,9 +20570,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     static let attachmentPathNoteHeader =
-        "Attached image files (to share one with the Oracle, pass its path in ask_oracle `images`):"
+        "Attached files (to share one with the Oracle, pass its path in ask_oracle `attachments`):"
 
-    private func renderAttachmentPathNote(text: String, attachments: [AgentImageAttachment]) -> String {
+    private func renderAttachmentPathNote(text: String, attachments: [AgentFileAttachment]) -> String {
         let paths = attachments.compactMap { attachment -> String? in
             guard case let .localFile(path) = attachment.source else { return nil }
             let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -20583,7 +20583,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return text.isEmpty ? note : text + "\n\n" + note
     }
 
-    private func renderAtPathAttachmentMessage(text: String, attachments: [AgentImageAttachment]) -> String {
+    private func renderAtPathAttachmentMessage(text: String, attachments: [AgentFileAttachment]) -> String {
         var lines: [String] = []
         for attachment in attachments {
             switch attachment.source {
@@ -21025,7 +21025,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @MainActor
     func augmentUserMessageForProviderSend(
         _ text: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         agent: AgentProviderKind? = nil,
         session: TabSession? = nil,
@@ -21295,7 +21295,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func startAgentRun(
         tabID: UUID,
         initialMessage: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
@@ -21438,7 +21438,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             TabSession.CodexFallbackSubmissionContext(
                 queueID: context.queueID,
                 providerText: initialMessageForRun,
-                images: context.images,
+                attachments: context.attachments,
                 taggedFileAttachments: context.taggedFileAttachments,
                 draftText: context.draftText,
                 optimisticUserItemID: context.optimisticUserItemID,
@@ -21470,7 +21470,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         initialMessageForRun: String,
         runID: UUID,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) -> AgentMessage {
         // Build initial message - for providers with resumable sessions, use --resume when available.
         let supportsSessionResume = session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
@@ -23415,7 +23415,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_submitWaitingClaudeAttachment(
             session: TabSession,
             text: String,
-            attachment: AgentImageAttachment
+            attachment: AgentFileAttachment
         ) -> UserTurnSubmissionResult {
             submitPreparedUserTurn(
                 tabID: session.tabID, session: session, trimmedText: text,
@@ -23799,7 +23799,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
-        session.pendingImageAttachments.removeAll()
+        session.pendingFileAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
@@ -24293,7 +24293,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let hasTranscript = !session.transcript.turns.isEmpty || !session.items.isEmpty
         let hasDraft = !session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasPendingAttachments = !session.pendingImageAttachments.isEmpty || !session.pendingTaggedFileAttachments.isEmpty
+        let hasPendingAttachments = !session.pendingFileAttachments.isEmpty || !session.pendingTaggedFileAttachments.isEmpty
         let hasPendingInteraction = session.runState == .waitingForUser
             || session.hasPendingQuestionUI
             || session.pendingApproval != nil

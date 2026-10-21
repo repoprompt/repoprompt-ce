@@ -19,7 +19,7 @@ public struct AgentMessage: Sendable, Equatable {
     public var userMessage: String
 
     /// Request-scoped, path-free images for non-agent provider adapters.
-    package var transientImages: [AITransientImage]
+    package var attachments: [OracleAttachment]
 
     /// Optional provider-specific session ID for resuming conversations
     /// Used by Claude CLI to resume with --resume <session-id> instead of replaying history
@@ -28,19 +28,19 @@ public struct AgentMessage: Sendable, Equatable {
     public init(systemPrompt: String = "", userMessage: String, resumeSessionID: String? = nil) {
         self.systemPrompt = systemPrompt
         self.userMessage = userMessage
-        transientImages = []
+        attachments = []
         self.resumeSessionID = resumeSessionID
     }
 
     package init(
         systemPrompt: String = "",
         userMessage: String,
-        transientImages: [AITransientImage],
+        attachments: [OracleAttachment],
         resumeSessionID: String? = nil
     ) {
         self.systemPrompt = systemPrompt
         self.userMessage = userMessage
-        self.transientImages = transientImages
+        self.attachments = attachments
         self.resumeSessionID = resumeSessionID
     }
 }

@@ -162,14 +162,14 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt
     func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
@@ -2216,13 +2216,13 @@ final class CodexNativeSessionController {
 
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2292,14 +2292,14 @@ final class CodexNativeSessionController {
 
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
         do {
             let result = try await performRequest(
                 method: "turn/steer",
@@ -2493,12 +2493,12 @@ final class CodexNativeSessionController {
 
     private static func turnInput(
         text: String,
-        images: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) throws -> [[String: Any]] {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var input: [[String: Any]] = []
-        for image in images {
-            switch image.source {
+        for attachment in attachments where attachment.kind == .image {
+            switch attachment.source {
             case let .localFile(path):
                 guard let path = nonEmptyString(path) else { continue }
                 input.append([
@@ -9543,14 +9543,14 @@ enum CommandExecutionOutputSanitizer {
 }
 
 enum CodexSessionControllerError: LocalizedError {
-    case imageAttachmentsUnsupported
+    case attachmentsUnsupported
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
 
     var errorDescription: String? {
         switch self {
-        case .imageAttachmentsUnsupported:
+        case .attachmentsUnsupported:
             "This Codex session controller does not support image attachments."
         case .emptyUserTurn:
             "Cannot send an empty user turn."

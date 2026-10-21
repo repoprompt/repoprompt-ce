@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 struct AgentComposerDraftRestorationOperation: Equatable {
@@ -366,7 +367,7 @@ struct AgentComposerProps: Equatable {
         currentTabID: nil,
         submitTarget: nil,
         attachments: AgentAttachmentStripSnapshot(
-            imageAttachments: [],
+            attachments: [],
             taggedFileAttachments: []
         ),
         runState: .idle,

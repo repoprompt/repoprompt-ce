@@ -134,7 +134,7 @@ final class OpenCodeCLIProvider: AIProvider {
         AgentMessage(
             systemPrompt: aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
             userMessage: buildPrompt(from: aiMessage),
-            transientImages: aiMessage.transientImages,
+            attachments: aiMessage.attachments,
             resumeSessionID: nil
         )
     }

@@ -836,7 +836,7 @@ actor ACPAgentSessionController {
             let promptRequest = effectivePromptRunRequest(override: overrideRunRequest)
             if case let .message(message) = payload,
                !promptImagesSupported,
-               !message.transientImages.isEmpty || !promptRequest.attachments.isEmpty
+               message.attachments.contains { $0.kind == .image } || promptRequest.attachments.contains { $0.kind == .image }
             {
                 refusedUnsupportedImages = true
                 throw AIProviderError.invalidConfiguration(

@@ -148,21 +148,21 @@ public struct AgentCrossSessionAttribution: Codable, Sendable, Equatable, Hashab
 enum AgentToolArgumentPersistencePolicy {
     static func sanitizedArgsJSON(toolName: String?, argsJSON: String?) -> String? {
         guard let argsJSON else { return nil }
-        guard isOracleImageTool(toolName) else { return argsJSON }
-        return OracleImageToolArguments.removingImages(fromArgsJSON: argsJSON)
+        guard isOracleSendTool(toolName) else { return argsJSON }
+        return OracleAttachmentContract.redactingArgsJSON(argsJSON)
     }
 
-    /// Whether the tool name resolves to an Oracle image send, using the canonical MCP
+    /// Whether the tool name resolves to an Oracle send, using the canonical MCP
     /// name resolver plus a fail-closed suffix check for server prefixes the resolver does
     /// not own.
-    private static func isOracleImageTool(_ toolName: String?) -> Bool {
+    private static func isOracleSendTool(_ toolName: String?) -> Bool {
         guard let toolName else { return false }
-        let imageTools = ["ask_oracle", "oracle_send"]
-        if let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName), imageTools.contains(canonical) {
+        let oracleTools = OracleAttachmentContract.oracleToolNames
+        if let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName), oracleTools.contains(canonical) {
             return true
         }
         let lowered = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return imageTools.contains { name in
+        return oracleTools.contains { name in
             lowered == name
                 || lowered.hasSuffix("__\(name)")
                 || lowered.hasSuffix(":\(name)")
@@ -180,8 +180,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Human-readable text shown in bubbles (for user/assistant/system/error kinds)
     public var text: String
 
-    /// User-provided image attachments for this turn
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
 
     /// Tagged file attachments (@ mentioned files) for this user turn
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
@@ -257,7 +256,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         timestamp: Date = Date(),
         kind: AgentChatItemKind,
         text: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         toolName: String? = nil,
         toolInvocationID: UUID? = nil,
@@ -327,7 +326,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         timestamp = try c.decode(Date.self, forKey: .timestamp)
         kind = try c.decode(AgentChatItemKind.self, forKey: .kind)
         text = try c.decode(String.self, forKey: .text)
-        attachments = try c.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
+        attachments = try c.decodeIfPresent([AgentFileAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(c.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
@@ -363,7 +362,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, userInputOrigin: AgentUserInputOrigin? = nil, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
+    public static func user(_ text: String, attachments: [AgentFileAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, userInputOrigin: AgentUserInputOrigin? = nil, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
         AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, userInputOrigin: userInputOrigin, crossSessionAttribution: crossSessionAttribution, dispatchedProviderText: dispatchedProviderText)
     }
 
@@ -589,7 +588,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public let timestamp: Date
     public var kind: AgentChatItemKind
     public var text: String
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var toolName: String? {
         didSet {
@@ -788,7 +787,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         timestamp = try container.decode(Date.self, forKey: .timestamp)
         kind = try container.decode(AgentChatItemKind.self, forKey: .kind)
         text = try container.decode(String.self, forKey: .text)
-        attachments = try container.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
+        attachments = try container.decodeIfPresent([AgentFileAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try container.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(container.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try container.decodeIfPresent(UUID.self, forKey: .toolInvocationID)

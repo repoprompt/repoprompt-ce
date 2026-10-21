@@ -18,32 +18,25 @@ class AnthropicProvider: AIProvider {
         }
     }
 
-    static func makeMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
+    static func makeMessages(for aiMessage: AIMessage) throws -> [MessageParameter.Message] {
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .anthropicMessages)
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
         var messages: [MessageParameter.Message] = []
 
         for (idx, entry) in aiMessage.conversationMessages.enumerated() {
-            let contentText: String = if let lastIdx = lastUserIndex,
-                                         entry.role == .user,
-                                         idx == lastIdx,
-                                         !tail.isEmpty
-            {
-                "\(tail)\n\n\(entry.content)"
-            } else {
-                entry.content
-            }
+            let isLastUser = entry.role == .user && idx == lastUserIndex
+            let body = isLastUser
+                ? AttachmentEncoding.prependingInlineText(of: planned, to: entry.content)
+                : entry.content
+            let contentText = isLastUser && !tail.isEmpty ? "\(tail)\n\n\(body)" : body
 
             let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
-            let content: MessageParameter.Message.Content =
-                if entry.role == .user, idx == lastUserIndex, !aiMessage.transientImages.isEmpty {
-                    .list(Self.imageContentBlocks(
-                        text: contentText,
-                        images: aiMessage.transientImages
-                    ))
-                } else {
-                    .text(contentText)
-                }
+            let content: MessageParameter.Message.Content = if isLastUser {
+                try Self.userContent(text: contentText, planned: planned)
+            } else {
+                .text(contentText)
+            }
             messages.append(
                 MessageParameter.Message(
                     role: role,
@@ -52,47 +45,58 @@ class AnthropicProvider: AIProvider {
             )
         }
 
-        // Edge-case parity with the OpenAI encoders: when no user entry exists, images (and
-        // any remaining context) still need a user turn or they would be silently dropped.
-        if lastUserIndex == nil, !aiMessage.transientImages.isEmpty {
-            messages.append(MessageParameter.Message(
+        if lastUserIndex == nil, !planned.isEmpty {
+            try messages.append(MessageParameter.Message(
                 role: .user,
-                content: .list(Self.imageContentBlocks(
-                    text: tail,
-                    images: aiMessage.transientImages
-                ))
+                content: Self.userContent(
+                    text: AttachmentEncoding.prependingInlineText(of: planned, to: tail),
+                    planned: planned
+                )
             ))
         }
 
         return messages
     }
 
-    private static func imageContentBlocks(
+    private static func userContent(
         text: String,
-        images: [AITransientImage]
-    ) -> [MessageParameter.Message.Content.ContentObject] {
+        planned: [PlannedAttachment]
+    ) throws -> MessageParameter.Message.Content {
         var blocks: [MessageParameter.Message.Content.ContentObject] = []
         // Anthropic rejects empty text blocks.
         if !text.isEmpty {
             blocks.append(.text(text))
         }
-        for image in images {
-            if let annotation = image.titleAnnotation {
-                blocks.append(.text(annotation))
+        var nativeCount = 0
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(imageType, data):
+                if let annotation = item.titleAnnotation {
+                    blocks.append(.text(annotation))
+                }
+                let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch imageType {
+                case .png: .png
+                case .jpeg: .jpeg
+                case .gif: .gif
+                case .webp: .webp
+                }
+                blocks.append(.image(.init(
+                    type: .base64,
+                    mediaType: mediaType,
+                    data: data.base64EncodedString()
+                )))
+                nativeCount += 1
+            case let .nativeDocument(data):
+                try blocks.append(.document(.pdf(
+                    base64Data: data.base64EncodedString(),
+                    title: item.attachment.normalizedTitle ?? item.attachment.fileName
+                )))
+                nativeCount += 1
+            case .inlineText:
+                break
             }
-            let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch image.mediaType {
-            case .png: .png
-            case .jpeg: .jpeg
-            case .gif: .gif
-            case .webp: .webp
-            }
-            blocks.append(.image(.init(
-                type: .base64,
-                mediaType: mediaType,
-                data: image.bytes.base64EncodedString()
-            )))
         }
-        return blocks
+        return nativeCount == 0 ? .text(text) : .list(blocks)
     }
 
     private func createSystemParameter(systemPrompt: String) -> MessageParameter.System {
@@ -164,7 +168,7 @@ class AnthropicProvider: AIProvider {
 
         // Use your existing helper functions
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = Self.makeMessages(for: aiMessage)
+        let messages = try Self.makeMessages(for: aiMessage)
 
         var temperature: Double? = 0
         // Skip temperature setting for thinking models; Claude 5.x rejects sampling parameters.
@@ -358,7 +362,7 @@ class AnthropicProvider: AIProvider {
         }
 
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = Self.makeMessages(for: aiMessage)
+        let messages = try Self.makeMessages(for: aiMessage)
 
         let parameters = MessageParameter(
             model: model,

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 
 /// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
@@ -37,11 +38,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 detail: "Grok Build one-shot requests cannot resume a previous session."
             )
         }
-        guard message.transientImages.isEmpty else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build one-shot requests do not accept image attachments. Choose an image-capable Oracle model or remove the images and retry."
-            )
-        }
+        let message = try Self.inliningAttachments(of: message)
 
         let trackedRunID = runID ?? UUID()
         return AsyncThrowingStream { continuation in
@@ -424,6 +421,17 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 userInfo: [NSLocalizedDescriptionKey: message]
             )
         )
+    }
+
+    private static func inliningAttachments(of message: AgentMessage) throws -> AgentMessage {
+        var inlined = message
+        inlined.userMessage = try AttachmentEncoding.textOnlyBody(
+            for: message.attachments,
+            route: .grokBuild,
+            body: message.userMessage
+        )
+        inlined.attachments = []
+        return inlined
     }
 
     private static func promptText(from message: AgentMessage) -> String {

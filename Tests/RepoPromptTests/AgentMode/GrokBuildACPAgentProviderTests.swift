@@ -33,7 +33,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
     private func makeRequest(
         workspacePath: String,
         resumeSessionID: String? = nil,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         autoApprove: Bool = false
     ) -> ACPRunRequest {
         ACPRunRequest(
@@ -255,7 +255,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
 
     func testUnsupportedAttachmentIsRejected() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig())
-        let attachment = AgentImageAttachment(source: .url("https://example.com/image.png"))
+        let attachment = AgentFileAttachment(source: .url("https://example.com/image.png"))
         XCTAssertThrowsError(
             try provider.buildPromptBlocks(
                 for: AgentMessage(systemPrompt: "", userMessage: "hi"),

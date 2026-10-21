@@ -144,9 +144,9 @@ class OpenAIProvider: AIProvider {
 
     // MARK: Helper – build the `input` array for the Responses API
 
-    private func createResponseInput(for aiMessage: AIMessage) -> SwiftOpenAI.InputType {
+    private func createResponseInput(for aiMessage: AIMessage) throws -> SwiftOpenAI.InputType {
         // Forward to the centralised builder defined on AIMessage
-        aiMessage.openAIResponsesInput()
+        try aiMessage.openAIResponsesInput()
     }
 
     // MARK: - Helper to decide whether to route via Responses-API
@@ -160,10 +160,10 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?,
         stream: Bool
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
 
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: createResponseInput(for: aiMessage),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -289,7 +289,7 @@ class OpenAIProvider: AIProvider {
         print("Effective model: \(effectiveModel)")
 
         let isO1PreviewOrMini = (effectiveModel == .o1Mini || effectiveModel == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: effectiveModel.toProviderModel() as! SwiftOpenAI.Model
@@ -383,7 +383,7 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
         let service = getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
@@ -449,7 +449,7 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let service = getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
@@ -476,7 +476,7 @@ class OpenAIProvider: AIProvider {
         }
 
         let isO1PreviewOrMini = (model == .o1Mini || model == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: model.toProviderModel() as! SwiftOpenAI.Model
@@ -661,9 +661,9 @@ class OpenAIProvider: AIProvider {
         _ aiMessage: AIMessage,
         model: AIModel,
         maxTokens: Int?
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: aiMessage.openAIResponsesInput(),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -791,7 +791,7 @@ extension OpenAIProvider: ResponsesJobProvider {
         model: AIModel,
         maxTokens: Int?
     ) async throws -> ResponseModel {
-        let parameters = buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
+        let parameters = try buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
         let response = try await getService().responseCreate(parameters)
 
         if response.status == .failed {

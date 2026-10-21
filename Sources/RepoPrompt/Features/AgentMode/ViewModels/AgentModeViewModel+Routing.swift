@@ -719,7 +719,7 @@ extension AgentModeViewModel {
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
             && session.transcript.turns.isEmpty
-            && session.pendingImageAttachments.isEmpty
+            && session.pendingFileAttachments.isEmpty
             && session.pendingTaggedFileAttachments.isEmpty
     }
 

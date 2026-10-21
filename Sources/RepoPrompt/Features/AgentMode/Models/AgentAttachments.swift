@@ -1,5 +1,5 @@
 import RepoPromptDomainRuntime
 
-public typealias AgentImageSource = RepoPromptDomainRuntime.AgentImageSource
-public typealias AgentImageAttachment = RepoPromptDomainRuntime.AgentImageAttachment
+public typealias AgentAttachmentSource = RepoPromptDomainRuntime.AgentAttachmentSource
+public typealias AgentFileAttachment = RepoPromptDomainRuntime.AgentFileAttachment
 public typealias AgentTaggedFileAttachment = RepoPromptDomainRuntime.AgentTaggedFileAttachment

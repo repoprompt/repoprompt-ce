@@ -86,7 +86,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var role: AgentTranscriptActivityRole
     public var itemKind: AgentChatItemKind
     public var text: String
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
@@ -119,7 +119,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         role: AgentTranscriptActivityRole,
         itemKind: AgentChatItemKind,
         text: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
@@ -225,7 +225,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         role = try c.decode(AgentTranscriptActivityRole.self, forKey: .role)
         itemKind = try c.decode(AgentChatItemKind.self, forKey: .itemKind)
         text = try c.decode(String.self, forKey: .text)
-        attachments = try c.decode([AgentImageAttachment].self, forKey: .attachments)
+        attachments = try c.decode([AgentFileAttachment].self, forKey: .attachments)
         taggedFileAttachments = try c.decode([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments)
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
@@ -297,7 +297,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var timestamp: Date
     public var sequenceIndex: Int
     public var text: String
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
@@ -354,7 +354,7 @@ extension AgentTranscriptRequestAnchor {
         timestamp = try c.decode(Date.self, forKey: .timestamp)
         sequenceIndex = try c.decode(Int.self, forKey: .sequenceIndex)
         text = try c.decode(String.self, forKey: .text)
-        attachments = try c.decode([AgentImageAttachment].self, forKey: .attachments)
+        attachments = try c.decode([AgentFileAttachment].self, forKey: .attachments)
         taggedFileAttachments = try c.decode([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments)
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)

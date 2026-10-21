@@ -34,9 +34,9 @@ extension AgentModeRunService {
     ///
     /// Authority: persistence/durable turn resources.
     struct AttachmentLifecycleHooks {
-        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentTabSession) -> UUID?
+        let reserveAttachmentsForTurn: ([AgentFileAttachment], AgentTabSession) -> UUID?
         let markAttachmentsConsumed: (AgentTabSession, UUID?) -> Void
-        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentTabSession) -> Void
+        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentFileAttachment], AgentTabSession) -> Void
         let consumeDeferredAttachmentCleanup: (AgentTabSession, Bool) -> Void
         let finalizeAttachmentsForTurn: (AgentTabSession, UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
     }
@@ -98,11 +98,11 @@ extension AgentModeRunService {
     ///
     /// Authority: provider capability inputs.
     struct ProviderInputAssemblyHooks {
-        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
+        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentFileAttachment]) -> AgentMessage
         /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
         let augmentUserMessageForProviderSend: (
             _ text: String,
-            _ attachments: [AgentImageAttachment],
+            _ attachments: [AgentFileAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
             _ session: AgentTabSession?
         ) async -> String

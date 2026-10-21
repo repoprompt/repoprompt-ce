@@ -1020,7 +1020,7 @@ final class ClaudeAgentModeCoordinator {
     func sendClaudeNativeMessage(
         session: AgentTabSession,
         text: String,
-        attachments _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         intent: NativeSessionIntent,
         allowsCatalogRouteControllerRecovery: Bool,
         autoEffortSelection: AutoEffortTurnSelection? = nil,

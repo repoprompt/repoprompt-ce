@@ -12,7 +12,8 @@ extension AIMessage {
     ///
     /// Replaces the old `createMessages` helper (which has been removed from
     /// providers).
-    func openAIChatMessages(embedSystemPrompt: Bool) -> [ChatCompletionParameters.Message] {
+    func openAIChatMessages(embedSystemPrompt: Bool) throws -> [ChatCompletionParameters.Message] {
+        let planned = try AttachmentEncoding.plan(attachments, route: .openAIChat)
         let tail = buildTail(embedSystemPrompt: embedSystemPrompt)
 
         var msgs: [ChatCompletionParameters.Message] = []
@@ -24,23 +25,21 @@ extension AIMessage {
         let lastUserIndex = conversationMessages.lastIndex { $0.role == .user }
 
         for (idx, entry) in conversationMessages.enumerated() {
-            let baseText = entry.content
-            let text = (entry.role == .user && idx == lastUserIndex && !tail.isEmpty)
-                ? tail + "\n" + baseText
-                : baseText
-
             let role: ChatCompletionParameters.Message.Role = (entry.role == .user)
                 ? .user
                 : .assistant
-            if entry.role == .user, idx == lastUserIndex, !transientImages.isEmpty {
-                msgs.append(.init(role: role, content: openAIChatContent(text: text)))
-            } else {
-                msgs.append(.init(role: role, content: .text(text)))
+            guard entry.role == .user, idx == lastUserIndex else {
+                msgs.append(.init(role: role, content: .text(entry.content)))
+                continue
             }
+            let body = AttachmentEncoding.prependingInlineText(of: planned, to: entry.content)
+            let text = tail.isEmpty ? body : tail + "\n" + body
+            try msgs.append(.init(role: role, content: openAIChatContent(text: text, planned: planned)))
         }
 
-        if lastUserIndex == nil, !transientImages.isEmpty {
-            msgs.append(.init(role: .user, content: openAIChatContent(text: tail)))
+        if lastUserIndex == nil, !planned.isEmpty {
+            let text = AttachmentEncoding.prependingInlineText(of: planned, to: tail)
+            try msgs.append(.init(role: .user, content: openAIChatContent(text: text, planned: planned)))
         }
 
         return msgs
@@ -53,7 +52,8 @@ extension AIMessage {
     /// All assistant turns are encoded as normal `message` objects
     /// (role = "assistant").  This avoids the need for the `msg_…` ids that
     /// `output_message` objects require.
-    func openAIResponsesInput() -> SwiftOpenAI.InputType {
+    func openAIResponsesInput() throws -> SwiftOpenAI.InputType {
+        let planned = try AttachmentEncoding.plan(attachments, route: .openAIResponses)
         // 1. Build the XML / meta tail that must be prepended to the *first*
         //    user message.
         let tail = buildTail(embedSystemPrompt: false)
@@ -67,14 +67,16 @@ extension AIMessage {
         for (index, entry) in conversationMessages.enumerated() {
             switch entry.role {
             case .user:
-                var text = entry.content
+                var text = index == lastUserIndex
+                    ? AttachmentEncoding.prependingInlineText(of: planned, to: entry.content)
+                    : entry.content
                 if firstUser {
                     text = additions + text // prepend only once
                     firstUser = false
                 }
 
-                let content = if index == lastUserIndex, !transientImages.isEmpty {
-                    openAIResponsesContent(text: text)
+                let content = if index == lastUserIndex {
+                    try openAIResponsesContent(text: text, planned: planned)
                 } else {
                     SwiftOpenAI.MessageContent.text(text)
                 }
@@ -97,45 +99,82 @@ extension AIMessage {
         // 3. Edge-case: no user message yet. Preserve the text-only behavior of
         // adding context only when there are no existing conversation items.
         if lastUserIndex == nil,
-           !transientImages.isEmpty || items.isEmpty && !additions.isEmpty
+           !planned.isEmpty || items.isEmpty && !additions.isEmpty
         {
-            let content = transientImages.isEmpty
-                ? SwiftOpenAI.MessageContent.text(additions)
-                : openAIResponsesContent(text: additions)
-            let msg = SwiftOpenAI.InputMessage(role: "user", content: content)
+            let text = AttachmentEncoding.prependingInlineText(of: planned, to: additions)
+            let msg = try SwiftOpenAI.InputMessage(
+                role: "user",
+                content: openAIResponsesContent(text: text, planned: planned)
+            )
             items.append(.message(msg))
         }
 
         return .array(items)
     }
 
-    private func openAIChatContent(text: String) -> ChatCompletionParameters.Message.ContentType {
+    private func openAIChatContent(
+        text: String,
+        planned: [PlannedAttachment]
+    ) throws -> ChatCompletionParameters.Message.ContentType {
         var parts: [ChatCompletionParameters.Message.ContentType.MessageContent] = []
         if !text.isEmpty {
             parts.append(.text(text))
         }
-        for image in transientImages {
-            if let annotation = image.titleAnnotation {
-                parts.append(.text(annotation))
+        var nativeCount = 0
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(mediaType, data):
+                guard let imageURL = URL(string: AttachmentEncoding.dataURL(mimeType: mediaType.rawValue, data: data)) else {
+                    throw AttachmentEncodingInvariant.unencodable(fileName: item.attachment.fileName, route: .openAIChat)
+                }
+                if let annotation = item.titleAnnotation {
+                    parts.append(.text(annotation))
+                }
+                parts.append(.imageUrl(.init(url: imageURL, detail: nil)))
+                nativeCount += 1
+            case .inlineText:
+                break
+            case .nativeDocument:
+                throw item.undeclaredRung(on: .openAIChat)
             }
-            guard let imageURL = URL(string: image.openAIDataURL) else { continue }
-            parts.append(.imageUrl(.init(url: imageURL, detail: nil)))
         }
-        return .contentArray(parts)
+        return nativeCount == 0 ? .text(text) : .contentArray(parts)
     }
 
-    private func openAIResponsesContent(text: String) -> SwiftOpenAI.MessageContent {
+    private func openAIResponsesContent(
+        text: String,
+        planned: [PlannedAttachment]
+    ) throws -> SwiftOpenAI.MessageContent {
         var parts: [SwiftOpenAI.ContentItem] = []
         if !text.isEmpty {
             parts.append(.text(SwiftOpenAI.TextContent(text: text)))
         }
-        for image in transientImages {
-            if let annotation = image.titleAnnotation {
-                parts.append(.text(SwiftOpenAI.TextContent(text: annotation)))
+        var nativeCount = 0
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(mediaType, data):
+                if let annotation = item.titleAnnotation {
+                    parts.append(.text(SwiftOpenAI.TextContent(text: annotation)))
+                }
+                parts.append(.image(SwiftOpenAI.ImageContent(
+                    detail: "auto",
+                    imageUrl: AttachmentEncoding.dataURL(mimeType: mediaType.rawValue, data: data)
+                )))
+                nativeCount += 1
+            case let .nativeDocument(data):
+                if let annotation = item.titleAnnotation {
+                    parts.append(.text(SwiftOpenAI.TextContent(text: annotation)))
+                }
+                parts.append(.file(SwiftOpenAI.FileContent(
+                    fileData: AttachmentEncoding.dataURL(mimeType: "application/pdf", data: data),
+                    filename: item.attachment.fileName
+                )))
+                nativeCount += 1
+            case .inlineText:
+                break
             }
-            parts.append(.image(SwiftOpenAI.ImageContent(detail: "auto", imageUrl: image.openAIDataURL)))
         }
-        return .array(parts)
+        return nativeCount == 0 ? .text(text) : .array(parts)
     }
 
     // MARK: - Temperature helpers

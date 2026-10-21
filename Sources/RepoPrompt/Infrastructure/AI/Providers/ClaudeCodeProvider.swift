@@ -155,13 +155,14 @@ final class ClaudeCodeProvider: AIProvider {
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
         }
-        let usesStreamJSONOutput = !aiMessage.transientImages.isEmpty
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .claudeCodeStreamJSON)
+        let usesStreamJSONOutput = planned.contains { $0.inlineTextBlock == nil }
         let stdin: String
-        if aiMessage.transientImages.isEmpty {
-            stdin = prompt
-        } else {
+        if usesStreamJSONOutput {
             Self.applyStreamJSONImageTransport(to: &options)
-            stdin = try Self.makeStreamJSONInput(prompt: prompt, images: aiMessage.transientImages)
+            stdin = try Self.makeStreamJSONInput(prompt: prompt, attachments: aiMessage.attachments)
+        } else {
+            stdin = AttachmentEncoding.prependingInlineText(of: planned, to: prompt)
         }
         let outputFormat: CLIOutputFormat = usesStreamJSONOutput ? .streamJson : .json
         let args = options.toTokens()
@@ -250,11 +251,15 @@ final class ClaudeCodeProvider: AIProvider {
         options.verbose = true
     }
 
-    static func makeStreamJSONInput(prompt: String, images: [AITransientImage]) throws -> String {
+    static func makeStreamJSONInput(prompt: String, attachments: [OracleAttachment]) throws -> String {
         do {
-            return try ClaudeStreamJSONImageTransport.input(prompt: prompt, images: images)
+            return try ClaudeStreamJSONTransport.input(prompt: prompt, attachments: attachments)
+        } catch let error as AttachmentAdmissionError {
+            throw error
+        } catch let error as AttachmentEncodingInvariant {
+            throw error
         } catch {
-            throw AIProviderError.invalidConfiguration(detail: "Unable to encode Claude image input.")
+            throw AIProviderError.invalidConfiguration(detail: "Unable to encode Claude attachment input.")
         }
     }
 
@@ -414,11 +419,11 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     private func parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
-        guard let terminal = ClaudeStreamJSONImageTransport.terminalEvent(in: data) else {
+        guard let terminal = ClaudeStreamJSONTransport.terminalEvent(in: data) else {
             throw AIProviderError.invalidResponse(detail: "Claude CLI returned stream JSON without completion payload")
         }
-        if terminal.type == "error" || ClaudeStreamJSONImageTransport.indicatesError(terminal.payload) {
-            let detail = ClaudeStreamJSONImageTransport.errorMessage(from: terminal.payload) ?? "Claude CLI returned an error"
+        if terminal.type == "error" || ClaudeStreamJSONTransport.indicatesError(terminal.payload) {
+            let detail = ClaudeStreamJSONTransport.errorMessage(from: terminal.payload) ?? "Claude CLI returned an error"
             throw AIProviderError.invalidResponse(detail: detail)
         }
         return parseCompletionDictionary(terminal.payload)
@@ -622,7 +627,7 @@ final class ClaudeCodeProvider: AIProvider {
     private func extractCLIErrorDetail(fromStdout data: Data, isStreamJSON: Bool = false) -> String? {
         guard !data.isEmpty else { return nil }
         if isStreamJSON {
-            return ClaudeStreamJSONImageTransport.errorDetail(in: data)
+            return ClaudeStreamJSONTransport.errorDetail(in: data)
         }
 
         // First pass: look for structured JSON errors

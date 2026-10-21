@@ -148,7 +148,7 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
         let row = AgentChatItem.user(
             "see these",
             attachments: [
-                AgentImageAttachment(source: .localFile(path: "\(home)/private/diagram.png"), title: "Secret diagram")
+                AgentFileAttachment(source: .localFile(path: "\(home)/private/diagram.png"), title: "Secret diagram")
             ],
             taggedFileAttachments: [
                 AgentTaggedFileAttachment(relativePath: "src/keys.swift", displayName: "keys.swift"),

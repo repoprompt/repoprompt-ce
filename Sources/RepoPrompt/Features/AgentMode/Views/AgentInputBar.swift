@@ -21,8 +21,9 @@ struct AgentComposerActions {
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let cancelRouting: (_ tabID: UUID) async -> Void
-    let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
-    let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
+    let attachFiles: (_ tabID: UUID, _ urls: [URL]) async -> Void
+    let reportAttachmentFailures: (_ tabID: UUID, _ failures: [AgentAttachmentFailure]) -> Void
+    let removePendingAttachment: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
     let removeTaggedFile: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let agentWorkspaceLookupContext: (_ tabID: UUID?) async -> WorkspaceLookupContext
@@ -129,8 +130,9 @@ struct AgentInputBar: View {
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
-            attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
-            removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
+            attachFiles: { tabID, urls in await agentModeVM.attachFiles(tabID: tabID, urls: urls).value },
+            reportAttachmentFailures: { tabID, failures in agentModeVM.reportAttachmentFailures(tabID: tabID, failures) },
+            removePendingAttachment: { tabID, attachmentID in agentModeVM.removePendingFileAttachment(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
                 agentModeVM.commitPendingTaggedFile(
                     tabID: tabID,
@@ -288,7 +290,7 @@ struct AgentComposerView: View, Equatable {
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
     @State private var isSyncingDraftFromSession: Bool = false
-    @State private var isImageDropTargeted: Bool = false
+    @State private var isAttachmentDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
@@ -303,7 +305,7 @@ struct AgentComposerView: View, Equatable {
         fontScale.preset
     }
 
-    private let imageInputAdapter = AgentImageInputAdapter()
+    private let attachmentIntake = AgentAttachmentIntake()
     private static let staleSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
 
     static func hasEquivalentRenderIdentity(
@@ -330,8 +332,8 @@ struct AgentComposerView: View, Equatable {
         )
     }
 
-    private var hasPendingImageAttachments: Bool {
-        props.attachments.hasImages
+    private var hasPendingFileAttachments: Bool {
+        props.attachments.hasAttachments
     }
 
     private var hasPendingTaggedFileAttachments: Bool {
@@ -339,7 +341,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var hasPendingAttachments: Bool {
-        hasPendingImageAttachments || hasPendingTaggedFileAttachments
+        hasPendingFileAttachments || hasPendingTaggedFileAttachments
     }
 
     private var isCodexRunActive: Bool {
@@ -350,7 +352,9 @@ struct AgentComposerView: View, Equatable {
         props.canUseLinkedAgentSession
     }
 
-    private var canAttachImages: Bool {
+    private static let attachmentDropTypes: [UTType] = [.fileURL, .image]
+
+    private var canAttachFiles: Bool {
         // Grok Build advertises no ACP image capability; its provider rejects attachments.
         !props.isAgentBusy && currentTabID != nil && props.selectedAgent != .grokBuild
     }
@@ -418,7 +422,7 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContentHeight: CGFloat {
         editorTextFieldHeight + AgentAttachmentStripLayout.reservedHeight(
-            hasImages: hasPendingImageAttachments,
+            hasAttachments: hasPendingFileAttachments,
             hasTaggedFiles: hasPendingTaggedFileAttachments
         ) + steeringUnsupportedInfoBoxReservedHeight
     }
@@ -577,8 +581,8 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(event.message)
             }
         }
-        .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
-        .overlay(imageDropOutline)
+        .onDrop(of: Self.attachmentDropTypes, isTargeted: $isAttachmentDropTargeted, perform: handleAttachmentDrop(providers:))
+        .overlay(attachmentDropOutline)
     }
 
     // MARK: - Transient Submit Guidance
@@ -622,7 +626,7 @@ struct AgentComposerView: View, Equatable {
                 AgentAttachmentsStrip(
                     snapshot: props.attachments,
                     allowsRemoval: true,
-                    onRemoveImage: removeImageAttachment,
+                    onRemoveAttachment: removeAttachment,
                     onRemoveTaggedFile: removeTaggedFileAttachment
                 )
                 .equatable()
@@ -633,7 +637,7 @@ struct AgentComposerView: View, Equatable {
                 placeholder: placeholderText,
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
-                onImagePaste: handleImagePaste(pasteboard:),
+                onAttachmentPaste: handleAttachmentPaste(pasteboard:),
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -713,15 +717,15 @@ struct AgentComposerView: View, Equatable {
 
             // Right side: Attach + Send/Cancel button
             HStack(spacing: 8) {
-                Button(action: pickImages) {
-                    Image(systemName: "photo.badge.plus")
-                        .foregroundColor(canAttachImages ? .secondary : .gray)
+                Button(action: pickFiles) {
+                    Image(systemName: "paperclip")
+                        .foregroundColor(canAttachFiles ? .secondary : .gray)
                         .font(.system(size: 16))
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
-                .disabled(!canAttachImages)
-                .hoverTooltip("Attach Images")
+                .disabled(!canAttachFiles)
+                .hoverTooltip("Attach Files")
                 .transaction { transaction in
                     transaction.animation = nil
                 }
@@ -1637,8 +1641,8 @@ struct AgentComposerView: View, Equatable {
     }
 
     @ViewBuilder
-    private var imageDropOutline: some View {
-        if isImageDropTargeted {
+    private var attachmentDropOutline: some View {
+        if isAttachmentDropTargeted {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
                 .foregroundColor(.accentColor)
@@ -1764,16 +1768,16 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func pickImages() {
-        guard canAttachImages, let tabID = currentTabID else { return }
+    private func pickFiles() {
+        guard canAttachFiles, let tabID = currentTabID else { return }
         Task { @MainActor in
             let targetWindow = WindowStatesManager.shared.allWindows.first { $0.windowID == windowID }?.nsWindow
-            let urls = await OpenPanelService.shared.pickImageFiles(
-                title: "Choose Images",
-                message: "Attach one or more images for the next turn.",
+            let urls = await OpenPanelService.shared.pickFiles(
+                title: "Choose Files",
+                message: "Attach one or more files for the next turn.",
                 attachedTo: targetWindow
             )
-            actions.attachImages(tabID, urls)
+            await actions.attachFiles(tabID, urls)
         }
     }
 
@@ -1783,9 +1787,9 @@ struct AgentComposerView: View, Equatable {
         actions.commitTaggedFile(tabID, suggestion, attachmentDisplayName)
     }
 
-    private func removeImageAttachment(_ attachmentID: UUID) {
+    private func removeAttachment(_ attachmentID: UUID) {
         guard let tabID = currentTabID else { return }
-        actions.removeImage(tabID, attachmentID)
+        actions.removePendingAttachment(tabID, attachmentID)
     }
 
     private func removeTaggedFileAttachment(_ attachmentID: UUID) {
@@ -1805,37 +1809,43 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func handleImageDrop(providers: [NSItemProvider]) -> Bool {
+    private func handleAttachmentDrop(providers: [NSItemProvider]) -> Bool {
         guard let tabID = currentTabID else {
             return false
         }
-        return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
-            guard !prepared.isEmpty else { return }
+        return attachmentIntake.loadPreparedAttachments(from: providers) { prepared, failures in
+            guard !prepared.isEmpty || !failures.isEmpty else { return }
             Task { @MainActor in
-                attachPreparedImages(prepared, tabID: tabID)
+                actions.reportAttachmentFailures(tabID, failures)
+                if !prepared.isEmpty {
+                    attachPreparedAttachments(prepared, tabID: tabID)
+                }
             }
         }
     }
 
-    private func handleImagePaste(pasteboard: NSPasteboard) -> Bool {
+    private func handleAttachmentPaste(pasteboard: NSPasteboard) -> Bool {
         guard let tabID = currentTabID else {
             return false
         }
-        guard imageInputAdapter.shouldConsumePasteAsImageAttachment(from: pasteboard) else {
+        guard attachmentIntake.shouldConsumePasteAsAttachment(from: pasteboard) else {
             return false
         }
-        let prepared = imageInputAdapter.preparedImages(from: pasteboard)
+        let prepared = attachmentIntake.preparedAttachments(from: pasteboard)
         guard !prepared.isEmpty else {
             return false
         }
-        attachPreparedImages(prepared, tabID: tabID)
+        attachPreparedAttachments(prepared, tabID: tabID)
         return true
     }
 
-    private func attachPreparedImages(_ prepared: [AgentImageInputAdapter.PreparedImage], tabID: UUID) {
+    private func attachPreparedAttachments(_ prepared: [AgentAttachmentIntake.Prepared], tabID: UUID) {
         let urls = prepared.map(\.url)
-        actions.attachImages(tabID, urls)
-        imageInputAdapter.cleanupTemporaryFiles(prepared)
+        let intake = attachmentIntake
+        Task { @MainActor in
+            await actions.attachFiles(tabID, urls)
+            intake.cleanupTemporaryFiles(prepared)
+        }
     }
 
     private func normalizedServerToggleKey(_ value: String) -> String {
@@ -1874,8 +1884,8 @@ struct AgentComposerView: View, Equatable {
     }
 }
 
-struct AgentImageInputAdapter {
-    struct PreparedImage: Equatable {
+struct AgentAttachmentIntake {
+    struct Prepared: Equatable {
         let url: URL
         let isTemporary: Bool
     }
@@ -1884,28 +1894,19 @@ struct AgentImageInputAdapter {
     private let temporaryRoot: URL
     private let preferredImageTypes: [UTType] = [.png, .jpeg, .heic, .heif, .gif, .bmp, .tiff]
 
-    private static let maxPlainTextCandidateCharacters = 50000
-    private static let maxPlainTextLineCount = 500
-    private static let markdownLinkTargetRegex = try! NSRegularExpression(pattern: #"\(([^)\r\n]+)\)"#)
-    private static let quotedPathRegex = try! NSRegularExpression(pattern: #"\"([^\"]+)\"|'([^']+)'|`([^`]+)`"#)
-    private static let fileURLTokenRegex = try! NSRegularExpression(pattern: #"file://[^\s<>()\[\]{}\"'`]+"#)
-    private static let absolutePathTokenRegex = try! NSRegularExpression(pattern: #"(?:^|[\s:=,])((?:~|/)[^\s<>()\[\]{}\"'`]+)"#)
-    private static let pathHintTokens = ["file://", "/", "~", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg"]
-    private static let fallbackImageFileExtensions: Set<String> = [
-        "png", "jpg", "jpeg", "jfif", "jpe", "gif", "bmp", "webp", "avif", "heic", "heif", "tif", "tiff", "svg", "ico"
-    ]
-
     init(fileManager: FileManager = .default, temporaryRoot: URL? = nil) {
         self.fileManager = fileManager
         self.temporaryRoot = temporaryRoot
             ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
-            .appendingPathComponent("AgentImageInput", isDirectory: true)
+            .appendingPathComponent("AgentAttachmentInput", isDirectory: true)
     }
 
-    func preparedImages(from pasteboard: NSPasteboard) -> [PreparedImage] {
-        let fileURLPrepared = preparedFileURLImages(from: pasteboard, includePlainTextReferences: true)
-        if !fileURLPrepared.isEmpty {
-            return fileURLPrepared
+    /// Files copied from Finder or any file URL on the pasteboard come first; raw image data, such as a
+    /// screenshot, is the fallback. Plain text is never read as a reference to a file.
+    func preparedAttachments(from pasteboard: NSPasteboard) -> [Prepared] {
+        let files = preparedFileURLs(from: pasteboard)
+        if !files.isEmpty {
+            return files
         }
 
         var prepared = preparedImageDataRepresentations(from: pasteboard)
@@ -1916,28 +1917,19 @@ struct AgentImageInputAdapter {
         return deduplicated(prepared)
     }
 
-    func shouldConsumePasteAsImageAttachment(from pasteboard: NSPasteboard) -> Bool {
+    func shouldConsumePasteAsAttachment(from pasteboard: NSPasteboard) -> Bool {
+        if !AttachmentPasteboard.regularFileURLs(in: pasteboard).isEmpty {
+            return true
+        }
         if hasExplicitImagePasteboardType(in: pasteboard) {
             return true
         }
-        if shouldConsumeNSImageReadablePasteboard(pasteboard) {
-            return true
-        }
-        if !preparedFileURLImages(from: pasteboard, includePlainTextReferences: false).isEmpty {
-            return true
-        }
-        guard let plainString = pasteboard.string(forType: .string) else {
-            return false
-        }
-        guard !fileURLs(fromPlainText: plainString).isEmpty else {
-            return false
-        }
-        return shouldConsumePlainTextPaste(plainString)
+        return shouldConsumeNSImageReadablePasteboard(pasteboard)
     }
 
-    func loadPreparedImages(
+    func loadPreparedAttachments(
         from providers: [NSItemProvider],
-        completion: @escaping ([PreparedImage]) -> Void
+        completion: @escaping (_ prepared: [Prepared], _ failures: [AgentAttachmentFailure]) -> Void
     ) -> Bool {
         let candidates = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
@@ -1947,38 +1939,60 @@ struct AgentImageInputAdapter {
             return false
         }
 
-        let lockQueue = DispatchQueue(label: "AgentImageInputAdapter.lock")
+        let lockQueue = DispatchQueue(label: "AgentAttachmentIntake.lock")
         let group = DispatchGroup()
-        var prepared: [PreparedImage] = []
+        var prepared: [Prepared] = []
+        var failures: [AgentAttachmentFailure] = []
+
+        func fail(_ fileName: String, _ reason: String) {
+            lockQueue.sync {
+                failures.append(AgentAttachmentFailure(fileName: fileName, reason: reason))
+            }
+        }
+
+        func appendImageData(from provider: NSItemProvider, typeIdentifier: String) {
+            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                defer { group.leave() }
+                guard let data, !data.isEmpty,
+                      let fileURL = try? writeTemporaryImageData(data, typeIdentifier: typeIdentifier)
+                else {
+                    fail(provider.suggestedName ?? "image", "The dropped image could not be read.")
+                    return
+                }
+                lockQueue.sync {
+                    prepared.append(Prepared(url: fileURL, isTemporary: true))
+                }
+            }
+        }
 
         for provider in candidates {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    if let fileURL = droppedFileURL(from: item), isImageFileURL(fileURL) {
+                    let fileURL = droppedFileURL(from: item)
+                    if let fileURL, AttachmentPasteboard.isRegularFile(fileURL) {
                         lockQueue.sync {
-                            prepared.append(PreparedImage(url: fileURL.standardizedFileURL, isTemporary: false))
+                            prepared.append(Prepared(url: fileURL.standardizedFileURL, isTemporary: false))
                         }
                         group.leave()
                         return
                     }
 
                     guard let imageTypeIdentifier = bestImageTypeIdentifier(from: provider.registeredTypeIdentifiers) else {
+                        if let fileURL {
+                            fail(
+                                fileURL.lastPathComponent,
+                                AttachmentPasteboard.isDirectory(fileURL)
+                                    ? AgentAttachmentStore.Error.sourceIsNotFile.localizedDescription
+                                    : "The item is not a regular file."
+                            )
+                        } else {
+                            fail(provider.suggestedName ?? "dropped item", "The dropped item could not be read.")
+                        }
                         group.leave()
                         return
                     }
-                    provider.loadDataRepresentation(forTypeIdentifier: imageTypeIdentifier) { data, _ in
-                        defer { group.leave() }
-                        guard let data, !data.isEmpty else { return }
-                        do {
-                            let fileURL = try writeTemporaryImageData(data, typeIdentifier: imageTypeIdentifier)
-                            lockQueue.sync {
-                                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-                            }
-                        } catch {
-                            return
-                        }
-                    }
+                    appendImageData(from: provider, typeIdentifier: imageTypeIdentifier)
                 }
                 continue
             }
@@ -1987,32 +2001,22 @@ struct AgentImageInputAdapter {
                 continue
             }
             group.enter()
-            provider.loadDataRepresentation(forTypeIdentifier: imageTypeIdentifier) { data, _ in
-                defer { group.leave() }
-                guard let data, !data.isEmpty else { return }
-                do {
-                    let fileURL = try writeTemporaryImageData(data, typeIdentifier: imageTypeIdentifier)
-                    lockQueue.sync {
-                        prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-                    }
-                } catch {
-                    return
-                }
-            }
+            appendImageData(from: provider, typeIdentifier: imageTypeIdentifier)
         }
 
         group.notify(queue: .main) {
             lockQueue.sync {
                 let deduplicatedPrepared = deduplicated(prepared)
+                let reportedFailures = failures
                 DispatchQueue.main.async {
-                    completion(deduplicatedPrepared)
+                    completion(deduplicatedPrepared, reportedFailures)
                 }
             }
         }
         return true
     }
 
-    func cleanupTemporaryFiles(_ prepared: [PreparedImage]) {
+    func cleanupTemporaryFiles(_ prepared: [Prepared]) {
         let temporaryPrefix = temporaryRoot.path + "/"
         for entry in prepared where entry.isTemporary {
             let standardized = entry.url.standardizedFileURL
@@ -2080,54 +2084,46 @@ struct AgentImageInputAdapter {
         canonicalImageType(forIdentifier: type.rawValue)
     }
 
-    private func preparedImageDataRepresentations(from pasteboard: NSPasteboard) -> [PreparedImage] {
-        var prepared: [PreparedImage] = []
+    private func preparedImageDataRepresentations(from pasteboard: NSPasteboard) -> [Prepared] {
+        var prepared: [Prepared] = []
 
         for item in pasteboard.pasteboardItems ?? [] {
-            guard let representation = firstImageDataRepresentation(in: item) else { continue }
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                continue
-            }
+            guard let representation = firstImageDataRepresentation(in: item),
+                  let fileURL = try? writeTemporaryImageData(
+                      representation.data,
+                      typeIdentifier: representation.typeIdentifier
+                  )
+            else { continue }
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
 
-        if prepared.isEmpty, let representation = firstImageDataRepresentation(in: pasteboard) {
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                // Ignore fallback conversion errors.
-            }
+        if prepared.isEmpty,
+           let representation = firstImageDataRepresentation(in: pasteboard),
+           let fileURL = try? writeTemporaryImageData(
+               representation.data,
+               typeIdentifier: representation.typeIdentifier
+           )
+        {
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
 
         return prepared
     }
 
-    private func preparedNSImageObjects(from pasteboard: NSPasteboard) -> [PreparedImage] {
+    private func preparedNSImageObjects(from pasteboard: NSPasteboard) -> [Prepared] {
         guard let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage] else {
             return []
         }
 
-        var prepared: [PreparedImage] = []
+        var prepared: [Prepared] = []
         for image in images {
-            guard let representation = imageDataRepresentation(from: image) else { continue }
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                continue
-            }
+            guard let representation = imageDataRepresentation(from: image),
+                  let fileURL = try? writeTemporaryImageData(
+                      representation.data,
+                      typeIdentifier: representation.typeIdentifier
+                  )
+            else { continue }
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
         return prepared
     }
@@ -2168,83 +2164,18 @@ struct AgentImageInputAdapter {
         return (tiffData, UTType.tiff.identifier)
     }
 
-    private func preparedFileURLImages(
-        from pasteboard: NSPasteboard,
-        includePlainTextReferences: Bool
-    ) -> [PreparedImage] {
-        var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
-
-        for item in pasteboard.pasteboardItems ?? [] {
-            if let fileURLString = item.string(forType: .fileURL),
-               let fileURL = URL(string: fileURLString),
-               fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            } else if let fileURLData = item.data(forType: .fileURL),
-                      let fileURL = URL(dataRepresentation: fileURLData, relativeTo: nil),
-                      fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            }
-
-            if includePlainTextReferences, let plainString = item.string(forType: .string) {
-                urls.append(contentsOf: fileURLs(fromPlainText: plainString))
-            }
-        }
-
-        if includePlainTextReferences, let plainString = pasteboard.string(forType: .string) {
-            urls.append(contentsOf: fileURLs(fromPlainText: plainString))
-        }
-
-        let prepared = urls
-            .map(\.standardizedFileURL)
-            .filter { $0.isFileURL && fileManager.fileExists(atPath: $0.path) && isImageFileURL($0) }
-            .map { PreparedImage(url: $0, isTemporary: false) }
-        return deduplicated(prepared)
-    }
-
-    private func fileURLs(fromPlainText text: String) -> [URL] {
-        let cappedText = text.count > Self.maxPlainTextCandidateCharacters
-            ? String(text.prefix(Self.maxPlainTextCandidateCharacters))
-            : text
-        var results: [URL] = []
-        var seenPaths: Set<String> = []
-        var processedLineCount = 0
-        cappedText.enumerateLines { line, stop in
-            if processedLineCount >= Self.maxPlainTextLineCount {
-                stop = true
-                return
-            }
-            processedLineCount += 1
-            guard lineLikelyContainsPathReference(line) else { return }
-            for candidate in fileReferenceCandidates(in: line) {
-                guard let fileURL = fileURLFromPlainText(candidate) else { continue }
-                let standardizedURL = fileURL.standardizedFileURL
-                let key = standardizedURL.path
-                guard !key.isEmpty else { continue }
-                guard !seenPaths.contains(key) else { continue }
-                seenPaths.insert(key)
-                results.append(standardizedURL)
-            }
-        }
-        return results
+    private func preparedFileURLs(from pasteboard: NSPasteboard) -> [Prepared] {
+        deduplicated(
+            AttachmentPasteboard.regularFileURLs(in: pasteboard).map { Prepared(url: $0, isTemporary: false) }
+        )
     }
 
     private func shouldConsumeNSImageReadablePasteboard(_ pasteboard: NSPasteboard) -> Bool {
         guard pasteboard.canReadObject(forClasses: [NSImage.self], options: nil) else {
             return false
         }
-        guard let plainString = pasteboard.string(forType: .string) else {
-            return true
-        }
-        let trimmed = plainString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return true
-        }
-        guard !fileURLs(fromPlainText: plainString).isEmpty else {
-            return false
-        }
-        return shouldConsumePlainTextPaste(plainString)
+        let plainString = pasteboard.string(forType: .string) ?? ""
+        return plainString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func hasExplicitImagePasteboardType(in pasteboard: NSPasteboard) -> Bool {
@@ -2259,302 +2190,6 @@ struct AgentImageInputAdapter {
             }
         }
         return false
-    }
-
-    private func shouldConsumePlainTextPaste(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-
-        let cappedText = trimmed.count > Self.maxPlainTextCandidateCharacters
-            ? String(trimmed.prefix(Self.maxPlainTextCandidateCharacters))
-            : trimmed
-        let lines = cappedText
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !lines.isEmpty else { return false }
-        guard lines.count <= Self.maxPlainTextLineCount else { return false }
-        return lines.allSatisfy { lineLooksLikeStandaloneImageReference($0) }
-    }
-
-    private func lineLooksLikeStandaloneImageReference(_ line: String) -> Bool {
-        if fileURLFromPlainText(line) != nil {
-            return true
-        }
-        if let markdownTarget = firstMarkdownImageTarget(in: line),
-           fileURLFromPlainText(markdownTarget) != nil
-        {
-            return true
-        }
-        return false
-    }
-
-    private func firstMarkdownImageTarget(in line: String) -> String? {
-        markdownImageTargets(in: line, requireStandaloneLine: true).first
-    }
-
-    private func markdownImageTargets(in line: String, requireStandaloneLine: Bool = false) -> [String] {
-        let characters = Array(line)
-        guard !characters.isEmpty else { return [] }
-
-        var targets: [String] = []
-        var index = 0
-        while index < characters.count {
-            guard characters[index] == "!", index + 1 < characters.count, characters[index + 1] == "[" else {
-                index += 1
-                continue
-            }
-
-            let imageStart = index
-            guard let altEnd = findClosingBracket(in: characters, startingAt: index + 1) else {
-                index += 2
-                continue
-            }
-            guard altEnd + 1 < characters.count, characters[altEnd + 1] == "(" else {
-                index = altEnd + 1
-                continue
-            }
-
-            guard let parsed = parseMarkdownLinkTarget(in: characters, openingParenIndex: altEnd + 1) else {
-                index = altEnd + 2
-                continue
-            }
-
-            if requireStandaloneLine {
-                let prefix = String(characters[..<imageStart]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let suffix = String(characters[(parsed.closingParenIndex + 1)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !prefix.isEmpty || !suffix.isEmpty {
-                    index = parsed.closingParenIndex + 1
-                    continue
-                }
-            }
-
-            targets.append(parsed.target)
-            index = parsed.closingParenIndex + 1
-        }
-
-        return targets
-    }
-
-    private func findClosingBracket(in characters: [Character], startingAt openingBracketIndex: Int) -> Int? {
-        guard openingBracketIndex < characters.count, characters[openingBracketIndex] == "[" else {
-            return nil
-        }
-        var index = openingBracketIndex + 1
-        var isEscaping = false
-        while index < characters.count {
-            let character = characters[index]
-            if isEscaping {
-                isEscaping = false
-                index += 1
-                continue
-            }
-            if character == "\\" {
-                isEscaping = true
-                index += 1
-                continue
-            }
-            if character == "]" {
-                return index
-            }
-            index += 1
-        }
-        return nil
-    }
-
-    private func parseMarkdownLinkTarget(
-        in characters: [Character],
-        openingParenIndex: Int
-    ) -> (target: String, closingParenIndex: Int)? {
-        guard openingParenIndex < characters.count, characters[openingParenIndex] == "(" else {
-            return nil
-        }
-        var depth = 1
-        var index = openingParenIndex + 1
-        var target = ""
-        var isEscaping = false
-        while index < characters.count {
-            let character = characters[index]
-            if isEscaping {
-                target.append(character)
-                isEscaping = false
-                index += 1
-                continue
-            }
-            if character == "\\" {
-                isEscaping = true
-                index += 1
-                continue
-            }
-            if character == "(" {
-                depth += 1
-                target.append(character)
-                index += 1
-                continue
-            }
-            if character == ")" {
-                depth -= 1
-                if depth == 0 {
-                    return (
-                        target.trimmingCharacters(in: .whitespacesAndNewlines),
-                        index
-                    )
-                }
-                target.append(character)
-                index += 1
-                continue
-            }
-            target.append(character)
-            index += 1
-        }
-        return nil
-    }
-
-    private func lineLikelyContainsPathReference(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        for token in Self.pathHintTokens where lower.contains(token) {
-            return true
-        }
-        return false
-    }
-
-    private func fileReferenceCandidates(in line: String) -> [String] {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-
-        var candidates = [trimmed]
-        candidates.append(contentsOf: markdownImageTargets(in: line))
-        appendMatches(regex: Self.markdownLinkTargetRegex, in: line, captureGroup: 1, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 1, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 2, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 3, into: &candidates)
-        appendMatches(regex: Self.fileURLTokenRegex, in: line, into: &candidates)
-        appendMatches(regex: Self.absolutePathTokenRegex, in: line, captureGroup: 1, into: &candidates)
-        return candidates
-    }
-
-    private func appendMatches(
-        regex: NSRegularExpression,
-        in text: String,
-        captureGroup: Int? = nil,
-        into candidates: inout [String]
-    ) {
-        let nsText = text as NSString
-        let searchRange = NSRange(location: 0, length: nsText.length)
-        regex.enumerateMatches(in: text, options: [], range: searchRange) { match, _, _ in
-            guard let match else { return }
-            let range: NSRange
-            if let captureGroup {
-                guard match.numberOfRanges > captureGroup else { return }
-                range = match.range(at: captureGroup)
-            } else {
-                range = match.range
-            }
-            guard range.location != NSNotFound, range.length > 0 else { return }
-            candidates.append(nsText.substring(with: range))
-        }
-    }
-
-    private func fileURLFromPlainText(_ rawText: String) -> URL? {
-        let normalized = normalizedPlainTextCandidate(rawText)
-        guard !normalized.isEmpty else { return nil }
-        let unescaped = unescapePathEscapes(in: normalized)
-
-        if let fileURL = URL(string: unescaped), fileURL.isFileURL {
-            return fileURL
-        }
-
-        if unescaped.hasPrefix("file://") {
-            var pathPart = String(unescaped.dropFirst("file://".count))
-            if pathPart.hasPrefix("localhost/") {
-                pathPart = String(pathPart.dropFirst("localhost/".count))
-            }
-            if !pathPart.hasPrefix("/") {
-                pathPart = "/" + pathPart
-            }
-            let decodedPath = pathPart.removingPercentEncoding ?? pathPart
-            return URL(fileURLWithPath: decodedPath)
-        }
-
-        if unescaped.hasPrefix("file:/") {
-            let normalized = "file://" + String(unescaped.dropFirst("file:/".count))
-            if let fileURL = URL(string: normalized), fileURL.isFileURL {
-                return fileURL
-            }
-        }
-
-        guard unescaped.hasPrefix("/") || unescaped.hasPrefix("~") else { return nil }
-        let expandedPath = (unescaped as NSString).expandingTildeInPath
-        let decodedPath = expandedPath.removingPercentEncoding ?? expandedPath
-        return URL(fileURLWithPath: decodedPath)
-    }
-
-    private func normalizedPlainTextCandidate(_ rawText: String) -> String {
-        var value = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return "" }
-
-        while let first = value.first, "<[({".contains(first) {
-            value.removeFirst()
-        }
-        while let last = value.last, ">)]},.;:!?".contains(last) {
-            value.removeLast()
-        }
-
-        if value.count > 1,
-           (value.hasPrefix("\"") && value.hasSuffix("\""))
-           || (value.hasPrefix("'") && value.hasSuffix("'"))
-           || (value.hasPrefix("`") && value.hasSuffix("`"))
-        {
-            value.removeFirst()
-            value.removeLast()
-        }
-
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func unescapePathEscapes(in value: String) -> String {
-        guard value.contains("\\") else { return value }
-        let escapable: Set<Character> = [" ", "(", ")", "[", "]", "{", "}", "!", "?", ",", ";", "\"", "'", "`"]
-        var output = ""
-        var index = value.startIndex
-        while index < value.endIndex {
-            let character = value[index]
-            if character == "\\" {
-                let nextIndex = value.index(after: index)
-                if nextIndex < value.endIndex {
-                    let next = value[nextIndex]
-                    if escapable.contains(next) {
-                        output.append(next)
-                    } else {
-                        output.append("\\")
-                        output.append(next)
-                    }
-                    index = value.index(after: nextIndex)
-                    continue
-                }
-            }
-            output.append(character)
-            index = value.index(after: index)
-        }
-        return output
-    }
-
-    private func isImageFileURL(_ url: URL) -> Bool {
-        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-
-        let rawExtension = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawExtension.isEmpty else { return false }
-        let normalizedExtension = rawExtension.lowercased()
-        if let type = UTType(filenameExtension: normalizedExtension) {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-        return Self.fallbackImageFileExtensions.contains(normalizedExtension)
     }
 
     private func droppedFileURL(from item: NSSecureCoding?) -> URL? {
@@ -2573,9 +2208,9 @@ struct AgentImageInputAdapter {
         return nil
     }
 
-    private func deduplicated(_ prepared: [PreparedImage]) -> [PreparedImage] {
+    private func deduplicated(_ prepared: [Prepared]) -> [Prepared] {
         var seenPaths: Set<String> = []
-        var result: [PreparedImage] = []
+        var result: [Prepared] = []
         for entry in prepared {
             let path = entry.url.standardizedFileURL.path
             guard !seenPaths.contains(path) else { continue }

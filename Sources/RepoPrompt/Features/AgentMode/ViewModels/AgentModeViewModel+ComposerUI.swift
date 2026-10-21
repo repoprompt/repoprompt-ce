@@ -40,7 +40,7 @@ extension AgentModeViewModel {
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
                 scopeTabID: tabID,
-                imageAttachments: pendingImageAttachments,
+                attachments: pendingFileAttachments,
                 taggedFileAttachments: pendingTaggedFileAttachments
             ),
             runState: runState,

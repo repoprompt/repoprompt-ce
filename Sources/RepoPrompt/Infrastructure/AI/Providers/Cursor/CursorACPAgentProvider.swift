@@ -147,7 +147,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         return try ACPPromptContentBuilder.blocks(
             text: text,
             attachments: request.attachments,
-            transientImages: message.transientImages
+            oracleAttachments: message.attachments
         )
     }
 

@@ -80,7 +80,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
