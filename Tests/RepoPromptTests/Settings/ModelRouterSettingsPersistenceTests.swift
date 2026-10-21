@@ -302,6 +302,9 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
             XCTAssertFalse(store.modelRouterConfiguration().allowPaidFastRouting)
             store.setUsageBalancingEnabled(true)
             store.setUsageBalancingPreset(.expiringQuota)
+            XCTAssertFalse(store.modelRouterConfiguration().usageBalancing.overrideRouter)
+            store.setUsageBalancingOverride(true)
+            XCTAssertTrue(store.modelRouterConfiguration().usageBalancing.overridesRouter)
             store.setAllowPaidFastRouting(true)
             let revision = store.modelRouterSettingsRevision
             let grant = ClaudeCLIUsageGrant(credentialProfileID: "fixture", grantedAt: Date(timeIntervalSince1970: 2_000_000_000))
@@ -309,6 +312,7 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
             XCTAssertEqual(store.modelRouterSettingsRevision, revision, "Acquisition consent is not routing policy")
             let saved = try file.load()
             XCTAssertEqual(saved.scalarPreferences?.modelRouter?.usageBalancingPreset, "expiringQuota")
+            XCTAssertEqual(saved.scalarPreferences?.modelRouter?.usageBalancingOverride, true)
             XCTAssertEqual(saved.scalarPreferences?.modelRouter?.allowPaidFastRouting, true)
             for (old, current) in [("qualityFirst", AgentUsageBalancingPreset.nearLimits), ("balanced", .evenPace), ("favorLargerPlan", .expiringQuota)] {
                 store.updateModelRouterScalar(commit: false) { $0.usageBalancingPreset = old }

@@ -1071,6 +1071,72 @@ extension AgentComposerSubmissionAttemptTests {
         )
     }
 
+    func testCriticalUsageOverrideMovesFreshTaskToClaudeWithUnknownCodexAndNoJev() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast, readiness: .needsConfiguration(generation: 1, reason: "No key"))
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setModelRouterProvider(nil, scope: .primarySession)
+        store.setUsageBalancingEnabled(true)
+        store.setUsageBalancingOverride(true)
+        let advisor = AgentUsageBalancer()
+        viewModel.modelRouterRuntime?.usageBalancer = advisor
+        let now = Date()
+        let reset = ISO8601DateFormatter().string(from: now.addingTimeInterval(37 * 3600))
+        let claude = try ClaudeAccountUsageMapper.snapshot(
+            data: JSONSerialization.data(withJSONObject: ["seven_day": ["utilization": 32, "resets_at": reset]]),
+            account: .init(lineage: .anthropicFirstParty, opaqueAccountID: nil, credentialProfileID: "test"),
+            observedAt: now
+        )
+        advisor.update(claude, provider: AgentProviderKind.claudeCode.rawValue)
+        advisor.update(nil, provider: AgentProviderKind.codexExec.rawValue)
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-6.1-sol-high"
+        let decision = try XCTUnwrap(viewModel.localUsageDecision(basedOn: viewModel.executableTarget(for: session), scope: .primarySession, surface: .general))
+        XCTAssertEqual(decision.candidate.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertEqual(decision.reason, "usage_override_expiring")
+        XCTAssertTrue(AgentUsageBalancer.mainSessionPeerClasses.contains(decision.candidate.usagePeerClass ?? ""), "The main session never drops to Haiku or Sonnet")
+        let configuration = store.modelRouterConfiguration()
+        let models = try AgentTaskRoutingCandidateBuilder().build(allowedProviders: [.claudeCode, .codexExec], availability: viewModel.modelRouterAvailabilityContext)
+        let primary = try XCTUnwrap(advisor.routerOverride(candidates: models, configuration: configuration, scope: .primarySession))
+        XCTAssertTrue(primary.candidates.allSatisfy {
+            $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue && AgentUsageBalancer.mainSessionPeerClasses.contains($0.usagePeerClass ?? "")
+        })
+        let subagent = try XCTUnwrap(advisor.routerOverride(candidates: models, configuration: configuration, scope: .subagent))
+        XCTAssertGreaterThanOrEqual(subagent.candidates.count, primary.candidates.count, "Subagents keep every Claude tier")
+        XCTAssertTrue(viewModel.applyRoutingTarget(decision.candidate, to: session))
+        let requests = await backend.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testCriticalUsageOverrideNeverOffersTheOtherProviderToJev() async throws {
+        let backend = ComposerRoutingBackend(outcome: .cancelEffort)
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setUsageBalancingEnabled(true)
+        store.setUsageBalancingOverride(true)
+        let advisor = AgentUsageBalancer()
+        viewModel.modelRouterRuntime?.usageBalancer = advisor
+        let now = Date()
+        let reset = ISO8601DateFormatter().string(from: now.addingTimeInterval(18000))
+        for (provider, used) in [(AgentProviderKind.codexExec, 95), (.claudeCode, 10)] {
+            let data = try JSONSerialization.data(withJSONObject: ["five_hour": ["utilization": used, "resets_at": reset]])
+            let usage = try ClaudeAccountUsageMapper.snapshot(
+                data: data,
+                account: .init(lineage: .anthropicFirstParty, opaqueAccountID: nil, credentialProfileID: "test"),
+                observedAt: now
+            )
+            advisor.update(usage, provider: provider.rawValue)
+        }
+        _ = try? await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless)
+        let requests = await backend.requests
+        XCTAssertFalse(requests.isEmpty)
+        XCTAssertTrue(
+            requests.flatMap(\.question.choices).allSatisfy { $0.description.hasPrefix("Provider: claudeCode;") },
+            "Critical usage must not let Jev pick the other provider"
+        )
+        store.setUsageBalancingOverride(false)
+        XCTAssertFalse(store.modelRouterConfiguration().usageBalancing.overridesRouter)
+    }
+
     func testStaleRouterAndUsagePeerCandidatesCannotMutateSelection() async throws {
         let (viewModel, _) = try await makeRoutingViewModel(backend: ComposerRoutingBackend(outcome: .selectLast))
         let builder = AgentTaskRoutingCandidateBuilder()

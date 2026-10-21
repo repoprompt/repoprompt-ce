@@ -807,6 +807,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var customInstructions: String?
         package var usageBalancingEnabled: Bool?
         package var usageBalancingPreset: String?
+        package var usageBalancingOverride: Bool?
         package var usageLargerPlan: String? // Legacy value retained for lossless settings round trips; no longer used.
         package var allowPaidFastRouting: Bool?
 

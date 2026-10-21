@@ -19,7 +19,32 @@ extension AgentModeViewModel {
             availability: availability,
             surface: surface
         )
-        guard let input = AgentTaskRoutingCandidateBuilder().usageCandidates(basedOn: target, allowedProviders: allowed, availability: availability, surface: surface) else { return nil }
+        let builder = AgentTaskRoutingCandidateBuilder()
+        // Critical usage is not limited to a same-tier, same-effort peer of the starting model:
+        // when the dominant provider has no such peer (for example Luna-low vs Haiku), the task
+        // still moves to that provider's comparable tier, falling back to its strong tier.
+        // Same starting-target exclusions as ordinary balancing: explicit paid Fast, parameterized
+        // targets, and providers outside Claude/Codex are never replaced.
+        if configuration.usageBalancing.overridesRouter,
+           target.modelParameters.isEmpty, !AgentTaskRoutingCandidateBuilder.isPaidFast(target),
+           [AgentProviderKind.claudeCode.rawValue, AgentProviderKind.codexExec.rawValue].contains(target.agentRaw),
+           let models = try? builder.build(allowedProviders: allowed, availability: availability, surface: surface),
+           let forced = advisor.routerOverride(candidates: models, configuration: configuration, scope: scope)
+        {
+            let startingClass = models.first { $0.target.agentRaw == target.agentRaw && $0.target.modelRaw == target.modelRaw }?.usagePeerClass
+                ?? builder.usageCandidates(basedOn: target, allowedProviders: allowed, availability: availability, surface: surface)?.selected.usagePeerClass
+            // Keep the starting model only when it is already an allowed tier of the dominant provider;
+            // a Luna start with OpenAI dominant still moves up to Sol, just as it would move to Opus.
+            if forced.candidates.contains(where: { $0.target.agentRaw == target.agentRaw && $0.usagePeerClass == startingClass }) { return nil }
+            // The primary-session floor already removed light/balanced tiers of either provider.
+            if let choice = forced.candidates.first(where: { startingClass != nil && $0.usagePeerClass == startingClass })
+                ?? forced.candidates.first(where: { $0.usagePeerClass == "strong" })
+                ?? forced.candidates.first
+            {
+                return AgentUsageBalancer.Decision(candidate: choice, reason: forced.reason)
+            }
+        }
+        guard let input = builder.usageCandidates(basedOn: target, allowedProviders: allowed, availability: availability, surface: surface) else { return nil }
         let decision = advisor.choose(selected: input.selected, candidates: input.candidates, evidence: nil, configuration: configuration)
         return decision.reason == nil ? nil : decision
     }

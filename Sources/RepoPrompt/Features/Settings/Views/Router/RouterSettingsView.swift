@@ -123,6 +123,13 @@ struct RouterSettingsView: View {
                 }.pickerStyle(.segmented)
                 Text(viewModel.configuration.usageBalancing.preset.explanation).foregroundStyle(.secondary)
             }
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Override Model Router when usage is critical", isOn: Binding(get: { viewModel.configuration.usageBalancing.overrideRouter }, set: viewModel.setUsageBalancingOverride))
+                    .disabled(!viewModel.configuration.usageBalancing.enabled)
+                Text("Critical means one plan has at least 25% of its weekly allowance resetting within 48 hours, has 1.75× the other plan’s unused allowance for its remaining time, or the other plan is 90% used. New tasks then go only to that provider; Model Router picks the model and effort within it, and is skipped when only one model qualifies. Otherwise Model Router and the strategy above are mixed.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Button("Manage plan usage…") { onNavigate?(.cliProviders) }.buttonStyle(.bordered)
             Divider()
             settingsDisclosure("What Usage Balancing shares", systemImage: "hand.raised", id: "usage-balancing:refresh-privacy", prominent: true) {

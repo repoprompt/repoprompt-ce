@@ -552,11 +552,11 @@ extension AgentModeViewModel {
             surface: surface
         )
         guard let registration = await runtime.registry.registration(for: backendID),
-              let models = try? builder.build(
+              let builtModels = try? builder.build(
                   snapshot: snapshot,
                   roleDefaults: agentModelRoleDefaultReferences(),
                   maximumChoices: registration.capabilities.finiteChoice.maximumChoices
-              ), let firstModel = models.first
+              ), !builtModels.isEmpty
         else {
             return StagedTaskRoutingResult(
                 candidates: [],
@@ -564,8 +564,17 @@ extension AgentModeViewModel {
             )
         }
 
-        var selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
+        var models = builtModels
         var usageBalancingReason: String?
+        // Critical usage decides the provider outright: the other provider is never offered, and a
+        // single remaining model skips the decision service entirely.
+        let usageOverride = allowUsageBalance ? runtime.usageBalancer?.routerOverride(candidates: builtModels, configuration: configuration, scope: scope) : nil
+        if let usageOverride {
+            models = usageOverride.candidates
+            usageBalancingReason = usageOverride.reason
+        }
+        let firstModel = models[0]
+        var selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
         var modelEvidence: DecisionEvidence?
         var judgmentRequested = false
         if models.count == 1 {
@@ -594,7 +603,7 @@ extension AgentModeViewModel {
             else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
             selectedModel = match
             modelEvidence = evidence
-            if allowUsageBalance, configuration.usageBalancing.enabled, !Task.isCancelled,
+            if usageOverride == nil, allowUsageBalance, configuration.usageBalancing.enabled, !Task.isCancelled,
                modelRouterConfigurationIsCurrent(configuration, backendID: backendID), let advisor = runtime.usageBalancer
             {
                 let decision = advisor.choose(selected: match, candidates: models, evidence: evidence, configuration: configuration)
