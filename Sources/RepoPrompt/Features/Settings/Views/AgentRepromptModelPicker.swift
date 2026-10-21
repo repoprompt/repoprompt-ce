@@ -10,8 +10,7 @@ struct AgentRepromptModelPicker: View {
     var concreteSelection: Binding<String> {
         Binding(
             get: {
-                if selection == AgentRepromptModelPreference.unavailableLegacyOracle { return "Unavailable model" }
-                return (selection.isEmpty || selection == AgentRepromptModelPolicy.primaryOracle) ? (resolvedModel?.rawValue ?? "No connected model") : selection
+                resolvedModel?.rawValue ?? "Choose a model"
             },
             set: { selection = $0 }
         )

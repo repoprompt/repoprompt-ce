@@ -67,6 +67,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func paste(_ sender: Any?) {
+        guard isEditable else { return }
         let pasteboard = sender as? NSPasteboard ?? NSPasteboard.general
         if enablesImagePasteHandling, imagePasteHandler?(pasteboard) == true {
             return
@@ -75,6 +76,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        guard isEditable else { return false }
         if enablesImagePasteHandling,
            isImageLikePasteboardType(type),
            imagePasteHandler?(pboard) == true
@@ -85,6 +87,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard isEditable else { return [] }
         let superOperation = super.draggingEntered(sender)
         if superOperation != [] {
             return superOperation
@@ -96,6 +99,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard isEditable else { return false }
         guard enablesImagePasteHandling else {
             return super.prepareForDragOperation(sender)
         }
@@ -106,6 +110,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard isEditable else { return false }
         guard enablesImagePasteHandling else {
             return super.performDragOperation(sender)
         }

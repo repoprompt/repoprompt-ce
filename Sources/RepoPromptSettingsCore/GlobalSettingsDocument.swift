@@ -361,7 +361,7 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
         self.additionalOracleModelRaws = sanitizedAdditionalOracleModelRaws(additionalOracleModelRaws)
         self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
         self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
-        self.agentRepromptModelRaw = AgentRepromptModelPreference.migratedRaw(agentRepromptModelRaw, primary: planningModelRaw)
+        self.agentRepromptModelRaw = AgentRepromptModelPreference.normalizedRaw(agentRepromptModelRaw)
         self.agentRepromptMode = agentRepromptMode
         self.agentRepromptIncludesRecentChat = agentRepromptIncludesRecentChat
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
@@ -414,7 +414,7 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
             container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
         )
         agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
-        agentRepromptModelRaw = try AgentRepromptModelPreference.migratedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw), primary: planningModelRaw)
+        agentRepromptModelRaw = try AgentRepromptModelPreference.normalizedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw))
         agentRepromptMode = try container.decodeIfPresent(AgentRepromptMode.self, forKey: .agentRepromptMode)
         agentRepromptIncludesRecentChat = try container.decodeIfPresent(Bool.self, forKey: .agentRepromptIncludesRecentChat)
         preferredComposeModelRaw = try Self.normalizedChatModelRaw(
@@ -961,7 +961,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.additionalOracleModels = additionalOracleModels
             self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
             self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
-            self.agentRepromptModelRaw = AgentRepromptModelPreference.migratedRaw(agentRepromptModelRaw, primary: planningModel)
+            self.agentRepromptModelRaw = AgentRepromptModelPreference.normalizedRaw(agentRepromptModelRaw)
             self.agentRepromptMode = agentRepromptMode
             self.agentRepromptIncludesRecentChat = agentRepromptIncludesRecentChat
             self.syncChatModelWithOracle = syncChatModelWithOracle
@@ -987,7 +987,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
                 container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
             )
             agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
-            agentRepromptModelRaw = try AgentRepromptModelPreference.migratedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw), primary: planningModel)
+            agentRepromptModelRaw = try AgentRepromptModelPreference.normalizedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw))
             agentRepromptMode = try container.decodeIfPresent(AgentRepromptMode.self, forKey: .agentRepromptMode)
             agentRepromptIncludesRecentChat = try container.decodeIfPresent(Bool.self, forKey: .agentRepromptIncludesRecentChat)
             if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {

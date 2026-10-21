@@ -37,12 +37,19 @@ extension AgentModeViewModel {
             source = text == operation.lastGeneratedText ? original : text
             operation.cancel(restoreOriginal: false, recover: false)
         }
+        if !reprepare, let recovery = repromptUIStore.recoveries[target.tabID] {
+            if recovery.requiresDecision { return true }
+            if recovery.bypassesPreparation, recovery.draftAtInvalidation == text { return false }
+        }
         guard repromptEnabled || forceReview,
               Self.isRepromptEligible(text: original, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
               !isMCPControlled(tabID: target.tabID) else { return false }
         guard let session = sessions[target.tabID], currentTabID == target.tabID,
               makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return true }
         repromptOperation?.invalidate(reason: "Another composer began preparation.")
+        // A new explicit preparation supersedes old decision/bypass authority, not its recoverable text.
+        repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
+        repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
         let rewriteSource = source
         let id = UUID()
         let workspaceID = workspaceManager?.activeWorkspaceID
@@ -102,7 +109,7 @@ extension AgentModeViewModel {
                     && live.agentRepromptGuidance == profile.agentRepromptGuidance
                     && live.agentRepromptMode == profile.agentRepromptMode
                     && live.agentRepromptIncludesRecentChat == profile.agentRepromptIncludesRecentChat
-                    && (profile.agentRepromptModelRaw != AgentRepromptModelPolicy.primaryOracle || live.planningModelRaw == profile.planningModelRaw)
+                    && resolvedRepromptModel(session: session) == model
                     && (workspaceManager?.activeWorkspace?.repoPaths ?? []) == roots
             }
         )
@@ -119,15 +126,12 @@ extension AgentModeViewModel {
             if repromptOperation?.id == id { repromptOperation = nil }
             syncStatusPillsUIState()
         }
-        let check: () -> Void = { [weak operation] in
-            Task { @MainActor in await Task.yield()
-                _ = operation?.validate()
-            }
-        }
+        let check: () -> Void = { [weak operation] in operation?.scheduleValidation() }
         session.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         modelRouterSettingsStore.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         workspaceManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
+        promptManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         operation.start()
         syncStatusPillsUIState()
         return true
@@ -168,7 +172,21 @@ extension AgentModeViewModel {
         guard let operation = repromptOperation, operation.phase == .completed,
               operation.sourceTabID == claim.attempt.sourceTabID,
               sessions[operation.sourceTabID] === claim.sourceSession,
-              operation.expectedDraft.utf8.elementsEqual(claim.attempt.rawDraftSnapshot.utf8) else { return }
+              operation.expectedDraft.utf8.elementsEqual(claim.attempt.rawDraftSnapshot.utf8)
+        else {
+            let tabID = claim.attempt.sourceTabID
+            guard repromptOperation == nil, currentTabID == tabID, sessions[tabID] === claim.sourceSession,
+                  let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation, !recovery.requiresDecision,
+                  recovery.draftAtInvalidation.utf8.elementsEqual(claim.attempt.rawDraftSnapshot.utf8),
+                  stagedSlashCommandProps(tabID: tabID) == nil else { return }
+            // Only the exact explicitly kept/restored draft may transfer original slash classification.
+            repromptDispatchTexts[claim.attempt.id] = claim.attempt.rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+            repromptDispatchOriginals[claim.attempt.id] = recovery.originalDraft
+            repromptAudits[claim.attempt.id] = .init(outcome: .approved)
+            repromptUIStore.recoveries[tabID]?.bypassesPreparation = false
+            repromptUIStore.recoveries[tabID]?.requiresDecision = true
+            return
+        }
         repromptDispatchTexts[claim.attempt.id] = claim.attempt.rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         repromptDispatchOriginals[claim.attempt.id] = operation.rawDraft
         repromptSpeculations[claim.attempt.id] = repromptSpeculations.removeValue(forKey: operation.id)

@@ -18,7 +18,7 @@ package enum AgentRepromptGuidance {
     """
 
     package static func normalizedOverride(_ text: String?) -> String? {
-        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty, text != defaultText else { return nil }
         return text
     }
 

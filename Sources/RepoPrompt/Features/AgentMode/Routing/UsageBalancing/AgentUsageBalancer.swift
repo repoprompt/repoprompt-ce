@@ -66,13 +66,11 @@ final class AgentUsageBalancer {
     }
 
     func update(_ snapshot: ProviderQuotaSnapshot?, provider: String) {
-        core.update(snapshot, provider: provider)
-        revision &+= 1
+        if core.update(snapshot, provider: provider) { revision &+= 1 }
     }
 
     func clear() {
-        core.clear()
-        revision &+= 1
+        if core.clear() { revision &+= 1 }
     }
 
     func choose(

@@ -7,6 +7,30 @@ import XCTest
 
 @MainActor
 final class AgentRepromptSettingsTests: XCTestCase {
+    func testSavingOnlyModelModeOrHistoryDoesNotFreezeDefaultGuidance() throws {
+        for baseline in [nil, "Custom user wording"] as [String?] {
+            for field in 0 ..< 3 {
+                let (store, api) = try fixture()
+                store.setGlobalAgentModelsProfile(.init(agentRepromptGuidance: baseline), contextBuilderWriteIntent: .preserveExistingOwnership)
+                let vm = AgentModelsSettingsViewModel(apiSettingsVM: api, settingsManager: store, settingsStore: store)
+                switch field {
+                case 0: vm.repromptModelDraft = AIModel.gpt61SolLow.rawValue
+                case 1: vm.repromptModeDraft = .sendAutomatically
+                default: vm.repromptRecentChatDraft = false
+                }
+                XCTAssertTrue(vm.saveRepromptDraft())
+                XCTAssertEqual(store.globalAgentModelsProfile().agentRepromptGuidance, baseline)
+                if baseline != nil {
+                    vm.repromptGuidanceDraft = " \n" + AgentRepromptGuidance.defaultText + "\n "
+                    XCTAssertTrue(vm.saveRepromptDraft())
+                    XCTAssertNil(store.globalAgentModelsProfile().agentRepromptGuidance)
+                }
+                XCTAssertTrue(vm.restoreDefaultRepromptGuidance())
+                XCTAssertNil(store.globalAgentModelsProfile().agentRepromptGuidance)
+            }
+        }
+    }
+
     func testScopedDraftSaveDefaultAndUnrelatedWritesPreserveFields() throws {
         for workspaceID in [nil, UUID()] {
             let (store, api) = try fixture()

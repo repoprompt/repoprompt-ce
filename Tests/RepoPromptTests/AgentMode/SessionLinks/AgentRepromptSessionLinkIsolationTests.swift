@@ -50,6 +50,30 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         XCTAssertNil(fixture.viewModel.repromptOperation)
     }
 
+    func testManagedInboundTargetReplacementRestoresLocalReviewOriginal() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        fixture.session.hasLoadedPersistedState = true
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.isMCPInstructionDispatchInProgress = true
+        fixture.enableReprompt()
+        XCTAssertTrue(try fixture.begin(text: "Private original"))
+        try await AsyncTestWait.waitUntil("local review", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(windowID: 1, workspaceID: UUID(), tabID: fixture.session.tabID, sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 0)
+        let turn = AgentNoncomposerTurn(endpoint: endpoint, providerText: "Managed envelope", sink: .init())
+        XCTAssertTrue(fixture.viewModel.submitNoncomposerSteer(tabID: fixture.session.tabID, session: fixture.session, displayText: "Managed instruction", turn: turn, route: .claudeInterrupt))
+        // Provider admission of that inbound work replaces the native run target.
+        fixture.session.installRunID(UUID())
+        fixture.viewModel.invalidateRepromptIfNeeded()
+        XCTAssertNil(fixture.viewModel.repromptOperation)
+        XCTAssertEqual(fixture.session.draftText, "Private original")
+        XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.originalDraft, "Private original")
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, "Managed envelope")
+    }
+
     func testHeldLocalClaimRemainsAnInboundDeliveryBlocker() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }

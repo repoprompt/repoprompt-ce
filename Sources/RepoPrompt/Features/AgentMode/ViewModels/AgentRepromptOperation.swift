@@ -20,6 +20,8 @@ final class AgentRepromptOperation {
     private var firstResult: AgentRepromptResult?
     private var task: Task<Void, Never>?
     private var publicationTask: Task<Void, Never>?
+    private var validationTask: Task<Void, Never>?
+    private(set) var hasUserEdits = false
     private var pendingBody: String?
     private var callRevision: UInt64 = 0
     private var publicationRevision: UInt64 = 0
@@ -71,10 +73,21 @@ final class AgentRepromptOperation {
             id: id,
             sourceTabID: sourceTabID,
             original: rawDraft,
-            modelName: model?.displayName ?? "Unavailable model",
+            modelName: model?.displayName ?? "Choose a model",
             usesChatContext: !request.recentChat.isEmpty
         )
         retry()
+    }
+
+    /// objectWillChange fires before mutation; one next-turn check covers a burst of publications.
+    func scheduleValidation() {
+        guard !isClosed, validationTask == nil else { return }
+        validationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            validationTask = nil
+            _ = validate()
+        }
     }
 
     @discardableResult
@@ -166,6 +179,7 @@ final class AgentRepromptOperation {
         guard let generation = applyDraft(text) else { return }
         expectedDraft = text
         expectedDraftGeneration = generation
+        store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
         publicationRevision &+= 1
         store.draftUpdate = .init(operationID: id, tabID: sourceTabID, revision: publicationRevision, text: text)
     }
@@ -173,6 +187,8 @@ final class AgentRepromptOperation {
     func noteUserMutation(text: String, generation: UInt64) {
         guard !isClosed, !isPublishing else { return }
         if phase == .completed {
+            store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
+            hasUserEdits = text != lastGeneratedText
             expectedDraft = text
             expectedDraftGeneration = generation
             onEdit?()
@@ -224,17 +240,21 @@ final class AgentRepromptOperation {
     func consumeAutoSend(_ request: AgentRepromptUIStore.AutoSendRequest) -> Bool {
         guard request.operationID == id, request.tabID == sourceTabID, !autoSendConsumed else { return false }
         autoSendConsumed = true
-        return mode == .sendAutomatically && !hadQuestions && !usedOriginal && phase == .completed
+        return mode == .sendAutomatically && !hadQuestions && !usedOriginal && !Self.startsWithProviderCommand(expectedDraft) && phase == .completed
             && request.operationID == id && request.tabID == sourceTabID
             && request.text == expectedDraft && request.text == lastGeneratedText
             && request.generation == expectedDraftGeneration && validate()
+    }
+
+    static func startsWithProviderCommand(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
     }
 
     private func complete() {
         guard validate() else { return }
         setPhase(.completed)
         onComplete?(expectedDraft)
-        if mode == .sendAutomatically, !hadQuestions, !isClosed {
+        if mode == .sendAutomatically, !hadQuestions, !Self.startsWithProviderCommand(expectedDraft), !isClosed {
             store.autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
         }
     }
@@ -278,6 +298,8 @@ final class AgentRepromptOperation {
         callRevision &+= 1
         task?.cancel()
         publicationTask?.cancel()
+        validationTask?.cancel()
+        validationTask = nil
         if restoreOriginal, candidate == expectedDraft { install(rawDraft) }
         task = nil
         observations.removeAll()
@@ -289,13 +311,13 @@ final class AgentRepromptOperation {
 
     func invalidate(reason: String) {
         guard !isClosed else { return }
+        let live = currentDraft()
+        let keepEdits = hasUserEdits || live != expectedDraft
+        let alternative = (phase == .completed && hasUserEdits) || lastGeneratedText.isEmpty ? live : lastGeneratedText
+        cancel(restoreOriginal: !keepEdits, recover: false)
         store.recover(
-            tabID: sourceTabID,
-            text: phase == .completed ? expectedDraft : lastGeneratedText,
-            originalDraft: rawDraft,
-            reason: reason,
-            currentDraft: currentDraft()
+            tabID: sourceTabID, text: alternative, originalDraft: rawDraft,
+            reason: reason, currentDraft: currentDraft(), requiresDecision: keepEdits
         )
-        cancel(restoreOriginal: false, recover: false)
     }
 }

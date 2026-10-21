@@ -82,10 +82,11 @@ Re-prompt v2 is off by default and enabled separately in each window. With conse
 sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
 relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Default resolution
 prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
-when possible, then the other subscription, then configured API providers, with the primary Oracle
-last. The UI always names the concrete model. Explicit models never silently fall back; legacy
-Use primary Oracle settings migrate to the then-current concrete Oracle model. A call freezes its billing
-route; a failure or retry cannot switch it. The resolved model is displayed. The provider's retention
+when possible, then the other subscription, then configured fast API tiers (Sonnet 5.5,
+GPT-6.1 Sol Low, Gemini 3 Flash), then none. No arbitrary catalog-first or primary Oracle fallback
+is used. Other configured models require an explicit choice. The UI names the concrete model or
+shows Choose a model when unavailable. Losing an already resolved default does not silently switch
+billing routes. Explicit models never fall back. A call freezes its billing route; failure/retry cannot switch it. The provider's retention
 and billing terms apply; do not send secrets you do not want that recipient to receive.
 
 **Include recent chat context** is on by default and persisted in the selected Agent Models
@@ -104,18 +105,23 @@ git review packaging or selection mutations**. Composer attachments/tagged files
 locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
 provider-history rows. Substantive answers may cause one refinement from original text plus answers;
 skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
-chat exposure; old consult-flow receipts do not authorize v2.
+chat exposure.
 
 The brief streams into the existing composer, read-only during preparation. **Review before
 sending** is the default: successful preparation unlocks editing and Return dispatches the current
 draft without rewriting it again. The opt-in, profile-scoped **Send automatically** mode dispatches
 a successful rewrite through ordinary fresh-claim admission on completion; any clarification questions
-force Review for that turn, even if skipped. Cmd+Return always prepares for Review (including a
+force Review for that turn, even if skipped. Slash-leading generated or edited text also forces
+Review, with a warning that the provider may interpret it as a command; only a deliberate subsequent
+Send can dispatch it. Cmd+Return always prepares for Review (including a
 one-shot when the pill is off), using current edited text or the first original when unchanged.
 The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
 the edited rewrite stays available through undo/recovery. After five seconds, Send original is an explicit second Send action through
 fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
-recovery banner. Truncated output is recoverable but cannot be sent as a successful preparation.
+recovery banner. Invalidation (tab/target/settings changes or Stop) also restores the original when
+the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
+rewrite choices, rather than silently starting another rewrite from generated output. Truncated output
+is recoverable but cannot be sent as a successful preparation.
 Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.
 
 Enabled Auto Effort can judge the rewriter's effort using its existing masked decision service.

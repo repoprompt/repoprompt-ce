@@ -19,6 +19,21 @@ final class ProviderUsageBalancerTests: XCTestCase {
         balancer.preferredPeerIndex(selected: selected, options: options, strategy: strategy, now: instant).map { options[$0] } ?? selected
     }
 
+    func testOnlyChangedSnapshotsReportAnEffectiveMutation() throws {
+        let balancer = ProviderUsageBalancer()
+        XCTAssertFalse(balancer.update(nil, provider: "claude"))
+        XCTAssertFalse(balancer.clear())
+        let value = try snapshot(95)
+        XCTAssertTrue(balancer.update(value, provider: "claude"))
+        XCTAssertFalse(balancer.update(value, provider: "claude"))
+        XCTAssertTrue(try balancer.update(snapshot(10), provider: "claude"))
+        XCTAssertTrue(balancer.update(nil, provider: "claude"))
+        XCTAssertFalse(balancer.update(nil, provider: "claude"))
+        XCTAssertFalse(balancer.clear())
+        XCTAssertTrue(balancer.update(value, provider: "claude"))
+        XCTAssertTrue(balancer.clear())
+    }
+
     func testNearLimitMovesToPeerDeterministicallyForEveryStrategy() throws {
         let balancer = ProviderUsageBalancer()
         var activities = 0

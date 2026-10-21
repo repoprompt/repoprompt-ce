@@ -165,6 +165,14 @@ extension AgentModeViewModel {
             session.draftText = text
             if repromptOperation?.sourceTabID == tabID {
                 repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            } else if let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+                      !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
+            {
+                // A kept draft authorizes only its exact text; edits need a new explicit recovery choice.
+                repromptUIStore.recoveries[tabID] = .init(
+                    text: text, originalDraft: recovery.originalDraft, reason: recovery.reason,
+                    draftAtInvalidation: text, requiresDecision: true
+                )
             }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

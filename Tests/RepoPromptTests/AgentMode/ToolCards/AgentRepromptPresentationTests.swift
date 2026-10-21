@@ -6,6 +6,49 @@ import XCTest
 
 @MainActor
 final class AgentRepromptPresentationTests: XCTestCase {
+    func testAttachmentMutationAndNativePasteAreBlockedWhilePreparationOwnsComposer() {
+        let store = AgentRepromptUIStore()
+        let tabID = UUID()
+        XCTAssertTrue(store.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID))
+        store.presentation = .init(id: UUID(), sourceTabID: tabID, original: "original", modelName: "model")
+        for phase in [AgentRepromptUIStore.Phase.generating, .refining, .clarifying] {
+            store.presentation?.phase = phase
+            XCTAssertFalse(store.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID), "Picker, drop, tagging and removal callbacks share this live gate")
+        }
+        store.presentation?.phase = .completed
+        XCTAssertTrue(store.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID))
+        XCTAssertFalse(store.allowsAttachmentMutation(tabID: tabID, currentTabID: nil), "Delayed intake must reject a cleared live selection, not fall back to a captured tab")
+        XCTAssertFalse(store.allowsAttachmentMutation(tabID: tabID, currentTabID: UUID()))
+        let textView = ImageAwareTextView()
+        textView.string = "Original"
+        textView.isEditable = false
+        textView.enablesImagePasteHandling = true
+        var pastes = 0
+        textView.imagePasteHandler = { _ in pastes += 1
+            return true
+        }
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        board.setString("new text", forType: .string)
+        textView.paste(board)
+        XCTAssertFalse(textView.readSelection(from: board, type: .string))
+        XCTAssertEqual(pastes, 0)
+        XCTAssertEqual(textView.string, "Original")
+    }
+
+    func testValidationPublicationsCoalesceIntoOneNextTurnCheck() async throws {
+        var checks = 0
+        let operation = AgentRepromptOperation(sourceTabID: UUID(), rawDraft: "original", draftGeneration: 0, request: .init(originalText: "original"), model: nil, service: nil, store: AgentRepromptUIStore(), currentDraft: { "original" }, applyDraft: { _ in 0 }, isCurrent: { checks += 1
+            return true
+        })
+        for _ in 0 ..< 100 {
+            operation.scheduleValidation()
+        }
+        try await AsyncTestWait.waitUntil("coalesced validation", timeout: 3) { checks > 0 }
+        XCTAssertEqual(checks, 1)
+        operation.cancel()
+    }
+
     func testPillSnapshotStopsSpinningAtCompletionNotAtDispatch() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
@@ -199,6 +242,6 @@ final class AgentRepromptPresentationTests: XCTestCase {
         XCTAssertEqual(fixture.session.draftText, "New typing")
         XCTAssertTrue(fixture.viewModel.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: true))
         XCTAssertEqual(fixture.session.draftText, "Reviewed brief")
-        XCTAssertNil(fixture.viewModel.repromptUIStore.recoveries[tabID])
+        XCTAssertTrue(fixture.viewModel.repromptUIStore.recoveries[tabID]?.bypassesPreparation == true)
     }
 }

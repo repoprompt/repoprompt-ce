@@ -29,12 +29,18 @@ package final class ProviderUsageBalancer {
 
     package init() {}
 
-    package func update(_ snapshot: ProviderQuotaSnapshot?, provider: String) {
+    @discardableResult
+    package func update(_ snapshot: ProviderQuotaSnapshot?, provider: String) -> Bool {
+        guard snapshots[provider] != snapshot else { return false }
         snapshots[provider] = snapshot
+        return true
     }
 
-    package func clear() {
+    @discardableResult
+    package func clear() -> Bool {
+        guard !snapshots.isEmpty else { return false }
         snapshots.removeAll()
+        return true
     }
 
     /// Returns the index in `options` of the comparable peer to use instead of `selected`, or `nil` to keep it.

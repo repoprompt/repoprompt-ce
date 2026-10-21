@@ -834,7 +834,6 @@ extension OracleViewModel {
     ) async throws
         -> [String: Value]
     {
-        try Task.checkCancellation()
         try contextBuilderScope?.checkpoint()
         // ────────── 1. Validate & extract parameters ──────────
         try Self.validateRawImageDispatchInvariant(args)
@@ -975,7 +974,6 @@ extension OracleViewModel {
                 onProgress: onProgress
             )
         }
-        try Task.checkCancellation()
         let queryId: UUID?
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
@@ -991,11 +989,7 @@ extension OracleViewModel {
             clearMCPSessionUIState(for: chatID)
             throw OracleContextBuilderCompletionError.missingExactQuery
         }
-        let response = try await withTaskCancellationHandler {
-            try await waitForContextBuilderCompletion(queryId)
-        } onCancel: {
-            Task { @MainActor [weak self] in await self?.cancelStreaming(in: chatID) }
-        }
+        let response = try await waitForContextBuilderCompletion(queryId)
         try contextBuilderScope?.admitSuccess()
 
         // ────────── 6. Build typed reply ──────────

@@ -5,6 +5,38 @@ import XCTest
 
 @MainActor
 final class AgentRepromptRoutingIntegrationTests: XCTestCase {
+    func testUsagePeerReconciliationDoesNotInvalidatePreparedSpeculation() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.store.setUsageBalancingEnabled(true)
+        let advisor = AgentUsageBalancer()
+        fixture.runtime.usageBalancer = advisor
+        let claim = try fixture.claim(text: "Original")
+        defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+        fixture.viewModel.startRepromptSpeculation(session: fixture.session, operationID: claim.attempt.id, text: "Complete brief", originalText: "Original")
+        let speculation = try XCTUnwrap(fixture.viewModel.repromptSpeculations[claim.attempt.id])
+        _ = await speculation.routingTask?.value
+        var base = try XCTUnwrap(AgentTaskRoutingCandidateBuilder().build(allowedProviders: [.claudeCode], availability: fixture.viewModel.modelRouterAvailabilityContext).first)
+        base.usagePeerClass = "reconciliation-peer"
+        let peer = AgentTaskRoutingCandidateBuilder.Candidate(opaqueKey: "peer", utilityTier: base.utilityTier, target: .init(agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "gpt-6-sol-high", reasoningEffortRaw: "high", modelParameters: []), descriptor: base.descriptor, usagePeerClass: base.usagePeerClass)
+        var reconciliations = 0
+        advisor.onRoutingActivity = {
+            reconciliations += 1
+            advisor.update(nil, provider: AgentProviderKind.codexExec.rawValue)
+            advisor.update(nil, provider: AgentProviderKind.claudeCode.rawValue)
+        }
+        defer { advisor.onRoutingActivity = nil }
+        let configuration = fixture.store.modelRouterConfiguration()
+        _ = advisor.choose(selected: base, candidates: [base, peer], evidence: nil, configuration: configuration)
+        XCTAssertGreaterThan(reconciliations, 0, "Exercise the peer-selection callback that reconciles disallowed leases")
+        XCTAssertEqual(advisor.revision, speculation.usageRevision, "Already-empty leases do not change effective usage state")
+        let before = await fixture.backend.requests.count
+        XCTAssertNotNil(fixture.viewModel.reusableRepromptRouting(speculation, approved: "Complete brief", configuration: configuration, backendID: fixture.backend.id, runtime: fixture.runtime))
+        XCTAssertEqual(speculation.reuse, .reused)
+        let after = await fixture.backend.requests.count
+        XCTAssertEqual(before, after)
+    }
+
     func testAutoEffortUsesApprovedTextAndOversizedOriginalFallback() {
         XCTAssertEqual(AgentModeViewModel.automationJudgingText(original: "vague", reprompted: "Approved task"), "Approved task")
         XCTAssertEqual(AgentModeViewModel.automationJudgingText(original: "original", reprompted: String(repeating: "x", count: 4001)), "original")

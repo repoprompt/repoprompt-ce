@@ -1,744 +1,91 @@
-# Agent Mode Re-prompt: Plan
+# Agent Mode Re-prompt — v2
 
-## 1. Goal
+## History
 
-Add an optional **Re-prompt** step to Agent Mode. When enabled, each eligible local composer message is first rewritten by an **isolated side call** — which may, at its own discretion, consult Oracle and/or run Context Builder for repository grounding — into a *balanced task brief* — goal, constraints, acceptance criteria, relevant known context, assumptions, open questions — that preserves the user's intent and wording and **never prescribes implementation steps the user didn't ask for**. The user reviews and edits the brief (answering at most a few load-bearing clarification questions first) before anything reaches the implementing agent. Rewrite guidance is user-replaceable in Settings with Restore Default. Re-prompt must compose frictionlessly with Model Router, Auto Effort, and usage balancing: they judge the approved brief, add no extra prompts, and add no avoidable latency.
+The October 20 v1 implementation used a modal review editor and optional Oracle/Context Builder consultations. User testing replaced that design before release. v2 removed the modal, consultants and selection-commit plumbing in favor of tool-less streaming into the existing composer. v2.1 added compact original comparison, repeat/undo shortcuts, profile-scoped modes and a concrete model picker. The obsolete v1 execution ledger and unshipped compatibility policy are intentionally removed; Git retains the implementation history.
 
-### Decisions at a glance (answers to the original open questions)
+## Current v2 contract
 
-| Question | Decision | Why |
-|---|---|---|
-| First prompt only, or every prompt? | **Every eligible local prompt while the pill is on.** Off by default; transient per window/view-model instance (no persisted enable flag). | Follow-ups are often the vaguest prompts. "First turn only" is already Interview's job; a sticky toggle lets the user turn it off once the task is well-scoped. |
-| Own session? | **Yes — stateless rewrite requests, not a visible agent session.** The rewriter itself has no tools and no history; refinement is a fresh request. Context consults it requests run through the existing Oracle / Context Builder entry points as their own (background) runs, never in the implementing agent's transcript. | Zero pollution of the implementing agent's context and no session clutter. |
-| Surface the rewrite? | **Always.** Mandatory editable review; never auto-send. The edited text is authoritative. | Meaning drift can't be detected mechanically; review is the real guardrail against micromanaging rewrites. |
-| Re-confirm when unclear? | **Yes, bounded:** ≤3 load-bearing questions (≤4 options each, custom answer allowed, skippable), then at most one refinement call. Remaining gaps become explicit "Open questions" in the brief. | Prefer a useful brief with explicit unknowns over a long interview. |
-| Which model? | The effective Agent Models profile's **primary Oracle model** (`planningModelRaw`) for the rewrite. No extra lanes, presets, router, Auto Effort, or fallback to the implementing model. **All factory-built providers, including CLI providers**, are supported; the rewrite contract travels as `AIMessage.systemPrompt`, the same way Oracle's headless sends deliver theirs (§3.4.1). | Already the user's chosen "thinking" model; CLI side-call transports are already fresh, tool-less, and non-resuming. |
-| Repo context? | **Rewriter's discretion.** Call 1 sees the message plus a small workspace manifest (root names, selected file paths). It may request **none, an Oracle consult, a Context Builder run, or both** (§3.4.2). Their results feed the single refinement call. Users can skip context gathering per run or turn it off in Settings. Context typed into the review editor goes only to the implementing agent. | Lets the rewriter turn vague terms into codebase vocabulary when that matters, without paying the latency on clear prompts. |
-| Model Router? | **Re-prompt runs first; Router, Auto Effort, and balancing judge the approved brief afterward**, with no new UI. Auto Effort's raw-draft input is fixed, oversized briefs fall back to the original text for judging, and a speculative pre-judgment during review hides router latency when the brief is sent unedited (§3.10). | The router gets a better signal and the user sees a single flow. |
+### Composer and lifecycle
 
-## 2. Background (current state)
+- The first Send prepares; Review before sending is the default. No submit claim is held during preparation. An operation UUID, per-call revision, canonical draft generation and 40 ms coalesced publications fence streaming updates. The next Send acquires a fresh ordinary composer claim and sends the exact edited draft.
+- The existing capped-height text field is read-only while streaming/refining or answering questions. Text alone is rewritten; attachments, tagged files and workflow selection retain their existing owners. All local attachment intake and removal must be gated while preparation owns the composer, including delayed picker/drop completions.
+- The strip displays the actual model, honest elapsed time, Cancel and Send original after five seconds. Completed review shows the first original inline (dimmed, expandable), adjacent Revert and keyboard hints. Only generating/refining spins, never completed review or routing speculation. The v2.1 stuck spinner was a cached pill snapshot not refreshed on phase changes; the operation's post-mutation callback now refreshes it.
+- Return prepares an unprepared enabled draft or sends a prepared draft. Cmd+Return explicitly prepares for Review, including one-shot with the pill off. Repeating an unchanged rewrite uses the first original; edited text becomes the new source while the first original remains the comparison/restoration reference. Shift+Return remains newline. Existing interactive-review shortcuts retain ownership. Cmd+Return formerly fell through to ordinary Return in this local editor; the edit-review card's Cmd+Return Accept remains untouched because Re-prompt refuses while interactive review owns input.
+- Esc during preparation cancels/restores; Esc/Revert after completion restores the original in one undo transaction and keeps the rewrite recoverable. Late chunks cannot regain authority after cancel, tab/session replacement, Stop or target/settings changes.
+- Invalidation restores the first original when the live draft is still operation-owned. User edits are never overwritten: an unresolved recovery offers Restore original / Keep rewrite and prevents Return from silently re-rewriting generated text. Both original and partial/completed/edited alternatives remain accessible. A kept/restored rewrite authorizes only its exact draft bytes through a fresh local claim, retaining original slash classification; later edits require a new explicit choice. Successful submission consumes that recovery authority, while failure retains original/rewrite choices. A newer explicit preparation supersedes old recovery authority without deleting its text. Inactive/replaced sessions cannot overwrite the active composer.
+- Send automatically is an opt-in profile preference. Successful completion emits a one-use intent consumed through a fresh submit claim. Any clarifying questions, including skip-all, force Review. Slash-leading generated or edited text (after leading whitespace) also forces Review: provider-native command interpretation is not assumed safe. Review displays “Starts with / — your agent may treat it as a command”. A deliberate subsequent Send may pass that text to the provider; RepoPrompt skill expansion remains bypassed for rewritten text.
 
-### 2.1 Composer submission path
+### Questions, output and isolation
 
-```text
-AgentInputBar.sendMessage → executeSubmit(claim, trimmed)
-  → executeComposerSubmitAttempt → submitClaimedComposerUserTurn
-  → submitUserTurn → submitPreparedUserTurn
-  → startAgentRun → AgentModeRunService.startRun → provider runner
-```
+- Markdown body streams directly, with headings only when useful and trivial prompts returned near-identically. Optional framed trailing questions metadata is incrementally withheld, including delimiter prefixes, and validated only when complete. At most three questions, at most one refinement rebuilt from original + substantive answers; skip-all does not refine.
+- Questions appear in a transient transcript slot using the timeout-free ask_user wizard, labeled Before sending. They are excluded from implementing-agent/provider history.
+- Side requests are tool-less and stateless. Native Claude uses request-scoped print NDJSON streaming with empty MCP configuration and no inherited tools/workspace; other providers use streamMessage. No consults, file contents, git packaging, Oracle chat links or attachment payloads are included. The cheap manifest contains root names and selected relative paths only.
+- Safety limits: original 32 KiB; guidance 16 KiB; answers 16 KiB; manifest 4 KiB; serialized history 8 KiB; output 80 KiB raw / 64 KiB body / 16 KiB metadata. Truncated/error text is recoverable, never successful auto-send. Safety ceilings are 60 seconds for API calls and 120 seconds for native calls, including effort judgment.
+- Session-link, managed/noncomposer, staged slash-command and attachment-only paths bypass preparation entirely. Enabling the pill does not change their ordinary admission policy. Original text controls RepoPrompt slash/workflow classification, not generated text.
 
-- UI send: `AgentInputBar.sendMessage()` — `Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift:1631–1670` (actions wired `:126–129`).
-- `executeComposerSubmitAttempt(text:claim:)` — `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift:17718–17781`. Revalidates the claim after hydration, handles initial execution-location preparation (`expectedInitialStartLocation`), clears the composer only after `.submitted` via `clearComposerDraftIfUnchanged`. The claim identifies the exact source session and draft snapshot and blocks competing submissions.
-- `submitUserTurn` (`:18340–18484`): validates input/provider, classifies native commands and slash skills, captures then clears selected workflow and pending attachments.
-- `submitPreparedUserTurn` (`:19071–19234`): builds bubble text and provider text; provider-text precedence is **managed → native-wrapper → submitted text**; then Computer Use wraps eligible input, Interview prepends on first turn (`:19133–19162`), selected workflow wraps (`AgentWorkflow.wrapUserText`, `Models/AgentWorkflow.swift:240+`); appends the user row; routes active-turn steering vs new run.
-- Automation wrappers between admission and preparation: `submitUserTurnAfterHydration` (`AgentModeViewModel.swift:18542`), `submitUserTurnAfterFreshTaskRouting` and `submitUserTurnAfterAutoEffort` (`AgentModeViewModel+Routing.swift:140, 284`), `submitUserTurnAfterUsageBalancing` (`AgentModeViewModel+UsageBalancing.swift:142`). Each can drop a carried replacement or re-read the original, and routing/balancing can change model/effort asynchronously.
-- `startAgentRun` (`:20891–21053`) → `augmentUserMessageForProviderSend` (`:20622–20631`; slash-skill expansion `:20743+`, tagged files, attachments) → `AgentModeRunService.startRun` (`Runtime/AgentModeRunService.swift:179–329`), which dispatches already-prepared turns to Codex / Claude / ACP / headless — too late and too broad for interactive rewriting.
-- **Hazard:** `trimmedText` also drives bubble construction, mention-driven file selection, and steering logic. Re-prompt needs explicit separation of **source text** vs **approved replacement**; globally replacing `trimmedText` would change command recognition and file selection.
+### Model, effort and settings
 
-### 2.2 Interview pill precedent
+- Profile-scoped model, mode, history and guidance extend schema 13 with requiredSchemaVersion feature fencing, global/workspace copy/reset and stale-draft conflict checks. No migration exists for unshipped Re-prompt sentinels. Unknown explicit model strings are retained but unavailable; unknown mode values fail closed to Review. Real shipped settings compatibility is unchanged.
+- The UI never names an abstract default model mode: the picker/header show a concrete resolved name or Choose a model. Default policy is fast current native subscription tier → other connected native subscription tier → bounded configured API fast tiers → none. No arbitrary catalog-first or primary-Oracle fallback. Model resolution is frozen for an operation/retries; failure never silently switches billing routes. Explicit selections never fall back. Runtime-unavailable models require a user choice.
+- Current preferred tiers are native Claude Code Sonnet 5.5 Low and Codex GPT-6.1 Sol Low; API fallback tiers are Sonnet 5.5, GPT-6.1 Sol Low and Gemini 3 Flash. Other models remain explicitly selectable when configured and side-call capable.
+- Effort defaults Low for supported variants. With Auto Effort enabled, the existing masked summary, decision policy, backend and coordinator choose the rewriter's effort without changing the implementing session. Explicit service tiers are preserved. Providers without supported effort fields retain provider-native behavior; no unsupported Anthropic API field is invented.
+- Settings use the standard model picker, mode row and recent-history toggle. Advanced guidance is collapsed; Restore Default affects guidance only. Saving model/mode/history alone preserves an untouched guidance baseline. Default-equivalent guidance normalizes to nil so future defaults still apply.
 
-- `interviewFirst` is transient view-model state (`AgentModeViewModel.swift:307–311`), first-message-only, reset after consumption (`:19162`).
-- Projection: `AgentStatusPillsSnapshot` in `ViewModels/UI/AgentStatusPillsUIStore.swift:42,62`; `update` publishes only unequal snapshots; `AgentStatusPillsRow` (`Views/Components/AgentStatusPillsRow.swift:61–63`) doesn't observe the whole VM. Pill: `AgentInterviewPill` (`Views/Components/AgentTogglePills.swift:47–62`); setters `AgentModeViewModel+StatusPillsUI.swift:162–169`; metrics `Views/Components/AgentStatusPillMetrics.swift`.
-- Interview = in-context clarification by the implementing agent. Re-prompt = out-of-context rewrite before the agent sees anything. They coexist.
+### Recent-chat addendum
 
-### 2.3 Model / side-call precedent
+Include recent chat context defaults on and persists in the profile. Only sessions with at least two previously completed user turns qualify. Include up to three prior user messages as sent (approved rewrites where applicable), plus each turn's final assistant reply trimmed UTF-8-safely to approximately 1.5 KiB, retaining start and end. Serialized total is capped at 8 KiB by dropping oldest first. Only post-compaction turns qualify. No tools, thinking, diffs, attachments, system/workflow wrappers or unfinished turns enter this projection.
 
-- No standalone title/commit/"enhance prompt" generator exists.
-- **Stateless transport:** `AIProvider.completeMessage(_:model:maxTokens:)` / `streamMessage`, constructed via `AIProviderFactory` (`Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift`). `AIMessage` carries a `systemPrompt` and `transientImages`; results are `AICompletionResult` text (so prompt-only JSON, not native structured output, is correct).
-- **How existing side calls deliver system prompts (incl. CLI providers):** Oracle headless sends freeze a `HeadlessContextSnapshot`, and `PromptViewModel.buildHeadlessAIMessage` puts the plan/chat/review system prompt (or a preset override) into `AIMessage.systemPrompt` (`Features/Chat/ViewModels/Oracle/OracleViewModel+MCP.swift:1400–1455`; `PromptViewModel+HeadlessPlan.swift:72–165`; `OracleHeadlessRuntime.swift:41–80,111–117`, 4-hour outer timeout). Each CLI provider then maps it as follows:
-  - `ClaudeCodeProvider`: native `--system-prompt` replacement when delivery is `.nativeSystemPrompt`, otherwise wrapped into the user prompt (`ClaudeAgentToolPreferences.swift:7–35`, `ClaudeCompatibleProviderRuntimeBridge.swift:229–233`, `ClaudeCodeAgentProvider.swift:384`). Empty MCP config plus `--strict-mcp-config`, an extensive `disallowedTools` list, no resume. Default timeout 6000 s (`ClaudeCodeProvider.swift:10–94,127–189,270–304,362–384`).
-  - `CodexCLIProvider`: fresh app-server session; `systemPrompt` → `baseInstructions`; `existing: nil` (no resume); shell, web, multi-agent, and MCP disabled; read-only sandbox; approval `.never`. 45 min timeout (`CodexCLIProvider.swift:115–161,491–500,935–1079`).
-  - `CursorCLIProvider` / `OpenCodeCLIProvider`: fresh ACP, `workspacePath: nil`, `resumeSessionID: nil`, `AgentMessage.systemPrompt`; Cursor runs in `ask` mode with a no-tools instruction, OpenCode uses `.noTools`; RepoPrompt MCP excluded (`CursorCLIProvider.swift:28–35,111–140`; `OpenCodeCLIProvider.swift:17–24,108–137`).
-  - `DevinCLIProvider`: private temp cwd, MCP disabled, prompt file containing the system prompt plus a no-tools instruction. 6000 s timeout (`DevinCLIProvider.swift:7–31,113–288`).
-  - Child processes honor `cancelChildOnTaskCancellation: true`. Provider default timeouts are very long, so Re-prompt needs its own outer timeout.
-- **Programmatic Oracle:** `OracleViewModel.tool_chatSend(...)` (`OracleViewModel+MCP.swift:825`). Inputs: message, mode (`chat|plan|review`), resolved execution/roster, `PromptViewModel`, and an `OracleSendTabContext` (tab/workspace IDs, frozen prompt, `StoredSelection`, lookup/review-Git contexts; `:27–154, 846–855`). It creates/locates a `ChatSession`, autosaves it, and returns `chat_id`/response/`context_id` (`:908–1070`). The session is visible/activated unless the context requests background activation. Cancel via `cancelStreaming(in:)` / `cancelAIResponse` (`OracleViewModel.swift:4071–4100`). The MCP adapter is `MCPOracleToolService.executeAskOracle` (`Infrastructure/MCP/MCPOracleToolService.swift:120,310`).
-- **Programmatic Context Builder:** `ContextBuilderAgentViewModel.runContextBuilderForMCP(...)` (`:2100`). Inputs: `WorkspaceSelectionIdentity`, frozen nested tab/workspace/lookup context, agent/model/run behavior, optional instructions override, and an MCP-control token. `clarify` is context-only (no Oracle chat); `question`/`plan` add an Oracle follow-up. It **commits its selection into the workspace tab** and persists it (`MCPServerViewModel+TabContext.swift:4574–4718`), and persists per-tab run history (`:2502–2504, 3969–3974`). In agent mode it reuses the invoking tab (`MCPServerViewModel.swift:4350–4519`). With the default `PromptEnhancementMode.fullRewrite`, it **sets the tab prompt** (`augment` appends; `preserve` leaves it alone; `SystemPromptService.swift:183–287`). Cancel via `cancelMCPContextBuilderRun` (`:2187–2191, 3404–3429`). Typical duration 30 s–5 min (`MCPContextBuilderToolProvider.swift:342`); progress stages and heartbeats are at `:568–640`.
-- Context Builder reads `effectiveAgentModelsProfile(workspaceID:)` → `planningModelRaw` (+ `additionalOracleModelRaws`) — `Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift:5641–5668`.
-- `OracleExecutionResolver` (`Features/Chat/Services/OracleExecutionResolver.swift`; roster `:377–383`) resolves via `AIModel.fromModelName` and checks `mcpOracleIsProviderConfigured(for:)`. Its full path also captures chat presets, prompt context, system prompts, extra lanes, reconciliation guidance — **inappropriate** for an isolated rewrite. Reuse only its model-resolution/availability primitives.
-- Context Builder's `PromptEnhancementMode` (`fullRewrite`/`augment`/`preserve`, `Sources/RepoPromptSettingsCore/ContextBuilderSettingsValues.swift:3–14`; guidance in `Infrastructure/AI/SystemPromptService.swift:11–17,181–215`) is vocabulary precedent only — no coupling.
+The fixed, non-editable contract marks history as BACKGROUND for intent/vocabulary only. Current message wins; history must not create new requirements, constraints or acceptance criteria. Assistant statements are unverified. Redirects/corrections/frustration must abandon, not repeat, the prior failed approach. The strip says with chat context only when excerpts are actually sent. Recipient disclosure includes history and is acknowledged per billing route/history exposure.
 
-### 2.4 Settings precedent
+### Routing and audit
 
-- Editable Oracle reconciliation guidance: view `Features/Settings/Views/AgentModelsSettingsView.swift:394–418`; save/restore/conflict in `Features/AgentMode/ViewModels/UI/AgentModelsSettingsViewModel.swift:305–345` (model settings `:392–478`).
-- `AgentModelsSettingsProfile` supports workspace/global scope and retained workspace overrides.
-- `Sources/RepoPromptSettingsCore/GlobalSettingsDocument.swift:83–99`: per-feature schema constants; `oracleReconciliationGuidanceSchemaVersion = 11`, `currentSchemaVersion = 12` (verified). `requiredSchemaVersion` fences meaningful settings (including retained workspace profiles) from older typed writers.
+Speculation starts only after a complete brief, keyed by preparation identity/content, and transfers to the fresh submit claim. Edits, changed candidates/configuration or effective usage state discard it. No-op usage reconciliation must not invalidate an otherwise reusable result. Turn Auto Effort judges the approved draft, with bounded original fallback for oversized text. Minimal audits contain outcomes and speculation/fallback flags, not raw prompts or consultation branches.
 
-### 2.5 Clarification UX precedent
+## PR #1432 review follow-up (2026-10-21)
 
-- `AgentAskUserInteraction`, `AgentAskUserPendingState` (`Features/AgentMode/Models/UserInteractionModels.swift:131–154, 267–310`) and `AgentAskUserWizardCard` (`Views/ToolCards/AgentAskUserWizardCard.swift`, shared with Context Builder): one question at a time, options/custom/skip, validation. `AgentAskUserPendingState` requires `interaction.timeoutSeconds` (default 300) and `timeoutStartedAt`; the card renders a countdown (`:106–108`) and a pulse derived from `timeoutSeconds / 3.0` (`:352`). For single-select, a custom answer clears selected options (`answer(from:)`).
-- Re-prompt clarification is **local pre-submission UI**: must not set `session.pendingAskUser`, move the run to waiting, or inherit runtime timeouts.
-- Workflow prompt guidance on grounded clarification: `Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift:75–89`, `WorkflowPrompt+Optimize.swift:61–70`, `WorkflowPrompt+Reminder.swift:40` ("ask when ambiguity is load-bearing; don't guess").
+- Maintainer and Sentry reports were read in full. Draft invalidation, default-guidance persistence, pill-dependent bypass admission and no-op usage revision findings were confirmed in source.
+- Merged origin/main at 446967aa6 without rebasing. PR #1426 remains OPEN (not merged); this branch therefore retains current image attachment API/text-view names. Read-only gating covers present image and tagged-file intake/removal, with delayed-callback revalidation; the future rename must preserve that guard.
+- Removed consult-era Oracle context_builder cancellation propagation, unshipped Re-prompt sentinel handling and obsolete v1 ledger material. Object-change freshness checks are coalesced per operation.
+- Compiler-index diagnosis reproduced 1,361 wrong-way file edges. The added edge was `Features/AgentMode/Runtime/AgentRepromptOperation.swift → Features/AgentMode/ViewModels/UI/AgentRepromptUIStore.swift`. The operation owns composer revisions, UI publications and recovery, not provider execution; moved it into ViewModels alongside its owning VM. The isolated provider service remains Runtime. No ratchet was increased.
+- One independent static review (`untitled-chat-3AF5C8`) verified two additional gaps: stale recovery authority could bypass/block a newer operation, and nil live tab selection fell back to a captured attachment target. Active operations now take precedence, accepted new preparation retires only old recovery authority (not recoverable text), and delayed attachment callbacks require the live selection even when nil. Focused regressions cover both.
+- Maintainer-guidance check: the invariant is preservation of first-original and user-edited state, with explicit send/replace choices. Root causes above are confirmed by source paths and focused regression fixtures. Canonical session drafts, operation revisions, scoped settings and fresh submit claims remain authorities. Validation notifications are coalesced to one pending check; no new provider IO/scanning occurs during UI projection. Live-provider command interpretation is deliberately not claimed safe; automatic dispatch falls back to Review.
 
-### 2.6 Session-link boundary
+### Changed files in the review follow-up
 
-- Idle attributed sends use `persistAndStartNoncomposerTurn` → `startAgentRun` directly; managed steers enter prepared submission with `AgentNoncomposerTurn`. Both intentionally skip composer preferences (`Runtime/SessionLinks/AgentModeViewModel+SessionLinkSend.swift:335`, `AgentSessionLinkManagedSteer.swift:10`). Readiness admission already treats an in-flight composer submission as a blocker.
-- Re-prompt stays absent from these paths. A pending local rewrite keeps holding the ordinary composer claim and gains no new session-link authority.
+One coordinator rename plus 30 modified files (21 source owners, eight existing test files, two docs; no new test-importing files):
 
-### 2.7 Model Router / Auto Effort / usage balancing
+- Agent Mode models/routing: `AgentRepromptModelPolicy.swift`, `Routing/UsageBalancing/AgentUsageBalancer.swift`.
+- Agent Mode VM: `AgentRepromptOperation.swift` (moved from Runtime), `AgentModeViewModel.swift`, `AgentModeViewModel+DraftsAttachments.swift`, `AgentModeViewModel+Reprompt.swift`, `AgentModeViewModel+RepromptUI.swift`, `UI/AgentModelsSettingsViewModel.swift`, `UI/AgentRepromptUIStore.swift`.
+- Composer/settings/shared editor: `AgentInputBar.swift`, `Components/AgentRepromptComposerStrip.swift`, `Components/AgentRepromptPill.swift`, `Settings/Views/AgentRepromptModelPicker.swift`, `Infrastructure/UI/TextField/ResizableTextField.swift`.
+- Consult/churn cleanup: `Chat/ViewModels/Oracle/OracleViewModel+MCP.swift`, `Infrastructure/MCP/MCPInvocationContext.swift`, `Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift` now match main (no net PR changes).
+- Core modules: `RepoPromptProviderQuota/ProviderUsageBalancer.swift`, `RepoPromptSettingsCore/AgentRepromptGuidance.swift`, `AgentRepromptModelPreference.swift`, `GlobalSettingsDocument.swift`.
+- Existing tests extended/revised: `ProviderUsageBalancerTests.swift`, `AgentRepromptSchemaTests.swift`, `AgentRepromptHistoryTests.swift`, `AgentRepromptSubmissionTests.swift`, `AgentRepromptRoutingIntegrationTests.swift`, `AgentRepromptSessionLinkIsolationTests.swift`, `AgentRepromptPresentationTests.swift`, `AgentRepromptSettingsTests.swift`.
+- Docs: this plan and `docs/privacy/telemetry.md`. The obsolete Runtime coordinator path is removed by the rename; no feature/service/test deletions are otherwise needed in this follow-up.
 
-- **What and when.** The Model Router picks **provider, base model, and initial effort** from local opaque candidates using a finite-choice task classification, followed by an effort classification. It never picks the workflow, tab, or worktree (`AgentModeViewModel+Routing.swift:518–621`). It runs only on an eligible **first send of a fresh session**: empty/new, non-MCP, non-child, inactive, and not blank or slash (`:282–304, 665–684`). Auto Effort judges eligible inactive turns, including settled follow-ups, but never an active turn or a Router-owned start. Usage balancing (`AgentModeViewModel+UsageBalancing.swift:36–74`, `AgentUsageBalancer.swift:55–143`) is local quota arithmetic that narrows the providers before routing.
-- **Inputs.** `submitUserTurnAfterFreshTaskRouting` (`+Routing.swift:140`) judges the passed `text` via `routeModelThenEffort(requestID: claim.attempt.id, text:...)`, checks `freshTaskRoutingEligibility(session:text:)`, and records `freshTaskRoutingByTabID` ownership for the source and destination tabs. Its stale checks are `composerSubmitClaimIsCurrent`, the destination session, `configuration.revision`, and `selectedBackendID`; a failed apply rolls back via `RoutedSelectionRollback`. **`submitUserTurnAfterAutoEffort` judges `claim.attempt.rawDraftSnapshot`, not `text`** (`:299–302`), so as written it would ignore an approved brief. Auto Effort only accepts turns of ≤4,000 characters and sends a 1,200-character masked excerpt (`Routing/AutoEffortTaskSummary.swift:8–68`). The Router forwards short text directly and reduces/masks long text (`Routing/ModelRouterDecisionPolicy.swift:35–114`, `Routing/AgentTaskRoutingTaskExcerpt.swift:8–27`).
-- **Transport and UI.** Decisions go to `FiniteChoiceDecisionRequest`s on Jev (`jev-1.13.0`) or OpenAI Decisions (`gpt-6-luna`), with a **5 s deadline and no retry**. The Router may make two sequential judgments (`Routing/Backends/OpenAIDecisions/OpenAIDecisionsDecisionService.swift:10–151`, `Routing/Backends/Jev/JevDecisionService.swift:39–48`). There are no per-turn decision cards: the Router pill shows a spinner and disables itself, and fresh-task model controls are disabled while the Router owns the start. Failed or stale decisions fall back to the manual selection (`AgentTogglePills.swift:202–260`, `+Routing.swift:223–276`). Enabling Auto Effort from its pill requires a disclosure (`Features/Settings/Views/Router/RouterSettingsView.swift:542–595`).
-- **Ordering and audit.** Composer worktree/tab creation happens before routing, so the Router applies its target to an already-created destination session. A per-session `AgentAutomationTurnAudit` keeps up to 128 non-content records (`Routing/AgentAutomationTurnAudit.swift:5–79`); `routerAudit: AgentAutomationTurnAudit.Feature` is threaded through `submitUserTurn`.
+## Verification
 
-## 3. Design
-
-### 3.1 Eligibility and bypasses
-
-| Input | Behavior |
-|---|---|
-| Local composer text, pill on | Re-prompt |
-| Native commands, slash skills, staged slash invocations, any text whose first non-whitespace char is `/` | Bypass |
-| Attachments-only / tagged-files-only (no text) | Bypass |
-| Text + attachments | Rewrite text only; attachments go to the agent unchanged and are **not** sent (contents, names, paths, thumbnails) to the rewrite model or to context consults |
-| Whitespace-only, no attachments | Existing empty-input rejection, no side call |
-| Structured interaction responses (approvals / ask_user answers) | Bypass |
-| Active local steering | Supported while the captured run/attempt stays current |
-| MCP starts/follow-ups, attributed sends, managed steers, auto-wakes, internal continuations | Always bypass; never read or consume Re-prompt state; never call the service |
-| Workflow selected | Rewrite user text first; workflow wraps approved text exactly once. Template is never shown to the rewrite model |
-| Interview on | Unchanged: consumed at its existing point. Cancelling Re-prompt doesn't consume it. Interview may still ask after dispatch |
-
-### 3.2 Composer preparation stage and frozen context
-
-Insert an async, composer-owned preparation stage **after** source readiness/claim/admission checks and command preflight, **before**: initial worktree creation, destination-tab creation for new-tab submits, router/Auto Effort judgments, consumption of workflow/attachments/Interview, and appending transcript rows. In the existing-session route, insert after hydration/claim/admission checks and before the `expectedInitialStartLocation` branch; apply equivalent ordering on other `executeComposerSubmitAttempt` routes.
-
-Proposed:
-
-```text
-prepareComposerReprompt(claim, sourceContext) async
-  → .unchanged | .approved(AgentRepromptApprovedTurn) | .cancelled
-```
-
-`AgentRepromptApprovedTurn` (immutable): approved trimmed text, operation ID, preparation-context identity for final validation.
-
-Proposed: one main-actor operation record per view model (multiple windows may prepare independently) holding: operation UUID + composer claim identity; source session object identity, persistent-binding identity/generations; source tab and workspace IDs; original raw draft + input revision; source run ID, attempt ID, run-state classification; selected workflow + mutation generation; ordered pending attachment identities and staged-command state; effective settings scope, primary Oracle raw model, resolved model, guidance snapshot; phase, model task, question drafts, editable review text; a one-shot completion mechanism. Do **not** capture assistant transcript content (streaming must not invalidate).
-
-**Freshness checks** — operation ID, task cancellation, claim, source binding, workspace, input revision, captured selections, settings snapshot — run (1) before each model call, (2) after every await, (3) before accepting clarification/review actions, (4) immediately before normal submission resumes. Invalidators: tab/workspace switch, source rebind, Stop, draft mutation, attachment/workflow change, a change to the primary Oracle model or guidance **in the captured effective settings scope** (edits to another scope don't invalidate), a newly blocking interaction, run/attempt transition (including **natural run completion during review** — conservative, avoids sending a reviewed steer into a different turn boundary). Streaming within the same attempt is fine. **Implementing provider/model/effort changes are not invalidators.** The rewrite doesn't depend on them, and post-approval dispatch reads the live selection exactly as today, so a user can change the model or toggle the Router during review without losing the brief. Router, Auto Effort, and usage balancing run after approval (§3.10). Consult tasks in flight are cancelled on invalidation. Invalidate eagerly from lifecycle events; keep the final comparison as a backstop.
-
-On invalidation: cancel the side request, dismiss UI, resolve once as `.cancelled`, leave draft and selections untouched, never submit into a replacement session.
-
-**Edited-brief recovery:** if invalidation (or a post-approval dispatch failure) happens after the user reached `reviewing`, keep the latest brief text in memory on `AgentRepromptUIStore` and show a non-blocking composer banner — "Re-prompt cancelled: *reason*. [Restore brief to composer] [Copy] [Dismiss]". Restore replaces the draft only on explicit click (and only if the draft is unchanged since invalidation, else it asks). The banner is cleared by the next submission, dismissal, or window teardown. Invalidation from a tab switch shows the banner on the source tab when the user returns, so the user never loses a sheet they can't find.
-
-### 3.3 State machine
-
-| Phase | Data | Actions |
-|---|---|---|
-| `generating` | input, manifest, model identity | Cancel · Send Original |
-| `clarifying` + `gatheringContext` (concurrent) | first result + `AgentAskUserPendingState`; consult tasks and their progress | answer/navigate/skip · **Skip context** · Cancel · Send Original |
-| `refining` | first result + answers/skips + context results | Cancel · Send Original |
-| `reviewing` | editable rendered brief | Edit · Send · Send Original · Cancel |
-| `failed` | safe error, retryable phase | Retry · Send Original · Cancel |
-
-Terminal outcomes: unchanged/original, approved, cancelled. Duplicate callbacks and late responses ignored after terminal.
-
-Algorithm:
-1. Eligibility checks (no mutation).
-2. Freeze context; build the workspace manifest (§3.4.2); start first request.
-3. Validate response.
-4. If `contextRequests` is non-empty (and policy allows), start the requested consults **immediately and concurrently** with step 5.
-5. If `openQuestions` non-empty → present in model order while consults run.
-6. When questions are done **and** consults have finished, failed, or been skipped: if there is ≥1 substantive answer or ≥1 successful consult result → one refinement request (original input + manifest + explicit answer/skip pairs + consult results). Otherwise use the first result with no second call. Show a "Gathering context… [Skip context]" state if questions finish before consults.
-7. Render brief into editable review.
-8. Gaps still reported by refinement → rendered as open questions; no second question loop.
-9. Send only after explicit approval + final freshness check.
-
-Question limits: ≤3 questions, ≤4 options each, single-select, custom response always allowed, no preselection, individually or wholly skippable. Mapping: each `openQuestions` entry → `AgentAskUserQuestion` with `allowsMultiple = false`, `allowsCustom = true`; IDs/labels must pass `AgentAskUserInteraction.validate` or the response is rejected as invalid. Refinement serializes each answer as `{question, selectedOption | customText | skipped}` — a custom answer is sent as free text (single-select custom clears options). Use existing answer builders; Re-prompt-specific limits live in its response validator, not the shared models. No countdown/auto-submit on user think time. Per-rewrite-call outer timeout: 60 s for API providers, 120 s for CLI providers. These cover Codex app-server and ACP cold starts, and they're required because provider defaults (6000 s, 45 min) are effectively unbounded; the outer timeout cancels the task, which for CLI providers terminates the child via `cancelChildOnTaskCancellation`. Provider-internal retries stay as configured but are bounded by the outer timeout. Max two successful **rewrite** calls per preparation (excluding explicit Retry), plus at most one Oracle consult and one Context Builder run.
-
-### 3.4 Isolated side-call service
-
-Proposed `AgentRepromptService`: a **nonisolated** (Sendable) service owning prompt assembly, the provider call, timeout, and decoding; it does not run on `MainActor`. The **operation** (lifecycle, UI, freshness) is owned by the `@MainActor` `AgentModeViewModel+Reprompt` extension, which awaits the service. Injectable: model resolution, availability/transport policy, provider factory.
-
-```text
-// proposed; model supplied separately from prompt content
-generate(request: AgentRepromptRequest, model: AIModel) async throws → AgentRepromptResult
-```
-
-Request: original user text, workspace manifest, captured guidance, optional answers + skipped question IDs, optional consult results.
-
-Must: reuse `AIModel.fromModelName` + existing provider-configuration check; execute one standalone provider request with no previous messages; create no Oracle chat/session and no canonical history **for the rewrite itself**; use a fresh request for refinement; never invoke normal prompt-context packaging (`buildHeadlessAIMessage`) for the rewrite. Refinement is rebuilt from the **original message + manifest + Q/A pairs + consult results**, not the first response — prevents compounded drift. Do **not** call `OracleExecutionResolver.resolve(.automatic, …)` for the rewrite.
-
-**Transport:** call `AIProvider.completeMessage` on a provider built by `AIProviderFactory` (no second client), with a single `AIMessage` whose `systemPrompt` = fixed contract + guidance and whose body = delimited user text + manifest (+ Q/A and consult results on refinement); `transientImages` empty. Prove with a request-capture test at the `AIMessage` level and one per provider family against real factory-built provider types (stubbed transport) showing the system prompt is delivered and nothing beyond the declared inputs is added.
-
-#### 3.4.1 System prompt delivery on all providers (incl. CLI)
-
-Follow the Oracle headless precedent exactly: the fixed contract + guidance goes in `AIMessage.systemPrompt`; each provider already maps it (§2.3) and already runs side calls fresh, tool-less, and non-resuming. No allowlist and no new provider flags.
-
-- **Claude Code:** request `.nativeSystemPrompt` delivery (`ClaudeAgentToolPreferences.nativeSystemPromptOverride`) so the contract **replaces** the Claude Code agent preamble rather than competing with it. If the user's configured delivery is wrapped, the contract is wrapped into the user prompt. The contract text must work in both positions; it opens with "You are a prompt rewriter, not a coding agent; output only the JSON object."
-- **Codex CLI:** `systemPrompt` → `baseInstructions` (replaces Codex's default developer instructions for that fresh session).
-- **Cursor / OpenCode / Devin:** their existing system-prompt + no-tools mapping applies unchanged.
-- **Verify in step 1** (not a design change): the Claude Code side-call cwd is not a workspace root, so project `CLAUDE.md`/memory isn't loaded into the rewriter. If it is, give it a private temp cwd like `DevinCLIProvider` does.
-- Cancellation terminates CLI children via `cancelChildOnTaskCancellation`.
-
-#### 3.4.2 Discretionary repository context (Oracle / Context Builder)
-
-**Manifest (call 1 input).** Workspace root names plus currently selected file paths (relative, capped at 50 paths / 4 KiB, with "+N more"). Never file contents, git state, transcript, or attachments. That's enough for the rewriter to judge whether its message references code it can't resolve.
-
-**Request contract.** The call-1 response may include:
-
-```text
-contextRequests: [
-  { kind: "oracle", question: String }            // ≤1; answered from the tab's current selection
-  { kind: "contextBuilder", instructions: String } // ≤1; discovers relevant files when unknown
-]
-```
-
-The rewriter chooses none, either, or both. Fixed-contract guidance on when to use each:
-- **none:** the message is clear or not about code specifics (most messages).
-- **oracle:** a quick question that the current selection can likely answer ("what's the existing pattern for X?").
-- **contextBuilder:** the relevant files are unknown and the terms are ambiguous (slow, 30 s–5 min, so it should be rare).
-- **both:** Context Builder is the broad sweep and Oracle answers a focused question. They run concurrently and Oracle uses the pre-run selection.
-
-The rewriter can't request more than one round; consult results go only to refinement.
-
-**Execution (owned by `AgentModeViewModel+Reprompt`, not by the rewrite service):**
-- **Oracle consult:** proposed `AgentRepromptContextConsultant.consultOracle` → `OracleViewModel.tool_chatSend` with `mode: chat` and **background activation**, using an `OracleSendTabContext` frozen from the source agent tab (the same selection the implementing agent's `ask_oracle` would see). It uses the normal Oracle roster for that workspace, so the consult is an ordinary Oracle chat. The chat is titled "Re-prompt consult", autosaved like any Oracle chat, and never added to the agent transcript. Outer timeout 180 s; cancel via `cancelStreaming(in:)`.
-- **Context Builder run:** proposed non-MCP entry `runContextBuilderForReprompt(...)` on `ContextBuilderAgentViewModel`. It is a thin wrapper over the same core as `runContextBuilderForMCP` (`:2100`) without the MCP-control token, using `clarify` (no Oracle follow-up) against the source agent tab, the rewriter's `instructions`, and a **per-run `PromptEnhancementMode.preserve` override** so the tab prompt is never rewritten (Re-prompt owns the rewriting). If the run-behavior type has no per-run enhancement override, add one; don't snapshot and restore the prompt instead. Outer timeout: Context Builder's own; the user can Skip at any time.
-- **Selection side effect:** Context Builder commits its selection to the agent tab. Snapshot the tab's `StoredSelection` before the run. On **approval**, keep the new selection (it's useful to the implementing agent's later `ask_oracle`/tool use) and state it in review ("Context Builder selected N files"). On **Cancel / Send Original / invalidation**, restore the snapshot only if the tab selection still equals what Context Builder committed; otherwise leave the user's newer changes.
-- **Results fed to refinement:** Oracle answer text (≤16 KiB, truncated with an explicit "[truncated]" marker, since this is model output rather than user input) and the Context Builder selected file paths + its effective prompt/summary (≤16 KiB, same rule). Results go under "Relevant known context" only when the rewriter judges them relevant. The fixed contract forbids turning consult findings into new requirements; they are context and assumptions, not obligations.
-- **Failure:** a failed, timed-out, or skipped consult is a non-fatal note ("Context Builder skipped") and refinement proceeds without it. If every consult fails and there are no answers, use the first result.
-- **Policy setting:** `agentRepromptContextPolicy: automatic | never` (default `automatic`). `never` strips `contextRequests` from the contract and omits the manifest, which restores the text-only behavior.
-
-**Response contract** (versioned JSON parsed from text; no native structured-output dependency):
-
-```text
-version: 1
-brief: { goal: String, constraints: [String], acceptanceCriteria: [String],
-         knownContext: [String], assumptions: [String] }
-openQuestions: [{ id, question, options: [{ label, description? }] }]
-contextRequests: [{ kind: "oracle" | "contextBuilder", question? | instructions? }]  // call 1 only; must be empty on refinement
-```
-
-All fields required; arrays may be empty; `goal` non-blank. A response with only `goal` (all arrays empty) is valid — that's the "minimal changes" path for already-clear messages. Render non-empty sections in order: Goal, Constraints, Acceptance criteria, Relevant known context, Assumptions, Open questions. No placeholder criteria or empty-section filler. The review editor holds the complete final text; it becomes provider base text verbatim (no regeneration).
-
-**Bounds (UTF-8):** input ≤32 KiB; guidance ≤16 KiB; total answers ≤16 KiB; response body and approved text ≤64 KiB each. Reject malformed JSON, unsupported versions, blank goal, duplicate question IDs/options, excess counts. Permit one surrounding JSON code fence; don't extract JSON from prose. Never truncate silently. No automatic JSON-repair call.
-
-**Typed errors:** missing/unknown/unconfigured primary Oracle; invalid context request (unknown kind, duplicates, >1 per kind, present on refinement → the response is invalid); size limit; timeout; auth/rate-limit/network/provider; malformed/invalid response; cancelled/stale. Shown in preparation UI, never in the implementing transcript. Drafts and selections preserved. Retry repeats the failed phase with the same frozen context; changed settings invalidate instead.
-
-### 3.5 Instructions and default guidance
-
-Two layers:
-1. **Fixed contract** (not editable): role line ("prompt rewriter, not a coding agent"), output schema, delimiting user text and consult results as untrusted content to rewrite (not instructions to the rewriter), no direct tool use, preservation rules, clarification limits, context-request rules and when-to-use guidance (§3.4.2), and "consult findings are context, never new requirements".
-2. **Editable guidance**: wording/organization preferences, and how eagerly to request context. Cannot remove review, exceed consult limits, bypass `agentRepromptContextPolicy`, enable tools, or override the contract.
-
-Draft default guidance:
-
-> Rewrite my message into a balanced task brief for an implementing agent. Preserve my intent, scope, important wording, named entities, uncertainty, and explicit constraints. Keep distinctive wording where it already communicates well; improve organization rather than replacing my voice unnecessarily.
->
-> Cover the goal, constraints, acceptance criteria, relevant known context, assumptions, and open questions when the supplied information supports those sections. Omit empty sections. Acceptance criteria must restate outcomes I requested, not introduce new obligations.
->
-> Never invent requirements, repository facts, APIs, files, deadlines, platform choices, or implementation decisions. Never prescribe implementation steps, architectures, testing requirements, migrations, or delegation unless I requested them. A clearer brief is not an implementation plan.
->
-> Distinguish supplied facts from assumptions. Do not convert uncertainty into a requirement. Avoid assumptions where a question would materially change scope, safety, correctness, or the requested outcome.
->
-> Ask only load-bearing questions that cannot reasonably be left open. Prefer a useful brief with explicit open questions over a long interview. Do not ask about information already supplied, or ask me to choose incidental implementation details.
->
-> For a short or already-clear message, make minimal changes.
->
-> Request repository context only when my message refers to code, behavior, or conventions you can't resolve from what I wrote. Prefer no context for clear requests, a focused Oracle question when the current selection likely has the answer, and Context Builder only when the relevant files are unknown. Use what you learn to name things the way the codebase does, not to add work I didn't ask for.
-
-Product copy: "balanced task brief". No new persisted mode enum.
-
-### 3.6 UI
-
-**Pill:** icon-only **Re-prompt** pill next to Interview, same metrics/conventions. Proposed (field set may adjust) `AgentRepromptPillProps: Equatable { isOn, isAvailable, isPreparing, modelDisplayName: String?, unavailableReason: String? }` added to `AgentStatusPillsSnapshot` (with `.empty` defaults). Large drafts never go through the pill snapshot.
-
-- Off + available → enable after a disclosure confirmation:
-  > Re-prompt sends the text of each eligible local prompt, your rewrite guidance, and your workspace root names and selected file paths to the workspace's primary Oracle model (*model/provider name*) before sending it to the agent. When it needs more context, it may consult Oracle or run Context Builder on this workspace, just as an agent could. This may be a different provider than your agent, with its own data-retention terms, so avoid pasting secrets. Attachments and conversation history are not included, and anything you add while reviewing goes only to the agent. You review and approve every result. (With context gathering set to Never, only the message text and guidance are sent.)
-
-  The acknowledgement (not the enable flag) is persisted as a local app preference outside `GlobalSettingsDocument`, so new windows don't re-prompt; it resets if the primary Oracle provider changes.
-- Off + unavailable → open Agent Models settings.
-- On → click disables future preparation; an in-flight operation is controlled by its own Cancel/Send Original.
-- On + unavailable → stay on, show warning; an eligible submit opens the failure/options UI rather than silently sending unchanged.
-
-**Sheet** (composer-attached, driven by a separate proposed `AgentRepromptUIStore` the input bar/presentation host observes):
-- progress: model name + Cancel/Send Original;
-- clarification: existing wizard, with a compact consult strip underneath ("Oracle: answering…", "Context Builder: discovering files (1:12)") and a **Skip context** button;
-- gathering context: shown only if questions finish before consults, with the same strip and Skip;
-- review: collapsed original, editable brief, a "Context used" disclosure (Oracle consult link opens the background chat; Context Builder file count), privacy/model note, actions;
-- error: safe message, Retry/Send Original/Cancel.
-
-"Send Original" bypasses only Re-prompt (workflow, Interview, Computer Use, attachments still apply). Review Send disabled for blank/oversized text; if open questions remain, show a warning that they stay unresolved. Every dismissal (Esc/close) = Cancel. Composer Send is unavailable while the claim is held. On Cancel, Send Original, or Send, focus returns to the composer input; all actions have accessibility labels.
-
-**Wizard adaptation:** add `showsTimeout: Bool = true` to `AgentAskUserWizardCard`; when `false` it hides the countdown (`:106–108`) **and** uses a fixed pulse period instead of `timeoutSeconds / 3.0` (`:352`). Re-prompt constructs `AgentAskUserPendingState` with the default `timeoutSeconds` as an inert value — nothing enforces it because the state is not in `TabSession` — so `UserInteractionModels.swift` stays unchanged. Activity callback may be a no-op. Question state lives in the operation, not `TabSession`; runtime pending-question projection and notifications untouched.
-
-### 3.7 Carrying approved text without changing source semantics
-
-Add `repromptedText: String? = nil` to `submitUserTurn`, `submitPreparedUserTurn`, `submitUserTurnAfterHydration` (`:18542`), `submitUserTurnAfterFreshTaskRouting` / `submitUserTurnAfterAutoEffort` (`+Routing.swift:140, 284`), `submitUserTurnAfterUsageBalancing` (`+UsageBalancing.swift:142`), and any other composer helper on that chain. Existing callers compile unchanged; only the claimed local-composer route passes non-nil. A test per wrapper asserts the replacement survives. Non-nil with `isLocalComposerInput == false` or `managedTurn != nil` is rejected; non-nil with slash source is unreachable (bypassed earlier) and is enforced by `assertionFailure` + a precondition test, not runtime behavior.
-
-| Concern | Text source |
-|---|---|
-| Command/skill classification | Original only |
-| Mention-driven auto file selection | Original only |
-| Draft restoration | Existing `rawDraftText` / claim snapshot |
-| User bubble | Approved replacement when present |
-| Provider base text | managed → native → **approved** → original |
-| Workflow wrapping | Existing workflow, once |
-| Computer Use, Interview | Existing order/behavior |
-| Usage estimation | Actual provider payload |
-| Steering / queued follow-up | Approved, wrapped payload |
-
-The bubble shows what the user approved; no new transcript metadata or serialization. Never reparse the replacement as a command: carry a "composer Re-prompt replacement" provenance flag to the slash-expansion seam in `augmentUserMessageForProviderSend` (`:20743+`) and skip slash expansion for that text. Audit every branch after `submitPreparedUserTurn`'s shown range: any provider-bound `steeringMessage` / `trimmedText` must use the final wrapped replacement; local restoration keeps using the original.
-
-**Automation:** see §3.10. Re-prompt itself never changes model selection.
-
-### 3.8 Settings and persistence
-
-Editor under Oracle settings in `AgentModelsSettingsView`. It explains that the primary Oracle writes the brief and may consult Oracle/Context Builder, and it includes a "Gather repository context: Automatic / Never" picker. Reuse reconciliation guidance's Save / Restore Default / conflict detection / Reload Current Text.
-
-| Location | Field | Default |
-|---|---|---|
-| `AgentModelsSettingsProfile` | `agentRepromptGuidance: String?` | nil |
-| `AgentModelsSettingsProfile` | `agentRepromptContextPolicy: AgentRepromptContextPolicy?` (`automatic` \| `never`) | nil = `automatic` |
-| `GlobalScalarPreferences.ModelSelectionSettings` | `agentRepromptGuidance: String?` | nil |
-| `GlobalScalarPreferences.ModelSelectionSettings` | `agentRepromptContextPolicy: AgentRepromptContextPolicy?` | nil = `automatic` |
-
-- nil/whitespace → built-in default. Trim outer whitespace only. Reject (don't truncate) oversized guidance on save.
-- New `AgentRepromptGuidance` in `RepoPromptSettingsCore`: single owner of default text, normalization, 16 KiB limit; no UI/provider deps.
-- Update profile init + custom decoding; global scalar init + decoding; effective-profile assembly and profile writes; workspace/global copies; recommendation/reset paths that rebuild profiles; any normalized reconstruction. Recommendations and unrelated model changes must preserve guidance.
-- Workspace overrides use their own guidance; nil = built-in default, **not** field-level inheritance from global.
-- Add `agentRepromptGuidanceSchemaVersion = 13`; bump `currentSchemaVersion` to 13; `requiredSchemaVersion` returns 13 **only** when a non-blank guidance override or a non-nil context policy exists globally or in any retained workspace profile. This follows the `oracleReconciliationGuidanceSchemaVersion = 11` precedent; users who never customize guidance are never fenced. Before step 2, confirm no open PR also claims schema 13 (renumber if so).
-- `AgentRepromptContextPolicy` lives in `RepoPromptSettingsCore` next to `AgentRepromptGuidance`. Unknown raw values decode as `automatic`.
-- Not persisted by Re-prompt: enable flag, model override, rewrite history, questions, drafts. (Oracle consult chats and Context Builder run history persist through their own existing owners.)
-
-### 3.9 Cancellation, lifecycle, privacy
-
-- All operation state, UI publication, claim interaction, continuation resolution on `MainActor`; provider I/O async, never blocking the actor.
-- Cancel → cancel side task, release without submitting. Send Original → cancel side work, resolve once, continue normal submission with no replacement.
-- Stop cancels preparation before ordinary run cancellation; an idle preparation must not manufacture a cancelled run attempt.
-- Window teardown cancels and releases suspended waiters. Late results from providers ignoring cancellation are rejected by operation-ID checks.
-- Claim held through clarification/review, released via existing `executeComposerSubmitAttempt` lifetime; verify `releaseComposerSubmitClaim` is paired on every exit, including invalidation and teardown.
-- CLI providers: Cancel/teardown must terminate the child process; test with a fake provider that ignores cancellation.
-- Consults: Cancel, Send Original, Skip context, invalidation, and teardown cancel in-flight Oracle (`cancelStreaming(in:)`) and Context Builder (`cancelMCPContextBuilderRun` core) work, then apply the selection-restore rule (§3.4.2). Late consult results are rejected by operation-ID checks.
-- Pre-approval failure never clears draft, attachments, workflow, or Interview. Post-approval dispatch failure: existing recovery restores the **original** draft.
-- Never log prompt text, guidance, answers, or output. Diagnostics: phase, duration, model/provider ID, sizes, error category only, routed through the existing `RepoPromptInstrumentation` / Telemetry owners; update `docs/privacy` to describe the side call, the manifest, discretionary consults, and router speculation. Drafts memory-only until approved text becomes an ordinary transcript row.
-
-### 3.10 Model Router / Auto Effort / usage-balancing integration
-
-Goal: with the Router and/or Auto Effort enabled, Re-prompt adds **no new prompts, cards, or settings interactions**, and post-Send latency is no worse than today.
-
-**Ordering (unchanged pipeline, Re-prompt prepended):**
-
-```text
-Re-prompt preparation (review/approve)
-  → worktree / destination-tab creation
-  → submitUserTurnAfterFreshTaskRouting (usage balancing → Router: fresh eligible sessions only)
-  → submitUserTurnAfterAutoEffort (eligible inactive turns)
-  → submitUserTurn → submitPreparedUserTurn
-```
-
-The Router still applies its target to an already-created destination session. Its stale checks (`composerSubmitClaimIsCurrent`, destination identity, `configuration.revision`, `selectedBackendID`, `freshTaskRoutingEligibility`) and `RoutedSelectionRollback` are unchanged. The composer claim is held throughout, so the Router's claim checks keep working.
-
-**Judged text: the approved brief.** It is a clearer task signal than the vague original.
-- **Router:** already judges the passed `text`; the wrapper passes the approved text. `freshTaskRoutingEligibility(session:text:)` evaluates the approved text (never blank or slash by construction).
-- **Auto Effort:** **fix** `submitUserTurnAfterAutoEffort` (`+Routing.swift:299–302`) to judge a proposed `automationJudgingText`, the approved text when present, instead of `claim.attempt.rawDraftSnapshot`. `rawDraftText: claim.attempt.rawDraftSnapshot` stays as-is for draft restoration.
-- **Oversized fallback:** if the approved text exceeds Auto Effort's 4,000-character eligibility limit but the original raw draft does not, Auto Effort judges the **original** rather than silently skipping. The Router's own long-text reduction handles long briefs, so the Router always judges the approved text. The audit records which text was judged.
-- The workflow category passed to Auto Effort stays `session.selectedWorkflow` (unchanged).
-
-**Hiding Router latency (speculative pre-judgment).** When review begins, the Router is enabled and backend-ready, and the source session is fresh-task-eligible, start a speculative `routeModelThenEffort` on the **generated** brief:
-- It uses a distinct request ID (`reprompt-spec-<operationID>`), so it never collides with the real `claim.attempt.id` judgment or its `freshTaskRoutingByTabID` ownership.
-- It applies nothing and owns no tab.
-
-On Send, reuse its `StagedTaskRoutingResult` only when all of these still match:
-- the approved text is byte-identical to the speculated text;
-- `configuration.revision` and `selectedBackendID`;
-- the post-usage-balancing candidate set identity (opaque keys plus targets).
-
-Otherwise cancel it via `runtime.coordinator.cancel(requestID:)` and judge normally. Reuse goes through a proposed optional `precomputedRouting:` parameter on `submitUserTurnAfterFreshTaskRouting`. Ownership registration, stale checks, `applyRoutingTarget`, and rollback all still run, so reuse only skips the network wait.
-
-The same applies to Auto Effort on follow-up turns: speculate `chooseAutoEffortForUserTurn` on the generated brief, keyed by text + session model + workflow, and reuse it under the same byte-identity rule. Every preparation exit (Cancel, Send Original, invalidation, teardown) cancels outstanding speculation. Speculation sends only what the opted-in Router/Auto Effort would send on Send. The one difference is when the user cancels after it has started; `docs/privacy` notes this.
-
-**UI coexistence.** The Re-prompt and Router pills are independent, and Re-prompt's sheet never shows routing state. On Send, the sheet closes and the Router pill shows its existing spinner (normally skipped thanks to speculation). Model controls stay enabled during review (not invalidators). They're disabled only once the Router owns the start, which is today's behavior. Re-prompt's own model (primary Oracle) is never routed.
-
-**Audit.** Extend `AgentAutomationTurnAudit` with an optional non-content `reprompt` feature record: `outcome` (approved | sentOriginal | bypassed), `consults` (none | oracle | contextBuilder | both, each with success/skipped/failed), `automationJudgedText` (approved | originalFallback), `routerSpeculation` (reused | discardedEdited | discardedStale | none). Codable optional fields default to nil, and the existing 128-record cap applies.
-
-## 4. File-by-file impact
-
-### Existing files
-
-| File | Change |
-|---|---|
-| `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` | Transient enabled state + operation ownership; preparation in claimed composer routes; propagate approved text through hydration/submission; source/display/provider text split; cancellation + final freshness. Lands atomically with the extension and text propagation. |
-| `…/AgentMode/ViewModels/AgentModeViewModel+StatusPillsUI.swift` | Setter/toggle + props projection; Interview unchanged. |
-| `…/AgentMode/ViewModels/UI/AgentStatusPillsUIStore.swift` | `AgentRepromptPillProps` + snapshot field + `.empty`; update every snapshot initializer (prod + tests). |
-| `…/AgentMode/Views/Components/AgentTogglePills.swift` | `AgentRepromptPill`, disclosure, accessibility, tooltip, unavailable behavior. |
-| `…/AgentMode/Views/Components/AgentStatusPillsRow.swift` | Insert pill after Interview; wire toggle + settings navigation. |
-| `…/AgentMode/Views/ToolCards/AgentAskUserWizardCard.swift` | Backward-compatible `showsTimeout`. |
-| `…/AgentMode/Views/AgentInputBar.swift` (or its presentation host) | Observe `AgentRepromptUIStore`, present sheet; keep submit-claim ownership. |
-| `…/AgentMode/ViewModels/UI/AgentModelsSettingsViewModel.swift` | Guidance draft/save/default/reload/conflict; writes use captured editing scope. |
-| `Sources/RepoPrompt/Features/Settings/Views/AgentModelsSettingsView.swift` | Scoped guidance editor. |
-| `Sources/RepoPromptSettingsCore/GlobalSettingsDocument.swift` | Both fields, normalization/decoding, schema 13 constant, retained-profile version detection. |
-| `GlobalSettingsStore` / effective-profile persistence owners (resolve by symbol) | Round-trip both fields via existing mutation mechanisms; publish existing change signals. |
-| `AgentModeViewModel+Routing.swift`, `AgentModeViewModel+UsageBalancing.swift` | Carry `repromptedText` through the wrappers. Auto Effort judges `automationJudgingText` instead of `rawDraftSnapshot` (`:299–302`), with the oversized fallback. Add an optional `precomputedRouting:` parameter for speculation reuse. |
-| `Features/AgentMode/Routing/AgentAutomationTurnAudit.swift` | Optional non-content `reprompt` feature record. |
-| `Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift` | Non-MCP `runContextBuilderForReprompt` wrapper over the `runContextBuilderForMCP` core; per-run `PromptEnhancementMode.preserve` override (add to the run-behavior type if absent). |
-| `Features/Chat/ViewModels/Oracle/OracleViewModel+MCP.swift` | None expected: `tool_chatSend` with background activation and a frozen `OracleSendTabContext`. Add a title hint only if one isn't already supported. |
-| `Infrastructure/AI/Providers/ClaudeCode/ClaudeAgentToolPreferences.swift` / `ClaudeCodeProvider.swift` | Only if needed: let the Re-prompt call request `.nativeSystemPrompt` delivery; private temp cwd if step 1 finds the side call runs in a workspace root. |
-| `AgentModeViewModel.swift` `augmentUserMessageForProviderSend` (`:20622`, slash expansion `:20743+`) | Provenance flag to skip slash expansion for replacements. |
-| `docs/privacy/*` | Describe the Re-prompt side call. |
-| Explicit Stop and window/session lifecycle entry points (resolve by symbol) | Cancel preparation without creating run attempts; no polling. |
-
-### New files (proposed paths)
-
-| File | Responsibility |
-|---|---|
-| `Sources/RepoPrompt/Features/AgentMode/Models/AgentRepromptModels.swift` | Request/result, validation, approved-turn value, phase/error enums, stable rendering. |
-| `Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptService.swift` | Isolated first/refinement calls, timeout, decoding, injectable transport. |
-| `Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptContextConsultant.swift` | Manifest building; Oracle consult and Context Builder run orchestration; selection snapshot/restore; result truncation; cancellation. Injectable for tests. |
-| `Sources/RepoPromptSettingsCore/AgentRepromptContextPolicy.swift` | `automatic` / `never` enum and lenient decoding. |
-| `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Reprompt.swift` | Operation lifecycle, eligibility, context capture/compare, wizard handling, review actions, one-shot completion. |
-| `Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentRepromptUIStore.swift` | Presentation store separate from pill snapshot and runtime interactions. |
-| `Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptSheet.swift` | Progress, clarification, review/edit, failure UI. |
-| `Sources/RepoPromptSettingsCore/AgentRepromptGuidance.swift` | Default text, normalization, size limit. |
-
-### Intentionally unchanged
-
-`AgentModeRunService.swift`, `AgentModeViewModel+SessionLinkSend.swift`, `AgentSessionLinkManagedSteer.swift`, `AgentWorkflow.swift`, `OracleExecutionResolver.swift` (not used for the rewrite; consults use the normal Oracle path), `UserInteractionModels.swift` (reuse only), `AgentChatItem` persistence, Router decision policies and backends (`ModelRouterDecisionPolicy`, `AutoEffortDecisionPolicy`, Decisions/Jev services).
-
-## 5. Execution index
-
-| # | Work item | Goal | Done when | Key files | Deps | Size |
-|---|---|---|---|---|---|---|
-| 1 | Resolve remaining owners + verifications | Pin the presentation host, `GlobalSettingsStore`/profile persistence owners, and Stop/teardown hooks. Confirm schema 13 is unclaimed. Verify the Claude Code side-call cwd and per-call `.nativeSystemPrompt` delivery. Confirm whether Context Builder's run behavior accepts a per-run enhancement-mode override, and whether `tool_chatSend` supports background activation and a title hint. | Remaining "resolve by symbol" rows have paths; findings recorded in this plan | — | — | S |
-| 2 | Settings contracts + schema 13 | Guidance persisted globally and per workspace | Round-trip, old-data decode, required-version tests pass at real load/save boundary | `GlobalSettingsDocument.swift`, `AgentRepromptGuidance.swift`, store | 1 | M |
-| 3 | Models + rewrite service | Stateless rewrite calls on every provider family, with strict validation | Message-level and per-provider-family capture shows only contract+guidance+text+manifest (+answers/consults); system prompt delivered on Claude Code (native), Codex (`baseInstructions`), ACP, and Devin; validation/timeout/cancel tests pass | `AgentRepromptModels.swift`, `AgentRepromptService.swift` | 1 | M |
-| 3b | Context consultant | Discretionary Oracle / Context Builder consults | Consult tests: none/oracle/CB/both, concurrency with questions, Skip, failure-non-fatal, selection restore rules, prompt never rewritten (`preserve`), cancellation | `AgentRepromptContextConsultant.swift`, `ContextBuilderAgentViewModel.swift` | 1, 3 | M |
-| 4 | Operation state + UI store (disabled by default) | Lifecycle, freshness, edited-brief recovery without touching submission | Freshness/one-shot/recovery tests pass; normal submission unaffected | `AgentModeViewModel+Reprompt.swift`, `AgentRepromptUIStore.swift` | 2, 3, 3b | M |
-| 5 | Composer integration (atomic) | Approved text flows to every provider route exactly once | Per-wrapper carry tests, submission/steering/slash tests, and session-link isolation tests pass | `AgentModeViewModel.swift`, `+Routing.swift`, `+UsageBalancing.swift`, Stop hooks | 4 | L |
-| 5b | Router / Auto Effort integration | Frictionless automation on approved text | Auto Effort judges the approved text with oversized fallback; speculation is reused on unedited Send and discarded on edit/stale; audit records written; no new UI | `+Routing.swift`, `AgentAutomationTurnAudit.swift` | 5 | M |
-| 6 | Pill, sheet, banner, settings editor | User-facing surface | Presentation tests pass; manual checks in §6.3 | pills, `AgentRepromptSheet.swift`, wizard, settings view/VM, `docs/privacy` | 2, 4 (sheet can be built against fake operations); wire-up after 5 | M |
-| 7 | Verification | Prove release acceptance | All §6 commands green | — | 1–6 (incl. 3b, 5b) | S |
-
-## 6. Verification
-
-### 6.1 New XCTest suites
-
-| Path | Coverage |
-|---|---|
-| `Tests/RepoPromptTests/AgentMode/AgentRepromptServiceTests.swift` | Primary-model-only. Request capture at `AIMessage` level and per provider family (Claude Code native system prompt, Codex `baseInstructions`, ACP, Devin): declared inputs only, empty `transientImages`. Manifest caps. First vs refinement payloads, incl. custom-answer serialization and consult results. Goal-only response valid. `contextRequests` validation (rejected on refinement). JSON validation. API 60 s / CLI 120 s timeouts. Cancellation, incl. a fake provider that ignores cancel. Bounds. Policy `never` omits manifest and context-request rules. |
-| `Tests/RepoPromptTests/AgentMode/AgentRepromptContextConsultantTests.swift` | Oracle-only, CB-only, both (concurrent), none. Consults run concurrently with clarification. Skip context. Non-fatal failure/timeout. Oracle background activation + frozen tab context. CB `clarify` + `preserve` (tab prompt unchanged). Selection kept on approval; restored on cancel/invalidation only if unchanged since commit. Result truncation markers. Late results ignored. |
-| `Tests/RepoPromptTests/AgentMode/Routing/AgentRepromptRoutingIntegrationTests.swift` | Router judges the approved text. Auto Effort judges the approved text (regression for the `rawDraftSnapshot` read) and falls back to the original over 4,000 chars. Speculation reused on byte-identical Send with same revision/backend/candidates; discarded on edit, revision change, or candidate change; cancelled on every preparation exit; distinct request ID from `claim.attempt.id`. Model change during review doesn't invalidate. Router stale checks and rollback still apply. Audit fields. |
-| `Tests/RepoPromptTests/AgentMode/AgentRepromptSubmissionTests.swift` | Eligibility; mandatory approval; raw draft preservation; invalidation (tab/workspace/draft/selection/user model change/captured-scope settings change/run transition) vs non-invalidation (other-scope settings, streaming); edited-brief recovery banner + restore; claim release on every exit; replacement carried through hydration/routing/Auto Effort/usage-balancing wrappers; workflow/Interview/CU ordering; attachments; active steering; slash-expansion bypass + slash precondition; automation after approval |
-| `Tests/RepoPromptTests/AgentMode/SessionLinks/AgentRepromptSessionLinkIsolationTests.swift` | Idle send + managed steer bypass; enabled state unchanged; zero side calls; pending local claim respected |
-| `Tests/RepoPromptTests/Settings/AgentRepromptSettingsTests.swift` | Draft/save/default; stale-scope conflict; global/workspace copies; unrelated writes preserve guidance |
-| `Tests/RepoPromptSettingsCoreTests/AgentRepromptGuidanceTests.swift` | Guidance default, normalization, size; `AgentRepromptContextPolicy` lenient decoding |
-| `Tests/RepoPromptSettingsCoreTests/AgentRepromptSchemaTests.swift` | Old decode; round-trip; required version; retained workspace overrides; rollback fence |
-| `Tests/RepoPromptTests/AgentMode/ToolCards/AgentRepromptPresentationTests.swift` | Wizard without countdown/with fixed pulse; no preselection; skips; review actions; blank/oversized validation; disclosure acknowledgement persistence/reset. Use existing view-test facilities where available; otherwise test sheet behavior through the operation and `AgentRepromptUIStore`, not SwiftUI views |
-
-Also update existing submission, pill-snapshot, settings-codec, and wizard regression suites affected by new initializer parameters/fields.
-
-### 6.2 Commands
-
-```bash
-make dev-test FILTER=AgentRepromptServiceTests
-make dev-test FILTER=AgentRepromptContextConsultantTests
-make dev-test FILTER=AgentRepromptRoutingIntegrationTests
-make dev-test FILTER=AgentRepromptSubmissionTests
-make dev-test FILTER=AgentRepromptSessionLinkIsolationTests
-make dev-test FILTER=AgentRepromptSettingsTests
-make dev-test FILTER=AgentRepromptGuidanceTests
-make dev-test FILTER=AgentRepromptSchemaTests
-make dev-test FILTER=AgentRepromptPresentationTests
-make dev-test          # full suite
-make dev-lint
-make dev-build && make dev-smoke   # live CE app check (Agent Mode change)
-```
-
-### 6.3 Manual checks
-
-Two windows preparing independently; new window doesn't re-show disclosure; new-worktree first send; primary Oracle on each provider family (API, Claude Code, Codex CLI, Cursor/OpenCode, Devin) produces a valid brief; vague repo-specific prompt triggers a consult and the brief uses codebase names; clear prompt triggers no consult; Skip context mid-Context Builder; Router + Auto Effort on: unedited Send has no visible routing wait, edited Send routes normally, follow-up turn Auto Effort judges the brief; model change during review keeps the sheet; tab/workspace switch during request and during review; Stop during each phase; unavailable credentials (pill warning + failure UI); active steering; text+attachments; every slash route; Interview + workflow together; natural run completion during review (invalidates); text scaling, keyboard dismissal (Esc = Cancel), accessibility labels.
-
-### 6.4 Release acceptance
-
-- An eligible local prompt causes **no** implementing-provider call before approval.
-- Cancellation leaves composer content and selections intact.
-- Approved text reaches every provider route exactly once.
-- Session-link / noncomposer traffic causes zero Re-prompt requests.
-- Captured rewrite payloads contain only the declared inputs: text, manifest (unless `never`), guidance, answers, and consult results. They never include conversation history or attachments.
-- With the Router and/or Auto Effort enabled, automation judges the approved brief and Re-prompt adds no extra prompts. An unedited Send reuses speculation.
-
-## 7. Tradeoffs and rejected alternatives
-
-- **Hook in `AgentModeRunService`** — rejected: provider-wide, post-commit, can't host interactive review, and would catch session-link traffic.
-- **Run as a visible child agent session with `ask_oracle`/`context_builder` tools**: rejected. It clutters the session list, makes an open-ended tool loop hard to bound in time and cost, and needs MCP plumbing per provider. A structured `contextRequests` response that the app executes gives the rewriter the same discretion with hard limits (one round, ≤1 of each consult) and works identically on every provider.
-- **Router judges the original text**: rejected. The brief is the better signal; the original is only a fallback for Auto Effort's size limit.
-- **Speculating before review** (on the first result): rejected. Briefs often change after clarification or refinement, which would waste a judgment.
-- **Reuse `OracleExecutionResolver.resolve(.automatic)`** — rejected: brings presets, extra lanes, and prompt context.
-- **Auto-send without review** — rejected: no mechanical drift detection; review is the core anti-micromanagement safeguard.
-- **Refinement from first response** — rejected in favor of original + Q/A to avoid compounded drift.
-
-## 8. Risks and migration
-
-- **Settings compatibility:** old docs decode with nil guidance; no eager rewrite. A non-blank override requires schema 13 so older codecs reject instead of silently dropping it. Rollback to a schema-12 build may make the document unavailable to that build — keep existing unsupported-document safeguards; never auto-downgrade or strip. Test at the real store load/save boundary and confirm the store advertises schema-13 support.
-- **Meaning drift:** mitigated by mandatory editable review, not by guidance alone.
-- **Latency/cost:** up to two primary-Oracle rewrite requests plus at most one Oracle consult and one Context Builder run (30 s–5 min). Mitigations: guidance biases toward no context, consults overlap with clarification, Skip context is always available, and the `never` policy exists. Router speculation adds at most one wasted 5 s Decisions judgment on edited sends.
-- **Context Builder side effects:** selection commit and run history persist. The prompt is never rewritten (`preserve`), and the selection is restored on cancel. If no per-run enhancement override exists, adding one is in scope (step 3b).
-- **Consult findings inflating scope:** the fixed contract treats them as context, not requirements, and review is the backstop.
-- **Stale submission:** long reviews widen races → immutable context, held claim, eager invalidation, post-await checks are mandatory.
-- **Unexpected command execution:** classify only original input; suppress slash expansion for replacements.
-- **Context leakage:** verify the actual rewrite payload. The rewrite must not use normal Oracle prompt packaging; repo content reaches only the consults, which use their normal paths.
-- **Recovery assumptions:** downstream branches of `submitPreparedUserTurn` beyond the reviewed range must be tested with replacement provider text and original restoration text.
-
-## Implementation ledger
-
-### Progress and deviations
-
-- Step 2: schema 13 plus both scoped fields, typed decoding, normalization, effective-profile assembly and writes implemented. Added `AgentRepromptGuidanceTests` and `AgentRepromptSchemaTests`, including real store reload/reset/retained-profile checks. Coordinated validation initially found a test-only existential initializer error; corrected to `GlobalSettingsFileStore(...)`; explicit module rerun passed (3 tests, zero failures): `make dev-test MODULE=RepoPromptSettingsCoreTests FILTER='AgentReprompt(Guidance|Schema)Tests'`. Regex-only filter did not resolve the app-free owner and unnecessarily built the app; its service compiler diagnostic was corrected before subsequent app validation. Validation generated an unrelated `Package.resolved` update; restored it rather than shipping dependency drift. The user-requested plan requires a durable-doc allowlist entry; the seven requested app-boundary suites require the exact +7 test-import ratchet ceiling (no source-size ratchet relaxation).
-- Open PRs touching settings (#1339, #854, #344) were inspected via read-only `gh pr diff`; none introduces a schema-version constant or claims schema 13.
-- Formatter deviation: conductor's `format` command does not accept file paths. Used `swiftformat <explicit changed paths> --config .swiftformat` rather than reformatting the whole repository; final lint remains daemon-coordinated.
-- Step 3b correction: `.preserve` controls generated instructions but terminal Context Builder commit still installs tool-authored prompt text and an empty-prompt output fallback. Re-prompt adds an internal per-run exact-preservation commit policy; ordinary Context Builder behavior remains unchanged. Its non-MCP wrapper uses a private token internally to reuse existing generation-safe run ownership, never a caller-supplied MCP token.
-
-### Validation ledger
-
-- Step-2 checkpoint: `ae32ef1aa` (`feat(agent): persist scoped Re-prompt settings with schema 13`); staged-index secret scan and repository preflight passed. Settings suites passed 3/3 in coordinated ticket `c3dd3a91-c2ea-46ca-92e7-64db0846f464`.
-- `make dev-swift-build PRODUCT=RepoPrompt`: ticket `ad9f17b6-5941-42d5-825e-f4b4f14e3034` failed before app compilation: pinned `swift-http-types` 1.5.1 declares no traits but `swift-nio-extras` requests `FoundationURL`. Coordinated Xcode test backend resolves 1.8.0; its lockfile changes are validation-only and must be restored before checkpointing. No dependency change is intended in this feature branch.
-- Compiler iteration: fixed `ConversationEntry.Role.user` typing and split a ternary out of a guard because SwiftFormat's `andOperator` rule converted its `&&` expressions into invalid guard commas.
-- Provenance deviation: shared queued steering crosses the run service's input-assembly hook. Correct slash-expansion suppression therefore requires a default-false, non-content provenance bit on queued instructions and the assembly hook, including a small `AgentModeRunService` change; the service still never invokes or observes Re-prompt preparation. ACP batches separate ordinary input from approved replacements.
-- Extracted the existing pure MCP context-hint matcher into its own small extension so the existing 5,000-line source-file ratchet remains unchanged after formatting the modified context owner.
-
-### Automation and privacy corrections
-
-- Candidate opaque keys are freshly randomized on every builder call. Speculation therefore retains the exact staged opaque-key/target pairs and validates their authoritative metadata snapshot, role defaults, configuration/backend, and usage revision instead of regenerating different keys for comparison. It also replays the captured usage-balancing arithmetic before reuse, including time-sensitive quota changes. Ownership, stale checks, application and rollback still use the normal composer path.
-- Speculative Auto Effort uses a separate request ID and does not publish `session.autoEffortJudgmentID` or a spinner while review is open. Approved-text size fallback uses the original raw draft; source command classification and draft restoration remain original-only.
-- The plan's sentence that review edits go “only to the implementing agent” conflicts with its requirement that enabled Router/Auto Effort judge the approved edited brief. Privacy copy is explicit: edits are never sent back to the rewrite model, but opted-in decision services receive their ordinary approved-text judgment input.
-- Ticket `6728835b-2ccc-43fd-9960-d7cce49fbdf3` compiled the app and ran 14 focused tests: all five consultant tests passed; five service/operation cases failed because their fixture referenced removed catalog model `gpt-4o`. Replaced that fixture with the current built-in `gpt61Sol`; rerun is required.
-
-- Step-3b checkpoint: `ced6330b0`; mandatory staged-index preflight passed. Ticket `10bc8153-422e-4a56-82ff-a2d6d4a6d70a` compiled the application and all tests, and passed service (6), consultant (5), session-link isolation (3), settings-core (3), and most submission/routing cases. Two fixture failures were corrected: active steering needs a real persistent session binding before minting a composer target; Auto Effort must choose a model supported by its policy, not merely one advertising effort controls. Focused rerun pending.
-
-### UI and final verification in progress
-
-- Step-5b checkpoint: `520e38a39`; staged-index commit preflight passed. Routing integration passed all five cases in ticket `8239b9fc-835c-4cdd-93c4-057790c8790b`. Active-steering fixture additionally required `recordRestorationAuthoritative(.persistedPayloadApplied)` after installing a persistent binding; the next combined run includes this correction.
-- Step 6 adds a transient pill, locally persisted provider disclosure acknowledgement (not enablement), mandatory composer sheet, timeout-free shared wizard, review validation, recovery restore/confirmation, scoped guidance/policy editor, and privacy documentation. A primary-provider change blocks the next rewrite pending renewed disclosure, rather than silently transmitting to a new provider.
-- Initial `make dev-lint` could not run because the system SwiftFormat was 0.63.1 while the repository requires 0.61.1. `make dev-install-format-tools` installed the pinned release successfully; coordinated lint is being rerun. Explicit changed-file formatting was initially performed with the system binary; pinned validation remains authoritative.
-- Oracle review was attempted twice with the prepared diff artifacts and selected live feature files. Both sends aborted before model execution because RepoPrompt's context reader insists on resolving a stale main-checkout plan path, despite removing it from selection. The main checkout is deliberately untouched; this is not a completed independent review.
-- Remaining evidence gaps: manual/two-window/accessibility checks, actual factory-provider-family payload captures and real CLI child-termination checks have not yet been performed. The message-level privacy boundary and cancellation-ignoring fake are covered. No visible app launch/relaunch or live provider requests have been made.
-
-### Step 1 — owner verification (2026-10-20)
-
-- Settings authority: `Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift` (`globalAgentModelsProfile`, `setGlobalAgentModelsProfile`, `normalizedAgentModelsProfile`); profile/scalar codecs in `GlobalSettingsDocument.swift`. Schema 13 is unclaimed in this base (current is 12); open-PR file checks are recorded with subsequent validation.
-- Presentation host: `Features/AgentMode/Views/AgentInputBar.swift`; held claim lifecycle is `executeComposerSubmitAttempt` in `AgentModeViewModel.swift`. Explicit Stop: `cancelAgentRun`; window teardown: `prepareForWindowClose` in that same owner.
-- Claude factory builds `ClaudeCodeProvider()` with nil working directory; `CLIProcessConfiguration.resolvedWorkingDirectory(nil)` resolves to the temporary directory, not the workspace. Native delivery currently reads a global preference inside `completeMessage`; a request-local override is required, without mutating the preference.
-- Context Builder's `ContextBuilderRunBehavior` already has an enhancement mode, and its DEBUG convenience entry demonstrates constructing `.preserve` per run. Production entry takes resolved authority and a control token, so a non-MCP wrapper must reuse that core with private ownership.
-- Oracle `OracleSendTabContext` supports `.background`; `tool_chatSend` already accepts `chat_name`, so no title-hint API addition is needed.
-- Maintainer-guidance check: mandatory review is the user-intent authority; held composer claim and captured context protect state; side calls must be bounded/observable and must not acquire noncomposer authority. Validation targets the actual settings and composer boundaries, not a parallel submission path.
-
-### Step-6 validation
-
-- Step-6 checkpoint: `57898aef9`; staged secret scan and repository guardrails passed. Final unfiltered `make dev-test` is ticket `4c987b21-a257-444f-8b60-aa2bf1ce22a3`; final product build is queued behind it as `c81f574d-f227-4983-b161-f7dd034d5388`. Final committed-source `make dev-lint` ticket `f3afbf58-c225-4f93-bf15-f8ed3eda8f12` completed successfully.
-
-- `make dev-test FILTER=AgentReprompt`: ticket `288f9d32-b415-4a11-b9bd-9233af452fa8` passed all nine requested suites: 34 app tests plus 3 settings-core tests, zero failures. Earlier presentation assertion incorrectly equated “no preselection” with an empty draft dictionary; the shared wizard creates empty records per question, and the corrected assertion checks their actual option/custom/skip values.
-- `make dev-lint`: ticket `3d9d98c9-8c1a-4f3b-9716-e0fba69581be` passed pinned SwiftFormat and strict SwiftLint (0/1845 files require formatting). The final two small recovery/test edits were subsequently formatted with the same pinned formatter; full final checks follow.
-- Added eager source-session observation and direct draft-write invalidation (draft text itself is not published). Stop preserves reviewed text without manufacturing an idle run cancellation. Immediate submission and asynchronous manual-dispatch rejection preserve the original draft and recover the approved brief separately. Explicit brief replacement acknowledges the existing restoration ledger so old fragments cannot reappear on the next editor write.
-- Command-provenance correction: a user may edit a brief to begin with `/`; it remains data. Original text owns command eligibility, and Auto Effort explicitly permits slash-like approved replacements. Normal non-Re-prompt command handling remains unchanged.
-- Still unverified/incomplete polish: per-consult completion status is consolidated after clarification, not updated independently while a question is open; native-sheet interaction with underlying model controls needs manual verification. Queued runtime-failure recovery beyond the manual submission rollback path is not yet separately covered. These do not have a completed acceptance claim.
-
-### Final verification results
-
-- **PASS** `make dev-test FILTER=AgentReprompt`: 37 tests across all nine named suites (ticket `288f9d32-b415-4a11-b9bd-9233af452fa8`).
-- **PASS** `make dev-lint`: pinned SwiftFormat 0.61.1 plus strict SwiftLint (final ticket `f3afbf58-c225-4f93-bf15-f8ed3eda8f12`).
-- **PASS** `make dev-swift-build PRODUCT=RepoPrompt`: final ticket `c81f574d-f227-4983-b161-f7dd034d5388`, exit 0. This supersedes the earlier dependency-resolution failure; `Package.resolved` is unchanged.
-- **NOT GREEN / INCOMPLETE** `make dev-test`: ticket `4c987b21-a257-444f-8b60-aa2bf1ce22a3` reached its 3,600-second timeout after 5,455 passing cases. It recorded assertion failures in three existing test methods, then timed out during `WorkspaceRootReconciliationTests.testBlockedDirectoryProbeDoesNotBlockWindowCloseOrSwitch`. A full-suite pass has not been established.
-- All three recorded failing methods **passed isolated reruns**, without source/test changes: `AgentSessionLinkRuntimeBridgeTests/testBusyTargetHoldsOneEntryAndDeliversOnTheNextReadinessPublication` (ticket `dfc1e450-92e1-4a4c-a0a7-388c6df481da`, 1 test); `AgentTranscriptPaneSnapshotPublicationTests/testTargetReplacementDropsOutgoingRowsFromPublishedSnapshot` and `AgentTranscriptRestorationLifecycleTests/testCancelledCurrentLoadWithLocalContentPresentsTranscriptWithoutLatchOrProof` (ticket `5981f0f3-c363-4a89-bad4-d609fdd32ed3`, 2 tests). Timing/order sensitivity is plausible, but no baseline attribution or unrelated repair is claimed.
-- Checkpoint commits were created after mandatory staged-index secret scans and repository preflight: step 2 `ae32ef1aa`, step 3b `ced6330b0`, step 5b `520e38a39`, step 6 `57898aef9`.
-- Main checkout untouched; no other worktrees, merges, pushes, visible app launches/relaunches, or live-provider requests. Live smoke/manual checks, the actual-provider-family capture/child-termination matrix, independent Oracle review, and the polish/coverage gaps listed above remain open. This branch does **not** claim full release acceptance yet.
-
-### Changed-file inventory (relative to d9d0f21)
-
-```text
-Scripts/source_layout_guardrails.sh
-Sources/RepoPrompt/App/WindowStateComposition.swift
-Sources/RepoPrompt/Features/AgentMode/Models/AgentRepromptModels.swift
-Sources/RepoPrompt/Features/AgentMode/Routing/AgentAutomationTurnAudit.swift
-Sources/RepoPrompt/Features/AgentMode/Routing/UsageBalancing/AgentUsageBalancer.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunService.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunServiceHooks.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptContextConsultant.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptService.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunPendingInstruction.swift
-Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunStartOutcome.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+DraftsAttachments.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Reprompt.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RepromptAutomation.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RepromptUI.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Routing.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+StatusPillsUI.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+UsageBalancing.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentTabSession.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentModelsSettingsViewModel.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentRepromptUIStore.swift
-Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentStatusPillsUIStore.swift
-Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift
-Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptPill.swift
-Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptSheet.swift
-Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentStatusPillsRow.swift
-Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/AgentAskUserWizardCard.swift
-Sources/RepoPrompt/Features/Chat/ViewModels/Oracle/OracleViewModel+MCP.swift
-Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift
-Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderRunLifecycle.swift
-Sources/RepoPrompt/Features/Settings/Views/AgentModelsSettingsView.swift
-Sources/RepoPrompt/Features/Settings/Views/AgentRepromptSettingsEditor.swift
-Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift
-Sources/RepoPrompt/Infrastructure/MCP/MCPInvocationContext.swift
-Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+ContextHint.swift
-Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift
-Sources/RepoPromptSettingsCore/AgentRepromptContextPolicy.swift
-Sources/RepoPromptSettingsCore/AgentRepromptGuidance.swift
-Sources/RepoPromptSettingsCore/GlobalSettingsDocument.swift
-Sources/RepoPromptSettingsCore/GlobalSettingsStore.swift
-Tests/RepoPromptSettingsCoreTests/AgentRepromptGuidanceTests.swift
-Tests/RepoPromptSettingsCoreTests/AgentRepromptSchemaTests.swift
-Tests/RepoPromptTests/AgentMode/AgentRepromptContextConsultantTests.swift
-Tests/RepoPromptTests/AgentMode/AgentRepromptServiceTests.swift
-Tests/RepoPromptTests/AgentMode/AgentRepromptSubmissionTests.swift
-Tests/RepoPromptTests/AgentMode/Routing/AgentRepromptRoutingIntegrationTests.swift
-Tests/RepoPromptTests/AgentMode/SessionLinks/AgentRepromptSessionLinkIsolationTests.swift
-Tests/RepoPromptTests/AgentMode/ToolCards/AgentRepromptPresentationTests.swift
-Tests/RepoPromptTests/Helpers/AgentSessionLinkRunnerTestSupport.swift
-Tests/RepoPromptTests/Settings/AgentRepromptSettingsTests.swift
-docs/migrations/build-modularization/ratchets.json
-docs/plans/agent-mode-reprompter-2026-10-20.md
-docs/privacy/telemetry.md
-```
-
-### Static-review corrections (2026-10-20)
-
-- Verified and fixed rejected ACP steering losing `skipsSlashExpansion` when rebuilt as a pending instruction. Added a regression at the real settlement boundary.
-- Re-prompt Context Builder commits suppress ordinary completion notifications/dock bounce whenever prompt preservation or a selection observer identifies the preparation consult. Ordinary Builder completions retain notifications.
-- Corrected disclosure and privacy documentation: Oracle consults use the configured roster with selected file contents, tab prompt and frozen git review context; Context Builder uses its own configured agent/provider and repository-reading tools. Roster behavior is unchanged. Version-2 receipts are per recipient configuration/context policy (and persist independently across provider switches), invalidating the old incomplete disclosure. Changes to that identity invalidate an active preparation.
-- Unknown stored context-policy values now fail closed to Never; an absent setting still defaults to Automatic. This intentionally tightens the original fallback.
-- Consultant selection disposition is fixed by the first terminal decision. Approval-kept state never restores on late selection observation, late task return or repeated cleanup; a skipped/cancelled consult still restores its own late commit. Added deterministic regressions.
-- User cancellation uses the composer's existing silent empty-blocked result, retaining the draft rather than reporting an error or pretending submission succeeded. Submissions bypassing Re-prompt no longer consume an existing recovery.
-- Removed only whitespace-only differences from the seven named existing files relative to base `d9d0f21`; functional changes are retained. Newly edited feature/test files were formatted with pinned SwiftFormat 0.61.1, without repository-wide mutation.
-- Independent Oracle static review completed successfully (`untitled-chat-18ABBC`), no findings. This supersedes the earlier failed review attempts but does not close the manual/live-provider acceptance gaps above.
-- Review-fix validation: **all requested commands passed** (exit 0):
-  - `make dev-test FILTER=AgentReprompt`: 43 cases across all nine feature suites; ticket `576b9b94-a5e4-4eae-8096-bcd2a0ed4b61`.
-  - `make dev-test FILTER=AgentSessionLink`: 1,273 cases (1,125 app + 148 supporting-target cases); ticket `0847d72c-30e9-4ded-8118-d381a8a86023`.
-  - `make dev-test FILTER=ContextBuilder`: 213 cases (204 app + 9 MCP-core); ticket `7b6ed46f-62fe-4c02-b7ba-25824a709bd7`.
-  - `make dev-swift-build PRODUCT=RepoPrompt`: ticket `0dee7ba9-e934-47df-8c92-22e9fb073c0b`.
-  - `make dev-lint`: pinned SwiftFormat (0/1845 files require formatting) and strict SwiftLint; ticket `b8ffb1a0-a5e9-4755-b388-08bc834914ad`.
-- Static comparison against base confirms no whitespace-only replacement hunks remain in the seven named files. No visible-app lifecycle actions, live-provider requests, pushes or main-checkout edits were performed. The earlier unfiltered-suite/manual acceptance gaps remain outside this focused review-fix validation.
-
-## v2 — inline, streaming preparation (2026-10-21)
-
-This user-approved rework supersedes the v1 modal/consult design and its UI acceptance requirements above.
-
-- First Send prepares without acquiring/latching a composer submit claim. A preparation UUID, per-call revision, operation-owned draft generation and 40 ms coalesced publications fence every stream update. The second Send obtains a fresh local composer claim and atomically adopts the completed draft/speculation. Composer text is the only editable authority; attachments/tagged files and workflows remain on their ordinary owner.
-- Removed `AgentRepromptSheet` and its host. Inline status/elapsed time, Cancel/Esc, Show original, Undo and recoverable partial/edited text use the existing composer. Read-only streaming uses its existing capped-height scroll view; one native undo action represents the replacement rather than one action per token. Send original becomes available after five seconds as a second explicit Send action: it restores the original and dispatches through ordinary fresh-claim admission, without waiting for generation. Completing generation itself never dispatches.
-- Before sending questions use a transient transcript slot with the existing timeout-free ask_user wizard. They never enter implementing/provider history or runtime ask_user state. Skips do not refine; substantive answers cause at most one refinement rebuilt from original text + answers.
-- New profile-scoped `agentRepromptModelRaw` extends schema 13: nil is Automatic, `primary-oracle` opts into the primary Oracle, and any other raw selection is explicit (unknown/disconnected values do not silently fall back). Guidance/model values retain requiredSchemaVersion feature fencing and scoped copy/reset/conflict behavior. The removed context-policy field is safely ignored on decode and not written back.
-- Automatic uses the current catalog's Sonnet 5.5 Low and Codex GPT-6.1 Sol Low tiers, preferring the current agent's connected native subscription, then the other subscription, then configured API models, with Oracle last. Resolution is frozen for the operation/retries. Settings and the pill's right-click menu share an OptimizedModelPicker binding-backed selector, filtered to configured streaming side-call models. The resolved model is visible. Auto Effort uses its existing masked summary/decision policy/backend/coordinator for the rewriter's supported effort variants, without mutating implementing-session settings.
-- Genuine provider streaming replaces complete-string rewriting. Native Claude print mode now has a request-scoped NDJSON partial-message path with strict empty MCP config, no tools and no global preference mutation; other side calls use provider.streamMessage. The 60/120-second safety race remains. Markdown is emitted directly; an explicit framed trailing question block is withheld incrementally (including delimiter prefixes), bounded and validated only when complete. Truncated/error output stays recoverable and cannot unlock Send as a success.
-- Deleted consultant, consultant tests, context request/result types, context-policy type/editor, separate review text/approval authority, frozen lookup/git packaging, Oracle chat links, selection commit/rollback and prompt-preservation/consult notification suppression plumbing. Generic Oracle cancellation checks/cleanup are retained: they protect ordinary Oracle/MCP calls independently of the removed consultant.
-- Router/turn-effort speculation is keyed to preparation UUID + complete content, starts only after a complete brief, transfers to the fresh local claim and is discarded on edits/stale policy. Audits retain outcomes and speculation/fallback flags only; no consult branches remain.
-
-### v2 recent-chat addendum
-
-- Include recent chat context defaults **on, transient per window**, like enablement. Only at least two previously completed user turns qualify. The projection uses canonical completion identities, user bubble text (approved rewrite where applicable), and only the final assistant text; never provider workflow envelopes, tools, attachments, reasoning or diffs.
-- Last up to three prior turns, assistant replies trimmed UTF-8-safely to 1.5 KiB (start + end), serialized total capped at 8 KiB by dropping oldest first. Only post-compaction rows qualify. The composer strip says with chat context only when excerpts were actually included; the pill menu exposes the toggle. Session-link/noncomposer submission paths never invoke preparation/history packaging.
-- Fixed service contract, not editable guidance, marks history as background for vocabulary/intent only: current message wins, assistant statements are unverified, and corrections/frustration/redirects must abandon rather than perpetuate prior failed approaches. Updated recipient disclosure and privacy documentation mention excerpts; version-3 disclosure receipts do not reuse consult-era acknowledgements.
-
-### v2 implementation findings / deviations
-
-- Providers without a catalogued, transport-supported effort variant retain their provider-native effort behavior. In particular the current Anthropic API SDK does not expose an effort/output-config field; no unsupported request parameter is invented. Native subscription and supported API variants use Low by default and the existing Auto Effort decision path when enabled, while preserving explicit billing/service tiers.
-- Independent static review (`untitled-chat-1AAF50`) found four issues, verified and corrected: composer publications now have revision acknowledgements so final user edits flush on tab departure; Claude whole-message fallback rejects truncated stop reasons; Automatic includes configured Claude-compatible API routes before Oracle; history strips indented/quoted backtick and tilde diff/patch fences and conservatively omits replies containing raw/unlabelled unified-patch signatures. Focused regressions cover each.
-- Preflight's app-test-import-file ratchet rejected separate new history and model-policy test files (341 > 340). The two suites share `AgentRepromptHistoryTests.swift`; no baseline was loosened and no tests were removed.
-- The existing composer height cap/internal scroll was reused rather than introducing a second text editor. Native undo registers one completed replacement action rather than holding an undo group open across asynchronous streaming.
-
-### v2 changed-file inventory
-
-Paths are relative to their indicated owner. 50 files: 9 added, 36 modified, 5 deleted.
-
-| Owner | Added / modified files |
-| --- | --- |
-| `Sources/RepoPrompt/App` | `WindowStateComposition.swift` |
-| `Sources/RepoPrompt/Features/AgentMode/Models` | `AgentRepromptModels.swift`, **new** `AgentRepromptHistory.swift`, **new** `AgentRepromptModelPolicy.swift` |
-| `…/AgentMode/Runtime` | `AgentRepromptService.swift`, **new** `AgentRepromptOperation.swift` |
-| `…/AgentMode/Routing` | `AgentAutomationTurnAudit.swift` |
-| `…/AgentMode/ViewModels` | `AgentModeViewModel.swift`, `AgentModeViewModel+DraftsAttachments.swift`, `AgentModeViewModel+Reprompt.swift`, `AgentModeViewModel+RepromptAutomation.swift`, **new** `AgentModeViewModel+RepromptEffort.swift`, `AgentModeViewModel+RepromptUI.swift`, `AgentModeViewModel+Routing.swift`, `UI/AgentModelsSettingsViewModel.swift`, `UI/AgentRepromptUIStore.swift` |
-| `…/AgentMode/Views` | `AgentInputBar.swift`, `AgentModeView.swift`, `Components/AgentRepromptPill.swift`, `Components/AgentStatusPillsRow.swift`, **new** `Components/AgentRepromptComposerStrip.swift` |
-| `Sources/RepoPrompt/Features/ContextBuilder/ViewModels` | `ContextBuilderAgentViewModel.swift`, `ContextBuilderRunLifecycle.swift` |
-| `Sources/RepoPrompt/Features/Settings/Views` | `AgentRepromptSettingsEditor.swift`, **new** `AgentRepromptModelPicker.swift` |
-| `Sources/RepoPrompt/Infrastructure/AI/Providers` | `ClaudeCodeProvider.swift`, **new** `ClaudeCode/ClaudeCLITextStreamDecoder.swift` |
-| `Sources/RepoPrompt/Infrastructure/MCP` | `MCPInvocationContext.swift`, `ViewModels/MCPServerViewModel+TabContext.swift` |
-| `Sources/RepoPrompt/Infrastructure/UI/TextField` | `ResizableTextField.swift` |
-| `Sources/RepoPromptSettingsCore` | `AgentRepromptGuidance.swift`, `GlobalSettingsDocument.swift`, `GlobalSettingsStore.swift`, **new** `AgentRepromptModelPreference.swift` |
-| `Tests/RepoPromptTests/AgentMode` | `AgentRepromptServiceTests.swift`, `AgentRepromptSubmissionTests.swift`, **new** `AgentRepromptHistoryTests.swift` (history and model-policy suites), `Routing/AgentRepromptRoutingIntegrationTests.swift`, `SessionLinks/AgentRepromptSessionLinkIsolationTests.swift`, `ToolCards/AgentRepromptPresentationTests.swift` |
-| `Tests/RepoPromptTests/Settings` | `AgentRepromptSettingsTests.swift` |
-| `Tests/RepoPromptSettingsCoreTests` | `AgentRepromptGuidanceTests.swift`, `AgentRepromptSchemaTests.swift` |
-| `docs` | `plans/agent-mode-reprompter-2026-10-20.md`, `privacy/telemetry.md` |
-
-Deleted:
-- `Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRepromptContextConsultant.swift`
-- `Sources/RepoPrompt/Features/AgentMode/Views/Components/AgentRepromptSheet.swift` (including its host)
-- `Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+ContextHint.swift` (ordinary helpers restored to their existing TabContext owner)
-- `Sources/RepoPromptSettingsCore/AgentRepromptContextPolicy.swift`
-- `Tests/RepoPromptTests/AgentMode/AgentRepromptContextConsultantTests.swift`
-
-### v2 verification
-
-Final coordinated validation (2026-10-21), all exit 0:
+Final frozen-source validation (2026-10-21):
 
 | Command | Result | Conductor ticket |
 | --- | --- | --- |
-| `make dev-test FILTER=AgentReprompt` | 53 tests, 0 failures (50 app + 3 settings-core), including both consolidated new suites | `6de9c6f1-c84e-42bd-ab9b-d25496e99751` |
-| `make dev-test FILTER=AgentSessionLink` | 1,273 tests, 0 failures | `0d60bb1b-8389-4026-82f2-35990e25cc08` |
-| `make dev-test FILTER=ContextBuilder` | 213 tests, 0 failures | `492fc46e-4b99-46a1-9b02-d1830c3dce1e` |
-| `make dev-swift-build PRODUCT=RepoPrompt` | Product build passed; no packaging/launch | `4a77389a-4a1d-45ed-a540-edc9bf90b5fe` |
-| `make dev-lint` | SwiftFormat 0/1,849 files need formatting; strict SwiftLint passed | `5cfa3247-de5c-422e-90bd-fdca48a332f9` |
+| `make dev-test FILTER=AgentReprompt` | 76 tests (72 app + four settings-core), zero failures | `67ae6333-0d1f-420b-8659-83ee36bdc12a` |
+| `make dev-test FILTER=AgentSessionLink` | 1,273 tests, zero failures | `5a81a12d-612b-45ec-bcdb-407dace2c421` |
+| `make dev-test FILTER=AgentModelsSettings` | 11 tests, zero failures | `b1bdeaac-d8c2-4c6b-9ba3-e55092d32d39` |
+| `make dev-test FILTER='GlobalSettings\|ProviderUsageBalancer\|ResizableTextField\|ContextBuilder'` | 257 distinct tests, zero failures; covers GlobalSettings 37, ProviderUsageBalancer four, ResizableTextField seven, ContextBuilder 213 (four overlapping matches run once) | `f70bfa0c-760a-4fb7-a944-b2606647b230` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | Passed, no packaging or launch | `9b52002c-0f35-48b1-9d38-128bbd20daaa` |
+| `make dev-lint` | Passed; 0/1,851 files need formatting; strict SwiftLint passed | `870854ed-2787-466d-a544-299a85b75517` |
+| `python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json` | Passed after the product build: wrong-way edges **1360/1360**, largest cycle 63/66 | Local compiler-index JSON with source hashes |
 
-Changed Swift files were formatted with the pinned SwiftFormat 0.61.1 only; no repository-wide mutation. Independent static review was performed once and all four verified findings were corrected. Earlier attempts exposed a missing explicit `self`, a native-undo test-harness grouping exception, and a prohibited `.help` modifier; these were fixed before the final green runs. Session-link validation was repeated on a frozen source snapshot after an earlier successful run reported changed source freshness.
+The first Re-prompt test run exposed missing persistent bindings in two new synthetic active-session fixtures, not compiler failures; corrected their setup before the green rerun. Initial diagnostic/validation jobs were explicitly cancelled before source adjustments, not counted as passing validation. After the first three filters passed, remaining filters were batched without changing their test set to reduce repeated shared-heavy admission waits; the superseded standalone GlobalSettings ticket was cancelled before admission. The final Re-prompt run recorded 15 minutes of coordinated global-heavy admission wait; no queue bypass was used. Only changed Swift files were formatted with the pinned formatter (the large VM's last adjustment used a line range); no formatting baseline was changed.
 
-Staged-index commit preflight passed after test consolidation (secret scan: no leaks; guardrails and all 15 guardrail tests passed), and must be rerun after staging this final documentation update. Remaining modularization growth messages are advisory, not ratchet failures; no baseline was relaxed.
+The staged-index contribution preflight (`.agents/skills/rpce-contribution-check/scripts/preflight.sh commit`) is the final gate before the local commit, rerun after any staging change. Optional full `pr-ready`/unfiltered validation was not run after the lengthy coordinated focused runs; full CI remains necessary. Existing compiler/package warnings are not represented as new failures.
 
-Not run: unfiltered/release validation or live-provider/manual UI smoke testing. No visible app lifecycle action, push or main-checkout mutation was performed; those remain outside this request.
-
-### v2.1 — composer usability refinement (2026-10-21)
-
-User live validation confirmed native Claude Code Sonnet 5.5 Low rewriting works. This refinement supersedes v2's Review-only UI, transient history toggle and special model-menu choices.
-
-- **Spinner root cause (confirmed):** `AgentStatusPillsRow` consumes a cached value snapshot. Preparation refreshed it at start/close, but phase completion/clarification/refinement did not refresh it. The operation now publishes a post-mutation state-change callback to rebuild that snapshot. Only generating/refining phases spin; neither questions, completed drafts nor router speculation do.
-- Completed header is compact and left-aligned: resolved model, dimmed/struck single-line first original (click to expand), adjacent Revert icon, then a subtle right-hand keyboard hint. Removed Show original/Undo buttons from the far right.
-- Return retains existing Send admission: prepare when enabled/unprepared, dispatch exact edited composer text when prepared. Cmd+Return is explicit Review preparation/re-preparation, even with the pill off; unchanged rewrites regenerate from the first original, edits become the new source, and the reference/restoration text remains the first original. Esc cancels streaming or reverts completed text. Revert registers one native undo action restoring its edited recovery; attachments/workflows remain untouched. Undo/recovery checks the live active tab, so a retained native undo callback cannot restore an inactive tab. The final focused/build/lint rerun covers this additional ownership fence.
-- **Shortcut audit:** the generic local editor previously treated Cmd+Return like Return (no distinct composer command). An edit-review card owns Cmd+Return for Accept. Re-prompt only intercepts the first-responder local editor, and refuses while any pending interactive review/input exists, preserving that card's shortcut. Shift+Return and Cmd+Shift+Return remain newline; noncomposer fields keep existing behavior. No alternate chord is necessary in the eligible local composer.
-- Persisted `agentRepromptMode` (Review default / opt-in Send automatically) and `agentRepromptIncludesRecentChat` (on default) extend schema 13 and its required-version fence across global/workspace profiles, copies, conflict checks and restarts. Unknown mode values fail closed to Review. Auto dispatch uses a one-use, operation/generation-fenced completion intent and a fresh ordinary composer claim; any questions, including skip-all, force Review. Explicit Cmd+Return always requests Review.
-- Model row/menu now uses the standard concrete model picker directly; no named default mode or Use primary Oracle choice. Nil remains an internal subscription-first default, presented as the actual resolved model. Legacy Oracle linkage decodes to the concrete Oracle model (an unresolved missing Oracle remains unavailable rather than switching routes). Settings show the requested subscription caption and effort sentence. Guidance is collapsed under Rewrite guidance (advanced); Restore Default affects guidance only.
-- Recent-history preference now persists in the same profile and is available in Settings and the pill menu. One-shot preparation uses the same recipient disclosure, without enabling the pill. Privacy copy documents opt-in auto dispatch.
-
-**Maintainer-guidance check:** user impact is explicit, predictable preparation/send ownership and no stuck busy indicator; confidence in snapshot root cause is confirmed by code and a cached-snapshot regression. Authorities remain canonical composer draft, operation identity/revisions, scoped settings and existing submit claims. Safety boundaries are cancellation, late completion, user edits, question fallback and disclosure; no new repository scanning or provider work is introduced by UI projection. Scope is this cohesive refinement now, with focused suites/build/lint and one independent static review; live UI/provider validation remains user-run because app launch is prohibited.
-
-Independent static review (`untitled-chat-D33323`) identified two verified edge cases, corrected with regressions: missing legacy Oracle settings now migrate to a stable unavailable marker (cannot bind to a later Oracle), and owned generated slash-prefixed drafts repeat using the first original while unowned/staged commands continue to bypass. No second review pass was requested. The in-flight initial test compilation was explicitly cancelled before applying these fixes so final validation can run on frozen sources.
-
-Changed files (24 modified; no additions/deletions):
-- Agent Mode runtime/VM: `AgentRepromptOperation.swift`, `AgentModeViewModel+Reprompt.swift`, `AgentModeViewModel+RepromptUI.swift`, `AgentModeViewModel.swift`, `UI/AgentModelsSettingsViewModel.swift`, `UI/AgentRepromptUIStore.swift`.
-- Composer/pills: `AgentInputBar.swift`, `Components/AgentRepromptComposerStrip.swift`, `Components/AgentRepromptPill.swift`, `Components/AgentStatusPillsRow.swift`.
-- Settings views: `AgentModelsSettingsView.swift`, `AgentRepromptModelPicker.swift`, `AgentRepromptSettingsEditor.swift`, `SettingsView.swift`.
-- Shared editor: `Infrastructure/UI/TextField/ResizableTextField.swift`.
-- Settings core: `AgentRepromptModelPreference.swift`, `GlobalSettingsDocument.swift`, `GlobalSettingsStore.swift`.
-- Tests: `AgentRepromptSchemaTests.swift`, `AgentRepromptSubmissionTests.swift`, `AgentRepromptPresentationTests.swift`, `AgentRepromptSettingsTests.swift` (extended existing suites; no new app-importing files).
-- Documentation: this plan and `docs/privacy/telemetry.md`.
-
-v2.1 verification, all final commands exit 0:
-
-| Command | Result | Conductor ticket |
-| --- | --- | --- |
-| `make dev-test FILTER=AgentReprompt` | 65 tests, 0 failures (61 app + 4 settings-core); includes final active-tab undo fence | `bbceb9d9-36ee-4e65-baf6-ceb9dfa6277c` |
-| `make dev-test FILTER=AgentSessionLink` | 1,273 tests, 0 failures | `a09c6b0e-6e15-494f-b837-448a6afb024a` |
-| `make dev-test FILTER=AgentModelsSettings` | 11 tests, 0 failures | `e8a6a574-4f25-4d75-9056-2bf32e7b3c3b` |
-| `make dev-test FILTER=GlobalSettings` | 37 tests, 0 failures | `9cfd8ed7-0d01-4753-b1d9-a73b5a151cd9` |
-| `make dev-test FILTER=ResizableTextField` | 7 tests, 0 failures | `64a78fe7-8f0d-4502-a13f-0a15857557a4` |
-| `make dev-swift-build PRODUCT=RepoPrompt` | Product build passed (repeated after final undo fence) | `a04b4c7a-4ec6-464b-a9be-a1d0db78bf23` |
-| `make dev-lint` | SwiftFormat 0/1,849 need formatting; strict SwiftLint passed | `6df6cf1e-e68c-4fd0-b928-2e222248cfa6` |
-
-The first compilation was cancelled to apply review findings. One model-picker binding comma error was then corrected before the green runs. Only changed files were formatted with the pinned formatter; no formatting baseline was changed. The last active-tab fence was revalidated with the owning Re-prompt suite, product build and lint after the broader boundary suites passed. Staged-index commit preflight is run after staging this final report, before the local commit. No tests or guardrail baselines were weakened.
-
-Not performed: visible app launch/relaunch, live-provider/manual UI testing, unfiltered/release validation, push or main-checkout changes. User-run live v2.1 testing remains the final usability check.
-
-## 9. Open questions
-
-None that block implementation. Step 1 verifications (Claude Code cwd, per-run Context Builder enhancement override, Oracle background activation/title) can each widen a work item but don't change the design.
+No app launch/relaunch, push, rebase or main-checkout working-tree changes were performed. Live multi-window/provider usability checks remain user-run.
 
 ## References
 
-- `docs/architecture/source-layout.md`, `docs/architecture/provider-plugins.md`, `docs/architecture/agent-session-oversight-auto-wake.md`
-- Workflow clarification precedents: `Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift`, `+Optimize.swift`, `+DeepPlan.swift`, `+Reminder.swift`
+- docs/architecture/source-layout.md
+- docs/architecture/provider-plugins.md
+- docs/architecture/agent-session-oversight-auto-wake.md
+- docs/testing.md

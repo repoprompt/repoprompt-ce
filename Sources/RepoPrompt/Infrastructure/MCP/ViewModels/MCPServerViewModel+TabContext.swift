@@ -4747,8 +4747,11 @@ extension MCPServerViewModel {
         ), isStillCurrent(), !Task.isCancelled else { return nil }
 
         if !committedTab.tab.name.isEmpty {
+            let tabName = committedTab.tab.name
             NotificationService.shared.notifyContextBuilderComplete(
-                tabName: committedTab.tab.name, tabID: committedTab.tab.id, fallbackToDockBounce: true
+                tabName: tabName,
+                tabID: committedTab.tab.id,
+                fallbackToDockBounce: true
             )
         }
 

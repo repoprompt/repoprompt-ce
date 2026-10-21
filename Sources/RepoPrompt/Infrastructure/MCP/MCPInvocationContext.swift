@@ -275,9 +275,7 @@ enum MCPTabContextResolution {
     case tabContextSnapshot(MCPTabContextSnapshot, source: MCPTabContextSnapshotSource)
 
     var snapshot: MCPTabContextSnapshot? {
-        if case let .tabContextSnapshot(snapshot, _) = self {
-            return snapshot
-        }
+        if case let .tabContextSnapshot(snapshot, _) = self { return snapshot }
         return nil
     }
 }

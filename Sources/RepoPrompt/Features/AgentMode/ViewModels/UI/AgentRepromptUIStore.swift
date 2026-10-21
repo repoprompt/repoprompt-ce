@@ -22,6 +22,7 @@ final class AgentRepromptUIStore: ObservableObject {
         var phase: Phase = .generating
         var startedAt = Date()
         var usesChatContext = false
+        var startsWithProviderCommand = false
         var error: String?
     }
 
@@ -46,6 +47,10 @@ final class AgentRepromptUIStore: ObservableObject {
         return publication?.tabID != tabID || publication?.identity == acknowledged
     }
 
+    func allowsAttachmentMutation(tabID: UUID, currentTabID: UUID?) -> Bool {
+        currentTabID == tabID && (presentation?.sourceTabID != tabID || presentation?.phase.isBusy != true)
+    }
+
     struct AutoSendRequest: Equatable {
         let operationID: UUID
         let tabID: UUID
@@ -66,6 +71,8 @@ final class AgentRepromptUIStore: ObservableObject {
         let originalDraft: String
         let reason: String
         var draftAtInvalidation = ""
+        var requiresDecision = false
+        var bypassesPreparation = false
     }
 
     @Published var autoSendRequest: AutoSendRequest?
@@ -75,8 +82,8 @@ final class AgentRepromptUIStore: ObservableObject {
     @Published var pendingQuestions: AgentAskUserPendingState?
     @Published var recoveries: [UUID: Recovery] = [:]
 
-    func recover(tabID: UUID, text: String, originalDraft: String, reason: String, currentDraft: String) {
+    func recover(tabID: UUID, text: String, originalDraft: String, reason: String, currentDraft: String, requiresDecision: Bool = false) {
         guard !text.isEmpty, text != originalDraft else { return }
-        recoveries[tabID] = .init(text: text, originalDraft: originalDraft, reason: reason, draftAtInvalidation: currentDraft)
+        recoveries[tabID] = .init(text: text, originalDraft: originalDraft, reason: reason, draftAtInvalidation: currentDraft, requiresDecision: requiresDecision)
     }
 }

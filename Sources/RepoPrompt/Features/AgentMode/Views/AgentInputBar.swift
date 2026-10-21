@@ -368,7 +368,7 @@ struct AgentComposerView: View, Equatable {
 
     private var canAttachImages: Bool {
         // Grok Build advertises no ACP image capability; its provider rejects attachments.
-        !props.isAgentBusy && currentTabID != nil && props.selectedAgent != .grokBuild
+        !props.isAgentBusy && currentTabID.map(canMutateAttachments) == true && props.selectedAgent != .grokBuild
     }
 
     private var renderedSubmitTarget: AgentComposerSubmitTarget? {
@@ -680,7 +680,7 @@ struct AgentComposerView: View, Equatable {
             if hasPendingAttachments {
                 AgentAttachmentsStrip(
                     snapshot: props.attachments,
-                    allowsRemoval: true,
+                    allowsRemoval: currentTabID.map(canMutateAttachments) == true,
                     onRemoveImage: removeImageAttachment,
                     onRemoveTaggedFile: removeTaggedFileAttachment
                 )
@@ -1866,6 +1866,12 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    private func canMutateAttachments(tabID: UUID) -> Bool {
+        let liveTabID: UUID? = if let repromptViewModel { repromptViewModel.currentTabID }
+        else { currentTabID }
+        return repromptStore.allowsAttachmentMutation(tabID: tabID, currentTabID: liveTabID)
+    }
+
     private func pickImages() {
         guard canAttachImages, let tabID = currentTabID else { return }
         Task { @MainActor in
@@ -1875,23 +1881,24 @@ struct AgentComposerView: View, Equatable {
                 message: "Attach one or more images for the next turn.",
                 attachedTo: targetWindow
             )
+            guard canMutateAttachments(tabID: tabID) else { return }
             actions.attachImages(tabID, urls)
         }
     }
 
     private func handleFileTagCommitted(_ suggestion: MentionSuggestion) {
-        guard let tabID = currentTabID else { return }
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
         let attachmentDisplayName = AgentFileMentionText.attachmentDisplayName(for: suggestion)
         actions.commitTaggedFile(tabID, suggestion, attachmentDisplayName)
     }
 
     private func removeImageAttachment(_ attachmentID: UUID) {
-        guard let tabID = currentTabID else { return }
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
         actions.removeImage(tabID, attachmentID)
     }
 
     private func removeTaggedFileAttachment(_ attachmentID: UUID) {
-        guard let tabID = currentTabID else { return }
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
         let attachment = props.attachments.taggedFileAttachments
             .first(where: { $0.id == attachmentID })
         actions.removeTaggedFile(tabID, attachmentID)
@@ -1908,7 +1915,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func handleImageDrop(providers: [NSItemProvider]) -> Bool {
-        guard let tabID = currentTabID else {
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
         }
         return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
@@ -1920,7 +1927,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func handleImagePaste(pasteboard: NSPasteboard) -> Bool {
-        guard let tabID = currentTabID else {
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
         }
         guard imageInputAdapter.shouldConsumePasteAsImageAttachment(from: pasteboard) else {
@@ -1935,9 +1942,10 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func attachPreparedImages(_ prepared: [AgentImageInputAdapter.PreparedImage], tabID: UUID) {
+        defer { imageInputAdapter.cleanupTemporaryFiles(prepared) }
+        guard canMutateAttachments(tabID: tabID) else { return }
         let urls = prepared.map(\.url)
         actions.attachImages(tabID, urls)
-        imageInputAdapter.cleanupTemporaryFiles(prepared)
     }
 
     private func normalizedServerToggleKey(_ value: String) -> String {

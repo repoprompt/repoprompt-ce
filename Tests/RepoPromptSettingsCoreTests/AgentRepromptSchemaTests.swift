@@ -4,19 +4,10 @@ import XCTest
 
 @MainActor
 final class AgentRepromptSchemaTests: XCTestCase {
-    func testModeHistoryFeatureFenceAndLegacyOracleMigration() throws {
-        let decoder = JSONDecoder()
-        let profile = try decoder.decode(AgentModelsSettingsProfile.self, from: Data(#"{"planningModelRaw":"chosen-oracle","agentRepromptModelRaw":"primary-oracle","agentRepromptMode":"future-mode"}"#.utf8))
-        XCTAssertEqual(profile.agentRepromptModelRaw, "chosen-oracle")
+    func testModeHistoryFeatureFenceAndUnknownSelectionsRemainExplicit() throws {
+        let profile = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: Data(#"{"planningModelRaw":"chosen-oracle","agentRepromptModelRaw":"future-selection","agentRepromptMode":"future-mode"}"#.utf8))
+        XCTAssertEqual(profile.agentRepromptModelRaw, "future-selection")
         XCTAssertEqual(profile.agentRepromptMode, .review, "Unknown modes never authorize auto-send")
-        let scalar = try decoder.decode(GlobalScalarPreferences.ModelSelectionSettings.self, from: Data(#"{"planningModel":"scalar-oracle","agentRepromptModelRaw":"primary-oracle"}"#.utf8))
-        XCTAssertEqual(scalar.agentRepromptModelRaw, "scalar-oracle")
-        var unavailable = try decoder.decode(AgentModelsSettingsProfile.self, from: Data(#"{"agentRepromptModelRaw":"primary-oracle"}"#.utf8))
-        XCTAssertEqual(unavailable.agentRepromptModelRaw, AgentRepromptModelPreference.unavailableLegacyOracle)
-        unavailable.planningModelRaw = "later-oracle"
-        let reconstructed = AgentModelsSettingsProfile(planningModelRaw: unavailable.planningModelRaw, agentRepromptModelRaw: unavailable.agentRepromptModelRaw)
-        let reloaded = try decoder.decode(AgentModelsSettingsProfile.self, from: JSONEncoder().encode(reconstructed))
-        XCTAssertEqual(reloaded.agentRepromptModelRaw, AgentRepromptModelPreference.unavailableLegacyOracle, "A missing legacy recipient must never acquire a later Oracle")
         XCTAssertEqual(GlobalSettingsDocument(scalarPreferences: .init(modelSelection: .init(agentRepromptMode: .sendAutomatically))).requiredSchemaVersion, 13)
         XCTAssertEqual(GlobalSettingsDocument(scalarPreferences: .init(modelSelection: .init(agentRepromptIncludesRecentChat: false))).requiredSchemaVersion, 13)
         let scoped = GlobalSettingsDocument(agentModelsSettings: [UUID(): .init(inheritanceMode: .useGlobalSettings, profile: .init(agentRepromptMode: .sendAutomatically, agentRepromptIncludesRecentChat: false))])
@@ -27,15 +18,10 @@ final class AgentRepromptSchemaTests: XCTestCase {
         let profile = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: Data("{}".utf8))
         XCTAssertNil(profile.agentRepromptGuidance)
         XCTAssertNil(profile.agentRepromptModelRaw)
-        for policy in [nil, "primary-oracle", "specific-model"] as [String?] {
+        for policy in [nil, "unknown-selection", "specific-model"] as [String?] {
             let document = GlobalSettingsDocument(scalarPreferences: .init(modelSelection: .init(agentRepromptModelRaw: policy)))
             XCTAssertEqual(document.requiredSchemaVersion, policy == nil ? 2 : 13)
         }
-        let legacy = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: Data(#"{"agentRepromptContextPolicy":"unknown-future-value","agentRepromptGuidance":"keep me"}"#.utf8))
-        XCTAssertNil(legacy.agentRepromptModelRaw)
-        XCTAssertEqual(legacy.agentRepromptGuidance, "keep me")
-        let encoded = try String(decoding: JSONEncoder().encode(legacy), as: UTF8.self)
-        XCTAssertFalse(encoded.contains("agentRepromptContextPolicy"))
         let retained = GlobalSettingsDocument(agentModelsSettings: [UUID(): .init(
             inheritanceMode: .useGlobalSettings,
             profile: .init(agentRepromptGuidance: "custom")

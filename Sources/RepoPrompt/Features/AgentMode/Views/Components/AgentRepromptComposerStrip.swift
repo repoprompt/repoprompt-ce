@@ -10,6 +10,7 @@ struct AgentRepromptComposerStrip: View {
     var onSendOriginal: ((UUID) -> Void)?
     @State private var showingOriginal = false
     @State private var confirmingReplacement = false
+    @State private var confirmingOriginal = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -52,6 +53,10 @@ struct AgentRepromptComposerStrip: View {
                     }
                 }
                 .font(.caption).controlSize(.small)
+                if presentation.phase == .completed, presentation.startsWithProviderCommand {
+                    Text("Starts with / — your agent may treat it as a command")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 if let error = presentation.error {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
@@ -62,25 +67,38 @@ struct AgentRepromptComposerStrip: View {
             }
             if let tabID, let recovery = store.recoveries[tabID] {
                 HStack(spacing: 6) {
-                    Text("Recoverable Re-prompt draft").font(.caption)
-                    Button(confirmingReplacement ? "Replace current draft" : "Restore") {
-                        if viewModel.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: confirmingReplacement) {
-                            confirmingReplacement = false
-                        } else { confirmingReplacement = true }
+                    Text(recovery.requiresDecision ? "Draft changed — choose what to keep" : "Recoverable Re-prompt draft").font(.caption)
+                    Button(confirmingOriginal ? "Replace with original" : "Restore original") {
+                        if viewModel.restoreRepromptOriginal(tabID: tabID, confirmedReplacement: confirmingOriginal) {
+                            confirmingOriginal = false
+                        } else { confirmingOriginal = true }
                     }
-                    Button("Copy") {
+                    if recovery.requiresDecision {
+                        Button("Keep rewrite") { viewModel.keepRepromptRewrite(tabID: tabID) }
+                    } else {
+                        Button(confirmingReplacement ? "Replace current draft" : "Restore rewrite") {
+                            if viewModel.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: confirmingReplacement) {
+                                confirmingReplacement = false
+                            } else { confirmingReplacement = true }
+                        }
+                    }
+                    Button("Copy rewrite") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(recovery.text, forType: .string)
                     }
-                    Button("Dismiss") { store.recoveries[tabID] = nil
-                        confirmingReplacement = false
+                    if !recovery.requiresDecision, !recovery.bypassesPreparation {
+                        Button("Dismiss") { store.recoveries[tabID] = nil
+                            confirmingReplacement = false
+                        }
                     }
                 }.controlSize(.small)
             }
         }
         .padding(.horizontal, 4)
         .onChange(of: store.presentation?.id) { _, _ in showingOriginal = false }
-        .onChange(of: tabID) { _, _ in confirmingReplacement = false }
+        .onChange(of: tabID) { _, _ in confirmingReplacement = false
+            confirmingOriginal = false
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Re-prompt")
     }

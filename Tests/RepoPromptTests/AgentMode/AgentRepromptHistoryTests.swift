@@ -92,24 +92,39 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         let claude = AgentRepromptModelPolicy.preferredClaude
         let codex = AgentRepromptModelPolicy.preferredCodex
         let models: [AIModel] = [.gpt61SolLow, claude, codex]
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, primary: .gpt61SolLow, currentProvider: .claudeCode, configured: models), claude)
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, primary: .gpt61SolLow, currentProvider: .codexExec, configured: models), codex)
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, primary: .gpt61SolLow, currentProvider: .codexExec, configured: [.gpt61SolLow, claude]), claude)
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, primary: .gpt61SolLow, currentProvider: nil, configured: [.gpt61SolLow]), .gpt61SolLow)
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .claudeCode, configured: models), claude)
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .codexExec, configured: models), codex)
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .codexExec, configured: [.gpt61SolLow, claude]), claude)
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: nil, configured: [.gpt61SolLow]), .gpt61SolLow)
     }
 
-    func testAutomaticUsesConfiguredCompatibleAPIBeforeOracle() throws {
+    func testDefaultNeverUsesArbitraryCompatibleAPIOrExpensiveTier() throws {
         let compatible = try XCTUnwrap(ClaudeCodeAIModelCatalog.compatibleBackendModelsForPicker(.glmZAI).first)
         XCTAssertNotNil(ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: compatible))
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, primary: .gpt61SolLow, currentProvider: .claudeCode, configured: [.gpt61SolLow, compatible]), compatible)
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .claudeCode, configured: [.gpt61SolLow, compatible]), .gpt61SolLow)
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .claudeCode, configured: [compatible, .gpt61SolHigh]))
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: nil, configured: []))
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: compatible.rawValue, currentProvider: .claudeCode, configured: [compatible]), compatible, "Other API routes require an explicit choice")
     }
 
-    func testExplicitModelAndUsePrimaryNeverSilentlyFallBack() {
+    func testExplicitUnavailableModelNeverSilentlyFallsBack() {
         let codex = AgentRepromptModelPolicy.preferredCodex
-        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: "unknown-future-model", primary: .gpt61SolLow, currentProvider: .codexExec, configured: [codex]))
-        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, primary: nil, currentProvider: .codexExec, configured: [codex]))
-        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: AgentRepromptModelPolicy.primaryOracle, primary: .gpt61SolLow, currentProvider: .codexExec, configured: [codex]))
-        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, primary: codex, currentProvider: .codexExec, configured: [codex, .gpt61SolLow]), .gpt61SolLow)
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: "unknown-future-model", currentProvider: .codexExec, configured: [codex]))
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, currentProvider: .codexExec, configured: [codex]))
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, currentProvider: .codexExec, configured: [codex, .gpt61SolLow]), .gpt61SolLow)
+    }
+
+    func testResolvedDefaultDisappearingRequiresChoiceRatherThanBillingRouteSwitch() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let claude = AgentRepromptModelPolicy.preferredClaude
+        fixture.viewModel.repromptAvailability = { [claude] in $0 == claude || $0 == .gpt61SolLow }
+        XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), claude)
+        fixture.viewModel.repromptAvailability = { $0 == .gpt61SolLow }
+        XCTAssertNil(fixture.viewModel.resolvedRepromptModel())
+        XCTAssertEqual(fixture.viewModel.repromptPillProps().modelDisplayName, "Choose a model")
+        fixture.viewModel.setRepromptModelRaw(AIModel.gpt61SolLow.rawValue)
+        XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), .gpt61SolLow)
     }
 
     func testRewriterEffortUsesAutoEffortDecisionWithoutMutatingImplementingModel() async throws {

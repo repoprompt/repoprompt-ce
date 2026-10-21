@@ -326,7 +326,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     var resolvedRepromptDraftModel: AIModel? {
         AgentRepromptModelPolicy.resolve(
             selection: repromptModelDraft.isEmpty ? nil : repromptModelDraft,
-            primary: profileSnapshot.planningModelRaw.flatMap(AIModel.fromModelName),
             currentProvider: repromptCurrentProvider(),
             configured: apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream }
         )
@@ -355,7 +354,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func saveRepromptDraft() -> Bool {
         guard isRepromptDraftDirty, repromptGuidanceIsWithinLimit else { return false }
         return persistRepromptDraft(
-            guidance: AgentRepromptGuidance.normalizedOverride(repromptGuidanceDraft),
+            guidance: repromptGuidanceDraft == AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+                ? repromptGuidanceBaseline : AgentRepromptGuidance.normalizedOverride(repromptGuidanceDraft),
             model: repromptModelDraft.isEmpty ? nil : repromptModelDraft
         )
     }

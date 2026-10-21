@@ -42,14 +42,8 @@ extension AgentModeViewModel {
     }
 
     func configuredRepromptModels() -> [AIModel] {
-        let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
-        var candidates = AIModel.allModels()
-        for model in promptManager?.availableModels ?? [] where !candidates.contains(model) {
-            candidates.append(model)
-        }
-        for model in [profile.agentRepromptModelRaw, profile.planningModelRaw].compactMap(\.self).compactMap(AIModel.fromModelName) where !candidates.contains(model) {
-            candidates.append(model)
-        }
+        // The configured/runtime-facing list, not every parseable catalog ID.
+        let candidates = repromptAvailability == nil ? (promptManager?.availableModels ?? []) : AIModel.allModels()
         return candidates.filter { model in
             AgentRepromptModelPolicy.supportsSideCall(model) && model.canStream
                 && (repromptAvailability?(model) ?? (promptManager?.mcpOracleIsProviderConfigured(for: model) == true))
@@ -62,10 +56,15 @@ extension AgentModeViewModel {
 
     func resolvedRepromptModel(session: TabSession? = nil) -> AIModel? {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
-        return AgentRepromptModelPolicy.resolve(
-            selection: profile.agentRepromptModelRaw, primary: profile.planningModelRaw.flatMap(AIModel.fromModelName),
-            currentProvider: (session ?? activeSession)?.selectedAgent, configured: configuredRepromptModels()
-        )
+        let provider = (session ?? activeSession)?.selectedAgent
+        let configured = configuredRepromptModels()
+        if profile.agentRepromptModelRaw == nil, let cached = repromptDefaultModel, cached.provider == provider {
+            // Losing availability after resolution requires a choice, never a silent billing-route switch.
+            return configured.contains(cached.model) ? cached.model : nil
+        }
+        let resolved = AgentRepromptModelPolicy.resolve(selection: profile.agentRepromptModelRaw, currentProvider: provider, configured: configured)
+        if profile.agentRepromptModelRaw == nil, let resolved { repromptDefaultModel = (provider, resolved) }
+        return resolved
     }
 
     func setRepromptModelRaw(_ raw: String) {
@@ -94,7 +93,7 @@ extension AgentModeViewModel {
         }
         return .init(
             isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isStreaming == true,
-            modelDisplayName: model?.displayName, providerID: recipient,
+            modelDisplayName: model?.displayName ?? "Choose a model", providerID: recipient,
             requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: recipient, defaults: .standard),
             unavailableReason: model == nil ? "Connect or choose a Re-prompt model in Agent Models settings." : nil
         )
@@ -114,6 +113,29 @@ extension AgentModeViewModel {
         syncStatusPillsUIState()
     }
 
+    /// Resolve an invalidated edited draft explicitly; keeping it bypasses preparation on the next Return.
+    func keepRepromptRewrite(tabID: UUID) {
+        guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID] else { return }
+        recovery.requiresDecision = false
+        recovery.bypassesPreparation = true
+        recovery.draftAtInvalidation = retrieveDraftText(for: tabID)
+        repromptUIStore.recoveries[tabID] = recovery
+    }
+
+    @discardableResult
+    func restoreRepromptOriginal(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
+        guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
+              confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
+        repromptOperation?.cancel(restoreOriginal: false, recover: false)
+        _ = loadDraftSnapshotForComposer(for: tabID)
+        restoreComposerDraft(tabID: tabID, text: recovery.originalDraft, message: "Restored original draft.", strategy: .replaceAlways)
+        recovery.requiresDecision = false
+        recovery.bypassesPreparation = false
+        recovery.draftAtInvalidation = recovery.originalDraft
+        repromptUIStore.recoveries[tabID] = recovery
+        return true
+    }
+
     @discardableResult
     func restoreRepromptRecovery(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
         guard currentTabID == tabID, let recovery = repromptUIStore.recoveries[tabID] else { return false }
@@ -121,7 +143,11 @@ extension AgentModeViewModel {
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
         _ = loadDraftSnapshotForComposer(for: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt draft.", strategy: .replaceAlways)
-        repromptUIStore.recoveries[tabID] = nil
+        var kept = recovery
+        kept.requiresDecision = false
+        kept.bypassesPreparation = true
+        kept.draftAtInvalidation = recovery.text
+        repromptUIStore.recoveries[tabID] = kept
         return true
     }
 }

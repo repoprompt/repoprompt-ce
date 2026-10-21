@@ -2420,7 +2420,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - Initialization
 
-    weak var oracleViewModel: OracleViewModel?
+    private weak var oracleViewModel: OracleViewModel?
     var repromptService: AgentRepromptService?
     let repromptUIStore = AgentRepromptUIStore()
     var repromptEnabled = false
@@ -2430,6 +2430,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
     var repromptAvailability: ((AIModel) -> Bool)?
+    var repromptDefaultModel: (provider: AgentProviderKind?, model: AIModel)?
 
     private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
         ClaudeAgentModeCoordinator.HostCapabilities(
@@ -18072,6 +18073,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let text = repromptDispatchOriginals[claim.attempt.id] ?? text
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
+        let repromptRecoveryID = repromptUIStore.recoveries[target.tabID]?.id
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
         guard composerSubmitClaimIsCurrent(claim) else {
@@ -18080,10 +18082,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         defer {
             if let approvedBriefForRecovery, !submittedApprovedBrief {
                 repromptUIStore.recoveries[target.tabID] = .init(
-                    text: approvedBriefForRecovery, originalDraft: claim.attempt.rawDraftSnapshot,
+                    text: approvedBriefForRecovery, originalDraft: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot,
                     reason: "The approved turn could not be submitted.",
-                    draftAtInvalidation: retrieveDraftText(for: target.tabID)
+                    draftAtInvalidation: retrieveDraftText(for: target.tabID), requiresDecision: true
                 )
+            }
+            if submittedApprovedBrief, repromptUIStore.recoveries[target.tabID]?.id == repromptRecoveryID {
+                repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
+                repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
             cancelRepromptSpeculation(claimID: claim.attempt.id)
             repromptAudits[claim.attempt.id] = nil
@@ -18112,7 +18118,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
-            if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
+            if repromptDispatchTexts[claim.attempt.id] != nil, let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
                 return blocked
             }
             let repromptedText = repromptDispatchTexts[claim.attempt.id]
@@ -18206,7 +18212,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return result
         case .createAgentSessionFromSourceTab:
             let sourceSession = claimedSourceSession
-            if repromptEnabled, let blocked = preflightInitialUserTurn(text: text, session: sourceSession) {
+            if repromptDispatchTexts[claim.attempt.id] != nil, let blocked = preflightInitialUserTurn(text: text, session: sourceSession) {
                 return blocked
             }
             let repromptedText = repromptDispatchTexts[claim.attempt.id]
