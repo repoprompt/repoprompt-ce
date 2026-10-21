@@ -295,7 +295,10 @@ final class TipHistoryStore: ObservableObject {
             for entry in entries {
                 previous[entry.tag] = entry
             }
-            let previousHeadTag = entries.first?.tag
+            // Leaving Tip clears displayed rows, not authenticated head identity
+            // or safety barriers. The prior head may still acquire its catalog
+            // digest when it is retained under a newer signed head on return.
+            let previousHeadTag = entries.first?.tag ?? highestHead?.tag
             for entry in page.entries {
                 guard let old = previous[entry.tag] else { continue }
                 // A newer head is not authority to rewrite already verified

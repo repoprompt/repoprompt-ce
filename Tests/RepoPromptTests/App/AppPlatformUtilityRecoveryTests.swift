@@ -1310,6 +1310,35 @@ final class TipHistoryStoreTests: XCTestCase {
         XCTAssertEqual(store.catalogState, .idle)
     }
 
+    func testReturningToTipAllowsPriorBarrierHeadDigestWithoutDroppingItsSafetyFence() async throws {
+        let fetcher = TipHistoryControlledFetcher(), store = makeStore(fetcher)
+        let barrier: [String: Any] = ["downgradeBarrier": true, "downgradeBarrierReasons": ["Reviewed persistence boundary"]]
+        let original = try envelope([6, 5], changes: [6: barrier])
+        await load(store, fetcher: fetcher, data: original)
+        channel = .stable
+        store.channelDidChange(.stable)
+        XCTAssertTrue(store.rows.isEmpty)
+        channel = .tip
+        store.channelDidChange(.tip)
+        var retained = barrier
+        retained["historyCatalogSha256"] = TipHistorySignatureVerifier.sha256(original)
+        let newer = try envelope([7, 6, 5], changes: [6: retained])
+        await load(store, fetcher: fetcher, data: newer, request: 1)
+        if case .loaded = store.catalogState {} else { XCTFail("Previous head digest enrichment failed: \(store.catalogState)") }
+        XCTAssertEqual(store.rows.first?.id, tag(7))
+        XCTAssertTrue(store.rows.first(where: { $0.id == tag(6) })?.entry.downgradeBarrier == true)
+        channel = .stable
+        store.channelDidChange(.stable)
+        channel = .tip
+        store.channelDidChange(.tip)
+        try await load(store, fetcher: fetcher, data: envelope([8, 7, 6, 5], changes: [
+            7: ["historyCatalogSha256": TipHistorySignatureVerifier.sha256(newer)],
+            6: ["historyCatalogSha256": TipHistorySignatureVerifier.sha256(original), "downgradeBarrier": false, "downgradeBarrierReasons": []]
+        ]), request: 2)
+        XCTAssertEqual(store.catalogState, .failed(.integrityMismatch), "Leaving Tip must not erase authenticated barriers")
+        await store.shutdown()
+    }
+
     func testRegressingAndRewrittenHeadFailWithoutReplacingRows() async throws {
         let fetcher = TipHistoryControlledFetcher(), store = makeStore(fetcher)
         try await load(store, fetcher: fetcher, data: envelope([8, 5]))
