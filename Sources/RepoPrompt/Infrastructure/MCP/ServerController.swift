@@ -84,6 +84,8 @@ final actor ServerController: ObservableObject {
 
     private var pendingApprovals: [ApprovalRequest] = []
     private var currentApproval: ApprovalRequest?
+    /// Reserves the FIFO head across asynchronous liveness/session checks.
+    private var preparingApproval = false
     private var sessionDecisions: [MCPApprovalProcessIdentity: SessionDecision] = [:]
     private var decisionOrder: UInt64 = 0
     private let monotonicNow: @Sendable () -> TimeInterval
@@ -619,21 +621,14 @@ final actor ServerController: ObservableObject {
     }
 
     private func enqueueApproval(_ request: ApprovalRequest) async {
-        guard await request.isConnectionLive() else {
+        // Register arrival and reserve capacity before any actor suspension.
+        // Include the head being validated, which has already left the array.
+        guard pendingApprovals.count + (currentApproval != nil || preparingApproval ? 1 : 0) < 32 else {
             request.deny()
             return
         }
-        if await resolveSessionDecision(request) { return }
-        // Bound pending continuations even when a client keeps spawning helpers.
-        guard pendingApprovals.count + (currentApproval == nil ? 0 : 1) < 32 else {
-            request.deny()
-            return
-        }
-        if currentApproval != nil {
-            pendingApprovals.append(request)
-            return
-        }
-        await beginApprovalRequest(request)
+        pendingApprovals.append(request)
+        await activateNextQueuedApprovalIfNeeded()
     }
 
     /// Returns true if the request was resolved without presenting UI.
@@ -706,10 +701,17 @@ final actor ServerController: ObservableObject {
 
     /// Starts the next queued approval request, if any.
     private func activateNextQueuedApprovalIfNeeded() async {
-        guard currentApproval == nil, pendingConnectionID == nil else { return }
+        guard !preparingApproval, currentApproval == nil, pendingConnectionID == nil else { return }
+        preparingApproval = true
+        defer { preparingApproval = false }
         while currentApproval == nil, !pendingApprovals.isEmpty {
             let request = pendingApprovals.removeFirst()
-            await enqueueApproval(request)
+            guard await request.isConnectionLive() else {
+                request.deny()
+                continue
+            }
+            if await resolveSessionDecision(request) { continue }
+            await beginApprovalRequest(request)
         }
     }
 

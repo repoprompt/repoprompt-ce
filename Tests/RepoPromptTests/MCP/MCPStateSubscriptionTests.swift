@@ -401,6 +401,77 @@ private final class ExecutionCounter: @unchecked Sendable {
             )
         }
 
+        func testSuspendedLivenessCheckCannotBeOvertakenByNewArrival() async {
+            // Exercise both an initial arrival and a head dequeued after resolving UI.
+            for queuedHead in [false, true] {
+                let controller = ServerController(installNetworkCallbacks: false)
+                let events = AdmissionEvents()
+                let suspended = expectation(description: "FIFO head suspended (queued: \(queuedHead))")
+                let gate = ApprovalLivenessGate(suspended: suspended)
+                await controller.setApprovalCallback { clientID, generation, _ in
+                    events.decide(clientID)
+                    events.prompt(generation)
+                }
+                if queuedHead {
+                    await controller.test_requestApproval(clientID: "active", approve: {}, deny: {})
+                    await controller.test_requestApproval(
+                        clientID: "head", isConnectionLive: { await gate.check() }, approve: {}, deny: {}
+                    )
+                }
+                await gate.pause()
+                let advance = Task {
+                    if queuedHead {
+                        await controller.resolvePendingApproval(allow: false, generation: events.generations[0])
+                    } else {
+                        await controller.test_requestApproval(
+                            clientID: "head", isConnectionLive: { await gate.check() }, approve: {}, deny: {}
+                        )
+                    }
+                }
+                await fulfillment(of: [suspended], timeout: 2)
+                await controller.test_requestApproval(clientID: "tail", approve: {}, deny: {})
+                XCTAssertEqual(events.decisions, queuedHead ? ["active"] : [], "New arrival must not overtake the suspended head")
+                await gate.resume()
+                await advance.value
+                XCTAssertEqual(events.decisions, queuedHead ? ["active", "head"] : ["head"])
+                if let generation = events.generations.last {
+                    await controller.resolvePendingApproval(allow: false, generation: generation)
+                }
+                XCTAssertEqual(events.decisions, queuedHead ? ["active", "head", "tail"] : ["head", "tail"])
+                if let generation = events.generations.last {
+                    await controller.resolvePendingApproval(allow: false, generation: generation)
+                }
+            }
+        }
+
+        private actor ApprovalLivenessGate {
+            let suspended: XCTestExpectation
+            private var paused = false
+            private var continuation: CheckedContinuation<Bool, Never>?
+
+            init(suspended: XCTestExpectation) {
+                self.suspended = suspended
+            }
+
+            func pause() {
+                paused = true
+            }
+
+            func check() async -> Bool {
+                guard paused else { return true }
+                return await withCheckedContinuation { continuation in
+                    self.continuation = continuation
+                    suspended.fulfill()
+                }
+            }
+
+            func resume() {
+                paused = false
+                continuation?.resume(returning: true)
+                continuation = nil
+            }
+        }
+
         func testSessionApprovalCoversReconnectsButNotSameNameOrRecycledPID() async {
             let controller = ServerController(installNetworkCallbacks: false, processIsCurrent: { _ in true })
             let events = AdmissionEvents()
