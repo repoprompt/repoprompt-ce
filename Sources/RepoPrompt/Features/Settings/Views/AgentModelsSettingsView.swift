@@ -46,7 +46,8 @@ struct AgentModelsSettingsView: View {
         workspaceName: String? = nil,
         settingsManager: (any SettingsManaging)? = nil,
         onNavigate: ((SettingsTab) -> Void)? = nil,
-        viewModel: AgentModelsSettingsViewModel? = nil
+        viewModel: AgentModelsSettingsViewModel? = nil,
+        repromptCurrentProvider: @escaping () -> AgentProviderKind? = { nil }
     ) {
         self.promptVM = promptVM
         self.apiSettingsVM = apiSettingsVM
@@ -58,7 +59,8 @@ struct AgentModelsSettingsView: View {
             apiSettingsVM: apiSettingsVM,
             workspaceID: workspaceID,
             workspaceName: workspaceName,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            repromptCurrentProvider: repromptCurrentProvider
         ))
     }
 
@@ -378,6 +380,8 @@ struct AgentModelsSettingsView: View {
 
                 Divider()
                 oracleReconciliationGuidanceEditor
+                Divider()
+                AgentRepromptSettingsEditor(viewModel: viewModel)
             }
         }
     }

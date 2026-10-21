@@ -90,6 +90,8 @@ struct AgentProviderControlCommand: Equatable {
 /// existing caller. Only a caller that must not act as "the target's next local send" sets any of
 /// them.
 struct AgentDirectRunStartOptions: Equatable {
+    /// Provider text approved by the composer is data, not a new slash invocation.
+    var skipsSlashExpansion: Bool = false
     /// Leaves `pendingHandoff` completely untouched: not prepended, not marked staged, not cleared,
     /// and not consulted for the history/payload decision.
     ///

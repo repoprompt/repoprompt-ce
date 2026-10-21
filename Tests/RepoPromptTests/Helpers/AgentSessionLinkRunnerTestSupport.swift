@@ -97,7 +97,9 @@ final class AgentSessionLinkRunnerHarness {
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             // No MCP infrastructure in these suites: signal routing immediately so the bootstrap lease
             // resolves instead of waiting for a connection that will never arrive.
-            if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
@@ -186,7 +188,7 @@ final class AgentSessionLinkRunnerHarness {
                         )
                     }
                 },
-                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
@@ -505,7 +507,9 @@ final class AgentSessionLinkACPResponseGate {
     }
 
     deinit {
-        if !released { try? handle.write(contentsOf: Data([1])) }
+        if !released {
+            try? handle.write(contentsOf: Data([1]))
+        }
         try? handle.close()
     }
 }

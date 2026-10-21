@@ -65,6 +65,7 @@ extension AgentModeViewModel {
     /// rejections each restore exactly once even when restoration events
     /// coalesce in the UI.
     func restoreRejectedManualSubmissionComposerState(
+        repromptedText: String? = nil,
         tabID: UUID,
         session: TabSession,
         draftText: String,
@@ -125,6 +126,12 @@ extension AgentModeViewModel {
             strategy: .replaceAlways,
             operation: operation
         )
+        if let repromptedText {
+            repromptUIStore.recoveries[tabID] = .init(
+                text: repromptedText, originalDraft: draftText, reason: message,
+                draftAtInvalidation: retrieveDraftText(for: tabID)
+            )
+        }
     }
 
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
@@ -156,6 +163,17 @@ extension AgentModeViewModel {
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
+            if repromptOperation?.sourceTabID == tabID {
+                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            } else if let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+                      !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
+            {
+                // A kept draft authorizes only its exact text; edits need a new explicit recovery choice.
+                repromptUIStore.recoveries[tabID] = .init(
+                    text: text, originalDraft: recovery.originalDraft, reason: recovery.reason,
+                    draftAtInvalidation: text, requiresDecision: true
+                )
+            }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -164,6 +182,7 @@ extension AgentModeViewModel {
                 tabDraftText[tabID] = text
             }
         }
+        invalidateRepromptIfNeeded()
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)

@@ -142,8 +142,69 @@ final class ClaudeCodeProvider: AIProvider {
         }
     }
 
+    /// Genuine request-scoped print streaming. No tools, workspace, inherited MCP or global preference mutation.
+    func streamMessage(
+        _ aiMessage: AIMessage, model: AIModel,
+        promptDelivery: ClaudeAgentToolPreferences.AgentModePromptDelivery
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    let lease = try await configService.prepareEmptyLaunchConfig()
+                    defer { lease.release() }
+                    var options = try await makeOptions(for: aiMessage, model: model, emptyConfigURL: lease.url)
+                    options.verbose = true
+                    options.systemPromptOverride = promptDelivery.nativeSystemPromptOverride(instructions: aiMessage.systemPrompt)
+                    let prompt = buildPrompt(from: aiMessage)
+                    let stream = try await runner.runStreaming(
+                        args: options.toTokens() + ["--include-partial-messages", "--tools", ""],
+                        stdin: promptDelivery.sendsRepoPromptAsUserMessage
+                            ? ClaudeCodePromptDelivery.decoratedUserMessage(prompt, instructions: aiMessage.systemPrompt) : prompt,
+                        outputMode: .auto(.streamJson), timeout: options.timeout,
+                        additionalEnvironment: options.additionalEnvironment, additionalRemovedKeys: options.removedEnvironmentKeys
+                    )
+                    var decoder = ClaudeCLITextStreamDecoder()
+                    var terminated = false
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        switch event {
+                        case let .stdout(data):
+                            for text in try decoder.append(data) {
+                                continuation.yield(.init(type: "content", text: text))
+                            }
+                        case let .terminated(status, timedOut):
+                            guard status == 0, !timedOut else { throw AIProviderError.invalidResponse(detail: "Claude stream did not exit successfully") }
+                            terminated = true
+                        case .stderr: break
+                        }
+                    }
+                    for text in try decoder.finish() {
+                        continuation.yield(.init(type: "content", text: text))
+                    }
+                    guard terminated else { throw CancellationError() }
+                    continuation.yield(.init(type: "message_stop", text: nil))
+                    continuation.finish()
+                } catch is ClaudeCLITextStreamFailure {
+                    continuation.yield(.init(type: AIStreamResult.incompleteType, text: nil))
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
-        let nativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
+        try await completeMessage(
+            aiMessage, model: model, maxTokens: maxTokens,
+            promptDelivery: ClaudeAgentToolPreferences.agentModePromptDelivery()
+        )
+    }
+
+    /// Request-scoped delivery; isolated callers must not mutate the user's preference.
+    func completeMessage(
+        _ aiMessage: AIMessage, model: AIModel, maxTokens: Int?,
+        promptDelivery nativePromptMode: ClaudeAgentToolPreferences.AgentModePromptDelivery
+    ) async throws -> AICompletionResult {
         let basePrompt = buildPrompt(from: aiMessage)
         let prompt = nativePromptMode.sendsRepoPromptAsUserMessage
             ? ClaudeCodePromptDelivery.decoratedUserMessage(basePrompt, instructions: aiMessage.systemPrompt)

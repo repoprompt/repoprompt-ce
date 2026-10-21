@@ -40,6 +40,16 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var workspaceName: String?
     @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
+    @Published var repromptGuidanceDraft: String
+    @Published var repromptModelDraft: String
+    @Published var repromptModeDraft: AgentRepromptMode
+    @Published var repromptRecentChatDraft: Bool
+    private var repromptModeBaseline: AgentRepromptMode?
+    private var repromptRecentChatBaseline: Bool?
+    let repromptCurrentProvider: () -> AgentProviderKind?
+    private var repromptDraftScope: AgentModelsEditingScope
+    private var repromptGuidanceBaseline: String?
+    private var repromptModelBaseline: String?
     @Published var oracleReconciliationGuidanceDraft: String
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
@@ -96,7 +106,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         settingsManager: (any SettingsManaging)? = nil,
         settingsStore: GlobalSettingsStore? = nil,
         defaults: UserDefaults = .standard,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        repromptCurrentProvider: @escaping () -> AgentProviderKind? = { nil }
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let settingsManager = settingsManager ?? settingsStore
@@ -106,11 +117,21 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
         let initialProfile = initial.profile
 
+        self.repromptCurrentProvider = repromptCurrentProvider
         self.apiSettingsVM = apiSettingsVM
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
         inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
+        repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(initialProfile.agentRepromptGuidance)
+        repromptModelDraft = initialProfile.agentRepromptModelRaw ?? ""
+        repromptModeDraft = initialProfile.agentRepromptMode ?? .review
+        repromptRecentChatDraft = initialProfile.agentRepromptIncludesRecentChat ?? true
+        repromptModeBaseline = initialProfile.agentRepromptMode
+        repromptRecentChatBaseline = initialProfile.agentRepromptIncludesRecentChat
+        repromptDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
+        repromptGuidanceBaseline = initialProfile.agentRepromptGuidance
+        repromptModelBaseline = initialProfile.agentRepromptModelRaw
         oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(initialProfile.oracleReconciliationGuidance)
         oracleGuidanceDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
         oracleGuidanceDraftBaseline = initialProfile.oracleReconciliationGuidance
@@ -298,6 +319,88 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     var hasUnsatisfiedRecommendations: Bool {
         recommendations.hasUnsatisfied
+    }
+
+    // MARK: - Re-prompt draft
+
+    var resolvedRepromptDraftModel: AIModel? {
+        AgentRepromptModelPolicy.resolve(
+            selection: repromptModelDraft.isEmpty ? nil : repromptModelDraft,
+            currentProvider: repromptCurrentProvider(),
+            configured: apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream }
+        )
+    }
+
+    var isRepromptDraftDirty: Bool {
+        repromptGuidanceDraft != AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+            || repromptModelDraft != (repromptModelBaseline ?? "")
+            || repromptModeDraft != (repromptModeBaseline ?? .review)
+            || repromptRecentChatDraft != (repromptRecentChatBaseline ?? true)
+    }
+
+    var repromptDraftHasConflict: Bool {
+        repromptDraftScope != editingScope
+            || repromptGuidanceBaseline != profileSnapshot.agentRepromptGuidance
+            || repromptModelBaseline != profileSnapshot.agentRepromptModelRaw
+            || repromptModeBaseline != profileSnapshot.agentRepromptMode
+            || repromptRecentChatBaseline != profileSnapshot.agentRepromptIncludesRecentChat
+    }
+
+    var repromptGuidanceIsWithinLimit: Bool {
+        AgentRepromptGuidance.isWithinLimit(repromptGuidanceDraft)
+    }
+
+    @discardableResult
+    func saveRepromptDraft() -> Bool {
+        guard isRepromptDraftDirty, repromptGuidanceIsWithinLimit else { return false }
+        return persistRepromptDraft(
+            guidance: repromptGuidanceDraft == AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+                ? repromptGuidanceBaseline : AgentRepromptGuidance.normalizedOverride(repromptGuidanceDraft),
+            model: repromptModelDraft.isEmpty ? nil : repromptModelDraft
+        )
+    }
+
+    @discardableResult
+    func restoreDefaultRepromptGuidance() -> Bool {
+        guard !repromptDraftHasConflict else { return false }
+        let accepted = updateSelectedProfile(reason: "agent_models.reprompt_default_guidance") { $0.agentRepromptGuidance = nil }
+        if accepted {
+            repromptGuidanceBaseline = nil
+            repromptGuidanceDraft = AgentRepromptGuidance.defaultText
+        }
+        return accepted
+    }
+
+    func reloadRepromptDraft() {
+        reloadScopedState()
+        refresh()
+        loadRepromptDraft()
+    }
+
+    private func loadRepromptDraft() {
+        repromptDraftScope = editingScope
+        repromptGuidanceBaseline = profileSnapshot.agentRepromptGuidance
+        repromptModelBaseline = profileSnapshot.agentRepromptModelRaw
+        repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+        repromptModelDraft = repromptModelBaseline ?? ""
+        repromptModeBaseline = profileSnapshot.agentRepromptMode
+        repromptRecentChatBaseline = profileSnapshot.agentRepromptIncludesRecentChat
+        repromptModeDraft = repromptModeBaseline ?? .review
+        repromptRecentChatDraft = repromptRecentChatBaseline ?? true
+    }
+
+    private func persistRepromptDraft(guidance: String?, model: String?) -> Bool {
+        guard !repromptDraftHasConflict else { return false }
+        let accepted = updateSelectedProfile(reason: "agent_models.reprompt_guidance") { profile in
+            profile.agentRepromptGuidance = guidance
+            profile.agentRepromptModelRaw = model
+            profile.agentRepromptMode = repromptModeDraft == .review ? nil : repromptModeDraft
+            profile.agentRepromptIncludesRecentChat = repromptRecentChatDraft ? nil : false
+        }
+        if accepted {
+            loadRepromptDraft()
+        }
+        return accepted
     }
 
     // MARK: - Oracle reconciliation draft
@@ -933,6 +1036,9 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         isReloadingScopedState = false
         if !isOracleGuidanceDraftDirty {
             loadOracleGuidanceDraft()
+        }
+        if !isRepromptDraftDirty {
+            loadRepromptDraft()
         }
     }
 

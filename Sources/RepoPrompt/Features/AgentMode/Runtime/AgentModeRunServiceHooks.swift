@@ -104,7 +104,8 @@ extension AgentModeRunService {
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentTabSession?
+            _ session: AgentTabSession?,
+            _ skipsSlashExpansion: Bool
         ) async -> String
         /// Stages a transcript handoff for fresh-session resume recovery.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
