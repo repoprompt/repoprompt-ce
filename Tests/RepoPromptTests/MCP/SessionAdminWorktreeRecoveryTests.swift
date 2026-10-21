@@ -194,6 +194,328 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         }
     }
 
+    // MARK: - Target default repository election (#1431)
+
+    // Declared [alpha, beta, gamma] is installed [beta, gamma, alpha], so a first-loaded default (beta) can never
+    // pass by accident. The caller's own bindings differ from the target's, so a caller-routed default fails too.
+
+    func testTargetWithoutBindingsCreatesInDeclaredPrimaryNotCallerOrFirstLoadedRoot() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.callerSession.worktreeBindings = try [
+                fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime),
+                fixture.binding(logical: repos.beta, worktree: repos.betaPrime)
+            ]
+            let callerBindings = fixture.callerSession.worktreeBindings
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/target-primary"), "idempotency_key": .string("target-primary")
+            ])
+            XCTAssertEqual(created["result"], .string("created"), Self.json(created))
+            let worktree = try XCTUnwrap(created["worktree"]?.objectValue, Self.json(created))
+            let path = try URL(fileURLWithPath: XCTUnwrap(worktree["path"]?.stringValue))
+            XCTAssertEqual(fixture.repositoryID(path), fixture.repositoryID(repos.alpha), "created in declared PRIMARY")
+            XCTAssertEqual(try fixture.head(path), try fixture.head(repos.alpha))
+            XCTAssertEqual(
+                fixture.targetBindingMap(), try [Self.canonical(repos.alpha): XCTUnwrap(worktree["worktree_id"]?.stringValue)],
+                "bound under the elected logical root"
+            )
+            XCTAssertEqual(fixture.callerSession.worktreeBindings, callerBindings)
+        }
+    }
+
+    func testTargetSoleSecondaryBindingIsTheDefaultRatherThanCallerBindingOrCanonicalCheckout() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.callerSession.worktreeBindings = try [fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime)]
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            let callerBindings = fixture.callerSession.worktreeBindings
+            let targetBindings = fixture.session.worktreeBindings
+            let betaPrimeID = try fixture.worktreeID(repos.betaPrime)
+
+            let current = try await fixture.call([
+                "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                "worktree": .string("@current"), "idempotency_key": .string("sole-secondary-current")
+            ])
+            let item = try XCTUnwrap(current["items"]?.arrayValue?.first?.objectValue, Self.json(current))
+            XCTAssertEqual(item["result"], .string("bound"), Self.json(current))
+            XCTAssertEqual(item["worktree"]?.objectValue?["worktree_id"], .string(betaPrimeID))
+            // `@current` of the elected checkout keeps the same binding identity; the host only refreshes its metadata.
+            XCTAssertEqual(fixture.targetBindingMap(), [Self.canonical(repos.beta): betaPrimeID])
+            XCTAssertEqual(fixture.session.worktreeBindings.map(\.id), targetBindings.map(\.id))
+            let boundBindings = fixture.session.worktreeBindings
+
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/sole-secondary"), "bind": .bool(false), "idempotency_key": .string("sole-secondary")
+            ])
+            XCTAssertEqual(created["result"], .string("created"), Self.json(created))
+            let worktree = try XCTUnwrap(created["worktree"]?.objectValue, Self.json(created))
+            let path = try URL(fileURLWithPath: XCTUnwrap(worktree["path"]?.stringValue))
+            XCTAssertEqual(fixture.repositoryID(path), fixture.repositoryID(repos.beta))
+            XCTAssertEqual(try fixture.head(path), try fixture.head(repos.betaPrime), "created from the bound checkout, not canonical beta")
+            XCTAssertEqual(
+                worktree["repo_root"]?.stringValue.map(Self.canonical), Self.canonical(repos.beta),
+                "the reported repository stays the canonical root so the next_call replays"
+            )
+            XCTAssertEqual(fixture.session.worktreeBindings, boundBindings)
+
+            // The receipt's next_call replays verbatim and replaces the sole binding under its logical root.
+            let next = try XCTUnwrap(created["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(created))
+            let replayed = try await fixture.call(next)
+            XCTAssertEqual(replayed["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), Self.json(replayed))
+            XCTAssertEqual(fixture.targetBindingMap(), try [Self.canonical(repos.beta): XCTUnwrap(worktree["worktree_id"]?.stringValue)])
+            XCTAssertEqual(fixture.callerSession.worktreeBindings, callerBindings)
+        }
+    }
+
+    func testTargetMultipleBindingsRefuseRelativeDefaultsButIdentifyingSelectorsStillBind() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [
+                fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime),
+                fixture.binding(logical: repos.beta, worktree: repos.betaPrime)
+            ]
+            let original = fixture.session.worktreeBindings
+            let registrations = try fixture.registrations()
+
+            let refusedCreate = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/ambiguous"), "idempotency_key": .string("ambiguous-create")
+            ])
+            XCTAssertEqual(refusedCreate["code"], .string("invalid_request"), Self.json(refusedCreate))
+            fixture.assertMultipleBindingRefusal(refusedCreate["detail"]?.stringValue)
+            XCTAssertEqual(try fixture.registrations(), registrations, "refused before any checkout is registered")
+            XCTAssertTrue(fixture.ownership.records.isEmpty)
+
+            for selector in ["@current", "@main:\(ElectionRepositories.topicBranch)"] {
+                let refused = try await fixture.call([
+                    "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                    "worktree": .string(selector), "idempotency_key": .string("ambiguous-\(selector)")
+                ])
+                let item = try XCTUnwrap(refused["items"]?.arrayValue?.first?.objectValue, Self.json(refused))
+                XCTAssertEqual(item["result"], .string("not_applied"), Self.json(refused))
+                fixture.assertMultipleBindingRefusal(item["detail"]?.stringValue)
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+            }
+
+            // An identifying selector names its own repository and logical root; the unrelated binding stays.
+            let topicID = try fixture.worktreeID(repos.alphaTopic)
+            let bound = try await fixture.call([
+                "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                "worktree": .string("@id:\(topicID)"), "idempotency_key": .string("identified-topic")
+            ])
+            XCTAssertEqual(bound["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), Self.json(bound))
+            XCTAssertEqual(fixture.targetBindingMap(), try [
+                Self.canonical(repos.alpha): topicID,
+                Self.canonical(repos.beta): fixture.worktreeID(repos.betaPrime)
+            ])
+
+            let explicit = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "repo_root": .string(repos.gamma.path), "branch": .string("e2e/explicit-gamma"), "bind": .bool(false),
+                "idempotency_key": .string("explicit-gamma")
+            ])
+            XCTAssertEqual(explicit["result"], .string("created"), Self.json(explicit))
+            let explicitPath = try URL(fileURLWithPath: XCTUnwrap(explicit["worktree"]?.objectValue?["path"]?.stringValue))
+            XCTAssertEqual(fixture.repositoryID(explicitPath), fixture.repositoryID(repos.gamma))
+        }
+    }
+
+    func testDeferredRelativeBindResolvesTheTargetDefaultAtTheIdleBoundary() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.mcpFollowUpRunPending = true
+            let queued = try await fixture.call([
+                "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                "worktree": .string("@main:\(ElectionRepositories.topicBranch)"), "apply": .string("next_boundary"),
+                "idempotency_key": .string("deferred-topic")
+            ])
+            XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"), Self.json(queued))
+            // Caller state changes while queued; the stored request has no repo_root and must not follow it.
+            fixture.callerSession.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            let callerBindings = fixture.callerSession.worktreeBindings
+            fixture.session.mcpFollowUpRunPending = false
+
+            let outcome = try await fixture.deferredOutcome()
+            let topicID = try fixture.worktreeID(repos.alphaTopic)
+            XCTAssertEqual(outcome["result"], .string("applied"), Self.json(.object(outcome)))
+            XCTAssertEqual(outcome["worktree_id"], .string(topicID), "relative to the target's declared PRIMARY")
+            XCTAssertEqual(fixture.targetBindingMap(), [Self.canonical(repos.alpha): topicID])
+            let saved = try await fixture.savedSession()
+            let persisted = try XCTUnwrap(saved)
+            XCTAssertEqual(persisted.worktreeBindings.map(\.worktreeID), [topicID])
+            XCTAssertEqual(persisted.worktreeBindings.map { Self.canonical($0.logicalRootPath) }, [Self.canonical(repos.alpha)])
+            XCTAssertEqual(fixture.callerSession.worktreeBindings, callerBindings)
+        }
+    }
+
+    func testDeferredRelativeBindRecapturesTargetBindingsChangedWhileQueued() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            fixture.session.mcpFollowUpRunPending = true
+            let queued = try await fixture.call([
+                "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                "worktree": .string("@main:\(ElectionRepositories.topicBranch)"), "apply": .string("next_boundary"),
+                "idempotency_key": .string("deferred-recapture")
+            ])
+            XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"), Self.json(queued))
+            // The default at queue time (beta') is not pinned: the attempt captures the target as it is then.
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime)]
+            fixture.session.mcpFollowUpRunPending = false
+
+            let outcome = try await fixture.deferredOutcome()
+            let topicID = try fixture.worktreeID(repos.alphaTopic)
+            XCTAssertEqual(outcome["result"], .string("applied"), Self.json(.object(outcome)))
+            XCTAssertEqual(outcome["worktree_id"], .string(topicID))
+            XCTAssertEqual(fixture.targetBindingMap(), [Self.canonical(repos.alpha): topicID])
+        }
+    }
+
+    func testExplicitCanonicalRepoRootKeepsCanonicalCheckoutWhileOmittedDefaultUsesBoundCheckout() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime)]
+
+            let explicit = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "repo_root": .string(repos.alpha.path), "branch": .string("e2e/explicit-canonical"), "bind": .bool(false),
+                "idempotency_key": .string("explicit-canonical")
+            ])
+            XCTAssertEqual(explicit["result"], .string("created"), Self.json(explicit))
+            let explicitPath = try URL(fileURLWithPath: XCTUnwrap(explicit["worktree"]?.objectValue?["path"]?.stringValue))
+            XCTAssertEqual(try fixture.head(explicitPath), try fixture.head(repos.alpha), "an explicit canonical path is not projected")
+
+            let elected = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/elected-default"), "bind": .bool(false), "idempotency_key": .string("elected-default")
+            ])
+            XCTAssertEqual(elected["result"], .string("created"), Self.json(elected))
+            let electedPath = try URL(fileURLWithPath: XCTUnwrap(elected["worktree"]?.objectValue?["path"]?.stringValue))
+            XCTAssertEqual(try fixture.head(electedPath), try fixture.head(repos.alphaPrime), "the omitted default uses the bound checkout")
+
+            // A repository outside the target's workspace stays unauthorized.
+            let outsider = try fixture.git.makeRepository(named: "outsider", files: ["outsider.txt": "outsider\n"])
+            let before = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: outsider)
+            let refused = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "repo_root": .string(outsider.path), "branch": .string("e2e/outsider"), "idempotency_key": .string("outsider")
+            ])
+            XCTAssertEqual(refused["code"], .string("invalid_request"), Self.json(refused))
+            XCTAssertEqual(try fixture.git.runGit(["worktree", "list", "--porcelain"], at: outsider), before)
+        }
+    }
+
+    func testHeldResolutionAbortsWhenTargetBindingsOrDeclaredOrderChangeBeforeCommit() async throws {
+        for change in ["bindings", "declared_order"] {
+            let hold = DiscoveryHold()
+            let live = GitRepoTargetResolver.Dependencies.live
+            let resolver = GitRepoTargetResolver(dependencies: .init(
+                resolveRepo: live.resolveRepo,
+                listWorktrees: { repo in
+                    await hold.pass()
+                    return try await live.listWorktrees(repo)
+                }
+            ))
+            try await withFixture(election: true, resolver: resolver) { fixture in
+                let repos = try XCTUnwrap(fixture.election)
+                let topicID = try fixture.worktreeID(repos.alphaTopic)
+                await hold.arm()
+                let request = Task { @MainActor in
+                    try await fixture.call([
+                        "op": .string("worktree_bind"), "session_id": .string(fixture.sessionID.uuidString),
+                        "worktree": .string("@id:\(topicID)"), "idempotency_key": .string("held-\(change)")
+                    ])
+                }
+                await hold.waitUntilHeld()
+                switch change {
+                case "bindings":
+                    fixture.session.worktreeBindings = try [fixture.binding(logical: repos.beta, worktree: repos.betaPrime)]
+                default:
+                    let index = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+                    fixture.window.workspaceManager.workspaces[index].repoPaths = [repos.beta, repos.alpha, repos.gamma].map(\.path)
+                }
+                let expected = fixture.session.worktreeBindings
+                await hold.release()
+                let reply = try await request.value
+                let item = try XCTUnwrap(reply["items"]?.arrayValue?.first?.objectValue, Self.json(reply))
+                XCTAssertEqual(item["code"], .string("scope_revoked"), "\(change): \(Self.json(reply))")
+                XCTAssertEqual(fixture.session.worktreeBindings, expected, change)
+            }
+        }
+    }
+
+    func testMergeApplyWithMultipleBindingsUsesSavedEndpointsNotDefaultElection() async throws {
+        try await withFixture(election: true, replicaHoldsTarget: false) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [
+                fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime),
+                fixture.binding(logical: repos.beta, worktree: repos.betaPrime)
+            ]
+            // A non-previewed saved operation fails only inside the saved-endpoint apply, after the host's
+            // capture-only admission; default election would refuse earlier with an ambiguity. Both endpoints sit
+            // inside workspace roots: the host admits a linked endpoint only when its own checkout root is a
+            // workspace repository, which is separate from #1431.
+            let operation = try Self.savedMergeOperation(source: repos.gamma, target: repos.alpha, status: .cancelled)
+            fixture.session.worktreeMergeOperations = [operation]
+            let text: String
+            do {
+                text = try await Self.json(.object(fixture.call([
+                    "op": .string("merge_apply"), "session_id": .string(fixture.sessionID.uuidString),
+                    "operation_id": .string(operation.id), "idempotency_key": .string("merge-apply-saved")
+                ])))
+            } catch {
+                text = "\(error) \(error.localizedDescription)"
+            }
+            XCTAssertTrue(text.contains("apply is only valid for a previewed worktree merge operation"), text)
+            XCTAssertFalse(text.contains("worktree bindings"), text)
+        }
+    }
+
+    func testIdentityReleaseRecoversUnavailableCheckoutDespiteMultipleBindings() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.worktreeBindings = try [
+                fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime),
+                fixture.binding(logical: repos.beta, worktree: repos.betaPrime)
+            ]
+            let betaPrimeID = try fixture.worktreeID(repos.betaPrime)
+            try FileManager.default.removeItem(at: repos.betaPrime)
+            let released = try await fixture.call([
+                "op": .string("worktree_release"), "session_id": .string(fixture.sessionID.uuidString),
+                "worktree_id": .string(betaPrimeID)
+            ])
+            XCTAssertEqual(released["result"], .string("applied"), Self.json(released))
+            XCTAssertEqual(fixture.targetBindingMap(), try [Self.canonical(repos.alpha): fixture.worktreeID(repos.alphaPrime)])
+        }
+    }
+
+    func testCreateFollowedByBusyBindKeepsOwnershipAndPartialReceiptInElectedRepository() async throws {
+        try await withFixture(election: true) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            fixture.session.mcpFollowUpRunPending = true
+            let reply = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/partial"), "idempotency_key": .string("partial-create")
+            ])
+            XCTAssertEqual(reply["result"], .string("partial"), Self.json(reply))
+            let worktree = try XCTUnwrap(reply["worktree"]?.objectValue, Self.json(reply))
+            let worktreeID = try XCTUnwrap(worktree["worktree_id"]?.stringValue)
+            let path = try URL(fileURLWithPath: XCTUnwrap(worktree["path"]?.stringValue))
+            XCTAssertEqual(fixture.repositoryID(path), fixture.repositoryID(repos.alpha))
+            XCTAssertNotNil(fixture.ownership.record(worktreeID: worktreeID), "committed creation keeps its ownership")
+            XCTAssertEqual(reply["affected"]?.objectValue?["worktree_ids"], .array([.string(worktreeID)]))
+            XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+
+            fixture.session.mcpFollowUpRunPending = false
+            let next = try XCTUnwrap(reply["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(reply))
+            let replayed = try await fixture.call(next)
+            XCTAssertEqual(replayed["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), Self.json(replayed))
+            XCTAssertEqual(fixture.targetBindingMap(), [Self.canonical(repos.alpha): worktreeID])
+        }
+    }
+
     @MainActor
     private struct Fixture {
         let git: ReviewGitRepositoryFixture
@@ -207,10 +529,67 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         let dataService: AgentSessionDataService
         let ownership: WorktreeOwnershipStore
         let service: SessionAdminMCPToolService
+        let callerSession: AgentTabSession
+        let election: ElectionRepositories?
 
         func call(_ arguments: [String: Value]) async throws -> [String: Value] {
             let result = try await service.execute(args: arguments)
             return try XCTUnwrap(result.objectValue)
+        }
+
+        func binding(logical: URL, worktree: URL) throws -> AgentSessionWorktreeBinding {
+            let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: worktree))
+            return AgentSessionWorktreeBinding(
+                id: UUID().uuidString, repositoryID: identity.repository.repositoryID, repoKey: identity.repository.repoKey,
+                logicalRootPath: logical.path, logicalRootName: logical.lastPathComponent,
+                worktreeID: identity.worktreeID, worktreeRootPath: worktree.path,
+                commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
+            )
+        }
+
+        func worktreeID(_ root: URL) throws -> String {
+            try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)).worktreeID
+        }
+
+        func repositoryID(_ root: URL) -> String? {
+            GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)?.repository.repositoryID
+        }
+
+        func head(_ root: URL) throws -> String {
+            try git.runGit(["rev-parse", "HEAD"], at: root).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        /// Git worktree registrations of every declared repository.
+        func registrations() throws -> [String] {
+            try (election?.declared ?? [repository]).map { try git.runGit(["worktree", "list", "--porcelain"], at: $0) }
+        }
+
+        /// Target bindings keyed by canonical logical root.
+        func targetBindingMap() -> [String: String] {
+            Dictionary(
+                session.worktreeBindings.map { (SessionAdminWorktreeRecoveryTests.canonical($0.logicalRootPath), $0.worktreeID) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        }
+
+        /// Waits through the production host's idle polling for the target's settled deferred bind.
+        func deferredOutcome() async throws -> [String: Value] {
+            var outcome: [String: Value]?
+            try await AsyncTestWait.waitUntil("deferred bind settled", timeout: 20) {
+                let inventory = try? await call(["op": .string("worktree_inventory")])
+                outcome = inventory?["deferred_outcomes"]?.arrayValue?.first?.objectValue
+                return outcome != nil
+            }
+            return try XCTUnwrap(outcome)
+        }
+
+        func assertMultipleBindingRefusal(_ detail: String?, file: StaticString = #filePath, line: UInt = #line) {
+            let detail = detail ?? ""
+            XCTAssertTrue(detail.contains("2 worktree bindings"), detail, file: file, line: line)
+            if let election {
+                XCTAssertTrue(detail.contains(election.alpha.path) && detail.contains(election.beta.path), detail, file: file, line: line)
+            }
+            XCTAssertFalse(detail.contains("DefaultRepositoryRequired"), detail, file: file, line: line)
         }
 
         func savedSession() async throws -> AgentSession? {
@@ -231,8 +610,21 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
     /// The passive replica is registered first and shares the physical tab and owner-valid index.
     /// Only the second window binds the background payload. Production provenance, caller binding,
     /// authorization and hosts must distinguish those facts without selecting either target tab.
-    private func withFixture(fullAccess: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
-        let git = try ReviewGitRepositoryFixture(name: "SessionAdminWorktreeRecovery")
+    /// `election` declares the three `ElectionRepositories` roots and installs them in adversarial order.
+    /// `replicaHoldsTarget: false` leaves the replica on its own workspace, for operations a replicated
+    /// target never admits (merge apply).
+    private func withFixture(
+        fullAccess: Bool = true,
+        election: Bool = false,
+        replicaHoldsTarget: Bool = true,
+        resolver: GitRepoTargetResolver = GitRepoTargetResolver(),
+        _ body: (Fixture) async throws -> Void
+    ) async throws {
+        // Election repositories live under the resolved temporary directory so declared, loaded, and Git paths agree.
+        let git = try ReviewGitRepositoryFixture(
+            name: "SessionAdminWorktreeRecovery",
+            parentDirectory: election ? FileManager.default.temporaryDirectory.resolvingSymlinksInPath() : nil
+        )
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let replica = WindowState()
@@ -242,7 +634,11 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
         OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+        let sessionID = UUID(), callerID = UUID()
         let cleanup: @MainActor () async -> Void = {
+            let materializer = WorkspaceRootBindingProjectionMaterializer(store: window.promptManager.workspaceFileContextStore)
+            await materializer.release(sessionID: sessionID)
+            await materializer.release(sessionID: callerID)
             window.beginClose()
             replica.beginClose()
             await window.tearDown()
@@ -253,15 +649,21 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             git.cleanup()
         }
         do {
-            let repository = try git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
+            let electionRepositories = try election ? Self.makeElectionRepositories(git) : nil
+            let repository = try electionRepositories?.alpha
+                ?? git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
+            let declared = electionRepositories?.declared ?? [repository]
             await replica.workspaceManager.awaitInitialized()
             await window.workspaceManager.awaitInitialized()
-            let created = window.workspaceManager.createWorkspace(name: "Worktree recovery", repoPaths: [repository.path], ephemeral: true)
+            let created = window.workspaceManager.createWorkspace(name: "Worktree recovery", repoPaths: declared.map(\.path), ephemeral: true)
             await window.workspaceManager.switchWorkspace(to: created, saveState: false, reason: "worktreeRecoveryTest")
-            _ = try await window.promptManager.workspaceFileContextStore.loadRoot(path: repository.path)
+            if let electionRepositories {
+                try await Self.installAdversarialOrder(electionRepositories, store: window.promptManager.workspaceFileContextStore)
+            } else {
+                _ = try await window.promptManager.workspaceFileContextStore.loadRoot(path: repository.path)
+            }
             var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             let foregroundTabID = try XCTUnwrap(workspace.activeComposeTabID)
-            let sessionID = UUID(), callerID = UUID()
             let foregroundIndex = try XCTUnwrap(workspace.composeTabs.firstIndex { $0.id == foregroundTabID })
             workspace.composeTabs[foregroundIndex].activeAgentSessionID = callerID
             let targetTab = ComposeTabState(name: "Background target", activeAgentSessionID: sessionID)
@@ -310,26 +712,31 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             try await viewModel.flushSaveRequired(for: targetTab.id, workspaceID: workspace.id).get()
             XCTAssertTrue(try viewModel.authoritativeLiveSession(for: sessionID) === session)
             workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            replica.workspaceManager.workspaces = [workspace]
-            replica.workspaceManager.activeWorkspace = workspace
-            replica.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
-            for tabID in Array(replica.agentModeViewModel.sessions.keys) {
-                replica.agentModeViewModel.test_removeSession(tabID: tabID)
+            if replicaHoldsTarget {
+                replica.workspaceManager.workspaces = [workspace]
+                replica.workspaceManager.activeWorkspace = workspace
+                replica.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                for tabID in Array(replica.agentModeViewModel.sessions.keys) {
+                    replica.agentModeViewModel.test_removeSession(tabID: tabID)
+                }
+                replica.agentModeViewModel.test_installSessionIndexSnapshot(
+                    viewModel.ownerValidatedSessionIndex, owner: owner, latestOwner: owner, activeWorkspace: workspace
+                )
             }
-            replica.agentModeViewModel.test_installSessionIndexSnapshot(
-                viewModel.ownerValidatedSessionIndex, owner: owner, latestOwner: owner, activeWorkspace: workspace
-            )
             window.promptManager.promptText = "Owner draft"
             replica.promptManager.promptText = "Replica draft"
             // Draft publication is asynchronous. Capture the no-peer-mutation baseline only
             // after fixture setup has reached both workspace projections.
             try await AsyncTestWait.waitUntil("foreground drafts published") {
                 window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == foregroundTabID }?.promptText == "Owner draft"
-                    && replica.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == foregroundTabID }?.promptText == "Replica draft"
+                    && (
+                        !replicaHoldsTarget
+                            || replica.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == foregroundTabID }?.promptText == "Replica draft"
+                    )
             }
             let source = OpenWindowsDelegationProvenanceSource()
-            XCTAssertEqual(source.resolutionState(for: sessionID), .replicated)
-            XCTAssertEqual(source.censusSnapshot().states[sessionID], .replicated)
+            XCTAssertEqual(source.resolutionState(for: sessionID), replicaHoldsTarget ? .replicated : .unique)
+            XCTAssertEqual(source.censusSnapshot().states[sessionID], replicaHoldsTarget ? .replicated : .unique)
             XCTAssertEqual(source.placement(for: sessionID)?.workspaceID, workspace.id)
             XCTAssertEqual(source.provenance(for: sessionID)?.hasUniqueRuntimeOwner, true)
             let runtimeOwner = try XCTUnwrap(SessionAdminWindows.runtimeOwner(for: sessionID))
@@ -339,8 +746,10 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let metadataPresenters = WindowStatesManager.shared.allWindows.filter {
                 $0.agentModeViewModel.ownerValidatedSessionIndex[sessionID] != nil
             }
-            XCTAssertTrue(metadataPresenters.first === replica, "Metadata order must not select the passive replica as writer")
-            XCTAssertEqual(metadataPresenters.count, 2)
+            if replicaHoldsTarget {
+                XCTAssertTrue(metadataPresenters.first === replica, "Metadata order must not select the passive replica as writer")
+            }
+            XCTAssertEqual(metadataPresenters.count, replicaHoldsTarget ? 2 : 1)
             XCTAssertNil(replica.agentModeViewModel.sessions[targetTab.id])
             let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
             if !fullAccess {
@@ -369,7 +778,9 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 }
             })
             let door = AgentSessionAdministrationFrontDoor.production(core: core, scopes: scopes, workspaceLocations: locations)
-            door.registerStructureHandlers(scopes: scopes, worktreeOwnership: ownership)
+            door.registerStructureHandlers(
+                scopes: scopes, worktreeOwnership: ownership, worktreeHost: SessionAdminWindowsWorktreeHost(resolver: resolver)
+            )
             var service = SessionAdminMCPToolService(
                 captureRequestMetadata: { .init(connectionID: UUID(), clientName: "worktree-recovery-test", windowID: window.windowID) },
                 requireTargetWindow: { window },
@@ -380,12 +791,152 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             try await body(.init(
                 git: git, repository: repository, window: window, replica: replica, session: session, sessionID: sessionID,
                 workspaceID: workspace.id, foregroundTabID: foregroundTabID, dataService: dataService,
-                ownership: ownership, service: service
+                ownership: ownership, service: service, callerSession: caller, election: electionRepositories
             ))
         } catch {
             await cleanup()
             throw error
         }
         await cleanup()
+    }
+
+    /// Declared [alpha, beta, gamma]; installed [beta, gamma, alpha]. Each linked checkout carries its own commit,
+    /// and alpha and beta both have an `e2e/topic` checkout, so a repository-relative `@main:e2e/topic` names a
+    /// different worktree for each default repository.
+    struct ElectionRepositories {
+        static let topicBranch = "e2e/topic"
+
+        let alpha: URL
+        let beta: URL
+        let gamma: URL
+        let alphaPrime: URL
+        let betaPrime: URL
+        let alphaTopic: URL
+        let betaTopic: URL
+
+        var declared: [URL] {
+            [alpha, beta, gamma]
+        }
+
+        var installed: [URL] {
+            [beta, gamma, alpha]
+        }
+    }
+
+    private static func makeElectionRepositories(_ git: ReviewGitRepositoryFixture) throws -> ElectionRepositories {
+        let alpha = try git.makeRepository(named: "alpha", files: ["alpha.txt": "alpha\n"])
+        let beta = try git.makeRepository(named: "beta", files: ["beta.txt": "beta\n"])
+        let gamma = try git.makeRepository(named: "gamma", files: ["gamma.txt": "gamma\n"])
+        func linked(_ name: String, from root: URL, branch: String) throws -> URL {
+            let path = git.sandbox.appendingPathComponent(name, isDirectory: true)
+            try git.runGit(["worktree", "add", "-b", branch, path.path, "HEAD"], at: root)
+            try git.write("\(name)\n", to: "\(name).txt", at: path)
+            try git.stage("\(name).txt", at: path)
+            try git.commit("\(name) commit", at: path)
+            return path
+        }
+        return try ElectionRepositories(
+            alpha: alpha, beta: beta, gamma: gamma,
+            alphaPrime: linked("alpha-wt", from: alpha, branch: "e2e/alpha-wt"),
+            betaPrime: linked("beta-wt", from: beta, branch: "e2e/beta-wt"),
+            alphaTopic: linked("alpha-topic", from: alpha, branch: ElectionRepositories.topicBranch),
+            betaTopic: linked("beta-topic", from: beta, branch: ElectionRepositories.topicBranch)
+        )
+    }
+
+    private static func installAdversarialOrder(_ repos: ElectionRepositories, store: WorkspaceFileContextStore) async throws {
+        let declared = Set(repos.declared.map(\.path))
+        for root in await store.roots() where declared.contains(root.standardizedFullPath) {
+            await store.unloadRoot(id: root.id)
+        }
+        for root in repos.installed {
+            _ = try await store.loadRoot(path: root.path)
+        }
+        let actor = await store.roots().filter { $0.kind == .primaryWorkspace }.map(\.standardizedFullPath)
+        XCTAssertEqual(actor, repos.installed.map(\.path), "actor install order must be adversarial")
+    }
+
+    private static func savedMergeOperation(
+        source: URL, target: URL, status: AgentSessionWorktreeMergeOperation.Status
+    ) throws -> AgentSessionWorktreeMergeOperation {
+        func endpoint(_ root: URL, head: String) throws -> GitWorktreeMergeEndpoint {
+            let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root))
+            return GitWorktreeMergeEndpoint(
+                worktreeID: identity.worktreeID, repositoryID: identity.repository.repositoryID,
+                repoKey: identity.repository.repoKey, path: root.path, name: root.lastPathComponent,
+                branch: nil, head: head, isMain: identity.isMain
+            )
+        }
+        let operationID = "merge_\(UUID().uuidString)"
+        let sourceEndpoint = try endpoint(source, head: String(repeating: "a", count: 40))
+        let targetEndpoint = try endpoint(target, head: String(repeating: "b", count: 40))
+        let now = Date()
+        let inspection = GitWorktreeMergeInspection(
+            source: sourceEndpoint, target: targetEndpoint,
+            mergeBase: String(repeating: "c", count: 40),
+            sourceHead: sourceEndpoint.head, targetHead: targetEndpoint.head,
+            sourceFingerprint: GitDiffFingerprint(headSHA: sourceEndpoint.head, baseRef: "HEAD", statusHash: "source-clean", generatedAt: now),
+            targetFingerprint: GitDiffFingerprint(headSHA: targetEndpoint.head, baseRef: "HEAD", statusHash: "target-clean", generatedAt: now),
+            blockers: [],
+            conflictPrediction: GitWorktreeMergeConflictPrediction(status: .clean),
+            summary: GitWorktreeMergeSummary(commits: 1, files: 1, insertions: 1, deletions: 0),
+            visualization: "target <- source"
+        )
+        let preview = GitWorktreeMergePreview(operationID: operationID, inspection: inspection, artifacts: GitWorktreeMergePreviewArtifacts(
+            snapshotID: "snapshot_\(operationID)",
+            snapshotDirectory: "/tmp/snapshot_\(operationID)",
+            manifestPath: "/tmp/snapshot_\(operationID)/manifest.json",
+            mapPath: "/tmp/snapshot_\(operationID)/MAP.txt",
+            allPatchPath: "/tmp/snapshot_\(operationID)/diff/all.patch",
+            sidecarPath: "/tmp/snapshot_\(operationID)/merge_preview.json"
+        ))
+        return AgentWorktreeMergeCoordinator.makeOperation(preview: preview, status: status, now: now)
+    }
+
+    private static func canonical(_ url: URL) -> String {
+        GitRepoRootAuthorization.canonicalPath(url.path)
+    }
+
+    private static func canonical(_ path: String) -> String {
+        GitRepoRootAuthorization.canonicalPath(path)
+    }
+
+    private static func json(_ value: [String: Value]) -> String {
+        json(.object(value))
+    }
+
+    private static func json(_ value: Value) -> String {
+        (try? JSONEncoder().encode(value)).map { String(decoding: $0, as: UTF8.self) } ?? "\(value)"
+    }
+}
+
+/// Holds the first armed worktree query until released, so a test can change target state mid-resolution.
+private actor DiscoveryHold {
+    private var armed = false
+    private var reached = false
+    private var reachedWaiter: CheckedContinuation<Void, Never>?
+    private var held: CheckedContinuation<Void, Never>?
+
+    func arm() {
+        armed = true
+    }
+
+    func pass() async {
+        guard armed else { return }
+        armed = false
+        reached = true
+        reachedWaiter?.resume()
+        reachedWaiter = nil
+        await withCheckedContinuation { held = $0 }
+    }
+
+    func waitUntilHeld() async {
+        guard !reached else { return }
+        await withCheckedContinuation { reachedWaiter = $0 }
+    }
+
+    func release() {
+        held?.resume()
+        held = nil
     }
 }

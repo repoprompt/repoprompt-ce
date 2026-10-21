@@ -3,6 +3,7 @@ import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 @MainActor
@@ -24,9 +25,11 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         let runtime: MCPDomainRuntime?
     }
 
+    /// `repoPaths` replaces the fixture's single scratch root with declared workspace roots.
     private func withFixture(
         ephemeral: Bool = true,
         runtimeBacked: Bool = false,
+        repoPaths: [String]? = nil,
         _ body: (Fixture) async throws -> Void
     ) async throws {
         let root = FileManager.default.temporaryDirectory
@@ -78,13 +81,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let workspace: WorkspaceModel
             if runtimeBacked {
                 let creation = try window.workspaceManager.createPersistentWorkspace(
-                    name: "Lane first save \(UUID().uuidString.prefix(8))", repoPaths: [root.path]
+                    name: "Lane first save \(UUID().uuidString.prefix(8))", repoPaths: repoPaths ?? [root.path]
                 )
                 workspace = try await creation.publishedWorkspace()
             } else {
                 workspace = window.workspaceManager.createWorkspace(
                     name: "Lane first save \(UUID().uuidString.prefix(8))",
-                    repoPaths: [root.path], ephemeral: ephemeral
+                    repoPaths: repoPaths ?? [root.path], ephemeral: ephemeral
                 )
             }
             let switched = await window.workspaceManager.switchWorkspace(
@@ -3197,5 +3200,255 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 $0.tab.id == lane.tabID || $0.tab.id == target.tabID
             }, "the conflicted child must never be stashed into a disputed subtree")
         }
+    }
+
+    // MARK: - agent_run startup worktree selection and inheritance (#1431 characterization)
+
+    // Startup is not part of the default repository election: explicit/create startup stays declared-PRIMARY-only
+    // and inheritance copies the parent's complete binding set. These tests characterize those rules through the
+    // real `agent_run` starter and must pass unchanged before and after the election lands.
+
+    func testStartupWorktreeSelectionKeepsDeclaredPrimaryAndRefusesSecondaryUnderReversedActorOrder() async throws {
+        try await withStartupRepositories { fixture, repos in
+            let created = await startObservingBindings(fixture, arguments: [
+                "worktree_create": .bool(true), "worktree_branch": .string("e2e/startup-primary")
+            ])
+            XCTAssertTrue(Self.isStartupSentinel(created.error), "\(String(describing: created.error))")
+            let binding = try XCTUnwrap(created.bindings.first, "no binding reached the starter")
+            XCTAssertEqual(created.bindings.count, 1)
+            XCTAssertEqual(Self.canonical(binding.logicalRootPath), Self.canonical(repos.alpha.path), "declared PRIMARY despite actor order")
+            XCTAssertEqual(binding.repositoryID, repos.repositoryID(repos.alpha))
+
+            let secondaryBefore = try repos.registrations(repos.beta)
+            let secondary = await startObservingBindings(fixture, arguments: [
+                "worktree_create": .bool(true), "worktree_repo_root": .string(repos.beta.path),
+                "worktree_branch": .string("e2e/startup-secondary")
+            ])
+            XCTAssertFalse(secondary.reachedStarter)
+            XCTAssertTrue(Self.text(secondary.error).contains("supports the primary workspace root only"), Self.text(secondary.error))
+            XCTAssertEqual(try repos.registrations(repos.beta), secondaryBefore, "refused before creating a secondary checkout")
+
+            // An identifying selector for a secondary checkout is searched only in PRIMARY, never bound under it.
+            let sibling = try await startObservingBindings(fixture, arguments: [
+                "worktree": .string("@id:\(repos.worktreeID(repos.betaPrime))")
+            ])
+            XCTAssertFalse(sibling.reachedStarter)
+            XCTAssertTrue(Self.text(sibling.error).contains("No worktree found for id"), Self.text(sibling.error))
+        }
+    }
+
+    func testStartupInheritanceCopiesFullParentSetUnlessExplicitOrDisabledAndKeepsAlreadyBoundTarget() async throws {
+        try await withStartupRepositories { fixture, repos in
+            let parentBindings = try [
+                repos.binding(logical: repos.alpha, worktree: repos.alphaPrime),
+                repos.binding(logical: repos.beta, worktree: repos.betaPrime)
+            ]
+            let parent = try installStartupSession(fixture, name: "Startup parent", bindings: parentBindings)
+
+            let inherited = await startObservingBindings(fixture, parentSessionID: parent.sessionID, arguments: [:])
+            XCTAssertTrue(Self.isStartupSentinel(inherited.error), "\(String(describing: inherited.error))")
+            XCTAssertEqual(
+                Set(inherited.bindings.map(\.worktreeID)), Set(parentBindings.map(\.worktreeID)),
+                "ordinary inheritance copies every parent binding, secondary root included"
+            )
+            XCTAssertEqual(
+                Set(inherited.bindings.map { Self.canonical($0.logicalRootPath) }),
+                Set([repos.alpha, repos.beta].map { Self.canonical($0.path) })
+            )
+
+            let explicit = await startObservingBindings(fixture, parentSessionID: parent.sessionID, arguments: [
+                "worktree_create": .bool(true), "worktree_branch": .string("e2e/startup-explicit")
+            ])
+            XCTAssertTrue(Self.isStartupSentinel(explicit.error), "\(String(describing: explicit.error))")
+            XCTAssertEqual(explicit.bindings.count, 1, "explicit arguments suppress inheritance")
+            XCTAssertEqual(explicit.bindings.first.map { Self.canonical($0.logicalRootPath) }, Self.canonical(repos.alpha.path))
+            XCTAssertFalse(parentBindings.map(\.worktreeID).contains(explicit.bindings.first?.worktreeID ?? ""))
+
+            let skipped = await startObservingBindings(fixture, parentSessionID: parent.sessionID, arguments: [
+                "inherit_worktree": .bool(false)
+            ])
+            XCTAssertTrue(Self.isStartupSentinel(skipped.error), "\(String(describing: skipped.error))")
+            XCTAssertTrue(skipped.reachedStarter)
+            XCTAssertEqual(skipped.bindings, [], "inherit_worktree=false skips copying")
+
+            // An already-bound target keeps its own bindings under inherit_worktree=false and survives the failed
+            // start, unlike the discarded fresh targets above.
+            let targetBindings = try [repos.binding(logical: repos.beta, worktree: repos.betaPrime)]
+            let existing = try installStartupSession(fixture, name: "Already bound target", bindings: targetBindings)
+            let retained = await startObservingBindings(
+                fixture, parentSessionID: parent.sessionID, requestedTabID: existing.session.tabID,
+                arguments: ["inherit_worktree": .bool(false)]
+            )
+            XCTAssertTrue(Self.isStartupSentinel(retained.error), "\(String(describing: retained.error))")
+            XCTAssertEqual(retained.targetSessionID, existing.sessionID)
+            XCTAssertEqual(retained.bindings, targetBindings, "inherit_worktree=false does not clear an already-bound target")
+            let viewModel = fixture.window.agentModeViewModel
+            XCTAssertTrue(viewModel.sessions[existing.session.tabID] === existing.session, "a preexisting target is retained")
+            XCTAssertEqual(existing.session.worktreeBindings, targetBindings)
+            for fresh in [inherited, explicit, skipped] {
+                let tabID = try XCTUnwrap(fresh.targetTabID)
+                XCTAssertNil(viewModel.sessions[tabID]?.activeAgentSessionID, "a fresh target is discarded after the failed start")
+            }
+            XCTAssertEqual(parent.session.worktreeBindings, parentBindings)
+        }
+    }
+
+    private static let startupSentinel = "STARTUP_WORKTREE_CHARACTERIZATION_REACHED_STARTER"
+
+    private struct StartupRepositories {
+        let git: ReviewGitRepositoryFixture
+        let alpha: URL
+        let beta: URL
+        let alphaPrime: URL
+        let betaPrime: URL
+
+        func binding(logical: URL, worktree: URL) throws -> AgentSessionWorktreeBinding {
+            let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: worktree))
+            return AgentSessionWorktreeBinding(
+                id: UUID().uuidString, repositoryID: identity.repository.repositoryID, repoKey: identity.repository.repoKey,
+                logicalRootPath: logical.path, logicalRootName: logical.lastPathComponent,
+                worktreeID: identity.worktreeID, worktreeRootPath: worktree.path,
+                commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
+            )
+        }
+
+        func worktreeID(_ root: URL) throws -> String {
+            try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)).worktreeID
+        }
+
+        func repositoryID(_ root: URL) -> String? {
+            GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)?.repository.repositoryID
+        }
+
+        func registrations(_ root: URL) throws -> String {
+            try git.runGit(["worktree", "list", "--porcelain"], at: root)
+        }
+    }
+
+    private struct StartupObservation {
+        var reachedStarter = false
+        var targetTabID: UUID?
+        var targetSessionID: UUID?
+        var bindings: [AgentSessionWorktreeBinding] = []
+        var error: Error?
+    }
+
+    /// Declared [alpha, beta] installed [beta, alpha], each with one linked checkout, plus an available model.
+    private func withStartupRepositories(_ body: (Fixture, StartupRepositories) async throws -> Void) async throws {
+        let git = try ReviewGitRepositoryFixture(
+            name: "StartupWorktreeCharacterization",
+            parentDirectory: FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        )
+        defer { git.cleanup() }
+        let alpha = try git.makeRepository(named: "alpha", files: ["alpha.txt": "alpha\n"])
+        let beta = try git.makeRepository(named: "beta", files: ["beta.txt": "beta\n"])
+        func linked(_ name: String, from root: URL) throws -> URL {
+            let path = git.sandbox.appendingPathComponent(name, isDirectory: true)
+            try git.runGit(["worktree", "add", "-b", "e2e/\(name)", path.path, "HEAD"], at: root)
+            return path
+        }
+        let repos = try StartupRepositories(
+            git: git, alpha: alpha, beta: beta,
+            alphaPrime: linked("alpha-wt", from: alpha), betaPrime: linked("beta-wt", from: beta)
+        )
+        try await withFixture(ephemeral: false, repoPaths: [alpha.path, beta.path]) { fixture in
+            let store = fixture.window.promptManager.workspaceFileContextStore
+            let declared = Set([alpha.path, beta.path])
+            for root in await store.roots() where declared.contains(root.standardizedFullPath) {
+                await store.unloadRoot(id: root.id)
+            }
+            for root in [beta, alpha] {
+                _ = try await store.loadRoot(path: root.path)
+            }
+            let actor = await store.roots().filter { $0.kind == .primaryWorkspace }.map(\.standardizedFullPath)
+            XCTAssertEqual(actor, [beta.path, alpha.path], "actor install order must be reversed")
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("startup model availability") {
+                fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            try await body(fixture, repos)
+        }
+    }
+
+    private func installStartupSession(
+        _ fixture: Fixture, name: String, bindings: [AgentSessionWorktreeBinding]
+    ) throws -> (sessionID: UUID, session: AgentTabSession) {
+        let manager = fixture.window.workspaceManager
+        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+        let sessionID = UUID()
+        let tab = ComposeTabState(name: name, activeAgentSessionID: sessionID)
+        manager.workspaces[index].composeTabs.append(tab)
+        fixture.window.promptManager.loadComposeTabsFromWorkspace(manager.workspaces[index], syncPromptText: false)
+        let viewModel = fixture.window.agentModeViewModel
+        let session = viewModel.session(for: tab.id)
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.worktreeBindings = bindings
+        XCTAssertTrue(try viewModel.authoritativeLiveSession(for: sessionID) === session)
+        return (sessionID, session)
+    }
+
+    /// Runs the real `agent_run` start through worktree preparation and records the target bindings at the
+    /// injected starter, which then stops before any provider work.
+    private func startObservingBindings(
+        _ fixture: Fixture,
+        parentSessionID: UUID? = nil,
+        requestedTabID: UUID? = nil,
+        arguments: [String: Value]
+    ) async -> StartupObservation {
+        var observation = StartupObservation()
+        let launchTabID = fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID ?? UUID()
+        var start = AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "startup-worktree-characterization", windowID: fixture.window.windowID) },
+            requireTargetWindow: { fixture.window }, resolveRequestedTabID: { _ in requestedTabID },
+            resolveSpawnParentSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in parentSessionID },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { target, _, _, viewModel, _, _, _, _, _, _, _, _ in
+                observation.reachedStarter = true
+                observation.targetTabID = target.tabID
+                observation.targetSessionID = target.sessionID
+                observation.bindings = target.sessionID.map { viewModel.worktreeBindings(forAgentSessionID: $0) } ?? []
+                throw MCPError.internalError(Self.startupSentinel)
+            }
+        )
+        start.resolveOracleReviewLaunchSource = { _, _ in
+            let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                route: .explicitWindowActiveCompose, windowID: fixture.window.windowID,
+                workspaceID: fixture.workspaceID, tabID: launchTabID, selectionRevision: 0,
+                promptText: "", selection: StoredSelection(), sourceAgentSessionID: nil, routedRunID: nil
+            )
+            return ResolvedAgentRunOracleReviewLaunchSource(snapshot: snapshot, source: .unavailable(.init(
+                delegationID: UUID(), sourceTabID: launchTabID, workspaceID: fixture.workspaceID,
+                sourceAgentSessionID: nil, sourceAgentRunID: nil, reason: .sourceCaptureFailed("Startup characterization fixture")
+            )))
+        }
+        var args = arguments
+        args["op"] = .string("start")
+        args["model_id"] = .string("claudeCode:sonnet:high")
+        args["message"] = .string("Startup worktree characterization")
+        do {
+            _ = try await start.execute(args: args)
+        } catch {
+            observation.error = error
+        }
+        return observation
+    }
+
+    private static func isStartupSentinel(_ error: Error?) -> Bool {
+        text(error).contains(startupSentinel)
+    }
+
+    private static func text(_ error: Error?) -> String {
+        error.map { "\($0) \($0.localizedDescription)" } ?? "no error"
+    }
+
+    private static func canonical(_ path: String) -> String {
+        GitRepoRootAuthorization.canonicalPath(path)
     }
 }

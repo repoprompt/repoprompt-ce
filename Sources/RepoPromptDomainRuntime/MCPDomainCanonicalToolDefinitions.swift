@@ -1319,20 +1319,22 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     /// The vendored `git` and `manage_worktree` definitions advertise a first-loaded-root default. App-backed
     /// calls use the shared default repository election instead; the direct headless backend keeps its own
-    /// root-set semantics, so the copy qualifies the policy by backend. Obsolete prose is replaced in place
-    /// (never contradicted by appended text), field shapes are unchanged, and reapplying changes nothing.
+    /// root-set semantics, so the copy qualifies the policy by backend. `agent_run` startup is not part of that
+    /// election, so its copy states its own PRIMARY-only and full-set inheritance rules instead. Obsolete prose is
+    /// replaced in place (never contradicted by appended text), field shapes are unchanged, and reapplying
+    /// changes nothing.
     private static func advertiseDefaultRepositoryElection(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         typealias Copy = MCPDefaultRepositoryElectionCopy
         var description = definition.description
-        let repoRootDescription: String
+        let propertyDescriptions: [String: String]
         switch definition.name {
         case MCPWindowToolName.git:
             description = replacingObsoleteLine(Copy.gitObsoleteDefault, with: Copy.gitDefault, in: description)
             description = replacingObsoleteLine(Copy.gitObsoleteTreeSpecifiers, with: Copy.gitTreeSpecifiers, in: description)
             description = replacingObsoleteLine(Copy.gitObsoleteMultiRootNote, with: Copy.gitMultiRootNote, in: description)
-            repoRootDescription = Copy.gitRepoRootProperty
+            propertyDescriptions = ["repo_root": Copy.gitRepoRootProperty]
         case MCPWindowToolName.manageWorktree:
             if !description.contains(Copy.manageWorktreeSection) {
                 description = description.contains(Copy.manageWorktreeSectionAnchor)
@@ -1342,18 +1344,26 @@ package enum MCPDomainCanonicalToolDefinitions {
                     )
                     : description + Copy.manageWorktreeSection
             }
-            repoRootDescription = Copy.manageWorktreeRepoRootProperty
+            propertyDescriptions = ["repo_root": Copy.manageWorktreeRepoRootProperty]
+        case MCPWindowToolName.agentRun:
+            description = replacingObsoleteLine(Copy.agentRunObsoleteWorktreeArgs, with: Copy.agentRunWorktreeArgs, in: description)
+            propertyDescriptions = [
+                "worktree_repo_root": Copy.agentRunWorktreeRepoRootProperty,
+                "inherit_worktree": Copy.agentRunInheritWorktreeProperty
+            ]
         default:
             return definition
         }
 
         var inputSchema = definition.inputSchema
         if case var .object(schema) = inputSchema,
-           case var .object(properties)? = schema["properties"],
-           case var .object(repoRoot)? = properties["repo_root"]
+           case var .object(properties)? = schema["properties"]
         {
-            repoRoot["description"] = .string(repoRootDescription)
-            properties["repo_root"] = .object(repoRoot)
+            for (name, text) in propertyDescriptions {
+                guard case var .object(property)? = properties[name] else { continue }
+                property["description"] = .string(text)
+                properties[name] = .object(property)
+            }
             schema["properties"] = .object(properties)
             inputSchema = .object(schema)
         }
@@ -3854,4 +3864,15 @@ package enum MCPDefaultRepositoryElectionCopy {
     """
     package static let manageWorktreeRepoRootProperty =
         "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
+
+    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    static let agentRunObsoleteWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
+    package static let agentRunWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. App-backed starts bind only the declared PRIMARY workspace root: `worktree_repo_root` defaults to it and a secondary root is refused, selectors resolve only in PRIMARY's repository, and the `git`/`manage_worktree` default repository does not apply. Inheritance copies the source session's complete binding set, secondary roots included. Direct headless backend: binds existing worktrees only (no `worktree_create`), and `worktree_repo_root` may name any declared root."
+    package static let agentRunWorktreeRepoRootProperty =
+        "[start] Repo/logical root selector for worktree resolution or creation. App-backed starts accept only the declared PRIMARY workspace root, which is the default; a secondary root is refused. The direct headless backend may name any declared root for an existing worktree."
+    package static let agentRunInheritWorktreeProperty =
+        "[start] When started from an Agent Mode run, inherit the source session's complete worktree binding set, secondary roots included, before provider startup. Default true. Set false to keep parent session threading but skip the copy; bindings the target already has are kept. Explicit worktree/worktree_id/worktree_create args take precedence, suppress parent inheritance, and bind only the requested worktree."
 }
