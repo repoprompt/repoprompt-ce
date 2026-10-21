@@ -57,8 +57,8 @@ enum AgentToolResultPersistencePolicy {
     static let maxPersistedToolSummaryBytes = 2048
     private static let cursorACPPersistedDiffBytesLimit = 1200
     private static let cursorACPFallbackPersistedDiffBytesLimit = 600
-    private static let cursorACPGeneratedDiffInputBytesLimit = 16384
-    private static let cursorACPGeneratedDiffInputLineLimit = 800
+    private static let cursorACPGeneratedDiffInputBytesLimit = ACPToolUpdateResultAdapter.generatedDiffInputBytesLimit
+    private static let cursorACPGeneratedDiffInputLineLimit = ACPToolUpdateResultAdapter.generatedDiffInputLineLimit
     private static let promptExportFileMetadataLimit = 12
 
     static func sanitizeItem(_ item: AgentChatItem) -> AgentChatItem {

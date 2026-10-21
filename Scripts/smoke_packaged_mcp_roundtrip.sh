@@ -66,7 +66,7 @@ cleanup() {
         [[ -z "$APP_LOG" || ! -f "$APP_LOG" ]] || cp "$APP_LOG" "$DIAGNOSTICS_DIR/packaged-app.log"
         [[ -z "$HELPER_DEBUG_LOG" || ! -f "$HELPER_DEBUG_LOG" ]] || cp "$HELPER_DEBUG_LOG" "$DIAGNOSTICS_DIR/helper-socket-debug.log"
         if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
-            find "$TEMP_ROOT" -maxdepth 1 -type f \( -name 'windows-attempt-*' -o -name 'socket-owner.err' -o -name 'launched-process.json' \) \
+            find "$TEMP_ROOT" -maxdepth 1 -type f \( -name 'windows-attempt-*' -o -name 'socket-owner.err' -o -name 'launched-process.json' -o -name 'external-initialize.*' \) \
                 -exec cp {} "$DIAGNOSTICS_DIR/" \; 2>/dev/null || true
         fi
         printf '%s\n' "--- packaged app sample excerpt ---" >&2
@@ -269,7 +269,11 @@ frames = [
                 },
             },
             "clientInfo": {
-                "name": "codex-mcp-client",
+                # Admission policy (#1346): the app auto-approves only a kernel-verified bundled
+                # helper whose clientInfo.name starts with "RepoPrompt CLI" (or a live managed
+                # agent). Any other name waits for manual approval (300s) and trips the watchdog.
+                # The name is not trust; the exact helper and socket ownership checks still apply.
+                "name": "RepoPrompt CLI (Packaged Smoke)",
                 "title": "Codex",
                 "version": "0.154.0",
             },
@@ -378,7 +382,24 @@ while (( $(date +%s) <= deadline )); do
         cat "$attempt_stdout"
         cat "$attempt_stderr" >&2
         log_phase "$SMOKE_LABEL validating object-valued external initialize capability"
-        run_external_initialize_request
+        external_stdout="$TEMP_ROOT/external-initialize.out"
+        external_stderr="$TEMP_ROOT/external-initialize.err"
+        set +e
+        run_external_initialize_request >"$external_stdout" 2>"$external_stderr"
+        external_status=$?
+        set -e
+        cat "$external_stdout"
+        cat "$external_stderr" >&2
+        if (( external_status != 0 )); then
+            if (( external_status == 124 )); then
+                log_phase "$SMOKE_LABEL external initialize/tools/list probe timed out after ${HELPER_REQUEST_TIMEOUT}s"
+            fi
+            if [[ -f "$HELPER_DEBUG_LOG" ]]; then
+                printf '%s\n' "--- helper socket debug tail (external initialize) ---" >&2
+                tail -100 "$HELPER_DEBUG_LOG" >&2 || true
+            fi
+            fail "$SMOKE_LABEL external initialize probe failed with exit $external_status"
+        fi
         "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
             fail "$SMOKE_LABEL release MCP socket ownership changed during the helper request"
         printf 'OK: %s completed bootstrap and windows request with exact helper %s against launched pid %s socket %s\n' \
