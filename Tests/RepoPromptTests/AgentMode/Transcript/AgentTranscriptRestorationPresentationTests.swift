@@ -2624,9 +2624,10 @@ extension AgentTranscriptPaneSnapshotPublicationTests {
                 from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Outgoing content")
             )]
             _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
+            XCTAssertNil(fixture.prompt.activeComposeTabID, "precondition: selection not yet published")
             fixture.viewModel.setAgentModeActive(true)
             await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
-            // Activation queues the loader; its task may not exist when the workspace switch returns.
+            // Activation queues the loader; its task does not exist yet when the workspace switch returns.
             // Hold preparation until that producer exists, then await the activation continuation too.
             await fixture.gate.waitUntilEntered()
             let loadTask = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask)
