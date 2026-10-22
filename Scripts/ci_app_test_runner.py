@@ -582,11 +582,18 @@ def run_local_tests(
         print("::error::extra build arguments require a separate scratch path")
         return 2
     swiftpm_args = (*scratch_path_args(scratch_path), *build_args)
+    # Consume conductor's private receipt before any SwiftPM subprocess: manifest
+    # caching keys on the environment, so a unique attempt path must not reach it.
+    receipt = os.environ.pop("REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT", None)
     # Keep compilation and its caches outside the disposable runtime home.
     environment = dict(os.environ)
     status = executor((swift_binary, "build", "--build-tests", *swiftpm_args), cwd, environment)
     if status != 0:
         return status
+    # Conductor must not interpret assertion/runtime failures as a corrupt seed.
+    # Its private receipt lives outside .build and is unique to this attempt.
+    if receipt:
+        Path(receipt).touch()
     with tempfile.TemporaryDirectory(prefix="rpce-local-tests-") as directory:
         environment = isolated_suite_environment(Path(directory), "local", environment)
         command: tuple[str, ...] | None = None

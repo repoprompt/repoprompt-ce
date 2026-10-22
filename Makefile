@@ -152,6 +152,7 @@ conductor-selftest:
 	python3 Scripts/test_modularization_index_graph.py
 	python3 Scripts/test_conductor_job_timings.py
 	python3 Scripts/test_conductor_job_phases.py
+	python3 Scripts/test_conductor_cache_retry.py
 	python3 Scripts/test_conductor_heavy_admission.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py

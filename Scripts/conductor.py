@@ -31,6 +31,7 @@ import socketserver
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -4750,6 +4751,7 @@ class DaemonState:
                             "cache_retry",
                             {
                                 "argv": argv,
+                                "testBuildReceipt": job.operation == "test",
                                 "key": cache_context.snapshot.key,
                                 "outcomePath": str(cache_context.outcome_path),
                                 "attemptTimeout": attempt_timeout,
@@ -8437,6 +8439,7 @@ def _run_cache_attempt(
     attempt_timeout: Optional[float],
     attempt_record_path: Path,
     ticket: str,
+    env: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, bool]:
     wrapper_start = process_start_token(os.getpid())
     if not wrapper_start:
@@ -8457,6 +8460,7 @@ def _run_cache_attempt(
         process = subprocess.Popen(
             gate_argv,
             cwd=str(repo_root),
+            env=env,
             stdin=subprocess.DEVNULL,
             pass_fds=(read_fd,),
             start_new_session=True,
@@ -8594,13 +8598,23 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     if not math.isfinite(cleanup_timeout) or cleanup_timeout < 0:
         raise ConductorError("cache retry cleanup timeout must be a finite non-negative number")
 
-    first_code, first_timed_out = _run_cache_attempt(
-        argv,
-        repo_root,
-        attempt_timeout,
-        attempt_record_path,
-        ticket,
-    )
+    # A test invocation contains both compilation and execution. Only failures before
+    # its successful build boundary are candidates for seeded-cache recovery. Use a
+    # private per-attempt receipt, not log matching or an inherited/stale .build file.
+    with tempfile.TemporaryDirectory(prefix="conductor-cache-attempt-") as directory:
+        test_build_receipt = Path(directory) / "test-build-succeeded"
+        attempt_env = dict(os.environ)
+        if args.get("testBuildReceipt"):
+            attempt_env["REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT"] = str(test_build_receipt)
+        first_code, first_timed_out = _run_cache_attempt(
+            argv,
+            repo_root,
+            attempt_timeout,
+            attempt_record_path,
+            ticket,
+            env=attempt_env,
+        )
+        test_build_succeeded = test_build_receipt.is_file()
     if first_code == 0:
         return 0
     build_dir = repo_root / ".build"
@@ -8612,6 +8626,11 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
         "seededTimedOut": first_timed_out,
         "coldRetryAttempted": False,
     }
+    if test_build_succeeded:
+        outcome["reason"] = "test build succeeded; post-build failure is not a seeded-cache failure"
+        if outcome_path.parent.is_dir():
+            _atomic_write_json(outcome_path, outcome)
+        return first_code
     if not (
         provenance
         and provenance.get("key") == key
