@@ -53,6 +53,12 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 // Named by the caller but already listed under an earlier adoptee: it stays visible
                 // to the agent as a named adoptee, not as that adoptee's descendant.
                 adoptees.append(adoptee)
+                if let index = items.firstIndex(where: { $0.sessionID == adoptee }) {
+                    items[index] = BatchConfirmationItem(
+                        sessionID: adoptee, title: items[index].title,
+                        effect: "Bring into this delegation scope under \(destinationName)"
+                    )
+                }
                 for key in descendantsByAdoptee.keys {
                     descendantsByAdoptee[key]?.removeAll { $0 == adoptee }
                 }

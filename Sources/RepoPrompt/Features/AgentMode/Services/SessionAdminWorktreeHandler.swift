@@ -649,8 +649,12 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // Prunability checks suspend. Re-prove the whole chain and every named member before
         // returning worktree paths or deferred outcomes; a stale pre-await census is not authority.
         try Task.checkCancellation()
+        // A chain snapshot alone does not refresh time-based expiry. Read through the authority
+        // runtime first so expiry (including any ancestor's) cascades before the disclosure fence.
+        let refreshedScope = context.scopes.record(id: batch.scope.id)
         let currentChain = context.scopeChain(of: batch.scope)
-        guard !initialChain.isEmpty, currentChain.count == initialChain.count,
+        guard refreshedScope?.isActive == true, refreshedScope?.generation == batch.scope.generation,
+              !initialChain.isEmpty, currentChain.count == initialChain.count,
               zip(initialChain, currentChain).allSatisfy({ before, after in
                   before.id == after.id && before.generation == after.generation && after.isActive
               }),
