@@ -360,6 +360,43 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
         }
     }
 
+    func testDisablingFullAccessPreservesCapturedManageLink() async throws {
+        try await withWindow { window in
+            var fullAccess = true
+            var linkLive = true
+            var acquisitions = 0
+            let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            scopes.isGlobalAutoApproveEnabled = { fullAccess }
+            let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+                targetSessionID: self.targetSessionID,
+                metadata: MCPRequestMetadata(connectionID: nil, clientName: nil, windowID: window.windowID, runPurpose: .agentModeRun),
+                targetWindow: window,
+                resolveSpawnParentSessionID: { _, _ in self.callerSessionID },
+                resolveObserverEndpoint: { _, _ in self.endpoint(sessionID: self.callerSessionID) },
+                resolveTargetProvenance: { .known(targetSessionID: $0, parentSessionID: nil) },
+                hasManageGrant: { _, _ in
+                    acquisitions += 1
+                    return .init(revalidate: {
+                        guard linkLive else { throw AgentSessionTargetOperationGuard.denialError(sessionID: self.targetSessionID) }
+                    }, commit: { body in
+                        guard linkLive else { throw AgentSessionTargetOperationGuard.denialError(sessionID: self.targetSessionID) }
+                        try body()
+                    })
+                },
+                authorizationEngine: scopes.authorization
+            )
+            fullAccess = false
+            try await authority.revalidate()
+            var published = false
+            try authority.commit { published = true }
+            XCTAssertTrue(published)
+            linkLive = false
+            await self.assertUniformDenial { try await authority.revalidate() }
+            XCTAssertThrowsError(try authority.commit {})
+            XCTAssertEqual(acquisitions, 1)
+        }
+    }
+
     func testUnrelatedAgentSessionIsDeniedWithUniformNotFound() async throws {
         try await withWindow { window in
             // Linked without management (or not linked at all), and not the spawn parent.
@@ -415,7 +452,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
         managedTargets: Set<UUID> = [],
         probe: Probe = Probe()
     ) async throws {
-        try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+        _ = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
             targetSessionID: targetSessionID,
             metadata: MCPRequestMetadata(
                 connectionID: nil,
@@ -772,6 +809,11 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 XCTAssertTrue(warning.contains("session binding failed"))
                 XCTAssertTrue(warning.contains("cleanup is manual"))
                 XCTAssertTrue(warning.contains(path))
+                XCTAssertTrue(fixture.session.items.contains { $0.text.contains(path) && $0.text.contains("cleanup is manual") })
+                let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+                let repositoryID = try XCTUnwrap(reply.objectValue?["repository"]?.objectValue?["repository_id"]?.stringValue)
+                XCTAssertNil(GlobalSettingsStore.shared.worktreeVisualIdentity(repositoryID: repositoryID, worktreeID: worktreeID))
+                XCTAssertNotNil(AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.records[worktreeID]?.releasedAt)
             }
         }
 

@@ -295,10 +295,10 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
 
         // A deterministic backend refusal before the fence is the backend's own error and not
         // applied; the same refusal after the fence remains indeterminate.
-        for refuseAfterFence in [false, true] {
+        for (refuseAfterFence, provenNoEffects) in [(false, false), (true, false), (true, true)] {
             let fixture = try RuntimeFixture(
                 mode: .app,
-                storage: container.appendingPathComponent("policy-\(refuseAfterFence)", isDirectory: true)
+                storage: container.appendingPathComponent("policy-\(refuseAfterFence)-\(provenNoEffects)", isDirectory: true)
             )
             let binding = Self.worktreeBinding { _ in
                 try await MCPDomainMutationCommitContext.admitPhysicalTargets(
@@ -308,6 +308,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                 if refuseAfterFence {
                     try await MCPDomainMutationCommitContext.willCommit()
                 }
+                if provenNoEffects { throw DomainMutationRefusedBeforeEffects(BackendRefusal()) }
                 throw BackendRefusal()
             }
             let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
@@ -327,7 +328,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                     }
                 }
             ) { error in
-                if refuseAfterFence {
+                if refuseAfterFence, !provenNoEffects {
                     guard case .partialSuccessAfterCommit = error as? DomainProtectedMutationError else {
                         return XCTFail("Expected partialSuccessAfterCommit, got \(error)")
                     }
@@ -337,12 +338,12 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             }
             XCTAssertEqual(
                 settlementState.withLock { $0 },
-                refuseAfterFence ? .indeterminateAfterCommit : .notApplied
+                refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .notApplied
             )
             let journal = try await fixture.runtime.mutationJournal.snapshot()
             XCTAssertEqual(
                 journal.recordSnapshots.map(\.status),
-                [refuseAfterFence ? .indeterminateAfterCommit : .failedBeforeCommit]
+                [refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .failedBeforeCommit]
             )
         }
     }

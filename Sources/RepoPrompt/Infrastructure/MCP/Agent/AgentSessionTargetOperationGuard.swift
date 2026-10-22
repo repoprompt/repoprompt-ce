@@ -217,7 +217,6 @@ enum AgentSessionTargetOperationGuard {
     ///
     /// Unresolved Agent-run routing always fails closed. Every denial reuses the scope-unavailable
     /// wording so an unauthorized UUID is indistinguishable from a nonexistent one.
-    @discardableResult
     static func requireWorktreeBindingAuthority(
         targetSessionID: UUID,
         metadata: MCPRequestMetadata,
@@ -240,32 +239,36 @@ enum AgentSessionTargetOperationGuard {
         } else {
             nil
         }
-        var manageAuthority: WorktreeBindingAuthority?
-        let authorized = await engine.authorizesWorktreeBinding(
-            caller: caller,
-            targetSessionID: targetSessionID,
-            spawnParentSessionID: { parentSessionID },
-            callerHoldsManageGrant: {
-                guard case let .agentSession(callerSessionID) = caller,
-                      let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
-                      endpoint.sessionID == callerSessionID
-                else { return false }
-                manageAuthority = await hasManageGrant(endpoint, targetSessionID)
-                return manageAuthority != nil
-            }
-        )
-        guard authorized else { throw denialError(sessionID: targetSessionID) }
-        if let manageAuthority { return manageAuthority }
-        // Self, administrative, and immutable spawn-parent authority stay unchanged. Full access
-        // must still be live at commit; a revoked waiver must not become a newly acquired link.
-        let validate: @MainActor () throws -> Void = {
-            guard engine.authorizesWorktreeBindingWithoutLink(
-                caller: caller, targetSessionID: targetSessionID, spawnParentSessionID: parentSessionID
-            ) else { throw denialError(sessionID: targetSessionID) }
+        // Retain both independent authority and the exact link proof at entry. Disabling full
+        // access must not discard an independently live Manage link, and neither branch may
+        // acquire a replacement link after a suspension.
+        let manageAuthority: WorktreeBindingAuthority? = if case let .agentSession(callerSessionID) = caller,
+                                                            callerSessionID != targetSessionID,
+                                                            let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
+                                                            endpoint.sessionID == callerSessionID
+        {
+            await hasManageGrant(endpoint, targetSessionID)
+        } else {
+            nil
         }
-        return WorktreeBindingAuthority(revalidate: { try validate() }, commit: {
-            try validate()
-            try $0()
+        let independentlyAuthorized: @MainActor () -> Bool = {
+            engine.authorizesWorktreeBindingWithoutLink(
+                caller: caller, targetSessionID: targetSessionID, spawnParentSessionID: parentSessionID
+            )
+        }
+        guard independentlyAuthorized() || manageAuthority != nil else { throw denialError(sessionID: targetSessionID) }
+        return WorktreeBindingAuthority(revalidate: {
+            if independentlyAuthorized() { return }
+            guard let manageAuthority else { throw denialError(sessionID: targetSessionID) }
+            try await manageAuthority.revalidate()
+        }, commit: { body in
+            if independentlyAuthorized() {
+                try body()
+            } else if let manageAuthority {
+                try manageAuthority.commit(body)
+            } else {
+                throw denialError(sessionID: targetSessionID)
+            }
         })
     }
 

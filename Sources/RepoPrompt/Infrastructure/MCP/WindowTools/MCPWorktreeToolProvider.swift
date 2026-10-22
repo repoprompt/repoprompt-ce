@@ -52,13 +52,15 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// Live Manage-grant proof from the session-link authority, revalidated against both endpoints.
     static func sessionLinkManageGrant(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
+        targetSessionID: UUID,
+        bridge: AgentSessionLinkRuntimeBridge? = nil
     ) async -> AgentSessionTargetOperationGuard.WorktreeBindingAuthority? {
-        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let bridge = bridge ?? .shared
         if case let .success(target) = await bridge.authorizeTarget(
             operation: .monitorWorktreeBinding,
             observerEndpoint: observerEndpoint,
-            targetSessionID: targetSessionID
+            targetSessionID: targetSessionID,
+            allowLinkEstablishment: false
         ) {
             let lease = target.lease
             guard let authorization = await bridge.managementCommitAuthorization(for: lease) else { return nil }
@@ -367,18 +369,18 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let createResult = try await vcsService.createGitWorktreeWithResult(
             request: plan.createRequest,
             at: context.repo.rootURL,
-            beforeCommit: {
-                try await bindingRequest?.authority.revalidate()
-                try await MCPDomainMutationCommitContext.willCommit()
-                try await bindingRequest?.authority.revalidate()
+            beforeCommit: { [self] in
+                if let bindingRequest {
+                    try await commitBindingMutation(bindingRequest.authority)
+                } else {
+                    try await MCPDomainMutationCommitContext.willCommit()
+                }
             }
         )
         let created = createResult.descriptor
-        let identity = try persistOrResolveVisualIdentity(
-            for: created,
-            args: args,
-            persist: true
-        )
+        let identity = try bindingRequest == nil
+            ? persistOrResolveVisualIdentity(for: created, args: args, persist: true)
+            : plannedVisualIdentity(for: created, args: args)
         let createdDTO = try await worktreeDTO(created, visualIdentity: identity, includeStatus: parseBool(args["include_status"]) ?? false)
 
         var bindingDTO: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?
@@ -395,13 +397,31 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     args: args,
                     source: "manage_worktree.create",
                     invocation: bindingRequest.invocation,
-                    authority: bindingRequest.authority
+                    authority: bindingRequest.authority,
+                    persistsVisualIdentity: true
                 )
                 bindingDTO = bindingResult.binding
                 previousDTO = bindingResult.previous
                 pendingDTO = bindingResult.pending.map(Self.pendingApplicationDTO)
             } catch {
-                bindingWarning = "Worktree was created, but session binding failed: \(error.localizedDescription) The created worktree is kept at \(created.path); cleanup is manual."
+                let warning = "Worktree was created, but session binding failed: \(error.localizedDescription) The created worktree is kept at \(created.path); cleanup is manual."
+                bindingWarning = warning
+                if let viewModel = try? dependencies.execution.requireTargetWindow().agentModeViewModel,
+                   let owner = try? viewModel.authoritativeLiveSession(for: bindingRequest.sessionID)
+                {
+                    owner.appendItem(.system(warning, sequenceIndex: owner.nextSequenceIndex))
+                    owner.isDirty = true
+                    viewModel.syncTranscriptUIState()
+                    viewModel.scheduleSave(for: owner)
+                }
+                AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.markReleased([
+                    AgentSessionWorktreeBinding(
+                        id: UUID().uuidString, repositoryID: created.repository.repositoryID,
+                        repoKey: created.repository.repoKey, logicalRootPath: context.repo.rootURL.path,
+                        logicalRootName: context.repo.rootURL.lastPathComponent, worktreeID: created.worktreeID,
+                        worktreeRootPath: created.path, branch: created.branch, source: "manage_worktree.create.refused"
+                    ).summary
+                ], bySessionID: bindingRequest.sessionID, at: Date())
             }
         }
 
@@ -593,11 +613,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
             if persistsVisualIdentity {
                 try await commitBindingMutation(authority)
-                try authority.commit {
-                    try Self.persistPlannedVisualIdentity(
-                        visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
-                    )
-                }
+                try commitPresentationAuthority(authority)
+                try Self.persistPlannedVisualIdentity(
+                    visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+                )
             }
             return (bindingDTO(previous), nil, nil)
         }
@@ -630,11 +649,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         if desiredBindings == existing, persistsVisualIdentity {
             try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
             try await commitBindingMutation(authority)
-            try authority.commit {
-                try Self.persistPlannedVisualIdentity(
-                    visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
-                )
-            }
+            try commitPresentationAuthority(authority)
+            try Self.persistPlannedVisualIdentity(
+                visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+            )
             return (bindingDTO(binding), nil, nil)
         }
         let pending = try await transitionOrScheduleBindings(
@@ -645,24 +663,31 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             authority: authority,
             beforeCommit: { [self] in
                 try await commitBindingMutation(authority)
-                if persistsVisualIdentity {
-                    try authority.commit {
-                        try Self.persistPlannedVisualIdentity(
-                            visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
-                        )
-                    }
-                }
             }
         )
+        if persistsVisualIdentity {
+            try Self.persistPlannedVisualIdentity(
+                visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+            )
+        }
         let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
         return (bindingDTO(binding), previousDTO, pending)
+    }
+
+    private func commitPresentationAuthority(_ authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority) throws {
+        do { try authority.commit {} } catch { throw DomainMutationRefusedBeforeEffects(error) }
     }
 
     /// The mutation journal may suspend too; never carry an entry-only permission across it.
     private func commitBindingMutation(_ authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority) async throws {
         try await authority.revalidate()
         try await MCPDomainMutationCommitContext.willCommit()
-        try await authority.revalidate()
+        do {
+            try await authority.revalidate()
+            try authority.commit {}
+        } catch {
+            throw DomainMutationRefusedBeforeEffects(error)
+        }
     }
 
     // MARK: - Self relocation

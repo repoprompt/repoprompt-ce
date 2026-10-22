@@ -17,7 +17,12 @@ If revocation happens after provider retirement, the old binding remains and a t
 recovery note explains that the next message restarts its provider at the old location. If a
 worktree was already created, it is **kept on disk, unbound**: `manage_worktree create` returns
 the created descriptor and a binding-failed warning. Cleanup is manual; revocation never deletes
-a worktree. A binding already published before revocation is not rolled back.
+a worktree. The target transcript also names the orphan and its path, and inventory records it
+as released for human cleanup; refused binds do not persist the requested visual identity.
+Before retirement, refusal restores the pre-existing handoff instead of injecting a spurious
+restart transcript. Same-root presentation changes never release a running provider's roots,
+even when HEAD changed. A still-live Manage link continues to authorize an operation if full
+access is disabled mid-transition. A binding already published before revocation is not rolled back.
 
 ## Copy-on-write checkouts on APFS
 

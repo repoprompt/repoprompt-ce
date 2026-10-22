@@ -9373,6 +9373,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // than binding fields: this is the single mutation point for a session's worktree binding.
         let previousLocation = agentSessionLinkLocationProjection(forTabID: session.tabID)
         session.worktreeBindings = bindings
+        publishWorktreeBindingChange(to: session, from: previousLocation)
+        return previous
+    }
+
+    private func publishWorktreeBindingChange(
+        to session: TabSession,
+        from previousLocation: AgentSessionLinkLocationProjection?
+    ) {
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
         syncComposerUIState(tabID: session.tabID)
@@ -9380,7 +9388,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         syncStatusPillsUIState()
         scheduleSave(for: session.tabID)
         notifyAgentSessionLinkLocationChange(forTabID: session.tabID, from: previousLocation)
-        return previous
     }
 
     private enum ExecutionLocationTransitionError: LocalizedError {
@@ -9598,11 +9605,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var ownershipCommitted = preparation == nil
         var providerContextInvalidated = false
         var bindingsPublished = false
+        let previousHandoff = session.pendingHandoff
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == changedDuringActiveRun
+                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
             else {
                 throw ExecutionLocationTransitionError.stale
             }
@@ -9629,7 +9637,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == changedDuringActiveRun
+                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
             else { throw ExecutionLocationTransitionError.stale }
             if executionRootsChanged, case .externalManagement = intent {
                 try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
@@ -9660,9 +9668,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     throw ExecutionLocationTransitionError.stale
                 }
                 if !changedDuringActiveRun {
+                    try commitAuthority? {}
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
                     try await revalidateAuthority?()
                 }
+                try commitAuthority? {}
                 providerContextInvalidated = true
                 await invalidateProviderContextForExecutionLocationChange(session)
                 guard sessions[session.tabID] === session,
@@ -9690,13 +9700,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == (changedDuringActiveRun && !executionRootsChanged)
+                  !executionRootsChanged || !session.runState.isActive
             else { throw ExecutionLocationTransitionError.stale }
+            let previousLocation = agentSessionLinkLocationProjection(forTabID: session.tabID)
             let publish: @MainActor () throws -> Void = {
                 // Authorization itself may have suspended since the last availability check.
                 try Task.checkCancellation()
                 try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-                _ = self.commitWorktreeBindings(desiredBindings, to: session)
+                session.worktreeBindings = desiredBindings
             }
             if let commitAuthority {
                 try commitAuthority(publish)
@@ -9704,6 +9715,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 try publish()
             }
             bindingsPublished = true
+            publishWorktreeBindingChange(to: session, from: previousLocation)
             // Delegated ownership follows the actual in-memory publication even when its required
             // disk flush later fails. No callback runs for a rejected provisional transition.
             afterCommit?()
@@ -9723,9 +9735,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return session.worktreeBindings
         } catch {
+            if !providerContextInvalidated, session.pendingHandoff != previousHandoff {
+                session.pendingHandoff = previousHandoff
+                session.isDirty = true
+                if let workspaceID = workspaceManager?.activeWorkspace?.id {
+                    _ = await Task { @MainActor in
+                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
+                    }.value
+                }
+                scheduleSave(for: session)
+            }
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
-            } else if ownershipCommitted, !bindingsPublished, let materializer, let preparation,
+            } else if executionRootsChanged, ownershipCommitted, !bindingsPublished, let materializer, let preparation,
                       !preparation.ownership.reusesInstalledOwnership,
                       sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
@@ -9733,7 +9755,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             {
                 // A refused post-install publication must not leave the unbound destination
                 // installed as session-owned roots. The old binding rematerializes on demand.
-                await materializer.release(sessionID: sessionID)
+                await materializer.release(ifOwnedBy: preparation.ownership.token)
             }
             if providerContextInvalidated, !bindingsPublished,
                sessions[session.tabID] === session,
@@ -9756,9 +9778,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 if case let .failure(failure) = recoverySave {
                     scheduleSave(for: session)
+                    if error is SessionAdminHostError { throw error }
                     throw ExecutionLocationTransitionError.unavailable("\(message) Recovery persistence failed: \(failure.message). Inspect the session before retrying.")
                 }
+                if error is SessionAdminHostError { throw error }
                 throw ExecutionLocationTransitionError.unavailable(message)
+            }
+            if !providerContextInvalidated, !bindingsPublished, MCPDomainMutationCommitContext.controller != nil, error is MCPError {
+                throw DomainMutationRefusedBeforeEffects(error)
             }
             throw error
         }

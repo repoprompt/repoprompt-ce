@@ -429,6 +429,116 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
+    func testRealManageLinkRevokedDuringProviderTeardownDoesNotPublishBinding() async throws {
+        let target = try await durableFixture()
+        let observer = try await durableFixture(windowID: -992)
+        defer { target.git.cleanup()
+            observer.git.cleanup()
+        }
+        let original = target.session.worktreeBindings
+        for node in [target, observer] {
+            node.session.selectedAgent = .claudeCode
+            let workspaceID = try XCTUnwrap(node.manager.activeWorkspaceID)
+            XCTAssertTrue(node.manager.compareAndSetActiveAgentSessionID(
+                expected: nil, replacement: node.sessionID, forTabID: node.session.tabID, inWorkspaceID: workspaceID
+            ))
+        }
+        let host = LiveWindowEndpointHost()
+        host.register(target.viewModel, windowID: -991)
+        host.register(observer.viewModel, windowID: -992)
+        let bridge = AgentSessionLinkRuntimeBridge(
+            authority: DomainAgentSessionLinkAuthority(identity: .init(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date())),
+            host: host, toolAdvertisementInvalidator: { _ in }
+        )
+        let outcome = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString)
+        guard case .added = outcome else { return XCTFail("Expected Manage link, got \(outcome)") }
+        let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == observer.sessionID }).domainEndpoint
+        guard case let .success(authorized) = await bridge.authorizeTarget(
+            operation: .monitorWorktreeBinding, observerEndpoint: endpoint, targetSessionID: target.sessionID
+        ) else { return XCTFail("Expected live Manage authority") }
+        let proof = await MCPWorktreeToolProvider.sessionLinkManageGrant(
+            observerEndpoint: endpoint, targetSessionID: target.sessionID, bridge: bridge
+        )
+        let grant = try XCTUnwrap(proof)
+        let observerID = observer.sessionID, targetID = target.sessionID
+        target.session.claudeController = WorktreeTeardownNativeController {
+            let stopped = await bridge.stopMonitorLink(
+                observerSessionID: observerID, targetSessionID: targetID,
+                linkID: authorized.lease.linkID, generation: authorized.lease.linkGeneration
+            )
+            XCTAssertEqual(stopped, .stopped)
+        }
+        target.viewModel.test_setAgentSessionSaver { _, _, _ in target.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await target.viewModel.transitionWorktreeBindings(
+                [], forSessionID: target.sessionID, intent: .externalManagement,
+                revalidateAuthority: grant.revalidate, commitAuthority: grant.commit
+            )
+            XCTFail("Unlink during teardown must prevent publication")
+        } catch {}
+        XCTAssertEqual(target.session.worktreeBindings, original)
+        XCTAssertNil(target.session.claudeController, "The refusal must happen after the fake teardown, not during initial admission")
+    }
+
+    func testSessionAdminScopeRevokedDuringProviderTeardownPreservesTypedRefusal() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        scopes.isGlobalAutoApproveEnabled = { false }
+        let grantee = UUID()
+        let request = try scopes.requestScope(
+            requesterSessionID: grantee, requesterTabID: nil, kind: .session(targetSessionID: fixture.sessionID),
+            capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        let scope = try scopes.approve(requestID: request.id).get()
+        fixture.session.claudeController = WorktreeTeardownNativeController {
+            _ = await MainActor.run { scopes.revoke(scopeID: scope.id) }
+        }
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            try await SessionAdminWindowsWorktreeHost().transition(
+                [], sessionID: fixture.sessionID, viewModel: fixture.viewModel,
+                isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
+            )
+            XCTFail("Revoked scope must refuse publication")
+        } catch SessionAdminHostError.authorityEnded {
+            // The handler maps this exact cause to scope_revoked, not bind_failed.
+        } catch {
+            XCTFail("Lost scope-revocation cause: \(error)")
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNil(fixture.session.claudeController)
+        XCTAssertNotNil(fixture.session.pendingHandoff.payload)
+    }
+
+    func testRefusalAfterHandoffStagingRestoresOriginalHandoffBeforeRetirement() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.pendingHandoff
+        let native = MonitorFakeNativeController()
+        fixture.session.claudeController = native
+        var saved: AgentSession?
+        fixture.viewModel.test_setAgentSessionSaver { value, _, _ in
+            saved = value
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                revalidateAuthority: {
+                    if fixture.session.pendingHandoff != original { throw SessionAdminHostError.authorityEnded }
+                }
+            )
+            XCTFail("Staged handoff must not survive a pre-retirement refusal")
+        } catch {}
+        XCTAssertEqual(fixture.session.pendingHandoff, original)
+        XCTAssertEqual(saved?.pendingHandoffPayload, original.payload)
+        XCTAssertTrue(fixture.session.claudeController === native)
+        let shutdowns = await native.shutdownCount
+        XCTAssertEqual(shutdowns, 0)
+    }
+
     func testRevokedAuthorityDuringProviderTeardownDoesNotPublishBinding() async throws {
         for unbind in [true, false] {
             let fixture = try await durableFixture()
@@ -466,10 +576,15 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let next = try makeNextBinding(fixture)
         fixture.session.claudeController = MonitorFakeNativeController()
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        var fences = 0
         do {
             _ = try await fixture.viewModel.transitionWorktreeBindings(
                 [next], forSessionID: fixture.sessionID, intent: .externalManagement,
-                commitAuthority: { _ in throw MCPError.invalidParams("Manage grant revoked at publication") }
+                commitAuthority: { body in
+                    fences += 1
+                    if fences == 3 { throw MCPError.invalidParams("Manage grant revoked at publication") }
+                    try body()
+                }
             )
             XCTFail("The final publication fence must refuse a revoked grant")
         } catch {
@@ -491,7 +606,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
         let original = fixture.session.worktreeBindings
-        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label", head: "changed-head")
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
         let native = MonitorFakeNativeController()
         await native.setTurnInFlight(true)
         fixture.session.claudeController = native
@@ -517,6 +633,12 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertEqual(ownership.provisionalOwnerCount, 0)
         let shutdowns = await native.shutdownCount
         XCTAssertEqual(shutdowns, 0)
+        _ = try await fixture.viewModel.transitionWorktreeBindings(
+            [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+            beforeCommit: { fixture.session.runState = .idle }
+        )
+        XCTAssertEqual(fixture.session.worktreeBindings, [presentation], "Authorized same-root edits survive a run-state change")
+        XCTAssertTrue(fixture.session.claudeController === native)
     }
 
     func testLogicalRootLookupAndUnbindAgreeAcrossSymlinkAlias() async throws {
@@ -860,7 +982,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let sessionID: UUID
     }
 
-    private func durableFixture() async throws -> DurableFixture {
+    private func durableFixture(windowID: Int = -991) async throws -> DurableFixture {
         let git = try ReviewGitRepositoryFixture(name: "DurableWorktreeSwitch")
         let logical = try git.makeRepository(named: "logical", files: ["README.md": "fixture\n"])
         let physical = git.sandbox.appendingPathComponent("physical")
@@ -879,7 +1001,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let manager = WorkspaceManagerViewModel(
             fileManager: files, promptViewModel: prompt, performInitialWorkspaceActivation: false
         )
-        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path)
+        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID)
         let workspace = WorkspaceModel(
             name: "Worktree switch", repoPaths: [logical.path], ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: session.tabID)], activeComposeTabID: session.tabID
@@ -913,14 +1035,15 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         _ binding: AgentSessionWorktreeBinding,
         id: String? = nil,
         logicalRootPath: String? = nil,
-        visualLabel: String? = nil
+        visualLabel: String? = nil,
+        head: String? = nil
     ) -> AgentSessionWorktreeBinding {
         .init(
             id: id ?? binding.id, repositoryID: binding.repositoryID,
             repoKey: binding.repoKey, logicalRootPath: logicalRootPath ?? binding.logicalRootPath,
             logicalRootName: binding.logicalRootName, worktreeID: binding.worktreeID,
             worktreeRootPath: binding.worktreeRootPath, commonGitDir: binding.commonGitDir,
-            isMainWorktree: binding.isMainWorktree, visualLabel: visualLabel ?? binding.visualLabel,
+            isMainWorktree: binding.isMainWorktree, head: head ?? binding.head, visualLabel: visualLabel ?? binding.visualLabel,
             boundAt: binding.boundAt, source: binding.source
         )
     }
@@ -940,9 +1063,9 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
-    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission") -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
         let viewModel = AgentModeViewModel(
-            testWindowID: -991,
+            testWindowID: windowID,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Admission tests must not start a provider")

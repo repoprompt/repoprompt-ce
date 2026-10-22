@@ -6531,7 +6531,8 @@ final class AgentSessionLinkRuntimeBridge {
     func authorizeTarget(
         operation: DomainAgentSessionTargetOperation,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
+        targetSessionID: UUID,
+        allowLinkEstablishment: Bool = true
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
         // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
         delegationScopes.reconcileGlobalAutoApprove()
@@ -6555,6 +6556,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             lease = value
         case .failure(.noActiveLink):
+            guard allowLinkEstablishment else { return .failure(.denied) }
             // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
             guard let established = await establishFullAccessLink(
                 operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID

@@ -637,21 +637,35 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         admitBindings: @escaping @MainActor () throws -> Void = {},
         bindingsCommitted: @escaping @MainActor () -> Void = {}
     ) async throws {
-        let sessionID = owner.location.sessionID
-        let viewModel = owner.location.window.agentModeViewModel
-        guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+        try await transition(
+            desired, sessionID: owner.location.sessionID, viewModel: owner.location.window.agentModeViewModel,
+            isStillAuthorized: { isStillAuthorized() && SessionAdminWindows.isCurrent(owner) },
+            admitBindings: admitBindings, bindingsCommitted: bindingsCommitted
+        )
+    }
+
+    /// Shared production transition seam: scope and exact carrier checks remain one live predicate.
+    func transition(
+        _ desired: [AgentSessionWorktreeBinding],
+        sessionID: UUID,
+        viewModel: AgentModeViewModel,
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        admitBindings: @escaping @MainActor () throws -> Void = {},
+        bindingsCommitted: @escaping @MainActor () -> Void = {}
+    ) async throws {
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         do {
             _ = try await viewModel.transitionWorktreeBindings(
                 desired, forSessionID: sessionID, intent: .externalManagement,
                 beforeCommit: {
-                    guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                     try admitBindings()
                 },
                 revalidateAuthority: {
-                    guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                 },
                 commitAuthority: {
-                    guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                     try $0()
                 },
                 afterCommit: bindingsCommitted
