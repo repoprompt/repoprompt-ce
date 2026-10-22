@@ -3178,8 +3178,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 #if DEBUG
                     try await gate(.beforeUnload)
                 #endif
-                await files.unloadRootFolderPath(root.standardizedFullPath)
+                // Pin the observed lifetime: a shell-less actor root still unloads, and a
+                // same-path replacement is left alone and reported as a stale invocation.
+                let unload = await files.unloadRootFolder(root, kind: .primaryWorkspace)
                 _ = try dependencies()
+                if unload == .superseded { throw failure(.staleInvocation) }
             }
             let loaded = Set(observation.requestedRoots.map(\.standardizedFullPath))
             let shells = Set(files.visibleRootShellProjections.map(\.fullPath))

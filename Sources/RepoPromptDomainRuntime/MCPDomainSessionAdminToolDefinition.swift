@@ -71,6 +71,7 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.
         - `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.
         - `worktree_create` (`repo_root`, `branch`, `base_ref`, `bind`), `worktree_bind` (`worktree`, `apply`: now|next_boundary), `worktree_unbind`, `worktree_release` (card; unbind + mark stale), `worktree_inventory` (`idle_days`), `merge_preview` (`merge_target`), `merge_apply` (`operation_id`; the user reviews it).
+        - Default repository for `worktree_create` and relative `worktree_bind` selectors comes from the **target** session, never yours: its sole worktree binding's checkout, or with no bindings its workspace's declared PRIMARY root (no fallback to another root). With several bindings pass `repo_root` or an identifying `worktree` (`@id:<worktree_id>`, `@branch:<branch>`, name, or path); bare `@main`, `@current`, `@wt`, and `@main:<branch>` are relative to that default and do not choose one. A deferred bind picks its default when it applies, not when queued. `worktree_unbind`, `worktree_release`, and `worktree_inventory` act by binding identity, and merge ops use the target's bound source and saved endpoints, so none of them chooses a default.
 
         **Rules**: Except under the user's unrestricted full-access grant, `retire` and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
         """,
@@ -167,7 +168,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 "model_id": .stringSchema("[set_model] Same-agent model_id from agent_manage.list_agents."),
                 "effort": .stringSchema("[set_effort] Effort supported by the target's model."),
                 "up_to_item_id": .stringSchema("[fork] Transcript row cutoff; default the latest row."),
-                "repo_root": .stringSchema("[worktree_create, worktree_bind, merge_preview] Repository root in the target's workspace."),
+                "repo_root": .stringSchema("[worktree_create, worktree_bind, merge_preview] Repository root in the target's workspace. When omitted, worktree_create and relative worktree_bind selectors use the target's sole worktree binding, or its declared PRIMARY root with no bindings; several bindings require repo_root or an identifying worktree. merge_preview uses it only to choose among the target's bound sources."),
                 "branch": .stringSchema("[worktree_create] Branch to create or check out."),
                 "base_ref": .stringSchema("[worktree_create] Base ref or commit."),
                 "bind": .object(["type": .string("boolean"), "description": .string("[worktree_create] Also bind it to the target.")]),
@@ -176,7 +177,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "enum": .array([.string("now"), .string("next_boundary")]),
                     "description": .string("[worktree_create, worktree_bind] now (default) or at the target's next idle boundary.")
                 ]),
-                "worktree": .stringSchema("[worktree_bind] Worktree selector: @id:<worktree_id>, path, branch, or name."),
+                "worktree": .stringSchema("[worktree_bind] Worktree selector: @id:<worktree_id>, @branch:<branch>, path, branch, or name identify a worktree directly; bare @main, @current, @wt, and @main:<branch> are relative to the target's default repository."),
                 "worktree_id": .stringSchema("[worktree_unbind, worktree_release] Only this worktree; default all."),
                 "merge_target": .stringSchema("[merge_preview] Merge target selector; default @main."),
                 "operation_id": .stringSchema("[merge_apply] Operation ID from merge_preview."),

@@ -1,9 +1,28 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
+    /// Records DEBUG root-lifetime hook events in order and holds each one until its gate opens.
+    @MainActor
+    private final class RootLifetimeHold {
+        let entered = XCTestExpectation(description: "root lifetime hook reached")
+        let gate: WorkspaceAuthorityRootTestFixture.Gate
+        private(set) var rootIDs: [UUID] = []
+
+        init(gate: WorkspaceAuthorityRootTestFixture.Gate) {
+            self.gate = gate
+        }
+
+        func hold(rootID: UUID) async {
+            rootIDs.append(rootID)
+            if rootIDs.count == 1 { entered.fulfill() }
+            await gate.wait()
+        }
+    }
+
     private final class RootDirectoryProbeCheckpoint: @unchecked Sendable {
         let entered = XCTestExpectation(description: "detached directory probe entered")
         let finished = XCTestExpectation(description: "detached directory probe finished")
@@ -847,6 +866,411 @@ import XCTest
             }
         }
 
+        func testAcceptedTargetUnloadsShellLessUnwantedPrimaryAndPreservesDesiredIDs() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let desired = Array(fixture.rootPaths.prefix(2))
+                let unwantedPath = fixture.rootPaths[2]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                XCTAssertEqual(before.model.repoPaths, desired)
+                XCTAssertEqual(before.shellPaths, desired)
+                XCTAssertEqual(before.readinessObservation.requestedRoots.map(\.standardizedFullPath), desired)
+                let desiredIDs = before.readinessObservation.requestedRoots.map(\.id)
+                // Deliberate actor-only setup, not a readiness boundary: the Store owns an unwanted
+                // primary lifetime that no UI shell or cached root reference ever attached.
+                let unwanted = try await store.loadRoot(
+                    path: unwantedPath, isSystemRoot: false, kind: .primaryWorkspace,
+                    respectRepoIgnore: fixture.files.respectRepoIgnore,
+                    respectCursorignore: fixture.files.respectCursorignore,
+                    skipSymlinks: fixture.files.skipSymlinks,
+                    enableHierarchicalIgnores: fixture.files.enableHierarchicalIgnores
+                )
+                let installed = await store.roots()
+                XCTAssertTrue(installed.contains { $0.id == unwanted.id && $0.kind == .primaryWorkspace })
+                XCTAssertFalse(fixture.files.visibleRootShellProjections.contains { $0.fullPath == unwantedPath })
+
+                let outcome: Result<WorkspacePrimaryRootSnapshot, Error>
+                do { outcome = try await .success(self.attempt(fixture, paths: desired)) }
+                catch { outcome = .failure(error) }
+                let after = try await fixture.capturePassive()
+                let remaining = await store.roots()
+                // Leak guard only, so fixture shutdown's empty-root contract cannot double-report a
+                // surviving lifetime. It runs after observation and never feeds an assertion.
+                if remaining.contains(where: { $0.id == unwanted.id }) {
+                    await store.unloadRoot(id: unwanted.id)
+                }
+
+                XCTAssertFalse(remaining.contains { $0.id == unwanted.id }, "Reconciliation must unload the actor-only unwanted lifetime")
+                XCTAssertFalse(remaining.contains { $0.standardizedFullPath == unwantedPath }, "No root of any kind may remain at the unwanted path")
+                XCTAssertEqual(Set(after.primaryRoots.map(\.id)), Set(desiredIDs))
+                XCTAssertEqual(after.readinessObservation.requestedRoots.map(\.id), desiredIDs)
+                XCTAssertEqual(after.readinessObservation.requestedRoots.map(\.standardizedFullPath), desired)
+                XCTAssertEqual(after.model.repoPaths, desired)
+                XCTAssertEqual(after.disk.repoPaths, desired)
+                XCTAssertEqual(after.canonical.document.metadata.repoPaths, desired)
+                XCTAssertEqual(after.shellPaths, desired)
+                let ready = try outcome.get()
+                XCTAssertEqual(ready.roots.map(\.id), desiredIDs)
+                XCTAssertEqual(ready.roots.map(\.standardizedFullPath), desired)
+                try await fixture.manager.validatePrimaryRootSnapshot(ready)
+            }
+        }
+
+        func testAlreadyAbsentUnwantedRootSettlesReadinessAndRepeatsIdempotently() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let desired = Array(fixture.rootPaths.prefix(2))
+                let unwantedPath = fixture.rootPaths[2]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let desiredIDs = before.readinessObservation.requestedRoots.map(\.id)
+                let unwanted = try await self.installActorOnlyRoot(fixture, path: unwantedPath)
+                let observedRef = await store.exactRootRef(path: unwantedPath, kind: .primaryWorkspace)
+                let unwantedRef = try XCTUnwrap(observedRef)
+                // Another owner unloads the observed lifetime after observation, before teardown admission.
+                var unloadedByOtherOwner = false
+                fixture.manager.rootReconciliationGateForTesting = { event in
+                    guard event.phase == .beforeUnload, !unloadedByOtherOwner else { return }
+                    unloadedByOtherOwner = true
+                    await store.unloadRoot(id: unwanted.id)
+                }
+                let ready = try await self.attempt(fixture, paths: desired)
+                fixture.manager.rootReconciliationGateForTesting = nil
+                XCTAssertTrue(unloadedByOtherOwner)
+                XCTAssertEqual(ready.roots.map(\.id), desiredIDs)
+                for _ in 0 ..< 2 {
+                    let repeated = await fixture.files.unloadRootFolder(unwantedRef, kind: .primaryWorkspace)
+                    XCTAssertEqual(repeated, .alreadyAbsent)
+                }
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.id == unwanted.id })
+                XCTAssertEqual(Set(roots.filter { $0.kind == .primaryWorkspace }.map(\.id)), Set(desiredIDs))
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), desired)
+                try await fixture.manager.validatePrimaryRootSnapshot(ready)
+            }
+        }
+
+        func testChangedObservedRootFailsStaleWithoutRemovingReplacement() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let desired = Array(fixture.rootPaths.prefix(2))
+                let unwantedPath = fixture.rootPaths[2]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let observed = try await self.installActorOnlyRoot(fixture, path: unwantedPath)
+                var replacement: WorkspaceRootRecord?
+                fixture.manager.rootReconciliationGateForTesting = { event in
+                    guard event.phase == .beforeUnload, replacement == nil else { return }
+                    // Same path, new lifetime: only the UUID distinguishes it from the observed root.
+                    await store.unloadRoot(id: observed.id)
+                    replacement = try? await self.installActorOnlyRoot(fixture, path: unwantedPath)
+                }
+                try await self.expectFailure(.staleInvocation) { _ = try await self.attempt(fixture, paths: desired) }
+                fixture.manager.rootReconciliationGateForTesting = nil
+                let replaced = try XCTUnwrap(replacement)
+                XCTAssertNotEqual(replaced.id, observed.id)
+                let afterStale = await store.roots()
+                XCTAssertTrue(afterStale.contains { $0.id == replaced.id }, "A same-path replacement is never unloaded for the observed lifetime")
+                XCTAssertFalse(afterStale.contains { $0.id == observed.id })
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), desired)
+                // A fresh attempt observes the replacement as its own unwanted lifetime and converges.
+                let ready = try await self.attempt(fixture, paths: desired)
+                XCTAssertEqual(ready.roots.map(\.id), before.readinessObservation.requestedRoots.map(\.id))
+                let converged = await store.roots()
+                XCTAssertFalse(converged.contains { $0.id == replaced.id })
+            }
+        }
+
+        func testSamePathLoadHeldBeforeStoreUnloadMarkAttachesOnlyANewLifetime() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let unwantedPath = fixture.rootPaths[2]
+                let store = fixture.files.workspaceFileContextStore
+                let unwanted = try await self.installActorOnlyRoot(fixture, path: unwantedPath)
+                let observedRef = await store.exactRootRef(path: unwantedPath, kind: .primaryWorkspace)
+                let unwantedRef = try XCTUnwrap(observedRef)
+                let hold = RootLifetimeHold(gate: fixture.makeGate())
+                fixture.files.setRootTeardownWillUnloadStoreRootHandler { _, rootID in
+                    await hold.hold(rootID: rootID)
+                }
+                var outcomes: [WorkspaceFilesViewModel.RootUnloadOutcome] = []
+                let teardownsSettled = XCTestExpectation(description: "teardown and same-ID joiner settled")
+                teardownsSettled.expectedFulfillmentCount = 2
+                fixture.startOwnedTask {
+                    let outcome = await fixture.files.unloadRootFolder(unwantedRef, kind: .primaryWorkspace)
+                    outcomes.append(outcome)
+                    teardownsSettled.fulfill()
+                }
+                try await fixture.awaitGateEvent(hold.entered)
+                // The held flight is registered, so this caller reaches the same-ID join on this actor
+                // before its first suspension, in the same turn that fulfills the signal.
+                let joinerEntered = XCTestExpectation(description: "same-ID caller entered while the flight is held")
+                fixture.startOwnedTask {
+                    joinerEntered.fulfill()
+                    let outcome = await fixture.files.unloadRootFolder(unwantedRef, kind: .primaryWorkspace)
+                    outcomes.append(outcome)
+                    teardownsSettled.fulfill()
+                }
+                try await fixture.awaitGateEvent(joinerEntered)
+                // Store has not marked the path unloading yet. A same-path load must wait at the
+                // teardown gate rather than observe or reuse the lifetime about to be unloaded.
+                let loadEntered = XCTestExpectation(description: "same-path load entered loadFolder")
+                loadEntered.assertForOverFulfill = false
+                let loading = fixture.files.$isLoading.dropFirst().sink { isLoading in
+                    if isLoading { loadEntered.fulfill() }
+                }
+                let loadDone = XCTestExpectation(description: "same-path load settled")
+                var loadError: Error?
+                fixture.startOwnedTask {
+                    do { try await fixture.files.loadFolder(at: URL(fileURLWithPath: unwantedPath, isDirectory: true), for: fixture.workspace) }
+                    catch { loadError = error }
+                    loadDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(loadEntered)
+                loading.cancel()
+                XCTAssertFalse(fixture.files.rootShellProjections.contains { $0.fullPath == unwantedPath })
+                hold.gate.release()
+                try await fixture.awaitGateEvent(teardownsSettled)
+                try await fixture.awaitGateEvent(loadDone)
+                XCTAssertNil(loadError)
+                XCTAssertEqual(outcomes, [.unloaded, .unloaded])
+                XCTAssertEqual(hold.rootIDs, [unwanted.id], "A same-ID unload joins the flight instead of starting a second teardown")
+                let current = await store.rootRecords(forRootFolderPaths: [unwantedPath])
+                let reloaded = try XCTUnwrap(current.first)
+                XCTAssertNotEqual(reloaded.id, unwanted.id)
+                XCTAssertEqual(fixture.files.rootShellProjections.filter { $0.fullPath == unwantedPath }.map(\.id), [reloaded.id])
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.id == unwanted.id })
+            }
+        }
+
+        func testStaleExpectedRootKeepsReplacementSelectionAndLoadToken() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
+                let replacedPath = fixture.rootPaths[1]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let stale = before.readinessObservation.requestedRoots[1]
+                await fixture.files.unloadRootFolderPath(replacedPath)
+                // Hold the replacement load after shell attach, while its load token is still outstanding.
+                let attach = RootLifetimeHold(gate: fixture.makeGate())
+                fixture.files.setRootLoadDidAttachRootShellHandler { _, rootID in
+                    await attach.hold(rootID: rootID)
+                }
+                let loadDone = XCTestExpectation(description: "replacement load finished")
+                var loadError: Error?
+                fixture.startOwnedTask {
+                    do { try await fixture.files.loadFolder(at: URL(fileURLWithPath: replacedPath, isDirectory: true), for: fixture.workspace) }
+                    catch { loadError = error }
+                    loadDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(attach.entered)
+                let replacementID = try XCTUnwrap(attach.rootIDs.first)
+                XCTAssertNotEqual(replacementID, stale.id)
+                let heldOutcome = await fixture.files.unloadRootFolder(stale, kind: .primaryWorkspace)
+                XCTAssertEqual(heldOutcome, .superseded)
+                attach.gate.release()
+                try await fixture.awaitGateEvent(loadDone)
+                fixture.files.setRootLoadDidAttachRootShellHandler(nil)
+                XCTAssertNil(loadError, "A stale teardown must not invalidate the replacement's load token")
+                try await fixture.selectFixtureFiles([replacedPath + "/README.md"])
+                let selected = fixture.files.snapshotSelection()
+                let settledOutcome = await fixture.files.unloadRootFolder(stale, kind: .primaryWorkspace)
+                XCTAssertEqual(settledOutcome, .superseded)
+                XCTAssertEqual(fixture.files.snapshotSelection(), selected)
+                XCTAssertEqual(fixture.files.selectedFiles.map(\.fullPath), [replacedPath + "/README.md"])
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), fixture.rootPaths)
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.last?.id, replacementID)
+                let roots = await store.roots()
+                XCTAssertTrue(roots.contains { $0.id == replacementID })
+                XCTAssertFalse(roots.contains { $0.id == stale.id })
+                let fresh = try await fixture.manager.readyPrimaryRootSnapshot(workspaceID: fixture.workspace.id, expectedRepoPaths: fixture.rootPaths)
+                XCTAssertEqual(fresh.roots.map(\.id), [before.readinessObservation.requestedRoots[0].id, replacementID])
+            }
+        }
+
+        func testSupersededWaiterLetsAdmittedTeardownFinishAndLaterIntentConverges() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let retainedID = before.readinessObservation.requestedRoots[0].id
+                let removedID = before.readinessObservation.requestedRoots[1].id
+                let unwanted = try await self.installActorOnlyRoot(fixture, path: fixture.rootPaths[2])
+                let hold = RootLifetimeHold(gate: fixture.makeGate())
+                fixture.files.setRootTeardownWillUnloadStoreRootHandler { _, rootID in
+                    await hold.hold(rootID: rootID)
+                }
+                let first = try XCTUnwrap(fixture.manager.requestRootReconciliation(workspaceID: fixture.workspace.id))
+                let firstSettled = XCTestExpectation(description: "superseded waiter settled while teardown is held")
+                fixture.startOwnedTask {
+                    do {
+                        _ = try await fixture.manager.awaitRootReconciliationCompletion(ticket: first)
+                        XCTFail("Superseded intent returned readiness")
+                    } catch let failure as WorkspaceRootReadinessFailure {
+                        XCTAssertEqual(failure.reason, .staleInvocation)
+                    } catch { XCTFail("Unexpected superseded waiter error: \(error)") }
+                    firstSettled.fulfill()
+                }
+                try await fixture.awaitGateEvent(hold.entered)
+                // New intent retires the held attempt and settles its waiter; the admitted teardown keeps running.
+                fixture.manager.acceptRootReconciliationTarget(workspaceID: fixture.workspace.id, repoPaths: [fixture.rootPaths[0]])
+                try await fixture.awaitGateEvent(firstSettled)
+                let held = await store.roots()
+                XCTAssertTrue(held.contains { $0.id == unwanted.id }, "The teardown is still held before its Store unload")
+                let later = try XCTUnwrap(fixture.manager.requestRootReconciliation(workspaceID: fixture.workspace.id))
+                XCTAssertNotEqual(later, first)
+                hold.gate.release()
+                let ready = try await fixture.perform("later intent converges after the admitted teardown") {
+                    try await fixture.manager.awaitRootReconciliationCompletion(ticket: later)
+                }
+                XCTAssertEqual(ready.roots.map(\.id), [retainedID])
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), [fixture.rootPaths[0]])
+                XCTAssertEqual(hold.rootIDs, [unwanted.id, removedID])
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.id == unwanted.id || $0.id == removedID })
+            }
+        }
+
+        func testDesiredShellLessRootAttachesSameIDWhileUnwantedActorRootUnloads() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let desired = Array(fixture.rootPaths.prefix(2))
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let desiredIDs = before.readinessObservation.requestedRoots.map(\.id)
+                // Detach only B's UI shell: its Store lifetime and ID stay desired and actor-only.
+                let detached = await fixture.files.detachRootShell(forRootPath: desired[1], unloadStoreRoot: false)
+                XCTAssertTrue(detached)
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), [desired[0]])
+                let unwanted = try await self.installActorOnlyRoot(fixture, path: fixture.rootPaths[2])
+                let ready = try await self.attempt(fixture, paths: desired)
+                XCTAssertEqual(ready.roots.map(\.id), desiredIDs)
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), desired)
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.id), desiredIDs)
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.id == unwanted.id })
+                try await fixture.manager.validatePrimaryRootSnapshot(ready)
+            }
+        }
+
+        func testUnwantedPrimaryTeardownLeavesSystemAndSessionRoots() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C", "D", "E"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let desired = Array(fixture.rootPaths.prefix(2))
+                let systemPath = fixture.rootPaths[3]
+                let sessionPath = fixture.rootPaths[4]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let desiredIDs = before.readinessObservation.requestedRoots.map(\.id)
+                try await fixture.files.loadFolder(at: URL(fileURLWithPath: systemPath, isDirectory: true), for: fixture.workspace, rootKind: .supplementalSystem)
+                let systemRecords = await store.rootRecords(forRootFolderPaths: [systemPath])
+                let system = try XCTUnwrap(systemRecords.first)
+                let session = try await self.installActorOnlyRoot(fixture, path: sessionPath, kind: .sessionWorktree)
+                let unwanted = try await self.installActorOnlyRoot(fixture, path: fixture.rootPaths[2])
+                let ready = try await self.attempt(fixture, paths: desired)
+                XCTAssertEqual(ready.roots.map(\.id), desiredIDs)
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.id == unwanted.id })
+                XCTAssertTrue(roots.contains { $0.id == system.id && $0.kind == system.kind })
+                XCTAssertTrue(roots.contains { $0.id == session.id && $0.kind == .sessionWorktree })
+                XCTAssertEqual(fixture.files.rootShellProjections.filter { $0.fullPath == systemPath }.map(\.id), [system.id])
+                XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), desired)
+                // Fixture shutdown unloads through shells, so release the actor-only session root here.
+                let sessionRef = await store.exactRootRef(path: sessionPath, kind: .sessionWorktree)
+                let sessionRoot = try XCTUnwrap(sessionRef)
+                let sessionOutcome = await fixture.files.unloadRootFolder(sessionRoot, kind: .sessionWorktree)
+                XCTAssertEqual(sessionOutcome, .unloaded)
+            }
+        }
+
+        func testAbsentExpectedRootYieldsToUnpublishedSuccessorLoad() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
+                let reloadedPath = fixture.rootPaths[1]
+                let store = fixture.files.workspaceFileContextStore
+                let before = try await fixture.capturePassive()
+                let stale = before.readinessObservation.requestedRoots[1]
+                await fixture.files.unloadRootFolderPath(reloadedPath)
+                // Hold the successor inside Store after its load token claim and before publication.
+                let storeLoadStarted = XCTestExpectation(description: "successor Store load started")
+                let gate = fixture.makeGate()
+                await store.setRootLoadWillStartHandler { path in
+                    if path == reloadedPath { storeLoadStarted.fulfill()
+                        await gate.wait()
+                    }
+                }
+                let loadDone = XCTestExpectation(description: "successor load finished")
+                var loadError: Error?
+                fixture.startOwnedTask {
+                    do { try await fixture.files.loadFolder(at: URL(fileURLWithPath: reloadedPath, isDirectory: true), for: fixture.workspace) }
+                    catch { loadError = error }
+                    loadDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(storeLoadStarted)
+                let outcome = await fixture.files.unloadRootFolder(stale, kind: .primaryWorkspace)
+                XCTAssertEqual(outcome, .superseded, "An absent expected root must not claim the path from an in-flight successor")
+                gate.release()
+                try await fixture.awaitGateEvent(loadDone)
+                await store.setRootLoadWillStartHandler(nil)
+                XCTAssertNil(loadError, "The successor's load token must survive the stale teardown")
+                let successor = try XCTUnwrap(fixture.files.visibleRootShellProjections.first { $0.fullPath == reloadedPath })
+                XCTAssertNotEqual(successor.id, stale.id)
+                let roots = await store.roots()
+                XCTAssertEqual(
+                    Set(roots.filter { $0.kind == .primaryWorkspace }.map(\.id)),
+                    Set(fixture.files.visibleRootShellProjections.map(\.id)),
+                    "No primary root may be stranded without a shell"
+                )
+            }
+        }
+
+        func testWorkspaceUnloadDuringTeardownWaitCancelsTheWaitingLoad() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let unwantedPath = fixture.rootPaths[2]
+                let store = fixture.files.workspaceFileContextStore
+                _ = try await self.installActorOnlyRoot(fixture, path: unwantedPath)
+                let observedRef = await store.exactRootRef(path: unwantedPath, kind: .primaryWorkspace)
+                let unwantedRef = try XCTUnwrap(observedRef)
+                let hold = RootLifetimeHold(gate: fixture.makeGate())
+                fixture.files.setRootTeardownWillUnloadStoreRootHandler { _, rootID in
+                    await hold.hold(rootID: rootID)
+                }
+                let teardownDone = XCTestExpectation(description: "held teardown settled")
+                var outcome: WorkspaceFilesViewModel.RootUnloadOutcome?
+                fixture.startOwnedTask {
+                    outcome = await fixture.files.unloadRootFolder(unwantedRef, kind: .primaryWorkspace)
+                    teardownDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(hold.entered)
+                let loadEntered = XCTestExpectation(description: "same-path load waiting at the teardown gate")
+                loadEntered.assertForOverFulfill = false
+                let loading = fixture.files.$isLoading.dropFirst().sink { isLoading in
+                    if isLoading { loadEntered.fulfill() }
+                }
+                let loadDone = XCTestExpectation(description: "waiting load settled")
+                var loadError: Error?
+                fixture.startOwnedTask {
+                    do { try await fixture.files.loadFolder(at: URL(fileURLWithPath: unwantedPath, isDirectory: true), for: fixture.workspace) }
+                    catch { loadError = error }
+                    loadDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(loadEntered)
+                loading.cancel()
+                // Workspace unload invalidates every load lifecycle on entry, before its first suspension,
+                // while the waiting load has not yet claimed a token that invalidation could reach.
+                let unloadStarted = XCTestExpectation(description: "workspace unload invalidated load lifecycles")
+                let unloadDone = XCTestExpectation(description: "workspace unload joined the teardown")
+                fixture.startOwnedTask {
+                    unloadStarted.fulfill()
+                    await fixture.files.unloadAllRootFolders()
+                    unloadDone.fulfill()
+                }
+                try await fixture.awaitGateEvent(unloadStarted)
+                hold.gate.release()
+                try await fixture.awaitGateEvent(teardownDone)
+                try await fixture.awaitGateEvent(unloadDone)
+                try await fixture.awaitGateEvent(loadDone)
+                XCTAssertEqual(outcome, .unloaded)
+                XCTAssertTrue(loadError is CancellationError, "A load that waited across workspace unload must not attach afterwards")
+                XCTAssertFalse(fixture.files.rootShellProjections.contains { $0.fullPath == unwantedPath })
+                let roots = await store.roots()
+                XCTAssertFalse(roots.contains { $0.standardizedFullPath == unwantedPath })
+            }
+        }
+
         func testRemovedCapturedIDFailsStaleWithoutRepairingInvocation() async throws {
             try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
                 let snapshot = try await fixture.manager.readyPrimaryRootSnapshot(workspaceID: fixture.workspace.id, expectedRepoPaths: fixture.rootPaths)
@@ -948,6 +1372,22 @@ import XCTest
             return try await fixture.perform("terminal reconciliation") {
                 try await fixture.manager.awaitRootReconciliation(ticket: ticket, deadline: .now.advanced(by: .seconds(10)))
             }
+        }
+
+        /// Deliberate actor-only setup, not a readiness boundary: the Store owns a lifetime that no
+        /// UI shell or cached root reference ever attached.
+        private func installActorOnlyRoot(
+            _ fixture: WorkspaceAuthorityRootTestFixture, path: String, kind: WorkspaceRootKind = .primaryWorkspace
+        ) async throws -> WorkspaceRootRecord {
+            let root = try await fixture.files.workspaceFileContextStore.loadRoot(
+                path: path, isSystemRoot: false, kind: kind,
+                respectRepoIgnore: fixture.files.respectRepoIgnore,
+                respectCursorignore: fixture.files.respectCursorignore,
+                skipSymlinks: fixture.files.skipSymlinks,
+                enableHierarchicalIgnores: fixture.files.enableHierarchicalIgnores
+            )
+            XCTAssertFalse(fixture.files.rootShellProjections.contains { $0.fullPath == path })
+            return root
         }
 
         private func expectFailure(_ reason: WorkspaceRootReadinessFailure.Reason, _ operation: () async throws -> Void) async throws {

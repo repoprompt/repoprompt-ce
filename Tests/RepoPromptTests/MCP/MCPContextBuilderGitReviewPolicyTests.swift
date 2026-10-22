@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import XCTest
 
 @MainActor
@@ -94,5 +96,68 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 XCTFail("Unexpected error: \(error)")
             }
         }
+    }
+
+    func testAvailableFrozenTargetSuppliesRelativeDefaultOrRefusesInsteadOfAmbientElection() throws {
+        let repo = GitRepoDescriptor(rootURL: URL(fileURLWithPath: "/tmp/frozen-review-target"))
+        let target = Self.target(primaryCheckout: repo)
+        let available = MCPContextBuilderGitReviewAdmission(
+            target: target, implicitRepositories: nil, preferredDefaultRepository: repo, publicationFence: nil
+        )
+        XCTAssertEqual(try MCPGitToolProvider.frozenDefaultRepository(for: available), repo)
+
+        let identityLost = MCPContextBuilderGitReviewAdmission(
+            target: target, implicitRepositories: nil, preferredDefaultRepository: nil, publicationFence: nil
+        )
+        XCTAssertThrowsError(try MCPGitToolProvider.frozenDefaultRepository(for: identityLost)) { error in
+            XCTAssertEqual(error as? MCPContextBuilderGitReviewPolicyError, .targetUnavailable(.checkoutIdentityChanged))
+        }
+    }
+
+    func testUnelectedOrAbsentTargetsLeaveRelativeSelectorsToAmbientElection() async throws {
+        let deferred = try await admitDeferred(hasExplicitSelector: true, requestsArtifactPublication: false)
+        XCTAssertNil(deferred.preferredDefaultRepository)
+        XCTAssertNil(try MCPGitToolProvider.frozenDefaultRepository(for: deferred))
+
+        let unavailable = try await admit(
+            .unavailable(.nonGitSelection(count: 1)), hasExplicitSelector: true, requestsArtifactPublication: false
+        )
+        XCTAssertNil(try MCPGitToolProvider.frozenDefaultRepository(for: unavailable))
+
+        let generic = try await MCPContextBuilderGitReviewPolicy().admit(
+            resolution: nil,
+            hasExplicitSelector: false,
+            requestsArtifactPublication: false,
+            operation: .status,
+            allRepositories: [],
+            store: WorkspaceFileContextStore()
+        )
+        XCTAssertNil(try MCPGitToolProvider.frozenDefaultRepository(for: generic))
+    }
+
+    private static func target(primaryCheckout repo: GitRepoDescriptor) -> ContextBuilderReviewTarget {
+        let root = WorkspaceRootRef(id: UUID(), name: repo.displayName, fullPath: repo.rootPath)
+        let checkout = ContextBuilderReviewCheckoutTarget(
+            logicalWorkspaceRoot: root,
+            physicalWorkspaceRoot: root,
+            physicalWorkspaceRootKind: .primaryWorkspace,
+            checkoutRootPath: repo.rootPath,
+            repoKey: repo.repoKey,
+            repositoryID: "gitrepo_frozen",
+            worktreeID: "wt_frozen",
+            kind: .canonical,
+            sessionRootAuthorization: nil
+        )
+        return ContextBuilderReviewTarget(
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sourceSelectionRevision: 1,
+            initialOrdinarySelectionIdentities: [],
+            initialSelectedArtifactIdentities: [],
+            checkouts: [checkout],
+            primaryCheckout: checkout,
+            artifactCapability: nil,
+            displayContext: ReviewGitDisplayContext(roots: [])
+        )
     }
 }

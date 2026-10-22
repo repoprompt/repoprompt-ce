@@ -62,9 +62,10 @@ import XCTest
 
         static func withDriver(
             rootNames: [String] = ["A", "B"], routedRuntime: Bool = false,
+            configuration: @escaping ([String]) -> [String] = { Array($0.prefix(2)) },
             _ body: @escaping (ContextBuilderMultiRootDiscoveryDriver) async throws -> Void
         ) async throws {
-            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: rootNames, configuration: { Array($0.prefix(2)) }) { fixture in
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: rootNames, configuration: configuration) { fixture in
                 let driver = ContextBuilderMultiRootDiscoveryDriver(fixture: fixture)
                 let operation = {
                     do {

@@ -1129,6 +1129,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseModelParameters)
             .map(advertiseOracleImageAttachments)
             .map(advertiseWorktreeListPagination)
+            .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
     }
 
@@ -1314,6 +1315,73 @@ package enum MCPDomainCanonicalToolDefinitions {
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
         )
+    }
+
+    /// The vendored `git` and `manage_worktree` definitions advertise a first-loaded-root default. App-backed
+    /// calls use the shared default repository election instead; the direct headless backend keeps its own
+    /// root-set semantics, so the copy qualifies the policy by backend. `agent_run` startup is not part of that
+    /// election, so its copy states its own PRIMARY-only and full-set inheritance rules instead. Obsolete prose is
+    /// replaced in place (never contradicted by appended text), field shapes are unchanged, and reapplying
+    /// changes nothing.
+    private static func advertiseDefaultRepositoryElection(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        typealias Copy = MCPDefaultRepositoryElectionCopy
+        var description = definition.description
+        let propertyDescriptions: [String: String]
+        switch definition.name {
+        case MCPWindowToolName.git:
+            description = replacingObsoleteLine(Copy.gitObsoleteDefault, with: Copy.gitDefault, in: description)
+            description = replacingObsoleteLine(Copy.gitObsoleteTreeSpecifiers, with: Copy.gitTreeSpecifiers, in: description)
+            description = replacingObsoleteLine(Copy.gitObsoleteMultiRootNote, with: Copy.gitMultiRootNote, in: description)
+            propertyDescriptions = ["repo_root": Copy.gitRepoRootProperty]
+        case MCPWindowToolName.manageWorktree:
+            if !description.contains(Copy.manageWorktreeSection) {
+                description = description.contains(Copy.manageWorktreeSectionAnchor)
+                    ? description.replacingOccurrences(
+                        of: Copy.manageWorktreeSectionAnchor,
+                        with: Copy.manageWorktreeSectionAnchor + Copy.manageWorktreeSection
+                    )
+                    : description + Copy.manageWorktreeSection
+            }
+            propertyDescriptions = ["repo_root": Copy.manageWorktreeRepoRootProperty]
+        case MCPWindowToolName.agentRun:
+            description = replacingObsoleteLine(Copy.agentRunObsoleteWorktreeArgs, with: Copy.agentRunWorktreeArgs, in: description)
+            propertyDescriptions = [
+                "worktree_repo_root": Copy.agentRunWorktreeRepoRootProperty,
+                "inherit_worktree": Copy.agentRunInheritWorktreeProperty
+            ]
+        default:
+            return definition
+        }
+
+        var inputSchema = definition.inputSchema
+        if case var .object(schema) = inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            for (name, text) in propertyDescriptions {
+                guard case var .object(property)? = properties[name] else { continue }
+                property["description"] = .string(text)
+                properties[name] = .object(property)
+            }
+            schema["properties"] = .object(properties)
+            inputSchema = .object(schema)
+        }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: inputSchema,
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// Replaces an obsolete line once; appends the replacement only if the anchor has drifted away.
+    private static func replacingObsoleteLine(_ obsolete: String, with replacement: String, in description: String) -> String {
+        guard !description.contains(replacement) else { return description }
+        return description.contains(obsolete)
+            ? description.replacingOccurrences(of: obsolete, with: replacement)
+            : description + "\n" + replacement
     }
 
     /// The vendored definitions still carry the retired fixed-wait wording, so canonicalization
@@ -2952,6 +3020,12 @@ package enum MCPDomainCanonicalToolDefinitions {
             applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
         }
 
+        package static func test_advertiseDefaultRepositoryElection(
+            _ definition: MCPDomainToolDefinition
+        ) -> MCPDomainToolDefinition {
+            advertiseDefaultRepositoryElection(definition)
+        }
+
         package static func test_canonicalizeAgentControlWaitSemantics(
             _ definition: MCPDomainToolDefinition
         ) -> MCPDomainToolDefinition {
@@ -3758,4 +3832,47 @@ package enum MCPDomainCanonicalToolDefinitions {
             isEnabledByDefault: definition.isEnabledByDefault
         )
     }
+}
+
+/// Shipped copy for the app-backed default repository election (#1431). The canonical pipeline applies it to
+/// `git` and `manage_worktree`; the management provider's legacy description reuses the same sentences.
+package enum MCPDefaultRepositoryElectionCopy {
+    static let gitObsoleteDefault =
+        "- Generic calls default to the first loaded root's repo; nested Agent Context Builder runs default to their frozen selected repository target"
+    static let gitDefault =
+        "- Default repository (app-backed): without a repository-identifying selector, use the session's sole applicable worktree binding; with no bindings, use declared PRIMARY (the first declared workspace root, with no fallback to another root). Multiple bindings require an explicit repository or identifying worktree selector. Nested Agent Context Builder runs use their frozen selected repository target instead."
+    static let gitObsoleteTreeSpecifiers =
+        "- Tree specifiers: append `@wt` (explicit worktree), `@main` (main checkout), or `@main:<branch>` to target a worktree by branch (local branch name)"
+    static let gitTreeSpecifiers = """
+    - Tree specifiers: append `@wt` (explicit worktree), `@main` (main checkout), or `@main:<branch>` to target a worktree by branch (local branch name), e.g. `<root>@main`. Bare `@main`, `@current`, and `@wt` are relative to the default repository and do not choose one; `@id:<worktree_id>` and `@branch:<branch>` identify a checkout directly.
+    - Direct headless backend: an unqualified call inspects every loaded Git root; the app-backed default does not apply.
+    """
+    static let gitObsoleteMultiRootNote = "Note: log/show/blame run on primary repo only with multi-root."
+    static let gitMultiRootNote = "Note: with multiple `repo_roots`, log/show/blame run on the first listed repository only."
+    static let gitRepoRootProperty =
+        "Repository root path inside a loaded root, or loaded root name. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector. Nested Agent Context Builder runs use the frozen selected repository target. Supports @wt, @main, or @main:<branch> (relative to that default unless prefixed by a root, e.g. <root>@main), @id:<worktree_id>, and @branch:<branch>."
+
+    static let manageWorktreeSectionAnchor = "- `target_worktree_id`: Durable merge target ID alternative to `target`."
+    package static let manageWorktreeSection = """
+
+
+    **Default repository** (app-backed `list`, `show`, `create`, `bind`, `select`, `unbind`):
+    - Without a repository-identifying selector, use the session's sole applicable worktree binding; with no bindings, use declared PRIMARY (the first declared workspace root, with no fallback to another root). Multiple bindings require an explicit repository or identifying worktree selector. The routed caller's session supplies this default, not a `session_id` target.
+    - `repo_root`/`repo_key` and identifying worktree selectors (`worktree_id`, `@id:<worktree_id>`, `@branch:<name>`, or a worktree name, branch, or path) choose their repository directly. Bare `@main`, `@current`, and `@wt` are relative to the default repository and do not choose one.
+    - Merge ops use the session's bound source worktree rather than this default, and `unbind` with `all=true` removes bindings by identity without choosing one.
+    - Direct headless backend: uses its first Git root; the app-backed default does not apply.
+    """
+    package static let manageWorktreeRepoRootProperty =
+        "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
+
+    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    static let agentRunObsoleteWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
+    package static let agentRunWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. App-backed starts bind only the declared PRIMARY workspace root: `worktree_repo_root` defaults to it and a secondary root is refused, selectors resolve only in PRIMARY's repository, and the `git`/`manage_worktree` default repository does not apply. Inheritance copies the source session's complete binding set, secondary roots included. Direct headless backend: binds existing worktrees only (no `worktree_create`), and `worktree_repo_root` may name any declared root."
+    package static let agentRunWorktreeRepoRootProperty =
+        "[start] Repo/logical root selector for worktree resolution or creation. App-backed starts accept only the declared PRIMARY workspace root, which is the default; a secondary root is refused. The direct headless backend may name any declared root for an existing worktree."
+    package static let agentRunInheritWorktreeProperty =
+        "[start] When started from an Agent Mode run, inherit the source session's complete worktree binding set, secondary roots included, before provider startup. Default true. Set false to keep parent session threading but skip the copy; bindings the target already has are kept. Explicit worktree/worktree_id/worktree_create args take precedence, suppress parent inheritance, and bind only the requested worktree."
 }
