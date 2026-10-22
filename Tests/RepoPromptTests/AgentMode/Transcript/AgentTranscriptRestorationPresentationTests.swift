@@ -3,6 +3,31 @@ import Foundation
 @testable import RepoPromptApp
 import XCTest
 
+/// Failure-only provenance for #1382; this does not change fixture scheduling or error precedence.
+@MainActor
+private final class RestorationFixtureFailureTrace {
+    private let invocationID = UUID()
+    var phase = "setup"
+    private var firstErrorPhase: String?
+    private var firstErrorCallerCancelled: Bool?
+
+    func noteRetainedError() {
+        guard firstErrorPhase == nil else { return }
+        firstErrorPhase = phase
+        firstErrorCallerCancelled = Task.isCancelled
+    }
+
+    func failureMessage(for error: Error) -> String {
+        let cancelledAtCatch = firstErrorCallerCancelled.map { String($0) } ?? "not-retained"
+        return """
+        Restoration fixture failure (#1382), invocation=\(invocationID)
+        phase=\(phase), firstErrorPhase=\(firstErrorPhase ?? "not-retained")
+        task=fixture-caller, cancelledAtCatch=\(cancelledAtCatch), cancelledNow=\(Task.isCancelled)
+        errorType=\(String(reflecting: type(of: error))), error=\(String(reflecting: error))
+        """
+    }
+}
+
 /// Table-driven precedence for the pure Agent transcript pane classifier (§4.4).
 final class AgentTranscriptPanePresentationTests: XCTestCase {
     private final class SessionObject {}
@@ -940,14 +965,33 @@ private extension XCTestCase {
     }
 
     func withRealObserverSavedTab(bound: Bool = true, _ body: (RealObserverFixture) async throws -> Void) async throws {
+        let trace = RestorationFixtureFailureTrace()
+        do {
+            try await performWithRealObserverSavedTab(bound: bound, trace: trace, body)
+        } catch {
+            // XCTest's throw-origin location alone cannot identify which fixture operation failed.
+            // Record provenance separately, then preserve the original error and cancellation semantics.
+            XCTFail(trace.failureMessage(for: error))
+            throw error
+        }
+    }
+
+    func performWithRealObserverSavedTab(
+        bound: Bool,
+        trace: RestorationFixtureFailureTrace,
+        _ body: (RealObserverFixture) async throws -> Void
+    ) async throws {
         let sandbox = try WorkspaceTestProcessSandbox.validate()
         let root = sandbox.appendingPathComponent("restoration-observer-\(UUID().uuidString)", isDirectory: true)
+        trace.phase = "create-root"
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let dataService = AgentSessionDataService.shared
+        trace.phase = "install-root-override"
         await dataService.test_setWorkspaceRootOverride(root)
         let gate = PrepareGate()
         let tabID = UUID()
         let sessionID = UUID()
+        trace.phase = "install-hydration-hook"
         await dataService.test_setAfterHydrationPrepareHook { preparedSessionID in
             guard preparedSessionID == sessionID else { return }
             try await gate.hold()
@@ -976,6 +1020,7 @@ private extension XCTestCase {
             completions.record(tabID: tabID, generation: generation)
         }
         var firstError: Error?
+        trace.phase = "body"
         do {
             try await body(RealObserverFixture(
                 viewModel: viewModel,
@@ -988,35 +1033,50 @@ private extension XCTestCase {
                 completions: completions
             ))
         } catch {
+            trace.noteRetainedError()
             firstError = error
         }
+        trace.phase = "cancel-loads"
         let pendingLoads = viewModel.sessions.values.compactMap(\.persistedLoadTask)
         pendingLoads.forEach { $0.cancel() }
+        trace.phase = "open-gate"
         await gate.open()
+        trace.phase = "join-loads"
         for task in pendingLoads {
             await task.value
         }
+        trace.phase = "join-cache-refresh"
         await viewModel.test_waitForSessionListCacheRefresh()
+        trace.phase = "drain-cleanup"
         do {
             try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
         } catch {
+            trace.noteRetainedError()
             firstError = firstError ?? error
         }
+        trace.phase = "close-agent-mode"
         await viewModel.prepareForWindowClose()
         viewModel.test_afterTabActivationContinuation = nil
         viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
         viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
+        trace.phase = "reset-hydration-hook"
         await dataService.test_setAfterHydrationPrepareHook(nil)
+        trace.phase = "reset-root-override"
         await dataService.test_setWorkspaceRootOverride(nil)
+        trace.phase = "remove-root"
         do {
             try FileManager.default.removeItem(at: root)
         } catch {
+            trace.noteRetainedError()
             firstError = firstError ?? error
         }
+        trace.phase = "lifetime-fence"
         withExtendedLifetime((manager, prompt)) {}
+        trace.phase = "rethrow-retained-error"
         if let firstError {
             throw firstError
         }
+        trace.phase = "return"
     }
 }
 
