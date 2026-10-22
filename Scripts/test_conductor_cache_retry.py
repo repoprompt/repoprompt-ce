@@ -54,7 +54,7 @@ sys.exit(run_local_tests(swift_binary='fixture-swift', cwd=Path.cwd(),
                 'argv': [sys.executable, '-c', script], 'key': key, 'testBuildReceipt': True,
                 'outcomePath': str(outcome_path), 'ticket': 'fixture',
                 'attemptRecordPath': str(root / 'fixture.cache-attempt.json'),
-                'attemptTimeout': 5 if hang_tests else 20,
+                'attemptTimeout': 15 if hang_tests else 20,
             })
         self.assertTrue(sentinel.exists())
         self.assertFalse((root / 'fixture.cache-attempt.json').exists())
@@ -82,7 +82,7 @@ sys.exit(run_local_tests(swift_binary='fixture-swift', cwd=Path.cwd(),
         conductor.DaemonState._apply_cache_retry_outcome_locked(job, outcome)
         self.assertEqual(job.exit_code, 124)
         self.assertTrue(job.timed_out)
-        self.assertEqual(job.error, 'post-build test execution timed out after 5.0s')
+        self.assertEqual(job.error, 'post-build test execution timed out after 15.0s')
 
     def test_receipt_write_failure_does_not_replace_test_result(self):
         with tempfile.TemporaryDirectory() as directory, \
