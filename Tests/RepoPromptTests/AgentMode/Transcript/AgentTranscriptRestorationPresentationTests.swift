@@ -1,32 +1,8 @@
 import Combine
 import Foundation
+import os
 @testable import RepoPromptApp
 import XCTest
-
-/// Failure-only provenance for #1382; this does not change fixture scheduling or error precedence.
-@MainActor
-private final class RestorationFixtureFailureTrace {
-    private let invocationID = UUID()
-    var phase = "setup"
-    private var firstErrorPhase: String?
-    private var firstErrorCallerCancelled: Bool?
-
-    func noteRetainedError() {
-        guard firstErrorPhase == nil else { return }
-        firstErrorPhase = phase
-        firstErrorCallerCancelled = Task.isCancelled
-    }
-
-    func failureMessage(for error: Error) -> String {
-        let cancelledAtCatch = firstErrorCallerCancelled.map { String($0) } ?? "not-retained"
-        return """
-        Restoration fixture failure (#1382), invocation=\(invocationID)
-        phase=\(phase), firstErrorPhase=\(firstErrorPhase ?? "not-retained")
-        task=fixture-caller, cancelledAtCatch=\(cancelledAtCatch), cancelledNow=\(Task.isCancelled)
-        errorType=\(String(reflecting: type(of: error))), error=\(String(reflecting: error))
-        """
-    }
-}
 
 /// Table-driven precedence for the pure Agent transcript pane classifier (§4.4).
 final class AgentTranscriptPanePresentationTests: XCTestCase {
@@ -763,6 +739,103 @@ final class AgentTranscriptPanePresentationTests: XCTestCase {
 
 // MARK: - Shared real-restoration fixtures (used by the lifecycle and snapshot publication suites)
 
+/// The synchronous cancellation handler can run off actor; every shared field is lock protected.
+private final class RestorationFixtureCancellationTrace: Sendable {
+    struct Cancellation {
+        let phase: String
+        let stack: [String]
+    }
+
+    private struct State {
+        var phase = "setup"
+        var cancellation: Cancellation?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func setPhase(_ phase: String) {
+        state.withLock { $0.phase = phase }
+    }
+
+    func recordCancellation() {
+        let phase = state.withLock { $0.phase }
+        let cancellation = Cancellation(phase: phase, stack: Thread.callStackSymbols)
+        state.withLock {
+            if $0.cancellation == nil { $0.cancellation = cancellation }
+        }
+    }
+
+    var cancellation: Cancellation? {
+        state.withLock { $0.cancellation }
+    }
+}
+
+/// Failure-only provenance for #1382; timings are observations, not deadlines or assertions.
+@MainActor
+private final class RestorationFixtureFailureTrace {
+    let cancellationTrace = RestorationFixtureCancellationTrace()
+    var invocationID = "not-created"
+    var pendingSaveDebounceCountBeforeClose: Int?
+    private let clock = ContinuousClock()
+    private var phaseStarted = ContinuousClock.now
+    private var elapsedPhases: [String] = []
+    var phase = "setup" {
+        didSet {
+            let now = clock.now
+            elapsedPhases.append("\(oldValue)=\(phaseStarted.duration(to: now))")
+            phaseStarted = now
+            cancellationTrace.setPhase(phase)
+            observeCallerCancellation()
+        }
+    }
+
+    private var firstErrorPhase: String?
+    private var firstErrorCallerCancelled: Bool?
+    private var firstObservedCancelledPhase: String?
+
+    init() {
+        observeCallerCancellation()
+    }
+
+    static func shouldDiagnose(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        return !(error is XCTSkip) && (error as NSError).domain != XCTestErrorDomain
+    }
+
+    private func observeCallerCancellation() {
+        if Task.isCancelled, firstObservedCancelledPhase == nil {
+            firstObservedCancelledPhase = phase
+        }
+    }
+
+    func noteRetainedError() {
+        observeCallerCancellation()
+        guard firstErrorPhase == nil else { return }
+        firstErrorPhase = phase
+        firstErrorCallerCancelled = Task.isCancelled
+    }
+
+    func failureMessage(for error: Error) -> String {
+        observeCallerCancellation()
+        let cancelledAtCatch = firstErrorCallerCancelled.map { String($0) } ?? "not-retained"
+        let timings = elapsedPhases + ["\(phase)=\(phaseStarted.duration(to: clock.now))"]
+        let cancellation = cancellationTrace.cancellation
+        let stack = cancellation?.stack.joined(separator: "\n") ?? "not-observed"
+        return """
+        Restoration fixture failure (#1382), invocation=\(invocationID)
+        phase=\(phase), firstErrorPhase=\(firstErrorPhase ?? "not-retained")
+        phaseElapsed: \(timings.joined(separator: ", "))
+        cancelledAtCatch=\(cancelledAtCatch), cancelledNow=\(Task.isCancelled)
+        firstObservedCancelledPhase=\(firstObservedCancelledPhase ?? "not-observed")
+        cancellationHandlerPhase=\(cancellation?.phase ?? "not-observed")
+        pendingSaveDebounceCountBeforeClose=\(pendingSaveDebounceCountBeforeClose.map { String($0) } ?? "not-reached")
+        errorType=\(String(reflecting: type(of: error))), error=\(String(reflecting: error))
+        cancellationStack (pre-cancelled entry may show handler installation):
+        \(stack)
+        """
+    }
+}
+
 private actor PrepareGate {
     private var entryCount = 0
     private var isOpen = false
@@ -965,24 +1038,33 @@ private extension XCTestCase {
     }
 
     func withRealObserverSavedTab(bound: Bool = true, _ body: (RealObserverFixture) async throws -> Void) async throws {
+        // Sandbox/XCTest setup failures already have their own attribution, not #1382 provenance.
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
         let trace = RestorationFixtureFailureTrace()
+        let cancellationTrace = trace.cancellationTrace
         do {
-            try await performWithRealObserverSavedTab(bound: bound, trace: trace, body)
+            try await withTaskCancellationHandler {
+                try await performWithRealObserverSavedTab(sandbox: sandbox, bound: bound, trace: trace, body)
+            } onCancel: {
+                cancellationTrace.recordCancellation()
+            }
         } catch {
-            // XCTest's throw-origin location alone cannot identify which fixture operation failed.
-            // Record provenance separately, then preserve the original error and cancellation semantics.
-            XCTFail(trace.failureMessage(for: error))
+            // Keep skips and framework assertions untouched; preserve every original error identity.
+            if RestorationFixtureFailureTrace.shouldDiagnose(error) {
+                XCTFail(trace.failureMessage(for: error))
+            }
             throw error
         }
     }
 
     func performWithRealObserverSavedTab(
+        sandbox: URL,
         bound: Bool,
         trace: RestorationFixtureFailureTrace,
         _ body: (RealObserverFixture) async throws -> Void
     ) async throws {
-        let sandbox = try WorkspaceTestProcessSandbox.validate()
         let root = sandbox.appendingPathComponent("restoration-observer-\(UUID().uuidString)", isDirectory: true)
+        trace.invocationID = root.lastPathComponent
         trace.phase = "create-root"
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let dataService = AgentSessionDataService.shared
@@ -1054,8 +1136,28 @@ private extension XCTestCase {
             trace.noteRetainedError()
             firstError = firstError ?? error
         }
+        trace.phase = "cancel-save-debounces"
+        let closingSessions = Array(viewModel.sessions.values)
+        let pendingSaves = closingSessions.compactMap(\.saveDebounceTask)
+        trace.pendingSaveDebounceCountBeforeClose = pendingSaves.count
+        for session in closingSessions {
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+        }
         trace.phase = "close-agent-mode"
         await viewModel.prepareForWindowClose()
+        // Close can itself schedule persistence. Fence those handles too, including retained sessions.
+        trace.phase = "cancel-close-save-debounces"
+        let closedSessions = closingSessions + Array(viewModel.sessions.values)
+        let closeSaves = closedSessions.compactMap(\.saveDebounceTask)
+        for session in closedSessions {
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+        }
+        trace.phase = "join-save-debounces"
+        for task in pendingSaves + closeSaves {
+            await task.value
+        }
         viewModel.test_afterTabActivationContinuation = nil
         viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
         viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
@@ -2294,6 +2396,77 @@ extension AgentTranscriptRestorationLifecycleTests {
 /// current-tab override. Sandbox first; bounded teardown before shared state resets.
 @MainActor
 extension AgentTranscriptRestorationLifecycleTests {
+    func testFixtureTeardownCancelsAndJoinsPendingSaveDebounce() async throws {
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        var pendingSave: Task<Void, Never>?
+        var retainedSession: AgentTabSession?
+        var retainedViewModel: AgentModeViewModel?
+        var saveFinished = false
+        defer {
+            pendingSave?.cancel()
+            continuation.finish()
+        }
+        try await withRealObserverSavedTab { fixture in
+            retainedViewModel = fixture.viewModel
+            let saved = AgentSession(id: fixture.sessionID, name: "Save cleanup", savedAt: Date())
+            _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
+            fixture.viewModel.setAgentModeActive(true)
+            await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
+            await fixture.gate.waitUntilEntered()
+            let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+            let load = try XCTUnwrap(session.persistedLoadTask)
+            await fixture.gate.open()
+            await load.value
+            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
+            retainedSession = session
+            if let previous = session.saveDebounceTask {
+                previous.cancel()
+                await previous.value
+            }
+            pendingSave = Task { @MainActor in
+                var iterator = stream.makeAsyncIterator()
+                _ = await iterator.next()
+                saveFinished = true
+            }
+            session.saveDebounceTask = pendingSave
+        }
+        let finishedAtFixtureReturn = saveFinished
+        let cancelledAtFixtureReturn = pendingSave?.isCancelled ?? false
+        pendingSave?.cancel()
+        continuation.finish()
+        await pendingSave?.value
+        XCTAssertNil(retainedSession?.saveDebounceTask, "Fixture must release its pending save handle")
+        XCTAssertTrue(cancelledAtFixtureReturn, "Fixture must cancel its pending save before closing")
+        XCTAssertTrue(finishedAtFixtureReturn, "Fixture must join the save before deleting its storage")
+        withExtendedLifetime((retainedSession, retainedViewModel)) {}
+    }
+
+    func testFixtureFailureTraceRecordsCancellationAndFiltersFrameworkErrors() async {
+        let trace = RestorationFixtureFailureTrace()
+        trace.invocationID = "restoration-observer-test"
+        let cancellationTrace = trace.cancellationTrace
+        let task = Task { @MainActor in
+            await withTaskCancellationHandler {
+                trace.phase = "body"
+                return trace.failureMessage(for: CancellationError())
+            } onCancel: {
+                cancellationTrace.recordCancellation()
+            }
+        }
+        task.cancel()
+        let message = await task.value
+        XCTAssertTrue(message.contains("invocation=restoration-observer-test"))
+        XCTAssertTrue(message.contains("phaseElapsed: setup="))
+        XCTAssertTrue(message.contains(", body="))
+        XCTAssertTrue(message.contains("firstObservedCancelledPhase=body"))
+        XCTAssertEqual(cancellationTrace.cancellation?.phase, "setup")
+        XCTAssertFalse(cancellationTrace.cancellation?.stack.isEmpty ?? true)
+        XCTAssertFalse(RestorationFixtureFailureTrace.shouldDiagnose(XCTSkip("skip")))
+        XCTAssertFalse(RestorationFixtureFailureTrace.shouldDiagnose(NSError(domain: XCTestErrorDomain, code: 0)))
+        XCTAssertTrue(RestorationFixtureFailureTrace.shouldDiagnose(CancellationError()))
+        XCTAssertTrue(RestorationFixtureFailureTrace.shouldDiagnose(NSError(domain: NSCocoaErrorDomain, code: 513)))
+    }
+
     /// §4.5: the same complete IDs with no live attempt or continuation start a real activation that
     /// reapplies current bindings; the selection publication is never ignored by tab ID alone.
     func testSameTabSelectionWithoutLiveWorkReappliesCurrentBindings() async throws {
