@@ -98,6 +98,29 @@ team, and entitlement profile from trusted control-plane tooling. Artifact ident
 comes from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`; the staged
 payload does not carry a second manifest copy.
 
+### Computer Use release validation
+
+The companion rejects the release-bundled Codex sender after it is re-signed by
+RepoPrompt (`-10000 Sender process is not authenticated`, issue #1423). Computer
+Use therefore refuses arming with the bundled runtime in release builds and
+explains how to select an OpenAI-signed local executable under Settings → Codex
+CLI → Advanced and restart. Debug builds keep their existing bundled-runtime
+behavior. This gate does not certify custom executables or automatically switch
+runtimes, import personal configuration, or change signing policy.
+
+For each release candidate, record a manual check (including app build, runtime
+version/source, companion version, and result):
+
+1. With the default bundled runtime and Computer Use enabled, `/computer-use`
+   must show the runtime requirement before arming, even with a companion installed.
+2. Select an OpenAI-signed local Codex executable, restart, and explicitly arm
+   Computer Use in a top-level chat. With the user's macOS permissions, perform
+   one non-destructive companion call such as listing apps. Record unavailable
+   prerequisites as **not run**, not a pass. Restore the runtime preference only
+   if requested; do not grant permissions or operate the desktop automatically.
+
+Debug tests and ordinary MCP smoke are not proof of release companion authentication.
+
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's environment or shell `PATH`. Settings
 presents the included Codex version and status as the ordinary path. Advanced users

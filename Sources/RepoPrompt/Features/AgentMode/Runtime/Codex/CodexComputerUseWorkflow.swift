@@ -137,6 +137,30 @@ enum CodexComputerUseWorkflow {
     static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
     static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
 
+    /// Release packaging re-signs bundled Codex with the RepoPrompt identity. The
+    /// companion rejects that sender; debug packaging preserves OpenAI's signature.
+    /// This is a known-incompatible-runtime gate, not authentication of external CLIs.
+    static func runtimeUnavailableMessage(
+        selection: CodexRuntimePreferences.Selection = CodexRuntimeAuthority.currentLaunchSnapshot().selection,
+        isReleaseBuild: Bool = CodexComputerUseWorkflow.isReleaseBuild
+    ) -> String? {
+        guard isReleaseBuild else { return nil }
+        switch selection {
+        case .inherited, .bundled:
+            return "Computer Use requires an OpenAI-signed Codex runtime. The included runtime is re-signed by RepoPrompt in release builds and is rejected by the companion. Select an OpenAI-signed local Codex executable in Settings → Codex CLI → Advanced, restart RepoPrompt CE, then arm /computer-use again."
+        case .external, .invalidExternalPreference:
+            return nil
+        }
+    }
+
+    static var isReleaseBuild: Bool {
+        #if DEBUG
+            false
+        #else
+            true
+        #endif
+    }
+
     @MainActor
     static var isEnabled: Bool {
         GlobalSettingsStore.shared.codexComputerUseEnabled()

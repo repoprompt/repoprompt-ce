@@ -268,6 +268,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
+    private let computerUseRuntimeUnavailableMessage: () -> String?
     private let computerUseCompanionReady: () -> Bool
     private let computerUseReservedEntryExists: () -> Bool
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
@@ -415,6 +416,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         },
         shouldManageCodexTooling: Bool,
         codexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
+        computerUseRuntimeUnavailableMessage: @escaping () -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage() },
         computerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
         computerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
@@ -439,6 +441,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.runtimeWorkspacePathsProvider = runtimeWorkspacePathsProvider
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
+        self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
         self.computerUseCompanionReady = computerUseCompanionReady
         self.computerUseReservedEntryExists = computerUseReservedEntryExists
         self.connectionPolicyInstaller = connectionPolicyInstaller
@@ -2368,6 +2371,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if let message = computerUseRuntimeUnavailableMessage() { return message }
         guard !computerUseReservedEntryExists() else { return CodexComputerUseWorkflow.collisionMessage }
         guard computerUseCompanionReady() else { return CodexComputerUseWorkflow.unavailableMessage }
         return nil

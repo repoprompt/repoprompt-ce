@@ -96,6 +96,45 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         super.tearDown()
     }
 
+    func testReleaseBundledRuntimeIsUnavailableButDebugAndExternalRemainEligible() throws {
+        let bundledSelections: [CodexRuntimePreferences.Selection] = [.inherited, .bundled]
+        for selection in bundledSelections {
+            let message = try XCTUnwrap(CodexComputerUseWorkflow.runtimeUnavailableMessage(selection: selection, isReleaseBuild: true))
+            XCTAssertTrue(message.contains("OpenAI-signed"))
+            XCTAssertTrue(message.contains("Advanced"))
+            XCTAssertTrue(message.contains("restart"))
+            XCTAssertNil(CodexComputerUseWorkflow.runtimeUnavailableMessage(selection: selection, isReleaseBuild: false))
+        }
+        XCTAssertNil(CodexComputerUseWorkflow.runtimeUnavailableMessage(selection: .external(path: "/local/codex"), isReleaseBuild: true))
+    }
+
+    func testReleaseRuntimeRequirementRejectsArmingEvenWithCompanionPresent() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        let (viewModel, session) = makeAdmissionFixture()
+        let message = try XCTUnwrap(CodexComputerUseWorkflow.runtimeUnavailableMessage(selection: .bundled, isReleaseBuild: true))
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Rejected runtime must not launch") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false,
+            computerUseRuntimeUnavailableMessage: { message },
+            computerUseCompanionReady: { true }, computerUseReservedEntryExists: { false },
+            codexHookApprovalSettings: GlobalSettingsStore.shared
+        )
+        coordinator.attach(viewModel: viewModel)
+        XCTAssertEqual(coordinator.nativeSlashCommandAvailabilityMessage(.computerUse, argumentsText: "", session: session), message)
+        let requestID = UUID()
+        session.codexComputerUseArmingRequestID = requestID
+        do {
+            try await coordinator.armCodexComputerUse(session: session, requestID: requestID)
+            XCTFail("Release-bundled Codex must be refused before arming")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, message)
+        }
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertNil(session.codexController)
+    }
+
     func testDefaultsOptInAndDisable() throws {
         let name = "computer-use-test-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))

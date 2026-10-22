@@ -1628,6 +1628,12 @@ actor CodexAppServerClient {
         try Task.checkCancellation()
         try ensureStartupAuthority(startupAuthority)
         if config.processFeaturePolicy.computerUseEnabled {
+            // Recheck the actual launch runtime as well as the UI's immutable selection.
+            if case .bundled = runtime.source,
+               let message = CodexComputerUseWorkflow.runtimeUnavailableMessage(selection: .bundled)
+            {
+                throw ClientError.executableUnavailable(message)
+            }
             // No suspension between presence-dependent overrides and spawn. This does not
             // claim atomicity against independent writers of the owned configuration.
             // Read the actual armed launch runtime, not a personal/default home. A reserved
