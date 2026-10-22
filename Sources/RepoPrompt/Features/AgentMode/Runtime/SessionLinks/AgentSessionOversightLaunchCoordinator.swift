@@ -146,8 +146,6 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     func launchCoordinatorReportWarning(id: String, message: String)
     /// Removes a transient aggregate notice after its condition no longer holds.
     func launchCoordinatorClearWarning(id: String)
-    /// Current bounded presentation storage, including dismissals and cap-driven evictions.
-    func launchCoordinatorHasWarning(id: String) -> Bool
 
     /// Asks the host to passively load the persisted state of these described-but-unhydrated
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
@@ -271,6 +269,8 @@ final class AgentSessionOversightLaunchCoordinator {
     private var isFrozen = false
     private var didLoadLaunchEntries = false
     private var reportedTerminalSummaryIDs: Set<String> = []
+    /// Tracks the condition edge, not warning presence, so Dismiss survives ordinary passes.
+    private var wasDuplicateBlocked = false
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -583,6 +583,8 @@ final class AgentSessionOversightLaunchCoordinator {
         isDirty = false
         drainTask?.cancel()
         drainTask = nil
+        clearDuplicateFlags()
+        synchronizeDuplicateWarning()
     }
 
     // MARK: Diagnostics
@@ -659,11 +661,6 @@ final class AgentSessionOversightLaunchCoordinator {
     /// would either grant against a half-built window or misclassify a session that simply has not
     /// been described yet.
     private func performPass() async {
-        // A pass that cannot reach a fresh census must not keep advertising an old duplicate.
-        // These are presentation flags only; waiting intent and all restoration gates stay intact.
-        for pair in launchPairOrder {
-            entries[pair]?.isBlockedByDuplicate = false
-        }
         defer { synchronizeDuplicateWarning() }
         guard !isFrozen,
               storeIsReady,
@@ -676,11 +673,17 @@ final class AgentSessionOversightLaunchCoordinator {
               !delegate.launchCoordinatorIsFrozen,
               let host = delegate.launchCoordinatorHost
         else {
+            clearDuplicateFlags()
             return
+        }
+        defer {
+            if isFrozen || delegate.launchCoordinatorIsFrozen { clearDuplicateFlags() }
         }
         let discovery = host.agentSessionLinkDiscoveryStates()
         // An empty set means no window has registered a level yet — that is "not described", not
         // "nothing to describe".
+        // Discovery and dirty-pass exits are transient: retain the last completed census until
+        // a successor is available, including across unrelated synchronous entry updates.
         guard !discovery.isEmpty, discovery.allSatisfy(\.isComplete) else {
             #if DEBUG
                 logDiscoveryPendingOnce(discovery)
@@ -1185,14 +1188,21 @@ final class AgentSessionOversightLaunchCoordinator {
         }
     }
 
+    /// Lasting restoration barriers invalidate the presentation condition, not saved intent.
+    private func clearDuplicateFlags() {
+        for pair in launchPairOrder {
+            entries[pair]?.isBlockedByDuplicate = false
+        }
+    }
+
     /// A transient, identifier-free projection over the bounded launch worklist.
     private func synchronizeDuplicateWarning() {
         guard let delegate else { return }
         let isWaiting = entries.values.contains {
             $0.isBlockedByDuplicate && ($0.state == .waiting || $0.parkedReference != nil)
         }
-        let isPublished = delegate.launchCoordinatorHasWarning(id: AgentSessionOversightWarningID.duplicateWaiting)
-        guard isWaiting != isPublished else { return }
+        guard isWaiting != wasDuplicateBlocked else { return }
+        wasDuplicateBlocked = isWaiting
         if isWaiting {
             delegate.launchCoordinatorReportWarning(
                 id: AgentSessionOversightWarningID.duplicateWaiting,

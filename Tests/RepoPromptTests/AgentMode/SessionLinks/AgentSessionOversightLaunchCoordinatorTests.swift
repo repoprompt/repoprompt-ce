@@ -458,10 +458,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
             func launchCoordinatorReportWarning(id _: String, message _: String) {}
             func launchCoordinatorClearWarning(id _: String) {}
-            func launchCoordinatorHasWarning(id _: String) -> Bool {
-                false
-            }
-
             func launchCoordinatorRequestHydration(sessionIDs _: Set<UUID>) {
                 XCTFail("Both endpoints are ready")
             }
@@ -1141,7 +1137,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         })
     }
 
-    func testDuplicateNoticeClearsWhenRestoreCensusIsUnavailable() async throws {
+    func testDuplicateNoticeHandlesDormantAndTransientDiscoveryBarriers() async throws {
         let base = try XCTUnwrap(directory)
         defer { directory = base }
         for incompleteDiscovery in [false, true] {
@@ -1160,6 +1156,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
                 $0.id == AgentSessionOversightWarningID.duplicateWaiting
             })
 
+            let previousDiscovery = fixture.host.discovery
             if incompleteDiscovery {
                 fixture.host.discovery = []
             } else {
@@ -1172,15 +1169,23 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             fixture.bridge.noteTopologyMayHaveChanged()
             await fixture.bridge.test_settleLaunchReconciliation()
 
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
+            if incompleteDiscovery {
+                XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.contains {
+                    $0.id == AgentSessionOversightWarningID.duplicateWaiting
+                }, "Transient discovery retains the last completed census until its successor arrives.")
+                fixture.host.discovery = previousDiscovery
+                fixture.bridge.noteTopologyMayHaveChanged()
+                await fixture.bridge.test_settleLaunchReconciliation()
+            }
             XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
                 $0.id == AgentSessionOversightWarningID.duplicateWaiting
             })
-            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
-            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
         }
     }
 
-    func testDuplicateNoticeIsRepublishedAfterWarningCapEviction() async throws {
+    func testDismissedDuplicateNoticeStaysDismissedUntilConditionReturns() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
         defer { fixture.bridge.freezeForTermination() }
@@ -1194,18 +1199,56 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.contains {
             $0.id == AgentSessionOversightWarningID.duplicateWaiting
         })
-        for index in 0 ..< AgentSessionOversightPersistencePresentation.maxWarnings {
-            fixture.bridge.reportPersistenceWarning(id: "test.warning.\(index)", message: "Controlled warning")
-        }
+        fixture.bridge.dismissPersistenceWarnings(ids: [AgentSessionOversightWarningID.duplicateWaiting])
         XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
             $0.id == AgentSessionOversightWarningID.duplicateWaiting
         })
 
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+            $0.id == AgentSessionOversightWarningID.duplicateWaiting
+        }, "Readiness events must not undo the user's Dismiss action.")
+
+        fixture.host.topology = .dormantAutoRestoreDisabled
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        fixture.host.topology = .completeAllEntriesConsumed
         fixture.bridge.noteTopologyMayHaveChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
         XCTAssertEqual(fixture.bridge.currentPersistencePresentation.warnings.count(where: {
             $0.id == AgentSessionOversightWarningID.duplicateWaiting
         }), 1)
+    }
+
+    func testDuplicateNoticeDoesNotFlickerAcrossTransientDiscovery() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        replaceTopology(fixture, with: [
+            makeReadyCandidate(windowID: 1, sessionID: observerSessionID),
+            makeReadyCandidate(windowID: 2, sessionID: targetSessionID),
+            makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        ])
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        fixture.bridge.reportPersistenceWarning(id: "test.warning", message: "Controlled warning")
+        let expectedIDs = fixture.bridge.currentPersistencePresentation.warnings.map(\.id)
+        XCTAssertTrue(expectedIDs.contains(AgentSessionOversightWarningID.duplicateWaiting))
+        let firstPublication = fixture.host.publishedPresentations.count
+        let previousDiscovery = fixture.host.discovery
+
+        fixture.host.discovery = []
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        fixture.host.discovery = previousDiscovery
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+
+        XCTAssertEqual(fixture.bridge.currentPersistencePresentation.warnings.map(\.id), expectedIDs)
+        XCTAssertTrue(fixture.host.publishedPresentations.dropFirst(firstPublication).allSatisfy {
+            $0.warnings.map(\.id) == expectedIDs
+        }, "Transient discovery must neither remove/re-add the notice nor reorder warnings.")
     }
 
     func testClosingEveryDuplicateCopyEndsTheNeverGrantedEntry() async throws {

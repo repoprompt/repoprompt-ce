@@ -388,10 +388,11 @@ an exact close-parked entry rearmed by the existing close policy. Existing candi
 reconsider it once both endpoints are unique, through the same readiness, hydration-proof and
 authorization fences; no timer or new grant path is involved. A transient, identifier-free notice
 explains the duplicate-window wait and clears when no waiting entry is blocked by duplicates.
-A pass stopped before a fresh census (including dormant restoration or incomplete discovery) clears
-the duplicate presentation flags rather than keeping an old claim visible. Notice synchronization
-checks actual presence in the bounded warning list, so eviction cannot prevent a later admitted pass
-from republishing a still-applicable notice.
+The notice is edge-triggered: Dismiss stays dismissed until the duplicate-blocked condition clears
+and returns. Transient incomplete-discovery and dirty-pass exits retain the last completed census,
+so they cannot remove/re-add the notice or reorder warnings. Lasting barriers (restoration not
+admitted, including dormant restoration, not ready, or frozen) clear the condition. A notice evicted
+by five other concurrent warnings is not republished until the condition clears and returns.
 This does not rearm an entry terminalized by a late-duplicate audit or an uncaptured lifecycle
 revocation. Terminal restoration warnings distinguish retained intent from removal for committed
 session deletion; a token-mismatched cleanup never claims removal.
