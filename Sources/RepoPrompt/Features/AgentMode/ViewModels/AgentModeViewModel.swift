@@ -9505,6 +9505,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
         beforeCommit: (@MainActor () async throws -> Void)? = nil,
+        revalidateAuthority: (@MainActor () async throws -> Void)? = nil,
+        commitAuthority: (@MainActor (@MainActor () throws -> Void) throws -> Void)? = nil,
         afterCommit: (@MainActor () -> Void)? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
@@ -9619,7 +9621,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Provisional root preparation is abortable. Only now may the caller mark the
             // protected mutation committed and persist visual identity; ordinary rejection
             // above must remain a pre-commit, actionable error.
+            try await revalidateAuthority?()
             try await beforeCommit?()
+            try await revalidateAuthority?()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             guard sessions[session.tabID] === session,
@@ -9657,6 +9661,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 if !changedDuringActiveRun {
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
+                    try await revalidateAuthority?()
                 }
                 providerContextInvalidated = true
                 await invalidateProviderContextForExecutionLocationChange(session)
@@ -9669,15 +9674,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
 
-            // Native teardown and handoff may await. A path reused for a different Git
-            // identity must not become the newly published execution authority.
+            // Native teardown and handoff may await. Neither a revoked grant nor a path reused
+            // for a different Git identity may become the new execution authority.
+            try await revalidateAuthority?()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
-            _ = commitWorktreeBindings(desiredBindings, to: session)
+            // Root ownership installation also suspends. This is the final authority fence;
+            // there is no await between its return and publishing the binding.
+            try await revalidateAuthority?()
+            try Task.checkCancellation()
+            guard sessions[session.tabID] === session,
+                  session.activeAgentSessionID == sessionID,
+                  session.worktreeBindings == previousBindings,
+                  session.runState.isActive == (changedDuringActiveRun && !executionRootsChanged)
+            else { throw ExecutionLocationTransitionError.stale }
+            let publish: @MainActor () throws -> Void = {
+                // Authorization itself may have suspended since the last availability check.
+                try Task.checkCancellation()
+                try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
+                _ = self.commitWorktreeBindings(desiredBindings, to: session)
+            }
+            if let commitAuthority {
+                try commitAuthority(publish)
+            } else {
+                try publish()
+            }
             bindingsPublished = true
             // Delegated ownership follows the actual in-memory publication even when its required
             // disk flush later fails. No callback runs for a rejected provisional transition.
@@ -9700,6 +9725,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } catch {
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
+            } else if ownershipCommitted, !bindingsPublished, let materializer, let preparation,
+                      !preparation.ownership.reusesInstalledOwnership,
+                      sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings
+            {
+                // A refused post-install publication must not leave the unbound destination
+                // installed as session-owned roots. The old binding rematerializes on demand.
+                await materializer.release(sessionID: sessionID)
             }
             if providerContextInvalidated, !bindingsPublished,
                sessions[session.tabID] === session,

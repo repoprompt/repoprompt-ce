@@ -21,8 +21,22 @@ enum AgentSessionTargetOperationGuard {
         (MCPRequestMetadata, WindowState) async -> DomainAgentSessionLinkEndpointIdentity?
     /// Immutable spawn provenance for one explicitly named target session.
     typealias TargetProvenanceResolver = (UUID) async -> DomainAgentSessionTargetProvenance
-    /// True only when the exact observer endpoint holds a live Manage grant over the target.
-    typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> Bool
+    /// Retains the exact authority chosen at entry, rather than reacquiring a replacement link.
+    struct WorktreeBindingAuthority {
+        let revalidate: @MainActor () async throws -> Void
+        let commit: @MainActor (@MainActor () throws -> Void) throws -> Void
+
+        init(
+            revalidate: @escaping @MainActor () async throws -> Void,
+            commit: @escaping @MainActor (@MainActor () throws -> Void) throws -> Void = { try $0() }
+        ) {
+            self.revalidate = revalidate
+            self.commit = commit
+        }
+    }
+
+    /// Nil unless the exact observer endpoint holds a live Manage grant over the target.
+    typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> WorktreeBindingAuthority?
 
     static func denialError(reference: String) -> MCPError {
         MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope. For a directly linked lane, use agent_session_link poll/wait/read, or steer/respond/stop with its Manage capability. For scope administration, call session_admin scope_status to inspect grants and operation requirements; request_scope asks the user for missing capabilities. If oversight tools are absent, call become_overseer and retry next turn from the original requesting session.")
@@ -203,6 +217,7 @@ enum AgentSessionTargetOperationGuard {
     ///
     /// Unresolved Agent-run routing always fails closed. Every denial reuses the scope-unavailable
     /// wording so an unauthorized UUID is indistinguishable from a nonexistent one.
+    @discardableResult
     static func requireWorktreeBindingAuthority(
         targetSessionID: UUID,
         metadata: MCPRequestMetadata,
@@ -210,26 +225,48 @@ enum AgentSessionTargetOperationGuard {
         resolveSpawnParentSessionID: SpawnParentSessionResolver,
         resolveObserverEndpoint: ObserverEndpointResolver,
         resolveTargetProvenance: TargetProvenanceResolver,
-        hasManageGrant: ManageGrantResolver
-    ) async throws {
+        hasManageGrant: ManageGrantResolver,
+        authorizationEngine: OverseerAuthorizationEngine? = nil
+    ) async throws -> WorktreeBindingAuthority {
+        let engine = authorizationEngine ?? .current
         let caller = await resolveCaller(
             metadata: metadata,
             targetWindow: targetWindow,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID
         )
-        let authorized = await OverseerAuthorizationEngine.current.authorizesWorktreeBinding(
+        // Capture independent spawn-parent authority even if full access short-circuits admission.
+        let parentSessionID: UUID? = if case let .agentSession(callerSessionID) = caller, callerSessionID != targetSessionID {
+            await resolveTargetProvenance(targetSessionID).parentSessionID
+        } else {
+            nil
+        }
+        var manageAuthority: WorktreeBindingAuthority?
+        let authorized = await engine.authorizesWorktreeBinding(
             caller: caller,
             targetSessionID: targetSessionID,
-            spawnParentSessionID: { await resolveTargetProvenance(targetSessionID).parentSessionID },
+            spawnParentSessionID: { parentSessionID },
             callerHoldsManageGrant: {
                 guard case let .agentSession(callerSessionID) = caller,
                       let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
                       endpoint.sessionID == callerSessionID
                 else { return false }
-                return await hasManageGrant(endpoint, targetSessionID)
+                manageAuthority = await hasManageGrant(endpoint, targetSessionID)
+                return manageAuthority != nil
             }
         )
         guard authorized else { throw denialError(sessionID: targetSessionID) }
+        if let manageAuthority { return manageAuthority }
+        // Self, administrative, and immutable spawn-parent authority stay unchanged. Full access
+        // must still be live at commit; a revoked waiver must not become a newly acquired link.
+        let validate: @MainActor () throws -> Void = {
+            guard engine.authorizesWorktreeBindingWithoutLink(
+                caller: caller, targetSessionID: targetSessionID, spawnParentSessionID: parentSessionID
+            ) else { throw denialError(sessionID: targetSessionID) }
+        }
+        return WorktreeBindingAuthority(revalidate: { try validate() }, commit: {
+            try validate()
+            try $0()
+        })
     }
 
     /// Resolves provenance and authorizes one target in a single step.

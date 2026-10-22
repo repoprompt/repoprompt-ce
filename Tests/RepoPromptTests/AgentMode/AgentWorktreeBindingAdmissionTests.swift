@@ -429,6 +429,96 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
+    func testRevokedAuthorityDuringProviderTeardownDoesNotPublishBinding() async throws {
+        for unbind in [true, false] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let original = fixture.session.worktreeBindings
+            let next = try makeNextBinding(fixture)
+            let grant = WorktreeTestManageGrant()
+            fixture.session.claudeController = WorktreeTeardownNativeController {
+                await grant.revoke()
+            }
+            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+                fixture.git.sandbox.appendingPathComponent("session.json")
+            }
+            do {
+                _ = try await fixture.viewModel.transitionWorktreeBindings(
+                    unbind ? [] : [next], forSessionID: fixture.sessionID, intent: .externalManagement,
+                    beforeCommit: { try await grant.validate() },
+                    revalidateAuthority: { try await grant.validate() }
+                )
+                XCTFail("Revocation during the awaited teardown must refuse the binding change")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("revoked"), error.localizedDescription)
+            }
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+            XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: next.worktreeRootPath), "A created but unbound worktree stays available for manual cleanup")
+        }
+    }
+
+    func testPublicationFenceRefusalReleasesInstalledDestinationOwnership() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let next = try makeNextBinding(fixture)
+        fixture.session.claudeController = MonitorFakeNativeController()
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [next], forSessionID: fixture.sessionID, intent: .externalManagement,
+                commitAuthority: { _ in throw MCPError.invalidParams("Manage grant revoked at publication") }
+            )
+            XCTFail("The final publication fence must refuse a revoked grant")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("revoked at publication"), error.localizedDescription)
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNotNil(fixture.session.pendingHandoff.payload)
+        XCTAssertTrue(fixture.session.items.contains { $0.text.contains("previous execution binding is unchanged") })
+        let store = fixture.prompt.workspaceFileContextStore
+        let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(ownership.installedOwnerCount, 0, "The refused destination must not remain installed")
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        let recovered = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(sessionID: fixture.sessionID, bindings: original)
+        XCTAssertNotNil(recovered, "The unchanged old binding can rebuild its released projection")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: next.worktreeRootPath))
+    }
+
+    func testPublicationRefusalPreservesReusedRootsOfAnActiveProvider() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        let native = MonitorFakeNativeController()
+        await native.setTurnInFlight(true)
+        fixture.session.claudeController = native
+        fixture.session.runState = .running
+        defer {
+            fixture.session.runState = .idle
+            fixture.session.claudeController = nil
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                commitAuthority: { _ in throw MCPError.invalidParams("Manage grant revoked") }
+            )
+            XCTFail("The final fence must refuse the presentation change")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("revoked"), error.localizedDescription)
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertTrue(fixture.session.claudeController === native)
+        XCTAssertEqual(fixture.session.runState, .running)
+        let ownership = await fixture.prompt.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(ownership.installedOwnerCount, 1, "Reused old roots still belong to the active provider")
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        let shutdowns = await native.shutdownCount
+        XCTAssertEqual(shutdowns, 0)
+    }
+
     func testLogicalRootLookupAndUnbindAgreeAcrossSymlinkAlias() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
@@ -899,6 +989,18 @@ private final class WorktreeProbeCodexController: CodexSessionControllerPassiveS
     }
 
     func shutdown() async {}
+}
+
+private actor WorktreeTestManageGrant {
+    private var live = true
+
+    func revoke() {
+        live = false
+    }
+
+    func validate() throws {
+        guard live else { throw MCPError.invalidParams("Manage grant revoked") }
+    }
 }
 
 private actor WorktreeTeardownNativeController: NativeAgentRuntimeControlling {
