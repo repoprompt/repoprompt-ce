@@ -2307,7 +2307,7 @@ final class AgentTabSession: ObservableObject {
 
     private enum SourceItemPayloadUpdate {
         case rebuildFromSource
-        case preserveForRetentionCompaction
+        case preserveSurvivingPayloads
     }
 
     /// How a committed source-items change treats the retained local-input index's identity.
@@ -2423,7 +2423,7 @@ final class AgentTabSession: ObservableObject {
                 ),
                 liveItemIDs: liveItemIDs
             )
-        case .preserveForRetentionCompaction:
+        case .preserveSurvivingPayloads:
             replaceEphemeralToolResultPayloadMap(ephemeralToolResultPayloadByItemID, liveItemIDs: liveItemIDs)
         }
         rebuildToolCorrelationIndexes()
@@ -2707,7 +2707,17 @@ final class AgentTabSession: ObservableObject {
     /// Unlike hydration or ordinary replacement, surviving payloads and their revisions stay intact.
     /// Pruning uses repaired live IDs; a rekeyed duplicate never inherits another item's raw payload.
     func setItemsSilentlyForRetentionCompaction(_ items: [AgentChatItem]) {
-        setItemsSilently(items, reason: .retentionCompaction, payloadUpdate: .preserveForRetentionCompaction)
+        setItemsSilently(items, reason: .retentionCompaction, payloadUpdate: .preserveSurvivingPayloads)
+    }
+
+    /// Repair pending rows without discarding payloads owned by unchanged completed cards.
+    /// Changed results are re-inspected so a terminal fallback cannot retain stale running output.
+    func setItemsSilentlyForPendingToolFinalizationRepair(_ items: [AgentChatItem]) {
+        let previousItemsByID = Dictionary(uniqueKeysWithValues: self.items.map { ($0.id, $0) })
+        setItemsSilently(items, reason: .pendingToolFinalizationRepair, payloadUpdate: .preserveSurvivingPayloads)
+        for item in self.items where previousItemsByID[item.id] != item {
+            refreshEphemeralPayload(for: item)
+        }
     }
 
     private func setItemsSilently(

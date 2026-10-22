@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptSettingsCore
     @_spi(TestSupport) @testable import RepoPromptApp
     import XCTest
 
@@ -114,6 +115,127 @@
                 XCTAssertNil(session.derivedTranscriptSyncState)
                 session.testAssertSourceItemDerivedStateIsConsistent()
             }
+        }
+
+        func testPendingToolRepairRefreshesChangedPayloadsAndPrunesRemovedRows() throws {
+            let session = AgentModeViewModel.TabSession(tabID: id(900_000))
+            var sourceItems = fixture(resultCount: 3)
+            let runningPayload = #"{"status":"running","output":"synthetic partial output"}"#
+            sourceItems[2].text = runningPayload
+            sourceItems[2].toolResultJSON = runningPayload
+            session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
+            var workingItems = sourceItems
+            workingItems[1] = try compacted(sourceItems[1])
+            session.setItemsSilentlyForRetentionCompaction(workingItems)
+            let keptID = sourceItems[1].id
+            let runningID = sourceItems[2].id
+            let removedID = sourceItems[3].id
+            let keptPayload = try XCTUnwrap(session.ephemeralToolResultPayloadByItemID[keptID])
+            let keptRevision = try XCTUnwrap(session.ephemeralToolResultPayloadRevisionByItemID[keptID])
+            XCTAssertEqual(session.ephemeralToolResultPayloadByItemID[runningID], runningPayload)
+            XCTAssertNotNil(session.ephemeralToolResultPayloadByItemID[removedID])
+            workingItems.removeAll { $0.id == removedID }
+            XCTAssertEqual(AgentTranscriptIO.finalizePendingToolCalls(
+                in: &workingItems, terminalState: .cancelled,
+                includeExplicitRepoPromptToolCalls: true, nonToolBoundary: 8
+            ), 1)
+            let repairedResult = try XCTUnwrap(workingItems.first { $0.id == runningID })
+
+            session.setItemsSilentlyForPendingToolFinalizationRepair(workingItems)
+
+            XCTAssertEqual(session.ephemeralToolResultPayloadByItemID[keptID], keptPayload)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[keptID], keptRevision)
+            XCTAssertNotEqual(session.ephemeralToolResultPayloadByItemID[runningID], runningPayload)
+            XCTAssertEqual(
+                session.ephemeralToolResultPayloadByItemID[runningID],
+                AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: repairedResult)
+            )
+            XCTAssertNil(session.ephemeralToolResultPayloadByItemID[removedID])
+            XCTAssertNil(session.ephemeralToolResultPayloadRevisionByItemID[removedID])
+            session.testAssertSourceItemDerivedStateIsConsistent()
+        }
+
+        func testSaveReconciliationPreservesCompletedToolPayload() async throws {
+            try await assertSavePreservesCompletedToolPayload(repairPendingTool: false)
+        }
+
+        func testSavePendingToolRepairPreservesOtherCompletedToolPayload() async throws {
+            try await assertSavePreservesCompletedToolPayload(repairPendingTool: true)
+        }
+
+        private func assertSavePreservesCompletedToolPayload(repairPendingTool: Bool) async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            defer {
+                WindowStatesManager.shared.unregisterWindowState(window)
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            }
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Retained tool save", repoPaths: [], ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "retainedToolSaveTests")
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+            let viewModel = window.agentModeViewModel
+            let session = await viewModel.ensureSessionReady(tabID: tabID)
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+            ))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.hasLoadedPersistedState = true
+            viewModel.test_setCurrentTabIDOverride(tabID)
+            defer {
+                viewModel.test_setCurrentTabIDOverride(nil)
+                session.saveDebounceTask?.cancel()
+                session.derivedTranscriptRefreshTask?.cancel()
+            }
+            var saves = 0
+            viewModel.test_setAgentSessionSaver { _, _, _ in
+                saves += 1
+                return FileManager.default.temporaryDirectory.appendingPathComponent("retained-tool-save.json")
+            }
+            session.selectedAgent = .codexExec
+            session.runState = .completed
+            let sourceItems = fixture(resultCount: 2)
+            session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
+            let completedItem = try compacted(sourceItems[1])
+            let payload = try XCTUnwrap(session.ephemeralToolResultPayloadByItemID[completedItem.id])
+            let revision = try XCTUnwrap(session.ephemeralToolResultPayloadRevisionByItemID[completedItem.id])
+            if repairPendingTool {
+                let compactedItems = try sourceItems.map { item in
+                    item.kind == .toolResult ? try compacted(item) : item
+                }
+                session.setItemsSilentlyForRetentionCompaction(compactedItems)
+                viewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                var pendingItems = session.items
+                pendingItems.append(.toolCall(
+                    name: "read_file", invocationID: id(700_000),
+                    argsJSON: #"{"path":"synthetic.swift"}"#, sequenceIndex: session.nextSequenceIndex
+                ))
+                // Do not notify live refresh: save itself must own the pending-tool repair.
+                session.setItemsSilentlyForRetentionCompaction(pendingItems)
+                XCTAssertTrue(session.items.contains { $0.kind == .toolCall })
+            } else {
+                // One result is already summary-only; the other forces save-time sanitization.
+                var mixedItems = sourceItems
+                mixedItems[1] = completedItem
+                session.setItemsSilentlyForRetentionCompaction(mixedItems)
+            }
+            XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: completedItem.id), payload)
+            let itemsBeforeSave = session.items
+            session.isDirty = true
+
+            await viewModel.flushSave(for: tabID)
+
+            XCTAssertEqual(saves, 1, "The regression must exercise the real save boundary")
+            XCTAssertNotEqual(session.items, itemsBeforeSave, "Save must repair or reconcile the fixture")
+            XCTAssertFalse(session.items.contains { $0.kind == .toolCall })
+            XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: completedItem.id), payload)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[completedItem.id], revision)
+            session.testAssertSourceItemDerivedStateIsConsistent()
         }
 
         private func assertFullReconciliation(resultCount: Int, runState: AgentSessionRunState) {

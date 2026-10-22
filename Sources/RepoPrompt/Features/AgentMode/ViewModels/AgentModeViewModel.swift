@@ -17546,7 +17546,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary
             )
             if repairedCount > 0 {
-                session.setItemsSilently(workingItemsSnapshot, reason: .pendingToolFinalizationRepair)
+                session.setItemsSilentlyForPendingToolFinalizationRepair(workingItemsSnapshot)
                 session.isDirty = true
                 refreshDerivedTranscriptState(for: session, reason: .saveSession)
                 #if DEBUG
@@ -17658,7 +17658,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if shouldReconcileWorkingItems {
                 let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
                 if trimmedWorkingItems != session.items {
-                    session.setItemsSilently(trimmedWorkingItems, reason: .retentionCompaction)
+                    session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
                     markDerivedTranscriptSynchronized(
                         for: session,
                         projectionProtection: builtPresentation.projectionProtection
