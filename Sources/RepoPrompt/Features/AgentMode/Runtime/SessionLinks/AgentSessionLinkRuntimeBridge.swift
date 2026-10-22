@@ -9226,6 +9226,10 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
         dismissPersistenceWarnings(ids: [id])
     }
 
+    func launchCoordinatorHasWarning(id: String) -> Bool {
+        persistencePresentation.warnings.contains { $0.id == id }
+    }
+
     func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>) {
         guard !isFrozenForTermination, !sessionIDs.isEmpty else { return }
         host?.agentSessionLinkRequestRestorationHydration(sessionIDs: sessionIDs)

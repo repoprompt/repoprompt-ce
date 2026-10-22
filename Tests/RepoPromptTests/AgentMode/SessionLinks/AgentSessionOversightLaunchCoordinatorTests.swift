@@ -458,6 +458,10 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
             func launchCoordinatorReportWarning(id _: String, message _: String) {}
             func launchCoordinatorClearWarning(id _: String) {}
+            func launchCoordinatorHasWarning(id _: String) -> Bool {
+                false
+            }
+
             func launchCoordinatorRequestHydration(sessionIDs _: Set<UUID>) {
                 XCTFail("Both endpoints are ready")
             }
@@ -1135,6 +1139,73 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
             $0.id == AgentSessionOversightWarningID.duplicateWaiting
         })
+    }
+
+    func testDuplicateNoticeClearsWhenRestoreCensusIsUnavailable() async throws {
+        let base = try XCTUnwrap(directory)
+        defer { directory = base }
+        for incompleteDiscovery in [false, true] {
+            directory = base.appendingPathComponent("incomplete-discovery-\(incompleteDiscovery)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try seedSavedPair()
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            let duplicate = makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+            replaceTopology(fixture, with: [observer, target, duplicate])
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.contains {
+                $0.id == AgentSessionOversightWarningID.duplicateWaiting
+            })
+
+            if incompleteDiscovery {
+                fixture.host.discovery = []
+            } else {
+                fixture.host.topology = .dormantAutoRestoreDisabled
+            }
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            replaceTopology(fixture, with: [observer, target])
+            await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+
+            XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+                $0.id == AgentSessionOversightWarningID.duplicateWaiting
+            })
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
+        }
+    }
+
+    func testDuplicateNoticeIsRepublishedAfterWarningCapEviction() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        replaceTopology(fixture, with: [
+            makeReadyCandidate(windowID: 1, sessionID: observerSessionID),
+            makeReadyCandidate(windowID: 2, sessionID: targetSessionID),
+            makeReadyCandidate(windowID: 3, sessionID: targetSessionID)
+        ])
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.warnings.contains {
+            $0.id == AgentSessionOversightWarningID.duplicateWaiting
+        })
+        for index in 0 ..< AgentSessionOversightPersistencePresentation.maxWarnings {
+            fixture.bridge.reportPersistenceWarning(id: "test.warning.\(index)", message: "Controlled warning")
+        }
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+            $0.id == AgentSessionOversightWarningID.duplicateWaiting
+        })
+
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.currentPersistencePresentation.warnings.count(where: {
+            $0.id == AgentSessionOversightWarningID.duplicateWaiting
+        }), 1)
     }
 
     func testClosingEveryDuplicateCopyEndsTheNeverGrantedEntry() async throws {

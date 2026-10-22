@@ -146,6 +146,8 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     func launchCoordinatorReportWarning(id: String, message: String)
     /// Removes a transient aggregate notice after its condition no longer holds.
     func launchCoordinatorClearWarning(id: String)
+    /// Current bounded presentation storage, including dismissals and cap-driven evictions.
+    func launchCoordinatorHasWarning(id: String) -> Bool
 
     /// Asks the host to passively load the persisted state of these described-but-unhydrated
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
@@ -269,7 +271,6 @@ final class AgentSessionOversightLaunchCoordinator {
     private var isFrozen = false
     private var didLoadLaunchEntries = false
     private var reportedTerminalSummaryIDs: Set<String> = []
-    private var isDuplicateWarningPublished = false
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -658,6 +659,11 @@ final class AgentSessionOversightLaunchCoordinator {
     /// would either grant against a half-built window or misclassify a session that simply has not
     /// been described yet.
     private func performPass() async {
+        // A pass that cannot reach a fresh census must not keep advertising an old duplicate.
+        // These are presentation flags only; waiting intent and all restoration gates stay intact.
+        for pair in launchPairOrder {
+            entries[pair]?.isBlockedByDuplicate = false
+        }
         defer { synchronizeDuplicateWarning() }
         guard !isFrozen,
               storeIsReady,
@@ -1185,8 +1191,8 @@ final class AgentSessionOversightLaunchCoordinator {
         let isWaiting = entries.values.contains {
             $0.isBlockedByDuplicate && ($0.state == .waiting || $0.parkedReference != nil)
         }
-        guard isWaiting != isDuplicateWarningPublished else { return }
-        isDuplicateWarningPublished = isWaiting
+        let isPublished = delegate.launchCoordinatorHasWarning(id: AgentSessionOversightWarningID.duplicateWaiting)
+        guard isWaiting != isPublished else { return }
         if isWaiting {
             delegate.launchCoordinatorReportWarning(
                 id: AgentSessionOversightWarningID.duplicateWaiting,
