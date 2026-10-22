@@ -18,9 +18,13 @@ extension AgentSessionAdministrationCore {
 }
 
 extension SpawnProvenanceDelegationMembershipProjector {
-    static func production(worktreeOwnership: WorktreeOwnershipStore) -> SpawnProvenanceDelegationMembershipProjector {
-        var projector = SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
+    static func production(
+        worktreeOwnership: WorktreeOwnershipStore,
+        source: (any DelegationProvenanceSource)? = nil
+    ) -> SpawnProvenanceDelegationMembershipProjector {
+        var projector = SpawnProvenanceDelegationMembershipProjector(source: source ?? OpenWindowsDelegationProvenanceSource())
         projector.ownedUnreleasedWorktreeIDs = { worktreeOwnership.ownedUnreleasedWorktreeIDs(createdBy: $0) }
+        projector.ownershipAccountingReady = { worktreeOwnership.loadState == .ready }
         return projector
     }
 }

@@ -3242,6 +3242,70 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertFalse(worktrees.contains(destination.path))
     }
 
+    func testWorktreeQuotaRefusesBeforeOwnershipBootstrap() async throws {
+        try await assertWorktreeQuotaRefusesUnknownOwnership(blocked: false)
+    }
+
+    func testWorktreeQuotaRefusesBlockedOwnershipLoad() async throws {
+        try await assertWorktreeQuotaRefusesUnknownOwnership(blocked: true)
+    }
+
+    private func assertWorktreeQuotaRefusesUnknownOwnership(blocked: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ownership-readiness-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let ownership = WorktreeOwnershipStore()
+        if blocked {
+            let database = directory.appendingPathComponent("blocked.sqlite")
+            try FileManager.default.createDirectory(at: database, withIntermediateDirectories: true)
+            await ownership.bootstrap(fileURL: directory.appendingPathComponent("legacy.json"), backupsDirectoryURL: nil, databaseURL: database)
+            guard case .blocked = ownership.loadState else { return XCTFail("The directory must block opening the ownership database") }
+        }
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        let scope = try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+        let projector = SpawnProvenanceDelegationMembershipProjector.production(worktreeOwnership: ownership, source: fixture.provenance)
+        let core = AgentSessionAdministrationCore(scopes: fixture.runtime, projector: projector)
+        core.register(SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: projector), host: fixture.worktrees, ownership: ownership
+        ))
+        let request = AgentSessionAdministrationRequest(
+            operation: .adminWorktreeCreate, caller: .agentSession(caller), scopeID: scope.id,
+            targetSessionIDs: [target], arguments: ["bind": .bool(false)]
+        )
+        let result = try await core.perform(request)
+        guard case let .denied(denial, _) = result else {
+            XCTAssertTrue(fixture.worktrees.created.isEmpty, "Unknown durable ownership must not be treated as zero usage")
+            return XCTFail("A configured worktree quota needs ready ownership accounting")
+        }
+        XCTAssertEqual(denial, .usageProofMissing)
+        XCTAssertTrue(fixture.worktrees.created.isEmpty)
+        XCTAssertThrowsError(try fixture.runtime.authorization.admitWorktreeBinding(
+            ["unaccounted"], target: target, scope: scope,
+            census: .init(bound: [:], retainedTargetIDs: [], ownership: ownership), projector: projector
+        )) { error in
+            guard case SessionAdminHostError.usageEvidenceUnavailable = error else { return XCTFail("Unexpected binding refusal: \(error)") }
+        }
+        projector.withSynchronousCensus { snapshot in
+            XCTAssertNil(snapshot.usageEvidence(of: scope.grant, spawnParentSessionID: nil))
+        }
+        projector.withSynchronousTargets([caller, target]) { snapshot in
+            XCTAssertNil(snapshot.usageEvidence(of: scope.grant, spawnParentSessionID: nil))
+        }
+        if !blocked {
+            // Explicit ephemeral bootstrap proves that this process has no durable ownership to load.
+            await ownership.bootstrapProduction(mode: .suppressed)
+            guard case let .completed(created) = try await core.perform(request) else { return XCTFail("Ready empty accounting should admit one creation") }
+            XCTAssertEqual(created.objectValue?["result"], .string("created"))
+            XCTAssertEqual(fixture.worktrees.created.count, 1)
+            guard case let .denied(exhausted, _) = try await core.perform(request) else { return XCTFail("The owned worktree must exhaust the quota") }
+            XCTAssertEqual(exhausted, .guardrailExceeded(guardrail: .maxWorktrees, limit: 1, current: 1))
+            XCTAssertEqual(fixture.worktrees.created.count, 1, "Unbound ownership must still consume the quota after readiness")
+        }
+    }
+
     func testWorktreeCreateRecordsOwnershipAndCountsTowardMaxWorktrees() async throws {
         let fixture = Fixture()
         let overseer = UUID(), member = UUID()
@@ -4171,10 +4235,15 @@ final class SessionAdminStructureTests: XCTestCase {
         }
         let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         let card = try XCTUnwrap(runtime.confirmations.confirmation(id: cardID, granteeSessionID: overseer))
-        XCTAssertEqual(Set(card.items.map(\.sessionID)), [adoptee, child, grandchild], "the user's card keeps the whole subtree")
-        XCTAssertEqual(Set(card.items.map(\.title)), ["Research", "SecretWorker (running)", "SecretGrandchild"])
-        for item in card.items where namedTargets.contains(item.sessionID) {
-            XCTAssertEqual(item.effect, "Bring into this delegation scope under Overseer")
+        if targetOrder == 0 {
+            XCTAssertEqual(card.items.map(\.sessionID), [adoptee, child, grandchild], "the user's card keeps the ordered subtree")
+            XCTAssertEqual(card.items.map(\.title), ["Research", "SecretWorker (running)", "SecretGrandchild"])
+        } else {
+            XCTAssertEqual(Set(card.items.map(\.sessionID)), [adoptee, child, grandchild])
+            XCTAssertEqual(Set(card.items.map(\.title)), ["Research", "SecretWorker (running)", "SecretGrandchild"])
+        }
+        if targetOrder == 1 {
+            XCTAssertEqual(card.items.first { $0.sessionID == child }?.effect, "Moves with Research (descendant)")
         }
         _ = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
 
@@ -4189,11 +4258,27 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(mismatch["code"], .string("confirmation_mismatch"))
         XCTAssertEqual(mismatch["approved_session_ids"], .array(namedTargets.map { .string($0.uuidString) }))
 
-        // After the user approves (with a descendant unticked), the applied result names the adoptee only.
-        runtime.confirmations.setItem(grandchild, ticked: false, confirmationID: cardID)
+        // Approve the complete subtree and assert successful effects, not merely a stored refusal.
         await frontDoor.approveAndApply(confirmationID: cardID, presentedTabID: callerTab, presentedSessionID: overseer)
         let applied = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
-        XCTAssertNotNil(applied["applied_result"])
+        let receipt = try XCTUnwrap(applied["applied_result"]?.objectValue)
+        XCTAssertEqual(receipt["result"], .string(targetOrder == 1 ? "partial" : "applied"))
+        XCTAssertEqual(receipt["changed_count"], .int(targetOrder == 2 ? 2 : 1))
+        let outcomes = items(receipt)
+        XCTAssertEqual(Set(outcomes.keys), Set(namedTargets.map(\.uuidString)))
+        XCTAssertEqual(outcomes[adoptee.uuidString]?["result"], .string("moved"))
+        if targetOrder == 1 {
+            XCTAssertEqual(outcomes[child.uuidString]?["code"], .string("already_member"))
+        } else if targetOrder == 2 {
+            XCTAssertEqual(outcomes[child.uuidString]?["result"], .string("moved"))
+        }
+        XCTAssertEqual(host.placements.map(\.session), targetOrder == 2 ? [child, adoptee] : [adoptee])
+        XCTAssertEqual(provenance.sessions[adoptee]?.effectiveOrganizationalParentID, overseer)
+        XCTAssertEqual(provenance.sessions[child]?.effectiveOrganizationalParentID, targetOrder == 2 ? overseer : adoptee)
+        XCTAssertEqual(provenance.sessions[grandchild]?.effectiveOrganizationalParentID, child)
+        XCTAssertEqual(runtime.confirmations.confirmation(id: cardID, granteeSessionID: overseer)?.state, .consumed)
+        let repeated = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
+        XCTAssertEqual(repeated["applied_result"], applied["applied_result"])
 
         let rendered = replies.map { String(describing: $0) }.joined(separator: "\n")
         let hiddenIDs = [child, grandchild].filter { !namedTargets.contains($0) }.map(\.uuidString)
@@ -6843,7 +6928,13 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
                 }
                 fixture.worktrees.bound[target] = [SessionAdminStructureTests.WorktreeHost.summary("private-worktree")]
                 let host = Host(base: fixture.worktrees)
-                host.onPrunability = { clock = clock.addingTimeInterval(elapsed) }
+                host.onPrunability = {
+                    clock = clock.addingTimeInterval(elapsed)
+                    // The nested grant inherits the parent's deadline: this covers cascade, not
+                    // an independently isolated ancestor-only expiry. No record read refreshes it.
+                    XCTAssertEqual(runtime.authorization.scopeChainHolds(.observe, scope: scope), elapsed < 60)
+                    XCTAssertEqual(runtime.scopeChain(from: scope.id).allSatisfy(\.isActive), elapsed < 60)
+                }
                 let core = AgentSessionAdministrationCore(scopes: runtime, projector: fixture.projector)
                 core.register(SessionAdminWorktreeHandler(
                     context: .init(scopes: runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
