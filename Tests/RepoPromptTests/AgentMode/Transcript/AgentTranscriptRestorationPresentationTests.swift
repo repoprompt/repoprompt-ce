@@ -2612,18 +2612,27 @@ extension AgentTranscriptPaneSnapshotPublicationTests {
     /// §4.5: when the target is replaced (awaiting the incoming owner), the published snapshot carries
     /// none of the outgoing conversation's rows.
     func testTargetReplacementDropsOutgoingRowsFromPublishedSnapshot() async throws {
+        for _ in 0 ..< 3 {
+            try await assertTargetReplacementDropsOutgoingRowsFromPublishedSnapshot()
+        }
+    }
+
+    private func assertTargetReplacementDropsOutgoingRowsFromPublishedSnapshot() async throws {
         try await withRealObserverSavedTab { fixture in
             var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
             saved.items = [AgentChatItemPersist(
                 from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Outgoing content")
             )]
             _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
-            await fixture.gate.open()
             fixture.viewModel.setAgentModeActive(true)
             await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
-            if let loadTask = fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask {
-                await loadTask.value
-            }
+            // Activation queues the loader; its task may not exist when the workspace switch returns.
+            // Hold preparation until that producer exists, then await the activation continuation too.
+            await fixture.gate.waitUntilEntered()
+            let loadTask = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask)
+            await fixture.gate.open()
+            await loadTask.value
+            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
             await fixture.prompt.switchComposeTab(fixture.tabID)
             XCTAssertFalse(fixture.viewModel.ui.transcript.snapshot.presentation.workingRows.isEmpty, "precondition: outgoing rows")
 
