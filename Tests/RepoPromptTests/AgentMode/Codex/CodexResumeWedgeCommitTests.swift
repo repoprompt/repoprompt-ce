@@ -27,6 +27,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         _ plans: [[WedgeFakeCodexController.Response]],
         mcpServerEnabler: @escaping @MainActor @Sendable () async -> Bool = { true },
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
+        runtimeUnavailableMessage: @escaping () -> String? = { nil },
         companionReady: @escaping () -> Bool = { true },
         freshSession: Bool = false,
         shouldManageCodexTooling: Bool = true
@@ -42,6 +43,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 factory.make(runID: runID, computerUseEnabled: enabled)
             },
             mcpServerEnabler: mcpServerEnabler,
+            testCodexComputerUseRuntimeUnavailableMessage: runtimeUnavailableMessage,
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
             testCodexLeaseRoutingTimeoutMs: 5000,
@@ -75,6 +77,26 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             session: session,
             factory: factory
         )
+    }
+
+    func testRuntimeRejectionPrecedesComposerOptInAndSessionCreation() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(false)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([], runtimeUnavailableMessage: { CodexComputerUseWorkflow.runtimeRequirementMessage }, freshSession: true)
+        let session = fixture.session
+        let bindingBefore = session.persistentSessionBindingIdentity
+        var prompted = false
+        let result = await fixture.viewModel.armComputerUseForLocalUser(session: session, confirmOptIn: {
+            prompted = true
+            return true
+        })
+        XCTAssertEqual(result, CodexComputerUseWorkflow.runtimeRequirementMessage)
+        XCTAssertFalse(prompted)
+        XCTAssertFalse(CodexComputerUseWorkflow.isEnabled)
+        XCTAssertEqual(session.persistentSessionBindingIdentity, bindingBefore)
+        XCTAssertNil(session.codexComputerUseArmingRequestID)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(fixture.factory.controllers.isEmpty)
     }
 
     func testRequiredRepoPromptDiscoveryFailureIsVisibleAndTerminatesBeforeDispatch() async throws {
@@ -1110,7 +1132,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
             codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            shouldManageCodexTooling: false, computerUseCompanionReady: { true },
+            shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false },
             codexHookApprovalSettings: GlobalSettingsStore.shared
         )
@@ -1144,7 +1166,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 if routeChecks == 2 { await gate.enterAndWait() }
                 return routeOwned
             },
-            shouldManageCodexTooling: true, computerUseCompanionReady: { true },
+            shouldManageCodexTooling: true, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false }, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
         coordinator.attach(viewModel: fixture.viewModel)

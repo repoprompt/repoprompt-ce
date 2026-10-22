@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 
 extension Notification.Name {
@@ -137,28 +138,60 @@ enum CodexComputerUseWorkflow {
     static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
     static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
 
-    /// Release packaging re-signs bundled Codex with the RepoPrompt identity. The
-    /// companion rejects that sender; debug packaging preserves OpenAI's signature.
-    /// This is a known-incompatible-runtime gate, not authentication of external CLIs.
+    static let runtimeRequirementMessage = "Computer Use requires an OpenAI-signed Codex runtime in RepoPrompt. The selected executable could not be verified as OpenAI-signed. Companion authentication failures have been reported with re-signed runtimes. Select an OpenAI-signed local Codex executable in Settings → Codex CLI → Advanced, restart RepoPrompt CE, then arm /computer-use again."
+
+    /// Issue #1423 correlates companion authentication failures with re-signing, but
+    /// the runtime versions also differed. Conservatively require the upstream signer;
+    /// this does not establish the companion's private authentication policy.
     static func runtimeUnavailableMessage(
-        selection: CodexRuntimePreferences.Selection = CodexRuntimeAuthority.currentLaunchSnapshot().selection,
-        isReleaseBuild: Bool = CodexComputerUseWorkflow.isReleaseBuild
+        executableURL: URL,
+        signatureValidator: (URL, String) -> Bool = { RuntimeCodeSigningDetector.validatesStaticCode(at: $0, requirementSource: $1) }
     ) -> String? {
-        guard isReleaseBuild else { return nil }
-        switch selection {
-        case .inherited, .bundled:
-            return "Computer Use requires an OpenAI-signed Codex runtime. The included runtime is re-signed by RepoPrompt in release builds and is rejected by the companion. Select an OpenAI-signed local Codex executable in Settings → Codex CLI → Advanced, restart RepoPrompt CE, then arm /computer-use again."
-        case .external, .invalidExternalPreference:
-            return nil
-        }
+        let requirement = "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
+        return signatureValidator(executableURL, requirement) ? nil : runtimeRequirementMessage
     }
 
-    static var isReleaseBuild: Bool {
-        #if DEBUG
-            false
-        #else
-            true
-        #endif
+    /// Resolve on every admission so transient failures retain the authority's retry
+    /// policy. Only signature results for an unchanged file are cached; spawn bypasses it.
+    static var configuredRuntimeUnavailableMessage: String? {
+        admissionProbe.unavailableMessage(resolveExecutable: {
+            CodexRuntimeAuthority.resolveConfigured().map(\.executableURL)
+        })
+    }
+
+    private static let admissionProbe = RuntimeAdmissionProbe()
+
+    final class RuntimeAdmissionProbe {
+        private struct FileIdentity: Equatable {
+            let url: URL
+            let modified: Date?
+            let size: NSNumber?
+            let inode: NSNumber?
+        }
+
+        private let lock = NSLock()
+        private var cached: (identity: FileIdentity, message: String?)?
+
+        func unavailableMessage(
+            resolveExecutable: () -> Result<URL, CodexRuntimeAuthority.Failure>,
+            signatureProbe: (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) }
+        ) -> String? {
+            let executable: URL
+            switch resolveExecutable() {
+            case let .success(url): executable = url.resolvingSymlinksInPath()
+            case let .failure(failure): return failure.localizedDescription
+            }
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path) else {
+                return signatureProbe(executable)
+            }
+            let identity = FileIdentity(url: executable, modified: attributes[.modificationDate] as? Date, size: attributes[.size] as? NSNumber, inode: attributes[.systemFileNumber] as? NSNumber)
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached, cached.identity == identity { return cached.message }
+            let message = signatureProbe(executable)
+            cached = (identity, message)
+            return message
+        }
     }
 
     @MainActor

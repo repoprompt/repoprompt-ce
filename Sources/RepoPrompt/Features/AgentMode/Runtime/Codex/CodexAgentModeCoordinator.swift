@@ -416,7 +416,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         },
         shouldManageCodexTooling: Bool,
         codexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
-        computerUseRuntimeUnavailableMessage: @escaping () -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage() },
+        computerUseRuntimeUnavailableMessage: @escaping () -> String? = { CodexComputerUseWorkflow.configuredRuntimeUnavailableMessage },
         computerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
         computerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
@@ -2363,6 +2363,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) -> String? {
         nativeSlashCommandAvailabilityMessage(command, argumentsText: "", session: session)
+    }
+
+    func computerUseRuntimeRequirementMessage() -> String? {
+        computerUseRuntimeUnavailableMessage()
     }
 
     private func computerUseAdmissionMessage(session: AgentTabSession) -> String? {

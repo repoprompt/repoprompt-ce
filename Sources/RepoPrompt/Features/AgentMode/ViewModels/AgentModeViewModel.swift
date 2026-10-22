@@ -2777,6 +2777,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexComputerUseRuntimeUnavailableMessage: @escaping () -> String? = { nil },
             testCodexComputerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
             testCodexComputerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
             testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
@@ -2858,6 +2859,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 routeOwnerValidator: testCodexRouteOwnerValidator,
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
+                computerUseRuntimeUnavailableMessage: testCodexComputerUseRuntimeUnavailableMessage,
                 computerUseCompanionReady: testCodexComputerUseCompanionReady,
                 computerUseReservedEntryExists: testCodexComputerUseReservedEntryExists,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
@@ -3719,6 +3721,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard session.codexComputerUseArmingRequestID == nil, !session.runState.isActive else {
             return "Wait for the current Codex operation to finish before enabling Computer Use."
         }
+        if let message = codexCoordinator.computerUseRuntimeRequirementMessage() { return message }
         let requestID = UUID()
         let binding = session.persistentSessionBindingIdentity
         let generation = session.bindingTransitionGeneration

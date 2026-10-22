@@ -98,29 +98,6 @@ team, and entitlement profile from trusted control-plane tooling. Artifact ident
 comes from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`; the staged
 payload does not carry a second manifest copy.
 
-### Computer Use release validation
-
-The companion rejects the release-bundled Codex sender after it is re-signed by
-RepoPrompt (`-10000 Sender process is not authenticated`, issue #1423). Computer
-Use therefore refuses arming with the bundled runtime in release builds and
-explains how to select an OpenAI-signed local executable under Settings → Codex
-CLI → Advanced and restart. Debug builds keep their existing bundled-runtime
-behavior. This gate does not certify custom executables or automatically switch
-runtimes, import personal configuration, or change signing policy.
-
-For each release candidate, record a manual check (including app build, runtime
-version/source, companion version, and result):
-
-1. With the default bundled runtime and Computer Use enabled, `/computer-use`
-   must show the runtime requirement before arming, even with a companion installed.
-2. Select an OpenAI-signed local Codex executable, restart, and explicitly arm
-   Computer Use in a top-level chat. With the user's macOS permissions, perform
-   one non-destructive companion call such as listing apps. Record unavailable
-   prerequisites as **not run**, not a pass. Restore the runtime preference only
-   if requested; do not grant permissions or operate the desktop automatically.
-
-Debug tests and ordinary MCP smoke are not proof of release companion authentication.
-
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's environment or shell `PATH`. Settings
 presents the included Codex version and status as the ordinary path. Advanced users
@@ -177,6 +154,39 @@ Rotate the pin only by reviewing a new official release and its checksum asset,
 updating every archive and exact-tree hash in the manifest, capturing the new
 license/notice files, and rerunning the offline artifact tests plus a protected
 release candidate. Never derive a new pin from an unverified local installation.
+
+### Computer Use release validation
+
+Issue #1423 reports companion authentication failures (`-10000 Sender process is
+not authenticated`) with a RepoPrompt-re-signed bundled Codex, but not with an
+OpenAI-signed external runtime. Those runtimes differed in version (0.159.0 versus
+0.163.0), so re-signing is a plausible cause, not a proven account of the
+companion's private authentication policy.
+
+RepoPrompt conservatively requires a valid OpenAI signing identity on the selected
+Codex executable before arming Computer Use, and verifies it again before spawning
+an armed app-server. This applies to bundled and external runtimes in every build
+mode. Ordinary `package_app.sh release`, local self-signed production installs,
+and contributor artifacts preserve OpenAI's nested signatures and are not blocked
+merely because they are release builds. Official privileged release signing still
+re-signs Codex; those runtimes show instructions for selecting an OpenAI-signed
+local executable under Settings → Codex CLI → Advanced and restarting. Signature
+validation is a prerequisite, not a guarantee of companion compatibility. No
+runtime is selected automatically and signing policy is unchanged.
+
+For each release candidate, record a separately authorized manual check (including
+app build, runtime version/source/signing team, companion version, and result):
+
+1. With a re-signed runtime and Computer Use enabled, `/computer-use` must show the
+   runtime requirement before opt-in or arming, even with a companion installed.
+2. With an OpenAI-signed runtime (bundled where signatures are preserved, or an
+   explicitly selected local executable after restart), arm Computer Use in a
+   top-level chat. With the user's macOS permissions, perform one non-destructive
+   companion call such as listing apps. Record unavailable prerequisites as
+   **not run**, not a pass. Do not grant permissions or operate the desktop
+   automatically, and restore runtime preferences only if requested.
+
+Debug tests and ordinary MCP smoke are not proof of release companion authentication.
 
 ### Guarded Codex update candidates
 
