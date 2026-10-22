@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 
@@ -143,54 +144,90 @@ enum CodexComputerUseWorkflow {
     /// Issue #1423 correlates companion authentication failures with re-signing, but
     /// the runtime versions also differed. Conservatively require the upstream signer;
     /// this does not establish the companion's private authentication policy.
+    static let openAISigningRequirement = "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
+
     static func runtimeUnavailableMessage(
         executableURL: URL,
         signatureValidator: (URL, String) -> Bool = { RuntimeCodeSigningDetector.validatesStaticCode(at: $0, requirementSource: $1) }
     ) -> String? {
-        let requirement = "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
-        return signatureValidator(executableURL, requirement) ? nil : runtimeRequirementMessage
+        signatureValidator(executableURL, openAISigningRequirement) ? nil : runtimeRequirementMessage
     }
 
-    /// Resolve on every admission so transient failures retain the authority's retry
-    /// policy. Only signature results for an unchanged file are cached; spawn bypasses it.
+    static let checkingRuntimeMessage = "Checking the Codex runtime for Computer Use. Wait for the check to finish, then retry."
+
+    @MainActor
     static var configuredRuntimeUnavailableMessage: String? {
-        admissionProbe.unavailableMessage(resolveExecutable: {
-            CodexRuntimeAuthority.resolveConfigured().map(\.executableURL)
-        })
+        admissionPreflight.startIfNeeded()
+        return admissionPreflight.cachedMessage
     }
 
-    private static let admissionProbe = RuntimeAdmissionProbe()
+    @MainActor
+    static func checkConfiguredRuntimeRequirement() async -> String? {
+        await admissionPreflight.check()
+    }
 
-    final class RuntimeAdmissionProbe {
-        private struct FileIdentity: Equatable {
-            let url: URL
-            let modified: Date?
-            let size: NSNumber?
-            let inode: NSNumber?
+    @MainActor
+    private static let admissionPreflight = RuntimeAdmissionPreflight()
+
+    /// Match the app-server's captured launch environment, not the GUI process PATH.
+    /// Both the bounded version probe and full static-code verification run off-main.
+    static func preflightRuntimeRequirement(
+        inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil,
+        signatureProbe: @escaping @Sendable (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) }
+    ) async -> String? {
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            inheritedEnvironment: inheritedEnvironment,
+            shellEnvironmentProvider: shellEnvironmentProvider,
+            launchSnapshot: launchSnapshot
+        )
+        guard let runtime = resolution.runtime else { return resolution.userMessage }
+        return await Task.detached(priority: .utility) {
+            signatureProbe(runtime.executableURL.resolvingSymlinksInPath())
+        }.value
+    }
+
+    /// Cache successful admission for the immutable launch selection. Failed checks
+    /// retry only on explicit arming; synchronous UI reads never probe or hash files.
+    /// Spawn independently revalidates the executable even after cached admission.
+    @MainActor
+    final class RuntimeAdmissionPreflight {
+        private let load: () async -> String?
+        private var pending: Task<String?, Never>?
+        private var hasResult = false
+        private var message: String?
+
+        init(load: @escaping () async -> String? = { await CodexComputerUseWorkflow.preflightRuntimeRequirement() }) {
+            self.load = load
         }
 
-        private let lock = NSLock()
-        private var cached: (identity: FileIdentity, message: String?)?
+        var cachedMessage: String? {
+            hasResult ? message : checkingRuntimeMessage
+        }
 
-        func unavailableMessage(
-            resolveExecutable: () -> Result<URL, CodexRuntimeAuthority.Failure>,
-            signatureProbe: (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) }
-        ) -> String? {
-            let executable: URL
-            switch resolveExecutable() {
-            case let .success(url): executable = url.resolvingSymlinksInPath()
-            case let .failure(failure): return failure.localizedDescription
+        func startIfNeeded() {
+            guard !hasResult, pending == nil else { return }
+            _ = beginCheck()
+        }
+
+        func check() async -> String? {
+            if hasResult, message == nil { return nil }
+            return await beginCheck().value
+        }
+
+        private func beginCheck() -> Task<String?, Never> {
+            if let pending { return pending }
+            let task = Task {
+                let result = await self.load()
+                // Publish before any waiter resumes and runs synchronous admission.
+                self.message = result
+                self.hasResult = true
+                self.pending = nil
+                return result
             }
-            guard let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path) else {
-                return signatureProbe(executable)
-            }
-            let identity = FileIdentity(url: executable, modified: attributes[.modificationDate] as? Date, size: attributes[.size] as? NSNumber, inode: attributes[.systemFileNumber] as? NSNumber)
-            lock.lock()
-            defer { lock.unlock() }
-            if let cached, cached.identity == identity { return cached.message }
-            let message = signatureProbe(executable)
-            cached = (identity, message)
-            return message
+            pending = task
+            return task
         }
     }
 

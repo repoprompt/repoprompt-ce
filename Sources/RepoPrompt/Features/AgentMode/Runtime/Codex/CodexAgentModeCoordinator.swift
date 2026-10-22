@@ -269,6 +269,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
     private let computerUseRuntimeUnavailableMessage: () -> String?
+    private let computerUseRuntimePreflight: () async -> String?
     private let computerUseCompanionReady: () -> Bool
     private let computerUseReservedEntryExists: () -> Bool
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
@@ -416,7 +417,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         },
         shouldManageCodexTooling: Bool,
         codexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
-        computerUseRuntimeUnavailableMessage: @escaping () -> String? = { CodexComputerUseWorkflow.configuredRuntimeUnavailableMessage },
+        computerUseRuntimeUnavailableMessage: (() -> String?)? = nil,
+        computerUseRuntimePreflight: (() async -> String?)? = nil,
         computerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
         computerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
@@ -441,7 +443,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.runtimeWorkspacePathsProvider = runtimeWorkspacePathsProvider
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
-        self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
+        if let computerUseRuntimeUnavailableMessage {
+            self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
+            self.computerUseRuntimePreflight = computerUseRuntimePreflight ?? { computerUseRuntimeUnavailableMessage() }
+        } else {
+            self.computerUseRuntimeUnavailableMessage = { CodexComputerUseWorkflow.configuredRuntimeUnavailableMessage }
+            self.computerUseRuntimePreflight = computerUseRuntimePreflight ?? { await CodexComputerUseWorkflow.checkConfiguredRuntimeRequirement() }
+        }
         self.computerUseCompanionReady = computerUseCompanionReady
         self.computerUseReservedEntryExists = computerUseReservedEntryExists
         self.connectionPolicyInstaller = connectionPolicyInstaller
@@ -2365,17 +2373,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         nativeSlashCommandAvailabilityMessage(command, argumentsText: "", session: session)
     }
 
-    func computerUseRuntimeRequirementMessage() -> String? {
-        computerUseRuntimeUnavailableMessage()
+    func computerUseRuntimeRequirementMessage() async -> String? {
+        await computerUseRuntimePreflight()
     }
 
-    private func computerUseAdmissionMessage(session: AgentTabSession) -> String? {
+    private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
         guard CodexComputerUseWorkflow.isEnabled else { return CodexComputerUseWorkflow.disabledMessage }
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
-        if let message = computerUseRuntimeUnavailableMessage() { return message }
+        if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return message }
         guard !computerUseReservedEntryExists() else { return CodexComputerUseWorkflow.collisionMessage }
         guard computerUseCompanionReady() else { return CodexComputerUseWorkflow.unavailableMessage }
         return nil
@@ -2385,16 +2393,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func armCodexComputerUse(session: AgentTabSession, requestID: UUID) async throws {
         let binding = session.persistentSessionBindingIdentity
         let generation = session.bindingTransitionGeneration
+        let runtimeMessage = await computerUseRuntimePreflight()
         guard !Task.isCancelled,
               viewModel?.currentTabID == session.tabID,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseArmingRequestID == requestID,
               session.persistentSessionBindingIdentity == binding,
               session.bindingTransitionGeneration == generation,
+              runtimeMessage == nil,
               computerUseAdmissionMessage(session: session) == nil,
               !session.runState.isActive || session.isCodexComputerUseArmed
         else {
-            throw CodexAppServerClient.ClientError.executableUnavailable(computerUseAdmissionMessage(session: session) ?? CodexComputerUseWorkflow.ineligibleMessage)
+            throw CodexAppServerClient.ClientError.executableUnavailable(runtimeMessage ?? computerUseAdmissionMessage(session: session) ?? CodexComputerUseWorkflow.ineligibleMessage)
         }
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
@@ -2531,7 +2541,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ command: NativeSlashCommand,
         argumentsText: String,
         session: AgentTabSession,
-        effectiveRunState: AgentSessionRunState? = nil
+        effectiveRunState: AgentSessionRunState? = nil,
+        deferComputerUseRuntimeCheckUntilArming: Bool = false
     ) -> String? {
         let runState = effectiveRunState ?? session.runState
         guard session.selectedAgent == .codexExec else {
@@ -2550,7 +2561,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return nil
         case .computerUse:
-            if let message = computerUseAdmissionMessage(session: session) { return message }
+            if let message = computerUseAdmissionMessage(session: session, checkRuntime: !deferComputerUseRuntimeCheckUntilArming) { return message }
             guard !runState.isActive || runState == .waitingForUser else {
                 return "Wait for the current Codex turn to finish before starting a /computer-use workflow."
             }

@@ -186,6 +186,16 @@ app build, runtime version/source/signing team, companion version, and result):
    **not run**, not a pass. Do not grant permissions or operate the desktop
    automatically, and restore runtime preferences only if requested.
 
+A read-only, opt-in XCTest can check the production static-code validator against
+an already-cached official binary (no downloads or Codex process launches):
+
+```bash
+REPOPROMPT_CODEX_CACHE_ROOT="$PWD/.build/codex-runtime" make dev-test FILTER=CodexComputerUseWorkflowTests
+```
+
+It skips when the host-target binary at `<cache>/<pinned-version>/<target>/bin/codex`
+is absent. The ordinary suite always checks that Security accepts the exact
+requirement syntax. Neither check is proof of live companion authentication.
 Debug tests and ordinary MCP smoke are not proof of release companion authentication.
 
 ### Guarded Codex update candidates
