@@ -3393,7 +3393,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
-                    await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
+                    _ = await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
                 },
                 prependPendingHandoffIfNeeded: { [weak self] text, session in
                     self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
@@ -9605,7 +9605,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var ownershipCommitted = preparation == nil
         var providerContextInvalidated = false
         var bindingsPublished = false
-        let previousHandoff = session.pendingHandoff
+        // Rollback owns only a handoff staged by this transition, never a send's or
+        // cancellation's changes to a pre-existing handoff.
+        var handoffRollback: (previous: PendingHandoffState, staged: PendingHandoffState)?
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
@@ -9669,7 +9671,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 if !changedDuringActiveRun {
                     try commitAuthority? {}
-                    await stageResumeRecoveryHandoffIfNeeded(for: session)
+                    let previousHandoff = session.pendingHandoff
+                    if let stagedHandoff = await stageResumeRecoveryHandoffIfNeeded(for: session) {
+                        handoffRollback = (previousHandoff, stagedHandoff)
+                    }
                     try await revalidateAuthority?()
                 }
                 try commitAuthority? {}
@@ -9735,8 +9740,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return session.worktreeBindings
         } catch {
-            if !providerContextInvalidated, session.pendingHandoff != previousHandoff {
-                session.pendingHandoff = previousHandoff
+            if !providerContextInvalidated, let handoffRollback,
+               session.pendingHandoff == handoffRollback.staged
+            {
+                session.pendingHandoff = handoffRollback.previous
                 session.isDirty = true
                 if let workspaceID = workspaceManager?.activeWorkspace?.id {
                     _ = await Task { @MainActor in
@@ -21314,13 +21321,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // Shared helper that stages a resume-recovery handoff so the model has
     // conversational context after a forced fresh session start.
     @MainActor
-    func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        guard session.oversight.pendingAutoWake?.isPeriodic != true else { return }
-        // Don't overwrite an existing staged payload.
+    func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async -> PendingHandoffState? {
+        guard session.oversight.pendingAutoWake?.isPeriodic != true else { return nil }
+        // Don't overwrite an existing staged payload, or claim ownership of it for rollback.
         if let existingPayload = session.pendingHandoff.payload,
            !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-            return
+            return nil
         }
         let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
         let sourceTabName = normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID))
@@ -21341,9 +21348,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             deliveryID: deliveryID
         )
         guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
+            return nil
         }
-        session.pendingHandoff = PendingHandoffState(
+        let stagedHandoff = PendingHandoffState(
             payload: payload,
             createdAt: Date(),
             sourceItemID: cutoffItemID,
@@ -21351,12 +21358,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isStagedForSend: false,
             executionLocationFailure: session.pendingHandoff.executionLocationFailure
         )
+        session.pendingHandoff = stagedHandoff
         session.isDirty = true
+        return stagedHandoff
     }
 
     @MainActor
     func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        await stageResumeRecoveryHandoffIfNeeded(for: session)
+        _ = await stageResumeRecoveryHandoffIfNeeded(for: session)
     }
 
     @MainActor

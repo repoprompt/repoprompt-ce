@@ -512,6 +512,102 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertNotNil(fixture.session.pendingHandoff.payload)
     }
 
+    func testSameRootRefusalDoesNotResurrectHandoffDeliveredDuringTransition() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        fixture.session.pendingHandoff = .init(payload: "handoff P", createdAt: Date())
+        let native = MonitorFakeNativeController()
+        fixture.session.claudeController = native
+        var saved: AgentSession?
+        fixture.viewModel.test_setAgentSessionSaver { value, _, _ in
+            saved = value
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    // The transition is suspended while another MainActor task sends. Use the
+                    // provider-facing prepend and accepted-send consumption used by the runner.
+                    try await Task { @MainActor in
+                        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+                        let text = fixture.viewModel.prependPendingHandoffIfNeeded("message", session: fixture.session)
+                        _ = try await native.sendUserMessage(text)
+                        fixture.session.pendingHandoff.clearAfterSend()
+                    }.value
+                    throw MCPError.invalidParams("Refused after concurrent send")
+                }
+            )
+            XCTFail("The presentation change must be refused")
+        } catch {}
+        let sent = await native.sentMessages
+        XCTAssertEqual(sent, ["handoff P\n\nmessage"])
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNil(fixture.session.pendingHandoff.payload, "A delivered handoff must not be resurrected by an unrelated rollback")
+        XCTAssertNil(saved?.pendingHandoffPayload, "Rollback must not force-save the already-delivered payload")
+        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "next")
+    }
+
+    func testSameRootRefusalDoesNotRestageHandoffAfterConcurrentCancelRun() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.pendingHandoff = .init(payload: "handoff P", createdAt: Date(), isStagedForSend: true)
+        let (events, continuation) = AsyncStream<Void>.makeStream()
+        let runner = Task { @MainActor in
+            for await _ in events {}
+            // Model the runner's recordPendingHandoffSendOutcome(false) cancellation cleanup.
+            if Task.isCancelled { fixture.session.pendingHandoff.isStagedForSend = false }
+        }
+        fixture.session.agentTask = runner
+        defer { runner.cancel()
+            continuation.finish()
+        }
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID, completion: .terminalTeardownCompleted)
+                    await runner.value
+                    XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend, "The cancelled runner must unstage the undelivered handoff")
+                    throw MCPError.invalidParams("Refused after concurrent cancellation")
+                }
+            )
+            XCTFail("The presentation change must be refused")
+        } catch {}
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertEqual(fixture.session.pendingHandoff.payload, "handoff P")
+        XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend, "Rollback must not undo cancelRun's unstage")
+        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "handoff P\n\nnext")
+    }
+
+    func testRefusalDoesNotOverwriteNewerHandoffAfterTransitionStaging() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let newer = AgentModeViewModel.PendingHandoffState(payload: "newer handoff", createdAt: Date())
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                revalidateAuthority: {
+                    if fixture.session.pendingHandoff.hasPayload {
+                        fixture.session.pendingHandoff = newer
+                        throw SessionAdminHostError.authorityEnded
+                    }
+                }
+            )
+            XCTFail("The transition must be refused after staging")
+        } catch {}
+        XCTAssertEqual(fixture.session.pendingHandoff, newer, "Rollback only owns its exact staged value")
+    }
+
     func testRefusalAfterHandoffStagingRestoresOriginalHandoffBeforeRetirement() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
