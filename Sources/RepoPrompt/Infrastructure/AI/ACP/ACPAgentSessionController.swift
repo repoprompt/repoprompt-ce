@@ -3689,20 +3689,29 @@ actor ACPAgentSessionController {
         let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
         let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
         let contextUsedTokens: Int?
+        let modelContextWindow: Int?
         if provider.providerID == .grokBuild {
-            // Grok's usage is turn-wide billing; input already includes cache reads.
-            // The sibling _meta.inputTokens is the last call's full prompt, not exact
-            // post-response occupancy. If absent, never substitute the billed sum.
             let meta = response["_meta"] as? [String: Any]
-            if let number = meta?["inputTokens"] as? NSNumber,
+            // Grok's totalTokens tracks current conversation state, including a reseed
+            // after compaction. inputTokens can still describe the pre-compaction call.
+            // Only older responses without totalTokens may use last-call input instead;
+            // zero/invalid current-state claims must not resurrect that stale prompt.
+            let contextCount = meta?["totalTokens"] ?? meta?["inputTokens"]
+            if let number = contextCount as? NSNumber,
                CFGetTypeID(number) != CFBooleanGetTypeID(),
-               let count = number as? Int, count >= 0
+               let count = number as? Int, count > 0
             {
                 contextUsedTokens = count
             } else {
                 contextUsedTokens = nil
             }
+            // Resolve from THIS session and response, not the global catalog or the
+            // composer's "default" alias. An explicit unknown model never borrows the
+            // current model's capacity; only an absent model ID can use that identity.
+            let modelRaw = (meta?["modelId"] as? String) ?? discoveredSessionModels?.currentModelRaw
+            modelContextWindow = discoveredSessionModels?.option(matching: modelRaw)?.contextWindowTokens
         } else {
+            modelContextWindow = nil
             contextUsedTokens = hasContextBreakdown
                 ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
                 : nil
@@ -3715,6 +3724,7 @@ actor ACPAgentSessionController {
             completionTokens: outputTokens,
             providerSessionID: providerSessionID,
             stopReason: stopReason,
+            modelContextWindow: modelContextWindow,
             contextUsedTokens: contextUsedTokens
         )
     }

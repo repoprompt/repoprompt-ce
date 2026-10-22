@@ -43,12 +43,6 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             if let contextWindowTokens {
                 return contextWindowTokens
             }
-            if selectedAgent == .grokBuild,
-               let reportedWindow = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?
-               .option(matching: selectedModelRaw)?.contextWindowTokens
-            {
-                return reportedWindow
-            }
             let model: AgentModel? = if let selectedAgent {
                 AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent)
             } else {
