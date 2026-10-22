@@ -387,9 +387,9 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// emits today is `repeatedResumeTimeout` (21 characters).
     public static let maximumTokenLength = maximumIdentifierLength
     /// Upper bound for diagnostics carried by a single turn summary. This is a
-    /// malformed-payload guard, not a producer bound: a turn emits one record
-    /// per reconnect fallback with no limit (`resumeFrameTooLarge` falls back on
-    /// the first oversized-resume failure). The value mirrors the per-turn entry
+    /// malformed-payload guard, not a producer bound: a turn can emit multiple
+    /// reconnect recovery records, including stopped oversized resumes, with no
+    /// fixed producer limit. The value mirrors the per-turn entry
     /// budget the consumers enforce — `get_session` renders ≤20 entries per
     /// turn — so a corrupt persisted list can displace at most one turn's
     /// rendered entries, and read-time dedupe keeps distinct records intact.

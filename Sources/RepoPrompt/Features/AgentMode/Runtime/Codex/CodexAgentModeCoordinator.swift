@@ -329,7 +329,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private enum CodexNativeSessionFallbackReason: String {
         case missingRollout
         case repeatedResumeTimeout
-        case resumeFrameTooLarge
     }
 
     private enum LiveBashRunningApplyResult {
@@ -4708,19 +4707,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     /// Chooses the fresh-thread fallback for a failed resume attempt, if any.
     ///
-    /// A resume response over the stdout frame budget is deterministic: retrying the same
-    /// target overflows again, so it falls back on the first occurrence. Timeouts may be
-    /// transient and only fall back once the repeated-timeout threshold is reached.
+    /// Only repeated timeouts permit the existing automatic fallback. A frame overflow
+    /// must stop without replacing the conversation: a fresh thread has no prior task.
     private func resumeFreshStartFallbackReason(
         attemptedResume: Bool,
         timeoutCount: Int?,
-        error: Error,
         allowResumeTimeoutFallback: Bool
     ) -> CodexNativeSessionFallbackReason? {
         guard allowResumeTimeoutFallback, attemptedResume else { return nil }
-        if CodexAppServerClient.isStdoutFrameBudgetExceededError(error) {
-            return .resumeFrameTooLarge
-        }
         if let timeoutCount, timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold {
             return .repeatedResumeTimeout
         }
@@ -4770,13 +4764,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resumeRecoveryMessage()
         case .repeatedResumeTimeout:
             repeatedResumeTimeoutRecoveryMessage()
-        case .resumeFrameTooLarge:
-            resumeFrameTooLargeRecoveryMessage()
         }
     }
 
-    private static func resumeFrameTooLargeRecoveryMessage() -> String {
-        "Codex couldn't resume the previous thread because its history was too large to load. Started a fresh thread."
+    private static func oversizedResumeFailureMessage() -> String {
+        "Codex couldn't resume the previous thread because its history was too large to load. No new thread was started; the previous conversation is unchanged. Retry this conversation, or open a new Agent tab and provide a recap of the prior task."
     }
 
     private static func missedCodexCompletionRecoveryMessage() -> String {
@@ -7591,17 +7583,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if let freshStartFallbackReason = resumeFreshStartFallbackReason(
                 attemptedResume: attemptedResume,
                 timeoutCount: resumeTimeoutCount,
-                error: effectiveError,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback
             ) {
-                let isFrameTooLarge = freshStartFallbackReason == .resumeFrameTooLarge
-                let failureDescription = isFrameTooLarge ? "oversized resume response" : "repeated resume timeout"
-                logCodex("[AgentModeVM][CodexReconnect] \(failureDescription) for tab \(session.tabID); retrying with a fresh thread start")
+                logCodex("[AgentModeVM][CodexReconnect] repeated resume timeout for tab \(session.tabID); retrying with a fresh thread start")
                 let expectedController = session.codexController
                 _ = invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: expectedController,
-                    source: isFrameTooLarge ? "resume-frame-too-large-fallback" : "resume-timeout-fallback",
+                    source: "resume-timeout-fallback",
                     preserveRunID: true
                 )
                 guard let freshController = await prepareCodexController() else { return }
@@ -7692,21 +7681,38 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if !shouldSkipTimedOutResumeTarget, resumeTimeoutCount == nil {
                 resetCodexResumeTimeoutState(for: session)
             }
-            let invalidatedTimedOutController = isControlPlaneTimeout
+            let isOversizedResume = attemptedResume
+                && CodexAppServerClient.isStdoutFrameBudgetExceededError(effectiveError)
+            let invalidatedTimedOutController = (isControlPlaneTimeout || isOversizedResume)
                 ? invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: session.codexController,
-                    source: attemptedResume ? "resume-timeout" : "start-timeout",
+                    source: isOversizedResume ? "resume-frame-too-large" : (attemptedResume ? "resume-timeout" : "start-timeout"),
                     preserveRunID: preserveExistingRunID
                 )
                 : false
             if !invalidatedTimedOutController {
                 markCodexReconnectNeeded(for: session, source: "ensure-error")
             }
-            let errorItem = AgentChatItem.error(
-                "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
+            var errorItem = AgentChatItem.error(
+                isOversizedResume
+                    ? Self.oversizedResumeFailureMessage()
+                    : "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
             )
+            if isOversizedResume {
+                // Reuse the durable diagnostic carrier so retention cannot erase why
+                // dispatch stopped while the old transcript remains visible.
+                errorItem.recoveryDiagnostic = AgentTranscriptRecoveryDiagnostic(
+                    id: errorItem.id,
+                    timestamp: errorItem.timestamp,
+                    sequenceIndex: errorItem.sequenceIndex,
+                    reason: "resumeFrameTooLarge",
+                    outcome: "resumeStopped",
+                    previousConversationID: session.codexConversationID,
+                    text: errorItem.text
+                )
+            }
             session.appendItem(errorItem)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         }
