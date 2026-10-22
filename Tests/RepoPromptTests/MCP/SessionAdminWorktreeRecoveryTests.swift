@@ -595,7 +595,9 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let binding = try XCTUnwrap(created["binding"]?.objectValue, Self.json(created))
             XCTAssertEqual(binding["code"], .string("target_busy"), Self.json(created))
             let next = try XCTUnwrap(binding["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(created))
-            XCTAssertEqual(next["repo_root"]?.stringValue.map(Self.canonical), Self.canonical(repos.alpha))
+            let reported = try XCTUnwrap(created["worktree"]?.objectValue?["repo_root"]?.stringValue, Self.json(created))
+            XCTAssertEqual(Self.canonical(reported), Self.canonical(repos.alpha))
+            XCTAssertEqual(next["repo_root"], .string("\(reported)@current"))
             fixture.session.mcpFollowUpRunPending = false
 
             let replayed = try await fixture.call(next)
@@ -660,6 +662,165 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 fixture.targetBindingMap(), [Self.canonical(primary): worktreeID],
                 "bound under the elected PRIMARY root, not the first installed root of its repository"
             )
+        }
+    }
+
+    // MARK: - Literal repository paths (#1431)
+
+    // Repository A sits at `project@main` and a distinct repository B at `project`. Read as a selector, A's path names
+    // B's main checkout, so every selector the handler generates from creation's elected path must keep it literal.
+
+    private static let selectorLookalikeNames = (alpha: "project@main", beta: "project")
+
+    private static func lookalikeRoots(includeB: Bool = true, aInstalledFirst: Bool = true) -> ElectionRoots {
+        { repos in
+            let declared = includeB ? [repos.alpha, repos.beta] : [repos.alpha]
+            return (declared: declared, installed: aInstalledFirst ? declared : declared.reversed())
+        }
+    }
+
+    func testCreateDefaultBindKeepsARepositoryPathThatReadsAsASelectorLiteral() async throws {
+        for aInstalledFirst in [true, false] {
+            let order = aInstalledFirst ? "A installed first" : "B installed first"
+            try await withFixture(
+                election: true, electionRepositoryNames: Self.selectorLookalikeNames,
+                electionRoots: Self.lookalikeRoots(aInstalledFirst: aInstalledFirst)
+            ) { fixture in
+                let repos = try XCTUnwrap(fixture.election)
+                XCTAssertEqual([repos.alpha.lastPathComponent, repos.beta.lastPathComponent], ["project@main", "project"])
+                let aCheckouts = try fixture.worktreeCount(repos.alpha)
+                let bCheckouts = try fixture.worktreeCount(repos.beta)
+                let request: [String: Value] = [
+                    "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                    "branch": .string("e2e/literal-default"), "idempotency_key": .string("literal-default")
+                ]
+                let created = try await fixture.call(request)
+                XCTAssertEqual(created["result"], .string("created"), "\(order): \(Self.json(created))")
+                XCTAssertEqual(created["bound"], .bool(true), order)
+                let worktree = try XCTUnwrap(created["worktree"]?.objectValue, Self.json(created))
+                let worktreeID = try XCTUnwrap(worktree["worktree_id"]?.stringValue)
+                let path = try URL(fileURLWithPath: XCTUnwrap(worktree["path"]?.stringValue))
+                XCTAssertEqual(fixture.repositoryID(path), fixture.repositoryID(repos.alpha), "\(order): created in A")
+                XCTAssertEqual(try fixture.worktreeCount(repos.alpha), aCheckouts + 1, order)
+                XCTAssertEqual(try fixture.worktreeCount(repos.beta), bCheckouts, order)
+                try await fixture.assertSoleBinding(logical: repos.alpha, worktreeID: worktreeID, order)
+                XCTAssertEqual(
+                    fixture.ownership.record(worktreeID: worktreeID)?.repoRootPath.map(Self.canonical), Self.canonical(repos.alpha),
+                    "\(order): ownership keeps the literal path"
+                )
+
+                // The creation key replays its receipt rather than creating again.
+                _ = try await fixture.call(request)
+                XCTAssertEqual(try fixture.worktreeCount(repos.alpha), aCheckouts + 1, order)
+                XCTAssertEqual(fixture.ownership.records.count, 1, order)
+            }
+        }
+    }
+
+    func testDeferredCreateBindKeepsARepositoryPathThatReadsAsASelectorLiteral() async throws {
+        try await withFixture(
+            election: true, electionRepositoryNames: Self.selectorLookalikeNames,
+            electionRoots: Self.lookalikeRoots(aInstalledFirst: false)
+        ) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            let aCheckouts = try fixture.worktreeCount(repos.alpha)
+            let bCheckouts = try fixture.worktreeCount(repos.beta)
+            fixture.session.mcpFollowUpRunPending = true
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/literal-deferred"), "apply": .string("next_boundary"),
+                "idempotency_key": .string("literal-deferred")
+            ])
+            XCTAssertEqual(created["result"], .string("created"), Self.json(created))
+            XCTAssertEqual(created["binding"]?.objectValue?["result"], .string("queued"), Self.json(created))
+            let worktreeID = try XCTUnwrap(created["worktree"]?.objectValue?["worktree_id"]?.stringValue, Self.json(created))
+            fixture.session.mcpFollowUpRunPending = false
+
+            let outcome = try await fixture.deferredOutcome()
+            XCTAssertEqual(outcome["result"], .string("applied"), Self.json(.object(outcome)))
+            XCTAssertEqual(outcome["worktree_id"], .string(worktreeID))
+            try await fixture.assertSoleBinding(logical: repos.alpha, worktreeID: worktreeID)
+            XCTAssertEqual(try fixture.worktreeCount(repos.alpha), aCheckouts + 1, "no second creation")
+            XCTAssertEqual(try fixture.worktreeCount(repos.beta), bCheckouts)
+            XCTAssertEqual(Array(fixture.ownership.records.keys), [worktreeID])
+        }
+    }
+
+    func testCreateDefaultBindCompletesForASoleRepositoryWhosePathReadsAsASelector() async throws {
+        try await withFixture(
+            election: true, electionRepositoryNames: Self.selectorLookalikeNames, electionRoots: Self.lookalikeRoots(includeB: false)
+        ) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/literal-sole"), "idempotency_key": .string("literal-sole")
+            ])
+            XCTAssertEqual(created["result"], .string("created"), Self.json(created))
+            XCTAssertEqual(created["bound"], .bool(true), Self.json(created))
+            let worktreeID = try XCTUnwrap(created["worktree"]?.objectValue?["worktree_id"]?.stringValue, Self.json(created))
+            try await fixture.assertSoleBinding(logical: repos.alpha, worktreeID: worktreeID)
+        }
+    }
+
+    func testCreateRecoveryCallsReplayARepositoryPathThatReadsAsASelectorLiterally() async throws {
+        try await withFixture(
+            election: true, electionRepositoryNames: Self.selectorLookalikeNames, electionRoots: Self.lookalikeRoots()
+        ) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            let aCheckouts = try fixture.worktreeCount(repos.alpha)
+            let bCheckouts = try fixture.worktreeCount(repos.beta)
+            fixture.session.mcpFollowUpRunPending = true
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/literal-recovery"), "idempotency_key": .string("literal-recovery")
+            ])
+            XCTAssertEqual(created["result"], .string("partial"), Self.json(created))
+            let worktree = try XCTUnwrap(created["worktree"]?.objectValue, Self.json(created))
+            let worktreeID = try XCTUnwrap(worktree["worktree_id"]?.stringValue)
+            let reported = try XCTUnwrap(worktree["repo_root"]?.stringValue)
+            XCTAssertEqual(Self.canonical(reported), Self.canonical(repos.alpha), "the receipt reports the literal path")
+            let receiptCall = try XCTUnwrap(created["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(created))
+            let binding = try XCTUnwrap(created["binding"]?.objectValue, Self.json(created))
+            XCTAssertEqual(binding["code"], .string("target_busy"), Self.json(created))
+            let busyCall = try XCTUnwrap(binding["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(created))
+            for call in [receiptCall, busyCall] {
+                XCTAssertEqual(call["repo_root"], .string("\(reported)@current"), Self.json(.object(call)))
+            }
+            fixture.session.mcpFollowUpRunPending = false
+
+            for (label, call) in [("busy recovery", busyCall), ("receipt", receiptCall)] {
+                let replayed = try await fixture.call(call)
+                XCTAssertEqual(replayed["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), "\(label): \(Self.json(replayed))")
+                try await fixture.assertSoleBinding(logical: repos.alpha, worktreeID: worktreeID, label)
+            }
+            XCTAssertEqual(try fixture.worktreeCount(repos.alpha), aCheckouts + 1)
+            XCTAssertEqual(try fixture.worktreeCount(repos.beta), bCheckouts)
+        }
+    }
+
+    func testCreateRecoverySelectorKeepsALinkedPrimaryCheckout() async throws {
+        let roots: ElectionRoots = { repos in
+            (declared: [repos.alphaPrime, repos.alpha], installed: [repos.alpha, repos.alphaPrime])
+        }
+        try await withFixture(election: true, electionRoots: roots) { fixture in
+            let repos = try XCTUnwrap(fixture.election)
+            let created = try await fixture.call([
+                "op": .string("worktree_create"), "session_id": .string(fixture.sessionID.uuidString),
+                "branch": .string("e2e/linked-primary"), "bind": .bool(false), "idempotency_key": .string("linked-primary")
+            ])
+            XCTAssertEqual(created["result"], .string("created"), Self.json(created))
+            let worktree = try XCTUnwrap(created["worktree"]?.objectValue, Self.json(created))
+            let worktreeID = try XCTUnwrap(worktree["worktree_id"]?.stringValue)
+            let path = try URL(fileURLWithPath: XCTUnwrap(worktree["path"]?.stringValue))
+            XCTAssertEqual(try fixture.head(path), try fixture.head(repos.alphaPrime), "created from the linked PRIMARY")
+            let reported = try XCTUnwrap(worktree["repo_root"]?.stringValue)
+            XCTAssertEqual(Self.canonical(reported), Self.canonical(repos.alphaPrime))
+            let next = try XCTUnwrap(created["next_call"]?.objectValue?["arguments"]?.objectValue, Self.json(created))
+            XCTAssertEqual(next["repo_root"], .string("\(reported)@current"))
+
+            let replayed = try await fixture.call(next)
+            XCTAssertEqual(replayed["items"]?.arrayValue?.first?.objectValue?["result"], .string("bound"), Self.json(replayed))
+            try await fixture.assertSoleBinding(logical: repos.alphaPrime, worktreeID: worktreeID)
         }
     }
 
@@ -850,6 +1011,19 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 .split(separator: "\n").count(where: { $0.hasPrefix("worktree ") })
         }
 
+        /// The target's only binding, live and persisted, is `logical` -> `worktreeID`.
+        func assertSoleBinding(
+            logical: URL, worktreeID: String, _ message: String = "", file: StaticString = #filePath, line: UInt = #line
+        ) async throws {
+            let expected = [[SessionAdminWorktreeRecoveryTests.canonical(logical), worktreeID]]
+            func rows(_ bindings: [AgentSessionWorktreeBinding]) -> [[String]] {
+                bindings.map { [SessionAdminWorktreeRecoveryTests.canonical($0.logicalRootPath), $0.worktreeID] }
+            }
+            XCTAssertEqual(rows(session.worktreeBindings), expected, "live \(message)", file: file, line: line)
+            let saved = try await savedSession()
+            XCTAssertEqual(saved.map { rows($0.worktreeBindings) }, expected, "persisted \(message)", file: file, line: line)
+        }
+
         /// Target bindings keyed by canonical logical root.
         func targetBindingMap() -> [String: String] {
             Dictionary(
@@ -897,12 +1071,14 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
     /// Only the second window binds the background payload. Production provenance, caller binding,
     /// authorization and hosts must distinguish those facts without selecting either target tab.
     /// `election` declares the three `ElectionRepositories` roots and installs them in adversarial order;
-    /// `electionRoots` replaces which of them are declared and their installation order.
+    /// `electionRepositoryNames` names the alpha and beta repository directories; `electionRoots` replaces which of
+    /// them are declared and their installation order.
     /// `replicaHoldsTarget: false` leaves the replica on its own workspace, for operations a replicated
     /// target never admits (merge apply).
     private func withFixture(
         fullAccess: Bool = true,
         election: Bool = false,
+        electionRepositoryNames: (alpha: String, beta: String) = ("alpha", "beta"),
         electionRoots: ElectionRoots? = nil,
         replicaHoldsTarget: Bool = true,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver(),
@@ -937,7 +1113,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             git.cleanup()
         }
         do {
-            let electionRepositories = try election ? Self.makeElectionRepositories(git, roots: electionRoots) : nil
+            let electionRepositories = try election ? Self.makeElectionRepositories(git, names: electionRepositoryNames, roots: electionRoots) : nil
             let repository = try electionRepositories?.alpha
                 ?? git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
             let declared = electionRepositories?.declared ?? [repository]
@@ -1110,10 +1286,10 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
     typealias ElectionRoots = (ElectionRepositories) throws -> (declared: [URL], installed: [URL])
 
     private static func makeElectionRepositories(
-        _ git: ReviewGitRepositoryFixture, roots: ElectionRoots?
+        _ git: ReviewGitRepositoryFixture, names: (alpha: String, beta: String), roots: ElectionRoots?
     ) throws -> ElectionRepositories {
-        let alpha = try git.makeRepository(named: "alpha", files: ["alpha.txt": "alpha\n"])
-        let beta = try git.makeRepository(named: "beta", files: ["beta.txt": "beta\n"])
+        let alpha = try git.makeRepository(named: names.alpha, files: ["alpha.txt": "alpha\n"])
+        let beta = try git.makeRepository(named: names.beta, files: ["beta.txt": "beta\n"])
         let gamma = try git.makeRepository(named: "gamma", files: ["gamma.txt": "gamma\n"])
         func linked(_ name: String, from root: URL, branch: String) throws -> URL {
             let path = git.sandbox.appendingPathComponent(name, isDirectory: true)
