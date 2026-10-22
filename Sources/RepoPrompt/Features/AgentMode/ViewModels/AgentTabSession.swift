@@ -1347,6 +1347,9 @@ final class AgentTabSession: ObservableObject {
     var codexNeedsReconnect: Bool = false
     var codexNativeStartupDisposition: AgentModeViewModel.CodexNativeStartupDisposition?
     var codexResumeTimeoutState: AgentModeViewModel.CodexResumeTimeoutState = .init()
+    // Like resume timeout accounting, this is session-scoped. A changed reference can resume;
+    // repeated attempts against the same oversized reference must not spawn another process.
+    var codexOversizedResumeTarget: AgentModeViewModel.CodexOversizedResumeTarget?
     var codexToolPreferencesGeneration: Int = 0
     var codexController: (any CodexSessionControlling)? {
         didSet {
