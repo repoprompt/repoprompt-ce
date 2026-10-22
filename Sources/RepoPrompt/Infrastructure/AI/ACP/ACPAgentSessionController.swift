@@ -3674,7 +3674,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func messageStopResult(
+    func messageStopResult(
         from response: [String: Any],
         sessionID: String,
         stopReason: String?
@@ -3688,9 +3688,25 @@ actor ACPAgentSessionController {
         let cachedReadTokens = intValue(usage?["cachedReadTokens"])
         let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
         let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
-        let contextUsedTokens = hasContextBreakdown
-            ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
-            : nil
+        let contextUsedTokens: Int?
+        if provider.providerID == .grokBuild {
+            // Grok's usage is turn-wide billing; input already includes cache reads.
+            // The sibling _meta.inputTokens is the last call's full prompt, not exact
+            // post-response occupancy. If absent, never substitute the billed sum.
+            let meta = response["_meta"] as? [String: Any]
+            if let number = meta?["inputTokens"] as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID(),
+               let count = number as? Int, count >= 0
+            {
+                contextUsedTokens = count
+            } else {
+                contextUsedTokens = nil
+            }
+        } else {
+            contextUsedTokens = hasContextBreakdown
+                ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
+                : nil
+        }
         let providerSessionID = providerSessionIdentity.loadSessionID ?? sessionID
         return AIStreamResult(
             type: "message_stop",

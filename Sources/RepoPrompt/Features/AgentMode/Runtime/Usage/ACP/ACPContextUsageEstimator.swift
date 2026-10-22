@@ -11,8 +11,9 @@ import Foundation
 ///   and `size` its context window, so the snapshot is `exact`. An occupancy report also marks
 ///   the turn: a later billed prompt-call count from the same turn may not replace it, since the
 ///   billed figure can be cumulative across the turn's internal requests.
-/// - Prompt-response usage (`ingestTurnFinalizationSignal`): `inputTokens` plus the cache fields
-///   are billed per-call input, so the snapshot is `bestEffort` — unless the provider already
+/// - Prompt-response usage (`ingestTurnFinalizationSignal`): the controller supplies a best-effort
+///   prompt figure (Grok's last-call full prompt, not its turn-wide billing totals). This is not
+///   post-response occupancy, so the snapshot is `bestEffort` — unless the provider already
 ///   reported occupancy this turn, in which case only a new window is adopted. A billed count
 ///   that exceeds the known window is provably cumulative rather than occupancy and is not
 ///   stored as the context count.
