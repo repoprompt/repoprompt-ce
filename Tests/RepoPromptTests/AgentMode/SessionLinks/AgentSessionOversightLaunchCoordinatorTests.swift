@@ -457,6 +457,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             }
 
             func launchCoordinatorReportWarning(id _: String, message _: String) {}
+            func launchCoordinatorClearWarning(id _: String) {}
             func launchCoordinatorRequestHydration(sessionIDs _: Set<UUID>) {
                 XCTFail("Both endpoints are ready")
             }
@@ -1111,7 +1112,12 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
         var restored = await isRestored(fixture)
         XCTAssertFalse(restored)
-        XCTAssertTrue(fixture.host.publishedPresentations.last?.warnings.isEmpty == true)
+        XCTAssertEqual(
+            fixture.bridge.currentPersistencePresentation.warnings.first {
+                $0.id == AgentSessionOversightWarningID.duplicateWaiting
+            }?.message,
+            "Some saved oversight links are waiting because a session is open in more than one window. Close the extra window to let RepoPrompt reconsider restoration."
+        )
 
         // Closing the extra window is sufficient; no store reload or interactive Add is needed.
         fixture.host.candidates = [observer, target]
@@ -1126,6 +1132,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let retainedToken = await fixture.store.token(for: pair)
         XCTAssertEqual(retainedToken, token)
         XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+            $0.id == AgentSessionOversightWarningID.duplicateWaiting
+        })
     }
 
     func testClosingEveryDuplicateCopyEndsTheNeverGrantedEntry() async throws {
@@ -1154,6 +1163,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             fixture.bridge.noteTopologyMayHaveChanged()
             await fixture.bridge.test_settleLaunchReconciliation()
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.bindingDrift))
+            XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+                $0.id == AgentSessionOversightWarningID.duplicateWaiting
+            })
             let token = await fixture.store.token(for: pair)
             XCTAssertNotNil(token)
 

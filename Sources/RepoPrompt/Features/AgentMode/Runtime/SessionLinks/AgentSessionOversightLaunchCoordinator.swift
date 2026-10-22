@@ -144,6 +144,8 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 
     /// Reports an aggregate, identifier-free warning for the persistence surface.
     func launchCoordinatorReportWarning(id: String, message: String)
+    /// Removes a transient aggregate notice after its condition no longer holds.
+    func launchCoordinatorClearWarning(id: String)
 
     /// Asks the host to passively load the persisted state of these described-but-unhydrated
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
@@ -211,6 +213,8 @@ final class AgentSessionOversightLaunchCoordinator {
         let pair: AgentSessionOversightIntent
         var token: AgentSessionOversightIntentToken?
         var state: EntryState = .waiting
+        /// Presentation-only result of the latest topology census, never establishment authority.
+        var isBlockedByDuplicate = false
         /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it or a
         /// refused establishment spends one of its bounded per-launch retries.
         var didStartReservation = false
@@ -224,8 +228,8 @@ final class AgentSessionOversightLaunchCoordinator {
         ///
         /// A session that was observed and then disappeared is a *positive* fact about this process,
         /// unlike a session that was never there: it survives an uncertain restore topology, which is
-        /// what lets an ordinary close of a waiting, never-granted pair end the saved relationship
-        /// instead of leaving it to reactivate later.
+        /// what lets an ordinary close of a waiting pair end its attempt for this launch, retaining
+        /// saved intent for a later launch instead of letting it reactivate in this one.
         var observedSessions: Set<UUID> = []
         /// The exact incarnations and grant generation this entry was activated against.
         ///
@@ -265,6 +269,7 @@ final class AgentSessionOversightLaunchCoordinator {
     private var isFrozen = false
     private var didLoadLaunchEntries = false
     private var reportedTerminalSummaryIDs: Set<String> = []
+    private var isDuplicateWarningPublished = false
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -376,6 +381,7 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.targetEndpoint = nil
         entry.reference = nil
         entries[pair] = entry
+        synchronizeDuplicateWarning()
         markDirty()
     }
 
@@ -405,6 +411,7 @@ final class AgentSessionOversightLaunchCoordinator {
             entry.state = .terminal(.lifecycleRevoked)
         }
         entries[pair] = entry
+        synchronizeDuplicateWarning()
     }
 
     /// Capture exact saved ownership synchronously, before close hides either endpoint.
@@ -495,6 +502,7 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.state = .cleanupPending(token)
         entries[pair] = entry
         if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
+        synchronizeDuplicateWarning()
     }
 
     /// The token a still-owed cleanup for `pair` would remove, if any.
@@ -650,6 +658,7 @@ final class AgentSessionOversightLaunchCoordinator {
     /// would either grant against a half-built window or misclassify a session that simply has not
     /// been described yet.
     private func performPass() async {
+        defer { synchronizeDuplicateWarning() }
         guard !isFrozen,
               storeIsReady,
               automaticRestoreEnabled,
@@ -690,6 +699,14 @@ final class AgentSessionOversightLaunchCoordinator {
         var candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]] = [:]
         for candidate in candidates {
             candidatesBySession[candidate.sessionID, default: []].append(candidate)
+        }
+
+        for pair in launchPairOrder {
+            guard var entry = entries[pair] else { continue }
+            entry.isBlockedByDuplicate = [pair.observerSessionID, pair.targetSessionID].contains {
+                (descriptorCounts[$0] ?? 0) > 1 || (candidatesBySession[$0] ?? []).count > 1
+            }
+            entries[pair] = entry
         }
 
         requestHydrationForWaitingEntries(
@@ -846,7 +863,7 @@ final class AgentSessionOversightLaunchCoordinator {
                 return .wait
             }
 
-            // Neither copy may be granted, but a never-granted entry can become unambiguous when
+            // Neither copy may be granted, but a waiting, not active, entry can become unique when
             // the extra window closes. Keep waiting on ordinary topology/readiness events and
             // re-prove every establishment fence then; an active entry's audit remains terminal.
             if descriptorCount > 1 || matches.count > 1 { return .wait }
@@ -855,7 +872,7 @@ final class AgentSessionOversightLaunchCoordinator {
                 // An endpoint this launch already observed and then watched disappear is a fact about
                 // *this* process, not the uncertainty an abandoned restore leftover represents: the
                 // tab, window, or workspace holding it was torn down while we were looking. That ends
-                // the saved relationship exactly as an ordinary close does.
+                // this launch's attempt; saved intent remains available for a later launch.
                 if entries[pair]?.observedSessions.contains(sessionID) == true {
                     return .terminal(.bindingDrift)
                 }
@@ -1052,9 +1069,9 @@ final class AgentSessionOversightLaunchCoordinator {
             // gone: at launch the shared path routinely refuses transiently (an endpoint still
             // hydrating or rebinding, a superseded hydration proof, a closing or retiring endpoint,
             // a transient observer eligibility input). Deleting here erased user-created links on
-            // ordinary restarts. Only `classify` may end the saved relationship, and only on a proven
+            // ordinary restarts. Only `classify` may end this launch's attempt, and only on a proven
             // fact (deleted, missing under a fully observed topology, ineligible, terminal hydration).
-            // A duplicate that has never been granted waits instead.
+            // A waiting entry blocked by a duplicate waits for topology to settle instead.
             settled.state = .waiting
             guard !isFrozen else {
                 entries[pair] = settled
@@ -1146,7 +1163,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded(reason: reason)
+        // Token mismatch proves no removal. Do not report that the saved row was removed.
         case .writeFailed, .blocked:
             // Suppressed for this launch and recorded token-qualified, so no topology event retries
             // it and no stale receipt can later delete a reasserted intent.
@@ -1159,6 +1176,24 @@ final class AgentSessionOversightLaunchCoordinator {
                 id: AgentSessionOversightWarningID.cleanupFailed,
                 message: AgentSessionOversightPersistenceCopy.automaticCleanupFailed
             )
+        }
+    }
+
+    /// A transient, identifier-free projection over the bounded launch worklist.
+    private func synchronizeDuplicateWarning() {
+        guard let delegate else { return }
+        let isWaiting = entries.values.contains {
+            $0.isBlockedByDuplicate && ($0.state == .waiting || $0.parkedReference != nil)
+        }
+        guard isWaiting != isDuplicateWarningPublished else { return }
+        isDuplicateWarningPublished = isWaiting
+        if isWaiting {
+            delegate.launchCoordinatorReportWarning(
+                id: AgentSessionOversightWarningID.duplicateWaiting,
+                message: AgentSessionOversightPersistenceCopy.duplicateWaiting
+            )
+        } else {
+            delegate.launchCoordinatorClearWarning(id: AgentSessionOversightWarningID.duplicateWaiting)
         }
     }
 
