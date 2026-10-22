@@ -5123,7 +5123,10 @@ class DaemonState:
         job.timed_out = True
         job.state = "failed"
         job.exit_code = 124
-        job.error = f"{attempt} cache build attempt timed out{suffix}"
+        if not cold_attempted and outcome.get("testBuildSucceeded"):
+            job.error = f"post-build test execution timed out{suffix}"
+        else:
+            job.error = f"{attempt} cache build attempt timed out{suffix}"
         job.result_summary = job.error
 
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
@@ -8601,10 +8604,12 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     # A test invocation contains both compilation and execution. Only failures before
     # its successful build boundary are candidates for seeded-cache recovery. Use a
     # private per-attempt receipt, not log matching or an inherited/stale .build file.
-    with tempfile.TemporaryDirectory(prefix="conductor-cache-attempt-") as directory:
-        test_build_receipt = Path(directory) / "test-build-succeeded"
+    with contextlib.ExitStack() as stack:
+        test_build_receipt = None
         attempt_env = dict(os.environ)
         if args.get("testBuildReceipt"):
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="conductor-cache-attempt-"))
+            test_build_receipt = Path(directory) / "test-build-succeeded"
             attempt_env["REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT"] = str(test_build_receipt)
         first_code, first_timed_out = _run_cache_attempt(
             argv,
@@ -8614,7 +8619,7 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
             ticket,
             env=attempt_env,
         )
-        test_build_succeeded = test_build_receipt.is_file()
+        test_build_succeeded = test_build_receipt is not None and test_build_receipt.is_file()
     if first_code == 0:
         return 0
     build_dir = repo_root / ".build"
@@ -8624,6 +8629,7 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
         "cleanupTimeoutSeconds": cleanup_timeout,
         "seededExitCode": first_code,
         "seededTimedOut": first_timed_out,
+        "testBuildSucceeded": test_build_succeeded,
         "coldRetryAttempted": False,
     }
     if test_build_succeeded:

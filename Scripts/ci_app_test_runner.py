@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -593,7 +594,10 @@ def run_local_tests(
     # Conductor must not interpret assertion/runtime failures as a corrupt seed.
     # Its private receipt lives outside .build and is unique to this attempt.
     if receipt:
-        Path(receipt).touch()
+        # Advisory: an unavailable receipt retains conductor's existing recovery
+        # behavior, but must not replace the actual test result with an I/O error.
+        with contextlib.suppress(OSError):
+            Path(receipt).touch()
     with tempfile.TemporaryDirectory(prefix="rpce-local-tests-") as directory:
         environment = isolated_suite_environment(Path(directory), "local", environment)
         command: tuple[str, ...] | None = None
