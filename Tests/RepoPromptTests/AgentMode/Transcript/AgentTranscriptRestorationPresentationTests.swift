@@ -1136,28 +1136,10 @@ private extension XCTestCase {
             trace.noteRetainedError()
             firstError = firstError ?? error
         }
-        trace.phase = "cancel-save-debounces"
-        let closingSessions = Array(viewModel.sessions.values)
-        let pendingSaves = closingSessions.compactMap(\.saveDebounceTask)
-        trace.pendingSaveDebounceCountBeforeClose = pendingSaves.count
-        for session in closingSessions {
-            session.saveDebounceTask?.cancel()
-            session.saveDebounceTask = nil
-        }
+        // This counts debounce handles only, not untracked persistCurrentSession flush tasks.
+        trace.pendingSaveDebounceCountBeforeClose = viewModel.sessions.values.compactMap(\.saveDebounceTask).count
         trace.phase = "close-agent-mode"
         await viewModel.prepareForWindowClose()
-        // Close can itself schedule persistence. Fence those handles too, including retained sessions.
-        trace.phase = "cancel-close-save-debounces"
-        let closedSessions = closingSessions + Array(viewModel.sessions.values)
-        let closeSaves = closedSessions.compactMap(\.saveDebounceTask)
-        for session in closedSessions {
-            session.saveDebounceTask?.cancel()
-            session.saveDebounceTask = nil
-        }
-        trace.phase = "join-save-debounces"
-        for task in pendingSaves + closeSaves {
-            await task.value
-        }
         viewModel.test_afterTabActivationContinuation = nil
         viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
         viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
@@ -2396,51 +2378,6 @@ extension AgentTranscriptRestorationLifecycleTests {
 /// current-tab override. Sandbox first; bounded teardown before shared state resets.
 @MainActor
 extension AgentTranscriptRestorationLifecycleTests {
-    func testFixtureTeardownCancelsAndJoinsPendingSaveDebounce() async throws {
-        let (stream, continuation) = AsyncStream<Void>.makeStream()
-        var pendingSave: Task<Void, Never>?
-        var retainedSession: AgentTabSession?
-        var retainedViewModel: AgentModeViewModel?
-        var saveFinished = false
-        defer {
-            pendingSave?.cancel()
-            continuation.finish()
-        }
-        try await withRealObserverSavedTab { fixture in
-            retainedViewModel = fixture.viewModel
-            let saved = AgentSession(id: fixture.sessionID, name: "Save cleanup", savedAt: Date())
-            _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
-            fixture.viewModel.setAgentModeActive(true)
-            await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
-            await fixture.gate.waitUntilEntered()
-            let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
-            let load = try XCTUnwrap(session.persistedLoadTask)
-            await fixture.gate.open()
-            await load.value
-            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
-            retainedSession = session
-            if let previous = session.saveDebounceTask {
-                previous.cancel()
-                await previous.value
-            }
-            pendingSave = Task { @MainActor in
-                var iterator = stream.makeAsyncIterator()
-                _ = await iterator.next()
-                saveFinished = true
-            }
-            session.saveDebounceTask = pendingSave
-        }
-        let finishedAtFixtureReturn = saveFinished
-        let cancelledAtFixtureReturn = pendingSave?.isCancelled ?? false
-        pendingSave?.cancel()
-        continuation.finish()
-        await pendingSave?.value
-        XCTAssertNil(retainedSession?.saveDebounceTask, "Fixture must release its pending save handle")
-        XCTAssertTrue(cancelledAtFixtureReturn, "Fixture must cancel its pending save before closing")
-        XCTAssertTrue(finishedAtFixtureReturn, "Fixture must join the save before deleting its storage")
-        withExtendedLifetime((retainedSession, retainedViewModel)) {}
-    }
-
     func testFixtureFailureTraceRecordsCancellationAndFiltersFrameworkErrors() async {
         let trace = RestorationFixtureFailureTrace()
         trace.invocationID = "restoration-observer-test"
