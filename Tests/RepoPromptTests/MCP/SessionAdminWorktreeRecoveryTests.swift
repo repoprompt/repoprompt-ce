@@ -526,7 +526,7 @@ final class DelegationScopeEndingTests: XCTestCase {
     }
 
     func testDeletionCommitCarriesOriginRemovalAndOneClockToStoreOnlyScopes() async throws {
-        for origin: AgentSessionDeletionOrigin in [.userUI, .agentCleanup(UUID()), .automaticDiscard, .composeTabBatch] {
+        for origin: AgentSessionDeletionOrigin in [.unknown, .mcpClient(), .mcpClient(UUID()), .userUI, .agentCleanup(UUID()), .automaticDiscard, .composeTabBatch] {
             for removed in [false, true] {
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                 defer { try? FileManager.default.removeItem(at: directory) }
@@ -558,7 +558,7 @@ final class DelegationScopeEndingTests: XCTestCase {
                 let record = DomainDelegationScopeRecord(grant: grant, generation: 0, state: .revoked)
                 let status = SessionAdminMCPToolService.scopeValue(record, now: date, ending: ending).objectValue?["ending"]?.objectValue
                 XCTAssertEqual(status?["file_removed"], .bool(removed))
-                XCTAssertEqual(status?["initiator"], .string(origin.kind == .agentCleanup ? "agent" : origin.kind == .automaticDiscard ? "system" : "user"))
+                XCTAssertEqual(status?["initiator"], .string(ending.initiator))
                 if origin.actorSessionID != owner { XCTAssertNil(status?["actor_session_id"]) }
                 runtime.freezeForTermination()
             }

@@ -79,6 +79,8 @@ package struct OverseerScopeEnding: Codable, Equatable {
     }
 
     package enum DeletionOrigin: String, Codable {
+        case unknown
+        case mcpClient = "mcp_client"
         case userUI = "user_ui"
         case agentCleanup = "agent_cleanup"
         case automaticDiscard = "automatic_discard"
@@ -91,7 +93,9 @@ package struct OverseerScopeEnding: Codable, Equatable {
         if reason == .historicalUnknown { return "unknown" }
         if reason == .sessionDeleted {
             switch deletionOrigin {
-            case .userUI, .composeTabBatch: return "user"
+            case .userUI: return "user"
+            case .mcpClient: return actorSessionID == nil ? "mcp_client" : "agent"
+            case .unknown, .composeTabBatch: return "unknown"
             case .agentCleanup: return "agent"
             case .automaticDiscard: return "system"
             case nil: return "unknown"

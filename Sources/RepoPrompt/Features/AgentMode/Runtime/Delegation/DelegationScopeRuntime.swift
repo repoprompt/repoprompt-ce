@@ -1137,7 +1137,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Revokes every scope granted to, or rooted at, a durably deleted session.
     @discardableResult
-    func revokeAll(involving sessionID: UUID, origin: AgentSessionDeletionOrigin = .userUI, fileRemoved: Bool? = nil) -> [DomainDelegationScopeRecord] {
+    func revokeAll(involving sessionID: UUID, origin: AgentSessionDeletionOrigin = .unknown, fileRemoved: Bool? = nil) -> [DomainDelegationScopeRecord] {
         let evidence = OverseerScopeEnding(reason: .sessionDeleted, at: now(), actorSessionID: origin.actorSessionID, originatingSessionID: sessionID, deletionOrigin: origin.kind, fileRemoved: fileRemoved)
         deletedSessionIDs.insert(sessionID)
         sessionWideApprovals.remove(sessionID)

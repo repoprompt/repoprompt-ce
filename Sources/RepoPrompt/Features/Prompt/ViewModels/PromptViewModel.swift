@@ -4181,12 +4181,15 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func closeComposeTab(
         _ id: UUID,
+        deletionOrigin: AgentSessionDeletionOrigin = .current,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
-        await removeComposeTabs(
-            withIDs: [id],
-            isMutationContextCurrent: isMutationContextCurrent
-        )
+        await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+            await removeComposeTabs(
+                withIDs: [id],
+                isMutationContextCurrent: isMutationContextCurrent
+            )
+        }
     }
 
     @MainActor

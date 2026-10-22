@@ -1806,7 +1806,7 @@ actor AgentSessionDataService {
                 try await deleteSessionFileDurably(
                     sessionID: candidate.sessionID,
                     fileURL: candidate.fileURL,
-                    origin: AgentSessionDeletionOrigin.current == .userUI ? .composeTabBatch : .current
+                    origin: .current
                 )
             } catch {
                 failures[candidate.tabID] = error

@@ -7,6 +7,11 @@ import RepoPromptShared
 struct AgentSessionDeletionOrigin: Equatable {
     let kind: OverseerScopeEnding.DeletionOrigin
     let actorSessionID: UUID?
+    static let unknown = Self(kind: .unknown, actorSessionID: nil)
+    static func mcpClient(_ caller: UUID? = nil) -> Self {
+        .init(kind: .mcpClient, actorSessionID: caller)
+    }
+
     static let userUI = Self(kind: .userUI, actorSessionID: nil)
     static let automaticDiscard = Self(kind: .automaticDiscard, actorSessionID: nil)
     static let composeTabBatch = Self(kind: .composeTabBatch, actorSessionID: nil)
@@ -14,7 +19,7 @@ struct AgentSessionDeletionOrigin: Equatable {
         .init(kind: .agentCleanup, actorSessionID: caller)
     }
 
-    @TaskLocal static var current: Self = .userUI
+    @TaskLocal static var current: Self = .unknown
 }
 
 /// Process-owned record of which agent sessions are being, or have been, durably deleted.
@@ -65,7 +70,7 @@ final class AgentSessionDeletionRegistry {
     struct AttemptToken: Equatable {
         let sessionID: UUID
         let attemptID: UUID
-        var origin: AgentSessionDeletionOrigin = .userUI
+        var origin: AgentSessionDeletionOrigin = .unknown
     }
 
     private var statesBySession: [UUID: State] = [:]

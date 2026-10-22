@@ -18707,7 +18707,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         guard let session = sessions[tabID], isFreshFirstSendDestination(session) else { return }
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
-            await promptManager?.closeComposeTab(tabID)
+            await promptManager?.closeComposeTab(tabID, deletionOrigin: .automaticDiscard)
         } else {
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)

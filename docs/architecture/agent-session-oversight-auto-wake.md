@@ -99,14 +99,25 @@ Descendants known only to storage are terminalized in the same recursive transac
 the initiating evidence. Explicit child transitions are written deepest-first to preserve their
 own evidence before an ancestor cascade. Session deletion also covers unloaded grants with the
 runtime's exact evidence, including its injected clock, typed `deletion_origin` (`user_ui`,
-`agent_cleanup`, `automatic_discard`, or `compose_tab_batch`), and `file_removed` when known.
+`agent_cleanup`, `mcp_client`, `automatic_discard`, or `unknown`), and `file_removed` when known.
+Unspecified callers default to `unknown`, never the user. Real UI deletion commands explicitly set
+`user_ui`; MCP `close_tab` and external `cleanup_sessions` set `mcp_client`, retaining a routed agent
+caller when proven. `initiator` is `agent` for a proven routed caller, `mcp_client` for an external
+client, and `unknown` when provenance is absent. Legacy `compose_tab_batch` evidence identifies a
+mechanism, not a human actor, and now reports an unknown initiator. Keyboard close currently stashes
+rather than deletes a chat, so it does not produce a deletion ending.
 Already-absent files still commit a deletion fence; `file_removed: false` distinguishes that path.
 Agent cleanup retains its routed caller ID internally. Malformed optional evidence falls back to a
 plain deny tombstone rather than blocking the durable revocation queue.
 
 The monitor and per-grantee MCP history expose the latest 16 endings (dated entries first, UUID
 ascending as a deterministic tie-break). The runtime caches the per-grantee projection rather than
-decoding all history on every status/render. `record(id:)` remains authority-only; only status uses
+decoding all history on every status/render. Only this 16-item projection is bounded: the backing
+`scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
+Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
+children) still record no ending evidence. Passive expiry projection can also hide a grant before
+lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+`record(id:)` remains authority-only; only status uses
 `statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
 scope UUID does not authorize reading its historical details. Scope status also reports continuity
 save state: a failed write still denies authority immediately in this process but must not claim

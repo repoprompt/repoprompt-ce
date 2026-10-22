@@ -1273,7 +1273,7 @@ struct AgentManageMCPToolService {
         let deletionOrigin: AgentSessionDeletionOrigin = if case let .agentSession(callerID) = cleanupCaller {
             .agentCleanup(callerID)
         } else {
-            .userUI
+            .mcpClient()
         }
         /// Deletion is human-only unless the user explicitly enabled full access. Neither spawn
         /// provenance nor an ordinary scope/link can supply this exception. Check before lookup.

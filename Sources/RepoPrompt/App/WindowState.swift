@@ -1245,14 +1245,19 @@ class WindowState: ObservableObject {
         )
     }
 
-    func closeActiveComposeTabFromShortcut() {
+    @discardableResult
+    func closeActiveComposeTabFromShortcut() -> Task<Void, Never>? {
         guard let activeTabID = promptManager.activeComposeTabID,
               promptManager.canCloseActiveComposeTab
         else {
-            return
+            return nil
         }
 
-        Task { await promptManager.stashTab(activeTabID) }
+        return Task {
+            await AgentSessionDeletionOrigin.$current.withValue(.userUI) {
+                await promptManager.stashTab(activeTabID)
+            }
+        }
     }
 
     /// Starts a new Agent session tab (mirrors the titlebar "New Session" control).
@@ -1581,12 +1586,7 @@ class WindowState: ObservableObject {
                         reason: "titlebar_delete_confirmation"
                     )
                 #endif
-                await promptManager.closeComposeTab(
-                    target.tabID,
-                    isMutationContextCurrent: { [weak self] in
-                        self?.agentChatTitleClusterMenuTargetIsValid(target) == true
-                    }
-                )
+                await deleteAgentChatFromTitlebar(target: target)
             }
         }
 
@@ -1595,6 +1595,18 @@ class WindowState: ObservableObject {
         } else {
             applyDelete(alert.runModal())
         }
+    }
+
+    /// Executes the confirmed titlebar Delete action, retaining its stale-target guard.
+    func deleteAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) async {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        await promptManager.closeComposeTab(
+            target.tabID,
+            deletionOrigin: .userUI,
+            isMutationContextCurrent: { [weak self] in
+                self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+            }
+        )
     }
 
     /// Shows or hides the Agent mode New Session titlebar edge accessory.
