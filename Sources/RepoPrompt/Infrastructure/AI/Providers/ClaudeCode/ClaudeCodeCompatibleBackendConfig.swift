@@ -113,6 +113,9 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     var auth: Auth
     var modelBehavior: ModelBehavior
     var updatedAt: Date?
+    /// Nil preserves the backend/Claude Code default; explicit overrides must be positive.
+    var requestTimeoutMilliseconds: Int?
+    var contextWindowTokens: Int?
 
     var normalizedDisplayName: String {
         let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,7 +147,9 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map({ $0 > 0 }) ?? true,
+              contextWindowTokens.map({ $0 > 0 }) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true

@@ -231,12 +231,16 @@ public extension ClaudeCompatibleBackendConfig {
             displayName: normalizedDisplayName,
             baseURL: baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             auth: auth,
-            modelBehavior: normalizedBehavior
+            modelBehavior: normalizedBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens
         )
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map({ $0 > 0 }) ?? true,
+              contextWindowTokens.map({ $0 > 0 }) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true
@@ -277,7 +281,9 @@ public extension ClaudeCompatibleBackendConfig {
             displayName: displayName,
             baseURL: baseURL,
             auth: auth,
-            modelBehavior: overrideBehavior
+            modelBehavior: overrideBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens
         )
     }
 }
@@ -348,6 +354,13 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
                 environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
             }
+        }
+
+        if let timeout = normalizedConfig.requestTimeoutMilliseconds, timeout > 0 {
+            environment["API_TIMEOUT_MS"] = String(timeout)
+        }
+        if let window = normalizedConfig.contextWindowTokens, window > 0 {
+            environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(window)
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {

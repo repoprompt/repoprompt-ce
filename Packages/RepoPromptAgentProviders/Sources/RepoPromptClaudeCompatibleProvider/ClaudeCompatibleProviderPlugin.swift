@@ -62,6 +62,8 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
     public let baseURL: String
     public let auth: ClaudeCompatibleBackendAuth
     public let modelBehavior: ClaudeCompatibleBackendModelBehavior
+    public let requestTimeoutMilliseconds: Int?
+    public let contextWindowTokens: Int?
 
     public init(
         id: ClaudeCompatibleBackendID,
@@ -69,7 +71,9 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         displayName: String,
         baseURL: String,
         auth: ClaudeCompatibleBackendAuth,
-        modelBehavior: ClaudeCompatibleBackendModelBehavior
+        modelBehavior: ClaudeCompatibleBackendModelBehavior,
+        requestTimeoutMilliseconds: Int? = nil,
+        contextWindowTokens: Int? = nil
     ) {
         self.id = id
         self.isEnabled = isEnabled
@@ -77,6 +81,8 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         self.baseURL = baseURL
         self.auth = auth
         self.modelBehavior = modelBehavior
+        self.requestTimeoutMilliseconds = requestTimeoutMilliseconds
+        self.contextWindowTokens = contextWindowTokens
     }
 }
 

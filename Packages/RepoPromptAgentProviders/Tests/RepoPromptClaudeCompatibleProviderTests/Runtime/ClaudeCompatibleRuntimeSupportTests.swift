@@ -2,6 +2,36 @@
 import XCTest
 
 final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
+    func testCustomBackendPersistsAndAppliesRequestLimits() throws {
+        let preset = ClaudeCompatibleBackendConfig(
+            id: .custom, isEnabled: true, displayName: "Local", baseURL: "http://127.0.0.1:8000",
+            auth: .anthropicAPIKey, modelBehavior: .claudeSlotMapping(.init(haiku: "qwen", sonnet: "qwen", opus: "qwen"))
+        )
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(preset)) as? [String: Any])
+        document["requestTimeoutMilliseconds"] = 600_000
+        document["contextWindowTokens"] = 262_144
+        let config = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+        let restored = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(config))
+        let overridden = restored.normalized.withSlotOverride(slot: "sonnet", backendModelID: "other")
+        let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: overridden, apiKey: "dummy")
+        XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
+        XCTAssertEqual(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "262144")
+
+        for invalid in [0, -1] {
+            document["requestTimeoutMilliseconds"] = invalid
+            document["contextWindowTokens"] = invalid
+            let invalidConfig = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+            XCTAssertFalse(invalidConfig.isValid)
+            let invalidEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalidConfig, apiKey: "dummy")
+            XCTAssertNil(invalidEnvironment["API_TIMEOUT_MS"])
+            XCTAssertNil(invalidEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        }
+        let legacy = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(preset))
+        let legacyEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: legacy, apiKey: "dummy")
+        XCTAssertNil(legacyEnvironment["API_TIMEOUT_MS"])
+        XCTAssertNil(legacyEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+    }
+
     func testRuntimeLaunchAndHeadlessSmokesPromptEnvironmentAndModels() async throws {
         let decorated = ClaudeCompatiblePromptDelivery.decoratedUserMessage(
             "Do the work",

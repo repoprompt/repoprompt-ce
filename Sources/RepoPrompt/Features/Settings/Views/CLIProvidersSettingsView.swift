@@ -1074,6 +1074,9 @@ struct CLIProvidersSettingsView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
             }
 
+            customBackendLimitField("Request timeout (milliseconds)", keyPath: \.requestTimeoutMilliseconds)
+            customBackendLimitField("Context window (tokens)", keyPath: \.contextWindowTokens)
+
             // Auth style picker
             HStack(spacing: 8) {
                 Text("Auth header")
@@ -1366,6 +1369,20 @@ struct CLIProvidersSettingsView: View {
                     .font(.system(size: 11))
             }
         }
+    }
+
+    private func customBackendLimitField(
+        _ title: String,
+        keyPath: WritableKeyPath<ClaudeCodeCompatibleBackendConfig, Int?>
+    ) -> some View {
+        CompatibleBackendLimitField(title: title, value: Binding(
+            get: { viewModel.compatibleBackendConfig(for: .custom)[keyPath: keyPath] },
+            set: { value in
+                var config = viewModel.compatibleBackendConfig(for: .custom)
+                config[keyPath: keyPath] = value
+                viewModel.saveCompatibleBackendConfig(config)
+            }
+        ))
     }
 
     // MARK: Advanced disclosure (base URL + auth style) for presets
@@ -2977,5 +2994,40 @@ struct CLIProvidersSettingsView: View {
         showGrokBuildTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+}
+
+private struct CompatibleBackendLimitField: View {
+    let title: String
+    @Binding var value: Int?
+    @State private var input = ""
+
+    private var trimmedInput: String {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isValid: Bool {
+        trimmedInput.isEmpty || Int(trimmedInput).map { $0 > 0 } == true
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            TextField("Claude Code default", text: $input)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .onAppear { input = value.map(String.init) ?? "" }
+                .onChange(of: input) { _, _ in
+                    guard isValid else { return }
+                    value = Int(trimmedInput)
+                }
+                .onChange(of: value) { _, newValue in
+                    input = newValue.map(String.init) ?? ""
+                }
+            Text(isValid ? "Leave blank to use the default. Applies to new launches." : "Enter a positive whole number. Change not saved.")
+                .font(.caption)
+                .foregroundColor(isValid ? .secondary : .red)
+        }
     }
 }

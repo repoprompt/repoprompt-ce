@@ -94,7 +94,9 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             displayName: normalized.normalizedDisplayName,
             baseURL: normalized.normalizedBaseURL ?? normalized.baseURL,
             auth: pluginAuth(from: normalized.auth),
-            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior)
+            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior),
+            requestTimeoutMilliseconds: normalized.requestTimeoutMilliseconds,
+            contextWindowTokens: normalized.contextWindowTokens
         )
     }
 

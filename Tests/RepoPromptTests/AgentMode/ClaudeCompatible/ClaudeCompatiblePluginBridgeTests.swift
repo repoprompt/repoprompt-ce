@@ -4,6 +4,34 @@ import MCP
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
+    func testCustomRequestLimitsSurviveStoreAndRuntimeBridge() throws {
+        let defaults = try makeIsolatedDefaults()
+        let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)
+        var config = ClaudeCodeCompatibleBackendID.custom.defaultPreset
+        config.baseURL = "http://127.0.0.1:8000"
+        config.requestTimeoutMilliseconds = 600_000
+        config.contextWindowTokens = 262_144
+        store.saveConfig(config)
+        let restored = ClaudeCodeCompatibleBackendStore(defaults: defaults).config(for: .custom)
+        XCTAssertTrue(restored.isValid)
+        let environment = ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: restored, apiKey: "dummy")
+        XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
+        XCTAssertEqual(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "262144")
+        config.contextWindowTokens = 0
+        XCTAssertFalse(config.isValid)
+        config.contextWindowTokens = nil
+        config.requestTimeoutMilliseconds = -1
+        XCTAssertFalse(config.isValid)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(restored)) as? [String: Any])
+        legacy.removeValue(forKey: "contextWindowTokens")
+        legacy.removeValue(forKey: "requestTimeoutMilliseconds")
+        let decoded = try JSONDecoder().decode(ClaudeCodeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertNil(decoded.contextWindowTokens)
+        XCTAssertNil(decoded.requestTimeoutMilliseconds)
+        XCTAssertTrue(decoded.isValid)
+    }
+
     @MainActor
     func testNativeSDKToolInputApprovalRoundTripPreservesMCPTypesAndStrictInventoryLimits() throws {
         let cases: [(literal: String, value: Value, acceptedLimit: Int?)] = [
