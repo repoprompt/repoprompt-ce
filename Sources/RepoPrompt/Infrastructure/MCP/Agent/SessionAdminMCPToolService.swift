@@ -236,7 +236,7 @@ struct SessionAdminMCPToolService {
             }
             var value = Self.requestValue(request)
             value["result"] = .string(request.state.label)
-            if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
+            if case let .granted(scopeID) = request.state, let record = runtime.statusRecord(id: scopeID) {
                 value["scope"] = Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))
             }
             return Self.withScopeAvailability(value, runtime: runtime)
@@ -245,7 +245,7 @@ struct SessionAdminMCPToolService {
             return Self.withScopeAvailability(["result": .string("scope_authority_unavailable")], runtime: runtime)
         }
         if let scopeID = try Self.parseUUID(args["scope_id"], field: "scope_id") {
-            guard let record = runtime.record(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
+            guard let record = runtime.statusRecord(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
                 throw Self.unavailableError
             }
             return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))], runtime: runtime)
@@ -647,10 +647,12 @@ struct SessionAdminMCPToolService {
         if let ending {
             var evidence: [String: Value] = ["reason": .string(ending.reason.rawValue)]
             if let at = ending.at { evidence["at"] = .string(ISO8601DateFormatter().string(from: at)) }
-            if let actor = ending.actorSessionID { evidence["actor_session_id"] = .string(actor.uuidString) }
+            if let actor = ending.actorSessionID, actor == record.grant.granteeSessionID { evidence["actor_session_id"] = .string(actor.uuidString) }
             if let origin = ending.originatingScopeID { evidence["originating_scope_id"] = .string(origin.uuidString) }
-            if let session = ending.originatingSessionID { evidence["originating_session_id"] = .string(session.uuidString) }
-            evidence["initiator"] = .string(ending.reason == .historicalUnknown ? "unknown" : ending.reason == .userRevoked || ending.reason == .fullAccessDisabled ? "user" : ending.reason == .granteeReleased ? "grantee" : "system")
+            if let session = ending.originatingSessionID, session == record.grant.granteeSessionID { evidence["originating_session_id"] = .string(session.uuidString) }
+            evidence["initiator"] = .string(ending.initiator)
+            if let origin = ending.deletionOrigin { evidence["deletion_origin"] = .string(origin.rawValue) }
+            if let removed = ending.fileRemoved { evidence["file_removed"] = .bool(removed) }
             value["ending"] = .object(evidence)
         }
         switch record.grant.kind {

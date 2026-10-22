@@ -1624,9 +1624,9 @@ final class AgentSessionLinkRuntimeBridge {
         // Awaited by the registry rather than spawned: the deleting caller must not proceed to
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
         // still live and its saved rows still on disk.
-        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID in
+        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID, origin, fileRemoved in
             guard let self else { return }
-            await handleCommittedSessionDeletion(sessionID)
+            await handleCommittedSessionDeletion(sessionID, origin: origin, fileRemoved: fileRemoved)
             self.host?.agentSessionLinkForgetDeletedSubagent(sessionID)
         }
         AgentSessionDeletionRegistry.shared.changeObserver = { [weak self] in
@@ -2393,12 +2393,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// of that UUID in any window may still be read through a grant. Only then is durable intent
     /// removed, and a disk failure there is recorded as a warning rather than pretending the deletion
     /// rolled back.
-    private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
+    private func handleCommittedSessionDeletion(_ sessionID: UUID, origin: AgentSessionDeletionOrigin, fileRemoved: Bool?) async {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         // Revoke synchronously before the first suspension. The deletion registry retains its
         // commit task through this callback, so an overlapping quit cannot seal stale scope intent.
-        delegationScopes.revokeAll(involving: sessionID)
+        delegationScopes.revokeAll(involving: sessionID, origin: origin, fileRemoved: fileRemoved)
         await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same

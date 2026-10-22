@@ -55,6 +55,7 @@ package enum OverseerContinuityMutation: Codable, Equatable {
     case endScope(String, OverseerScopeEnding, original: OverseerContinuityRow?)
     /// A committed session deletion fences later legacy imports, including currently unloaded scopes.
     case deletedSession(String)
+    case deletedSessionWithEvidence(String, OverseerScopeEnding)
     /// Explicit link assertion or ownership transition; expected revision is a compare-and-swap.
     case put(OverseerContinuityRow, expectedRevision: Int64?)
     case remove(kind: OverseerContinuityKind, id: String, expectedRevision: Int64)
@@ -69,6 +70,35 @@ package struct OverseerScopeEnding: Codable, Equatable {
         case expired
         case fullAccessDisabled = "full_access_disabled"
         case historicalUnknown = "historical_unknown"
+        case fullAccessReconciled = "full_access_reconciled"
+
+        package init(from decoder: any Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Self(rawValue: raw) ?? .historicalUnknown
+        }
+    }
+
+    package enum DeletionOrigin: String, Codable {
+        case userUI = "user_ui"
+        case agentCleanup = "agent_cleanup"
+        case automaticDiscard = "automatic_discard"
+        case composeTabBatch = "compose_tab_batch"
+    }
+
+    package let deletionOrigin: DeletionOrigin?
+    package let fileRemoved: Bool?
+    package var initiator: String {
+        if reason == .historicalUnknown { return "unknown" }
+        if reason == .sessionDeleted {
+            switch deletionOrigin {
+            case .userUI, .composeTabBatch: return "user"
+            case .agentCleanup: return "agent"
+            case .automaticDiscard: return "system"
+            case nil: return "unknown"
+            }
+        }
+        if reason == .userRevoked || reason == .fullAccessDisabled { return "user" }
+        return reason == .granteeReleased ? "grantee" : "system"
     }
 
     package let reason: Reason
@@ -77,7 +107,9 @@ package struct OverseerScopeEnding: Codable, Equatable {
     package let originatingScopeID: UUID?
     package let originatingSessionID: UUID?
 
-    package init(reason: Reason, at: Date? = nil, actorSessionID: UUID? = nil, originatingScopeID: UUID? = nil, originatingSessionID: UUID? = nil) {
+    package init(reason: Reason, at: Date? = nil, actorSessionID: UUID? = nil, originatingScopeID: UUID? = nil, originatingSessionID: UUID? = nil, deletionOrigin: DeletionOrigin? = nil, fileRemoved: Bool? = nil) {
+        self.deletionOrigin = deletionOrigin
+        self.fileRemoved = fileRemoved
         self.reason = reason
         self.at = at
         self.actorSessionID = actorSessionID

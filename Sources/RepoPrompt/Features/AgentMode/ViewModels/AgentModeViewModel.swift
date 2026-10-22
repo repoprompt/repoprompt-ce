@@ -12206,7 +12206,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if bindingOnlyMCPSessionTargetRecoveryIDs.contains(recoveryID) {
             do {
-                try await agentSessionDeleter(sessionID, workspace)
+                try await AgentSessionDeletionOrigin.$current.withValue(.automaticDiscard) {
+                    try await agentSessionDeleter(sessionID, workspace)
+                }
             } catch {
                 return .retainedForRetry
             }
@@ -12221,7 +12223,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .complete
             }
         } else if target.origin == .createdNewTab {
-            let failures = await agentSessionsBatchDeleter([target.tabID], workspace)
+            let failures = await AgentSessionDeletionOrigin.$current.withValue(.automaticDiscard) {
+                await agentSessionsBatchDeleter([target.tabID], workspace)
+            }
             guard failures[target.tabID] == nil else { return .retainedForRetry }
             guard pendingMCPSessionTargetDiscardIsCurrent(
                 recoveryID: recoveryID,
@@ -12313,7 +12317,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessions.removeValue(forKey: target.tabID)
         tabsWithActiveAgentRun.remove(target.tabID)
         mcpControlledTabIDs.remove(target.tabID)
-        await promptManager?.closeComposeTab(target.tabID)
+        await AgentSessionDeletionOrigin.$current.withValue(.automaticDiscard) {
+            await promptManager?.closeComposeTab(target.tabID)
+        }
     }
 
     func mcpDeactivateControlContext(

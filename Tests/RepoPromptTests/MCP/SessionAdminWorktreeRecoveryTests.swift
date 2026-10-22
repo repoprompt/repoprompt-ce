@@ -429,6 +429,8 @@ final class DelegationScopeEndingTests: XCTestCase {
             let restored = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { clock }, notifyCatalogChanged: { _ in })
             await restored.bootstrap(store: store())
             XCTAssertFalse(restored.hasLiveScope(grantedTo: caller))
+            XCTAssertNil(restored.record(id: scope.id), "Restored history must not participate in authorization")
+            XCTAssertEqual(restored.statusRecord(id: scope.id)?.id, scope.id)
             XCTAssertEqual(restored.ending(for: scope.id), evidence)
             XCTAssertEqual(restored.ending(for: child.id), evidence)
             XCTAssertFalse(restored.hasLiveScope(grantedTo: childSession))
@@ -467,7 +469,8 @@ final class DelegationScopeEndingTests: XCTestCase {
         await restored.bootstrap(store: store())
         await restored.flushPersistence()
         XCTAssertEqual(restored.ending(for: scope.id)?.reason, .expired)
-        XCTAssertEqual(restored.record(id: scope.id)?.state, .expired)
+        XCTAssertEqual(restored.statusRecord(id: scope.id)?.state, .expired)
+        XCTAssertNil(restored.record(id: scope.id))
         XCTAssertFalse(restored.hasLiveScope(grantedTo: caller))
         let reopened = store()
         _ = reopened.loadForLaunch()
@@ -513,13 +516,99 @@ final class DelegationScopeEndingTests: XCTestCase {
         let childOwner = UUID()
         let child = try runtime.attenuate(parentScopeID: scope.id, presentedGeneration: scope.generation, caller: .agentSession(owner), newGranteeSessionID: childOwner, newGranteeMemberships: [.init(scopeID: scope.id, targetSessionID: childOwner, basis: .allSessions)], capabilities: [.observe], guardrails: .init()).get()
         enabled = false
-        runtime.reconcileGlobalAutoApprove()
+        runtime.reconcileGlobalAutoApprove(userInitiated: true)
         XCTAssertEqual(runtime.ending(for: scope.id)?.reason, .fullAccessDisabled)
         XCTAssertEqual(runtime.ending(for: child.id)?.originatingScopeID, scope.id)
         XCTAssertEqual(runtime.ending(for: child.id)?.reason, .fullAccessDisabled)
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: owner))
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: childOwner))
         runtime.freezeForTermination()
+    }
+
+    func testDeletionCommitCarriesOriginRemovalAndOneClockToStoreOnlyScopes() async throws {
+        for origin: AgentSessionDeletionOrigin in [.userUI, .agentCleanup(UUID()), .automaticDiscard, .composeTabBatch] {
+            for removed in [false, true] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let store = DelegationScopeStore(fileURL: directory.appendingPathComponent("delegationScopes.json"), backupsDirectoryURL: directory, mode: .enabled)
+                let date = Date(timeIntervalSince1970: 2_000_000), owner = UUID(), id = UUID()
+                let grant = DomainDelegationScopeGrant(id: id, granteeSessionID: owner, kind: .tree(rootSessionID: owner), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: date)
+                // Deliberately do not load this grant into runtime: the deletion mutation must
+                // terminalize scopes owned by another writer with the very same evidence.
+                let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { date }, notifyCatalogChanged: { _ in })
+                await runtime.bootstrap(store: store)
+                XCTAssertEqual(store.record(operationID: UUID(), grants: [grant], revoked: []), .applied)
+                let registry = AgentSessionDeletionRegistry.test_instance(scopePersistenceMode: .ephemeral)
+                var committedOrigin: AgentSessionDeletionOrigin?
+                registry.commitObserver = { sessionID, observedOrigin, fileRemoved in
+                    committedOrigin = observedOrigin
+                    runtime.revokeAll(involving: sessionID, origin: observedOrigin, fileRemoved: fileRemoved)
+                }
+                let token = try registry.beginDurableDeletion(sessionID: owner, origin: origin)
+                await registry.didCommitDurableDeletion(token, fileRemoved: removed)
+                await runtime.flushPersistence()
+                _ = store.loadForLaunch()
+                let ending = try XCTUnwrap(store.endedScopes[id]?.ending)
+                XCTAssertEqual(committedOrigin, origin)
+                XCTAssertEqual(ending.at, date)
+                XCTAssertEqual(ending.deletionOrigin, origin.kind)
+                XCTAssertEqual(ending.actorSessionID, origin.actorSessionID)
+                XCTAssertEqual(ending.fileRemoved, removed)
+                XCTAssertNil(ending.originatingScopeID, "Store must not fabricate an origin different from runtime")
+                let record = DomainDelegationScopeRecord(grant: grant, generation: 0, state: .revoked)
+                let status = SessionAdminMCPToolService.scopeValue(record, now: date, ending: ending).objectValue?["ending"]?.objectValue
+                XCTAssertEqual(status?["file_removed"], .bool(removed))
+                XCTAssertEqual(status?["initiator"], .string(origin.kind == .agentCleanup ? "agent" : origin.kind == .automaticDiscard ? "system" : "user"))
+                if origin.actorSessionID != owner { XCTAssertNil(status?["actor_session_id"]) }
+                runtime.freezeForTermination()
+            }
+        }
+    }
+
+    func testHistoryOutputIsBoundedOrderedAndGranteeIndexedWithMissingDates() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DelegationScopeStore(fileURL: directory.appendingPathComponent("delegationScopes.json"), backupsDirectoryURL: directory, mode: .enabled)
+        let owner = UUID(), outsider = UUID(), date = Date(timeIntervalSince1970: 2_000_000)
+        var expected: [UUID] = []
+        for i in 0 ..< 20 {
+            let id = try XCTUnwrap(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", i)))
+            let grant = DomainDelegationScopeGrant(id: id, granteeSessionID: owner, kind: .tree(rootSessionID: owner), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: date)
+            let ending = try OverseerEndedScope(ending: .init(reason: .userRevoked, at: i < 14 ? date.addingTimeInterval(Double(i)) : nil), originalPayload: JSONEncoder().encode(grant))
+            XCTAssertEqual(store.record(operationID: UUID(), grants: [], revoked: [id], endings: [id: ending]), .applied)
+            expected.append(id)
+        }
+        expected = Array(expected.prefix(14).reversed()) + Array(expected.suffix(6))
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { date }, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
+        XCTAssertEqual(runtime.recentScopeEndings.map(\.id), Array(expected.prefix(16)))
+        XCTAssertEqual(runtime.scopes(grantedTo: owner).map(\.id), Array(expected.prefix(16)))
+        XCTAssertTrue(runtime.scopes(grantedTo: outsider).isEmpty)
+        XCTAssertEqual(runtime.recentScopeEndings.map(\.id), Array(expected.prefix(16)), "Cached projection remains stable")
+        for id in expected {
+            XCTAssertNil(runtime.record(id: id))
+        }
+        runtime.freezeForTermination()
+    }
+
+    func testMalformedEvidenceStillPersistsDenyAndFutureReasonPreservesOriginalPayload() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DelegationScopeStore(fileURL: directory.appendingPathComponent("delegationScopes.json"), backupsDirectoryURL: directory, mode: .enabled)
+        let id = UUID(), owner = UUID(), date = Date(timeIntervalSince1970: 2_000_000)
+        let grant = DomainDelegationScopeGrant(id: id, granteeSessionID: owner, kind: .tree(rootSessionID: owner), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: date)
+        XCTAssertEqual(store.record(operationID: UUID(), grants: [grant], revoked: []), .applied)
+        XCTAssertEqual(store.record(operationID: UUID(), grants: [], revoked: [id], endings: [id: .init(ending: .init(reason: .userRevoked), originalPayload: Data("malformed".utf8))]), .applied)
+        _ = store.loadForLaunch()
+        XCTAssertTrue(store.currentGrants.isEmpty)
+        XCTAssertEqual(store.endedScopes[id]?.ending.reason, .historicalUnknown)
+        let original = try JSONEncoder().encode(grant)
+        let envelope = OverseerEndedScope(ending: .init(reason: .userRevoked, at: date), originalPayload: original)
+        let bytes = try JSONEncoder().encode(envelope)
+        let future = try XCTUnwrap(String(data: bytes, encoding: .utf8)).replacingOccurrences(of: "user_revoked", with: "future_reason")
+        let decoded = try JSONDecoder().decode(OverseerEndedScope.self, from: Data(future.utf8))
+        XCTAssertEqual(decoded.ending.reason, .historicalUnknown)
+        XCTAssertEqual(decoded.originalPayload, original)
     }
 
     func testTerminalRetryRetainsFirstEvidenceAndHistoricalUnknownIsNotAttributed() throws {

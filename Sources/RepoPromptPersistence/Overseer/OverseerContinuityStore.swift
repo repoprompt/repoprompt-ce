@@ -291,11 +291,14 @@ package final class OverseerContinuityStore: @unchecked Sendable {
             }
             return ids
         case let .deletedSession(id):
+            return try apply(.deletedSessionWithEvidence(id, .init(reason: .sessionDeleted, originatingSessionID: UUID(uuidString: id))), revision: revision, db: db)
+        case let .deletedSessionWithEvidence(id, ending):
+            guard ending.reason == .sessionDeleted, ending.originatingSessionID == UUID(uuidString: id) else { throw OverseerContinuityError.invalidRecord }
             try db.execute("INSERT INTO deleted_sessions VALUES (?,?) ON CONFLICT(id) DO NOTHING", [.text(id), .integer(revision)])
             let roots = try db.rows("SELECT id FROM continuity_rows WHERE kind='scope' AND (owner_id=? OR anchor_id=?)", [.text(id), .text(id)]) { try SessionCatalogDatabase.string($0) }
             var affected: [String] = []
             for root in roots {
-                affected += try apply(.endScope(root, .init(reason: .sessionDeleted, at: Date(), originatingScopeID: UUID(uuidString: root), originatingSessionID: UUID(uuidString: id)), original: nil), revision: revision, db: db)
+                affected += try apply(.endScope(root, ending, original: nil), revision: revision, db: db)
             }
             try db.execute("UPDATE continuity_rows SET terminal=1,revision=? WHERE kind='link' AND (owner_id=? OR anchor_id=?)", [.integer(revision), .text(id), .text(id)])
             return affected
@@ -392,7 +395,7 @@ package final class OverseerContinuityStore: @unchecked Sendable {
                     id = row.id
                 case let .revokeScope(value): kind = .scope
                     id = value
-                case .remove, .deletedSession, .endScope: throw OverseerContinuityError.invalidRecord
+                case .remove, .deletedSession, .deletedSessionWithEvidence, .endScope: throw OverseerContinuityError.invalidRecord
                 }
                 if try db.integer("SELECT 1 FROM continuity_rows WHERE kind=? AND id=?", [.text(kind.rawValue), .text(id)]) != nil {
                     outcome = "destination_wins"

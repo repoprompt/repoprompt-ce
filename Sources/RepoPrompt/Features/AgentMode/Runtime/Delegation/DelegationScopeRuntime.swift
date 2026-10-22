@@ -223,6 +223,7 @@ final class DelegationScopeRuntime: ObservableObject {
         let grants: [DomainDelegationScopeGrant]
         let revoked: [UUID]
         var deletedSessions: [UUID] = []
+        var deletionEndings: [UUID: OverseerScopeEnding] = [:]
         var endings: [UUID: OverseerEndedScope] = [:]
     }
 
@@ -251,20 +252,51 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Revoked/released scope IDs, newest last. Persisted as tombstones honored by `reactivate`.
     private var revokedScopeIDs: [UUID] = []
-    private var scopeEndings: [UUID: OverseerEndedScope] = [:]
+    private var scopeEndings: [UUID: OverseerEndedScope] = [:] {
+        didSet { endingRecordsByGrantee = nil
+            recentEndingCache = nil
+        }
+    }
+
+    private var endingRecordsByGrantee: [UUID: [DomainDelegationScopeRecord]]?
+    private var recentEndingCache: [EndingSummary]?
+
+    private func buildEndingIndexIfNeeded() {
+        guard endingRecordsByGrantee == nil else { return }
+        var index: [UUID: [DomainDelegationScopeRecord]] = [:]
+        let ordered = scopeEndings.keys.sorted {
+            let a = scopeEndings[$0]?.ending.at ?? .distantPast
+            let b = scopeEndings[$1]?.ending.at ?? .distantPast
+            return a == b ? $0.uuidString < $1.uuidString : a > b
+        }
+        var summaries: [EndingSummary] = []
+        for id in ordered {
+            let record = endedRecord(id: id)
+            if let record, index[record.grant.granteeSessionID, default: []].count < 16 {
+                index[record.grant.granteeSessionID, default: []].append(record)
+            }
+            if summaries.count < 16, let ending = scopeEndings[id]?.ending {
+                summaries.append(.init(id: id, ending: ending, granteeSessionID: record?.grant.granteeSessionID))
+            }
+        }
+        endingRecordsByGrantee = index
+        recentEndingCache = summaries
+    }
 
     struct EndingSummary: Identifiable {
         let id: UUID
         let ending: OverseerScopeEnding
+        let granteeSessionID: UUID?
     }
 
     /// Bounded monitor projection; terminal identities remain in continuity storage.
     var recentScopeEndings: [EndingSummary] {
-        scopeEndings.map { EndingSummary(id: $0.key, ending: $0.value.ending) }
-            .sorted {
-                if $0.ending.at == $1.ending.at { return $0.id.uuidString < $1.id.uuidString }
-                return ($0.ending.at ?? .distantPast) > ($1.ending.at ?? .distantPast)
-            }.prefix(16).map(\.self)
+        buildEndingIndexIfNeeded()
+        return recentEndingCache ?? []
+    }
+
+    func endingGrantee(for scopeID: UUID) -> UUID? {
+        endedRecord(id: scopeID)?.grant.granteeSessionID
     }
 
     func ending(for scopeID: UUID) -> OverseerScopeEnding? {
@@ -277,11 +309,11 @@ final class DelegationScopeRuntime: ObservableObject {
         return .init(grant: grant, generation: 0, state: ended.ending.reason == .expired ? .expired : .revoked)
     }
 
-    private func captureEndings(_ records: [DomainDelegationScopeRecord], reason: OverseerScopeEnding.Reason, origin: UUID? = nil, session: UUID? = nil, actor: UUID? = nil, at date: Date? = nil) {
+    private func captureEndings(_ records: [DomainDelegationScopeRecord], reason: OverseerScopeEnding.Reason, origin: UUID? = nil, session: UUID? = nil, actor: UUID? = nil, at date: Date? = nil, evidence: OverseerScopeEnding? = nil) {
         let endingDate = date ?? now()
         for record in records where scopeEndings[record.id] == nil {
             guard let payload = try? JSONEncoder().encode(record.grant) else { continue }
-            scopeEndings[record.id] = .init(ending: .init(reason: reason, at: endingDate, actorSessionID: actor, originatingScopeID: origin, originatingSessionID: session), originalPayload: payload)
+            scopeEndings[record.id] = .init(ending: evidence ?? .init(reason: reason, at: endingDate, actorSessionID: actor, originatingScopeID: origin, originatingSessionID: session), originalPayload: payload)
         }
     }
 
@@ -509,13 +541,26 @@ final class DelegationScopeRuntime: ObservableObject {
         expireDueScopes()
         let live = authority.scopes(grantedTo: sessionID)
         let known = Set(live.map(\.id))
-        return live + scopeEndings.keys.filter { !known.contains($0) }.compactMap { endedRecord(id: $0) }.filter { $0.grant.granteeSessionID == sessionID }
+        buildEndingIndexIfNeeded()
+        let ended = (endingRecordsByGrantee?[sessionID] ?? []).filter { !known.contains($0.id) }
+        let active = live.filter(\.isActive)
+        let history = (live.filter { !$0.isActive } + ended).sorted {
+            let a = scopeEndings[$0.id]?.ending.at ?? .distantPast
+            let b = scopeEndings[$1.id]?.ending.at ?? .distantPast
+            return a == b ? $0.id.uuidString < $1.id.uuidString : a > b
+        }
+        return active + history.prefix(16)
+    }
+
+    /// History is presentation-only and must never enter authorization lookup.
+    func statusRecord(id: UUID) -> DomainDelegationScopeRecord? {
+        record(id: id) ?? endedRecord(id: id)
     }
 
     func record(id: UUID) -> DomainDelegationScopeRecord? {
         guard canUseAuthority else { return nil }
         expireDueScopes()
-        return authority.record(id: id) ?? endedRecord(id: id)
+        return authority.record(id: id)
     }
 
     func scopeChain(from scopeID: UUID) -> [DomainDelegationScopeRecord] {
@@ -900,14 +945,14 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Off means off: revoke every global grant once the setting is turned off. Called when the
     /// setting changes and before each scoped administration decision.
-    func reconcileGlobalAutoApprove() {
+    func reconcileGlobalAutoApprove(userInitiated: Bool = false) {
         guard canUseAuthority, !authorization.issuesFullAccessGrant else { return }
         let global = authority.liveRecords(now: now()).filter(\.grant.unrestricted)
         guard !global.isEmpty else { return }
         var changed: [DomainDelegationScopeRecord] = []
         for record in global {
             let revoked = authority.revoke(scopeID: record.id)
-            captureEndings(revoked, reason: .fullAccessDisabled, origin: record.id)
+            captureEndings(revoked, reason: userInitiated ? .fullAccessDisabled : .fullAccessReconciled, origin: record.id)
             changed.append(contentsOf: revoked)
         }
         recordRevocations(changed)
@@ -1092,15 +1137,16 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Revokes every scope granted to, or rooted at, a durably deleted session.
     @discardableResult
-    func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+    func revokeAll(involving sessionID: UUID, origin: AgentSessionDeletionOrigin = .userUI, fileRemoved: Bool? = nil) -> [DomainDelegationScopeRecord] {
+        let evidence = OverseerScopeEnding(reason: .sessionDeleted, at: now(), actorSessionID: origin.actorSessionID, originatingSessionID: sessionID, deletionOrigin: origin.kind, fileRemoved: fileRemoved)
         deletedSessionIDs.insert(sessionID)
         sessionWideApprovals.remove(sessionID)
-        if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID) }
+        if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID, evidence: evidence) }
         guard canUseAuthority else { return [] }
         let changed = authority.revokeAll(involving: sessionID)
-        captureEndings(changed, reason: .sessionDeleted, session: sessionID)
+        captureEndings(changed, reason: .sessionDeleted, evidence: evidence)
         recordRevocations(changed)
-        persist(invalidated: [], deletedSessions: [sessionID])
+        persist(invalidated: [], deletedSessions: [sessionID], deletionEndings: [sessionID: evidence])
         return changed
     }
 
@@ -1168,11 +1214,11 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// A committed deletion is a proven-permanent fact, so it is recorded even while quitting: the
     /// next launch must not restore authority granted to, or rooted at, a deleted session.
-    private func revokeAllWhileTerminating(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+    private func revokeAllWhileTerminating(involving sessionID: UUID, evidence: OverseerScopeEnding) -> [DomainDelegationScopeRecord] {
         let changed = authority.revokeAll(involving: sessionID)
-        captureEndings(changed, reason: .sessionDeleted, session: sessionID)
+        captureEndings(changed, reason: .sessionDeleted, evidence: evidence)
         revokedScopeIDs.append(contentsOf: changed.map(\.id))
-        persist(invalidated: changed.map(\.id), deletedSessions: [sessionID])
+        persist(invalidated: changed.map(\.id), deletedSessions: [sessionID], deletionEndings: [sessionID: evidence])
         return changed
     }
 
@@ -1327,7 +1373,7 @@ final class DelegationScopeRuntime: ObservableObject {
     }
 
     /// Immutable row deltas from a live decision, never a replacement snapshot.
-    private func persist(invalidated: [UUID], deletedSessions: [UUID] = []) {
+    private func persist(invalidated: [UUID], deletedSessions: [UUID] = [], deletionEndings: [UUID: OverseerScopeEnding] = [:]) {
         guard persistenceMode == .requiresStore, availability != .ephemeral else { return }
         let grants = authority.activeGrants.filter { !queuedGrantIDs.contains($0.id) }
         guard !grants.isEmpty || !invalidated.isEmpty || !deletedSessions.isEmpty else { return }
@@ -1342,8 +1388,8 @@ final class DelegationScopeRuntime: ObservableObject {
         // durability. If the entire write fails, only this process knows the deny; report that
         // limitation honestly and retain the exact operation for retry.
         if !invalidated.isEmpty || !deletedSessions.isEmpty {
-            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: invalidated, deletedSessions: deletedSessions, endings: scopeEndings.filter { invalidated.contains($0.key) })
-            let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions, endings: terminal.endings) ?? .pending
+            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: invalidated, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: scopeEndings.filter { invalidated.contains($0.key) })
+            let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions, deletionEndings: terminal.deletionEndings, endings: terminal.endings) ?? .pending
             lastPersistenceOutcome = outcome
             if outcome == .applied || outcome == .unchanged {
                 lastContinuityOperationID = terminal.id
@@ -1365,7 +1411,7 @@ final class DelegationScopeRuntime: ObservableObject {
             guard let self else { return }
             while let pending = pendingSaves.first {
                 let outcome = await Task.detached {
-                    store.record(operationID: pending.id, grants: pending.grants, revoked: pending.revoked, deletedSessions: pending.deletedSessions, endings: pending.endings)
+                    store.record(operationID: pending.id, grants: pending.grants, revoked: pending.revoked, deletedSessions: pending.deletedSessions, deletionEndings: pending.deletionEndings, endings: pending.endings)
                 }.value
                 guard let index = pendingSaves.firstIndex(where: { $0.id == pending.id }) else { continue }
                 lastPersistenceOutcome = outcome

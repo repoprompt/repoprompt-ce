@@ -197,12 +197,14 @@ struct DelegationActiveScopesSection: View {
                     DisclosureGroup("Recently ended delegations") {
                         ForEach(endings) { item in
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Scope \(item.id.uuidString)")
+                                Text(item.granteeSessionID.flatMap(DelegationDisplayNames.sessionTitle) ?? "Ended delegation")
                                 Text(item.ending.reason.rawValue.replacingOccurrences(of: "_", with: " "))
+                                if let origin = item.ending.deletionOrigin { Text("Deletion: \(origin.rawValue.replacingOccurrences(of: "_", with: " "))") }
+                                if let removed = item.ending.fileRemoved { Text(removed ? "Session file removed" : "Session file was already absent") }
                                 if let at = item.ending.at { Text(at.formatted(date: .abbreviated, time: .standard)) }
-                                if let actor = item.ending.actorSessionID { Text("Initiating session: \(actor.uuidString)") }
-                                if let origin = item.ending.originatingScopeID { Text("Originating scope: \(origin.uuidString)") }
-                                if let session = item.ending.originatingSessionID { Text("Deleted session: \(session.uuidString)") }
+                                if let actor = item.ending.actorSessionID { Text("Initiating session: \(DelegationDisplayNames.sessionTitle(actor) ?? "Deleted or unavailable session")") }
+                                if let origin = item.ending.originatingScopeID { Text("Originating delegation: \(runtime.endingGrantee(for: origin).flatMap(DelegationDisplayNames.sessionTitle) ?? "Unavailable delegation")") }
+                                if let session = item.ending.originatingSessionID { Text("Deleted session: \(DelegationDisplayNames.sessionTitle(session) ?? "Deleted or unavailable session")") }
                             }
                             .font(.caption2)
                             .foregroundStyle(.secondary)
