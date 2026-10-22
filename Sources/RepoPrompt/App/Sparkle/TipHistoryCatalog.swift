@@ -79,7 +79,7 @@ enum TipHistoryLoadError: Error, Equatable {
 enum TipHistoryRole: String { case legacy, preparer, transition, successor, unknown }
 enum TipHistorySigningIdentity: String { case legacy, successor, unknown }
 enum TipHistoryInstallationType: String { case application, package, unknown }
-enum TipHistoryEntryOrigin: String { case catalog, seed, unknown }
+enum TipHistoryEntryOrigin: String { case catalog, seed, githubRelease, unknown }
 enum TipHistoryTextSource: String { case reviewed, commit }
 enum TipHistoryMetadataProblem: String, Equatable {
     case identity = "Unknown or inconsistent signing identity"
@@ -482,7 +482,7 @@ enum TipHistoryCatalogDecoder {
             if commitRange == nil || (commitRange?.count ?? -1) < 0 || (commitRange?.fromCommit.map { !TipHistoryRepository.matches($0, #"^[0-9a-f]{40}$"#) } ?? false) { problem = .provenance }
             let source = TipHistoryTextSource(rawValue: titleSource ?? "")
             let entryOrigin = TipHistoryEntryOrigin(rawValue: origin ?? "") ?? .unknown
-            if !TipHistoryRepository.validTag(tag ?? "") || !TipHistoryRepository.matches(releaseCommit ?? "", #"^[0-9a-f]{40}$"#) || shortSHA != releaseCommit.map({ String($0.prefix(12)) }) || tag != shortSHA.map({ "tip-" + $0 }) || date == nil || sanitize(marketingVersion ?? "", limit: 40).isEmpty || entryOrigin == .unknown || (entryOrigin == .seed && historyCatalogSha256 != nil) || hasHistoryUI == nil || (historyCatalogSha256.map { !TipHistoryRepository.matches($0, #"^[0-9a-f]{64}$"#) } ?? false) {
+            if !TipHistoryRepository.validTag(tag ?? "") || !TipHistoryRepository.matches(releaseCommit ?? "", #"^[0-9a-f]{40}$"#) || shortSHA != releaseCommit.map({ String($0.prefix(12)) }) || tag != shortSHA.map({ "tip-" + $0 }) || date == nil || sanitize(marketingVersion ?? "", limit: 40).isEmpty || (entryOrigin != .catalog && entryOrigin != .seed) || (entryOrigin == .seed && historyCatalogSha256 != nil) || hasHistoryUI == nil || (historyCatalogSha256.map { !TipHistoryRepository.matches($0, #"^[0-9a-f]{64}$"#) } ?? false) {
                 problem = .provenance
             }
             let text = sanitize(title ?? "", limit: 90)

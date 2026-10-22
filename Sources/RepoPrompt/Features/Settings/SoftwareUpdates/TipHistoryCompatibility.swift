@@ -25,7 +25,7 @@ struct TipHistoryInstallationContext: Equatable {
 
 enum TipHistoryDirection: Equatable { case older, newer }
 enum TipHistoryCaution: Equatable {
-    case dataCompatibilityNotGuaranteed, barrierUnknownInstalledOutsideHistory, credentialMigrationPaused
+    case dataCompatibilityNotGuaranteed, barrierUnknownInstalledOutsideHistory, credentialMigrationPaused, downloadOnlyNonOfficial
 
     var message: String {
         switch self {
@@ -35,6 +35,8 @@ enum TipHistoryCaution: Equatable {
             "RepoPrompt cannot check data-format changes between these builds."
         case .credentialMigrationPaused:
             "Credential migration is paused on this Mac. Installing a different build does not complete it."
+        case .downloadOnlyNonOfficial:
+            "This is not an official release installation. You may save a verified official build, but this does not approve replacing this app or migrating its data or credentials."
         }
     }
 }
@@ -77,6 +79,7 @@ enum TipHistoryAvailability: Equatable {
     var badge: String {
         switch self {
         case .installed: "Installed"
+        case let .available(_, cautions) where cautions.contains(.downloadOnlyNonOfficial): "Download only"
         case .available(.older, _): "Older"
         case .available(.newer, _): "Newer"
         case .unavailable: "Unavailable"
@@ -91,7 +94,8 @@ enum TipHistoryCompatibility {
         let matchesIdentity = (context.runningIdentity == .legacy && entry.signingIdentity == .legacy) ||
             (context.runningIdentity == .successor && entry.signingIdentity == .successor)
         if let installed = context.installedBuild, installed == entry.build, matchesIdentity { return .installed }
-        guard context.runningIdentity != .nonOfficial else { return .unavailable(.nonOfficialRunningBuild) }
+        let downloadOnly = context.runningIdentity == .nonOfficial && entry.origin == .githubRelease
+        guard context.runningIdentity != .nonOfficial || downloadOnly else { return .unavailable(.nonOfficialRunningBuild) }
         guard entry.role != .transition, entry.installationType == .application, entry.download != nil else {
             return .unavailable(.transitionInstaller)
         }
@@ -103,7 +107,7 @@ enum TipHistoryCompatibility {
         }
         guard entry.architectures.contains(context.architecture) else { return .unavailable(.unsupportedArchitecture) }
         guard let installed = context.installedBuild else { return .unavailable(.unorderableInstalledBuild) }
-        var cautions: [TipHistoryCaution] = []
+        var cautions: [TipHistoryCaution] = downloadOnly ? [.downloadOnlyNonOfficial, .dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory] : []
         let older = entry.build < installed
         if older {
             if let barrier = loaded.first(where: { $0.build > entry.build && $0.build <= installed && $0.downgradeBarrier }) {
@@ -114,9 +118,11 @@ enum TipHistoryCompatibility {
             if let unknown = loaded.first(where: { $0.build > entry.build && $0.build <= installed && $0.metadataProblem != nil }) {
                 return .unavailable(.downgradeBarrier(atBuild: unknown.buildNumber, reasons: ["Safety metadata is invalid"]))
             }
-            guard let head = loaded.first, installed <= head.build else { return .unavailable(.historyBehindInstalled) }
-            cautions.append(.dataCompatibilityNotGuaranteed)
-            if !loaded.contains(where: { $0.build == installed }) { cautions.append(.barrierUnknownInstalledOutsideHistory) }
+            guard let head = loaded.first, downloadOnly || installed <= head.build else { return .unavailable(.historyBehindInstalled) }
+            if !cautions.contains(.dataCompatibilityNotGuaranteed) { cautions.append(.dataCompatibilityNotGuaranteed) }
+            if entry.origin == .githubRelease || !loaded.contains(where: { $0.build == installed }) {
+                if !cautions.contains(.barrierUnknownInstalledOutsideHistory) { cautions.append(.barrierUnknownInstalledOutsideHistory) }
+            }
         }
         if context.migrationBlockedMessage != nil { cautions.append(.credentialMigrationPaused) }
         return .available(direction: older ? .older : .newer, cautions: cautions)

@@ -6,12 +6,20 @@ struct TipBuildHistoryView: View {
     @State private var expanded = false
 
     var body: some View {
-        SettingSection(title: "Tip Build History", description: "Download a recent signed and notarized Tip build to reinstall it manually. Sparkle can’t install older versions automatically.") {
+        SettingSection(title: "Tip Build History", description: store.isInspectionOnlyContext ? "Browse existing Tip releases and save a verified official binary for inspection. Do not replace this Debug or unknown-identity app." : "Browse recent Tip releases and download a verified build to reinstall manually. Sparkle can’t install older versions automatically.") {
             if let message = manager.updatesDisabledMessage {
                 Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             } else {
                 DisclosureGroup("Recent Tip builds", isExpanded: $expanded) {
                     VStack(alignment: .leading, spacing: 12) {
+                        if store.historySource == .githubReleases {
+                            Label("GitHub release metadata — not a signed history catalog", systemImage: "info.circle")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("Release titles, commit notes, and download metadata are not catalog-signed. Archives must still pass full verification before they are saved. Data-format coverage is unknown.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else if store.historySource == .signedCatalog {
+                            Text("Source: signed Tip history catalog").font(.caption).foregroundStyle(.secondary)
+                        }
                         catalogStatus
                         if let retry = store.catalogRetryAfter, retry > Date() {
                             Text("The server asked you to wait until \(retry.formatted(date: .omitted, time: .standard)) before retrying.").font(.caption)
@@ -28,8 +36,8 @@ struct TipBuildHistoryView: View {
                                 if let start = store.historyStartBuild { Text("No other Tip builds yet. History starts with build \(start).") }
                                 else { Text("Only the installed build is on this page. Load older builds to see more history.") }
                             }
-                            footer
                         }
+                        if store.pageCount > 0 { footer }
                         if store.downloadState != .idle { TipHistoryDownloadNoticeView(store: store) }
                     }
                     .padding(.top, 10)
@@ -51,16 +59,19 @@ struct TipBuildHistoryView: View {
             }
         case let .failed(error):
             if error == .notPublishedYet {
-                Text("History isn’t available yet. It starts with the first Tip build that publishes it.")
+                Text(store.historySource == .githubReleases ? "Couldn’t load existing Tip releases. Retry or view the official release archive." : "The signed catalog is unavailable. Previously authenticated history cannot be replaced with unsigned release metadata.")
                 archiveLink
                 Button("Retry") { store.refresh() }
             } else {
-                Label(store.rows.isEmpty ? error.message : "Couldn’t refresh — showing previous verified results. \(error.message)", systemImage: "exclamationmark.triangle.fill")
+                Label(store.rows.isEmpty ? error.message : "Couldn’t refresh — showing previously loaded results. \(error.message)", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                 Button("Retry") { store.refresh() }
                 if store.rows.isEmpty { archiveLink }
             }
         case .loaded:
+            if store.rows.isEmpty {
+                Text("No usable builds on this page. Load older releases if available, or view all Tip releases on GitHub.")
+            }
             if store.historyBehindLatestNotice {
                 HStack {
                     Text("History is behind the latest update.").foregroundStyle(.orange)
@@ -106,16 +117,18 @@ struct TipBuildHistoryView: View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text(row.entry.title).font(.headline).textSelection(.enabled)
-            Text(row.entry.titleSource == .reviewed ? "From reviewed release notes" : "From commit messages")
+            Text(row.entry.origin == .githubRelease ? "From GitHub source commit/PR messages (unsigned metadata)" : row.entry.titleSource == .reviewed ? "From reviewed release notes" : "From commit messages")
                 .font(.caption).foregroundStyle(.secondary)
             ForEach(Array(row.entry.notes.enumerated()), id: \.offset) { _, note in
                 Text("• " + note.text).textSelection(.enabled)
             }
-            if row.entry.omittedNoteCount > 0 { Text("and \(row.entry.omittedNoteCount) more commits").font(.caption) }
+            if row.entry.omittedNoteCount > 0 {
+                Text(row.entry.origin == .githubRelease ? "and \(row.entry.omittedNoteCount) more change-note lines" : "and \(row.entry.omittedNoteCount) more commits").font(.caption)
+            }
             Text("Signing identity: \(row.entry.signingIdentity.rawValue) · \(row.entry.bundleIdentifier) · Team \(row.entry.teamIdentifier)")
                 .font(.caption).textSelection(.enabled)
             if !row.entry.hasHistoryUI {
-                Text("This build has no history browser; use Check for Updates to return to the latest version.")
+                Text(row.entry.origin == .githubRelease ? "This release may predate the history browser. On an official installation, use Check for Updates to return to the latest version." : "This build has no history browser; use Check for Updates to return to the latest version.")
                     .font(.caption).foregroundStyle(.orange)
             }
             if row.entry.origin == .seed {
@@ -131,7 +144,7 @@ struct TipBuildHistoryView: View {
                 ForEach(Array(cautions.enumerated()), id: \.offset) { _, caution in
                     Label(caution.message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                 }
-                if direction == .older, !cautions.contains(.barrierUnknownInstalledOutsideHistory) {
+                if direction == .older, row.entry.origin != .githubRelease, !cautions.contains(.barrierUnknownInstalledOutsideHistory) {
                     Text("No known data-format change between this build and the installed build. This is not a compatibility guarantee.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -141,7 +154,7 @@ struct TipBuildHistoryView: View {
                     Text("Sparkle rechecks and may offer a newer build. This does not pin installation to the selected build.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Button("Download build \(row.entry.buildNumber)…") { store.requestDownload(tag: row.id) }
+                    Button(store.isInspectionOnlyContext ? "Download build \(row.entry.buildNumber) for inspection…" : "Download build \(row.entry.buildNumber)…") { store.requestDownload(tag: row.id) }
                         .disabled(store.downloadState.isActive)
                 }
                 if store.downloadState.isActive { Text("Another download is in progress").font(.caption) }
@@ -163,7 +176,7 @@ struct TipBuildHistoryView: View {
             case let .failed(error):
                 Text("Couldn’t load older builds · \(error.message)").foregroundStyle(.orange)
                 Button("Retry older page") { store.loadOlderPage() }
-            case .exhausted: Text("End of recorded history").font(.caption).foregroundStyle(.secondary)
+            case .exhausted: Text(store.historySource == .githubReleases ? "End of available GitHub release metadata" : "End of recorded history").font(.caption).foregroundStyle(.secondary)
             case .pageLimitReached: archiveLink
             }
             if let refreshed = store.lastRefreshedAt {
@@ -172,7 +185,10 @@ struct TipBuildHistoryView: View {
                     Button("Refresh") { store.refresh() }.disabled(store.catalogState == .loading)
                 }
             }
-            Text("\(store.rows.count) recorded builds shown · \(store.rows.count(where: { $0.availability.canDownload })) downloadable on this Mac. Availability depends on identity, system requirements, and known downgrade barriers; it does not prove data compatibility.")
+            if store.releaseOmittedCount > 0 {
+                Text("\(store.releaseOmittedCount) release records omitted because their metadata could not be used.").font(.caption).foregroundStyle(.secondary)
+            }
+            Text("\(store.rows.count) builds shown · \(store.rows.count(where: { $0.availability.canDownload })) downloadable on this Mac. Availability depends on identity, system requirements, and known downgrade barriers; it does not prove data compatibility.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

@@ -383,14 +383,52 @@ the job, and requires the final artifact manifest to record
 owner-only temporary token file and removes it through the job's always-run
 cleanup step.
 
-### Tip history: signing, activation, and retention
+### Tip history: immediate release browsing and optional signed catalogs
 
 Tip history is separate from Sparkle discovery. It does **not** change `appcast.xml` bytes,
 retained migration predecessors, feeds, Apple migration policy, or the Sparkle key. Reviewed
 plain-text fragments live in [`ReleaseNotes/Tip`](../ReleaseNotes/Tip/README.md).
 
-The pipeline is wired but **inactive by default**. With no `Scripts/tip_history_policy.json`,
-the runtime reads `Scripts/tip_history_policy.example.json`; its null activation tag explicitly
+#### Existing releases are usable immediately
+
+The history disclosure works **without catalog activation or a policy change**. If the signed
+head returns 404 and this process has never authenticated a signed catalog, the app immediately
+loads existing public Tip releases from the feed-derived official repository. It presents readable
+release/commit metadata, explicit omitted-record counts, and user-requested pagination bounded to
+ten pages. Nothing is fetched at launch or merely by opening Settings; expanding the disclosure,
+Refresh, and Load older builds are the network entry points.
+
+This source is labeled **GitHub release metadata — not a signed history catalog**. Release titles,
+commit notes, and unsigned asset/checksum metadata do not establish authenticated catalog history
+or complete persistence-format coverage. Older downloads always require both backup acknowledgement
+and a separate unknown-data-format acknowledgement, even if the installed build appears in the
+release list. Every archive still undergoes size/hash/Sparkle-signature verification, confined
+extraction, bundle/official-identity validation, and Gatekeeper assessment before the app is saved.
+The app never executes or installs the acquired binary and never changes update preferences.
+Fallback release discovery does not source-audit the historical binary’s update/preference behavior;
+the confirmation shows the current app’s automatic-check choice without promising that an older
+binary reads it or behaves identically.
+
+A Debug or unknown-identity running app may obtain an official fallback binary **for inspection
+only**. Its saved-result notice offers Finder reveal, not Quit/reinstall/replace-current-app steps.
+It explicitly says not to replace the Debug/unknown-identity app and to use the official migration
+and update path for any later installation. Official cross-identity acquisitions and transition
+package targets remain blocked.
+
+A bad signature, malformed/newer catalog format, timeout, or other catalog error does **not**
+authorize fallback. Once any signed catalog has been authenticated in this process, a later 404
+cannot downgrade discovery to unsigned release metadata, including after switching channels.
+Fallback rows are not entered into the signed-head monotonicity pin or the authenticated barrier
+ledger; known signed barriers are never discarded. A signed catalog, when available, is preferred
+and replaces fallback display rows through the same cancellation/request-generation fences.
+HTTP 404/410 for an archive keeps its row visible but unavailable until an explicit refresh
+revalidates that entry; no proactive HEAD sweep or automatic retry loop is performed.
+
+#### Optional signed-catalog publication
+
+The signed-catalog pipeline is wired but **inactive by default**. This does not disable the
+existing-release browser above. With no `Scripts/tip_history_policy.json`,
+the release tooling reads `Scripts/tip_history_policy.example.json`; its null activation tag explicitly
 keeps the pre-history release inventories unchanged. This is not bootstrap authorization.
 An inactive policy also rejects a live catalog rather than silently dropping an existing chain.
 Do not use an environment variable, API 404, or a one-entry/fabricated seed catalog to activate it.
@@ -411,14 +449,14 @@ provenance, add an anchor, setting, override or bootstrap bypass.
 The emitted bootstrap evidence also records the candidate commit/tag, while its canonical digest
 is pinned in that candidate's policy. The approved activation ordering must resolve this evidence
 binding as well as the activation tag; merely changing the tag field is not sufficient.
-Keep history disabled and resolve this decision explicitly before first activation.
+Keep signed-catalog publication disabled and resolve this decision explicitly before its first
+activation. These publication gates do not gate browsing or verified acquisition of existing releases.
 
-**User-visible consequence:** merging this implementation and shipping an ordinary Tip does not
-by itself enable rollback. Tip users can open the history disclosure, but without a published signed
-catalog it reports that history is unavailable; there are no admitted historical downloads to select.
-Usable guided reinstall begins only after the reviewed activation contract, audits, policy and signed
-30-entry bootstrap catalog have been published through the protected release path. Creating an
-unsigned or manually invented “history anchor” in tip-updates is not an activation procedure.
+**User-visible behavior:** an ordinary Tip with no signed catalog uses the immediate release fallback.
+It does not wait for a 30-entry bootstrap, a policy floor, an activation tag, or an invented history
+anchor. The signed catalog remains the preferred future source of authenticated notes, pagination,
+and audited downgrade barriers. Creating an unsigned or manually invented “history anchor” in
+tip-updates is not a signed-catalog activation procedure.
 
 After that decision is resolved, activation also requires a separately reviewed
 `Scripts/tip_history_policy.json` and approved-source bootstrap evidence file. Pin all of:

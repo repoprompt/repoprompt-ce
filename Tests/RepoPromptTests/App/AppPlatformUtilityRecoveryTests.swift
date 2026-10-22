@@ -1793,3 +1793,512 @@ final class TipHistoryStoreTests: XCTestCase {
         }
     }
 }
+
+private actor TipHistoryControlledReleases: TipHistoryReleaseDiscovering {
+    private var pending: [Int: CheckedContinuation<TipHistoryReleasePage, Error>] = [:]
+    private var pages: [Int] = []
+    private var invalidations = 0
+
+    func invalidateCache() async {
+        invalidations += 1
+    }
+
+    func invalidationCount() -> Int {
+        invalidations
+    }
+
+    func fetchPage(repository: TipHistoryRepository, page: Int) async throws -> TipHistoryReleasePage {
+        let id = pages.count
+        pages.append(page)
+        // Intentionally finish after cancellation so generation fences, rather
+        // than cooperative behavior of this fake, protect every publication.
+        return try await withCheckedThrowingContinuation { pending[id] = $0 }
+    }
+
+    func count() -> Int {
+        pages.count
+    }
+
+    func requestedPages() -> [Int] {
+        pages
+    }
+
+    func succeed(_ id: Int, _ page: TipHistoryReleasePage) {
+        pending.removeValue(forKey: id)?.resume(returning: page)
+    }
+
+    func fail(_ id: Int, _ error: Error) {
+        pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+}
+
+extension TipHistoryStoreTests {
+    private func fallbackStore(_ fetcher: TipHistoryControlledFetcher, _ releases: TipHistoryControlledReleases, worker: any TipHistoryArtifactDownloading = TipHistoryControlledDownloader(), commit: @escaping @MainActor (URL, URL, TipHistoryEntry) throws -> URL = { _, destination, _ in destination.appendingPathComponent("saved") }) -> TipHistoryStore {
+        TipHistoryStore(
+            repository: TipHistoryTestFixture.repository,
+            fetcher: fetcher,
+            releaseProvider: releases,
+            downloader: worker,
+            publicKey: key.publicKey.rawRepresentation.base64EncodedString(),
+            contextProvider: { self.context },
+            channelProvider: { self.channel },
+            latestNoticeProvider: { self.notice },
+            clock: { self.now },
+            chooseDestination: { URL(fileURLWithPath: "/tmp/tip-release-fallback-test") },
+            cancelDestination: {},
+            commitApplication: commit
+        )
+    }
+
+    private func githubEntry(_ number: Int, build: String? = nil, title: String? = nil, notes: [TipHistoryNote]? = nil, date: Date? = nil, download: TipHistoryDownload? = nil, successor: Bool = false) throws -> TipHistoryEntry {
+        var raw = TipHistoryTestFixture.entry(number, successor: successor)
+        if let build { raw["buildNumber"] = build }
+        let entry = try XCTUnwrap(TipHistoryTestFixture.page([raw]).entries.first)
+        return TipHistoryEntry(
+            tag: entry.tag,
+            releaseCommit: entry.releaseCommit,
+            shortSHA: entry.shortSHA,
+            commitDate: date ?? entry.commitDate,
+            buildNumber: entry.buildNumber,
+            build: entry.build,
+            marketingVersion: entry.marketingVersion,
+            hasHistoryUI: false,
+            origin: .githubRelease,
+            role: entry.role,
+            signingIdentity: entry.signingIdentity,
+            bundleIdentifier: entry.bundleIdentifier,
+            teamIdentifier: entry.teamIdentifier,
+            migrationPhase: entry.migrationPhase,
+            installationType: entry.installationType,
+            minimumSystemVersion: entry.minimumSystemVersion,
+            minimumSystemVersionString: entry.minimumSystemVersionString,
+            commitRange: nil,
+            architectures: entry.architectures,
+            title: title ?? "Release \(entry.buildNumber) improves workspace recovery",
+            titleSource: .commit,
+            notes: notes ?? [TipHistoryNote(text: "Preserve workspace selections after reload", source: .commit)],
+            omittedNoteCount: 0,
+            downgradeBarrier: false,
+            downgradeBarrierReasons: [],
+            download: download ?? entry.download,
+            metadataProblem: entry.metadataProblem,
+            historyCatalogSha256: nil
+        )
+    }
+
+    private func enterFallback(
+        _ store: TipHistoryStore,
+        _ fetcher: TipHistoryControlledFetcher,
+        _ releases: TipHistoryControlledReleases,
+        response: TipHistoryReleasePage,
+        request: Int = 0,
+        releaseRequest: Int = 0
+    ) async {
+        store.refresh()
+        await waitUntil { await fetcher.count() == request + 1 }
+        await fetcher.fail(request, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == releaseRequest + 1 }
+        await releases.succeed(releaseRequest, response)
+        await waitUntil { store.catalogState != .loading }
+    }
+
+    func testInitialCatalog404ImmediatelyShowsExistingReleaseBuildsAndCommitNotes() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        let initialRequests = await releases.count()
+        XCTAssertEqual(initialRequests, 0)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(136, build: "39.21.36"), githubEntry(133, build: "39.21.33")], nextPage: 2, omittedCount: 1))
+        XCTAssertEqual(store.historySource, .githubReleases)
+        XCTAssertEqual(store.rows.map(\.entry.buildNumber), ["39.21.36", "39.21.33"])
+        XCTAssertTrue(store.rows.allSatisfy { $0.entry.origin == .githubRelease && !$0.entry.notes.isEmpty })
+        XCTAssertEqual(store.releaseOmittedCount, 1)
+        XCTAssertEqual(store.olderPageState, .available)
+        XCTAssertNil(store.historyStartBuild)
+        await store.shutdown()
+    }
+
+    func testOnlyCatalogNotPublishedYetCanStartFallback() async {
+        for error: TipHistoryLoadError in [.network, .timeout, .invalidSignature, .unsupportedFormat, .integrityMismatch, .malformed, .httpStatus(403), .httpStatus(429)] {
+            let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+            let store = fallbackStore(fetcher, releases)
+            store.refresh()
+            await waitUntil { await fetcher.count() == 1 }
+            await fetcher.fail(0, error)
+            await waitUntil { store.catalogState == .failed(error) }
+            let count = await releases.count()
+            XCTAssertEqual(count, 0)
+            XCTAssertNil(store.historySource)
+            await store.shutdown()
+        }
+    }
+
+    func testAuthenticatedSignedCatalogNeverFallsBackOn404() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await load(store, fetcher: fetcher, data: envelope([6, 5, 2]))
+        let rows = store.rows
+        store.refresh()
+        await waitUntil { await fetcher.count() == 2 }
+        await fetcher.fail(1, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { store.catalogState == .failed(.notPublishedYet) }
+        XCTAssertEqual(store.historySource, .signedCatalog)
+        XCTAssertEqual(store.rows, rows)
+        let count = await releases.count()
+        XCTAssertEqual(count, 0)
+        await store.shutdown()
+    }
+
+    func testChannelSwitchCannotResetSignedCatalogAuthorityIntoFallback() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await load(store, fetcher: fetcher, data: envelope([6, 5, 2]))
+        channel = .stable
+        store.channelDidChange(.stable)
+        channel = .tip
+        store.channelDidChange(.tip)
+        store.loadIfNeeded()
+        await waitUntil { await fetcher.count() == 2 }
+        await fetcher.fail(1, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { store.catalogState == .failed(.notPublishedYet) }
+        let count = await releases.count()
+        XCTAssertEqual(count, 0)
+        await store.shutdown()
+    }
+
+    func testUnsignedFallbackNeverCreatesASignedHeadMonotonicityPin() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(136)], nextPage: nil, omittedCount: 0))
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(133)], nextPage: nil, omittedCount: 0), request: 1, releaseRequest: 1)
+        XCTAssertEqual(store.rows.first?.entry.buildNumber, "133")
+        XCTAssertEqual(store.debugPublishedSnapshot()["signed_catalog_authenticated"] as? Bool, false)
+        await store.shutdown()
+    }
+
+    func testFirstSignedCatalogReplacesUnsignedRowsWithoutComparingTheirHeadPin() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(136)], nextPage: nil, omittedCount: 0))
+        try await load(store, fetcher: fetcher, data: envelope([6, 5, 2]), request: 1)
+        XCTAssertEqual(store.historySource, .signedCatalog)
+        XCTAssertEqual(store.rows.first?.entry.buildNumber, "6")
+        XCTAssertTrue(store.rows.allSatisfy { $0.entry.origin != .githubRelease })
+        await store.shutdown()
+    }
+
+    func testReleasePagesMergeUniqueNumericBuildsAndStopAtTenPages() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        let first = try githubEntry(30), overlap = try githubEntry(29)
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [first, overlap], nextPage: 2, omittedCount: 2))
+        store.loadOlderPage()
+        await waitUntil { await releases.count() == 2 }
+        try await releases.succeed(1, TipHistoryReleasePage(entries: [overlap, githubEntry(280, build: "29.0.0"), githubEntry(27)], nextPage: 3, omittedCount: 1))
+        await waitUntil { store.pageCount == 2 }
+        XCTAssertEqual(store.rows.map(\.entry.buildNumber), ["30", "29", "27"])
+        for page in 3 ... 10 {
+            store.loadOlderPage()
+            await waitUntil { await releases.count() == page }
+            try await releases.succeed(page - 1, TipHistoryReleasePage(entries: [githubEntry(27 - page)], nextPage: page + 1, omittedCount: 0))
+            await waitUntil { store.pageCount == page }
+        }
+        XCTAssertEqual(store.olderPageState, .pageLimitReached)
+        XCTAssertEqual(store.releaseOmittedCount, 3)
+        XCTAssertNil(store.historyStartBuild)
+        store.loadOlderPage()
+        let requested = await releases.requestedPages()
+        XCTAssertEqual(requested, Array(1 ... 10))
+        let invalidations = await releases.invalidationCount()
+        XCTAssertEqual(invalidations, 1, "Older pages must not invalidate their shared release index")
+        await store.shutdown()
+    }
+
+    func testReleasePageOverlapConflictAndCursorCycleKeepPreviousRows() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6), githubEntry(5)], nextPage: 2, omittedCount: 0))
+        let original = store.rows
+        store.loadOlderPage()
+        await waitUntil { await releases.count() == 2 }
+        try await releases.succeed(1, TipHistoryReleasePage(entries: [githubEntry(5, title: "Inconsistent overlap"), githubEntry(2)], nextPage: nil, omittedCount: 0))
+        await waitUntil { store.olderPageState == .failed(.integrityMismatch) }
+        XCTAssertEqual(store.rows, original)
+        store.loadOlderPage()
+        await waitUntil { await releases.count() == 3 }
+        try await releases.succeed(2, TipHistoryReleasePage(entries: [githubEntry(2)], nextPage: 2, omittedCount: 0))
+        await waitUntil { store.olderPageState == .failed(.malformed) }
+        XCTAssertEqual(store.rows, original)
+        await store.shutdown()
+    }
+
+    func testReleaseOlderPageAfterRefreshCannotMutateNewHead() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: 2, omittedCount: 0))
+        store.loadOlderPage()
+        await waitUntil { await releases.count() == 2 }
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(7)], nextPage: 2, omittedCount: 0), request: 1, releaseRequest: 2)
+        try await releases.succeed(1, TipHistoryReleasePage(entries: [githubEntry(2)], nextPage: nil, omittedCount: 0))
+        await waitUntil { (store.debugPublishedSnapshot()["owned_task_count"] as? Int) == 0 }
+        XCTAssertEqual(store.rows.map(\.entry.buildNumber), ["7"])
+        XCTAssertEqual(store.pageCount, 1)
+        await store.shutdown()
+    }
+
+    func testLeavingTipDiscardsPendingReleaseHead() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        store.refresh()
+        await waitUntil { await fetcher.count() == 1 }
+        await fetcher.fail(0, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 1 }
+        channel = .stable
+        store.channelDidChange(.stable)
+        try await releases.succeed(0, TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        await store.shutdown()
+        XCTAssertTrue(store.rows.isEmpty)
+        XCTAssertNil(store.historySource)
+        XCTAssertEqual(store.catalogState, .idle)
+    }
+
+    func testCancelAndRestartReleaseHeadDiscardsOldCompletion() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        store.refresh()
+        await waitUntil { await fetcher.count() == 1 }
+        await fetcher.fail(0, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 1 }
+        store.cancelLoad()
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(7)], nextPage: nil, omittedCount: 0), request: 1, releaseRequest: 1)
+        try await releases.succeed(0, TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        await waitUntil { (store.debugPublishedSnapshot()["owned_task_count"] as? Int) == 0 }
+        XCTAssertEqual(store.rows.first?.entry.buildNumber, "7")
+        await store.shutdown()
+    }
+
+    func testReleaseCacheAndRefreshFailureKeepRowsAndSelection() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        store.selectedTag = tag(6)
+        store.loadIfNeeded()
+        await assertCount(fetcher, 1)
+        store.refresh()
+        await waitUntil { await fetcher.count() == 2 }
+        await fetcher.fail(1, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 2 }
+        await releases.fail(1, TipHistoryLoadError.timeout)
+        await waitUntil { store.catalogState == .failed(.timeout) }
+        XCTAssertEqual(store.rows.first?.entry.buildNumber, "6")
+        XCTAssertEqual(store.selectedTag, tag(6))
+        now.addTimeInterval(601)
+        store.loadIfNeeded()
+        await waitUntil { await fetcher.count() == 3 }
+        await fetcher.fail(2, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 3 }
+        try await releases.succeed(2, TipHistoryReleasePage(entries: [githubEntry(7)], nextPage: nil, omittedCount: 0))
+        await waitUntil { store.catalogState != .loading }
+        XCTAssertNil(store.selectedTag)
+        let invalidations = await releases.invalidationCount()
+        XCTAssertEqual(invalidations, 3, "Explicit refresh and expired TTL must each request fresh page-one metadata")
+        await store.shutdown()
+    }
+
+    func testShutdownWaitsForCancelledOwnedReleaseProvider() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        store.refresh()
+        await waitUntil { await fetcher.count() == 1 }
+        await fetcher.fail(0, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 1 }
+        var finished = false
+        let shutdown = Task { await store.shutdown()
+            finished = true
+        }
+        await waitUntil { store.catalogState == .idle }
+        XCTAssertFalse(finished)
+        try await releases.succeed(0, TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        await shutdown.value
+        XCTAssertTrue(finished)
+        XCTAssertTrue(store.rows.isEmpty)
+    }
+
+    func testFallbackOlderAlwaysRequiresBothBackupAndUnknownCoverageConsent() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases(), worker = TipHistoryControlledDownloader()
+        let store = fallbackStore(fetcher, releases, worker: worker)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6), githubEntry(5), githubEntry(2)], nextPage: nil, omittedCount: 0))
+        guard case let .available(.older, cautions) = store.rows.last?.availability else { return XCTFail("Older release was not admitted") }
+        XCTAssertTrue(cautions.contains(.barrierUnknownInstalledOutsideHistory))
+        store.beginDownload(tag: tag(2))
+        store.beginDownload(tag: tag(2), acknowledgedBackup: true)
+        store.beginDownload(tag: tag(2), acknowledgedUnknownCoverage: true)
+        XCTAssertEqual(store.downloadState, .idle)
+        let before = await worker.count()
+        XCTAssertEqual(before, 0)
+        store.beginDownload(tag: tag(2), acknowledgedBackup: true, acknowledgedUnknownCoverage: true)
+        await waitUntil { await worker.count() == 1 }
+        store.cancelDownload()
+        await worker.finish(0)
+        await store.shutdown()
+    }
+
+    func testNonOfficialFallbackSaveIsInspectionOnlyEvenAfterChannelChange() async throws {
+        context = TipHistoryInstallationContext(
+            installedBuild: context.installedBuild,
+            installedBuildString: "5",
+            runningIdentity: .nonOfficial,
+            osVersion: context.osVersion,
+            architecture: context.architecture,
+            migrationBlockedMessage: nil,
+            sparkleConfigurationValid: true
+        )
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases(), worker = TipHistoryControlledDownloader()
+        let store = fallbackStore(fetcher, releases, worker: worker)
+        let entry = try githubEntry(6)
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [entry], nextPage: nil, omittedCount: 0))
+        guard case let .available(_, cautions) = store.rows.first?.availability else { return XCTFail("Inspection acquisition was blocked") }
+        XCTAssertTrue(cautions.contains(.downloadOnlyNonOfficial))
+        let notice = AvailableUpdateNotice(channel: .tip, version: entry.marketingVersion, buildNumber: "6", shortCommitSHA: nil, date: nil, releaseNotes: nil, downloadURL: entry.download?.url)
+        XCTAssertFalse(store.canCheckLatest(entry, notice: notice, canInstall: true))
+        store.requestDownload(tag: tag(6))
+        XCTAssertEqual(store.confirmationEntry?.tag, tag(6))
+        store.confirmationEntry = nil
+        store.beginDownload(tag: tag(6), acknowledgedUnknownCoverage: true)
+        await waitUntil { await worker.count() == 1 }
+        await worker.finish(0)
+        await waitUntil { if case .ready = store.downloadState { return true }
+            return false
+        }
+        XCTAssertTrue(store.acquiredForInspectionOnly)
+        channel = .stable
+        store.channelDidChange(.stable)
+        XCTAssertTrue(store.acquiredForInspectionOnly)
+        await store.shutdown()
+    }
+
+    func testNonOfficialExceptionDoesNotEnableSignedCatalogAcquisition() async throws {
+        context = TipHistoryInstallationContext(
+            installedBuild: context.installedBuild,
+            installedBuildString: "5",
+            runningIdentity: .nonOfficial,
+            osVersion: context.osVersion,
+            architecture: context.architecture,
+            migrationBlockedMessage: nil,
+            sparkleConfigurationValid: true
+        )
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await load(store, fetcher: fetcher, data: envelope([6, 5, 2]))
+        XCTAssertTrue(store.rows.allSatisfy { !$0.availability.canDownload })
+        store.beginDownload(tag: tag(6))
+        XCTAssertEqual(store.downloadState, .idle)
+        await store.shutdown()
+    }
+
+    func testFallbackContextChangeCancelsBeforeExclusiveCommit() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases(), worker = TipHistoryControlledDownloader()
+        var commits = 0
+        let store = fallbackStore(fetcher, releases, worker: worker) { _, destination, _ in commits += 1
+            return destination
+        }
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        store.beginDownload(tag: tag(6))
+        await waitUntil { await worker.count() == 1 }
+        context = TipHistoryInstallationContext(
+            installedBuild: context.installedBuild,
+            installedBuildString: "5",
+            runningIdentity: .legacy,
+            osVersion: context.osVersion,
+            architecture: context.architecture,
+            migrationBlockedMessage: nil,
+            sparkleConfigurationValid: false
+        )
+        store.contextDidChange()
+        await worker.finish(0)
+        await store.shutdown()
+        XCTAssertEqual(commits, 0)
+        XCTAssertEqual(store.downloadState, .idle)
+    }
+
+    func testFallbackMissingArtifactNeedsExplicitMetadataRevalidation() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases(), worker = TipHistoryControlledDownloader()
+        let store = fallbackStore(fetcher, releases, worker: worker)
+        let page = try TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0)
+        await enterFallback(store, fetcher, releases, response: page)
+        store.beginDownload(tag: tag(6))
+        await waitUntil { await worker.count() == 1 }
+        await worker.fail(0, httpStatus: 404)
+        await waitUntil { store.rows.first?.availability == .unavailable(.missingAsset) }
+        now.addTimeInterval(601)
+        store.loadIfNeeded()
+        await waitUntil { await fetcher.count() == 2 }
+        await fetcher.fail(1, TipHistoryLoadError.notPublishedYet)
+        await waitUntil { await releases.count() == 2 }
+        await releases.succeed(1, page)
+        await waitUntil { store.catalogState != .loading }
+        XCTAssertEqual(store.rows.first?.availability, .unavailable(.missingAsset))
+        await enterFallback(store, fetcher, releases, response: page, request: 2, releaseRequest: 2)
+        XCTAssertTrue(store.rows.first?.availability.canDownload == true)
+        await store.shutdown()
+    }
+
+    func testMissingReleaseArtifactRevalidationIgnoresRecoveredDisplayTextButNotArtifactChanges() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases(), worker = TipHistoryControlledDownloader()
+        let store = fallbackStore(fetcher, releases, worker: worker)
+        let original = try githubEntry(6, title: "Commit lookup unavailable", notes: [])
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [original], nextPage: nil, omittedCount: 0))
+        store.beginDownload(tag: tag(6))
+        await waitUntil { await worker.count() == 1 }
+        await worker.fail(0, httpStatus: 404)
+        await waitUntil { store.rows.first?.availability == .unavailable(.missingAsset) }
+        let recovered = try githubEntry(6, title: "Recovered commit subject", notes: [TipHistoryNote(text: "Recovered commit details", source: .commit)], date: Date(timeIntervalSince1970: 42))
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [recovered], nextPage: nil, omittedCount: 0), request: 1, releaseRequest: 1)
+        XCTAssertTrue(store.rows.first?.availability.canDownload == true)
+        XCTAssertEqual(store.rows.first?.entry.title, "Recovered commit subject")
+        store.beginDownload(tag: tag(6))
+        await waitUntil { await worker.count() == 2 }
+        await worker.fail(1, httpStatus: 410)
+        await waitUntil { store.rows.first?.availability == .unavailable(.missingAsset) }
+        let priorDownload = try XCTUnwrap(original.download)
+        let changedDownload = TipHistoryDownload(
+            name: priorDownload.name,
+            url: priorDownload.url,
+            size: priorDownload.size + 1,
+            expandedSize: priorDownload.expandedSize,
+            sha256: priorDownload.sha256,
+            edSignature: priorDownload.edSignature
+        )
+        let differentArtifact = try githubEntry(6, download: changedDownload)
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [differentArtifact], nextPage: nil, omittedCount: 0), request: 2, releaseRequest: 2)
+        XCTAssertEqual(store.rows.first?.availability, .unavailable(.missingAsset))
+        await store.shutdown()
+    }
+
+    func testEmptyOmittedReleasePageRequiresExplicitOlderTapWithoutEagerWalking() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [], nextPage: 2, omittedCount: 30))
+        XCTAssertTrue(store.rows.isEmpty)
+        XCTAssertEqual(store.releaseOmittedCount, 30)
+        XCTAssertEqual(store.olderPageState, .available)
+        let before = await releases.count()
+        XCTAssertEqual(before, 1)
+        store.loadOlderPage()
+        await waitUntil { await releases.count() == 2 }
+        try await releases.succeed(1, TipHistoryReleasePage(entries: [githubEntry(6)], nextPage: nil, omittedCount: 0))
+        await waitUntil { store.rows.count == 1 }
+        await store.shutdown()
+    }
+
+    func testReleaseTerminalPageNeverClaimsCompleteSignedPersistenceCoverage() async throws {
+        let fetcher = TipHistoryControlledFetcher(), releases = TipHistoryControlledReleases()
+        let store = fallbackStore(fetcher, releases)
+        try await enterFallback(store, fetcher, releases, response: TipHistoryReleasePage(entries: [githubEntry(6), githubEntry(5), githubEntry(2)], nextPage: nil, omittedCount: 0))
+        XCTAssertEqual(store.olderPageState, .exhausted)
+        XCTAssertNil(store.historyStartBuild)
+        guard case let .available(.older, cautions) = store.rows.last?.availability else { return XCTFail("Missing older release") }
+        XCTAssertTrue(cautions.contains(.barrierUnknownInstalledOutsideHistory))
+        XCTAssertEqual(store.debugPublishedSnapshot()["signed_catalog_authenticated"] as? Bool, false)
+        await store.shutdown()
+    }
+}

@@ -46,6 +46,11 @@ private struct TipHistoryOlderBuildConfirmation: View {
         store.rows.first { $0.id == entry.tag }?.availability
     }
 
+    private var isOlder: Bool {
+        if case .available(.older, _) = availability { return true }
+        return false
+    }
+
     private var needsUnknownAcknowledgement: Bool {
         if case let .available(_, cautions) = availability { return cautions.contains(.barrierUnknownInstalledOutsideHistory) }
         return false
@@ -53,12 +58,24 @@ private struct TipHistoryOlderBuildConfirmation: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Download older Tip build \(entry.buildNumber)?").font(.headline)
-            Text("You will choose a folder and RepoPrompt will download and verify the app. Reinstallation is manual: quit RepoPrompt, replace the actual installed copy in Finder, then open it yourself.")
-            Text("There is no automatic undo. Older builds may not read settings, workspace/session data, agent configuration, or credentials written by newer builds. Make a Time Machine backup or a copy of your app data first.")
-            Text("Use Check for Updates to return to the newest build; it does not restore data.")
-            Text("Automatic update checks are \(store.automaticallyChecksForUpdates ? "On" : "Off"). The installed build will keep this setting. This download does not change your channel or preferences.")
-            Toggle("I have backed up my data and understand that older builds may not read it.", isOn: $acknowledgesBackup)
+            Text(store.isInspectionOnlyContext ? "Save official Tip build \(entry.buildNumber) for inspection?" : "Download older Tip build \(entry.buildNumber)?").font(.headline)
+            if store.isInspectionOnlyContext {
+                Text("You will choose a folder and RepoPrompt will save a verified official binary for inspection only. Do not replace this Debug or unknown-identity app. This is not rollback or cross-identity installation approval; use the official migration/update path for installation.")
+                Text("Saving the binary does not install it or migrate data. Before any later installation, back up your data: an older build may not read data or credentials written by a newer one.")
+                Text("Automatic update checks in this running app are \(store.automaticallyChecksForUpdates ? "On" : "Off"). This download changes no preferences and makes no claim that an official app shares this app’s settings or identity.")
+            } else {
+                Text("You will choose a folder and RepoPrompt will download and verify the app. Reinstallation is manual: quit RepoPrompt, replace the actual installed copy in Finder, then open it yourself.")
+                Text("There is no automatic undo. Older builds may not read settings, workspace/session data, agent configuration, or credentials written by newer builds. Make a Time Machine backup or a copy of your app data first.")
+                Text("Use Check for Updates to return to the newest build; it does not restore data.")
+                if entry.origin == .githubRelease {
+                    Text("Automatic update checks in this running app are \(store.automaticallyChecksForUpdates ? "On" : "Off"). This download changes no channel or preferences. This historical release’s update/preference behavior has not been source-audited; do not assume it matches the current app.")
+                } else {
+                    Text("Automatic update checks are \(store.automaticallyChecksForUpdates ? "On" : "Off"). The installed build will keep this setting. This download does not change your channel or preferences.")
+                }
+            }
+            if isOlder {
+                Toggle("I have backed up my data and understand that older builds may not read it.", isOn: $acknowledgesBackup)
+            }
             if needsUnknownAcknowledgement {
                 Toggle("RepoPrompt cannot check data-format changes between these builds; I understand this additional uncertainty.", isOn: $acknowledgesUnknownCoverage)
             }
@@ -72,7 +89,7 @@ private struct TipHistoryOlderBuildConfirmation: View {
                     store.confirmationEntry = nil
                     store.beginDownload(tag: entry.tag, acknowledgedBackup: acknowledgesBackup, acknowledgedUnknownCoverage: acknowledgesUnknownCoverage)
                 }
-                .disabled(!acknowledgesBackup || (needsUnknownAcknowledgement && !acknowledgesUnknownCoverage) || availability?.canDownload != true)
+                .disabled((isOlder && !acknowledgesBackup) || (needsUnknownAcknowledgement && !acknowledgesUnknownCoverage) || availability?.canDownload != true)
             }
         }
         .padding(24)
@@ -109,19 +126,32 @@ struct TipHistoryDownloadNoticeView: View {
             case let .ready(_, appURL, folderURL):
                 Label("Verified build saved", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Text(folderURL.path).font(.caption).textSelection(.enabled)
-                Text("1. Quit RepoPrompt CE.")
-                Text("2. In Finder, replace your actual installed copy with RepoPrompt CE.app from this folder (normally drag it to Applications and choose Replace). Do not keep competing runnable copies.")
-                Text("Installed copy: \(Bundle.main.bundleURL.path)").font(.caption).textSelection(.enabled)
-                Text("If the installed copy is on a mounted or read-only volume, move the verified app to your normal writable application location manually.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("3. Open the replaced app. macOS may confirm that it was downloaded from the internet.")
-                Text("4. If automatic checks are on, the newest Tip build is shown as available, not installed automatically. Use Check for Updates to return to the newest build.")
-                Text("There is no automatic undo or data restore. Older builds may not read data or credentials written by newer builds.")
-                    .font(.caption).foregroundStyle(.orange)
+                if store.acquiredForInspectionOnly {
+                    Text("Official binary saved for inspection only — not rollback approval.").font(.headline)
+                    Text("Do not replace your Debug or unknown-identity app with this binary. The current app’s identity, preferences, data, and credentials are not proven compatible with it.")
+                        .foregroundStyle(.orange)
+                    Text("If you later choose to install an official app, use the official migration/update path. Saving this binary neither installs it nor authorizes crossing the application-identity boundary.")
+                } else {
+                    Text("1. Quit RepoPrompt CE.")
+                    Text("2. In Finder, replace your actual installed copy with RepoPrompt CE.app from this folder (normally drag it to Applications and choose Replace). Do not keep competing runnable copies.")
+                    Text("Installed copy: \(Bundle.main.bundleURL.path)").font(.caption).textSelection(.enabled)
+                    Text("If the installed copy is on a mounted or read-only volume, move the verified app to your normal writable application location manually.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("3. Open the replaced app. macOS may confirm that it was downloaded from the internet.")
+                    if store.acquiredEntry?.origin == .githubRelease {
+                        Text("4. Review the historical app’s update settings before using it. Its update/preference and data-format behavior have not been source-audited. Use the official update path to return to a current release.")
+                    } else {
+                        Text("4. If automatic checks are on, the newest Tip build is shown as available, not installed automatically. Use Check for Updates to return to the newest build.")
+                    }
+                    Text("There is no automatic undo or data restore. Older builds may not read data or credentials written by newer builds.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 HStack {
                     Button("Show in Finder") { store.revealDownload() }
                         .hoverTooltip(appURL.path)
-                    Button("Quit RepoPrompt CE…") { NSApp.terminate(nil) }
+                    if !store.acquiredForInspectionOnly {
+                        Button("Quit RepoPrompt CE…") { NSApp.terminate(nil) }
+                    }
                     Button("Done") { store.clearDownloadResult() }
                 }
             case let .failed(tag, error):

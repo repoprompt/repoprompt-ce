@@ -4,6 +4,10 @@ import Foundation
 
 /// History has its own request identities; it never alters Sparkle's latest-only
 /// check state machine or any update/channel/defaults preference.
+enum TipHistorySource: String, Equatable {
+    case signedCatalog, githubReleases
+}
+
 enum TipHistoryCatalogState: Equatable {
     case idle, loading, loaded(refreshedAt: Date), failed(TipHistoryLoadError)
 }
@@ -48,6 +52,13 @@ struct TipHistoryRow: Identifiable, Equatable {
 final class TipHistoryStore: ObservableObject {
     typealias PageDecoder = @Sendable (Data, String?, String?, String, TipHistoryRepository) throws -> TipHistoryPage
 
+    @Published private(set) var historySource: TipHistorySource?
+    @Published private(set) var releaseOmittedCount = 0
+    @Published private(set) var acquiredForInspectionOnly = false
+    var isInspectionOnlyContext: Bool {
+        context.runningIdentity == .nonOfficial
+    }
+
     @Published private(set) var catalogState: TipHistoryCatalogState = .idle
     @Published private(set) var olderPageState: TipHistoryOlderPageState = .none
     @Published private(set) var rows: [TipHistoryRow] = []
@@ -77,6 +88,7 @@ final class TipHistoryStore: ObservableObject {
 
     let repository: TipHistoryRepository
     private let fetcher: any TipHistoryCatalogFetching
+    private let releaseProvider: any TipHistoryReleaseDiscovering
     private let downloader: any TipHistoryArtifactDownloading
     private let publicKey: String
     private let contextProvider: @MainActor () -> TipHistoryInstallationContext
@@ -96,14 +108,19 @@ final class TipHistoryStore: ObservableObject {
     /// Refresh replaces display pages, not already authenticated safety evidence.
     private var knownBarriers: [String: TipHistoryEntry] = [:]
     // A 404/410 disables the exact authenticated entry without removing its row.
-    // Only an explicit refresh followed by successful signed head/page
-    // revalidation may clear it; TTL reloads and channel changes cannot.
+    // Only an explicit refresh followed by matching entry revalidation from the
+    // active source may clear it; TTL reloads and channel changes cannot. Release
+    // metadata revalidation is not a catalog signature or archive verification.
     private var missingAssets: [String: TipHistoryEntry] = [:]
     private var missingAssetsAwaitingRevalidation: Set<String> = []
     private var olderReference: TipHistoryPageReference?
     private var visitedReferences: Set<TipHistoryPageReference> = []
     private var visitedTags: Set<String> = []
     private var highestHead: TipHistoryEntry?
+    // Unsigned release metadata never establishes or regresses this authority.
+    private var hasAuthenticatedSignedCatalog = false
+    private var releaseNextPage: Int?
+    private var releaseFetchedPages: Set<Int> = []
     private var headRequest: UUID?
     private var olderRequest: UUID?
     private var headTask: Task<Void, Never>?
@@ -126,6 +143,7 @@ final class TipHistoryStore: ObservableObject {
     init(
         repository: TipHistoryRepository,
         fetcher: any TipHistoryCatalogFetching = TipHistoryCatalogFetcher(),
+        releaseProvider: any TipHistoryReleaseDiscovering = TipHistoryReleaseDiscovery(),
         downloader: any TipHistoryArtifactDownloading,
         publicKey: String = SparkleUpdaterManager.pinnedPublicEdKey,
         contextProvider: @escaping @MainActor () -> TipHistoryInstallationContext,
@@ -144,6 +162,7 @@ final class TipHistoryStore: ObservableObject {
     ) {
         self.repository = repository
         self.fetcher = fetcher
+        self.releaseProvider = releaseProvider
         self.downloader = downloader
         self.publicKey = publicKey
         self.contextProvider = contextProvider
@@ -243,6 +262,13 @@ final class TipHistoryStore: ObservableObject {
     }
 
     func loadOlderPage() {
+        if historySource == .githubReleases {
+            guard !shuttingDown, channelProvider() == .tip, headRequest == nil, olderRequest == nil,
+                  pageCount < 10, catalogRetryAfter.map({ clock() >= $0 }) ?? true,
+                  let page = releaseNextPage, page <= 10 else { return }
+            startReleasePage(page, generation: catalogGeneration, missingTagsToRevalidate: [])
+            return
+        }
         guard !shuttingDown, channelProvider() == .tip, headRequest == nil, olderRequest == nil,
               pageCount < 10, catalogRetryAfter.map({ clock() >= $0 }) ?? true,
               let reference = olderReference else { return }
@@ -273,6 +299,115 @@ final class TipHistoryStore: ObservableObject {
         ownedTasks[id] = task
     }
 
+    /// Release pagination is deliberately not a signed page chain. It has its
+    /// own integer cursor and never changes highestHead or authenticated safety
+    /// evidence. Only a first catalog 404 may enter this path.
+    private func startReleasePage(_ number: Int, generation: UInt64, missingTagsToRevalidate: Set<String>) {
+        guard generation == catalogGeneration, !shuttingDown, channelProvider() == .tip,
+              !hasAuthenticatedSignedCatalog, (1 ... 10).contains(number) else { return }
+        if number != 1, releaseFetchedPages.contains(number) {
+            olderPageState = .failed(.integrityMismatch)
+            return
+        }
+        let id = UUID()
+        catalogRetryAfter = nil
+        if number == 1 {
+            headRequest = id
+            historySource = .githubReleases
+            catalogState = .loading
+        } else {
+            olderRequest = id
+            olderPageState = .loading
+        }
+        guard generation == catalogGeneration, !shuttingDown else { return }
+        let provider = releaseProvider, repository = repository
+        let task = Task.detached(priority: .utility) { [weak self] in
+            let result: Result<TipHistoryReleasePage, Error>
+            do {
+                if number == 1 {
+                    try Task.checkCancellation()
+                    await provider.invalidateCache()
+                    try Task.checkCancellation()
+                }
+                let page = try await provider.fetchPage(repository: repository, page: number)
+                try Task.checkCancellation()
+                result = .success(page)
+            } catch { result = .failure(error) }
+            await self?.receiveReleasePage(result, number: number, generation: generation, id: id, missingTagsToRevalidate: missingTagsToRevalidate)
+            await self?.finishedTask(id)
+        }
+        if number == 1 { headTask = task }
+        else { olderTask = task }
+        ownedTasks[id] = task
+    }
+
+    private func receiveReleasePage(_ result: Result<TipHistoryReleasePage, Error>, number: Int, generation: UInt64, id: UUID, missingTagsToRevalidate: Set<String>) {
+        guard generation == catalogGeneration, channelProvider() == .tip, !shuttingDown,
+              !hasAuthenticatedSignedCatalog, historySource == .githubReleases else { return }
+        if number == 1 {
+            guard headRequest == id else { return }
+            headRequest = nil
+            headTask = nil
+        } else {
+            guard olderRequest == id, releaseNextPage == number else { return }
+            olderRequest = nil
+            olderTask = nil
+        }
+        do {
+            let page = try result.get()
+            // Page ten may advertise eleven as an overflow sentinel. It is
+            // accepted here, displayed as pageLimitReached, and never fetched.
+            guard page.entries.count <= 30, page.omittedCount >= 0,
+                  page.nextPage == nil || page.nextPage == number + 1 else { throw TipHistoryLoadError.malformed }
+            var merged = number == 1 ? [] : entries
+            for entry in page.entries {
+                guard entry.origin == .githubRelease else { throw TipHistoryLoadError.malformed }
+                if let duplicate = merged.first(where: { $0.tag == entry.tag }) {
+                    guard duplicate.matchesImmutableFields(of: entry) else { throw TipHistoryLoadError.integrityMismatch }
+                    continue
+                }
+                // API pages may shift while a release is published. Never show
+                // two rows for numerically equal builds, even with different tags.
+                if merged.contains(where: { $0.build == entry.build }) { continue }
+                merged.append(entry)
+            }
+            merged.sort { $0.build > $1.build }
+            let (omitted, overflow) = (number == 1 ? 0 : releaseOmittedCount).addingReportingOverflow(page.omittedCount)
+            guard !overflow else { throw TipHistoryLoadError.malformed }
+            if number == 1 {
+                releaseFetchedPages = [1]
+                pageCount = 1
+                missingAssetsAwaitingRevalidation = missingTagsToRevalidate
+                lastRefreshedAt = clock()
+                catalogState = .loaded(refreshedAt: lastRefreshedAt!)
+            } else {
+                releaseFetchedPages.insert(number)
+                pageCount += 1
+            }
+            entries = merged
+            releaseNextPage = page.nextPage
+            releaseOmittedCount = omitted
+            olderReference = nil
+            // An API terminal page is not proof of a complete signed interval.
+            historyStartBuild = nil
+            revalidateMissingAssets(in: page.entries)
+            if !entries.contains(where: { $0.tag == selectedTag }) { selectedTag = nil }
+            updateOlderState()
+            contextDidChange()
+        } catch {
+            if error is CancellationError { return }
+            let failure = error as? TipHistoryCatalogFetchFailure
+            let transfer = error as? TipHistoryTransferFailure
+            catalogRetryAfter = failure?.retryAfter ?? transfer?.retryAfter
+            let reason = failure?.reason ?? (error as? TipHistoryLoadError) ??
+                transfer?.httpStatus.map { TipHistoryLoadError.httpStatus($0) } ??
+                (transfer?.reason == .timeout ? .timeout : .network)
+            if number == 1 { catalogState = .failed(reason) }
+            else { olderPageState = .failed(reason) }
+            contextDidChange()
+        }
+    }
+
     private func receiveHead(_ result: Result<TipHistoryPage, Error>, generation: UInt64, id: UUID, missingTagsToRevalidate: Set<String>) {
         guard generation == catalogGeneration, headRequest == id, channelProvider() == .tip, !shuttingDown else { return }
         headRequest = nil
@@ -292,7 +427,7 @@ final class TipHistoryStore: ObservableObject {
                 }
             }
             var previous = knownBarriers
-            for entry in entries {
+            for entry in entries where entry.origin != .githubRelease {
                 previous[entry.tag] = entry
             }
             // Leaving Tip clears displayed rows, not authenticated head identity
@@ -309,6 +444,11 @@ final class TipHistoryStore: ObservableObject {
                 guard old.matchesImmutableFields(of: entry), validDigest else { throw TipHistoryLoadError.integrityMismatch }
             }
             highestHead = head
+            hasAuthenticatedSignedCatalog = true
+            historySource = .signedCatalog
+            releaseNextPage = nil
+            releaseFetchedPages = []
+            releaseOmittedCount = 0
             missingAssetsAwaitingRevalidation = missingTagsToRevalidate
             revalidateMissingAssets(in: page.entries)
             entries = page.entries
@@ -325,8 +465,13 @@ final class TipHistoryStore: ObservableObject {
         } catch {
             if error is CancellationError { return }
             let failure = error as? TipHistoryCatalogFetchFailure
+            let reason = failure?.reason ?? (error as? TipHistoryLoadError) ?? .network
+            if reason == .notPublishedYet, !hasAuthenticatedSignedCatalog {
+                startReleasePage(1, generation: generation, missingTagsToRevalidate: missingTagsToRevalidate)
+                return
+            }
             catalogRetryAfter = failure?.retryAfter
-            catalogState = .failed(failure?.reason ?? (error as? TipHistoryLoadError) ?? .network)
+            catalogState = .failed(reason)
             contextDidChange()
         }
     }
@@ -378,6 +523,12 @@ final class TipHistoryStore: ObservableObject {
     }
 
     private func updateOlderState() {
+        if historySource == .githubReleases {
+            if releaseNextPage == nil { olderPageState = pageCount == 0 ? .none : .exhausted }
+            else if pageCount >= 10 || (releaseNextPage ?? 0) > 10 { olderPageState = .pageLimitReached }
+            else { olderPageState = .available }
+            return
+        }
         if olderReference == nil { olderPageState = entries.isEmpty ? .none : .exhausted }
         else if pageCount >= 10 { olderPageState = .pageLimitReached }
         else { olderPageState = .available }
@@ -391,9 +542,15 @@ final class TipHistoryStore: ObservableObject {
 
     private func availability(_ entry: TipHistoryEntry) -> TipHistoryAvailability {
         let covered = (entries.filter { knownBarriers[$0.tag] == nil } + Array(knownBarriers.values)).sorted { $0.build > $1.build }
-        let value = TipHistoryCompatibility.evaluate(entry, in: covered, context: context)
+        var value = TipHistoryCompatibility.evaluate(entry, in: covered, context: context)
+        if entry.origin == .githubRelease, case let .available(.older, cautions) = value,
+           !cautions.contains(.barrierUnknownInstalledOutsideHistory)
+        {
+            value = .available(direction: .older, cautions: cautions + [.barrierUnknownInstalledOutsideHistory])
+        }
         if case .available = value, missingAssets[entry.tag] != nil { return .unavailable(.missingAsset) }
-        if case .available(.older, _) = value, historyBehindLatestNotice { return .unavailable(.historyBehindInstalled) }
+        if case let .available(.older, cautions) = value, historyBehindLatestNotice,
+           !cautions.contains(.downloadOnlyNonOfficial) { return .unavailable(.historyBehindInstalled) }
         return value
     }
 
@@ -403,15 +560,32 @@ final class TipHistoryStore: ObservableObject {
 
     private func revalidateMissingAssets(in verifiedEntries: [TipHistoryEntry]) {
         for entry in verifiedEntries where missingAssetsAwaitingRevalidation.contains(entry.tag) {
-            guard let missing = missingAssets[entry.tag], missing.matchesImmutableFields(of: entry) else { continue }
+            guard let missing = missingAssets[entry.tag], matchesMissingArtifact(missing, entry) else { continue }
             missingAssets[entry.tag] = nil
             missingAssetsAwaitingRevalidation.remove(entry.tag)
         }
     }
 
+    private func matchesMissingArtifact(_ old: TipHistoryEntry, _ new: TipHistoryEntry) -> Bool {
+        guard old.origin == .githubRelease, new.origin == .githubRelease else {
+            return old.matchesImmutableFields(of: new)
+        }
+        // Commit lookup is best effort: title, notes, date and other display
+        // annotations may improve on refresh without changing the missing ZIP.
+        // Keep every acquisition constraint and provenance/identity binding.
+        return old.tag == new.tag && old.releaseCommit == new.releaseCommit && old.shortSHA == new.shortSHA &&
+            old.buildNumber == new.buildNumber && old.build == new.build && old.marketingVersion == new.marketingVersion &&
+            old.role == new.role && old.signingIdentity == new.signingIdentity &&
+            old.bundleIdentifier == new.bundleIdentifier && old.teamIdentifier == new.teamIdentifier &&
+            old.migrationPhase == new.migrationPhase && old.installationType == new.installationType &&
+            old.minimumSystemVersion == new.minimumSystemVersion && old.minimumSystemVersionString == new.minimumSystemVersionString &&
+            old.architectures == new.architectures && old.download == new.download && old.metadataProblem == new.metadataProblem &&
+            old.downgradeBarrier == new.downgradeBarrier && old.downgradeBarrierReasons == new.downgradeBarrierReasons
+    }
+
     func contextDidChange() {
         context = contextProvider()
-        for entry in entries where entry.downgradeBarrier || entry.metadataProblem != nil {
+        for entry in entries where entry.origin != .githubRelease && (entry.downgradeBarrier || entry.metadataProblem != nil) {
             knownBarriers[entry.tag] = entry
         }
         rows = entries.map { TipHistoryRow(entry: $0, availability: availability($0)) }
@@ -425,6 +599,10 @@ final class TipHistoryStore: ObservableObject {
         }
         entries = []
         rows = []
+        historySource = nil
+        releaseNextPage = nil
+        releaseFetchedPages = []
+        releaseOmittedCount = 0
         selectedTag = nil
         confirmationEntry = nil
         olderReference = nil
@@ -440,7 +618,7 @@ final class TipHistoryStore: ObservableObject {
     }
 
     func canCheckLatest(_ entry: TipHistoryEntry, notice: AvailableUpdateNotice?, canInstall: Bool) -> Bool {
-        guard channelProvider() == .tip, canInstall, entries.first?.tag == entry.tag,
+        guard channelProvider() == .tip, !isInspectionOnlyContext, canInstall, entries.first?.tag == entry.tag,
               case .available(.newer, _) = availability(entry),
               let notice, notice.channel == .tip, let number = notice.buildNumber,
               SparkleBuildVersion(number) == entry.build, let download = entry.download,
@@ -453,9 +631,10 @@ final class TipHistoryStore: ObservableObject {
     func requestDownload(tag: String) {
         guard !shuttingDown, downloadTask == nil else { return }
         contextDidChange()
-        guard let row = rows.first(where: { $0.id == tag }), case let .available(direction, _) = row.availability else { return }
-        if direction == .older { confirmationEntry = row.entry }
-        else { beginDownload(tag: tag) }
+        guard let row = rows.first(where: { $0.id == tag }), case let .available(direction, cautions) = row.availability else { return }
+        if direction == .older || cautions.contains(.barrierUnknownInstalledOutsideHistory) || cautions.contains(.downloadOnlyNonOfficial) {
+            confirmationEntry = row.entry
+        } else { beginDownload(tag: tag) }
     }
 
     /// Consent is not a preference. Both acknowledgements must be supplied by
@@ -478,6 +657,7 @@ final class TipHistoryStore: ObservableObject {
         )
         attempt = token
         acquiredEntry = row.entry
+        acquiredForInspectionOnly = isInspectionOnlyContext
         retryAfter = nil
         downloadHTTPStatus = nil
         downloadState = .choosingDestination(tag: tag)
@@ -590,6 +770,7 @@ final class TipHistoryStore: ObservableObject {
         guard !downloadState.isActive else { return }
         downloadState = .idle
         acquiredEntry = nil
+        acquiredForInspectionOnly = false
         retryAfter = nil
     }
 
@@ -610,6 +791,9 @@ final class TipHistoryStore: ObservableObject {
     #if DEBUG
         func debugPublishedSnapshot() -> [String: Any] {
             [
+                "history_source": historySource?.rawValue ?? "none",
+                "signed_catalog_authenticated": hasAuthenticatedSignedCatalog,
+                "release_omitted_count": releaseOmittedCount,
                 "catalog_state": String(describing: catalogState),
                 "older_page_state": String(describing: olderPageState),
                 "row_count": rows.count,

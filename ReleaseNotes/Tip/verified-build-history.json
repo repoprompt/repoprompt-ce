@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "title": "Prepare verified Tip build history and guided reinstall",
+  "title": "Browse existing Tip builds and save verified apps",
   "notes": [
-    "Adds history, verified-download and manual-reinstall controls; activation awaits an audited release catalog.",
-    "Preserves automatic-check preferences and blocks unsupported signing-identity transitions.",
-    "Adds signed history publishing and audited bootstrap tooling for maintainers."
+    "Browse existing Tip releases immediately when no signed catalog has been published; release and commit metadata are clearly labeled.",
+    "Downloads are fully verified before saving. Older releases require separate backup and unknown-data-format acknowledgements.",
+    "Official identity boundaries stay enforced; Debug and unknown-identity apps can save official binaries for inspection, not replace themselves."
   ],
   "breaksDowngrade": false
 }

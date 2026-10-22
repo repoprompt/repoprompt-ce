@@ -616,3 +616,377 @@ final class TipHistoryCompatibilityTests: XCTestCase {
         XCTAssertFalse(TipHistoryCompatibility.evaluate(page.entries[2], in: page.entries, context: context()).canDownload)
     }
 }
+
+extension AppcastEligibilityTests {
+    func testPublicTipDiscoveryBindsMetadataWithoutClaimingCatalogTrust() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let transport = TipPublicReleaseTransport(responses: fixture.responses())
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        let page = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+        let entry = try XCTUnwrap(page.entries.first)
+        XCTAssertEqual(page.entries.count, 1)
+        XCTAssertEqual(page.omittedCount, 0)
+        XCTAssertNil(page.nextPage)
+        XCTAssertEqual(entry.origin, .githubRelease)
+        XCTAssertNil(entry.historyCatalogSha256)
+        XCTAssertFalse(entry.hasHistoryUI)
+        XCTAssertEqual(entry.buildNumber, "39.21.36")
+        XCTAssertEqual(entry.marketingVersion, "1.6.0")
+        XCTAssertEqual(entry.teamIdentifier, "648A27MST5")
+        XCTAssertEqual(entry.title, "Keep connection approval across reconnects")
+        XCTAssertEqual(entry.titleSource, .commit)
+        XCTAssertEqual(entry.notes.last?.text, "Preserve FIFO approval order.")
+        XCTAssertTrue(entry.notes.allSatisfy { $0.source == .commit })
+        XCTAssertEqual(entry.download?.sha256, fixture.zipHash)
+        XCTAssertEqual(entry.download?.size, 412_514_799)
+        XCTAssertNil(entry.metadataProblem)
+        let requests = await transport.requests
+        XCTAssertTrue(requests.contains(fixture.commitURL))
+        XCTAssertFalse(requests.contains { $0.contains("/releases/assets/") || $0.hasSuffix(".zip") })
+    }
+
+    func testPublicTipDiscoverySingleLineCommitHasSourceDerivedNote() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let transport = TipPublicReleaseTransport(responses: fixture.responses(message: "Fix reconnect approval"))
+        let page = try await TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+            .fetchPage(repository: fixture.repository, page: 1)
+        let entry = try XCTUnwrap(page.entries.first)
+        XCTAssertEqual(entry.title, "Fix reconnect approval")
+        XCTAssertEqual(entry.notes, [TipHistoryNote(text: "Source change: Fix reconnect approval", source: .commit)])
+    }
+
+    func testPublicTipDiscoverySkipsMissingAndInconsistentAssetsButSortsNumericBuilds() async throws {
+        let low = try TipPublicReleaseFixture(sha: String(repeating: "a", count: 40), build: "39.9.99")
+        let high = try TipPublicReleaseFixture(sha: String(repeating: "b", count: 40), build: "39.21.36")
+        var missing = low.release
+        missing["tag_name"] = "tip-cccccccccccc"
+        missing["assets"] = []
+        var draft = high.release
+        draft["draft"] = true
+        var responses = low.responses()
+        responses.merge(high.responses()) { _, new in new }
+        responses[low.listURL] = try TipPublicReleaseFixture.json([low.release, missing, high.release, draft, ["draft": false]])
+        let transport = TipPublicReleaseTransport(responses: responses)
+        let page = try await TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+            .fetchPage(repository: low.repository, page: 1)
+        XCTAssertEqual(page.entries.map(\.buildNumber), ["39.21.36", "39.9.99"])
+        XCTAssertEqual(page.omittedCount, 3)
+    }
+
+    func testPublicTipDiscoveryRejectsBrokenHashSizeIdentityRoleAndNamespaceBindings() async throws {
+        for mutation in ["hash", "size", "identity", "role", "sha", "namespace", "checksums"] {
+            let fixture = try TipPublicReleaseFixture(mutation: mutation)
+            let transport = TipPublicReleaseTransport(responses: fixture.responses())
+            let page = try await TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+                .fetchPage(repository: fixture.repository, page: 1)
+            XCTAssertTrue(page.entries.isEmpty, mutation)
+            XCTAssertEqual(page.omittedCount, 1, mutation)
+            let requests = await transport.requests
+            XCTAssertFalse(requests.contains { $0.contains("evil.example") }, mutation)
+        }
+    }
+
+    func testPublicTipDiscoveryHasExplicitSourceFailureAndBoundedPages() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        var responses = fixture.responses()
+        responses.removeValue(forKey: fixture.commitURL)
+        responses[fixture.listURL] = try TipPublicReleaseFixture.json(Array(repeating: fixture.release, count: 30))
+        let transport = TipPublicReleaseTransport(responses: responses)
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        let page = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+        XCTAssertNil(page.nextPage)
+        XCTAssertEqual(page.omittedCount, 29)
+        let entry = try XCTUnwrap(page.entries.first)
+        XCTAssertEqual(entry.title, "Commit ab84d47e6271 — source unavailable")
+        XCTAssertTrue(entry.notes[0].text.contains("unavailable"))
+        XCTAssertFalse(entry.notes[0].source == .reviewed)
+        XCTAssertNil(entry.commitDate)
+        for pageNumber in [0, 11] {
+            do {
+                _ = try await discovery.fetchPage(repository: fixture.repository, page: pageNumber)
+                XCTFail("Out-of-bound release page accepted")
+            } catch {
+                XCTAssertEqual(error as? TipHistoryLoadError, .malformed)
+            }
+        }
+        do {
+            let other = try XCTUnwrap(TipHistoryRepository(feedURL: URL(string: "https://github.com/other/releases/releases/latest/download/appcast.xml")))
+            _ = try await discovery.fetchPage(repository: other, page: 1)
+            XCTFail("Foreign update repository accepted")
+        } catch {
+            XCTAssertEqual(error as? TipHistoryLoadError, .malformed)
+        }
+    }
+
+    func testPublicTipDiscoveryFindsNewestBuildBeyondServerFirstPageAndCachesSuccessfulPages() async throws {
+        let newest = try TipPublicReleaseFixture()
+        var records: [[String: Any]] = []
+        var responses = newest.responses()
+        for number in 1 ... 104 {
+            let older = try TipPublicReleaseFixture(sha: String(format: "%012x", number) + String(repeating: "0", count: 28), build: "38.0.\(number)")
+            records.append(older.release)
+            responses.merge(older.responses()) { _, new in new }
+        }
+        // Mimic the observed SHA-ordered API: newest publication/build is not
+        // even in server page one, much less in the first thirty records.
+        let invalid = try TipPublicReleaseFixture(sha: String(repeating: "f", count: 40), build: "99.0.0", mutation: "hash")
+        records.append(invalid.release)
+        responses.merge(invalid.responses()) { _, new in new }
+        records.append(newest.release)
+        XCTAssertEqual(Set(records.compactMap { $0["tag_name"] as? String }).count, records.count, "Generated full SHAs must also have unique twelve-character release tags")
+        responses[newest.listURL] = try TipPublicReleaseFixture.json(Array(records.prefix(100)))
+        let secondIndexURL = newest.listURL.replacingOccurrences(of: "&page=1", with: "&page=2")
+        responses[secondIndexURL] = try TipPublicReleaseFixture.json(Array(records.dropFirst(100)))
+        let transport = TipPublicReleaseTransport(responses: responses)
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        let first = try await discovery.fetchPage(repository: newest.repository, page: 1)
+        XCTAssertEqual(first.entries.first?.buildNumber, "39.21.36")
+        XCTAssertEqual(first.entries.count, 30)
+        XCTAssertEqual(first.omittedCount, 1)
+        XCTAssertEqual(first.nextPage, 2)
+        var requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0.contains("/commits/") }), 30)
+        let second = try await discovery.fetchPage(repository: newest.repository, page: 2)
+        XCTAssertEqual(second.entries.count, 30)
+        XCTAssertTrue(Set(first.entries.map(\.tag)).isDisjoint(with: second.entries.map(\.tag)))
+        _ = try await discovery.fetchPage(repository: newest.repository, page: 1)
+        requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0.contains("/releases?") }), 2)
+        XCTAssertEqual(requests.count(where: { $0.contains("/commits/") }), 60)
+        await discovery.invalidateCache()
+        let refreshed = try await discovery.fetchPage(repository: newest.repository, page: 1)
+        XCTAssertEqual(refreshed.entries, first.entries)
+        requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0.contains("/releases?") }), 4)
+        XCTAssertEqual(requests.count(where: { $0.contains("/commits/") }), 60, "Successful immutable commit text survives explicit refresh")
+    }
+
+    func testCancelledDelayedInvalidationCannotClearNewerDiscoveryWork() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let listURL = try XCTUnwrap(URL(string: fixture.listURL))
+        let transport = TipPublicReleaseTransport(responses: fixture.responses(), pauseFirstList: true)
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        let delayed = Task {
+            _ = try await transport.fetch(listURL, maximumBytes: 4_194_304)
+            await discovery.invalidateCache()
+        }
+        await transport.waitUntilListPaused()
+        delayed.cancel()
+        let fresh = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+        await transport.resumePausedList(with: Data("[]".utf8))
+        try await delayed.value
+        let cached = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+        XCTAssertEqual(cached.entries, fresh.entries)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0.contains("/releases?") }), 2, "Cancelled invalidation must preserve the newer page cache")
+    }
+
+    func testPublicTipDiscoveryPropagatesRetryAfterWithoutAdvancingPastRateLimitedMetadata() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let rolloutURL = try XCTUnwrap(fixture.assets.keys.first { $0.hasSuffix("/identity-rollout.json") })
+        let retryAfter = Date(timeIntervalSince1970: 2_000_000_000)
+        let transport = TipPublicReleaseTransport(responses: fixture.responses(), failures: [rolloutURL: TipHistoryCatalogFetchFailure(reason: .httpStatus(429), retryAfter: retryAfter)])
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        do {
+            _ = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+            XCTFail("Rate-limited metadata was cached as an omission")
+        } catch let failure as TipHistoryCatalogFetchFailure {
+            XCTAssertEqual(failure.reason, .httpStatus(429))
+            XCTAssertEqual(failure.retryAfter, retryAfter)
+        }
+        let retry = try await discovery.fetchPage(repository: fixture.repository, page: 1)
+        XCTAssertEqual(retry.entries.count, 1)
+        XCTAssertEqual(retry.omittedCount, 0)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0 == rolloutURL }), 2)
+        XCTAssertEqual(requests.count(where: { $0.contains("/releases?") }), 1)
+    }
+
+    func testPublicTipDiscoveryInvalidationFencesAnInFlightIndexResponse() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let repository = fixture.repository
+        let transport = TipPublicReleaseTransport(responses: fixture.responses(), pauseFirstList: true)
+        let discovery = TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+        let stale = Task { try await discovery.fetchPage(repository: repository, page: 1) }
+        await transport.waitUntilListPaused()
+        await discovery.invalidateCache()
+        let fresh = try await discovery.fetchPage(repository: repository, page: 1)
+        XCTAssertEqual(fresh.entries.count, 1)
+        // Deliberately deliver an empty old response even after cancellation.
+        await transport.resumePausedList(with: Data("[]".utf8))
+        do {
+            _ = try await stale.value
+            XCTFail("Invalidated request returned a stale page")
+        } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let cached = try await discovery.fetchPage(repository: repository, page: 1)
+        XCTAssertEqual(cached.entries, fresh.entries)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count(where: { $0.contains("/releases?") }), 2)
+    }
+
+    func testPublicTipDiscoveryPropagatesCancellationAndBoundsInjectedResponses() async throws {
+        let fixture = try TipPublicReleaseFixture()
+        let cancelled = TipHistoryReleaseDiscovery(fetch: { _, _ in throw CancellationError() })
+        do {
+            _ = try await cancelled.fetchPage(repository: fixture.repository, page: 1)
+            XCTFail("Cancellation swallowed")
+        } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let oversized = TipHistoryReleaseDiscovery(fetch: { _, bound in Data(repeating: 32, count: bound + 1) })
+        do {
+            _ = try await oversized.fetchPage(repository: fixture.repository, page: 1)
+            XCTFail("Oversized metadata accepted")
+        } catch {
+            XCTAssertEqual(error as? TipHistoryLoadError, .malformed)
+        }
+    }
+}
+
+extension TipHistoryCatalogTests {
+    func testSignedCatalogCannotClaimPublicReleaseFallbackOrigin() throws {
+        var raw = TipHistoryTestFixture.entry(3)
+        raw["origin"] = "githubRelease"
+        let page = try TipHistoryTestFixture.page([raw])
+        XCTAssertEqual(page.entries.first?.metadataProblem, .provenance)
+    }
+}
+
+extension TipHistoryCompatibilityTests {
+    func testPublicFallbackRetainsUnknownCoverageAndNonOfficialSaveOnlyCautions() async throws {
+        let installed = try TipPublicReleaseFixture()
+        let older = try TipPublicReleaseFixture(sha: String(repeating: "a", count: 40), build: "39.21.35")
+        var responses = installed.responses()
+        responses.merge(older.responses()) { _, new in new }
+        responses[installed.listURL] = try TipPublicReleaseFixture.json([installed.release, older.release])
+        let transport = TipPublicReleaseTransport(responses: responses)
+        let page = try await TipHistoryReleaseDiscovery(fetch: { try await transport.fetch($0, maximumBytes: $1) })
+            .fetchPage(repository: installed.repository, page: 1)
+        XCTAssertEqual(page.entries.count, 2)
+        let target = try XCTUnwrap(page.entries.last)
+        // Having the installed build in the fallback list is NOT coverage of
+        // intervening persistence changes or an absence of reviewed barriers.
+        XCTAssertEqual(
+            TipHistoryCompatibility.evaluate(target, in: page.entries, context: context("39.21.36")),
+            .available(direction: .older, cautions: [.dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory])
+        )
+        let saveOnly = TipHistoryCompatibility.evaluate(target, in: page.entries, context: context("39.21.36", identity: .nonOfficial))
+        XCTAssertEqual(saveOnly, .available(direction: .older, cautions: [.downloadOnlyNonOfficial, .dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory]))
+        XCTAssertTrue(saveOnly.canDownload)
+        XCTAssertEqual(saveOnly.badge, "Download only")
+        XCTAssertEqual(
+            TipHistoryCompatibility.evaluate(target, in: page.entries, context: context("999", identity: .nonOfficial)),
+            .available(direction: .older, cautions: [.downloadOnlyNonOfficial, .dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory])
+        )
+        XCTAssertEqual(TipHistoryCompatibility.evaluate(target, in: page.entries, context: context("999")), .unavailable(.historyBehindInstalled))
+        let sameBuild = try XCTUnwrap(page.entries.first)
+        XCTAssertEqual(
+            TipHistoryCompatibility.evaluate(sameBuild, in: page.entries, context: context("39.21.36", identity: .nonOfficial)),
+            .available(direction: .newer, cautions: [.downloadOnlyNonOfficial, .dataCompatibilityNotGuaranteed, .barrierUnknownInstalledOutsideHistory])
+        )
+    }
+}
+
+/// The schema and identity values match the existing published build 39.21.36.
+/// No binary is fetched/executed; a syntactically valid enclosure signature is
+/// deliberately not treated as verified by discovery.
+private struct TipPublicReleaseFixture {
+    let repository: TipHistoryRepository
+    let release: [String: Any]
+    let assets: [String: Data]
+    let commitURL: String
+    let listURL = "https://api.github.com/repos/repoprompt/repoprompt-ce-tip-updates/releases?per_page=100&page=1"
+    let zipHash = "7677766fb706f0b5e5fb841c55b3b23cf7373382f00643541954a5e49ae8cf70"
+
+    init(sha: String = "ab84d47e6271d107cdfc1208116150a7ae86d259", build: String = "39.21.36", mutation: String? = nil) throws {
+        repository = try XCTUnwrap(TipHistoryRepository(feedURL: URL(string: "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml")))
+        let tag = "tip-\(sha.prefix(12))"
+        let base = "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/download/\(tag)/"
+        let zip = "RepoPrompt-\(tag)-\(build).zip"
+        let manifestName = "RepoPrompt-\(tag)-\(build)-artifact-manifest.json"
+        let manifest = try Self.json([
+            "schema_version": 1,
+            "bundle": ["identifier": "com.pvncher.repoprompt.ce", "build_number": build, "marketing_version": "1.6.0", "signing_mode": "developer-id", "architectures": ["arm64", "x86_64"]],
+            "bundle_signing": ["identifier": "com.pvncher.repoprompt.ce", "team_identifier": "648A27MST5"]
+        ])
+        let manifestHash = TipHistorySignatureVerifier.sha256(manifest)
+        let item: [String: Any] = [
+            "role": mutation == "role" ? "successor" : "preparer", "tag": tag,
+            "buildNumber": build, "marketingVersion": "1.6.0", "installationType": "application", "minimumSystemVersion": "14.0",
+            "enclosureName": zip, "enclosureSha256": zipHash, "enclosureSize": 412_514_799,
+            "edSignature": Data(repeating: 7, count: 64).base64EncodedString(), "url": base + zip
+        ]
+        let rollout = try Self.json([
+            "schemaVersion": 1, "channel": "tip", "updateRepository": repository.path, "sourceTag": tag,
+            "releaseCommit": mutation == "sha" ? String(repeating: "f", count: 40) : sha,
+            "buildNumber": build, "marketingVersion": "1.6.0", "currentRole": "preparer", "signingIdentity": "legacy",
+            "bundleIdentifier": "com.pvncher.repoprompt.ce", "teamIdentifier": mutation == "identity" ? "UNTRUSTED" : "648A27MST5",
+            "migrationPhase": "legacy-preparer", "appcastItems": [item],
+            "appArtifactManifest": ["name": manifestName, "sha256": mutation == "hash" ? String(repeating: "0", count: 64) : manifestHash]
+        ])
+        let sums = Data("\(mutation == "checksums" ? String(repeating: "0", count: 64) : zipHash)  \(zip)\n\(manifestHash)  \(manifestName)\n\(TipHistorySignatureVerifier.sha256(rollout))  identity-rollout.json\n".utf8)
+        assets = [base + "identity-rollout.json": rollout, base + manifestName: manifest, base + "SHA256SUMS": sums]
+        var inventory: [[String: Any]] = assets.map { url, bytes in
+            ["name": URL(string: url)!.lastPathComponent, "size": bytes.count, "state": "uploaded", "browser_download_url": url]
+        }
+        inventory.append(["name": zip, "size": mutation == "size" ? 1 : 412_514_799, "state": "uploaded", "browser_download_url": mutation == "namespace" ? "https://evil.example/\(zip)" : base + zip])
+        release = ["tag_name": tag, "draft": false, "published_at": "2026-10-21T17:34:29Z", "assets": inventory]
+        commitURL = "https://api.github.com/repos/repoprompt/repoprompt-ce/commits/\(sha)?per_page=1"
+    }
+
+    func responses(message: String = "Merge pull request #1435 from opaque/branch\n\nKeep connection approval across reconnects\n\nPreserve FIFO approval order.\u{202E}") -> [String: Data] {
+        var responses = assets
+        responses[listURL] = try! Self.json([release])
+        responses[commitURL] = try! Self.json([
+            "sha": URL(string: commitURL)!.lastPathComponent,
+            "commit": ["message": message, "committer": ["date": "2026-10-21T15:00:00Z"]]
+        ])
+        return responses
+    }
+
+    static func json(_ value: Any) throws -> Data {
+        try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    }
+}
+
+private actor TipPublicReleaseTransport {
+    let responses: [String: Data]
+    private(set) var requests: [String] = []
+    private var pauseFirstList: Bool
+    private var failures: [String: TipHistoryCatalogFetchFailure]
+    private var pausedList: CheckedContinuation<Data, Never>?
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+    init(responses: [String: Data], pauseFirstList: Bool = false, failures: [String: TipHistoryCatalogFetchFailure] = [:]) {
+        self.responses = responses
+        self.pauseFirstList = pauseFirstList
+        self.failures = failures
+    }
+
+    func waitUntilListPaused() async {
+        if pausedList != nil {
+            return
+        }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+
+    func resumePausedList(with data: Data) {
+        pausedList?.resume(returning: data)
+        pausedList = nil
+    }
+
+    func fetch(_ url: URL, maximumBytes: Int) async throws -> Data {
+        requests.append(url.absoluteString)
+        if let failure = failures.removeValue(forKey: url.absoluteString) {
+            throw failure
+        }
+        if pauseFirstList, url.absoluteString.contains("/releases?") {
+            pauseFirstList = false
+            return await withCheckedContinuation {
+                pausedList = $0
+                pauseWaiter?.resume()
+                pauseWaiter = nil
+            }
+        }
+        guard let data = responses[url.absoluteString] else { throw TipHistoryLoadError.network }
+        guard data.count <= maximumBytes else { throw TipHistoryLoadError.malformed }
+        return data
+    }
+}
