@@ -251,6 +251,7 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
+        case resumeTimedOut = "resume_timed_out"
         case cancelled
     }
 

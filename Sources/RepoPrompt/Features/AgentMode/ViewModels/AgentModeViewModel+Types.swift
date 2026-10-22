@@ -724,6 +724,7 @@ extension AgentModeViewModel {
         case fresh
         case resumed
         case resumeFellBackToFresh
+        case resumeTimedOut
     }
 
     struct CodexResumeTimeoutState: Equatable {

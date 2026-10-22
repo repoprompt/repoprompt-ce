@@ -328,7 +328,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     /// rename would change stored tokens, so treat case names as a stable wire contract.
     private enum CodexNativeSessionFallbackReason: String {
         case missingRollout
-        case repeatedResumeTimeout
         case resumeFrameTooLarge
     }
 
@@ -394,7 +393,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let processIDs: Set<String>
     }
 
-    private static let repeatedResumeTimeoutFallbackThreshold = 2
     private let preferenceDefaults: UserDefaults
     private let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     private let perfRecorder: any AgentModePerfRecording
@@ -4614,7 +4612,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private static func codexNativeSessionFailurePrefix(
         disposition: AgentModeViewModel.CodexNativeStartupDisposition
     ) -> String {
-        disposition == .resumed ? "Codex native resume failed:" : "Codex native start failed:"
+        disposition == .resumed || disposition == .resumeTimedOut ? "Codex native resume failed:" : "Codex native start failed:"
     }
 
     private static func isCodexNativeSessionFailureText(
@@ -4672,28 +4670,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return count
     }
 
-    private func shouldSkipResumeAfterRepeatedTimeouts(
-        session: AgentTabSession,
-        existingRef: CodexNativeSessionController.SessionRef?,
-        allowResumeTimeoutFallback: Bool
-    ) -> Bool {
-        guard allowResumeTimeoutFallback,
-              let existingRef,
-              let target = Self.normalizedCodexResumeTimeoutTarget(
-                  conversationID: existingRef.conversationID,
-                  rolloutPath: existingRef.rolloutPath
-              )
-        else {
-            return false
-        }
-        let timeoutState = session.codexResumeTimeoutState
-        guard timeoutState.consecutiveTimeouts >= Self.repeatedResumeTimeoutFallbackThreshold else {
-            return false
-        }
-        return timeoutState.conversationID == target.conversationID
-            && timeoutState.rolloutPath == target.rolloutPath
-    }
-
     @discardableResult
     private func recordCodexResumeTimeoutIfNeeded(
         session: AgentTabSession,
@@ -4708,21 +4684,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     /// Chooses the fresh-thread fallback for a failed resume attempt, if any.
     ///
-    /// A resume response over the stdout frame budget is deterministic: retrying the same
-    /// target overflows again, so it falls back on the first occurrence. Timeouts may be
-    /// transient and only fall back once the repeated-timeout threshold is reached.
+    /// Frame overflow retains its existing fallback policy. Timeouts never authorize a
+    /// fresh thread: callers must explicitly retry the resume or hand off the task.
     private func resumeFreshStartFallbackReason(
         attemptedResume: Bool,
-        timeoutCount: Int?,
         error: Error,
         allowResumeTimeoutFallback: Bool
     ) -> CodexNativeSessionFallbackReason? {
         guard allowResumeTimeoutFallback, attemptedResume else { return nil }
         if CodexAppServerClient.isStdoutFrameBudgetExceededError(error) {
             return .resumeFrameTooLarge
-        }
-        if let timeoutCount, timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold {
-            return .repeatedResumeTimeout
         }
         return nil
     }
@@ -4760,16 +4731,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         "Codex couldn't resume the previous thread because its rollout file was missing. Started a fresh thread."
     }
 
-    private static func repeatedResumeTimeoutRecoveryMessage() -> String {
-        "Codex couldn't resume the previous thread after repeated timeout. Started a fresh thread."
+    private static func resumeTimeoutFailureMessage() -> String {
+        "Codex native resume failed: the previous thread timed out while loading. No new thread was started; the previous conversation is unchanged. Retry by sending your message again, or use Handoff to New Chat on an assistant message to carry this task's context into a new chat."
     }
 
     private static func recoveryMessage(for fallbackReason: CodexNativeSessionFallbackReason) -> String {
         switch fallbackReason {
         case .missingRollout:
             resumeRecoveryMessage()
-        case .repeatedResumeTimeout:
-            repeatedResumeTimeoutRecoveryMessage()
         case .resumeFrameTooLarge:
             resumeFrameTooLargeRecoveryMessage()
         }
@@ -6708,6 +6677,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if pendingCodexStartsByTabID[session.tabID]?.sessionID == sessionID {
             return
         }
+        // A startup outcome belongs to this attempt, never a later retry.
+        session.codexNativeStartupDisposition = nil
         let runAttemptIDAtEntry = session.activeRunAttemptID
         let effectiveRunState = semanticRunState ?? session.runState
         cancelCodexIdleShutdown(for: session.tabID)
@@ -7157,11 +7128,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
             )
             let routingReadinessAttemptedResume = Self.isCodexResumeAttempt(routingReadinessResumeCandidate)
-                && !shouldSkipResumeAfterRepeatedTimeouts(
-                    session: session,
-                    existingRef: routingReadinessResumeCandidate,
-                    allowResumeTimeoutFallback: allowResumeTimeoutFallback
-                )
             if forIdleNativeCompact {
                 guard session.runID == runID,
                       session.activeRunAttemptID == runAttemptIDAtEntry,
@@ -7424,20 +7390,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             for: session,
             skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
         )
-        let shouldSkipTimedOutResumeTarget = shouldSkipResumeAfterRepeatedTimeouts(
-            session: session,
-            existingRef: resumeCandidate,
-            allowResumeTimeoutFallback: allowResumeTimeoutFallback
-        )
-        if shouldSkipTimedOutResumeTarget {
-            logCodex("[AgentModeVM][CodexReconnect] skipping repeated timed-out resume target for tab \(session.tabID) and starting a fresh thread")
-        }
-        let existingRef = shouldSkipTimedOutResumeTarget ? nil : resumeCandidate
+        let existingRef = resumeCandidate
         guard let startController = session.codexController else { return }
         let controllerGenerationAtStart = session.codexControllerGeneration
         guard await computerUseStartupIsCurrent(startController) else { return }
         do {
-            var startResult = try await startCodexNativeSession(
+            let startResult = try await startCodexNativeSession(
                 controller: startController,
                 existingRef: existingRef,
                 baseInstructions: basePrompt,
@@ -7448,13 +7406,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 beforeStart: { await computerUseStartupIsCurrent(startController) }
             )
             guard await computerUseStartupIsCurrent(startController) else { return }
-            if shouldSkipTimedOutResumeTarget, startResult.fallbackReason == nil {
-                startResult = CodexNativeSessionStartResult(
-                    sessionRef: startResult.sessionRef,
-                    fallbackReason: .repeatedResumeTimeout,
-                    disposition: .resumeFellBackToFresh
-                )
-            }
             if deferPublicationUntilRouting {
                 guard stageCodexNativeSessionStartResult(
                     startResult,
@@ -7525,7 +7476,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
                     do {
-                        var recoveredStartResult = try await startCodexNativeSession(
+                        let recoveredStartResult = try await startCodexNativeSession(
                             controller: recoveredController,
                             existingRef: existingRef,
                             baseInstructions: basePrompt,
@@ -7536,13 +7487,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             beforeStart: { await computerUseStartupIsCurrent(recoveredController) }
                         )
                         guard await computerUseStartupIsCurrent(recoveredController) else { return }
-                        if shouldSkipTimedOutResumeTarget, recoveredStartResult.fallbackReason == nil {
-                            recoveredStartResult = CodexNativeSessionStartResult(
-                                sessionRef: recoveredStartResult.sessionRef,
-                                fallbackReason: .repeatedResumeTimeout,
-                                disposition: .resumeFellBackToFresh
-                            )
-                        }
                         if deferPublicationUntilRouting {
                             guard stageCodexNativeSessionStartResult(
                                 recoveredStartResult,
@@ -7590,18 +7534,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }()
             if let freshStartFallbackReason = resumeFreshStartFallbackReason(
                 attemptedResume: attemptedResume,
-                timeoutCount: resumeTimeoutCount,
                 error: effectiveError,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback
             ) {
-                let isFrameTooLarge = freshStartFallbackReason == .resumeFrameTooLarge
-                let failureDescription = isFrameTooLarge ? "oversized resume response" : "repeated resume timeout"
-                logCodex("[AgentModeVM][CodexReconnect] \(failureDescription) for tab \(session.tabID); retrying with a fresh thread start")
+                logCodex("[AgentModeVM][CodexReconnect] oversized resume response for tab \(session.tabID); retrying with a fresh thread start")
                 let expectedController = session.codexController
                 _ = invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: expectedController,
-                    source: isFrameTooLarge ? "resume-frame-too-large-fallback" : "resume-timeout-fallback",
+                    source: "resume-frame-too-large-fallback",
                     preserveRunID: true
                 )
                 guard let freshController = await prepareCodexController() else { return }
@@ -7689,7 +7630,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return
                 }
             }
-            if !shouldSkipTimedOutResumeTarget, resumeTimeoutCount == nil {
+            if resumeTimeoutCount == nil {
                 resetCodexResumeTimeoutState(for: session)
             }
             let invalidatedTimedOutController = isControlPlaneTimeout
@@ -7703,8 +7644,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if !invalidatedTimedOutController {
                 markCodexReconnectNeeded(for: session, source: "ensure-error")
             }
+            if attemptedResume, isControlPlaneTimeout {
+                session.codexNativeStartupDisposition = .resumeTimedOut
+            }
             let errorItem = AgentChatItem.error(
-                "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
+                attemptedResume && isControlPlaneTimeout
+                    ? Self.resumeTimeoutFailureMessage()
+                    : "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
             )
             session.appendItem(errorItem)
@@ -7961,13 +7907,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             logCodex("[AgentModeVM] sendCodexNativeMessage: no active thread after ensure, failing run")
             clearCodexAuthRecoveryAttempt(for: session.runID)
             clearCodexPendingAuthRetryTurn(session)
-            let message = "Codex native send failed: session not ready"
-            let alreadyReportedStartFailure = session.items.last.map {
-                $0.kind == .error && Self.isCodexNativeSessionFailureText(
-                    $0.text,
-                    disposition: session.codexNativeStartupDisposition
-                )
-            } ?? false
+            let reportedFailure = session.items.last.flatMap { item -> AgentChatItem? in
+                item.kind == .error && Self.isCodexNativeSessionFailureText(
+                    item.text, disposition: session.codexNativeStartupDisposition
+                ) ? item : nil
+            }
+            let message = reportedFailure?.text ?? "Codex native send failed: session not ready"
+            let alreadyReportedStartFailure = reportedFailure != nil
             if !alreadyReportedStartFailure {
                 markCodexReconnectNeeded(for: session, source: "send-no-active-thread")
             }
@@ -9623,6 +9569,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             terminalState: terminalState,
             source: "codex.finalize.\(reason)",
             errorText: errorMessage,
+            failureReason: turnStatus == .failed && session.codexNativeStartupDisposition == .resumeTimedOut ? .resumeTimedOut : nil,
             attachmentDisposition: attachmentDisposition,
             finalizeNonCodexUsage: false,
             supportsFollowUp: false,

@@ -1345,33 +1345,85 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.providerCleanupHandle?.rolloutPath, Self.oldRolloutPath, file: file, line: line)
     }
 
-    func testTwoResumeTimeoutsThenFreshRoutingFailureRetainsPersistedTupleAndLaterSend() async throws {
-        let fixture = makeFixture([
-            [.timeout],
-            [.timeout],
-            [.success("failed-fresh-thread")],
-            [.success("later-fresh-thread")]
-        ])
-        await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
-        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 1)
+    func testResumeTimeoutRejectsSendWithOneActionableFailureAndPreservesThread() async {
+        let fixture = makeFixture([[.timeout], [.discoveryFailure]])
+        var notifications: [String?] = []
+        var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
+        fixture.session.appendItem(.user("continue the task"))
+        fixture.coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(), terminalSessionBinder: { owned in
+            AgentRunTerminalSessionBinding(
+                tabID: owned.tabID, lifecycle: owned.runLifecycle,
+                hooks: .init(
+                    flushPendingAssistantDelta: {}, finalizeStreamingItems: {}, finalizePendingToolCalls: { _ in },
+                    finalizeNonCodexTurnUsage: {}, cancelPendingInteractions: { _ in }, finalizeAttachments: { _, _ in },
+                    setAgentRunInactive: {}, prepareTerminalPublication: {},
+                    makeTerminalPublicationEnvelope: { _, _, _, _ in nil }, updateBindings: {},
+                    notifyAgentTurnComplete: {}, notifyAgentTurnFailed: { notifications.append($0) }, scheduleSave: {},
+                    publishTerminalCommit: { revision, _ in
+                        reasons.append(revision.failureReason)
+                        return .accepted(successorEpoch: nil)
+                    }, startFollowUpRun: { _ in }
+                ),
+                validatesOwnership: { owned.isCurrentRunAttemptForCurrentBinding($0, expectedRunID: $1) },
+                providerDrainGeneration: { owned.providerTerminalDrainGeneration },
+                terminalTurnID: { owned.items.last(where: { $0.kind == .user })?.id },
+                queuedFollowUp: { nil }, setFollowUpPending: { _ in }, removeFirstQueuedFollowUp: { nil },
+                appendError: { owned.appendItem(.error($0, sequenceIndex: owned.nextSequenceIndex)) },
+                finishActiveState: { ownership, state, source in
+                    owned.runState = state
+                    _ = owned.endRunAttempt(ifCurrent: ownership, source: source)
+                }, retainProcessRunIdentity: { _, _ in }, sourceItemsRevision: { owned.sourceItemsRevision },
+                assistantDeltaFlushGeneration: { owned.assistantDeltaFlushGeneration },
+                latestFailureText: { AgentTranscriptIO.latestErrorText(from: owned.transcript, latestTurnOnly: true) }
+            )
+        })
+        guard case let .failed(message) = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session, text: "continue the task", attachments: []
+        ) else { return XCTFail("A timed-out resume must reject the send") }
         assertOldTuple(fixture.session)
-
-        let second = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
-        defer { second.cancel() }
-        try await waitForPendingStart(fixture)
-        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 2)
-        assertOldTuple(fixture.session)
-        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
-        let failedRunID = try XCTUnwrap(fixture.session.runID)
-        await MCPRoutingWaiter.shared.notifyFailed(runID: failedRunID)
-        await second.value
-
-        assertOldTuple(fixture.session)
+        XCTAssertTrue(message.contains("No new thread was started"))
+        XCTAssertTrue(message.contains("Retry"))
+        XCTAssertTrue(message.contains("Handoff to New Chat"))
+        XCTAssertEqual(fixture.session.items.filter { $0.kind == .error }.map(\.text), [message])
+        XCTAssertEqual(notifications, [message])
+        XCTAssertEqual(reasons.map { $0?.rawValue }, ["resume_timed_out"])
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        XCTAssertTrue(fixture.session.codexNeedsReconnect)
         XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
-        XCTAssertFalse(fixture.session.codexNeedsReconnect)
-        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
-        XCTAssertEqual(fixture.factory.controllers[2].startedTurnCount, 0)
 
+        // A later, different startup failure must not inherit the timeout classification.
+        fixture.session.runState = .running
+        fixture.session.beginRunAttempt(source: "retry-after-timeout")
+        fixture.session.appendItem(.user("retry the task", sequenceIndex: fixture.session.nextSequenceIndex))
+        guard case let .failed(retryMessage) = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session, text: "retry the task", attachments: []
+        ) else { return XCTFail("Discovery failure must reject the retry") }
+        XCTAssertTrue(retryMessage.contains("Tool catalog not ready"))
+        XCTAssertEqual(notifications, [message, retryMessage])
+        XCTAssertEqual(reasons, [.resumeTimedOut, .agentError])
+        XCTAssertEqual(fixture.session.transcript.turns.last?.allActivities.filter { $0.itemKind == .error }.map(\.text), [retryMessage])
+        assertOldTuple(fixture.session)
+    }
+
+    func testRepeatedResumeTimeoutsPreservePersistedTupleAndExplicitRetryResumesSameThread() async throws {
+        let fixture = makeFixture([
+            [.timeout], [.timeout], [.timeout], [.success(Self.oldThreadID)]
+        ], shouldManageCodexTooling: false)
+        for count in 1 ... 3 {
+            await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+            assertOldTuple(fixture.session)
+            XCTAssertEqual(fixture.factory.controllers.count, count, "one resume attempt per explicit retry")
+            XCTAssertEqual(fixture.factory.controllers.last?.receivedExistingIDs, [Self.oldThreadID])
+            XCTAssertEqual(fixture.factory.controllers.last?.startedTurnCount, 0)
+            XCTAssertTrue(fixture.session.codexNeedsReconnect)
+            XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, count)
+            XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumeTimedOut)
+            XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+        }
+        try await AsyncTestWait.waitUntil("timed-out controllers retired", timeout: 4) {
+            fixture.factory.controllers.allSatisfy { $0.shutdownCount == 1 }
+        }
         var saved: AgentSession?
         fixture.viewModel.test_setAgentSessionSaver { agentSession, _, _ in
             saved = agentSession
@@ -1382,36 +1434,25 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(saved?.codexRolloutPath, Self.oldRolloutPath)
         XCTAssertEqual(saved?.providerCleanupHandle?.conversationID, Self.oldThreadID)
 
-        fixture.session.runState = .idle
-        fixture.session.beginRunAttempt(source: "codex-resume-wedge-later-send")
-        let later = Task {
-            await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session,
-                text: "continue",
-                attachments: []
-            )
-        }
-        defer { later.cancel() }
-        try await waitForPendingStart(fixture)
-        XCTAssertEqual(fixture.factory.controllers[3].receivedExistingIDs, [nil])
-        assertOldTuple(fixture.session)
-        try await MCPRoutingWaiter.shared.notifyFailed(runID: XCTUnwrap(fixture.session.runID))
-        _ = await later.value
-        assertOldTuple(fixture.session)
+        await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(fixture.factory.controllers.count, 4)
+        XCTAssertEqual(fixture.factory.controllers[3].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.session.codexConversationID, Self.oldThreadID)
+        XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumed)
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0)
         XCTAssertFalse(fixture.session.codexNeedsReconnect)
-        XCTAssertEqual(fixture.factory.controllers[2].startedTurnCount, 0)
-        XCTAssertEqual(fixture.factory.controllers[3].startedTurnCount, 0)
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
     }
 
-    func testRepeatedTimeoutReplacementRenewsAdmissionAndDiscardsOldRoutingSignal() async throws {
-        let responseGate = TestReleaseFence(name: "replacement response")
+    func testExplicitRetryAfterTimeoutRenewsAdmissionAndDiscardsOldRoutingSignal() async throws {
+        let responseGate = TestReleaseFence(name: "retry response")
         let fixture = makeFixture([
-            [.timeout],
             [.routedTimeout],
-            [.suspendedSuccess("replacement-thread", responseGate)]
+            [.suspendedSuccess(Self.oldThreadID, responseGate)]
         ])
         await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+        assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.factory.controllers.count, 1, "timeout must stop instead of replacing the thread")
         let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
         defer {
             responseGate.release()
@@ -1422,24 +1463,23 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let runID = try XCTUnwrap(fixture.session.runID)
         let clientName = try XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint)
         let staleOutcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: runID)
-        XCTAssertNil(staleOutcome, "the retired process's routed signal must not satisfy the replacement wait")
+        XCTAssertNil(staleOutcome, "the retired process's routed signal must not satisfy the retry wait")
         let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
-        XCTAssertTrue(pendingPolicies.contains { $0.runID == runID }, "replacement needs fresh admission after the old permit expired")
+        XCTAssertTrue(pendingPolicies.contains { $0.runID == runID }, "retry needs fresh admission")
         assertOldTuple(fixture.session)
-        XCTAssertEqual(fixture.factory.controllers[1].shutdownCount, 1)
-        XCTAssertEqual(fixture.factory.controllers[2].runID, runID)
+        XCTAssertEqual(fixture.factory.controllers[0].shutdownCount, 1)
+        XCTAssertEqual(fixture.factory.controllers[1].receivedExistingIDs, [Self.oldThreadID])
 
         responseGate.release()
         try await waitForPendingStart(fixture)
         assertOldTuple(fixture.session)
-        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 2)
-        XCTAssertEqual(fixture.factory.controllers[2].startedTurnCount, 0)
         await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
         await startup.value
-        XCTAssertEqual(fixture.session.codexConversationID, "replacement-thread")
-        XCTAssertEqual(fixture.session.providerCleanupHandle?.conversationID, "replacement-thread")
+        XCTAssertEqual(fixture.session.codexConversationID, Self.oldThreadID)
+        XCTAssertEqual(fixture.session.providerCleanupHandle?.conversationID, Self.oldThreadID)
         XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0)
-        XCTAssertEqual(fixture.session.items.count(where: { $0.text.contains("Started a fresh thread") }), 1)
+        XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumed)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
         let retainedPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
         XCTAssertTrue(retainedPolicies.contains { $0.runID == runID }, "old lease cleanup must not revoke successor admission")
         await ServerNetworkManager.shared.revokeClientConnectionPolicy(for: clientName, windowID: 1, runID: runID)
