@@ -76,6 +76,34 @@ immediately when that specific scope ends, including during asynchronous cleanup
 Valid committed scope/link rows restore normally. Failed continuity writes retain their existing
 honest pending/failed receipts; this flow does not strengthen a failed write into crash durability.
 
+## Delegation scope ending evidence
+
+Scope endings are app-owned diagnostic facts, not another authority. `scope_status` includes an
+`ending` object for known ended grants: `reason`, optional `at`, `initiator`, optional
+`actor_session_id`, `originating_scope_id`, and `originating_session_id`. Reasons are
+`user_revoked`, `grantee_released`, `session_deleted`, `expired`, `full_access_disabled`, and
+`historical_unknown`. A cascade keeps its initiating scope/session, not an invented child actor.
+`at` is when the owning transition was materialized, including recovery after an offline expiry;
+the grant's `expires_at` remains the scheduled deadline. Historical tombstones lacking evidence
+report an unknown initiator and no fabricated time. Existing history cannot explain the original
+unexpected ending retroactively.
+
+Ending evidence and the irreversible terminal identity share a continuity transaction. The first
+ending wins across later release/revoke calls, ancestor cascades, and operation retries. A terminal
+row wraps its original grant bytes for diagnostic status after restart; it is never reactivated.
+Old readers already ignore terminal payloads, and live grant payloads/schema are unchanged.
+Descendants known only to storage are terminalized in the same recursive transaction and inherit
+the initiating evidence. Explicit child transitions are written deepest-first to preserve their
+own evidence before an ancestor cascade. Session deletion also covers unloaded grants.
+
+The monitor exposes the latest 16 endings. MCP status remains caller-owned; knowing another
+scope UUID does not authorize reading its historical details. Scope status also reports continuity
+save state: a failed write still denies authority immediately in this process but must not claim
+that either the ending evidence or denial survived a crash. Shutdown itself is not revocation;
+compatible saved grants can restore. Mixed-profile legacy descriptions remain preserved for
+explicit user review rather than being represented as revoked grants. Guardrail admission or
+membership-proof failure refuses the operation and does not itself end its scope.
+
 ## Four owners, deliberately disjoint
 
 Nothing here has a single god object. Confusing these four is the most common way to introduce a

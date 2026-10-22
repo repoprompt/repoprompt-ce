@@ -51,11 +51,49 @@ package enum OverseerContinuityMutation: Codable, Equatable {
     case grant(OverseerContinuityRow)
     /// All descendants become terminal in the same transaction, including concurrent children.
     case revokeScope(String)
+    /// Terminal evidence shares the revocation transaction; it never confers authority.
+    case endScope(String, OverseerScopeEnding, original: OverseerContinuityRow?)
     /// A committed session deletion fences later legacy imports, including currently unloaded scopes.
     case deletedSession(String)
     /// Explicit link assertion or ownership transition; expected revision is a compare-and-swap.
     case put(OverseerContinuityRow, expectedRevision: Int64?)
     case remove(kind: OverseerContinuityKind, id: String, expectedRevision: Int64)
+}
+
+/// Bounded, app-owned evidence. Unknown historical tombstones deliberately have no invented time.
+package struct OverseerScopeEnding: Codable, Equatable {
+    package enum Reason: String, Codable {
+        case userRevoked = "user_revoked"
+        case granteeReleased = "grantee_released"
+        case sessionDeleted = "session_deleted"
+        case expired
+        case fullAccessDisabled = "full_access_disabled"
+        case historicalUnknown = "historical_unknown"
+    }
+
+    package let reason: Reason
+    package let at: Date?
+    package let actorSessionID: UUID?
+    package let originatingScopeID: UUID?
+    package let originatingSessionID: UUID?
+
+    package init(reason: Reason, at: Date? = nil, actorSessionID: UUID? = nil, originatingScopeID: UUID? = nil, originatingSessionID: UUID? = nil) {
+        self.reason = reason
+        self.at = at
+        self.actorSessionID = actorSessionID
+        self.originatingScopeID = originatingScopeID
+        self.originatingSessionID = originatingSessionID
+    }
+}
+
+/// Only terminal scope rows use this envelope. Live grant bytes and the database schema stay unchanged.
+package struct OverseerEndedScope: Codable, Equatable {
+    package let ending: OverseerScopeEnding
+    package let originalPayload: Data
+    package init(ending: OverseerScopeEnding, originalPayload: Data) {
+        self.ending = ending
+        self.originalPayload = originalPayload
+    }
 }
 
 package struct OverseerContinuityReceipt: Codable, Equatable {

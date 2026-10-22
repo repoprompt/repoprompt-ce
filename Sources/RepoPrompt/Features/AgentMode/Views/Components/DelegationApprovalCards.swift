@@ -128,15 +128,16 @@ struct DelegationApprovalSlot: View {
 }
 
 /// The user's list of every live delegation scope, with a Revoke control for each. Hosted in the
-/// oversight monitor popover; renders nothing when no scope is live.
+/// oversight monitor popover, alongside bounded diagnostic-only ending history.
 struct DelegationActiveScopesSection: View {
     @ObservedObject var runtime: DelegationScopeRuntime
     @AppStorage(DelegationScopeRuntime.autoApproveAllRequestsKey) private var globalAutoApprove = false
 
     var body: some View {
         let scopes = runtime.allLiveScopes()
+        let endings = runtime.recentScopeEndings
         let standing = runtime.sessionWideApprovals.sorted { $0.uuidString < $1.uuidString }
-        if !scopes.isEmpty || !standing.isEmpty || globalAutoApprove || runtime.persistenceStatusMessage != nil
+        if !scopes.isEmpty || !endings.isEmpty || !standing.isEmpty || globalAutoApprove || runtime.persistenceStatusMessage != nil
             || !runtime.continuityRecoveryOffers.isEmpty
         {
             VStack(alignment: .leading, spacing: 6) {
@@ -190,6 +191,23 @@ struct DelegationActiveScopesSection: View {
                         Button("Approve new live grants from these descriptions") {
                             runtime.approveContinuityRecovery(sourceID: offer.id)
                         }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                if !endings.isEmpty {
+                    DisclosureGroup("Recently ended delegations") {
+                        ForEach(endings) { item in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Scope \(item.id.uuidString)")
+                                Text(item.ending.reason.rawValue.replacingOccurrences(of: "_", with: " "))
+                                if let at = item.ending.at { Text(at.formatted(date: .abbreviated, time: .standard)) }
+                                if let actor = item.ending.actorSessionID { Text("Initiating session: \(actor.uuidString)") }
+                                if let origin = item.ending.originatingScopeID { Text("Originating scope: \(origin.uuidString)") }
+                                if let session = item.ending.originatingSessionID { Text("Deleted session: \(session.uuidString)") }
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        }
                     }
                 }
                 ForEach(scopes, id: \.id) { scope in
