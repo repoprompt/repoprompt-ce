@@ -1726,7 +1726,8 @@ enum AgentSessionOversightPersistenceCopy {
     static let futureSchema = "Saved continuity uses a newer format and was preserved. Current approved links still work; use a compatible version to recover those saved records."
     static let unreadable = "Saved link continuity could not open. Existing data is preserved and current approved links still work. Check local storage permissions and disk space, then retry saving."
     static let quarantined = "Legacy link data could not be decoded and remains preserved for recovery; no unknown authority was activated."
-    static let terminalRestorationSummary = "Some saved oversight links couldn’t be restored and were removed."
+    static let terminalRestorationSummary = "Some saved oversight links couldn’t be restored. They were kept for a later launch."
+    static let deletedRestorationSummary = "Saved oversight links for deleted sessions were removed."
     static let addWriteFailed = "Live oversight and continuity saving have separate results. This change is not saved; check disk space and storage permissions, then retry saving."
     static let addCompensationFailed = "Oversight didn’t start, and RepoPrompt couldn’t clear its saved request. It won’t retry again this launch; check disk space and permissions before relaunching."
     static let stopWriteFailed = "Saved link removal is pending or failed. The live unlink result is separate; check disk space and storage permissions, then retry saving."
@@ -1856,6 +1857,7 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
 enum AgentSessionOversightWarningID {
     static let quarantined = "oversight.persistence.quarantined"
     static let terminalRestoration = "oversight.persistence.terminalRestoration"
+    static let deletedRestoration = "oversight.persistence.deletedRestoration"
     static let cleanupFailed = "oversight.persistence.cleanupFailed"
     static let compensationFailed = "oversight.persistence.compensationFailed"
 }

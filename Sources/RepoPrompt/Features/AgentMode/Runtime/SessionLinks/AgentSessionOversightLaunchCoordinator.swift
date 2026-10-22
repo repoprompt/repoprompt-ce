@@ -74,7 +74,7 @@ enum AgentSessionOversightRestoreTopologyState: Equatable {
 ///
 /// Diagnostics only: these are enum-like outcome labels, never rendered with a session name or UUID.
 enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
-    /// The saved UUID resolves to more than one live incarnation, so neither may be granted.
+    /// A previously granted UUID resolves to multiple live incarnations; its exact grant is revoked.
     case ambiguousDuplicate = "ambiguous_duplicate"
     /// No descriptor and no candidate, under a topology that proves absence.
     case missing
@@ -264,7 +264,7 @@ final class AgentSessionOversightLaunchCoordinator {
     private var storeIsReady = false
     private var isFrozen = false
     private var didLoadLaunchEntries = false
-    private var didReportTerminalSummary = false
+    private var reportedTerminalSummaryIDs: Set<String> = []
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -823,6 +823,14 @@ final class AgentSessionOversightLaunchCoordinator {
         descriptorCounts: [UUID: Int],
         candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]]
     ) -> Disposition {
+        // Record presence for both endpoints before any early wait (including a duplicate on the
+        // first endpoint). Closing every observed copy must still end the launch entry rather than
+        // look like an uncertain workspace that never returned.
+        for sessionID in [pair.observerSessionID, pair.targetSessionID]
+            where (descriptorCounts[sessionID] ?? 0) > 0 || !(candidatesBySession[sessionID] ?? []).isEmpty
+        {
+            noteObserved(pair: pair, sessionID: sessionID)
+        }
         var resolved: [UUID: AgentSessionLinkEndpointCandidate] = [:]
         for sessionID in [pair.observerSessionID, pair.targetSessionID] {
             let descriptorCount = descriptorCounts[sessionID] ?? 0
@@ -838,9 +846,10 @@ final class AgentSessionOversightLaunchCoordinator {
                 return .wait
             }
 
-            // A duplicate is a *positive* fact even under an uncertain topology: two live
-            // incarnations of one UUID mean neither may be granted, exactly as manual Add refuses.
-            if descriptorCount > 1 || matches.count > 1 { return .terminal(.ambiguousDuplicate) }
+            // Neither copy may be granted, but a never-granted entry can become unambiguous when
+            // the extra window closes. Keep waiting on ordinary topology/readiness events and
+            // re-prove every establishment fence then; an active entry's audit remains terminal.
+            if descriptorCount > 1 || matches.count > 1 { return .wait }
 
             if descriptorCount == 0, matches.isEmpty {
                 // An endpoint this launch already observed and then watched disappear is a fact about
@@ -855,8 +864,6 @@ final class AgentSessionOversightLaunchCoordinator {
                 // rather than deleting an intent whose window may simply never have come back.
                 return topology.provesAbsence ? .terminal(.missing) : .wait
             }
-            noteObserved(pair: pair, sessionID: sessionID)
-
             // A described-but-unhydrated background tab. Waiting here is the entire reason
             // descriptors exist: restoration must never force-hydrate a lazy tab.
             guard let candidate = matches.first else { continue }
@@ -1046,8 +1053,8 @@ final class AgentSessionOversightLaunchCoordinator {
             // hydrating or rebinding, a superseded hydration proof, a closing or retiring endpoint,
             // a transient observer eligibility input). Deleting here erased user-created links on
             // ordinary restarts. Only `classify` may end the saved relationship, and only on a proven
-            // fact (deleted, missing under a fully observed topology, duplicate, ineligible, terminal
-            // hydration).
+            // fact (deleted, missing under a fully observed topology, ineligible, terminal hydration).
+            // A duplicate that has never been granted waits instead.
             settled.state = .waiting
             guard !isFrozen else {
                 entries[pair] = settled
@@ -1078,7 +1085,7 @@ final class AgentSessionOversightLaunchCoordinator {
     /// cannot spin; exhaustion preserves intent rather than deleting it.
     static let maxAutomaticEstablishmentAttempts = 3
 
-    /// Terminalizes one entry and removes exactly its own durable token.
+    /// Terminalizes one entry, removing exactly its own durable token only for committed deletion.
     private func retire(
         pair: AgentSessionOversightIntent,
         reason: AgentSessionOversightLaunchTerminalReason
@@ -1095,7 +1102,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
             return
         }
         entry.state = .terminal(reason)
@@ -1125,7 +1132,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
         case .tokenMismatch:
             // A generation mismatch is the store proving this retirement is stale. The explicit Add
             // will hand the entry to the interactive path; do not pre-emptively terminalize it.
@@ -1139,7 +1146,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
         case .writeFailed, .blocked:
             // Suppressed for this launch and recorded token-qualified, so no topology event retries
             // it and no stale receipt can later delete a reasserted intent.
@@ -1155,13 +1162,18 @@ final class AgentSessionOversightLaunchCoordinator {
         }
     }
 
-    /// One aggregate summary per launch. Never names a session.
-    private func reportTerminalSummaryIfNeeded() {
-        guard !didReportTerminalSummary else { return }
-        didReportTerminalSummary = true
+    /// One aggregate summary per disposition per launch. Never names a session.
+    private func reportTerminalSummaryIfNeeded(reason: AgentSessionOversightLaunchTerminalReason) {
+        let removed = reason.removesDurableIntent
+        let id = removed
+            ? AgentSessionOversightWarningID.deletedRestoration
+            : AgentSessionOversightWarningID.terminalRestoration
+        guard reportedTerminalSummaryIDs.insert(id).inserted else { return }
         delegate?.launchCoordinatorReportWarning(
-            id: AgentSessionOversightWarningID.terminalRestoration,
-            message: AgentSessionOversightPersistenceCopy.terminalRestorationSummary
+            id: id,
+            message: removed
+                ? AgentSessionOversightPersistenceCopy.deletedRestorationSummary
+                : AgentSessionOversightPersistenceCopy.terminalRestorationSummary
         )
     }
 }

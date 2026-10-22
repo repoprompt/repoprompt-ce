@@ -383,6 +383,12 @@ the next pass reclassifies first. Only committed deletion removes the durable ro
 classifications end this launch's attempt without erasing continuity. An exhausted budget likewise
 leaves the intent dormant for the next launch.
 
+A never-granted launch entry blocked by duplicate window incarnations stays waiting. Existing
+candidate/topology events reconsider it once both endpoints are unique, through the same readiness,
+hydration-proof and authorization fences; no timer or new grant path is involved. This does not
+rearm an already-granted entry revoked by a late duplicate or another lifecycle event. Terminal
+restoration warnings distinguish retained intent from removal for committed session deletion.
+
 **Committed continuity survives restart or crash.** Scope, link-intent, and worktree transitions
 write affected SQLite rows and receipts atomically; no clean-shutdown marker or final snapshot is
 required. Live decisions and save acknowledgements are separate: pending/failed writes are not

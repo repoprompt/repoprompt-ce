@@ -580,10 +580,10 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.pendingReservationCount, 0)
         // The refusal itself proves nothing and does not immediately re-run.
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
-        // The next readiness event reclassifies first and proves the duplicate.
+        // The next readiness event reclassifies first and waits for the duplicate to clear.
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
     }
 
     func testBothExactHydrationProofsAreFreshAfterReservation() async throws {
@@ -1031,6 +1031,30 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertTrue(restored)
     }
 
+    func testCommittedDeletionReportsRemovalRatherThanRetainedIntent() async throws {
+        try seedSavedPair()
+        let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
+        await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        replaceTopology(fixture, with: [makeReadyCandidate(windowID: 1, sessionID: observerSessionID)])
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.deleted))
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNil(token)
+        XCTAssertEqual(
+            fixture.bridge.currentPersistencePresentation.warnings.first {
+                $0.id == AgentSessionOversightWarningID.deletedRestoration
+            }?.message,
+            "Saved oversight links for deleted sessions were removed."
+        )
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.warnings.contains {
+            $0.id == AgentSessionOversightWarningID.terminalRestoration
+        })
+    }
+
     // MARK: - Absence
 
     func testAMissingSessionIsRemovedOnlyWhenTheTopologyProvesAbsence() async throws {
@@ -1064,8 +1088,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.missing))
     }
 
-    /// A duplicate is a positive fact even under an uncertain topology.
-    func testADuplicateLiveIncarnationTerminatesEvenWhenAbsenceIsUncertain() async throws {
+    /// A never-granted duplicate waits, then restores through ordinary readiness and authorization.
+    func testADuplicateLiveIncarnationRestoresWhenUniqueAgain() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
         fixture.host.topology = .incompleteLeftoversAbandoned(count: 2)
@@ -1084,9 +1108,62 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         let token = await fixture.store.token(for: pair)
         XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
-        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
-        let restored = await isRestored(fixture)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        var restored = await isRestored(fixture)
         XCTAssertFalse(restored)
+        XCTAssertTrue(fixture.host.publishedPresentations.last?.warnings.isEmpty == true)
+
+        // Closing the extra window is sufficient; no store reload or interactive Add is needed.
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+        // WindowStatesManager separately publishes topology after unregistering the window.
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        restored = await isRestored(fixture)
+        XCTAssertTrue(restored)
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        let retainedToken = await fixture.store.token(for: pair)
+        XCTAssertEqual(retainedToken, token)
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+    }
+
+    func testClosingEveryDuplicateCopyEndsTheNeverGrantedEntry() async throws {
+        let base = try XCTUnwrap(directory)
+        defer { directory = base }
+        for duplicateObserver in [false, true] {
+            directory = base.appendingPathComponent("duplicate-observer-\(duplicateObserver)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try seedSavedPair()
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            fixture.host.topology = .incompleteLeftoversAbandoned(count: 2)
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            let duplicate = makeReadyCandidate(
+                windowID: 3, sessionID: duplicateObserver ? observerSessionID : targetSessionID
+            )
+            replaceTopology(fixture, with: [observer, target, duplicate])
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+
+            replaceTopology(fixture, with: [duplicateObserver ? target : observer])
+            await fixture.bridge.invalidateWindow(duplicateObserver ? 1 : 2, reason: .windowClosed)
+            await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.bindingDrift))
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNotNil(token)
+
+            replaceTopology(fixture, with: [observer, target])
+            fixture.bridge.noteCandidateReadinessChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let restored = await isRestored(fixture)
+            XCTAssertFalse(restored)
+            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
+        }
     }
 
     func testATerminalHydrationProofTerminatesTheEntryDespiteALiveCandidate() async throws {
@@ -1449,6 +1526,20 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             1,
             "An audited entry is finished, never requeued."
         )
+        XCTAssertEqual(
+            fixture.bridge.currentPersistencePresentation.warnings.first {
+                $0.id == AgentSessionOversightWarningID.terminalRestoration
+            }?.message,
+            "Some saved oversight links couldn’t be restored. They were kept for a later launch."
+        )
+        replaceTopology(fixture, with: [observer, target])
+        await fixture.bridge.invalidateWindow(3, reason: .windowClosed)
+        // WindowStatesManager separately publishes topology after unregistering the window.
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        restored = await isRestored(fixture)
+        XCTAssertFalse(restored, "A previously granted and revoked link must not be resurrected.")
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
     }
 
     /// An ordinary close of a described-but-unhydrated tab ends the saved relationship.
