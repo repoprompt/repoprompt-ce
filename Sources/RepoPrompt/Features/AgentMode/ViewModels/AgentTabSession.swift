@@ -2308,6 +2308,7 @@ final class AgentTabSession: ObservableObject {
     private enum SourceItemPayloadUpdate {
         case rebuildFromSource
         case preserveSurvivingPayloads
+        case preserveUnchangedRows
     }
 
     /// How a committed source-items change treats the retained local-input index's identity.
@@ -2334,6 +2335,11 @@ final class AgentTabSession: ObservableObject {
     ) {
         let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         let repairedItems = repair.items
+        let previousItemsByID: [UUID: AgentChatItem]? = if case .preserveUnchangedRows = payloadUpdate {
+            Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        } else {
+            nil
+        }
         switch localInputIdentity {
         case .invalidate:
             invalidateLocalInputStructure()
@@ -2356,6 +2362,13 @@ final class AgentTabSession: ObservableObject {
         items = repairedItems
         suppressSourceItemsChanged = false
         rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if let previousItemsByID {
+            // Unchanged summary rows cannot reconstruct their retained raw result. Re-inspect
+            // only changed/new rows, after ID repair and live-ID pruning, before notifying.
+            for item in items where previousItemsByID[item.id] != item {
+                refreshEphemeralPayload(for: item)
+            }
+        }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -2402,6 +2415,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             repair.items,
             dispatch: .notify(.structural),
+            payloadUpdate: .preserveUnchangedRows,
             diagnosticContext: "\(diagnosticContext).commit"
         )
         return true
@@ -2423,7 +2437,7 @@ final class AgentTabSession: ObservableObject {
                 ),
                 liveItemIDs: liveItemIDs
             )
-        case .preserveSurvivingPayloads:
+        case .preserveSurvivingPayloads, .preserveUnchangedRows:
             replaceEphemeralToolResultPayloadMap(ephemeralToolResultPayloadByItemID, liveItemIDs: liveItemIDs)
         }
         rebuildToolCorrelationIndexes()
@@ -2678,6 +2692,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
+            payloadUpdate: .preserveUnchangedRows,
             localInputIdentity: .batchDiff,
             diagnosticContext: "mutateItemsBatch"
         )
@@ -2700,24 +2715,28 @@ final class AgentTabSession: ObservableObject {
     }
 
     func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
-        setItemsSilently(items, reason: reason, payloadUpdate: .rebuildFromSource)
+        let payloadUpdate: SourceItemPayloadUpdate = switch reason {
+        case .retentionCompaction:
+            .preserveSurvivingPayloads
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .preserveUnchangedRows
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .rebuildFromSource
+        }
+        setItemsSilently(items, reason: reason, payloadUpdate: payloadUpdate)
     }
 
     /// Reconcile compacted source items without re-inspecting payloads that the session already owns.
     /// Unlike hydration or ordinary replacement, surviving payloads and their revisions stay intact.
     /// Pruning uses repaired live IDs; a rekeyed duplicate never inherits another item's raw payload.
     func setItemsSilentlyForRetentionCompaction(_ items: [AgentChatItem]) {
-        setItemsSilently(items, reason: .retentionCompaction, payloadUpdate: .preserveSurvivingPayloads)
+        setItemsSilently(items, reason: .retentionCompaction)
     }
 
     /// Repair pending rows without discarding payloads owned by unchanged completed cards.
     /// Changed results are re-inspected so a terminal fallback cannot retain stale running output.
     func setItemsSilentlyForPendingToolFinalizationRepair(_ items: [AgentChatItem]) {
-        let previousItemsByID = Dictionary(uniqueKeysWithValues: self.items.map { ($0.id, $0) })
-        setItemsSilently(items, reason: .pendingToolFinalizationRepair, payloadUpdate: .preserveSurvivingPayloads)
-        for item in self.items where previousItemsByID[item.id] != item {
-            refreshEphemeralPayload(for: item)
-        }
+        setItemsSilently(items, reason: .pendingToolFinalizationRepair)
     }
 
     private func setItemsSilently(

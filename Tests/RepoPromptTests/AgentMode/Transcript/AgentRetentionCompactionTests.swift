@@ -87,7 +87,7 @@
 
         func testOrdinaryReplacementStillRebuildsPayloadsAndAdvancesTheirRevisions() throws {
             let reasons: [AgentModeViewModel.TabSession.SilentItemReplacementReason] = [
-                .persistedSessionHydration, .routeActivation, .testOverride, .retentionCompaction
+                .persistedSessionHydration, .routeActivation, .testOverride
             ]
             for reason in reasons {
                 let session = AgentModeViewModel.TabSession(tabID: id(900_000))
@@ -117,7 +117,90 @@
             }
         }
 
+        func testAssistantToolBoundaryPreservesCompactedPayload() throws {
+            let viewModel = makeViewModel()
+            let session = try compactedSession(in: viewModel)
+            let result = session.items[1]
+            let payload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id))
+            let revision = session.ephemeralToolResultPayloadRevisionByItemID[result.id]
+            XCTAssertTrue(viewModel.applyAssistantDelta("Synthetic next-tool preamble", session: session))
+            XCTAssertEqual(session.items.last?.isStreaming, true)
+
+            viewModel.endActiveAssistantSegment(session)
+
+            XCTAssertEqual(session.items.last?.isStreaming, false)
+            XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id), payload)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[result.id], revision)
+        }
+
+        func testTerminalCommitBarrierPreservesCompactedPayload() async throws {
+            let viewModel = makeViewModel()
+            let session = try compactedSession(in: viewModel)
+            session.selectedAgent = .claudeCode
+            session.installRunID(UUID())
+            let ownership = session.beginRunAttempt(source: "retained-payload-terminal-test")
+            let result = session.items[1]
+            let payload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id))
+            let revision = session.ephemeralToolResultPayloadRevisionByItemID[result.id]
+            XCTAssertTrue(viewModel.applyAssistantDelta("Synthetic final response", session: session))
+            session.appendItem(.toolCall(
+                name: "read_file", invocationID: id(700_001),
+                argsJSON: #"{"path":"synthetic.swift"}"#, sequenceIndex: session.nextSequenceIndex
+            ))
+            defer { session.saveDebounceTask?.cancel() }
+
+            await viewModel.test_publishNaturalCompletion(session)
+
+            let commit = try XCTUnwrap(session.lastTerminalCommitRevision)
+            XCTAssertEqual(commit.ownership, ownership)
+            XCTAssertEqual(commit.terminalState, .completed)
+            XCTAssertEqual(session.runState, .completed)
+            XCTAssertFalse(session.items.contains { $0.isStreaming || $0.kind == .toolCall })
+            XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id), payload)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[result.id], revision)
+        }
+
+        func testSilentRepairReasonsPreserveCompactedPayloads() throws {
+            for reason in [
+                AgentModeViewModel.TabSession.SilentItemReplacementReason.pendingToolFinalizationRepair,
+                .codexCommandStatusReconciliation, .retentionCompaction
+            ] {
+                let session = try compactedSession(in: makeViewModel())
+                let payloads = session.ephemeralToolResultPayloadByItemID
+                let revisions = session.ephemeralToolResultPayloadRevisionByItemID
+
+                session.setItemsSilently(session.items, reason: reason)
+
+                XCTAssertEqual(session.ephemeralToolResultPayloadByItemID, payloads, reason.rawValue)
+                XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID, revisions, reason.rawValue)
+            }
+        }
+
+        private func compactedSession(in viewModel: AgentModeViewModel) throws -> AgentModeViewModel.TabSession {
+            let session = AgentModeViewModel.TabSession(tabID: id(900_000))
+            session.runState = .running
+            let sourceItems = fixture(resultCount: 2)
+            session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
+            let compactedItems = try sourceItems.map { item in
+                item.kind == .toolResult ? try compacted(item) : item
+            }
+            session.setItemsSilentlyForRetentionCompaction(compactedItems)
+            viewModel.test_installLiveSession(session)
+            return session
+        }
+
         func testPendingToolRepairRefreshesChangedPayloadsAndPrunesRemovedRows() throws {
+            try assertRepairRefreshesChangedPayloadsAndPrunesRemovedRows(reason: .pendingToolFinalizationRepair)
+        }
+
+        func testBatchAndCodexRepairsRefreshChangedPayloadsAndPruneRemovedRows() throws {
+            try assertRepairRefreshesChangedPayloadsAndPrunesRemovedRows(reason: nil)
+            try assertRepairRefreshesChangedPayloadsAndPrunesRemovedRows(reason: .codexCommandStatusReconciliation)
+        }
+
+        private func assertRepairRefreshesChangedPayloadsAndPrunesRemovedRows(
+            reason: AgentModeViewModel.TabSession.SilentItemReplacementReason?
+        ) throws {
             let session = AgentModeViewModel.TabSession(tabID: id(900_000))
             var sourceItems = fixture(resultCount: 3)
             let runningPayload = #"{"status":"running","output":"synthetic partial output"}"#
@@ -141,7 +224,11 @@
             ), 1)
             let repairedResult = try XCTUnwrap(workingItems.first { $0.id == runningID })
 
-            session.setItemsSilentlyForPendingToolFinalizationRepair(workingItems)
+            if let reason {
+                session.setItemsSilently(workingItems, reason: reason)
+            } else {
+                XCTAssertTrue(session.mutateItemsBatch { $0 = workingItems })
+            }
 
             XCTAssertEqual(session.ephemeralToolResultPayloadByItemID[keptID], keptPayload)
             XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[keptID], keptRevision)
@@ -204,6 +291,9 @@
             let completedItem = try compacted(sourceItems[1])
             let payload = try XCTUnwrap(session.ephemeralToolResultPayloadByItemID[completedItem.id])
             let revision = try XCTUnwrap(session.ephemeralToolResultPayloadRevisionByItemID[completedItem.id])
+            let secondResultID = sourceItems[2].id
+            let secondPayload = try XCTUnwrap(session.ephemeralToolResultPayloadByItemID[secondResultID])
+            let secondRevision = try XCTUnwrap(session.ephemeralToolResultPayloadRevisionByItemID[secondResultID])
             if repairPendingTool {
                 let compactedItems = try sourceItems.map { item in
                     item.kind == .toolResult ? try compacted(item) : item
@@ -235,6 +325,8 @@
             XCTAssertFalse(session.items.contains { $0.kind == .toolCall })
             XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: completedItem.id), payload)
             XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[completedItem.id], revision)
+            XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: secondResultID), secondPayload)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[secondResultID], secondRevision)
             session.testAssertSourceItemDerivedStateIsConsistent()
         }
 
