@@ -9,7 +9,8 @@ final class TooltipPendingPresentation {
     private let scheduleWork: Scheduler
     private var work: DispatchWorkItem?
     private var generation: UInt64 = 0
-    private var observers: [NSObjectProtocol] = []
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
+    private var wasKey = false
     private weak var owner: NSWindow?
     private var ownerID: ObjectIdentifier?
     private var onEnd: (() -> Void)?
@@ -23,8 +24,8 @@ final class TooltipPendingPresentation {
     }
 
     deinit {
-        for observer in observers {
-            NotificationCenter.default.removeObserver(observer)
+        for (center, observer) in observers {
+            center.removeObserver(observer)
         }
         work?.cancel()
     }
@@ -32,17 +33,21 @@ final class TooltipPendingPresentation {
     func schedule(
         owner: NSWindow?,
         after delay: TimeInterval,
-        isEligible: @escaping () -> Bool,
+        isEligible: @escaping (_ owner: NSWindow, _ wasKey: Bool) -> Bool,
         onEnd: @escaping () -> Void = {},
         show: @escaping () -> Void
     ) {
         cancel()
         self.onEnd = onEnd
         if let owner { observe(owner) }
+        let center = NSWorkspace.shared.notificationCenter
+        observers.append((center, center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancel() }
+        }))
         let token = generation
         work = scheduleWork(delay) { [weak self] in
             guard let self, generation == token else { return }
-            let eligible = self.owner != nil && isEligible()
+            let eligible = self.owner.map { isEligible($0, self.wasKey) } ?? false
             cancel()
             guard eligible else { return }
             show()
@@ -68,8 +73,8 @@ final class TooltipPendingPresentation {
         generation &+= 1
         work?.cancel()
         work = nil
-        for observer in observers {
-            NotificationCenter.default.removeObserver(observer)
+        for (center, observer) in observers {
+            center.removeObserver(observer)
         }
         observers.removeAll()
         owner = nil
@@ -82,6 +87,7 @@ final class TooltipPendingPresentation {
     private func observe(_ owner: NSWindow) {
         self.owner = owner
         ownerID = ObjectIdentifier(owner)
+        wasKey = owner.isKeyWindow
         for notification in [
             NSWindow.didResignKeyNotification,
             NSWindow.willCloseNotification,
@@ -89,11 +95,12 @@ final class TooltipPendingPresentation {
             NSWindow.willBeginSheetNotification,
             NSWindow.didMiniaturizeNotification
         ] {
-            observers.append(NotificationCenter.default.addObserver(forName: notification, object: owner, queue: .main) { [weak self] _ in
+            let center = NotificationCenter.default
+            observers.append((center, center.addObserver(forName: notification, object: owner, queue: .main) { [weak self] _ in
                 // AppKit owner events are delivered on the main thread. Invalidate
                 // synchronously: a queued Task could lose the race with the timer.
                 MainActor.assumeIsolated { self?.cancel() }
-            })
+            }))
         }
     }
 }
