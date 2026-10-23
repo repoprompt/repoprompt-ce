@@ -3293,12 +3293,14 @@ class PromptViewModel: ObservableObject {
             )
         }
 
+        let timing = WorkspaceAgentAdmissionTiming()
         return try await manager.withAgentSessionAdmission(
             workspaceID: expectedWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            timing: timing
         ) {
-            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID) {
+            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID, timing: timing) {
                 return .rejected(
                     AgentAdmissionPersistenceReceipt(outcome: rejection, commitEvidence: .none),
                     .workspacePersistenceRejected
@@ -3387,7 +3389,9 @@ class PromptViewModel: ObservableObject {
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
+            timing.begin(.save)
             let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            timing.end()
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt

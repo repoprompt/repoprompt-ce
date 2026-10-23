@@ -20,6 +20,35 @@ Records contain receipt time, byte count, sanitized CLI version, and only five-h
 
 Managed settings can override the probe. Zero invocations are inconclusive without a known-working authorized interactive control, and results apply only to the tested CLI version/configuration. Keep the output private; remove the temporary directory manually after inspection. The `claimed` marker is intentionally not automatically reset, including after a failed launch.
 
+## Agent admission slow-phase diagnostics
+
+Agent identity admission automatically emits `event=agentAdmission.slow` through the
+`WorkspaceAgentAdmission` OSLog category when a completed admission scope takes at
+least five seconds (including rejection, cancellation, and thrown failure). It uses
+`ContinuousClock`; it adds no timers, sleeps, retries, or asynchronous operations.
+There is no setting to enable and no persisted diagnostic state to clean up.
+
+The record contains only fixed phase names, millisecond durations, and invocation
+counts. `queue_wait` covers acquiring the workspace admission lease; `refresh`
+covers canonical refresh and write-baseline adoption; `save` covers admission
+persistence and own-save waits/convergence during refresh; `other` covers remaining
+lease-held preparation, projection, and recovery. Phase durations are exclusive:
+a save nested inside refresh is not counted twice. `holdMS` aggregates all phases
+except queue wait. Logging happens after lease release. No workspace/session IDs,
+titles, paths, prompt text, or raw errors are included.
+
+For a future 44-second stall, `slowest` and the per-phase durations distinguish
+queue contention from refresh, save, and other work. Counts expose repeated phase
+entries. This attributes elapsed time, including executor contention, not CPU cost
+or a proven underlying cause. It does not report an admission that never exits its
+scope; existing coordinator queue/acquire/release records remain complementary.
+No threshold enforcement or admission behavior changes are implied.
+
+Deterministic coverage uses an injected clock:
+`make dev-test FILTER='WorkspaceAgentAdmissionTimingTests|ConcurrentSameWorkspaceAgentRunAdmissionTests'`.
+No live launch is required for these tests; capturing a real slow admission still
+requires a separately authorized running-app investigation.
+
 ## Quality gate before adding a test
 
 Add a test only when all four answers are concrete:

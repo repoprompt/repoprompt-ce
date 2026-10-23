@@ -10917,10 +10917,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        let timing = WorkspaceAgentAdmissionTiming()
         return try await workspaceManager.withAgentSessionAdmission(
             workspaceID: owningWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            timing: timing
         ) {
             let admissionWorkspace = workspaceManager.workspaces.first { $0.id == expectedWorkspaceID }
             let hasUnboundTargetTab: Bool = admissionWorkspace?.composeTabs.contains {
@@ -10965,11 +10967,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
 
             try Task.checkCancellation()
+            timing.begin(.save)
             let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: expectedWorkspaceID,
                 source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission"),
                 allowRetainedAgentAdmissionRecoveryRetry: false
             )
+            timing.end()
             #if DEBUG
                 await test_afterProvisionalExistingTabBindingInstalled?()
             #endif

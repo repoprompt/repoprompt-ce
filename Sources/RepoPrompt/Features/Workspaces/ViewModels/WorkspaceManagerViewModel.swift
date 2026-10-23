@@ -12303,7 +12303,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         return NSError(domain: "RepoPrompt.AgentAdmission", code: 2, userInfo: userInfo)
     }
 
-    private func refreshCanonicalWorkspaceForAgentAdmission(workspaceID: UUID) async throws {
+    private func refreshCanonicalWorkspaceForAgentAdmission(
+        workspaceID: UUID,
+        timing: WorkspaceAgentAdmissionTiming? = nil
+    ) async throws {
+        timing?.begin(.refresh)
+        defer { timing?.end() }
         guard let initialWorkspace = workspace(withID: workspaceID) else {
             throw NSError(
                 domain: "RepoPrompt.AgentAdmission",
@@ -12340,8 +12345,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 #if DEBUG
                     agentAdmissionWillAwaitOwnSavesHandlerForTesting?(workspaceID, ownSaves.count)
                 #endif
-                for task in ownSaves {
-                    try await Self.awaitOwnSaveCompletion(task)
+                do {
+                    timing?.begin(.save)
+                    defer { timing?.end() }
+                    for task in ownSaves {
+                        try await Self.awaitOwnSaveCompletion(task)
+                    }
                 }
                 let refreshed = await domainWorkspaceAuthorityClient.agentAdmissionSnapshot(workspaceID)
                 admissionSnapshot = refreshed.snapshot
@@ -12352,10 +12361,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         if admissionDiagnostic?.admissionState == .dirtyWithoutLiveSave {
             // Dirty with no live save may be this window's own interrupted save (#1089). Finish it
             // once, under this admission lease, then admit only from a fresh clean read.
+            timing?.begin(.save)
             let resolution = await resolveDirtyCanonicalForAgentAdmission(
                 workspaceID: workspaceID,
                 client: domainWorkspaceAuthorityClient
             )
+            timing?.end()
             try Task.checkCancellation()
             dirtyOwnership = resolution.ownership
             if let refreshed = resolution.refreshed {
@@ -12512,7 +12523,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Must run inside the admission lease, before a new provisional binding is installed.
     /// Identity-only refresh can observe a newer digest without adopting its complete document.
     /// Join the existing projection owner to obtain that witness instead of rebasing stale bytes.
-    func prepareAgentAdmissionWriteBaseline(workspaceID: UUID) async throws -> WorkspacePersistenceOutcome? {
+    func prepareAgentAdmissionWriteBaseline(
+        workspaceID: UUID,
+        timing: WorkspaceAgentAdmissionTiming? = nil
+    ) async throws -> WorkspacePersistenceOutcome? {
+        timing?.begin(.refresh)
+        defer { timing?.end() }
         guard let workspace = workspace(withID: workspaceID), !workspace.isEphemeral,
               domainWorkspaceAuthorityClient != nil
         else { return nil }
@@ -12525,7 +12541,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         try Task.checkCancellation()
-        try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID)
+        try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
         guard !isPreparingForWindowClose, activeWorkspaceID == workspaceID,
               fullDocumentWriteBaseline(workspaceID: workspaceID) != nil
         else {
@@ -12541,16 +12557,24 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID: UUID,
         admissionID: UUID,
         refreshCanonicalState: Bool = false,
+        timing injectedTiming: WorkspaceAgentAdmissionTiming? = nil,
         operation: @MainActor () async throws -> T
     ) async throws -> T {
+        let timing = injectedTiming ?? WorkspaceAgentAdmissionTiming()
+        defer { timing.finish() }
         let lease = try await workspaceAgentAdmissionCoordinator.acquire(
             workspaceID: workspaceID,
             admissionID: admissionID
         )
-        defer { lease.release() }
+        timing.acquired()
+        defer {
+            // Stop measuring before release; emit only after releasing the admission lease.
+            timing.end()
+            lease.release()
+        }
         try Task.checkCancellation()
         if refreshCanonicalState {
-            try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID)
+            try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
         }
         try Task.checkCancellation()
         return try await operation()

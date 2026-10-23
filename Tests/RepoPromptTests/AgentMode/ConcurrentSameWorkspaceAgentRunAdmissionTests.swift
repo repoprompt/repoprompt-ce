@@ -1672,18 +1672,29 @@ import XCTest
             let coordinator = WorkspaceAgentAdmissionCoordinator()
             let fixture = makeManagerFixture(coordinator: coordinator)
             defer { fixture.manager.prepareForWindowClose() }
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
 
             do {
                 _ = try await fixture.manager.withAgentSessionAdmission(
                     workspaceID: UUID(),
-                    admissionID: UUID()
+                    admissionID: UUID(),
+                    timing: timing
                 ) {
+                    timing.begin(.save)
+                    defer { timing.end() }
+                    now += .seconds(44)
                     throw AdmissionTestError.expected
                 }
                 XCTFail("The controlled operation must throw.")
             } catch AdmissionTestError.expected {}
 
             XCTAssertEqual(coordinator.snapshot().trackedWorkspaceCount, 0)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(reports.first?.slowestPhase, .save)
+            XCTAssertEqual(reports.first?.totalMilliseconds, 44000)
+            XCTAssertEqual(reports.first?.holdMilliseconds, 44000)
         }
 
         func testAgentAdmissionSaveRetriesOnceThenPersistsNewestState() async throws {
@@ -2723,3 +2734,58 @@ import XCTest
         }
     }
 #endif
+
+@MainActor
+final class WorkspaceAgentAdmissionTimingTests: XCTestCase {
+    func testFortyFourSecondStallIsAttributedToEachExclusivePhase() throws {
+        for slowPhase in WorkspaceAgentAdmissionTiming.Phase.allCases {
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
+            now += slowPhase == .queueWait ? .seconds(44) : .seconds(1)
+            timing.acquired()
+            timing.begin(.refresh)
+            now += slowPhase == .refresh ? .seconds(44) : .seconds(1)
+            // Baseline adoption can refresh again, with save work nested inside that refresh.
+            timing.begin(.refresh)
+            timing.begin(.save)
+            now += slowPhase == .save ? .seconds(44) : .seconds(1)
+            timing.end()
+            timing.end()
+            timing.end()
+            now += slowPhase == .other ? .seconds(44) : .seconds(1)
+            timing.finish()
+
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(report.slowestPhase, slowPhase)
+            XCTAssertEqual(report.milliseconds[slowPhase.rawValue], 44000)
+            XCTAssertEqual(report.totalMilliseconds, 47000)
+            XCTAssertEqual(report.holdMilliseconds, slowPhase == .queueWait ? 3000 : 46000)
+            XCTAssertEqual(report.counts, [1, 2, 1, 1])
+            XCTAssertTrue(report.logMessage.contains("slowest=\(slowPhase.name)"))
+        }
+    }
+
+    func testThresholdBoundaryAndRepeatedFinishEmitAtMostOneReport() {
+        for elapsed in [Duration.milliseconds(4999), .seconds(5)] {
+            var now = Duration.zero
+            var messages: [String] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { messages.append($0.logMessage) })
+            now = elapsed
+            timing.finish() // Includes cancellation/failure before acquiring a lease.
+            timing.finish()
+            timing.acquired()
+            timing.begin(.save)
+            timing.end()
+            timing.finish()
+            if elapsed < .seconds(5) {
+                XCTAssertEqual(messages, [])
+            } else {
+                XCTAssertEqual(messages, [
+                    "event=agentAdmission.slow totalMS=5000.000 holdMS=0.000 slowest=queue_wait queue_waitMS=5000.000 queue_waitCount=1 refreshMS=0.000 refreshCount=0 saveMS=0.000 saveCount=0 otherMS=0.000 otherCount=0"
+                ])
+            }
+        }
+    }
+}
