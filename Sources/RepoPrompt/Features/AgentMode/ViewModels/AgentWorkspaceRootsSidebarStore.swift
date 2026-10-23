@@ -31,7 +31,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     let pendingCount: UInt64
     let updatesPending: Bool
     let graphRevision: UInt64?
-    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget? = nil
+    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
 
     static let pending = Self(
         state: .notInitialized,

@@ -11246,10 +11246,9 @@ actor WorkspaceFileContextStore {
                 ? .unavailable : .scheduled
         }
         if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
-            let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
             // Only the execution stream may clear a terminal state. A worker can publish a
             // newer terminal result while this actor is suspended in the prioritize call.
-            return disposition
+            return await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
         }
         if let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] {
             switch launch.phase {
