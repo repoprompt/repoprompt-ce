@@ -175,21 +175,12 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("missing path")
         }
         let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let lines = text.components(separatedBy: .newlines)
-        let start = args["start_line"]?.intValue
-        let limit = args["limit"]?.intValue
-        let selected: ArraySlice<String>
-        if let start, start < 0 {
-            selected = lines.suffix(min(lines.count, abs(start)))
-        } else if let start {
-            let index = max(0, start - 1)
-            guard index < lines.count else { return try .mcp(.string("")) }
-            selected = lines[index ..< min(lines.count, index + max(0, limit ?? lines.count))]
-        } else {
-            selected = lines[...]
-        }
-        return try .mcp(.string(selected.joined(separator: "\n")))
+        let text = try await MCPDomainHeadlessFileReader.read(
+            at: url,
+            startLine: args["start_line"]?.intValue,
+            limit: args["limit"]?.intValue
+        )
+        return try .mcp(.string(text))
     }
 
     package func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
