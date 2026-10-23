@@ -1404,12 +1404,13 @@ final class AgentModeRunService {
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
 
-        // Ordinary stop keeps existing behavior. A cwd-changing cancellation
-        // restores every queued, undelivered draft once without replaying the
-        // already-delivered active prompt.
+        // Restore undelivered local steering on Stop without replaying the active
+        // prompt or putting managed instructions in the user's composer. A cwd-changing
+        // cancellation additionally restores ordinary queued follow-up drafts.
         switch intent {
         case .userStop:
             restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+            restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
         case .runtimeShutdown:

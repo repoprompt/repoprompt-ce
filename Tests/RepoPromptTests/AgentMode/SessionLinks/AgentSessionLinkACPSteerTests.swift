@@ -237,6 +237,9 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(sent.contains("local direction"))
         XCTAssertTrue(sent.contains("managed direction"))
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID)
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "")
+        XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
     }
 
     func testStaleRunRequeuesManagedSteerExactlyOnce() async throws {
@@ -869,6 +872,81 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         release.finish(())
         let outcome = await steering.value
         guard case .delivered = outcome else { return XCTFail("Expected accepted steering, got \(outcome)") }
+    }
+
+    func testUserStopRestoresQueuedLocalACPTextOnceInOrder() async throws {
+        let fixture = try await makeFixture()
+        let entered = expectation(description: "ACP flush waiting for tool idle")
+        let withdrawn = expectation(description: "Stop withdrew queued work")
+        let release = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_beforeACPToolIdleWait = {
+            entered.fulfill()
+            await release.value()
+        }
+        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        defer {
+            fixture.viewModel.test_beforeACPToolIdleWait = nil
+            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+        }
+        let (batch, _) = mixedSteeringBatch(fixture, localDraft: "first local draft")
+        let second = AgentModeViewModel.TabSession.ACPSteeringInstruction(
+            id: UUID(), targetRunID: fixture.session.runID,
+            targetRunAttemptID: fixture.session.activeRunAttemptID,
+            providerText: "second provider text", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "second local draft",
+            optimisticUserItemID: nil, createdAt: Date()
+        )
+        fixture.session.pendingACPSteeringInstructions = [batch[0], second]
+        fixture.session.pendingNonCodexUserInputTokenQueue = [11, 22]
+        let steering = Task { await self.steer(fixture, request: self.request("withdraw managed direction")) }
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertEqual(fixture.session.pendingACPSteeringInstructions.count, 3)
+        let stop = Task { await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID) }
+        await fulfillment(of: [withdrawn], timeout: 5)
+        release.finish(())
+        await stop.value
+        fixture.viewModel.test_setBeforeCancellationCommit(nil)
+        let outcome = await steering.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "first local draft\nsecond local draft")
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID)
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "first local draft\nsecond local draft")
+    }
+
+    func testUserStopRestoresDequeuedLocalACPTextWithoutManagedEnvelope() async throws {
+        let fixture = try await makeFixture()
+        let entered = expectation(description: "ACP batch dequeued for augmentation")
+        let withdrawn = expectation(description: "Stop withdrew queued work")
+        let release = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_afterProviderInputAugmentation = {
+            entered.fulfill()
+            await release.value()
+        }
+        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        defer {
+            fixture.viewModel.test_afterProviderInputAugmentation = nil
+            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+        }
+        let (batch, _) = mixedSteeringBatch(fixture)
+        fixture.session.pendingACPSteeringInstructions = [batch[0]]
+        fixture.session.pendingNonCodexUserInputTokenQueue = [11]
+        let steering = Task { await self.steer(fixture, request: self.request("withdraw dequeued managed direction")) }
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        let stop = Task { await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID) }
+        await fulfillment(of: [withdrawn], timeout: 5)
+        release.finish(())
+        await stop.value
+        let outcome = await steering.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "typed local draft")
+        XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
     }
 
     func testACPControllerTeardownWithdrawsManagedSteerBeforeDequeue() async throws {
