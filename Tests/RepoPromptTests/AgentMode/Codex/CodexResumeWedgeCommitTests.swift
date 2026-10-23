@@ -29,7 +29,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
         companionReady: @escaping () -> Bool = { true },
         freshSession: Bool = false,
-        shouldManageCodexTooling: Bool = true
+        shouldManageCodexTooling: Bool = true,
+        authRecovery: (any CodexManagedAuthRecovering)? = nil
     ) -> Fixture {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
@@ -42,6 +43,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 factory.make(runID: runID, computerUseEnabled: enabled)
             },
             mcpServerEnabler: mcpServerEnabler,
+            testCodexManagedAuthRecovery: authRecovery,
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
             testCodexLeaseRoutingTimeoutMs: 5000,
@@ -1345,12 +1347,13 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.providerCleanupHandle?.rolloutPath, Self.oldRolloutPath, file: file, line: line)
     }
 
-    func testResumeTimeoutRejectsSendWithOneActionableFailureAndPreservesThread() async {
-        let fixture = makeFixture([[.timeout], [.discoveryFailure]])
+    func testResumeTimeoutRejectsSendWithOneActionableFailureAndPreservesThread() async throws {
+        let fixture = makeFixture([[.timeout], [.timeout], [.discoveryFailure]], authRecovery: MonitorStubCodexAuthRecovery())
         var notifications: [String?] = []
         var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
         fixture.session.appendItem(.user("continue the task"))
-        fixture.coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(), terminalSessionBinder: { owned in
+        let barrier = AgentRunTerminalCommitBarrier()
+        let makeBinding: (AgentTabSession) -> AgentRunTerminalSessionBinding = { owned in
             AgentRunTerminalSessionBinding(
                 tabID: owned.tabID, lifecycle: owned.runLifecycle,
                 hooks: .init(
@@ -1376,7 +1379,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 assistantDeltaFlushGeneration: { owned.assistantDeltaFlushGeneration },
                 latestFailureText: { AgentTranscriptIO.latestErrorText(from: owned.transcript, latestTurnOnly: true) }
             )
-        })
+        }
+        fixture.coordinator.installTerminalCommitBarrier(barrier, terminalSessionBinder: makeBinding)
         guard case let .failed(message) = await fixture.coordinator.sendCodexNativeMessage(
             session: fixture.session, text: "continue the task", attachments: []
         ) else { return XCTFail("A timed-out resume must reject the send") }
@@ -1384,6 +1388,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(message.contains("No new thread was started"))
         XCTAssertTrue(message.contains("Retry"))
         XCTAssertTrue(message.contains("Handoff to New Chat"))
+        XCTAssertTrue(message.contains("thread/resume: Request timed out after 120.0s"))
+        XCTAssertTrue(message.contains("agent_run start with a handoff summary"))
+        XCTAssertNil(fixture.session.codexNativeStartupDisposition, "terminal settlement consumes the failure")
         XCTAssertEqual(fixture.session.items.filter { $0.kind == .error }.map(\.text), [message])
         XCTAssertEqual(notifications, [message])
         XCTAssertEqual(reasons.map { $0?.rawValue }, ["resume_timed_out"])
@@ -1391,6 +1398,45 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
         XCTAssertTrue(fixture.session.codexNeedsReconnect)
         XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+
+        let notice = try XCTUnwrap(fixture.session.items.first { $0.kind == .error })
+        XCTAssertEqual(notice.recoveryDiagnostic?.reason, AgentTranscriptRecoveryDiagnostic.resumeTimedOutReason)
+        XCTAssertEqual(notice.recoveryDiagnostic?.outcome, AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome)
+        XCTAssertEqual(notice.recoveryDiagnostic?.previousConversationID, Self.oldThreadID)
+        XCTAssertNil(notice.recoveryDiagnostic?.replacementConversationID)
+        var transcript = AgentTranscriptIO.importLegacyItems([.user("continue the task"), notice], terminalState: .failed)
+        transcript.turns[0].retentionTier = .summary
+        let compacted = AgentTranscriptCompactor.compact(transcript)
+        let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(compacted))
+        let projection = AgentTranscriptProjectionBuilder.build(from: restored)
+        let retained = (projection.workingRows + projection.archivedRows).filter { $0.id == notice.id }
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(retained.first?.kind, .error)
+        XCTAssertEqual(retained.first?.text, notice.text)
+        XCTAssertEqual(retained.first?.recoveryDiagnostic?.reason, AgentTranscriptRecoveryDiagnostic.resumeTimedOutReason)
+        XCTAssertEqual(retained.first?.recoveryDiagnostic?.outcome, AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome)
+        XCTAssertEqual(AgentTranscriptIO.latestErrorText(from: restored, latestTurnOnly: true), notice.text)
+        XCTAssertEqual(DomainAgentRunSnapshot.FailureReason.classify(status: .failed, statusText: notice.text), .resumeTimedOut)
+        XCTAssertEqual(DomainAgentRunSnapshot.FailureReason.classify(status: .failed, statusText: "Request timed out after 120.0s"), .timeout)
+
+        // A successful auth refresh followed by a resume timeout must not add login guidance.
+        fixture.session.runState = .running
+        fixture.session.beginRunAttempt(source: "auth-recovery-timeout")
+        _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: fixture.session)
+        fixture.session.appendItem(.user("recover auth", sequenceIndex: fixture.session.nextSequenceIndex))
+        fixture.session.codexPendingAuthRetryTurn = .init(
+            text: "recover auth", images: [], model: nil, reasoningEffort: nil, serviceTier: nil,
+            attachmentReservationID: nil, expectedTurnID: nil, auditTurnID: nil
+        )
+        await fixture.coordinator.test_handleCodexNativeEvent(.error("account/chatgptAuthTokens/refresh"), session: fixture.session)
+        let authErrors = fixture.session.transcript.turns.last?.allActivities.filter { $0.itemKind == .error } ?? []
+        XCTAssertEqual(authErrors.count, 1)
+        let authMessage = authErrors.first?.text
+        XCTAssertTrue(authMessage?.contains("Prefer Handoff") == true)
+        XCTAssertFalse(authMessage?.contains(CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage) == true)
+        XCTAssertEqual(notifications, [message, authMessage])
+        XCTAssertEqual(reasons, [.resumeTimedOut, .resumeTimedOut])
+        XCTAssertNil(fixture.session.codexNativeStartupDisposition)
 
         // A later, different startup failure must not inherit the timeout classification.
         fixture.session.runState = .running
@@ -1400,15 +1446,32 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             session: fixture.session, text: "retry the task", attachments: []
         ) else { return XCTFail("Discovery failure must reject the retry") }
         XCTAssertTrue(retryMessage.contains("Tool catalog not ready"))
-        XCTAssertEqual(notifications, [message, retryMessage])
-        XCTAssertEqual(reasons, [.resumeTimedOut, .agentError])
+        XCTAssertEqual(notifications, [message, authMessage, retryMessage])
+        XCTAssertEqual(reasons, [.resumeTimedOut, .resumeTimedOut, .agentError])
         XCTAssertEqual(fixture.session.transcript.turns.last?.allActivities.filter { $0.itemKind == .error }.map(\.text), [retryMessage])
         assertOldTuple(fixture.session)
+
+        // The shared barrier must not use an earlier turn's error for another provider.
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.runState = .running
+        fixture.session.codexNativeStartupDisposition = .resumeTimedOut
+        let ownership = fixture.session.beginRunAttempt(source: "unrelated-provider-failure")
+        XCTAssertNil(fixture.session.codexNativeStartupDisposition, "new attempts clear even unconsumed startup failures")
+        fixture.session.appendItem(.user("unrelated task", sequenceIndex: fixture.session.nextSequenceIndex))
+        _ = await barrier.commit(.init(
+            binding: makeBinding(fixture.session), ownership: ownership, expectedRunID: fixture.session.runID,
+            terminalState: .failed, source: "test.unrelated-provider",
+            attachmentDisposition: .restoreToPending, finalizeNonCodexUsage: false, supportsFollowUp: false,
+            notifyTurnComplete: false, providerDrainGeneration: fixture.session.providerTerminalDrainGeneration,
+            providerBuffersAreDrained: { true }
+        ))
+        XCTAssertEqual(notifications, [message, authMessage, retryMessage, nil])
+        XCTAssertEqual(reasons, [.resumeTimedOut, .resumeTimedOut, .agentError, .agentError])
     }
 
     func testRepeatedResumeTimeoutsPreservePersistedTupleAndExplicitRetryResumesSameThread() async throws {
         let fixture = makeFixture([
-            [.timeout], [.timeout], [.timeout], [.success(Self.oldThreadID)]
+            [.initializationTimeout], [.timeout], [.timeout], [.success(Self.oldThreadID)]
         ], shouldManageCodexTooling: false)
         for count in 1 ... 3 {
             await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
@@ -1419,6 +1482,16 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             XCTAssertTrue(fixture.session.codexNeedsReconnect)
             XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, count)
             XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumeTimedOut)
+            let notice = try XCTUnwrap(fixture.session.items.last)
+            XCTAssertLessThanOrEqual(notice.text.count, AgentTranscriptRecoveryDiagnostic.maximumTextLength)
+            XCTAssertEqual(notice.recoveryDiagnostic?.text, notice.text)
+            if count == 1 {
+                XCTAssertTrue(notice.text.contains("initialize: Request timed out after"))
+                XCTAssertFalse(notice.text.contains("timed out while loading"))
+            } else {
+                XCTAssertTrue(notice.text.contains("Prefer Handoff"))
+                XCTAssertTrue(notice.text.contains("Retry only if conditions improve"))
+            }
             XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
         }
         try await AsyncTestWait.waitUntil("timed-out controllers retired", timeout: 4) {
@@ -1487,12 +1560,25 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testOversizedResumeResponseFallsBackToFreshThreadOnFirstFailure() async throws {
+        let responseGate = TestReleaseFence(name: "oversized replacement response")
         let fixture = makeFixture([
-            [.oversizedResume],
-            [.success("fresh-after-oversized-resume")]
+            [.routedOversizedResume],
+            [.suspendedSuccess("fresh-after-oversized-resume", responseGate)]
         ])
         let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
-        defer { startup.cancel() }
+        defer {
+            responseGate.release()
+            startup.cancel()
+        }
+        let entered = await responseGate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        let clientName = try XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint)
+        let staleOutcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: runID)
+        XCTAssertNil(staleOutcome, "the old routed signal must not authorize the replacement")
+        let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertTrue(pendingPolicies.contains { $0.runID == runID }, "replacement must renew the expired bootstrap permit")
+        responseGate.release()
         try await waitForPendingStart(fixture)
 
         XCTAssertEqual(fixture.factory.controllers.count, 2, "an oversized resume must retire the poisoned controller")
@@ -1516,6 +1602,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("after repeated timeout") })
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("frame budget") }, "the overflow must not surface as a send failure")
+        let retainedPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertTrue(retainedPolicies.contains { $0.runID == runID }, "old lease cleanup must not revoke successor admission")
+        await ServerNetworkManager.shared.revokeClientConnectionPolicy(for: clientName, windowID: 1, runID: runID)
+        await MCPRoutingWaiter.shared.cleanup(runID: runID)
     }
 
     func testSettledOldLeaseCannotRevokeSameRunSuccessor() async {
@@ -1882,12 +1972,14 @@ private final class WedgeControllerFactory {
 final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
     enum Response {
         case timeout
+        case initializationTimeout
         case discoveryFailure
         case policyRequiredResume
         case routedThenResumeFailure(TestReleaseFence)
         case routedTimeout
         case missingRollout
         case oversizedResume
+        case routedOversizedResume
         case suspendedSuccess(String, TestReleaseFence)
         case suspendedMissingRollout(TestReleaseFence)
         case success(String)
@@ -2008,6 +2100,10 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
                 message: "Request timed out after 120.0s",
                 data: nil
             ))
+        case .initializationTimeout:
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "initialize", code: nil, message: "Request timed out after 30.0s", data: nil
+            ))
         case .timeout:
             throw CodexAppServerClient.ClientError.requestFailed(.init(
                 method: "thread/resume",
@@ -2041,6 +2137,12 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
             else { throw CodexAppServerClient.ClientError.invalidResponse }
             lock.withLock { active = true }
             return existing
+        case .routedOversizedResume:
+            await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                for: AgentProviderKind.codexMCPClientID, windowID: 1, runID: runID
+            )
+            await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+            throw CodexAppServerClient.ClientError.stdoutFrameBudgetExceeded(limitBytes: 64 * 1024 * 1024)
         case .oversizedResume:
             throw CodexAppServerClient.ClientError.stdoutFrameBudgetExceeded(limitBytes: 64 * 1024 * 1024)
         case let .suspendedMissingRollout(gate):

@@ -478,6 +478,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             if ["cancelled", "canceled", "interrupted", "aborted"].contains(where: text.contains) {
                 return .cancelled
             }
+            if text.hasPrefix("codex native resume failed:"),
+               text.contains("no new thread was started"),
+               ["timed out", "timeout", "deadline exceeded", "took too long"].contains(where: text.contains)
+            {
+                return .resumeTimedOut
+            }
             if ["timed out", "timeout", "deadline exceeded", "took too long"].contains(where: text.contains) {
                 return .timeout
             }

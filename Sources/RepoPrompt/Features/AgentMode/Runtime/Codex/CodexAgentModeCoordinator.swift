@@ -4731,8 +4731,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         "Codex couldn't resume the previous thread because its rollout file was missing. Started a fresh thread."
     }
 
-    private static func resumeTimeoutFailureMessage() -> String {
-        "Codex native resume failed: the previous thread timed out while loading. No new thread was started; the previous conversation is unchanged. Retry by sending your message again, or use Handoff to New Chat on an assistant message to carry this task's context into a new chat."
+    private static func resumeTimeoutFailureMessage(error: Error, consecutiveTimeouts: Int) -> String {
+        let detail: String = if case let CodexAppServerClient.ClientError.requestFailed(failure) = error {
+            "\(failure.method): \(error.localizedDescription)"
+        } else {
+            error.localizedDescription
+        }
+        let guidance = consecutiveTimeouts >= 2
+            ? "Prefer Handoff to New Chat on an assistant message after repeated timeouts. Retry only if conditions improve. Agent callers: use agent_run start with a handoff summary."
+            : "Retry by sending your message again, or use Handoff to New Chat on an assistant message. Agent callers: use agent_run start with a handoff summary."
+        return "Codex native resume failed: \(String(detail.prefix(120))). No new thread was started; the previous conversation is unchanged. \(guidance)"
     }
 
     private static func recoveryMessage(for fallbackReason: CodexNativeSessionFallbackReason) -> String {
@@ -5881,7 +5889,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session,
                 turnStatus: .failed,
                 reason: "managed-auth-recovery-no-controller",
-                errorMessage: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage,
+                errorMessage: session.codexNativeStartupDisposition == .resumeTimedOut
+                    ? nil : CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage,
                 notifyOnCompleted: false,
                 deleteDeferredFilesWhenFailureHasNoInFlight: true
             )
@@ -7647,12 +7656,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if attemptedResume, isControlPlaneTimeout {
                 session.codexNativeStartupDisposition = .resumeTimedOut
             }
-            let errorItem = AgentChatItem.error(
+            var errorItem = AgentChatItem.error(
                 attemptedResume && isControlPlaneTimeout
-                    ? Self.resumeTimeoutFailureMessage()
+                    ? Self.resumeTimeoutFailureMessage(error: effectiveError, consecutiveTimeouts: resumeTimeoutCount ?? 1)
                     : "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
             )
+            if attemptedResume, isControlPlaneTimeout {
+                errorItem.recoveryDiagnostic = AgentTranscriptRecoveryDiagnostic(
+                    id: errorItem.id, timestamp: errorItem.timestamp, sequenceIndex: errorItem.sequenceIndex,
+                    reason: AgentTranscriptRecoveryDiagnostic.resumeTimedOutReason,
+                    outcome: AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome,
+                    previousConversationID: session.codexConversationID,
+                    text: errorItem.text, itemKind: .error
+                )
+            }
             session.appendItem(errorItem)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         }
@@ -9517,6 +9535,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         let expectedRunID = session.runID
+        let resumeTimedOut = session.codexNativeStartupDisposition == .resumeTimedOut
+        if resumeTimedOut {
+            // Consume the startup failure exactly once, before any terminal await.
+            session.codexNativeStartupDisposition = nil
+        }
         drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
         clearCodexRecoveryAttempt(
@@ -9569,7 +9592,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             terminalState: terminalState,
             source: "codex.finalize.\(reason)",
             errorText: errorMessage,
-            failureReason: turnStatus == .failed && session.codexNativeStartupDisposition == .resumeTimedOut ? .resumeTimedOut : nil,
+            failureReason: turnStatus == .failed && resumeTimedOut ? .resumeTimedOut : nil,
             attachmentDisposition: attachmentDisposition,
             finalizeNonCodexUsage: false,
             supportsFollowUp: false,
