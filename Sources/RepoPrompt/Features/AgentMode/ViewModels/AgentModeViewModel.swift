@@ -10923,6 +10923,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             admissionID: UUID(),
             refreshCanonicalState: true,
             kind: .existingTab,
+            classifyError: { $0 is MCPError ? .rejected : .threw },
             timing: timing
         ) {
             let admissionWorkspace = workspaceManager.workspaces.first { $0.id == expectedWorkspaceID }

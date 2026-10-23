@@ -12579,8 +12579,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID: UUID,
         admissionID: UUID,
         refreshCanonicalState: Bool = false,
-        kind: WorkspaceAgentAdmissionTiming.Kind = .recovery,
+        kind: WorkspaceAgentAdmissionTiming.Kind,
         classifyOutcome: @MainActor (T) -> WorkspaceAgentAdmissionTiming.Outcome = { _ in .committed },
+        classifyError: @MainActor (Error) -> WorkspaceAgentAdmissionTiming.Outcome = { _ in .threw },
         timing injectedTiming: WorkspaceAgentAdmissionTiming? = nil,
         operation: @MainActor () async throws -> T
     ) async throws -> T {
@@ -12608,7 +12609,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             outcome = Task.isCancelled ? .cancelled : classifyOutcome(result)
             return result
         } catch {
-            outcome = error is CancellationError || Task.isCancelled ? .cancelled : .threw
+            outcome = error is CancellationError || Task.isCancelled ? .cancelled : classifyError(error)
             throw error
         }
     }

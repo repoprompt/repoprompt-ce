@@ -719,7 +719,8 @@ import XCTest
                 try await manager.withAgentSessionAdmission(
                     workspaceID: workspace.id,
                     admissionID: UUID(),
-                    refreshCanonicalState: true
+                    refreshCanonicalState: true,
+                    kind: .freshTab
                 ) {
                     operationRan = true
                 }
@@ -1683,6 +1684,7 @@ import XCTest
                 _ = try await fixture.manager.withAgentSessionAdmission(
                     workspaceID: UUID(),
                     admissionID: UUID(),
+                    kind: .freshTab,
                     timing: timing
                 ) {
                     timing.begin(.save)
