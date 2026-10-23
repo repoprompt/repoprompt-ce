@@ -360,3 +360,85 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+final class ClaudeCompactionContextUsageTests: XCTestCase {
+    func testCompactionBoundaryInvalidatesRingUntilFreshOccupancyArrives() {
+        for trigger in ["manual", "auto"] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .claudeCode
+            let estimator = ClaudeContextUsageEstimator(
+                tokenEstimator: { _ in 10 },
+                contextUsageBuilder: AgentModeViewModel.contextUsageFromClaudeProviderTokens
+            )
+            var translator = ClaudeSDKNDJSONTranslator()
+            let sidebar = AgentRuntimeSidebarViewModel()
+            func consume(_ line: String) {
+                for result in translator.parseNDJSONLine(Data(line.utf8)) {
+                    switch result.type {
+                    case "usage":
+                        estimator.ingestUsageSignal(
+                            promptTokens: result.promptTokens, completionTokens: result.completionTokens,
+                            contextUsedTokens: result.contextUsedTokens, modelContextWindow: result.modelContextWindow,
+                            session: session
+                        )
+                    case "status":
+                        estimator.ingestStatusSignal(result.text, session: session)
+                    case "system":
+                        estimator.ingestSystemSignal(result.text, session: session)
+                    case "message_stop":
+                        estimator.ingestTurnFinalizationSignal(
+                            contextUsedTokens: result.contextUsedTokens, modelContextWindow: result.modelContextWindow,
+                            session: session
+                        )
+                        _ = estimator.finalizeTurn(
+                            promptTokens: result.promptTokens, completionTokens: result.completionTokens,
+                            contextUsedTokens: result.contextUsedTokens, session: session
+                        )
+                    default:
+                        break
+                    }
+                }
+                sidebar.update(items: [], codexUsage: session.codexContextUsage)
+            }
+            let usage = #"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":1000,"cache_read_input_tokens":149000,"output_tokens":10}}}"#
+            let result = #"{"type":"result","subtype":"success","usage":{"input_tokens":150000,"output_tokens":10},"modelUsage":{"claude-sonnet-4-6":{"contextWindow":200000}}}"#
+            estimator.beginTurn(session: session, initialMessage: "Earlier turn")
+            consume(usage)
+            consume(result)
+            XCTAssertEqual(sidebar.snapshot.usedTokens, 150_000)
+
+            estimator.beginTurn(session: session, initialMessage: "/compact")
+            // Automatic compaction can occur after this turn already reported its old context.
+            consume(usage)
+            consume(#"{"type":"system","subtype":"status","status":"compacting"}"#)
+            consume("{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"\(trigger)\",\"pre_tokens\":150000}}")
+            XCTAssertNil(session.contextUsageSnapshot?.used, trigger)
+            XCTAssertNil(sidebar.snapshot.usedTokens, trigger)
+            XCTAssertEqual(sidebar.snapshot.contextWindowTokens, 200_000)
+            XCTAssertNotNil(session.contextUsageSnapshot?.compactedAt)
+            XCTAssertNil(session.activeNonCodexTurnTokenAccumulator?.observedContextUsedTokens)
+
+            // Init has no post-compaction size; result usage is billed aggregate, not occupancy.
+            consume(#"{"type":"system","subtype":"init","session_id":"compact-fixture","model":"claude-sonnet-4-6"}"#)
+            estimator.ingestUsageSignal(
+                promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
+                modelContextWindow: nil, session: session
+            )
+            XCTAssertNil(session.contextUsageSnapshot?.used, "Billed input alone cannot establish post-compaction occupancy")
+            consume(result)
+            XCTAssertNil(sidebar.snapshot.usedTokens, "Finalization must not restore old context")
+            XCTAssertNil(session.providerTokenUsageByTurn.last?.contextUsedTokens)
+            estimator.beginTurn(session: session, initialMessage: "Continue")
+            consume(result)
+            XCTAssertNil(sidebar.snapshot.usedTokens, "Unmeasured later turns must remain unknown")
+
+            estimator.beginTurn(session: session, initialMessage: "Fresh measurement")
+            consume(#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":10}}}"#)
+            XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+            consume(result)
+            XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+            XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 10000)
+        }
+    }
+}

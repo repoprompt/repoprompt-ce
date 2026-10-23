@@ -106,7 +106,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             if contextUsed > 0 {
                 return contextUsed
             }
-            if prompt > 0 {
+            // A billed prompt count cannot resolve an unknown post-compaction occupancy.
+            if prompt > 0, !awaitsPostCompactionUsage(session: session) {
                 return prompt
             }
             return nil
@@ -177,6 +178,16 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let normalized = systemText.lowercased()
         guard normalized.contains("context compacted") else { return }
         session.contextCompactedAt = Date()
+        // compact_boundary reports pre_tokens, not the size of the compacted context.
+        // Invalidate both ring fallbacks and this turn's pre-boundary observation while
+        // retaining the model window and all historical billing/usage records.
+        session.codexContextUsage = AgentContextUsage(
+            modelContextWindow: session.codexContextUsage?.modelContextWindow,
+            lastTotalTokens: nil,
+            totalTotalTokens: nil
+        )
+        session.activeNonCodexTurnTokenAccumulator?.observedContextUsedTokens = nil
+        session.isDirty = true
         _ = updateSnapshot(
             from: session.codexContextUsage,
             source: .compactionSignal,
@@ -210,7 +221,10 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             || resolvedContextUsed > 0
 
         guard hasUsage else {
-            if !session.providerTokenUsageByTurn.isEmpty, session.codexContextUsage == nil {
+            if !session.providerTokenUsageByTurn.isEmpty,
+               session.codexContextUsage == nil,
+               session.contextCompactedAt == nil
+            {
                 session.codexContextUsage = contextUsageBuilder(
                     session.providerTokenUsageByTurn,
                     nil
@@ -247,10 +261,14 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         // preserve the existing codexContextUsage which may have been set by
         // ingestUsageSignal with actual data.
         let existingUsage = session.codexContextUsage
-        let rebuilt = contextUsageBuilder(
+        // Without a fresh observation, rebuilding after compaction would resurrect the
+        // latest historical (pre-compaction) context. Keep the current reading instead,
+        // including an explicitly unknown reading while waiting for occupancy.
+        let canRebuildContext = session.contextCompactedAt == nil || persistedContextUsed > 0
+        let rebuilt = canRebuildContext ? contextUsageBuilder(
             session.providerTokenUsageByTurn,
             existingUsage?.modelContextWindow
-        )
+        ) : nil
         if let rebuilt {
             session.codexContextUsage = rebuilt
         }
@@ -262,6 +280,10 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
         session.isDirty = true
         return true
+    }
+
+    private func awaitsPostCompactionUsage(session: AgentTabSession) -> Bool {
+        session.contextCompactedAt != nil && session.codexContextUsage?.lastTotalTokens == nil
     }
 
     private func normalizedContextUsedTokens(
