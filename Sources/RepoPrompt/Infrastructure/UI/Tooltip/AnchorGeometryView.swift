@@ -60,6 +60,17 @@ struct AnchorGeometryView: NSViewRepresentable {
             scheduleReport()
         }
 
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            // Invalidate the old anchor synchronously, before a delayed show can
+            // run. Geometry itself remains deferred to avoid layout re-entry.
+            if window !== newWindow {
+                lastWindow = nil
+                lastFrameInWindow = .null
+                callback(.zero, nil)
+            }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             scheduleReport()

@@ -76,10 +76,10 @@ private struct HoverTooltipModifier: ViewModifier {
     /// Keep *all* tooltip runtime mutable state in a reference container so that
     /// geometry updates and event-driven dismissals do NOT invalidate SwiftUI layout.
     /// This prevents AppKit updateConstraints/layout recursion crashes inside popovers.
+    @MainActor
     final class TooltipRuntime {
-        var pendingWork: DispatchWorkItem?
+        let pendingPresentation = TooltipPendingPresentation()
         var pendingReposition: DispatchWorkItem?
-        let pendingWorkGate = WorkItemGate()
         let pendingRepositionGate = WorkItemGate()
         var overlayController: TooltipOverlayController?
         var globalMonitor: Any?
@@ -113,6 +113,11 @@ private struct HoverTooltipModifier: ViewModifier {
         content
             .background(
                 AnchorGeometryView(refreshID: anchorRefreshID) { rect, win in
+                    // Bind an initially deferred report, or invalidate an owner transition.
+                    rt.pendingPresentation.updateOwner(win)
+                    if rt.overlayController != nil, rt.anchorInfo.window !== win || win == nil {
+                        hideOverlay()
+                    }
                     // Update reference container without triggering SwiftUI updates
                     rt.anchorInfo.rect = rect
                     rt.anchorInfo.window = win
@@ -137,11 +142,19 @@ private struct HoverTooltipModifier: ViewModifier {
 
                     cancelPendingWork()
 
-                    // Avoid retain cycle: runtime -> pendingWork -> closure -> runtime
-                    rt.pendingWork = rt.pendingWorkGate.schedule(after: showDelay) { [tooltipContent, placement, preset, weak rt] in
-                        guard let rt else { return }
-                        guard let hostWindow = rt.anchorInfo.window else { return }
-                        defer { rt.pendingWork = nil }
+                    // Input dismissal must cover the delay, not just a visible overlay.
+                    installDismissMonitors()
+                    rt.pendingPresentation.schedule(owner: rt.anchorInfo.window, after: showDelay, isEligible: { [weak rt] in
+                        guard let hostWindow = rt?.anchorInfo.window else { return false }
+                        return hostWindow.isVisible
+                            && hostWindow.isKeyWindow
+                            && !hostWindow.isMiniaturized
+                            && hostWindow.attachedSheet == nil
+                            && showTooltips
+                    }, onEnd: {
+                        removeDismissMonitors()
+                    }) { [tooltipContent, placement, preset, weak rt] in
+                        guard let rt, let hostWindow = rt.anchorInfo.window else { return }
 
                         hideOverlay()
 
@@ -174,9 +187,7 @@ private struct HoverTooltipModifier: ViewModifier {
 
     @MainActor
     private func cancelPendingWork() {
-        runtime.pendingWork?.cancel()
-        runtime.pendingWork = nil
-        runtime.pendingWorkGate.cancel()
+        runtime.pendingPresentation.cancel()
     }
 
     @MainActor
@@ -203,6 +214,7 @@ private struct HoverTooltipModifier: ViewModifier {
         // Defer to next runloop to avoid doing too much during event processing.
         runtime.globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: masks) { [weak anchorInfo = runtime.anchorInfo] _ in
             _ = anchorInfo // prevent capture warning
+            MainActor.assumeIsolated { cancelPendingWork() }
             DispatchQueue.main.async {
                 Task { @MainActor in
                     hideOverlay()
@@ -211,6 +223,7 @@ private struct HoverTooltipModifier: ViewModifier {
         }
         runtime.localMonitor = NSEvent.addLocalMonitorForEvents(matching: masks.union(.keyDown)) { [weak anchorInfo = runtime.anchorInfo] event in
             _ = anchorInfo // prevent capture warning
+            MainActor.assumeIsolated { cancelPendingWork() }
             DispatchQueue.main.async {
                 Task { @MainActor in
                     hideOverlay()
