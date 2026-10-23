@@ -191,9 +191,9 @@ final class DirectHeadlessFileSearchFilterTests: XCTestCase {
                 "path": .string(fixture.file.path), "start_line": .int(1), "limit": .int(1)
             ]))
             XCTFail("An oversized file must not bypass the byte bound through line slicing")
-        } catch is CancellationError {
-            XCTFail("Expected a file-size error")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? MCPDomainHeadlessFileReader.ReadError, .tooLarge)
+        }
     }
 
     func testReadFileHonorsAlreadyCancelledCaller() async throws {
