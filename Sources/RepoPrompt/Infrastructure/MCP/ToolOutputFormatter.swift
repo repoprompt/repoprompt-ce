@@ -3254,6 +3254,12 @@ extension ToolOutputFormatter {
     private static func codeStructureUnavailableAction(
         issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
     ) -> String {
+        if issues.contains(where: { $0.code == "graph_budget_exhausted" }) {
+            return "This generation cannot be resumed with Retry. Reduce indexed scope or resource usage before reloading the root."
+        }
+        if issues.contains(where: { $0.code == "graph_retry_exhausted" || $0.code == "graph_worker_recovery_exhausted" }) {
+            return "Use Code Map Retry to restart indexing; polling cannot restart it."
+        }
         if issues.contains(where: { $0.code == "path_not_found" }) {
             return "Check spelling with get_file_tree, then retry root-relative or root-prefixed."
         }

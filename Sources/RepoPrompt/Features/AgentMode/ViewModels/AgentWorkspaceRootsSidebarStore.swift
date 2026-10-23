@@ -31,6 +31,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     let pendingCount: UInt64
     let updatesPending: Bool
     let graphRevision: UInt64?
+    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget? = nil
 
     static let pending = Self(
         state: .notInitialized,
@@ -110,7 +111,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case .reconciling: "Reconciling…"
         case .paused: "Paused"
         case .recoveryExhausted: "Retry needed"
-        case .unavailable: "Unavailable"
+        case .unavailable: graphIndexBudget == nil ? "Unavailable" : "Indexing limit reached"
         case .revoked: "Revoked"
         }
     }
@@ -138,7 +139,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case .recoveryExhausted:
             "Code Map indexing stopped after repeated recovery attempts. Retry to resume indexing."
         case .unavailable:
-            "Code Maps are unavailable for this root."
+            graphIndexBudget?.terminalMessage ?? "Code Maps are unavailable for this root."
         case .revoked:
             "Code Map graph authority was revoked and must be re-established."
         }
@@ -174,7 +175,8 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
             supportedCount: stableSupportedCount,
             pendingCount: coverage?.pendingCount ?? 0,
             updatesPending: snapshot.updatesPending,
-            graphRevision: snapshot.graphRevision
+            graphRevision: snapshot.graphRevision,
+            graphIndexBudget: snapshot.graphIndexBudget
         )
     }
 }

@@ -4,6 +4,76 @@ import RepoPromptPersistence
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testBudgetLimitedGraphProjectsAsTerminalWithoutRetry() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root", files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            enginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumRetainedSourceByteCountPerRoot: 1
+            )
+        )
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        try await AsyncTestWait.waitUntil("engine stops at its source reservation budget", timeout: 30) {
+            await engine.accounting().graphIndexRoots.contains { $0.phase == .budgetLimited }
+        }
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty, "Budget projection must not depend on parsing latency")
+        // Observe the public subscription, not just an engine diagnostic. Terminal work must
+        // take precedence over honest incomplete coverage, and must not offer an ineffective retry.
+        try await AsyncTestWait.waitUntil("budget terminal reaches public status", timeout: 5) {
+            await store.currentCodemapRootStatusUpdate().roots.first?.availability == .unavailable
+        }
+        let update = await store.currentCodemapRootStatusUpdate()
+        let snapshot = try XCTUnwrap(update.roots.first)
+        XCTAssertEqual(snapshot.unavailableReason, .budgetLimited)
+        XCTAssertNotEqual(snapshot.coverage?.isComplete, true)
+        let budget = try XCTUnwrap(snapshot.graphIndexBudget)
+        XCTAssertEqual(budget.dimension, .retainedSourceBytes)
+        XCTAssertEqual(budget.limit, 1)
+        XCTAssertGreaterThan(budget.attempted, budget.limit)
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
+        let stream = await engine.graphIndexExecutionUpdates(rootEpoch: rootEpoch)
+        var iterator = stream.makeAsyncIterator()
+        let replayed = await iterator.next()
+        XCTAssertEqual(replayed, .budgetLimited(budget))
+        let retry = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        XCTAssertEqual(retry, .unavailable)
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot)
+        XCTAssertFalse(presentation.isActivelyMapping)
+        XCTAssertFalse(presentation.showsProgress)
+        XCTAssertFalse(presentation.canRetry)
+        XCTAssertEqual(presentation.statusText, "Indexing limit reached")
+        XCTAssertEqual(presentation.tooltip, budget.terminalMessage)
+
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let result = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: [file.id],
+            direction: nil,
+            maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget,
+            rootScope: .allLoaded
+        )
+        XCTAssertEqual(result.status, .unavailable)
+        let issue = try XCTUnwrap(result.roots.first?.issues.first { $0.code == "graph_budget_exhausted" })
+        XCTAssertFalse(issue.retryable)
+        XCTAssertNil(issue.retryAfterMilliseconds)
+        XCTAssertEqual(issue.attempted, Int(clamping: budget.attempted))
+        XCTAssertEqual(issue.limit, 1)
+        XCTAssertFalse(result.roots.flatMap(\.issues).contains { $0.code == "graph_indexing" || $0.code == "seed_pending" })
+    }
+
     func testGlobalDisableGatesManifestPublicationAndCancelsWriterUntilReenabled() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let relativePath = "Sources/Feature.swift"
