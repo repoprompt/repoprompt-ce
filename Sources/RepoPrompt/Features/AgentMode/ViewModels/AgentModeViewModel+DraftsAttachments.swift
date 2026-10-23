@@ -160,6 +160,9 @@ extension AgentModeViewModel {
 
     private func writeDraftText(for tabID: UUID, _ text: String) {
         let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
+        if !repromptUIStore.hasCancelledDraft(tabID: tabID, text: text) {
+            repromptUIStore.clearCancelledDraft(tabID: tabID)
+        }
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text

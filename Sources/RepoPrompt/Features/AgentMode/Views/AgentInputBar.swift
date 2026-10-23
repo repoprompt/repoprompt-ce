@@ -122,7 +122,7 @@ struct AgentInputBar: View {
         // an idle session also invalidates the equatable view's retained actions.
         let cursorSession = agentModeVM.activeSession
         return AgentComposerActions(
-            prepareReprompt: { target, text in agentModeVM.beginComposerReprompt(target: target, text: text) },
+            prepareReprompt: { target, text in agentModeVM.prepareRepromptForComposerSend(target: target, text: text) },
             toggleComputerUse: { tabID, identity in await agentModeVM.toggleComputerUse(tabID: tabID, expectedSessionIdentity: identity) },
             storeDraft: { tabID, text, sequence in
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
@@ -298,6 +298,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     @State private var localInputText: String = ""
+    @State private var nativeComposerEditor = TextFieldNativeEditor()
     @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var acknowledgedDraftRestorationSequenceByTab: [UUID: UInt64] = [:]
@@ -380,6 +381,10 @@ struct AgentComposerView: View, Equatable {
               target.tabID == props.currentTabID,
               target.tabID == currentTabID
         else { return nil }
+        if let viewModel = repromptViewModel {
+            guard viewModel.currentTabID == target.tabID, let session = viewModel.sessions[target.tabID],
+                  viewModel.makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return nil }
+        }
         return target
     }
 
@@ -397,10 +402,6 @@ struct AgentComposerView: View, Equatable {
     private var repromptEditTransaction: TextFieldExternalEditTransaction? {
         if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
         return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
-    }
-
-    private var isRepromptBlockingSend: Bool {
-        repromptPresentation.map { $0.phase != .completed } ?? false
     }
 
     private var isSubmissionPending: Bool {
@@ -421,7 +422,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var canSubmitToRenderedTarget: Bool {
-        !isRepromptBlockingSend && props.canSendWithCurrentProvider
+        props.canSendWithCurrentProvider
             && renderedSubmitTarget != nil
             && !isSubmissionPending
     }
@@ -429,7 +430,12 @@ struct AgentComposerView: View, Equatable {
     private var localInputTextBinding: Binding<String> {
         Binding(
             get: { localInputText },
-            set: { setLocalInputText($0) }
+            set: { text in
+                guard let tabID = currentTabID,
+                      repromptViewModel == nil || repromptViewModel?.currentTabID == tabID else { return }
+                setLocalInputText(text)
+                actions.storeDraft(tabID, text, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+            }
         )
     }
 
@@ -587,15 +593,10 @@ struct AgentComposerView: View, Equatable {
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
             actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
-        .onReceive(repromptStore.$composerFocusRestoreRequest) { request in
-            guard let request, request.tabID == currentTabID else { return }
+        .onChange(of: repromptStore.composerFocusRestoreRequest) { _, request in
+            guard let request, request.tabID == currentTabID,
+                  repromptViewModel?.currentTabID == request.tabID else { return }
             composerFocusRestoreRequest = request.id
-        }
-        .onChange(of: repromptStore.presentation) { old, new in
-            guard let tabID = currentTabID,
-                  old?.sourceTabID == tabID || new?.sourceTabID == tabID,
-                  old?.id != new?.id || old?.phase != new?.phase else { return }
-            composerFocusRestoreRequest = UUID()
         }
         .onReceive(repromptStore.$draftUpdate) { update in
             guard let update, update.tabID == currentTabID else { return }
@@ -608,7 +609,7 @@ struct AgentComposerView: View, Equatable {
             guard let request, request.tabID == currentTabID,
                   let operation = repromptViewModel?.repromptOperation, operation.id == request.operationID,
                   operation.consumeAutoSend(request), localInputText == request.text else { return }
-            sendMessage() // Same fresh local claim and attachment/workflow admission as an explicit Send.
+            submitMessage(rawDraftSnapshot: request.text, restoreFocus: false)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
@@ -695,8 +696,8 @@ struct AgentComposerView: View, Equatable {
             if let repromptViewModel {
                 VStack(alignment: .leading, spacing: 6) {
                     AgentRepromptQuestionsView(viewModel: repromptViewModel, store: repromptStore, tabID: currentTabID, onReturnToComposer: { [tabID = currentTabID] in
-                        guard currentTabID == tabID else { return }
-                        composerFocusRestoreRequest = UUID()
+                        guard repromptViewModel.currentTabID == tabID else { return }
+                        repromptStore.requestComposerFocus(tabID: tabID)
                     })
                     AgentRepromptComposerStrip(
                         viewModel: repromptViewModel,
@@ -729,7 +730,7 @@ struct AgentComposerView: View, Equatable {
             ResizableTextField(
                 text: localInputTextBinding,
                 placeholder: placeholderText,
-                onReturn: handleComposerReturn,
+                onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onImagePaste: handleImagePaste(pasteboard:),
                 features: .agentInputBar(
@@ -747,7 +748,6 @@ struct AgentComposerView: View, Equatable {
                     }
                 ),
                 externalUpdateTick: externalTextUpdateTick,
-                isReadOnly: repromptPresentation?.phase.isBusy == true,
                 externalEditTransaction: repromptEditTransaction,
                 onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
                     if let id { undoRepromptDraft(expectedID: id) }
@@ -755,14 +755,23 @@ struct AgentComposerView: View, Equatable {
                         _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
                     }
                 },
+                onBeginUserEditing: repromptViewModel == nil ? nil : { [tabID = currentTabID] text, yieldedID in
+                    guard let tabID, let viewModel = repromptViewModel,
+                          viewModel.currentTabID == tabID, let operation = viewModel.repromptOperation,
+                          operation.sourceTabID == tabID, operation.id != yieldedID, operation.beginUserEditing() else { return nil }
+                    setLocalInputText(text)
+                    actions.storeDraft(tabID, text, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+                    return .init(id: operation.id, revision: externalTextUpdateTick)
+                },
                 onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
                     guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
                     if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
                     else { operation.cancel() }
                 },
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
-                onReadOnlyReturn: repromptViewModel == nil ? nil : handleComposerReturn,
                 focusRestoreRequest: composerFocusRestoreRequest,
+                nativeEditor: nativeComposerEditor,
+                nativeEditorIdentity: currentTabID.map { AnyHashable($0) },
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -849,7 +858,7 @@ struct AgentComposerView: View, Equatable {
                         inputText: localInputText,
                         hasMessages: false, // Disable resend in agent mode - just show greyed send button
                         sendWhenEmpty: hasPendingAttachments,
-                        sendTooltip: "Send Message",
+                        sendTooltip: repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)",
                         foregroundColor: .accentColor,
                         sendAction: sendMessage,
                         resendAction: {}
@@ -1769,12 +1778,13 @@ struct AgentComposerView: View, Equatable {
         operation.useOriginal()
         guard operation.phase == .completed else { return }
         loadDraftFromSession(for: tabID)
-        sendMessage() // A second explicit user action, through ordinary fresh-claim admission.
+        submitMessage(rawDraftSnapshot: localInputText, restoreFocus: true)
     }
 
     private func undoRepromptDraft(expectedID: UUID?) {
         guard let expectedID, let viewModel = repromptViewModel, let operation = viewModel.repromptOperation,
-              operation.id == expectedID, viewModel.currentTabID == operation.sourceTabID else { return }
+              operation.id == expectedID, viewModel.currentTabID == operation.sourceTabID,
+              operation.validate() else { return }
         // Flush a last keystroke even if SwiftUI's onChange has not run yet.
         if let tabID = currentTabID {
             actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
@@ -1784,33 +1794,23 @@ struct AgentComposerView: View, Equatable {
 
     private func repromptAgain() -> Bool {
         retireUnownedSubmissionLatch()
-        guard !isRepromptBlockingSend, !isSubmissionPending, props.canSendWithCurrentProvider,
+        if repromptViewModel?.repromptOperation?.phase.isBusy == true || isSubmissionPending { return true }
+        guard props.canSendWithCurrentProvider,
               let target = renderedSubmitTarget, let repromptViewModel else { return false }
+        guard let native = nativeComposerEditor.snapshot(matching: AnyHashable(target.tabID)), !native.hasMarkedText else { return true }
+        setLocalInputText(native.text)
         actions.storeDraft(target.tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[target.tabID] ?? 0)
         return repromptViewModel.requestComposerRepromptAgain(target: target, text: localInputText)
     }
 
-    private func handleComposerReturn() {
-        guard let target = renderedSubmitTarget else { return }
-        let override = repromptStore.hasPreparedDraft(tabID: target.tabID, text: localInputText)
-        if override, let operation = repromptViewModel?.repromptOperation, operation.sourceTabID == target.tabID {
-            operation.useCurrentDraft(localInputText)
-            guard operation.phase == .completed, !operation.isClosed else { return }
-        }
-        if override, repromptViewModel?.repromptOperation == nil, repromptStore.recoveries[target.tabID] != nil {
-            actions.storeDraft(target.tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[target.tabID] ?? 0)
-            repromptViewModel?.keepRepromptRewrite(tabID: target.tabID)
-        }
-        submitMessage(bypassReprompt: override)
-    }
-
     private func sendMessage() {
-        submitMessage(bypassReprompt: false)
+        guard let tabID = currentTabID,
+              let native = nativeComposerEditor.snapshot(matching: AnyHashable(tabID)), !native.hasMarkedText else { return }
+        submitMessage(rawDraftSnapshot: native.text, restoreFocus: true)
     }
 
-    private func submitMessage(bypassReprompt: Bool) {
+    private func submitMessage(rawDraftSnapshot: String, restoreFocus: Bool) {
         retireUnownedSubmissionLatch()
-        guard !isRepromptBlockingSend else { return }
         guard !isSubmissionPending else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
             return
@@ -1823,7 +1823,6 @@ struct AgentComposerView: View, Equatable {
             }
             return
         }
-        let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || hasPendingAttachments else { return }
         guard let submitTarget = renderedSubmitTarget else {
@@ -1831,16 +1830,9 @@ struct AgentComposerView: View, Equatable {
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
+        setLocalInputText(rawDraftSnapshot)
         actions.storeDraft(submitTarget.tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[submitTarget.tabID] ?? 0)
-        if !bypassReprompt, let viewModel = repromptViewModel, viewModel.repromptEnabled,
-           AgentModeViewModel.isRepromptEligible(text: rawDraftSnapshot, hasStagedCommand: props.stagedSlashCommand != nil),
-           viewModel.resolvedRepromptModel() == nil
-        {
-            // An enabled rewrite must not silently become an unreviewed send if its route disconnects.
-            showSteeringUnsupportedNotice(viewModel.repromptModelResolution().unavailableReason ?? "Connect a Re-prompt model or turn Re-prompt off to send as typed.")
-            return
-        }
-        if !bypassReprompt, actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
+        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
@@ -1859,7 +1851,7 @@ struct AgentComposerView: View, Equatable {
             // Admission owns this snapshot now; routing must not leave a duplicate in the editor.
             setLocalInputText("", isExternalUpdate: true)
             resetTextFieldTrigger.toggle()
-            composerFocusRestoreRequest = UUID()
+            if restoreFocus { composerFocusRestoreRequest = UUID() }
             Task { @MainActor in
                 let submissionResult = await actions.executeSubmit(claim, trimmed)
                 let effects = submissionLatch.complete(

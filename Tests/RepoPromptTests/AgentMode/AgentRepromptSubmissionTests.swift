@@ -460,45 +460,152 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     }
 
     func testCancelRestoresOriginalAndLateChunksCannotChangeIt() async throws {
-        let fixture = try await AgentRepromptTestFixture()
-        defer { fixture.cleanUp() }
-        fixture.enableReprompt()
-        let gate = AgentRepromptStartGate()
-        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
-            try await publish("Partial")
-            _ = await gate.wait()
-            try await publish(" late result")
-        })
-        XCTAssertTrue(try fixture.begin(text: "Original"))
-        try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
-        let oldID = try XCTUnwrap(fixture.viewModel.repromptOperation?.id)
-        fixture.viewModel.cancelReprompt()
-        XCTAssertEqual(fixture.session.draftText, "Original")
-        await gate.release()
-        try await Task.sleep(for: .milliseconds(80))
-        XCTAssertEqual(fixture.session.draftText, "Original")
-        XCTAssertNil(fixture.viewModel.repromptSpeculations[oldID])
-        XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, "Partial")
+        for hasPartial in [false, true] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let gate = AgentRepromptStartGate()
+            defer { Task { await gate.release() } }
+            fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+                if hasPartial { try await publish("Partial") }
+                _ = await gate.wait()
+                try await publish(" late result")
+            })
+            XCTAssertTrue(try fixture.begin(text: "Original"))
+            if hasPartial {
+                try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
+            }
+            let oldID = try XCTUnwrap(fixture.viewModel.repromptOperation?.id)
+            fixture.viewModel.cancelReprompt()
+            XCTAssertEqual(fixture.session.draftText, "Original")
+            XCTAssertFalse(try fixture.begin(text: "Original"), "Cancelling always lets the next Send use the original, even before the first token")
+            await gate.release()
+            try await Task.sleep(for: .milliseconds(80))
+            XCTAssertEqual(fixture.session.draftText, "Original")
+            XCTAssertNil(fixture.viewModel.repromptOperation)
+            XCTAssertNil(fixture.viewModel.repromptSpeculations[oldID])
+            XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, hasPartial ? "Partial" : nil)
+        }
     }
 
-    func testUserMutationDuringStreamingWinsAndRecoversPartial() async throws {
+    func testUserEditingTakesOverBeforeAndDuringStreamingWithoutAnotherDecision() async throws {
+        for hasPartial in [false, true] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let gate = AgentRepromptStartGate()
+            defer { Task { await gate.release() } }
+            fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+                if hasPartial { try await publish("Partial") }
+                _ = await gate.wait()
+                try await publish(" late")
+            })
+            XCTAssertTrue(try fixture.begin(text: "Original"))
+            if hasPartial {
+                try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
+            }
+            let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+            let publication = fixture.viewModel.repromptUIStore.draftUpdate
+            XCTAssertTrue(operation.beginUserEditing())
+            XCTAssertEqual(operation.phase, .completed)
+            XCTAssertTrue(operation.hasUserEdits)
+            XCTAssertEqual(fixture.viewModel.repromptUIStore.draftUpdate, publication, "Taking focus for a keystroke or IME must not replace native text")
+            await gate.release()
+            try await Task.sleep(for: .milliseconds(80))
+            XCTAssertEqual(fixture.session.draftText, hasPartial ? "Partial" : "Original", "Fence the provider before the editor commits its first character")
+            fixture.viewModel.storeDraftText(for: fixture.session.tabID, "User wins")
+            XCTAssertEqual(fixture.session.draftText, "User wins")
+            XCTAssertEqual(operation.expectedDraft, "User wins")
+            XCTAssertEqual(operation.expectedDraftGeneration, fixture.session.draftMutationGeneration)
+            XCTAssertFalse(try fixture.begin(text: "User wins"), "The next Send must not rewrite again or require Keep rewrite")
+            XCTAssertNil(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID])
+            fixture.viewModel.undoReprompt()
+            XCTAssertEqual(fixture.session.draftText, "Original")
+            XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, "User wins")
+        }
+    }
+
+    func testCancellingOriginalSendPreservesAlternativeRewriteAndCancellationChoice() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         fixture.enableReprompt()
         let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
         fixture.viewModel.repromptService = .init(transport: { _, _, publish in
-            try await publish("Partial")
+            try await publish("Partial rewrite")
             _ = await gate.wait()
-            try await publish(" late")
         })
         XCTAssertTrue(try fixture.begin(text: "Original"))
-        try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
-        fixture.viewModel.storeDraftText(for: fixture.session.tabID, "User wins")
-        XCTAssertNil(fixture.viewModel.repromptOperation)
-        await gate.release()
+        try await AsyncTestWait.waitUntil("partial rewrite", timeout: 5) { fixture.session.draftText == "Partial rewrite" }
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        vm.cancelReprompt()
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        XCTAssertFalse(vm.prepareRepromptForComposerSend(target: target, text: "Original"))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Original")
+        guard case .claimed = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected an admitted original send")
+        }
+        XCTAssertTrue(vm.retrieveDraftText(for: tabID).isEmpty)
+        await vm.cancelPresentedComposerSubmission(id: attempt.id)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Original")
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.text, "Partial rewrite")
+        XCTAssertTrue(vm.repromptUIStore.hasCancelledDraft(tabID: tabID, text: "Original"))
+        let retryTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        XCTAssertFalse(vm.prepareRepromptForComposerSend(target: retryTarget, text: "Original"))
+        XCTAssertNil(vm.repromptOperation, "Retrying the restored original must not start another rewrite")
+    }
+
+    func testEditingClarificationOrFailureKeepsDraftSendableAndFencesAutoSend() async throws {
+        for phase in [AgentRepromptUIStore.Phase.clarifying, .failed, .completed] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            fixture.viewModel.setRepromptMode(.sendAutomatically)
+            fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+                try await publish("Rewrite")
+                if phase == .clarifying {
+                    try await publish(AgentRepromptStreamParser.delimiter + AgentRepromptServiceTests.questions + AgentRepromptStreamParser.endDelimiter)
+                } else if phase == .failed { throw AgentRepromptError.incomplete }
+            })
+            XCTAssertTrue(try fixture.begin(text: "Original"))
+            try await AsyncTestWait.waitUntil("requested phase", timeout: 5) { fixture.viewModel.repromptOperation?.phase == phase }
+            let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+            let intent = fixture.viewModel.repromptUIStore.autoSendRequest
+            XCTAssertTrue(operation.beginUserEditing())
+            if let intent { XCTAssertFalse(operation.consumeAutoSend(intent), "Beginning marked text fences an already queued auto-send before commit") }
+            XCTAssertNil(fixture.viewModel.repromptUIStore.pendingQuestions)
+            XCTAssertNil(fixture.viewModel.repromptUIStore.presentation?.error)
+            XCTAssertNil(fixture.viewModel.repromptUIStore.autoSendRequest)
+            fixture.viewModel.storeDraftText(for: fixture.session.tabID, "My edited request")
+            XCTAssertEqual(operation.phase, .completed)
+            XCTAssertFalse(try fixture.begin(text: "My edited request"))
+            XCTAssertTrue(fixture.session.items.isEmpty)
+        }
+    }
+
+    func testMetadataOnlyChunksDoNotRepublishComposer() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        let publisher = AgentRepromptCapturedPublisher()
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+            await publisher.save(publish)
+            try await publish("Body")
+            _ = await gate.wait()
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("body visible", timeout: 5) { fixture.session.draftText == "Body" }
+        let publication = fixture.viewModel.repromptUIStore.draftUpdate
+        try await publisher.emit(AgentRepromptStreamParser.delimiter + AgentRepromptServiceTests.questions)
         try await Task.sleep(for: .milliseconds(80))
-        XCTAssertEqual(fixture.session.draftText, "User wins")
-        XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID]?.text, "Partial")
+        XCTAssertEqual(fixture.viewModel.repromptUIStore.draftUpdate, publication)
+        try await publisher.emit(AgentRepromptStreamParser.endDelimiter)
+        await gate.release()
+        try await AsyncTestWait.waitUntil("clarification", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .clarifying }
+        XCTAssertEqual(fixture.session.draftText, "Body")
     }
 
     func testSessionReplacementRejectsLateChunksAndDoesNotOverwriteReplacementDraft() async throws {

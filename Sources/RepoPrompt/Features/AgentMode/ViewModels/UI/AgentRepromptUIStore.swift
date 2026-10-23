@@ -6,7 +6,32 @@ final class AgentRepromptUIStore: ObservableObject {
     /// Preparation, not a keystroke deadline, distinguishes the first Return from the next.
     /// This only chooses the UI action; operation validation and fresh claim admission still apply.
     func hasPreparedDraft(tabID: UUID, text: String) -> Bool {
-        presentation?.sourceTabID == tabID || recoveries[tabID]?.draftAtInvalidation == text
+        presentation?.sourceTabID == tabID || recoveries[tabID]?.draftAtInvalidation.utf8.elementsEqual(text.utf8) == true
+            || hasCancelledDraft(tabID: tabID, text: text)
+    }
+
+    struct CancelledDraft: Equatable {
+        let id = UUID()
+        let text: String
+    }
+
+    private(set) var cancelledDrafts: [UUID: CancelledDraft] = [:]
+
+    func rememberCancelledDraft(tabID: UUID, text: String) {
+        cancelledDrafts[tabID] = .init(text: text)
+    }
+
+    func hasCancelledDraft(tabID: UUID, text: String) -> Bool {
+        cancelledDrafts[tabID]?.text.utf8.elementsEqual(text.utf8) == true
+    }
+
+    func clearCancelledDraft(tabID: UUID) {
+        cancelledDrafts[tabID] = nil
+    }
+
+    func restoreCancelledDraft(_ draft: CancelledDraft?, tabID: UUID, currentDraft: String) {
+        guard cancelledDrafts[tabID] == nil, let draft, draft.text.utf8.elementsEqual(currentDraft.utf8) else { return }
+        cancelledDrafts[tabID] = draft
     }
 
     struct SubmittedDraft: Equatable {
@@ -14,6 +39,7 @@ final class AgentRepromptUIStore: ObservableObject {
         let recovery: Recovery?
         let publication: DraftUpdate?
         let autoSend: AutoSendRequest?
+        let cancelledDraft: CancelledDraft?
     }
 
     func submittedDraftSnapshot(tabID: UUID) -> SubmittedDraft {
@@ -21,7 +47,8 @@ final class AgentRepromptUIStore: ObservableObject {
             tabID: tabID,
             recovery: recoveries[tabID],
             publication: draftUpdate?.tabID == tabID ? draftUpdate : nil,
-            autoSend: autoSendRequest?.tabID == tabID ? autoSendRequest : nil
+            autoSend: autoSendRequest?.tabID == tabID ? autoSendRequest : nil,
+            cancelledDraft: cancelledDrafts[tabID]
         )
     }
 
@@ -30,6 +57,7 @@ final class AgentRepromptUIStore: ObservableObject {
         if recoveries[snapshot.tabID] == snapshot.recovery { recoveries[snapshot.tabID] = nil }
         if draftUpdate == snapshot.publication { draftUpdate = nil }
         if autoSendRequest == snapshot.autoSend { autoSendRequest = nil }
+        if cancelledDrafts[snapshot.tabID] == snapshot.cancelledDraft { cancelledDrafts[snapshot.tabID] = nil }
     }
 
     enum Phase: Equatable {

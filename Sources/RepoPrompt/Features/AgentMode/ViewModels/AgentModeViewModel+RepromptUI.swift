@@ -24,8 +24,9 @@ enum AgentRepromptDisclosure {
         ]
     }
 
-    static let howItWorks = "Return rewrites the message in the composer; press Return again to send it. Esc reverts, ⌘↩ rewrites again, "
-        + "⌘⇧O sends the original. A clarification answer may trigger one more rewrite. Send automatically mode "
+    static let howItWorks = "Send or Return rewrites the message in the composer; press either again to send the visible text. "
+        + "You can keep editing at any time; typing stops the rewrite. Esc restores the original for your next Send, ⌘↩ rewrites again, "
+        + "and ⌘⇧O sends the original immediately. Clarification is optional; an answer may trigger one more rewrite. Send automatically mode "
         + "(Re-prompt menu) dispatches completed rewrites unless a question or slash-leading text needs review."
 }
 

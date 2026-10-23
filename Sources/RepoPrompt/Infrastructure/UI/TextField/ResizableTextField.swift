@@ -44,6 +44,17 @@ final class ImageAwareTextView: NSTextView {
     var enablesImagePasteHandling = false
     var commandReturnHandler: (() -> Bool)?
     var readOnlyReturnHandler: (() -> Void)?
+    var beginUserEditingHandler: (() -> Void)?
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        if isEditable { beginUserEditingHandler?() }
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if isEditable { beginUserEditingHandler?() }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
 
     override func keyDown(with event: NSEvent) {
         if handleReadOnlyReturn(event) { return }
@@ -61,8 +72,17 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if window?.firstResponder === self, isEditable, !hasMarkedText(),
+           event.modifierFlags.intersection([.command, .option, .control]) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "z"
+        {
+            beginUserEditingHandler?()
+        }
         if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
-           commandReturnHandler?() == true { return true }
+           let commandReturnHandler
+        {
+            if event.isARepeat || commandReturnHandler() { return true }
+        }
         return super.performKeyEquivalent(with: event)
     }
 
@@ -211,6 +231,38 @@ struct TextFieldExternalEditTransaction: Equatable {
     let isComplete: Bool
 }
 
+struct TextFieldExternalEditTakeover {
+    let id: UUID
+    let revision: Int
+}
+
+@MainActor
+final class TextFieldNativeEditor {
+    struct Snapshot {
+        let text: String
+        let hasMarkedText: Bool
+    }
+
+    private weak var textView: NSTextView?
+    private var identity: AnyHashable?
+
+    func snapshot(matching identity: AnyHashable) -> Snapshot? {
+        guard self.identity == identity, let textView, textView.window != nil else { return nil }
+        return .init(text: textView.string, hasMarkedText: textView.hasMarkedText())
+    }
+
+    func attach(_ textView: NSTextView, identity: AnyHashable?) {
+        self.textView = textView
+        self.identity = identity
+    }
+
+    func detach(_ textView: NSTextView) {
+        guard self.textView === textView else { return }
+        self.textView = nil
+        identity = nil
+    }
+}
+
 struct ResizableTextField: View {
     @Binding var text: String
     let placeholder: String
@@ -223,11 +275,15 @@ struct ResizableTextField: View {
     var isReadOnly = false
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
+    /// Checks the live operation against the last yielded ID before native text or IME changes.
+    var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
+    var nativeEditor: TextFieldNativeEditor?
+    var nativeEditorIdentity: AnyHashable?
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -289,10 +345,13 @@ struct ResizableTextField: View {
             isReadOnly: isReadOnly,
             externalEditTransaction: externalEditTransaction,
             onUndoExternalEdit: onUndoExternalEdit,
+            onBeginUserEditing: onBeginUserEditing,
             onEscape: onEscape,
             onCommandReturn: onCommandReturn,
             onReadOnlyReturn: onReadOnlyReturn,
             focusRestoreRequest: focusRestoreRequest,
+            nativeEditor: nativeEditor,
+            nativeEditorIdentity: nativeEditorIdentity,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -330,11 +389,15 @@ struct CustomTextField: NSViewRepresentable {
     var isReadOnly = false
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
+    /// Checks the live operation against the last yielded ID before native text or IME changes.
+    var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
+    var nativeEditor: TextFieldNativeEditor?
+    var nativeEditorIdentity: AnyHashable?
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -402,6 +465,10 @@ struct CustomTextField: NSViewRepresentable {
         textView.layoutManager?.usesFontLeading = true
 
         textView.delegate = context.coordinator
+        textView.beginUserEditingHandler = { [weak coordinator = context.coordinator, weak textView] in
+            guard let textView else { return }
+            coordinator?.beginUserEditingIfNeeded(textView: textView)
+        }
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
@@ -424,6 +491,8 @@ struct CustomTextField: NSViewRepresentable {
         textView.string = text
         context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
         context.coordinator.clearUndoHistory()
+        context.coordinator.nativeEditorIdentity = nativeEditorIdentity
+        context.coordinator.connectNativeEditor(textView: textView)
 
         // Initial height calculation
         Task { @MainActor in
@@ -436,6 +505,7 @@ struct CustomTextField: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
+        defer { context.coordinator.connectNativeEditor(textView: textView) }
         textView.isEditable = !isReadOnly
         context.coordinator.restoreFocusIfRequested(textView: textView)
         context.coordinator.beginExternalEditIfNeeded()
@@ -465,26 +535,35 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
 
+        if context.coordinator.shouldIgnoreYieldedExternalUpdate(externalUpdateTick) {
+            context.coordinator.pendingExternalTextUpdate = nil
+            if let externalUpdateTick {
+                context.coordinator.lastAppliedExternalUpdateTick = max(context.coordinator.lastAppliedExternalUpdateTick ?? externalUpdateTick, externalUpdateTick)
+            }
+            return
+        }
+
         var appliedProgrammaticTextChange = false
         let isFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
         let hasPendingExternalUpdate = externalUpdateTick.map {
             context.coordinator.lastAppliedExternalUpdateTick != $0
         } ?? false
+        let isNativeIdentityChanging = context.coordinator.nativeEditorIdentity != nativeEditorIdentity
+        if textView.hasMarkedText(), textView.string != text || isNativeIdentityChanging {
+            if hasPendingExternalUpdate || isNativeIdentityChanging {
+                context.coordinator.pendingExternalTextUpdate = (
+                    text: text,
+                    tick: externalUpdateTick,
+                    identity: nativeEditorIdentity
+                )
+            }
+            return
+        }
         // Avoid replacing active user edits with a stale SwiftUI binding snapshot. Explicit
         // external updates are allowed through via externalUpdateTick. Callers that do not
         // opt into revision tracking retain the previous synchronization behavior.
         if textView.string != text {
-            let hasMarkedText = textView.hasMarkedText()
-            if hasMarkedText {
-                if let externalUpdateTick, hasPendingExternalUpdate {
-                    context.coordinator.pendingExternalTextUpdate = (
-                        text: text,
-                        tick: externalUpdateTick
-                    )
-                }
-                return
-            }
-            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate
+            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate || isNativeIdentityChanging
             guard Self.shouldApplyTextSynchronization(
                 isFirstResponder: isFirstResponder,
                 hasMarkedText: false,
@@ -503,6 +582,8 @@ struct CustomTextField: NSViewRepresentable {
                 context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
             }
         }
+        context.coordinator.pendingExternalTextUpdate = nil
+        context.coordinator.nativeEditorIdentity = nativeEditorIdentity
         context.coordinator.completeExternalEditIfNeeded()
         if appliedProgrammaticTextChange, !isReadOnly {
             context.coordinator.scheduleFileTagSuggestionsRefresh(for: textView, immediate: true)
@@ -517,6 +598,8 @@ struct CustomTextField: NSViewRepresentable {
         textView.imagePasteHandler = nil
         textView.commandReturnHandler = nil
         textView.readOnlyReturnHandler = nil
+        textView.beginUserEditingHandler = nil
+        coordinator.connectedNativeEditor?.detach(textView)
         coordinator.focusRestorationTask?.cancel()
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
@@ -530,6 +613,14 @@ struct CustomTextField: NSViewRepresentable {
         var parent: CustomTextField
         var lastFocusRestoreRequest: UUID?
         var focusRestorationTask: Task<Void, Never>?
+        weak var connectedNativeEditor: TextFieldNativeEditor?
+        var nativeEditorIdentity: AnyHashable?
+
+        func connectNativeEditor(textView: NSTextView) {
+            if connectedNativeEditor !== parent.nativeEditor { connectedNativeEditor?.detach(textView) }
+            parent.nativeEditor?.attach(textView, identity: nativeEditorIdentity)
+            connectedNativeEditor = parent.nativeEditor
+        }
 
         /// Only reclaim abandoned/container focus. Never steal a live sibling field's editor.
         static func mayRestoreFocus(to textView: NSTextView, in window: NSWindow) -> Bool {
@@ -565,11 +656,13 @@ struct CustomTextField: NSViewRepresentable {
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
         var lastAppliedExternalUpdateTick: Int?
-        var pendingExternalTextUpdate: (text: String, tick: Int)?
+        var pendingExternalTextUpdate: (text: String, tick: Int?, identity: AnyHashable?)?
 
         private let textViewUndoManager = UndoManager()
         private var externalEditID: UUID?
         private var externalEditUndoRegistered = false
+        private var yieldedExternalEditID: UUID?
+        private var yieldedExternalUpdateThroughTick: Int?
         private let fileTagHelper = FileTagMentionHelper()
         private let slashSkillHelper = SlashSkillMentionHelper()
         // NEW: mark inactive after dismantle
@@ -577,6 +670,32 @@ struct CustomTextField: NSViewRepresentable {
 
         init(_ parent: CustomTextField) {
             self.parent = parent
+        }
+
+        func shouldIgnoreYieldedExternalUpdate(_ tick: Int?) -> Bool {
+            guard let tick, let yieldedExternalUpdateThroughTick else { return false }
+            return tick <= yieldedExternalUpdateThroughTick
+        }
+
+        func beginUserEditingIfNeeded(textView: NSTextView) {
+            guard isActive, !internalUpdateInProgress, !parent.isReadOnly,
+                  nativeEditorIdentity == parent.nativeEditorIdentity,
+                  let onBeginUserEditing = parent.onBeginUserEditing,
+                  let takeover = onBeginUserEditing(textView.string, yieldedExternalEditID) else { return }
+            beginExternalEditIfNeeded()
+            yieldedExternalEditID = takeover.id
+            yieldedExternalUpdateThroughTick = takeover.revision
+            pendingExternalTextUpdate = nil
+            if parent.externalEditTransaction?.id == takeover.id {
+                registerExternalEditUndoIfNeeded()
+            } else {
+                externalEditUndoRegistered = true
+            }
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if !internalUpdateInProgress { beginUserEditingIfNeeded(textView: textView) }
+            return true
         }
 
         func textDidChange(_ notification: Notification) {
@@ -601,6 +720,8 @@ struct CustomTextField: NSViewRepresentable {
                 } else {
                     lastAppliedExternalUpdateTick = pendingExternalTextUpdate.tick
                 }
+                nativeEditorIdentity = pendingExternalTextUpdate.identity
+                connectNativeEditor(textView: textView)
             } else {
                 parent.text = textView.string
             }
@@ -666,16 +787,20 @@ struct CustomTextField: NSViewRepresentable {
                 return true
             }
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                // Use the *current* event to read modifier flags (more reliable)
-                let flags = textView.window?.currentEvent?.modifierFlags ?? []
-                if flags.contains(.shift) {
+                let event = textView.window?.currentEvent
+                let flags = event?.modifierFlags.intersection([.shift, .command, .option, .control]) ?? []
+                if flags == .shift {
                     textView.insertNewline(nil) // Shift+Return → newline
-                } else if flags.contains(.command), !flags.contains(.option), !flags.contains(.control), let action = parent.onCommandReturn {
+                } else if flags == .command, let action = parent.onCommandReturn {
+                    if event?.isARepeat == true { return true }
                     return action()
-                } else {
+                } else if flags.isEmpty {
                     // A held Return is not an explicit second press/submit.
-                    if textView.window?.currentEvent?.isARepeat != true { parent.onReturn() } // Plain Return → send
-                }
+                    if event?.isARepeat != true {
+                        parent.text = textView.string
+                        parent.onReturn()
+                    }
+                } else { return false }
                 return true
             }
             // Some keyboards/IMEs use insertLineBreak for Shift+Return; let it fall through to newline.
@@ -733,19 +858,33 @@ struct CustomTextField: NSViewRepresentable {
         func beginExternalEditIfNeeded() {
             let id = parent.externalEditTransaction?.id
             guard id != externalEditID else { return }
+            if let id, id == yieldedExternalEditID {
+                externalEditID = id
+                return
+            }
             if id != nil, !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing {
                 textViewUndoManager.removeAllActions()
             }
             externalEditID = id
             externalEditUndoRegistered = false
+            yieldedExternalEditID = nil
+            yieldedExternalUpdateThroughTick = nil
         }
 
         func completeExternalEditIfNeeded() {
-            guard parent.externalEditTransaction?.isComplete == true, !externalEditUndoRegistered else { return }
+            guard parent.externalEditTransaction?.isComplete == true else { return }
+            registerExternalEditUndoIfNeeded()
+        }
+
+        private func registerExternalEditUndoIfNeeded() {
+            guard parent.externalEditTransaction != nil, !externalEditUndoRegistered else { return }
             externalEditUndoRegistered = true
             let undo = parent.onUndoExternalEdit
+            let ownsUndoGroup = textViewUndoManager.groupingLevel == 0
+            if ownsUndoGroup { textViewUndoManager.beginUndoGrouping() }
             textViewUndoManager.registerUndo(withTarget: self) { _ in undo?() }
             textViewUndoManager.setActionName("Re-prompt")
+            if ownsUndoGroup { textViewUndoManager.endUndoGrouping() }
         }
 
         func clearUndoHistory() {

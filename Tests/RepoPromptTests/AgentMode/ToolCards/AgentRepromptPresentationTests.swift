@@ -25,6 +25,198 @@ private struct RepromptFocusSibling: NSViewRepresentable {
 
 @MainActor
 final class AgentRepromptPresentationTests: XCTestCase {
+    func testComposerSendPreparesOnceThenAcceptsVisibleDraftInEveryPhase() async throws {
+        for state in ["generating", "clarifying", "refining", "completed", "failed"] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let gate = AgentRepromptStartGate()
+            defer { Task { await gate.release() } }
+            let probe = AgentRepromptStreamProbe()
+            fixture.viewModel.repromptService = .init(transport: { message, _, publish in
+                let input = message.conversationMessages[0].content
+                await probe.append(input)
+                if state == "clarifying" || state == "refining", !input.contains("\"answers\"") {
+                    try await publish("Visible rewrite" + AgentRepromptStreamParser.delimiter + AgentRepromptServiceTests.questions + AgentRepromptStreamParser.endDelimiter)
+                    return
+                }
+                try await publish(state == "refining" ? "Visible refinement" : "Visible rewrite")
+                if state == "failed" { throw AgentRepromptError.provider }
+                if state == "generating" || state == "refining" {
+                    _ = await gate.wait()
+                    try await publish(" late output")
+                }
+            })
+            let vm = fixture.viewModel
+            let tabID = fixture.session.tabID
+            vm.storeDraftText(for: tabID, "Original")
+            let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+            XCTAssertTrue(vm.prepareRepromptForComposerSend(target: target, text: "Original"), state)
+            XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+            if state == "refining" {
+                try await AsyncTestWait.waitUntil("clarification before refinement", timeout: 5) { vm.repromptOperation?.phase == .clarifying }
+                vm.repromptOperation?.updateDraft(questionID: "scope", draft: .init(selectedOptionLabels: ["Small"]))
+                vm.repromptOperation?.completeQuestions()
+            }
+            let phase: AgentRepromptUIStore.Phase = switch state {
+            case "generating": .generating
+            case "clarifying": .clarifying
+            case "refining": .refining
+            case "failed": .failed
+            default: .completed
+            }
+            let visible = state == "refining" ? "Visible refinement" : "Visible rewrite"
+            try await AsyncTestWait.waitUntil("visible \(state) draft", timeout: 5) {
+                vm.repromptOperation?.phase == phase && fixture.session.draftText == visible
+            }
+            let operation = try XCTUnwrap(vm.repromptOperation)
+            let hadSpeculation = vm.repromptSpeculations[operation.id] != nil
+            XCTAssertFalse(vm.prepareRepromptForComposerSend(target: target, text: visible), state)
+            XCTAssertEqual(operation.phase, .completed)
+            XCTAssertEqual(fixture.session.draftText, visible)
+            XCTAssertNil(vm.repromptUIStore.pendingQuestions)
+            XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+            if state == "completed" {
+                XCTAssertEqual(vm.repromptSpeculations[operation.id] != nil, hadSpeculation, "Accepting a completed draft retains its routing work")
+            }
+            let claim = try fixture.claim(text: visible, local: true)
+            defer { vm.releaseComposerSubmitClaim(claim) }
+            XCTAssertEqual(vm.repromptDispatchTexts[claim.attempt.id], visible)
+            XCTAssertEqual(vm.repromptDispatchOriginals[claim.attempt.id], "Original")
+            XCTAssertNil(vm.repromptOperation)
+            await gate.release()
+            for _ in 0 ..< 10 {
+                await Task.yield()
+            }
+            XCTAssertEqual(fixture.session.draftText, visible)
+            let calls = await probe.values
+            XCTAssertEqual(calls.count, state == "refining" ? 2 : 1, "Sending never begins another rewrite")
+            XCTAssertTrue(fixture.session.items.isEmpty, "Only the subsequent claimed executor may dispatch")
+        }
+    }
+
+    func testComposerSendAcceptsOnlyTheExactRecoveryAndRetainsOriginalClassification() async throws {
+        for text in ["/compact rewritten data", "A different request"] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let vm = fixture.viewModel
+            let tabID = fixture.session.tabID
+            vm.repromptUIStore.recover(tabID: tabID, text: "/compact rewritten data", originalDraft: "Original", reason: "Context changed", currentDraft: "/compact rewritten data", requiresDecision: true)
+            vm.storeDraftText(for: tabID, text)
+            let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+            if text.hasPrefix("/") {
+                XCTAssertFalse(vm.prepareRepromptForComposerSend(target: target, text: text))
+                let claim = try fixture.claim(text: text, local: true)
+                defer { vm.releaseComposerSubmitClaim(claim) }
+                XCTAssertEqual(vm.repromptDispatchOriginals[claim.attempt.id], "Original")
+                XCTAssertEqual(vm.repromptDispatchTexts[claim.attempt.id], text)
+            } else {
+                XCTAssertTrue(vm.prepareRepromptForComposerSend(target: target, text: text))
+                XCTAssertEqual(vm.repromptOperation?.rawDraft, text)
+                XCTAssertFalse(vm.repromptUIStore.recoveries[tabID]?.bypassesPreparation == true)
+            }
+        }
+    }
+
+    func testComposerSendRejectsStaleTargetBeforeChangingPreparation() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("completed rewrite", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        let vm = fixture.viewModel
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let operation = try XCTUnwrap(vm.repromptOperation)
+        let draft = fixture.session.draftText
+        fixture.session.composerSubmissionToken = UUID()
+        XCTAssertTrue(vm.prepareRepromptForComposerSend(target: target, text: draft))
+        XCTAssertTrue(vm.repromptOperation === operation)
+        XCTAssertFalse(operation.isClosed, "Reject stale UI before validating or consuming the current operation")
+        XCTAssertEqual(fixture.session.draftText, draft)
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+    }
+
+    func testUnavailableRewriteModelDoesNotBlockOrdinaryComposerSend() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.repromptAvailability = { _ in false }
+        let vm = fixture.viewModel
+        vm.storeDraftText(for: fixture.session.tabID, "Original")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let selection = vm.repromptModelSelectionRaw()
+        XCTAssertFalse(vm.prepareRepromptForComposerSend(target: target, text: "Original"))
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertEqual(vm.repromptModelSelectionRaw(), selection)
+        XCTAssertEqual(fixture.session.draftText, "Original")
+    }
+
+    func testComposerSendAcceptsCanonicalEquivalentNativeText() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in try await publish("Caf\u{00E9}") })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        let vm = fixture.viewModel
+        try await AsyncTestWait.waitUntil("completed normalized rewrite", timeout: 5) { vm.repromptOperation?.phase == .completed }
+        let nativeText = "Cafe\u{0301}"
+        vm.storeDraftText(for: fixture.session.tabID, nativeText)
+        XCTAssertEqual(fixture.session.draftText, nativeText)
+        XCTAssertFalse(fixture.session.draftText.utf8.elementsEqual(nativeText.utf8), "Draft storage keeps canonical-equivalent text unchanged")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        XCTAssertFalse(vm.prepareRepromptForComposerSend(target: target, text: nativeText), "Normalization alone must not trap Send")
+        XCTAssertEqual(vm.repromptOperation?.phase, .completed)
+    }
+
+    func testExplicitRewriteRetriesFailedPreparationFromOriginal() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let probe = AgentRepromptStreamProbe()
+        fixture.viewModel.repromptService = .init(transport: { message, _, publish in
+            await probe.append(message.conversationMessages[0].content)
+            let calls = await probe.values
+            if calls.count == 1 {
+                try await publish("/compact Failed partial")
+                throw AgentRepromptError.provider
+            }
+            try await publish("Retried rewrite")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        let vm = fixture.viewModel
+        try await AsyncTestWait.waitUntil("failed rewrite", timeout: 5) { vm.repromptOperation?.phase == .failed }
+        let failedID = vm.repromptOperation?.id
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        XCTAssertTrue(vm.requestComposerRepromptAgain(target: target, text: fixture.session.draftText))
+        try await AsyncTestWait.waitUntil("retried rewrite", timeout: 5) { vm.repromptOperation?.phase == .completed }
+        XCTAssertNotEqual(vm.repromptOperation?.id, failedID)
+        XCTAssertEqual(fixture.session.draftText, "Retried rewrite")
+        let calls = await probe.values
+        XCTAssertEqual(calls.count, 2)
+        let input = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].utf8)) as? [String: Any])
+        XCTAssertEqual(input["originalText"] as? String, "Original")
+    }
+
+    func testCancelledDraftReceiptMovesWithSubmissionWithoutReplacingNewerReceipt() {
+        let store = AgentRepromptUIStore()
+        let tabID = UUID(), otherTabID = UUID()
+        store.rememberCancelledDraft(tabID: tabID, text: "Original")
+        store.rememberCancelledDraft(tabID: otherTabID, text: "Other")
+        let submitted = store.submittedDraftSnapshot(tabID: tabID)
+        store.clearSubmittedDraft(submitted)
+        XCTAssertFalse(store.hasCancelledDraft(tabID: tabID, text: "Original"))
+        XCTAssertTrue(store.hasCancelledDraft(tabID: otherTabID, text: "Other"))
+        store.restoreCancelledDraft(submitted.cancelledDraft, tabID: tabID, currentDraft: "Original\nNew typing")
+        XCTAssertNil(store.cancelledDrafts[tabID])
+        store.restoreCancelledDraft(submitted.cancelledDraft, tabID: tabID, currentDraft: "Original")
+        XCTAssertTrue(store.hasCancelledDraft(tabID: tabID, text: "Original"))
+        store.rememberCancelledDraft(tabID: tabID, text: "New original")
+        store.clearSubmittedDraft(submitted)
+        store.restoreCancelledDraft(submitted.cancelledDraft, tabID: tabID, currentDraft: "Original")
+        XCTAssertTrue(store.hasCancelledDraft(tabID: tabID, text: "New original"))
+    }
+
     func testHostedFocusHandoffRestoresRemovedQuestionButNeverStealsLiveFieldOrBackgroundWindow() async throws {
         var returns = 0
         func root(questionVisible: Bool, readOnly: Bool, request: UUID?) -> some View {

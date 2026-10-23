@@ -71,9 +71,8 @@ struct AgentRepromptPill: View {
         }
         .popover(isPresented: $showingDisclosure) { disclosure }
         .onChange(of: showingDisclosure) { _, showing in
-            // Every dismissal path (buttons, Esc, click outside) hands keyboard focus back.
             guard !showing else { return }
-            store.requestComposerFocus(tabID: disclosureSourceTabID)
+            if store.oneShotDisclosureRequest?.id == oneShotRequestID { store.oneShotDisclosureRequest = nil }
             disclosureSourceTabID = nil
         }
     }
@@ -122,19 +121,26 @@ struct AgentRepromptPill: View {
                 Spacer()
                 Button("Cancel  ⎋") {
                     if store.oneShotDisclosureRequest?.id == oneShotRequestID { store.oneShotDisclosureRequest = nil }
-                    showingDisclosure = false
+                    dismissDisclosureReturningToComposer()
                 }
                 .keyboardShortcut(.cancelAction)
                 Button(oneShotRequestID == nil ? "Enable  ↩" : "Re-prompt once  ↩") {
                     if let oneShotRequestID, let disclosedProviderID {
                         viewModel.confirmOneShotReprompt(requestID: oneShotRequestID, providerID: disclosedProviderID)
                     } else { setEnabled(true, disclosedProviderID) }
-                    showingDisclosure = false
+                    dismissDisclosureReturningToComposer()
                 }
                 .keyboardShortcut(.defaultAction)
             }
         }
         .padding()
         .frame(width: 360)
+    }
+
+    private func dismissDisclosureReturningToComposer() {
+        let tabID = disclosureSourceTabID
+        showingDisclosure = false
+        guard viewModel.currentTabID == tabID else { return }
+        store.requestComposerFocus(tabID: tabID)
     }
 }

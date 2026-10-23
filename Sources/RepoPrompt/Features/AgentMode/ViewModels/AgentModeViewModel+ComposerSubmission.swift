@@ -73,8 +73,13 @@ extension AgentModeViewModel {
                 message: message,
                 strategy: .prependAlways
             )
+            repromptUIStore.restoreCancelledDraft(
+                pending.repromptDraft.cancelledDraft,
+                tabID: pending.sourceTabID,
+                currentDraft: retrieveDraftText(for: pending.sourceTabID)
+            )
             if repromptUIStore.recoveries[pending.sourceTabID] == nil {
-                if let original = pending.originalDraft {
+                if let original = pending.originalDraft, pending.text != original {
                     // Bind only after restoration has composed against newer typing. Never let a
                     // late executor re-stamp this authority or overwrite a newer preparation.
                     repromptUIStore.recover(
