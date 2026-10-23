@@ -116,7 +116,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         agentKind: AgentProviderKind
     ) -> Int? {
         guard let config = compatibleBackendConfig(for: agentKind) else { return nil }
-        if let window = config.contextWindowTokens, window > 0 {
+        if let window = config.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
             return window
         }
         guard let baseRaw = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }

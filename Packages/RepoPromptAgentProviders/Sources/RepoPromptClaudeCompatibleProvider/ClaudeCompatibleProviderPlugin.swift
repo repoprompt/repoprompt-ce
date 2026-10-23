@@ -52,6 +52,13 @@ public enum ClaudeCompatibleBackendModelBehavior: Codable, Hashable, Sendable {
     case claudeSlotMapping(ClaudeCompatibleSlotMapping)
 }
 
+/// Shared host/provider validation bounds for optional backend overrides.
+public enum ClaudeCompatibleBackendLimits {
+    /// RepoPrompt requires at least one second to avoid accidental seconds-as-milliseconds input.
+    public static let requestTimeoutMilliseconds = 1000 ... Int(Int32.max)
+    public static let contextWindowTokens = 1 ... Int(Int32.max)
+}
+
 /// Sanitized persisted backend configuration supplied by the host at launch/catalog time.
 /// Secrets are deliberately absent; the host owns secure storage and may pass a
 /// resolved launch environment separately after keychain access succeeds.
@@ -72,8 +79,8 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         baseURL: String,
         auth: ClaudeCompatibleBackendAuth,
         modelBehavior: ClaudeCompatibleBackendModelBehavior,
-        requestTimeoutMilliseconds: Int? = nil,
-        contextWindowTokens: Int? = nil
+        requestTimeoutMilliseconds: Int?,
+        contextWindowTokens: Int?
     ) {
         self.id = id
         self.isEnabled = isEnabled

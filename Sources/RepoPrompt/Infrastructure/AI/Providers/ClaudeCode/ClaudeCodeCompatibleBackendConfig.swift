@@ -113,7 +113,7 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     var auth: Auth
     var modelBehavior: ModelBehavior
     var updatedAt: Date?
-    /// Nil preserves the backend/Claude Code default; explicit overrides must be positive.
+    /// Nil preserves the backend/Claude Code default; overrides use provider-validated ranges.
     var requestTimeoutMilliseconds: Int?
     var contextWindowTokens: Int?
 
@@ -148,8 +148,8 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
 
     var isValid: Bool {
         guard normalizedBaseURL != nil,
-              requestTimeoutMilliseconds.map({ $0 > 0 }) ?? true,
-              contextWindowTokens.map({ $0 > 0 }) ?? true else { return false }
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true

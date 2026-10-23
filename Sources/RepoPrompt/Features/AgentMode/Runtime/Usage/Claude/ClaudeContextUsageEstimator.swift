@@ -88,7 +88,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         let prompt = max(0, promptTokens ?? 0)
         let existing = session.codexContextUsage
-        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
+        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow ?? configuredContextWindow(for: session)
         let contextUsed = normalizedContextUsedTokens(
             contextUsedTokens,
             modelContextWindow: resolvedWindow
@@ -134,7 +134,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         session: AgentTabSession
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
-        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
+        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow ?? configuredContextWindow(for: session)
         let resolvedContextUsed = normalizedContextUsedTokens(
             contextUsedTokens,
             modelContextWindow: resolvedWindow
@@ -200,7 +200,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let estimatedToolOutput = accumulator?.estimatedToolOutputTokens ?? 0
         let resolvedContextUsed = normalizedContextUsedTokens(
             contextUsedTokens,
-            modelContextWindow: session.codexContextUsage?.modelContextWindow
+            modelContextWindow: session.codexContextUsage?.modelContextWindow ?? configuredContextWindow(for: session)
         ) ?? 0
         let hasUsage = prompt > 0
             || completion > 0
@@ -249,7 +249,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let existingUsage = session.codexContextUsage
         let rebuilt = contextUsageBuilder(
             session.providerTokenUsageByTurn,
-            existingUsage?.modelContextWindow
+            existingUsage?.modelContextWindow ?? configuredContextWindow(for: session)
         )
         if let rebuilt {
             session.codexContextUsage = rebuilt
@@ -262,6 +262,13 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
         session.isDirty = true
         return true
+    }
+
+    private func configuredContextWindow(for session: AgentTabSession) -> Int? {
+        ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
+            forRequestedModelRaw: session.selectedModelRaw,
+            agentKind: session.selectedAgent
+        )
     }
 
     private func normalizedContextUsedTokens(

@@ -159,7 +159,9 @@ public extension ClaudeCompatibleBackendID {
                     haiku: "glm-4.5-air",
                     sonnet: "glm-5.2[1m]",
                     opus: "glm-5.2[1m]"
-                ))
+                )),
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .kimi:
             ClaudeCompatibleBackendConfig(
@@ -168,7 +170,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "https://api.kimi.com/coding/",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .custom:
             ClaudeCompatibleBackendConfig(
@@ -177,7 +181,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         }
     }
@@ -239,8 +245,8 @@ public extension ClaudeCompatibleBackendConfig {
 
     var isValid: Bool {
         guard normalizedBaseURL != nil,
-              requestTimeoutMilliseconds.map({ $0 > 0 }) ?? true,
-              contextWindowTokens.map({ $0 > 0 }) ?? true else { return false }
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true
@@ -356,11 +362,12 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             }
         }
 
-        if let timeout = normalizedConfig.requestTimeoutMilliseconds, timeout > 0 {
+        if let timeout = normalizedConfig.requestTimeoutMilliseconds, ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains(timeout) {
             environment["API_TIMEOUT_MS"] = String(timeout)
         }
-        if let window = normalizedConfig.contextWindowTokens, window > 0 {
-            environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(window)
+        if let window = normalizedConfig.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            // The auto-compact threshold cannot raise an unknown model's assumed context window.
+            environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(window)
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {

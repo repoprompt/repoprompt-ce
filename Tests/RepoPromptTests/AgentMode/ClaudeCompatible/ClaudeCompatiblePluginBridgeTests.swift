@@ -4,6 +4,7 @@ import MCP
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
+    @MainActor
     func testCustomRequestLimitsSurviveStoreAndRuntimeBridge() throws {
         let defaults = try makeIsolatedDefaults()
         let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)
@@ -16,7 +17,8 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertTrue(restored.isValid)
         let environment = ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: restored, apiKey: "dummy")
         XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
-        XCTAssertEqual(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "262144")
+        XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
+        XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
         config.contextWindowTokens = 0
         XCTAssertFalse(config.isValid)
         config.contextWindowTokens = nil
@@ -30,6 +32,37 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertNil(decoded.contextWindowTokens)
         XCTAssertNil(decoded.requestTimeoutMilliseconds)
         XCTAssertTrue(decoded.isValid)
+        for timeout in [600, 999, Int(Int32.max) + 1] {
+            config.requestTimeoutMilliseconds = timeout
+            XCTAssertFalse(config.isValid)
+        }
+
+        let restore = installTemporaryCustomSlotMapping()
+        defer { restore() }
+        var sharedConfig = ClaudeCodeCompatibleBackendStore.shared.config(for: .custom)
+        sharedConfig.contextWindowTokens = 262_144
+        ClaudeCodeCompatibleBackendStore.shared.saveConfig(sharedConfig)
+        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(forRequestedModelRaw: "sonnet", agentKind: .customClaudeCompatible), 262_144)
+        var sidebar = AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: .customClaudeCompatible, selectedModelRaw: "sonnet")
+        XCTAssertEqual(sidebar.effectiveContextWindowTokens, 262_144)
+        sidebar.contextWindowTokens = 128_000
+        XCTAssertEqual(sidebar.effectiveContextWindowTokens, 128_000, "A provider-reported window remains authoritative")
+
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .customClaudeCompatible
+        session.selectedModelRaw = "sonnet"
+        let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
+            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+        })
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000, "Configured windows prevent valid usage above 200K from being discarded")
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000, modelContextWindow: 128_000, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000)
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 100_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000, "A later window-less event must retain the last reported window")
     }
 
     @MainActor
