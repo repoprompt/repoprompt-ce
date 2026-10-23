@@ -120,33 +120,8 @@ RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
 
-Settings → CLI Providers → Codex offers **Import MCP servers from ~/.codex…**
-after connection. This explicit, confirmed action copies only previously absent
-`[mcp_servers.name]` tables (including nested env/header values) into the managed
-config, with a private `0600` replacement file. Credentials inside those tables
-are copied only after the confirmation; auth files and other Codex configuration
-are never imported. Existing managed entries and reserved RepoPrompt/computer-use
-names are preserved, including case-insensitive permission-name collisions.
-Imported entries have `enabled = false` in the file; existing CE permission choices
-remain authoritative. Review the MCP permission controls and start a new session
-to use an imported server. Import does not reload running controllers, overwrite
-existing entries, synchronize later edits, or remove earlier imports. To update an
-existing imported definition, edit CE's managed configuration explicitly.
-
-The import requires UTF-8 regular files bounded to 2 MiB and an owned, non-symlinked
-managed destination directory. Ambiguous inline/dotted root MCP definitions,
-MCP array tables, malformed values, duplicate/conflicting keys or tables, and
-header-looking lines inside MCP multiline values are rejected without changing the
-managed file. The last restriction protects the existing line-oriented managed
-config repairer. Imported definitions must specify exactly one string `command`
-or `url`. The bounded validator accepts string command/URL/cwd/bearer-env fields,
-string arrays for args/env-vars/tool selections, Boolean enabled/required/parallel
-flags, nonnegative decimal timeouts, and string-valued env/HTTP-header maps
-(inline or nested tables). Unknown fields, OAuth tables, dotted assignments, and
-other TOML value forms are rejected rather than copied speculatively; use the
-managed config directly for unsupported layouts. Quoted names use TOML Unicode
-escape identity, including eight-digit escapes, before collision checks. CRLF
-imports are normalized to LF. Status/errors never include raw definitions or values.
+For the opt-in user MCP snapshot import and its isolation/permission contract, see
+[Codex user MCP import](architecture/codex-user-mcp-import.md).
 
 Within that isolated `config.toml`, RepoPrompt owns the
 `[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output

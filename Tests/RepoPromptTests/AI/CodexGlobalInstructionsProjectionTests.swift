@@ -66,7 +66,7 @@ final class CodexUserMCPImportTests: XCTestCase {
         XCTAssertTrue(result.content.contains("args = [\n  \"--fixture\","))
     }
 
-    func testRejectsAmbiguousOrIncompleteLayouts() {
+    func testRejectsAmbiguousOrIncompleteLayouts() throws {
         let sources = [
             "mcp_servers.fixture.command = 'fixture'",
             "[mcp_servers]\nfixture = {command = 'fixture'}",
@@ -77,7 +77,7 @@ final class CodexUserMCPImportTests: XCTestCase {
             "[mcp_servers.fixture]\ncommand = 'fixture'\n[mcp_servers.FIXTURE]\ncommand = 'other'"
         ]
         for (index, source) in sources.enumerated() {
-            XCTAssertThrowsError(try CodexUserMCPImport.merge(source: source, destination: "# managed"), "case \(index)")
+            XCTAssertEqual(try CodexUserMCPImport.merge(source: source, destination: "# managed").importedCount, 0, "case \(index)")
         }
     }
 
@@ -94,8 +94,8 @@ final class CodexUserMCPImportTests: XCTestCase {
         let result = try CodexUserMCPImport.merge(source: source, destination: destination)
         XCTAssertEqual(result.importedCount, 0)
         XCTAssertEqual(result.content, destination)
-        XCTAssertThrowsError(try CodexUserMCPImport.merge(source: #"[mcp_servers."\U00110000"]"#, destination: destination))
-        XCTAssertThrowsError(try CodexUserMCPImport.merge(source: #"[mcp_servers."\q"]"#, destination: destination))
+        XCTAssertEqual(try CodexUserMCPImport.merge(source: #"[mcp_servers."\U00110000"]"#, destination: destination).importedCount, 0)
+        XCTAssertEqual(try CodexUserMCPImport.merge(source: #"[mcp_servers."\q"]"#, destination: destination).importedCount, 0)
     }
 
     func testCRLFHTTPServerAndInlineHeadersImport() throws {
@@ -127,13 +127,13 @@ final class CodexUserMCPImportTests: XCTestCase {
         try withImportFiles { source, destination in
             let original = "[mcp_servers.fixture]\ncommand = 'fixture'\n[mcp_servers.fixture.env]\nFIXTURE_TOKEN = 'synthetic-secret'\n"
             try original.write(to: source, atomically: true, encoding: .utf8)
-            let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination)
+            let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination, resetPermissions: { _ in })
             XCTAssertEqual(result.importedCount, 1)
             XCTAssertEqual(try String(contentsOf: source, encoding: .utf8), original)
             XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), result.content)
             let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
             XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
-            let repeated = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination)
+            let repeated = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination, resetPermissions: { _ in })
             XCTAssertEqual(repeated.importedCount, 0)
             let after = try FileManager.default.attributesOfItem(atPath: destination.path)
             XCTAssertEqual(after[.systemFileNumber] as? NSNumber, attributes[.systemFileNumber] as? NSNumber)
@@ -149,7 +149,7 @@ final class CodexUserMCPImportTests: XCTestCase {
                 "[mcp_servers.fixture]\ncommand =",
                 "[mcp_servers.fixture]\ncommand = 'one'\ncommand = 'two'",
                 "[mcp_servers.fixture]\ncommand = 42",
-                "[mcp_servers.fixture]\ncommand = 'fixture'\ntool_timeout_sec = 9223372036854775808",
+                "[mcp_servers.fixture]\ncommand = 'fixture'\ntool_timeout_sec = -1",
                 "[mcp_servers.fixture]\ncommand = 'fixture'\nstartup_timeout_ms = 1.5",
                 "[mcp_servers.fixture]\ncommand\u{00A0}= 'fixture'",
                 "[mcp_servers.fixture]\ncommand = 'fixture'\n[mcp_servers.\u{00A0}fixture.env]\nKEY = 'value'",
@@ -157,24 +157,29 @@ final class CodexUserMCPImportTests: XCTestCase {
                 "[mcp_servers.fixture]\ncommand = 'fixture'\nargs = ['one' 'two']",
                 "[mcp_servers.fixture]\ncommand = 'fixture'\nenv = { KEY = 'one', KEY = 'two' }",
                 "[mcp_servers.fixture]\ncommand = 'fixture'\nenv = {}\n[mcp_servers.fixture.env]\nKEY = 'two'",
+                "[mcp_servers.fixture]\ncommand = 'fixture'\nenv = { FIRST = 'one' }\nenv.SECOND = 'two'",
+                "[mcp_servers.fixture]\ncommand = 'fixture'\n[mcp_servers.fixture.tools.read]\napproval_mode = 'not-a-mode'",
+                "[mcp_servers.fixture]\ncommand = 'fixture'\nenv_vars = [{ source = 'local' }]",
+                "[mcp_servers.fixture]\ncommand = 'fixture'\nurl = 'https://example.invalid'",
                 #"""
                 [mcp_servers.fixture]
                 command = "fixture\q"
                 """#
             ]
             for (index, content) in invalid.enumerated() {
+                try "managed-original".write(to: destination, atomically: true, encoding: .utf8)
                 try content.write(to: source, atomically: true, encoding: .utf8)
-                XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination), "case \(index)")
+                XCTAssertEqual(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination, resetPermissions: { _ in }).importedCount, 0, "case \(index)")
                 XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "managed-original", "case \(index)")
             }
             try FileManager.default.removeItem(at: source)
             try FileManager.default.createSymbolicLink(at: source, withDestinationURL: destination)
-            XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination))
+            XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination, resetPermissions: { _ in }))
             try FileManager.default.removeItem(at: source)
             try "[mcp_servers.fixture]\ncommand = 'fixture'".write(to: source, atomically: true, encoding: .utf8)
             try FileManager.default.removeItem(at: destination)
             try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: source)
-            XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination))
+            XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination, resetPermissions: { _ in }))
             XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: destination.path), source.path)
         }
     }
@@ -185,6 +190,113 @@ final class CodexUserMCPImportTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try body(root.appendingPathComponent("source.toml"), root.appendingPathComponent("managed.toml"))
+    }
+
+    func testPartialImportReportsOnlyServerAndKeyNames() throws {
+        let source = """
+        [mcp_servers.bad]
+        command = "synthetic-secret"
+        unknown_option = "never-echo-this-value"
+        [mcp_servers.good]
+        command = "fixture"
+        [unrelated broken section]
+        api_key = "never-echo-this-value"
+        [mcp_servers.other]
+        url = "https://example.invalid"
+        auth = "oauth"
+        oauth_resource = "fixture"
+        scopes = ["read"]
+        environment_id = "local"
+        http_headers_helper = "fixture-helper"
+        [mcp_servers.other.oauth]
+        client_id = "fixture"
+        """
+        let result = try CodexUserMCPImport.merge(source: source, destination: "")
+        XCTAssertEqual(result.importedNames, ["good", "other"])
+        XCTAssertTrue(result.skipped.joined().contains("unknown_option"))
+        XCTAssertTrue(result.skipped.joined().contains("section at line"))
+        XCTAssertFalse(result.summary.contains("never-echo-this-value"))
+        XCTAssertFalse(result.summary.contains("synthetic-secret"))
+        XCTAssertFalse(result.content.contains("never-echo-this-value"))
+    }
+
+    func testReservedAliasesAndControlCharacterNamesAreNotImported() throws {
+        for name in ["RepoPromptCEGrokRuntime", "REPOPROMPTCE", "computer_use", "Computer-Use", #"bad\bname"#, #"bad\fname"#, #"bad\u0001name"#, #"bad\u007Fname"#] {
+            let source = "[mcp_servers.\"\(name)\"]\ncommand = 'untrusted'\n"
+            let result = try CodexUserMCPImport.merge(source: source, destination: "")
+            XCTAssertEqual(result.importedCount, 0, name)
+        }
+        XCTAssertTrue(MCPIntegrationHelper.isReservedMCPServerIdentifier("computer_use"))
+        XCTAssertTrue(MCPIntegrationHelper.isReservedMCPServerIdentifier("RepoPromptCEGrokRuntime"))
+        XCTAssertFalse(MCPIntegrationHelper.isReservedMCPServerIdentifier("not-RepoPromptCE"))
+    }
+
+    func testSourceSymlinkAndCodexHomeAndStalePermissionReset() throws {
+        let suite = "CodexMCPImport-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try withImportFiles { source, destination in
+            let target = source.deletingLastPathComponent().appendingPathComponent("dotfiles.toml")
+            try "[mcp_servers.Fixture]\ncommand = 'fixture'\n[[mcp_servers.Fixture.env_vars]]\nname = 'FIXTURE_TOKEN'\nsource = 'local'\n".write(to: target, atomically: true, encoding: .utf8)
+            try FileManager.default.createSymbolicLink(at: source, withDestinationURL: target)
+            CodexAgentToolPreferences.setMCPServerEnabled(normalizedName: "fixture", isEnabled: true, defaults: defaults)
+            let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination) { names in
+                XCTAssertEqual(names, ["Fixture"])
+                XCTAssertTrue(CodexAgentToolPreferences.disableImportedMCPServers(names, defaults: defaults))
+            }
+            XCTAssertEqual(result.importedCount, 1)
+            XCTAssertFalse(CodexAgentToolPreferences.mcpServerEnabled(normalizedName: "FIXTURE", defaults: defaults))
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: source.path), target.path)
+            XCTAssertNil(try CodexUserMCPImport.pendingSummary(sourceURL: source, destinationURL: destination))
+            XCTAssertEqual(CodexUserMCPImport.sourceConfigURL(environment: ["CODEX_HOME": target.deletingLastPathComponent().path], home: URL(fileURLWithPath: "/fixture-home")).lastPathComponent, "config.toml")
+            XCTAssertEqual(CodexUserMCPImport.sourceConfigURL(environment: [:], home: URL(fileURLWithPath: "/fixture-home")).path, "/fixture-home/.codex/config.toml")
+            XCTAssertEqual(CodexUserMCPImport.sourceConfigURL(environment: ["CODEX_HOME": "~/custom"], home: URL(fileURLWithPath: "/fixture-home")).path, "/fixture-home/custom/config.toml")
+        }
+    }
+
+    func testPermissionPersistenceFailureDoesNotPublishDefinitions() throws {
+        try withImportFiles { source, destination in
+            try "[mcp_servers.fixture]\ncommand = 'fixture'\n".write(to: source, atomically: true, encoding: .utf8)
+            XCTAssertThrowsError(try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source, destinationURL: destination) { _ in throw CodexUserMCPImport.Failure.writeFailed })
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+            let hint = try CodexUserMCPImport.pendingSummary(sourceURL: source, destinationURL: destination)
+            XCTAssertTrue(try XCTUnwrap(hint).contains("fixture"))
+            XCTAssertFalse(try XCTUnwrap(hint).contains("command"))
+        }
+    }
+
+    func testSharedQuotedKeyAndCommandParsingAndTimeoutRepair() throws {
+        let content = #"[mcp_servers."\U00000066ixture"]"# + "\ncommand = 'fixture'\n" + #"[mcp_servers."invalid\q"]"#
+        XCTAssertEqual(CodexIntegrationConfiguration.mcpServerEntries(from: content).map(\.normalizedName), ["fixture"])
+        for scalar in [8, 12, 1, 31, 127] {
+            let name = try "fixture" + String(XCTUnwrap(UnicodeScalar(scalar)))
+            let key = CodexIntegrationConfiguration.cliPathComponent(forNormalizedServerName: name)
+            XCTAssertEqual(CodexIntegrationConfiguration.importTableHeader("[mcp_servers.\(key)]")?.path, ["mcp_servers", name])
+            XCTAssertTrue(key.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value != 127 })
+        }
+        let command = MCPIntegrationHelper.serverCommand.replacingOccurrences(of: "/", with: #"\u002F"#)
+        let managed = #"[mcp_servers."\U00000052epoPromptCE"]"# + "\ncommand = \"\(command)\"\ntool_timeout_sec = 1\n"
+        let repaired = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: managed)
+        XCTAssertTrue(repaired.foundTarget)
+        XCTAssertTrue(repaired.changed)
+        XCTAssertFalse(CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: managed.replacingOccurrences(of: "\\u002F", with: "\\q")).foundTarget)
+    }
+
+    func testPinnedCodexToolApprovalAndEnvironmentDeclarationsImport() throws {
+        let source = """
+        [mcp_servers.fixture]
+        command = "fixture"
+        startup_readiness = "catalog"
+        default_tools_approval_mode = "prompt"
+        env_vars = [{ name = "FIXTURE_TOKEN", source = "local" }]
+        omit_tools_from = ["deferred"]
+        [mcp_servers.fixture.tools.read]
+        approval_mode = "approve"
+        output_token_limit = 100
+        """
+        let result = try CodexUserMCPImport.merge(source: source, destination: "")
+        XCTAssertEqual(result.importedCount, 1)
+        XCTAssertTrue(result.content.contains("approval_mode = \"approve\""))
     }
 
     func testMissingMCPDefinitionsDoNotChangeDestination() throws {

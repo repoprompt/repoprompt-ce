@@ -72,6 +72,7 @@ struct CLIProvidersSettingsView: View {
     @State private var confirmsCodexMCPImport = false
     @State private var isImportingCodexMCP = false
     @State private var codexMCPImportStatus: String?
+    @State private var codexMCPPendingImport: String?
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
@@ -1888,7 +1889,7 @@ struct CLIProvidersSettingsView: View {
 
     private var codexMCPImportControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(isImportingCodexMCP ? "Importing MCP servers…" : "Import MCP servers from ~/.codex…") {
+            Button(isImportingCodexMCP ? "Importing MCP servers…" : "Import user Codex MCP servers…") {
                 confirmsCodexMCPImport = true
             }
             .disabled(isImportingCodexMCP)
@@ -1898,10 +1899,9 @@ struct CLIProvidersSettingsView: View {
                     Task { @MainActor in
                         codexMCPImportStatus = await Task.detached(priority: .userInitiated) {
                             do {
-                                let source = FileManager.default.homeDirectoryForCurrentUser
-                                    .appendingPathComponent(".codex/config.toml")
+                                let source = CodexUserMCPImport.sourceConfigURL()
                                 let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source)
-                                return "Imported \(result.importedCount) new MCP server(s). Existing and reserved entries were preserved. Review MCP permissions below, then start a new session."
+                                return result.summary + " Existing and reserved entries were preserved. New entries are disabled. Review MCP permissions below, then start a new session."
                             } catch {
                                 // Only our sanitized, content-free errors may reach the UI.
                                 return (error as? CodexUserMCPImport.Failure)?.localizedDescription
@@ -1913,12 +1913,21 @@ struct CLIProvidersSettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Copies only new [mcp_servers.name] tables from ~/.codex/config.toml, including any credentials stored in those tables, into CE's private configuration. Nothing in ~/.codex is changed. Existing CE entries and permission choices are preserved; new entries default to disabled. This is a one-time snapshot, not automatic synchronization.")
+                Text("Copies only new [mcp_servers.name] tables from $CODEX_HOME/config.toml (default ~/.codex/config.toml), including any credentials stored in those tables, into CE's private configuration. The source is not changed. Existing CE entries and permission choices are preserved; new entries are reset to disabled. This is a one-time snapshot, not automatic synchronization.")
             }
-            Text(codexMCPImportStatus ?? "User Codex MCP servers are not imported automatically. Import a snapshot to make them available in CE's MCP permission controls.")
+            Text(codexMCPImportStatus ?? codexMCPPendingImport ?? "User Codex MCP servers are not imported automatically. Import a snapshot to make them available in CE's MCP permission controls.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        .task {
+            codexMCPPendingImport = await Task.detached(priority: .utility) {
+                do {
+                    return try CodexUserMCPImport.pendingSummary(sourceURL: CodexUserMCPImport.sourceConfigURL(), destinationURL: CodexIntegrationConfiguration.configURL())
+                } catch {
+                    return "Could not inspect user Codex MCP server names. Use Import to inspect the source configuration."
+                }
+            }.value
         }
     }
 

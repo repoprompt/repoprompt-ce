@@ -110,10 +110,12 @@ enum CodexIntegrationConfiguration {
     }
 
     /// Called only by the explicit Settings import action, never during provider startup.
-    static func importUserMCPServers(sourceURL: URL, destinationURL: URL? = nil) throws -> CodexUserMCPImport.Result {
+    static func importUserMCPServers(sourceURL: URL, destinationURL: URL? = nil, resetPermissions: ([String]) throws -> Void = { names in
+        guard CodexAgentToolPreferences.disableImportedMCPServers(names) else { throw CodexUserMCPImport.Failure.writeFailed }
+    }) throws -> CodexUserMCPImport.Result {
         fileLock.lock()
         defer { fileLock.unlock() }
-        return try CodexUserMCPImport.importFile(sourceURL: sourceURL, destinationURL: destinationURL ?? configURL())
+        return try CodexUserMCPImport.importFile(sourceURL: sourceURL, destinationURL: destinationURL ?? configURL(), resetPermissions: resetPermissions)
     }
 
     /// Reuse the integration's quoted/dotted-key parser without exposing its mutation machinery.
@@ -149,7 +151,11 @@ enum CodexIntegrationConfiguration {
             case "\t":
                 escaped.append("\\t")
             default:
-                escaped.append(character)
+                if scalar.value < 32 || scalar.value == 127 {
+                    escaped.append(String(format: "\\u%04X", scalar.value))
+                } else {
+                    escaped.append(character)
+                }
             }
         }
 
