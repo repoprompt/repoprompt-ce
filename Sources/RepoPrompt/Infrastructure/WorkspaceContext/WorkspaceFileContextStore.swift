@@ -15234,23 +15234,23 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceCodemapStructureRootResult {
         let snapshot = makeCodemapRootStatusSnapshot(rootEpoch: mapped.rootEpoch)
         guard snapshot.availability == .unavailable else { return mapped }
-        let code: String
+        let reason: WorkspaceCodemapStructureStopReason
         let message: String
         switch snapshot.unavailableReason {
         case .budgetLimited:
-            code = "graph_budget_exhausted"
+            reason = .budgetExhausted
             message = snapshot.graphIndexBudget?.terminalMessage ?? "Code Map indexing reached its resource budget."
         case .workerRecoveryExhausted:
-            code = "graph_worker_recovery_exhausted"
+            reason = .workerRecoveryExhausted
             message = "Code Map indexing stopped after repeated worker recovery attempts. Use Code Map Retry to restart; polling cannot restart it."
         case .retryExhausted:
-            code = "graph_retry_exhausted"
+            reason = .retryExhausted
             message = "Code Map indexing stopped after repeated retries. Use Code Map Retry to restart; polling cannot restart it."
         default:
             return mapped
         }
         let issue = WorkspaceCodemapStructureIssueRecord(
-            code: code,
+            code: reason.rawValue,
             phase: "graph_index",
             path: nil,
             retryable: false,
@@ -15279,7 +15279,8 @@ actor WorkspaceFileContextStore {
             issues: mapped.issues.filter {
                 !["graph_indexing", "seed_pending", "updates_pending", "watcher_gap_reconciling"].contains($0.code)
             } + [issue],
-            receipt: mapped.receipt
+            receipt: mapped.receipt,
+            executionStop: WorkspaceCodemapStructureExecutionStop(reason: reason, budget: snapshot.graphIndexBudget)
         )
     }
 
