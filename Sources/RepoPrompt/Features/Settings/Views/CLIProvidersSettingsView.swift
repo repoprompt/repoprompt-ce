@@ -69,6 +69,9 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiCodeExpanded: Bool = false
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
+    @State private var confirmsCodexMCPImport = false
+    @State private var isImportingCodexMCP = false
+    @State private var codexMCPImportStatus: String?
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
@@ -1883,6 +1886,42 @@ struct CLIProvidersSettingsView: View {
         isLoadingCodexRuntimePreflight = false
     }
 
+    private var codexMCPImportControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(isImportingCodexMCP ? "Importing MCP servers…" : "Import MCP servers from ~/.codex…") {
+                confirmsCodexMCPImport = true
+            }
+            .disabled(isImportingCodexMCP)
+            .confirmationDialog("Import user Codex MCP servers?", isPresented: $confirmsCodexMCPImport, titleVisibility: .visible) {
+                Button("Import MCP servers") {
+                    isImportingCodexMCP = true
+                    Task { @MainActor in
+                        codexMCPImportStatus = await Task.detached(priority: .userInitiated) {
+                            do {
+                                let source = FileManager.default.homeDirectoryForCurrentUser
+                                    .appendingPathComponent(".codex/config.toml")
+                                let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source)
+                                return "Imported \(result.importedCount) new MCP server(s). Existing and reserved entries were preserved. Review MCP permissions below, then start a new session."
+                            } catch {
+                                // Only our sanitized, content-free errors may reach the UI.
+                                return (error as? CodexUserMCPImport.Failure)?.localizedDescription
+                                    ?? "MCP import failed. No server definitions are included in this message."
+                            }
+                        }.value
+                        isImportingCodexMCP = false
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Copies only new [mcp_servers.name] tables from ~/.codex/config.toml, including any credentials stored in those tables, into CE's private configuration. Nothing in ~/.codex is changed. Existing CE entries and permission choices are preserved; new entries default to disabled. This is a one-time snapshot, not automatic synchronization.")
+            }
+            Text(codexMCPImportStatus ?? "User Codex MCP servers are not imported automatically. Import a snapshot to make them available in CE's MCP permission controls.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
@@ -1965,6 +2004,7 @@ struct CLIProvidersSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
+                    codexMCPImportControls
                     directProviderInlineControls(for: .codex)
                 } else {
                     Text("Permissions and runtime controls appear here after Codex is connected.")

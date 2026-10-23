@@ -109,6 +109,24 @@ enum CodexIntegrationConfiguration {
         configDirectoryURL().appendingPathComponent("config.toml")
     }
 
+    /// Called only by the explicit Settings import action, never during provider startup.
+    static func importUserMCPServers(sourceURL: URL, destinationURL: URL? = nil) throws -> CodexUserMCPImport.Result {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        return try CodexUserMCPImport.importFile(sourceURL: sourceURL, destinationURL: destinationURL ?? configURL())
+    }
+
+    /// Reuse the integration's quoted/dotted-key parser without exposing its mutation machinery.
+    static func importTableHeader(_ line: String) -> (path: [String], isArray: Bool)? {
+        guard let header = parseTOMLHeader(line) else { return nil }
+        return (header.keyPath.map(\.normalized), header.isArrayTable)
+    }
+
+    static func importAssignment(_ line: String) -> (path: [String], value: String)? {
+        guard let assignment = parseTOMLAssignment(line) else { return nil }
+        return (assignment.keyPath.map(\.normalized), String(assignment.valueText))
+    }
+
     static func cliPathComponent(forNormalizedServerName name: String) -> String {
         guard !name.isEmpty else { return "\"\"" }
         if name.unicodeScalars.allSatisfy({ tomlBareKeyCharacters.contains($0) }) {
@@ -654,11 +672,16 @@ enum CodexIntegrationConfiguration {
             if ch == quote {
                 let end = text.index(after: cursor)
                 let raw = String(text[start ..< end])
-                let normalized = quote == "\""
-                    ? decodeDoubleQuotedTomlKey(inner)
-                    : inner.replacingOccurrences(of: "''", with: "'")
+                let normalized: String
+                if quote == "\"" {
+                    guard let decoded = decodeDoubleQuotedTomlKey(inner) else { return nil }
+                    normalized = decoded
+                } else {
+                    normalized = inner
+                }
                 return (TOMLKeyComponent(raw: raw, normalized: normalized), end)
             }
+            guard ch.unicodeScalars.allSatisfy({ $0.value == 9 || ($0.value >= 32 && $0.value != 127) }) else { return nil }
             inner.append(ch)
             cursor = text.index(after: cursor)
         }
@@ -829,17 +852,14 @@ enum CodexIntegrationConfiguration {
         }
     }
 
-    private static func decodeDoubleQuotedTomlKey(_ value: String) -> String {
+    static func decodeDoubleQuotedTomlKey(_ value: String) -> String? {
         var result = ""
         result.reserveCapacity(value.count)
 
         var iterator = value.makeIterator()
         while let ch = iterator.next() {
             if ch == "\\" {
-                guard let next = iterator.next() else {
-                    result.append("\\")
-                    break
-                }
+                guard let next = iterator.next() else { return nil }
                 switch next {
                 case "\"":
                     result.append("\"")
@@ -855,28 +875,29 @@ enum CodexIntegrationConfiguration {
                     result.append("\u{0C}")
                 case "r":
                     result.append("\r")
-                case "u":
+                case "u", "U":
+                    let count = next == "u" ? 4 : 8
                     var hex = ""
-                    for _ in 0 ..< 4 {
+                    for _ in 0 ..< count {
                         if let digit = iterator.next() {
                             hex.append(digit)
                         } else {
                             break
                         }
                     }
-                    if hex.count == 4,
+                    if hex.count == count, hex.allSatisfy(\.isHexDigit),
                        let scalar = UInt32(hex, radix: 16),
                        let unicode = UnicodeScalar(scalar)
                     {
                         result.append(Character(unicode))
                     } else {
-                        result.append("\\u")
-                        result.append(hex)
+                        return nil
                     }
                 default:
-                    result.append(next)
+                    return nil
                 }
             } else {
+                guard ch.unicodeScalars.allSatisfy({ $0.value == 9 || ($0.value >= 32 && $0.value != 127) }) else { return nil }
                 result.append(ch)
             }
         }
