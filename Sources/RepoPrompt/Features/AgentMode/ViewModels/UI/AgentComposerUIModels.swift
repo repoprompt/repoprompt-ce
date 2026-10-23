@@ -177,6 +177,17 @@ struct AgentComposerSubmitAttempt: Equatable {
     }
 }
 
+/// A locally admitted message waiting for routing/session preparation, not yet provider-dispatched.
+/// Kept out of chatItems so it cannot change fresh-task routing eligibility or be persisted as sent.
+struct AgentComposerPendingSubmission: Equatable, Identifiable {
+    let id: UUID
+    let sourceTabID: UUID
+    var destinationTabID: UUID
+    let text: String
+    let repromptDraft: AgentRepromptUIStore.SubmittedDraft
+    let originalDraft: String?
+}
+
 struct AgentComposerSubmissionLatch {
     struct CompletionEffects: Equatable {
         let matchedAttempt: Bool

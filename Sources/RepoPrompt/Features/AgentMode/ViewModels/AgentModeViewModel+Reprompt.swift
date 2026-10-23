@@ -38,14 +38,25 @@ extension AgentModeViewModel {
             operation.cancel(restoreOriginal: false, recover: false)
         }
         if !reprepare, let recovery = repromptUIStore.recoveries[target.tabID] {
-            if recovery.requiresDecision { return true }
-            if recovery.bypassesPreparation, recovery.draftAtInvalidation == text { return false }
+            if recovery.draftAtInvalidation != text {
+                // Keep the recoverable alternative, but never lend its original/classification
+                // authority to a different draft typed after restoration or invalidation.
+                repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
+                repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
+            } else {
+                if recovery.requiresDecision { return true }
+                if recovery.bypassesPreparation { return false }
+            }
         }
         guard repromptEnabled || forceReview,
               Self.isRepromptEligible(text: original, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
               !isMCPControlled(tabID: target.tabID) else { return false }
         guard let session = sessions[target.tabID], currentTabID == target.tabID,
               makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return true }
+        // Without a resolved model a preparation can only fail. Ordinary Return sends the draft
+        // as typed (the pill already shows why Re-prompt is unavailable); explicit Cmd-Return still
+        // reports the failure. No other model is substituted, so a saved choice is never overridden.
+        if !forceReview, resolvedRepromptModel(session: session) == nil { return false }
         repromptOperation?.invalidate(reason: "Another composer began preparation.")
         // A new explicit preparation supersedes old decision/bypass authority, not its recoverable text.
         repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
@@ -76,7 +87,8 @@ extension AgentModeViewModel {
             manifest: AgentRepromptModelPolicy.manifest(rootNames: roots.map { URL(fileURLWithPath: $0).lastPathComponent }, selectedPaths: relativePaths),
             guidance: AgentRepromptGuidance.effectiveText(profile.agentRepromptGuidance), recentChat: history
         )
-        let model = resolvedRepromptModel(session: session)
+        // Preparation is the point of use: pin the automatic route before any backend call.
+        let model = repromptModelResolution(session: session, pinningDefault: true).model
         let disclosed = model == nil || repromptAvailability != nil || !repromptPillProps().requiresDisclosure
         let operation = AgentRepromptOperation(
             id: id, sourceTabID: target.tabID, rawDraft: original, draftGeneration: session.draftMutationGeneration,

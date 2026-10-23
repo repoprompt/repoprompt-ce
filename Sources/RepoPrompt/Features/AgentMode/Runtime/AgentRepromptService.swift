@@ -94,12 +94,19 @@ struct AgentRepromptService {
         brief is not an implementation plan. Trivial prompts should come back near-identical;
         use headings only when useful. A manifest is vocabulary, not evidence about file contents.
         \(AgentRepromptHistory.framing)
-        Only when a load-bearing ambiguity requires an answer, append at most 3 questions AFTER
+        Rewrite directly by default. Do not ask for confirmation, permission to rewrite, preferred
+        phrasing, level of detail, implementation approach, testing strategy or next steps. Preserve
+        unspecified choices as unspecified; the implementing agent can investigate them. In an
+        ongoing conversation, short follow-ups, corrections and requests to continue should remain
+        direct follow-ups, not become questionnaires. Ask only if two incompatible interpretations
+        would materially change the user's actual goal and neither can be preserved in the brief.
+        In that exceptional case append at most 1 question AFTER
         the Markdown body using this exact framing (the delimiter starts on its own line):
         <<<REPROMPT_QUESTIONS_V2>>>
         [{"id":"unique","question":"text","options":[{"label":"unique","description":"optional"}]}]
         <<<END_REPROMPT_QUESTIONS_V2>>>
-        Each question has at most 4 options; single selection, custom answers and skipping are allowed.
+        Put the most natural answer first. Each question has at most 3 options; single selection,
+        custom answers and skipping are allowed.
         Leave incidental gaps explicit instead of asking implementation questions. Omit the entire
         trailer when no question is needed. Never place metadata before or inside the body.
         Refinement uses the ORIGINAL text plus supplied substantive answers, not the prior rewrite.

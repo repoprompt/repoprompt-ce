@@ -259,6 +259,26 @@ final class AgentRepromptOperation {
         }
     }
 
+    /// Explicit keyboard override: freeze exactly what is visible, without another model call.
+    /// Cancel and revision-fence streaming before the fresh composer claim can be acquired.
+    func useCurrentDraft(_ text: String) {
+        // A reviewed draft already owns its exact generation and speculative routing work.
+        // Sending it is not an edit, nor an explicit choice to send the original.
+        guard validate(), phase != .completed else { return }
+        callRevision &+= 1
+        task?.cancel()
+        task = nil
+        publicationTask?.cancel()
+        publicationTask = nil
+        pendingBody = nil
+        store.pendingQuestions = nil
+        store.autoSendRequest = nil
+        usedOriginal = text == rawDraft
+        install(text)
+        setPhase(.completed)
+        onEdit?()
+    }
+
     func useOriginal() {
         guard validate() else { return }
         store.recover(

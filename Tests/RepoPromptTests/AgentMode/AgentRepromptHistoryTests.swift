@@ -118,6 +118,7 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         let claude = AgentRepromptModelPolicy.preferredClaude
+        fixture.viewModel.repromptEnabled = true // Enabled Re-prompt owns a pinned billing route.
         fixture.viewModel.repromptAvailability = { [claude] in $0 == claude || $0 == .gpt61SolLow }
         XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), claude)
         fixture.viewModel.repromptAvailability = { $0 == .gpt61SolLow }
@@ -127,7 +128,72 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), .gpt61SolLow)
     }
 
-    func testRewriterEffortUsesAutoEffortDecisionWithoutMutatingImplementingModel() async throws {
+    func testSavedUnavailableSelectionIsExplainedAndOnlyExplicitAutomaticResetResolvesDefault() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let claude = AgentRepromptModelPolicy.preferredClaude
+        fixture.viewModel.repromptAvailability = { [claude] in $0 == claude }
+        fixture.viewModel.setRepromptModelRaw(AIModel.gpt61SolLow.rawValue)
+        XCTAssertEqual(fixture.viewModel.repromptModelResolution(), .savedSelectionUnavailable(raw: AIModel.gpt61SolLow.rawValue))
+        let props = fixture.viewModel.repromptPillProps()
+        XCTAssertFalse(props.isAvailable, "A disconnected saved choice is never replaced by the connected default")
+        XCTAssertTrue(props.unavailableReason?.contains("saved") == true)
+        fixture.viewModel.useAutomaticRepromptModel()
+        XCTAssertEqual(fixture.viewModel.repromptModelSelectionRaw(), "")
+        XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), claude)
+    }
+
+    func testDisabledPillRenderDoesNotPinRouteWhileAvailabilityLoads() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let claude = AgentRepromptModelPolicy.preferredClaude
+        XCTAssertFalse(fixture.viewModel.repromptEnabled)
+        fixture.viewModel.repromptAvailability = { $0 == .gpt61SolLow }
+        XCTAssertEqual(fixture.viewModel.repromptPillProps().modelDisplayName, AIModel.gpt61SolLow.displayName)
+        XCTAssertNil(fixture.viewModel.repromptDefaultModel, "Rendering an off pill is not consent or use")
+        fixture.viewModel.repromptAvailability = { [claude] in $0 == claude || $0 == .gpt61SolLow }
+        XCTAssertEqual(fixture.viewModel.resolvedRepromptModel(), claude, "A late subscription replaces an unused API default")
+        _ = fixture.viewModel.repromptModelResolution(pinningDefault: true)
+        XCTAssertEqual(fixture.viewModel.repromptDefaultModel?.model, claude)
+        fixture.viewModel.repromptAvailability = { $0 == .gpt61SolLow }
+        XCTAssertEqual(fixture.viewModel.repromptModelResolution(), .automaticDefaultUnavailable(claude))
+    }
+
+    func testPillReturnWithoutModelSendsAsTypedInsteadOfStartingDoomedPreparation() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.viewModel.repromptEnabled = true
+        fixture.viewModel.repromptAvailability = { _ in false }
+        XCTAssertFalse(try fixture.begin(text: "Fix the parser"), "No model: ordinary Return proceeds to the normal send path")
+        XCTAssertNil(fixture.viewModel.repromptOperation)
+        XCTAssertNil(fixture.viewModel.repromptUIStore.presentation)
+    }
+
+    func testUnavailableReasonsDistinguishLostDefaultFromMissingDefault() {
+        let claude = AgentRepromptModelPolicy.preferredClaude
+        XCTAssertNil(AgentRepromptModelResolution.resolved(claude).unavailableReason)
+        XCTAssertEqual(AgentRepromptModelResolution.resolved(claude).model, claude)
+        let lost = AgentRepromptModelResolution.automaticDefaultUnavailable(claude).unavailableReason ?? ""
+        XCTAssertTrue(lost.contains(claude.displayName) && lost.contains("billing"))
+        let none = AgentRepromptModelResolution.noAutomaticDefault.unavailableReason ?? ""
+        XCTAssertTrue(none.contains("Claude Code") && none.contains("Codex"))
+        XCTAssertNil(AgentRepromptModelResolution.noAutomaticDefault.model)
+    }
+
+    func testDisclosureSummaryIsConciseButKeepsEssentialConsentFacts() {
+        let withChat = AgentRepromptDisclosure.summary(modelName: "Sonnet Low", routeName: "Claude Code", includesRecentChat: true)
+        let withoutChat = AgentRepromptDisclosure.summary(modelName: "Sonnet Low", routeName: "Claude Code", includesRecentChat: false)
+        XCTAssertEqual(withChat.count, 3)
+        XCTAssertEqual(withoutChat.count, 3)
+        let text = withChat.joined(separator: " ")
+        XCTAssertLessThanOrEqual(text.split(separator: " ").count, 70, "The consent summary must not become a wall of text")
+        for fact in ["Sonnet Low", "Claude Code", "selected paths", "Never file contents", "billing", "retention", "secrets", "Auto Effort", "recent chat"] {
+            XCTAssertTrue(text.contains(fact), "Missing consent fact: \(fact)")
+        }
+        XCTAssertFalse(withoutChat.joined(separator: " ").contains("recent chat"), "Recent-chat exposure is disclosed only when enabled")
+    }
+
+    func testRewriterUsesLowEffortWithoutSerialDecisionOrImplementingModelMutation() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         let model = AgentRepromptModelPolicy.preferredClaude
@@ -139,10 +205,10 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         await fixture.runtime.reconcileDemand()
         let chosen = await fixture.viewModel.chooseRepromptEffort(model: model, text: "Fix a parser edge case", requestID: UUID())
         let requests = await fixture.backend.requests
-        XCTAssertEqual(requests.last?.consumerID, .autoEffort)
+        XCTAssertTrue(requests.isEmpty, "A wording pass must not wait for a separate decision-backend call")
         XCTAssertEqual(chosen.providerType, model.providerType)
         XCTAssertEqual(chosen.modelName, model.modelName)
-        XCTAssertNotEqual(chosen.defaultReasoningEffort, "low")
+        XCTAssertEqual(chosen.defaultReasoningEffort, "low")
         XCTAssertEqual(fixture.session.selectedModelRaw, implementing)
         XCTAssertNil(fixture.session.autoEffortJudgmentID)
     }

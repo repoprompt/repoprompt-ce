@@ -5,7 +5,142 @@ import SwiftUI
 import XCTest
 
 @MainActor
+private final class RepromptFocusWindow: NSWindow {
+    var reportsKeyWindow = true
+    override var isKeyWindow: Bool {
+        reportsKeyWindow
+    }
+}
+
+private struct RepromptFocusSibling: NSViewRepresentable {
+    let identifier: String
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: "")
+        field.identifier = .init(identifier)
+        return field
+    }
+
+    func updateNSView(_ nsView: NSTextField, context: Context) {}
+}
+
+@MainActor
 final class AgentRepromptPresentationTests: XCTestCase {
+    func testHostedFocusHandoffRestoresRemovedQuestionButNeverStealsLiveFieldOrBackgroundWindow() async throws {
+        var returns = 0
+        func root(questionVisible: Bool, readOnly: Bool, request: UUID?) -> some View {
+            VStack {
+                if questionVisible { RepromptFocusSibling(identifier: "question") }
+                CustomTextField(text: .constant("Draft"), placeholder: "", onReturn: { returns += 1 }, isReadOnly: readOnly, onReadOnlyReturn: { returns += 1 }, focusRestoreRequest: request, currentHeightPresetIndex: .constant(0), onHeightChange: { _ in })
+                RepromptFocusSibling(identifier: "unrelated")
+            }.frame(width: 480, height: 220)
+        }
+        let host = NSHostingView(rootView: root(questionVisible: true, readOnly: false, request: nil))
+        let window = RepromptFocusWindow(contentRect: .init(x: 0, y: 0, width: 480, height: 220), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil
+            window.close()
+        }
+        host.layoutSubtreeIfNeeded()
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        let editor = try XCTUnwrap(descendants(host).compactMap { $0 as? ImageAwareTextView }.first)
+        let coordinator = try XCTUnwrap(editor.delegate as? CustomTextField.Coordinator)
+        func awaitRequest(_ request: UUID) async throws {
+            host.layoutSubtreeIfNeeded()
+            try await AsyncTestWait.waitUntil("focus request reached native editor", timeout: 3) { coordinator.lastFocusRestoreRequest == request }
+            await coordinator.focusRestorationTask?.value
+        }
+        XCTAssertTrue(window.makeFirstResponder(editor))
+        let preparation = UUID()
+        host.rootView = root(questionVisible: true, readOnly: true, request: preparation)
+        try await awaitRequest(preparation)
+        XCTAssertFalse(editor.isEditable)
+        XCTAssertTrue(window.firstResponder === editor)
+
+        let question = try XCTUnwrap(descendants(host).first { $0.identifier?.rawValue == "question" })
+        XCTAssertTrue(window.makeFirstResponder(question))
+        XCTAssertFalse(window.firstResponder === editor)
+        let completion = UUID()
+        host.rootView = root(questionVisible: false, readOnly: false, request: completion)
+        try await awaitRequest(completion)
+        XCTAssertNil(question.window)
+        XCTAssertTrue(window.firstResponder === editor, "Removing the focused answer must hand the native responder back to the same composer")
+        XCTAssertTrue(editor.isEditable)
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 30, windowNumber: window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        window.sendEvent(event)
+        XCTAssertEqual(returns, 1)
+
+        let unrelated = try XCTUnwrap(descendants(host).first { $0.identifier?.rawValue == "unrelated" })
+        XCTAssertTrue(window.makeFirstResponder(unrelated))
+        let liveResponder = window.firstResponder
+        let laterCompletion = UUID()
+        host.rootView = root(questionVisible: false, readOnly: false, request: laterCompletion)
+        try await awaitRequest(laterCompletion)
+        XCTAssertTrue(window.firstResponder === liveResponder, "A real sibling text field must retain its field editor")
+        window.reportsKeyWindow = false
+        XCTAssertTrue(window.makeFirstResponder(window))
+        let backgroundCompletion = UUID()
+        host.rootView = root(questionVisible: false, readOnly: false, request: backgroundCompletion)
+        try await awaitRequest(backgroundCompletion)
+        XCTAssertTrue(window.firstResponder === window, "Background windows must not reclaim focus")
+    }
+
+    func testWindowDeliversNextReturnAfterEditorBecomesReadOnly() throws {
+        var returns = 0
+        let field = CustomTextField(text: .constant("Original"), placeholder: "", onReturn: { returns += 1 }, onReadOnlyReturn: { returns += 1 }, currentHeightPresetIndex: .constant(0), onHeightChange: { _ in })
+        let host = NSHostingView(rootView: field)
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 480, height: 120), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil
+            window.close()
+        }
+        host.layoutSubtreeIfNeeded()
+        func editor(in view: NSView) -> ImageAwareTextView? {
+            if let text = view as? ImageAwareTextView { return text }
+            return view.subviews.lazy.compactMap { editor(in: $0) }.first
+        }
+        let textView = try XCTUnwrap(editor(in: host))
+        XCTAssertTrue(window.makeFirstResponder(textView))
+        func pressReturn(timestamp: TimeInterval) throws {
+            let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: timestamp, windowNumber: window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+            window.sendEvent(event)
+        }
+        try pressReturn(timestamp: 1)
+        XCTAssertEqual(returns, 1)
+        textView.isEditable = false
+        let coordinator = try XCTUnwrap(textView.delegate as? CustomTextField.Coordinator)
+        coordinator.parent.isReadOnly = true
+        try pressReturn(timestamp: 30)
+        XCTAssertEqual(returns, 2, "The next Return must arrive across preparation's read-only transition, even after a pause")
+    }
+
+    func testReadOnlyEditorHandlesReturnDirectlyButNotHeldKeysOrModifiedReturn() throws {
+        let textView = ImageAwareTextView()
+        textView.isEditable = false
+        var returns = 0
+        textView.readOnlyReturnHandler = { returns += 1 }
+        func event(_ flags: NSEvent.ModifierFlags = [], repeatKey: Bool = false, code: UInt16 = 36) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: repeatKey, keyCode: code))
+        }
+        try textView.keyDown(with: event())
+        XCTAssertEqual(returns, 1, "Read-only Return must not depend on NSTextView insertion delegate delivery")
+        try textView.keyDown(with: event(repeatKey: true))
+        XCTAssertEqual(returns, 1)
+        try textView.keyDown(with: event(code: 76))
+        XCTAssertEqual(returns, 2, "Keypad Return also sends")
+        let modifiers: [NSEvent.ModifierFlags] = [.shift, .command, .option, .control]
+        for flags in modifiers {
+            XCTAssertFalse(try textView.handleReadOnlyReturn(event(flags)))
+        }
+        XCTAssertFalse(try textView.handleReadOnlyReturn(event(code: 0)))
+        textView.isEditable = true
+        XCTAssertFalse(try textView.handleReadOnlyReturn(event()))
+        XCTAssertEqual(returns, 2)
+    }
+
     func testAttachmentMutationAndNativePasteAreBlockedWhilePreparationOwnsComposer() {
         let store = AgentRepromptUIStore()
         let tabID = UUID()
@@ -127,6 +262,9 @@ final class AgentRepromptPresentationTests: XCTestCase {
         XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.reprompt.isPreparing, "Questions are not provider streaming")
         XCTAssertTrue(store.pendingQuestions?.draftsByQuestionID.values.allSatisfy { $0.selectedOptionLabels.isEmpty && $0.customResponse.isEmpty && !$0.skipped } == true)
         XCTAssertEqual(fixture.session.draftText, "Generated body")
+        let panel = NSHostingView(rootView: AgentRepromptQuestionsView(viewModel: fixture.viewModel, store: store, tabID: fixture.session.tabID).frame(width: 480))
+        XCTAssertGreaterThanOrEqual(panel.fittingSize.height, 80)
+        XCTAssertLessThanOrEqual(panel.fittingSize.height, 250, "Compact clarification content must stay bounded without a duplicated wizard")
         XCTAssertNil(fixture.session.pendingAskUser)
         XCTAssertTrue(fixture.session.items.isEmpty, "Pre-send questions never enter provider history")
         fixture.viewModel.repromptOperation?.completeQuestions(skipAll: true)

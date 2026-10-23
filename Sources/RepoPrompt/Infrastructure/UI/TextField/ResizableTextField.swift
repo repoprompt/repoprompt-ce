@@ -43,6 +43,22 @@ final class ImageAwareTextView: NSTextView {
     var imagePasteHandler: ((NSPasteboard) -> Bool)?
     var enablesImagePasteHandling = false
     var commandReturnHandler: (() -> Bool)?
+    var readOnlyReturnHandler: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if handleReadOnlyReturn(event) { return }
+        super.keyDown(with: event)
+    }
+
+    /// Non-editable NSTextView does not reliably forward insertion commands to its delegate.
+    /// Handle only plain Return here; IME, newline and command shortcuts keep native ownership.
+    func handleReadOnlyReturn(_ event: NSEvent) -> Bool {
+        guard !isEditable, !hasMarkedText(), let readOnlyReturnHandler,
+              event.keyCode == 36 || event.keyCode == 76,
+              event.modifierFlags.intersection([.shift, .command, .option, .control]).isEmpty else { return false }
+        if !event.isARepeat { readOnlyReturnHandler() }
+        return true
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
@@ -209,6 +225,9 @@ struct ResizableTextField: View {
     var onUndoExternalEdit: (() -> Void)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    var onReadOnlyReturn: (() -> Void)?
+    /// Explicit, scoped handoff after a transient composer interaction finishes.
+    var focusRestoreRequest: UUID?
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -272,6 +291,8 @@ struct ResizableTextField: View {
             onUndoExternalEdit: onUndoExternalEdit,
             onEscape: onEscape,
             onCommandReturn: onCommandReturn,
+            onReadOnlyReturn: onReadOnlyReturn,
+            focusRestoreRequest: focusRestoreRequest,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -311,6 +332,9 @@ struct CustomTextField: NSViewRepresentable {
     var onUndoExternalEdit: (() -> Void)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    var onReadOnlyReturn: (() -> Void)?
+    /// Explicit, scoped handoff after a transient composer interaction finishes.
+    var focusRestoreRequest: UUID?
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -379,6 +403,7 @@ struct CustomTextField: NSViewRepresentable {
 
         textView.delegate = context.coordinator
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
+        textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
         context.coordinator.configureFileTagSupport(
@@ -412,8 +437,10 @@ struct CustomTextField: NSViewRepresentable {
         context.coordinator.parent = self
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.isEditable = !isReadOnly
+        context.coordinator.restoreFocusIfRequested(textView: textView)
         context.coordinator.beginExternalEditIfNeeded()
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
+        textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
         if textView.font != fontPreset.nsFont {
@@ -489,6 +516,8 @@ struct CustomTextField: NSViewRepresentable {
         textView.delegate = nil
         textView.imagePasteHandler = nil
         textView.commandReturnHandler = nil
+        textView.readOnlyReturnHandler = nil
+        coordinator.focusRestorationTask?.cancel()
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -499,6 +528,40 @@ struct CustomTextField: NSViewRepresentable {
     @MainActor
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: CustomTextField
+        var lastFocusRestoreRequest: UUID?
+        var focusRestorationTask: Task<Void, Never>?
+
+        /// Only reclaim abandoned/container focus. Never steal a live sibling field's editor.
+        static func mayRestoreFocus(to textView: NSTextView, in window: NSWindow) -> Bool {
+            guard window.isKeyWindow else { return false }
+            guard let responder = window.firstResponder else { return true }
+            if responder === window || responder === textView { return true }
+            guard let view = responder as? NSView else { return false }
+            if view.window !== window || textView.isDescendant(of: view) { return true }
+            if let fieldEditor = view as? NSTextView, fieldEditor.isFieldEditor,
+               let owner = fieldEditor.delegate as? NSView
+            {
+                return owner.window !== window
+            }
+            return false
+        }
+
+        func restoreFocusIfRequested(textView: NSTextView) {
+            let request = parent.focusRestoreRequest
+            guard request != lastFocusRestoreRequest else { return }
+            lastFocusRestoreRequest = request
+            focusRestorationTask?.cancel()
+            focusRestorationTask = nil
+            guard let request else { return }
+            focusRestorationTask = Task { @MainActor [weak self, weak textView] in
+                await Task.yield()
+                guard let self, let textView, !Task.isCancelled, isActive,
+                      parent.focusRestoreRequest == request, let window = textView.window,
+                      Self.mayRestoreFocus(to: textView, in: window) else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
+
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
         var lastAppliedExternalUpdateTick: Int?
@@ -566,7 +629,20 @@ struct CustomTextField: NSViewRepresentable {
                 parent.onEscape?()
                 return true
             }
-            if parent.isReadOnly { return false }
+            if parent.isReadOnly {
+                // Preparation locks editing, not the composer's explicit Return override.
+                let event = textView.window?.currentEvent
+                let flags = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+                if commandSelector == #selector(NSResponder.insertNewline(_:)),
+                   !textView.hasMarkedText(), isActive,
+                   flags.intersection([.shift, .command, .option, .control]).isEmpty,
+                   let onReturn = parent.onReadOnlyReturn
+                {
+                    if event?.isARepeat != true { onReturn() }
+                    return true
+                }
+                return false
+            }
             // IME FIX: if composing, let IME handle keys (Return/space/numbers etc.)
             if textView.hasMarkedText() { return false }
             guard isActive else { return false }
@@ -597,7 +673,8 @@ struct CustomTextField: NSViewRepresentable {
                 } else if flags.contains(.command), !flags.contains(.option), !flags.contains(.control), let action = parent.onCommandReturn {
                     return action()
                 } else {
-                    parent.onReturn() // Plain Return → send
+                    // A held Return is not an explicit second press/submit.
+                    if textView.window?.currentEvent?.isARepeat != true { parent.onReturn() } // Plain Return → send
                 }
                 return true
             }

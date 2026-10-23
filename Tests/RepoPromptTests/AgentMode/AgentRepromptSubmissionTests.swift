@@ -5,6 +5,198 @@ import XCTest
 
 @MainActor
 final class AgentRepromptSubmissionTests: XCTestCase {
+    func testNextReturnUsesPreparedDraftWithoutATimingWindowAndOnlyInItsTab() {
+        let store = AgentRepromptUIStore()
+        let tabID = UUID(), otherTabID = UUID()
+        XCTAssertFalse(store.hasPreparedDraft(tabID: tabID, text: "rewrite"))
+        store.presentation = .init(id: UUID(), sourceTabID: tabID, original: "original", modelName: "model")
+        store.presentation?.startedAt = .distantPast
+        for phase in [AgentRepromptUIStore.Phase.generating, .refining, .clarifying, .completed, .failed] {
+            store.presentation?.phase = phase
+            XCTAssertTrue(store.hasPreparedDraft(tabID: tabID, text: "rewrite"), "The next Return must send even after a long wait")
+            XCTAssertFalse(store.hasPreparedDraft(tabID: otherTabID, text: "rewrite"))
+        }
+        store.presentation = nil
+        XCTAssertFalse(store.hasPreparedDraft(tabID: tabID, text: "rewrite"))
+        store.recover(tabID: tabID, text: "rewrite", originalDraft: "original", reason: "changed", currentDraft: "rewrite", requiresDecision: true)
+        XCTAssertTrue(store.hasPreparedDraft(tabID: tabID, text: "rewrite"))
+        XCTAssertFalse(store.hasPreparedDraft(tabID: tabID, text: "An unrelated new request"))
+        XCTAssertFalse(store.hasPreparedDraft(tabID: tabID, text: "/compact"))
+        XCTAssertFalse(store.hasPreparedDraft(tabID: otherTabID, text: "rewrite"))
+    }
+
+    func testCurrentDraftOverrideFencesLateStreamAndRetainsFreshClaimBoundary() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+            try await publish("Visible partial rewrite")
+            _ = await gate.wait()
+            try await publish("Late replacement must not win")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original in box"))
+        try await AsyncTestWait.waitUntil("visible partial rewrite", timeout: 5) { fixture.session.draftText == "Visible partial rewrite" }
+        let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+        operation.useCurrentDraft("Visible partial rewrite")
+        XCTAssertEqual(operation.phase, .completed)
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        await gate.release()
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(fixture.session.draftText, "Visible partial rewrite")
+        XCTAssertEqual(operation.phase, .completed)
+        let claim = try fixture.claim(text: "Visible partial rewrite", local: true)
+        XCTAssertEqual(fixture.viewModel.repromptDispatchTexts[claim.attempt.id], "Visible partial rewrite")
+        XCTAssertNil(fixture.viewModel.repromptOperation)
+    }
+
+    func testImmediateSendHandoffClearsDraftBeforeAsyncWorkAndRestoresOnRejection() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        vm.storeDraftText(for: tabID, "Ready to send")
+        vm.repromptUIStore.recover(tabID: tabID, text: "Ready to send", originalDraft: "Original typed request", reason: "test", currentDraft: "Ready to send")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Ready to send")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected admitted local send")
+        }
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "", "Clear synchronously, before routing or session preparation")
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Ready to send")
+        XCTAssertNil(vm.repromptUIStore.recoveries[tabID], "Recovery moves into the pending send, not a stale composer banner")
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.repromptDraft.recovery?.originalDraft, "Original typed request")
+        XCTAssertTrue(fixture.session.items.isEmpty, "Pending UI must not change routing eligibility")
+        vm.storeDraftText(for: tabID, "New typing")
+        vm.releaseComposerSubmitClaim(claim)
+        let result = await vm.executePresentedComposerSubmitAttempt(text: "Ready to send", claim: claim)
+        guard case .blocked = result else { return XCTFail("Released claim must reject") }
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Ready to send\nNew typing")
+        XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.originalDraft, "Original typed request")
+        vm.finishPresentedComposerSubmitAttempt(claim, result: result)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Ready to send\nNew typing", "Recovery must be exactly once")
+    }
+
+    func testCancelledPreparedSendRetainsOriginalAndCleansTransferredWorkBeforeExecution() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        XCTAssertTrue(try fixture.begin(text: "Original typed request"))
+        try await ready(fixture)
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let rewritten = fixture.session.draftText
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: rewritten)
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected admitted rewritten send")
+        }
+        XCTAssertEqual(vm.repromptDispatchOriginals[attempt.id], "Original typed request")
+        await vm.cancelPresentedComposerSubmission(id: attempt.id)
+        XCTAssertNil(vm.repromptDispatchOriginals[attempt.id])
+        XCTAssertNil(vm.repromptDispatchTexts[attempt.id])
+        XCTAssertNil(vm.repromptAudits[attempt.id])
+        XCTAssertNil(vm.repromptSpeculations[attempt.id])
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.originalDraft, "Original typed request")
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.draftAtInvalidation, vm.retrieveDraftText(for: tabID))
+        XCTAssertTrue(vm.repromptUIStore.hasPreparedDraft(tabID: tabID, text: rewritten))
+        vm.repromptUIStore.recover(tabID: tabID, text: "New rewrite", originalDraft: "New original", reason: "new", currentDraft: "New draft")
+        let newer = vm.repromptUIStore.recoveries[tabID]
+        _ = await vm.executePresentedComposerSubmitAttempt(text: rewritten, claim: claim)
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID], newer, "Late cancelled executor must not replace newer recovery")
+    }
+
+    func testCancelPendingSendFencesDispatchAndRestoresOnlyOnce() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        vm.storeDraftText(for: tabID, "Pending message")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Pending message")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected admitted local send")
+        }
+        XCTAssertTrue(vm.ui.composer.hasPendingSubmission(tabID: tabID))
+        vm.storeDraftText(for: tabID, "Next draft")
+        await vm.cancelPresentedComposerSubmission(id: attempt.id)
+        XCTAssertFalse(vm.composerSubmitClaimIsCurrent(claim))
+        XCTAssertFalse(vm.ui.composer.hasPendingSubmission(tabID: tabID))
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Pending message\nNext draft")
+        // Loading the restored text acknowledges its ledger fragment, as the real editor does
+        // before retrying that visible draft. Without this, the ledger deliberately retains it.
+        let restoredSnapshot = vm.loadDraftSnapshotForComposer(for: tabID)
+        XCTAssertEqual(restoredSnapshot.text, "Pending message\nNext draft")
+        let retryTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let retryAttempt = AgentComposerSubmitAttempt(id: UUID(), target: retryTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Pending message\nNext draft")
+        guard case let .claimed(retryClaim) = vm.claimComposerSubmitForImmediatePresentation(retryAttempt) else {
+            return XCTFail("Cancel must allow a fresh send before the previous executor settles")
+        }
+        defer { vm.finishPresentedComposerSubmitAttempt(retryClaim, result: .blocked(message: "test cleanup")) }
+        let result = await vm.executePresentedComposerSubmitAttempt(text: "Pending message", claim: claim)
+        guard case .blocked = result else { return XCTFail("Cancelled claim must not dispatch") }
+        XCTAssertTrue(vm.composerSubmitClaimIsCurrent(retryClaim), "Late cleanup must not release the retry's claim")
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[retryAttempt.id]?.text, "Pending message\nNext draft")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        fixture.store.setAutoEffortEnabled(false)
+        let staleFallback = await vm.submitUserTurnAfterAutoEffort(text: "Pending message", claim: claim, session: fixture.session, destinationTabID: tabID)
+        guard case .blocked = staleFallback else { return XCTFail("Disabled Auto Effort fast path must still fence a cancelled claim") }
+        XCTAssertTrue(fixture.session.items.isEmpty)
+    }
+
+    func testImmediateSendCompletionNeverClearsNewDraftAndPreviewFollowsDestination() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        vm.storeDraftText(for: tabID, "Submitted text")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Submitted text")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected admitted local send")
+        }
+        let destination = UUID()
+        vm.movePendingComposerSubmission(claim, to: destination)
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.destinationTabID, destination)
+        XCTAssertTrue(vm.ui.composer.hasPendingSubmission(tabID: destination))
+        let destinationSession = vm.session(for: destination)
+        destinationSession.selectedAgent = .claudeCode
+        vm.test_setCurrentTabIDOverride(destination)
+        let destinationTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: destination, session: destinationSession))
+        let secondAttempt = AgentComposerSubmitAttempt(id: UUID(), target: destinationTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Second send")
+        guard case .rejected(.activeAttemptExists) = vm.claimComposerSubmitForImmediatePresentation(secondAttempt) else {
+            return XCTFail("A first-send destination must not accept another send while its source claim is preparing")
+        }
+        vm.storeDraftText(for: tabID, "Next message")
+        vm.finishPresentedComposerSubmitAttempt(claim, result: .submitted)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next message")
+        XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+        XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
+    }
+
+    func testSubmittedDraftClearsOnlyItsRecoveryAndPublication() {
+        let store = AgentRepromptUIStore()
+        let tab = UUID(), other = UUID()
+        store.recover(tabID: tab, text: "rewrite", originalDraft: "original", reason: "test", currentDraft: "rewrite")
+        store.recover(tabID: other, text: "other rewrite", originalDraft: "other original", reason: "test", currentDraft: "other rewrite")
+        store.draftUpdate = .init(operationID: UUID(), tabID: tab, revision: 1, text: "rewrite")
+        let snapshot = store.submittedDraftSnapshot(tabID: tab)
+        store.clearSubmittedDraft(snapshot)
+        XCTAssertNil(store.recoveries[tab])
+        XCTAssertNil(store.draftUpdate)
+        XCTAssertNotNil(store.recoveries[other])
+        store.recover(tabID: tab, text: "new rewrite", originalDraft: "new original", reason: "new preparation", currentDraft: "new rewrite")
+        store.draftUpdate = .init(operationID: UUID(), tabID: tab, revision: 1, text: "new rewrite")
+        store.clearSubmittedDraft(snapshot)
+        XCTAssertEqual(store.recoveries[tab]?.text, "new rewrite", "Old submission must not erase newer recovery")
+        XCTAssertEqual(store.draftUpdate?.text, "new rewrite")
+    }
+
     func testRepeatUsesEditedTextOrFirstOriginalWithoutHoldingAClaim() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
@@ -45,18 +237,40 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: tabID, "/compact rewrite")
         fixture.viewModel.repromptUIStore.recoveries[tabID] = .init(text: "/compact rewrite", originalDraft: "First original", reason: "Context changed", draftAtInvalidation: "/compact rewrite", requiresDecision: true)
         fixture.viewModel.keepRepromptRewrite(tabID: tabID)
-        fixture.viewModel.storeDraftText(for: tabID, "/compact edited rewrite")
-        XCTAssertTrue(try fixture.begin(text: fixture.session.draftText), "An edit to a kept recovery asks for a new decision, not a rewrite")
+        XCTAssertFalse(try fixture.begin(text: fixture.session.draftText), "Only the exact explicitly kept rewrite bypasses preparation")
         XCTAssertNil(fixture.viewModel.repromptOperation)
-        fixture.viewModel.keepRepromptRewrite(tabID: tabID)
         let claim = try fixture.claim(text: fixture.session.draftText, local: true)
         XCTAssertEqual(fixture.viewModel.repromptDispatchOriginals[claim.attempt.id], "First original")
         let result = await fixture.viewModel.executeComposerSubmitAttempt(text: claim.attempt.rawDraftSnapshot, claim: claim, createAndActivateSessionTab: { nil })
         XCTAssertEqual(result, .submitted)
-        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, "/compact edited rewrite")
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, "/compact rewrite")
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.last?.skipsSlashExpansion == true)
         XCTAssertFalse(fixture.viewModel.repromptUIStore.recoveries[tabID]?.requiresDecision == true)
         XCTAssertFalse(fixture.viewModel.repromptUIStore.recoveries[tabID]?.bypassesPreparation == true)
+    }
+
+    func testNewDraftNeverBorrowsAnUnrelatedRecoveryOriginal() async throws {
+        for text in ["A different task", "/compact"] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let tabID = fixture.session.tabID
+            fixture.viewModel.repromptUIStore.recoveries[tabID] = .init(text: "Old rewrite", originalDraft: "Old original", reason: "Original restored", draftAtInvalidation: "Old original", requiresDecision: true, bypassesPreparation: true)
+            fixture.viewModel.storeDraftText(for: tabID, text)
+            XCTAssertFalse(fixture.viewModel.repromptUIStore.hasPreparedDraft(tabID: tabID, text: text))
+            fixture.viewModel.keepRepromptRewrite(tabID: tabID)
+            XCTAssertEqual(fixture.viewModel.repromptUIStore.recoveries[tabID]?.draftAtInvalidation, "Old original", "Keep must not re-stamp a historical recovery onto new text")
+            let prepares = try fixture.begin(text: text)
+            XCTAssertEqual(prepares, !text.hasPrefix("/"))
+            if prepares {
+                try await ready(fixture)
+                XCTAssertEqual(fixture.viewModel.repromptOperation?.rawDraft, text)
+            }
+            let claim = try fixture.claim(text: fixture.session.draftText, local: true)
+            defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+            XCTAssertEqual(fixture.viewModel.repromptDispatchOriginals[claim.attempt.id], prepares ? text : nil)
+            XCTAssertFalse(fixture.viewModel.repromptUIStore.recoveries[tabID]?.bypassesPreparation == true)
+        }
     }
 
     func testNewPreparationSupersedesOldRecoveryDecisionAndBypassAuthority() async throws {
