@@ -386,6 +386,90 @@ import XCTest
             XCTAssertEqual(preparations, 1, "No real workspace mutation occurred; the two-attempt retry budget must remain unused")
         }
 
+        func testUnchangedGitModePublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: false)
+        }
+
+        func testChangedGitModePublicationStillInvalidatesAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: true)
+        }
+
+        private func assertGitModePublicationDuringAdmissionSave(
+            changesMode: Bool,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            let gitViewModel = fixture.window.promptManager.gitViewModel
+            let initialMode = gitViewModel.gitDiffInclusionMode
+            trackCleanup {
+                gitViewModel.gitDiffInclusionMode = initialMode
+                await fixture.cleanup()
+            }
+            let manager = fixture.window.workspaceManager
+            let initialTabs = try XCTUnwrap(manager.activeWorkspace, file: file, line: line).composeTabs
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                // Settings sync can republish the same mode while document preparation
+                // is suspended. The control changes it once, then republishes that value
+                // on the retry; only the real transition may invalidate the capture.
+                let currentMode = gitViewModel.gitDiffInclusionMode
+                let publishedMode: GitDiffInclusionMode = changesMode && preparations == 1
+                    ? (currentMode == .all ? .none : .all)
+                    : currentMode
+                gitViewModel.gitDiffInclusionMode = publishedMode
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("Git mode publication during admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let observations = await recorder.observations()
+            XCTAssertEqual(observations.count, 1, file: file, line: line)
+            XCTAssertEqual(
+                preparations,
+                changesMode ? 2 : 1,
+                "Only a changed Git mode may consume the one allowed save retry",
+                file: file,
+                line: line
+            )
+            let observation = try XCTUnwrap(observations.first, file: file, line: line)
+            let pair = AdmissionIdentityPair(tabID: observation.tabID, sessionID: observation.sessionID)
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let canonical = try XCTUnwrap(snapshot, file: file, line: line)
+            let canonicalWorkspace = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: canonical.document.documentBytes
+            )
+            let savedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            assertExactAdmissionState(
+                in: canonicalWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+            assertExactAdmissionState(
+                in: savedWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+        }
+
         func testCanonicalAdmissionRefreshReResolvesWorkspaceAfterReorder() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -2126,6 +2210,11 @@ import XCTest
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let firstWindow = WindowState(domainRuntime: firstRuntime)
             let secondWindow = WindowState(domainRuntime: secondRuntime)
+            for (label, window) in [("A", firstWindow), ("B", secondWindow)] {
+                window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                    print("WORKSPACE_SAVE_CONFLICT distinct-\(label) \(fields.sorted { $0.key < $1.key })")
+                }
+            }
             WindowStatesManager.shared.registerWindowState(firstWindow)
             WindowStatesManager.shared.registerWindowState(secondWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)

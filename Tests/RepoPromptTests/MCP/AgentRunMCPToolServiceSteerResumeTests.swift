@@ -17,6 +17,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.runState = .running
         viewModel.storeDraftText(for: session.tabID, "Keep my draft")
         let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
+        // Delivery tasks and session observations hold the runtime weakly; the fixture owns it.
+        defer { withExtendedLifetime(runtime) {} }
         runtime.test_suppressDecisionDelivery = false
         let request = try runtime.requestScope(
             requesterSessionID: sessionID, requesterTabID: session.tabID,

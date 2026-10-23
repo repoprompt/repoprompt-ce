@@ -2614,6 +2614,10 @@ class PromptViewModel: ObservableObject {
 
         // Observe git diff inclusion mode changes
         gitViewModel.$gitDiffInclusionMode
+            // Workspace settings sync can reassign the current mode while a save is
+            // being prepared. Only a changed mode may invalidate that capture.
+            // Keep the initial value as the comparison baseline before dropping it.
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in

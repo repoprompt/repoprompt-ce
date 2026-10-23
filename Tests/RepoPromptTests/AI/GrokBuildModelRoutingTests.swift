@@ -529,12 +529,18 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             exit 7
         fi
         trap 'printf "last write" > "$session/session-id/final-write" && printf "stopped" > "$RPCE_FIXTURE_ROOT/child-stopped"; exit 0' TERM
+        exec 3<> "$RPCE_FIXTURE_ROOT/hold.fifo"
         if [ "$RPCE_FIXTURE_MODE" = cancel ]; then
             printf 'ready\n' > "$RPCE_FIXTURE_ROOT/ready.fifo"
         fi
-        /bin/sleep 60 &
-        wait $!
+        while :; do
+            read -r release <&3
+        done
         """#
+        let holdFIFO = root.appendingPathComponent("hold.fifo")
+        guard mkfifo(holdFIFO.path, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         let environment = [

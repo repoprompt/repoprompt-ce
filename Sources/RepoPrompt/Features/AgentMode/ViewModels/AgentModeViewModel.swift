@@ -902,6 +902,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
     private var saveCompletionWaitersBySessionID: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var workspaceSaveFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var bypassesAgentSessionPersistenceSuppressionForTesting = false
     private var agentSessionSaver: AgentSessionSaver = { session, workspace, canonicalItemCount in
         try await AgentSessionDataService.shared.saveAgentSession(
@@ -1108,6 +1109,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_setAgentSessionSaver(_ saver: @escaping AgentSessionSaver) {
             bypassesAgentSessionPersistenceSuppressionForTesting = true
             agentSessionSaver = saver
+        }
+
+        var test_beforeSessionPersistenceDrainWait: (@MainActor () -> Void)?
+
+        func test_drainSessionPersistenceAfterWindowClose() async {
+            precondition(hasPreparedForWindowClose)
+            while true {
+                let debounces = sessions.values.compactMap { session -> Task<Void, Never>? in
+                    let task = session.saveDebounceTask
+                    session.saveDebounceTask = nil
+                    task?.cancel()
+                    return task
+                }
+                let flushes = Array(workspaceSaveFlushTasks.values)
+                let inFlightIDs = Array(saveInFlightSessionIDs)
+                guard !debounces.isEmpty || !flushes.isEmpty || !inFlightIDs.isEmpty else { return }
+                test_beforeSessionPersistenceDrainWait?()
+                for task in debounces + flushes {
+                    await task.value
+                }
+                for sessionID in inFlightIDs {
+                    await waitForInFlightSave(sessionID: sessionID)
+                }
+            }
         }
 
         func test_setAgentSessionLinkInheritanceHandler(
@@ -17958,7 +17983,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func persistCurrentSession() {
         guard !suppressesAgentSessionPersistence else { return }
         guard let tabID = currentTabID else { return }
-        Task {
+        let requestID = UUID()
+        workspaceSaveFlushTasks[requestID] = Task {
+            defer { workspaceSaveFlushTasks.removeValue(forKey: requestID) }
             await flushSave(for: tabID)
         }
     }

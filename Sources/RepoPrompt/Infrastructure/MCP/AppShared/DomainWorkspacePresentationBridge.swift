@@ -719,6 +719,13 @@ final class DomainWorkspacePresentationBridge {
             guard isCurrentRun(runID) else { return }
             rejection = await project(refetched, attempt: refetchAttempt, runID: runID, allowCoveredMetadata: true)
             resolved = refetched
+            // A covering reconciliation can also win during the FINAL decode suspension.
+            // Complete its metadata handoff synchronously; no third read/decode or retry budget.
+            if rejection == .superseded,
+               acceptCoveredCatalogMetadata(refetched, attempt: refetchAttempt, runID: runID)
+            {
+                rejection = nil
+            }
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
             if needsCurrentSnapshot(rejection, refetched), workspaceManager?.coversDomainCatalog(refetched) == false {
                 workspaceManager?.reportDomainCatalogFailure(
@@ -729,6 +736,39 @@ final class DomainWorkspacePresentationBridge {
         if let rejection {
             didRejectProjection(runID: runID, publicationSequence: resolved.publicationSequence, reason: rejection)
         }
+    }
+
+    /// Only an already-accepted catalog with exact qualified document descendants can hand off.
+    /// Preserve the suspended attempt's failure witnesses: a newer report must not be cleared.
+    private func acceptCoveredCatalogMetadata(
+        _ snapshot: DomainWorkspaceCatalogSnapshot,
+        attempt: DomainCatalogAttempt,
+        runID: UUID
+    ) -> Bool {
+        guard isCurrentRun(runID), let manager = workspaceManager,
+              manager.domainCatalogReconciliationGeneration > 0,
+              !manager.requiresFullCatalogReconciliation,
+              manager.coversDomainCatalog(snapshot),
+              snapshot.workspaces.allSatisfy({ manager.qualifiedDomainWorkspaceDescendant($0) != nil })
+        else { return false }
+        let handoff = DomainCatalogAttempt(
+            generation: manager.beginDomainCatalogAttempt().generation,
+            failureWitness: attempt.failureWitness,
+            projectionIssueWitness: attempt.projectionIssueWitness
+        )
+        guard case let .accepted(receipt) = manager.applyDomainWorkspaceCatalog(
+            snapshot,
+            projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+            preferredActiveWorkspaceID: nil,
+            rootMapPolicy: .snapshotMetadata,
+            attempt: handoff
+        ), isCurrentRun(runID) else { return false }
+        let digests = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0.document.contentDigest)
+        })
+        cacheAcceptedModels(snapshot.workspaces, availableModelIDs: Set(digests.keys))
+        commitAccepted(receipt, digests: digests, runID: runID)
+        return true
     }
 
     /// A proven own document submission or already-adopted document may refresh bookkeeping from
