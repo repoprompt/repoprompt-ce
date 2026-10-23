@@ -146,7 +146,10 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
         let freshWindow = normalizedPositive(modelContextWindow)
-        let resolvedWindow = freshWindow ?? existing?.modelContextWindow
+        // Zero is an explicit withdrawal (e.g. Grok changed models but cannot resolve
+        // capacity); nil remains "no new claim" for providers that omit a window.
+        let clearsWindow = modelContextWindow == 0
+        let resolvedWindow = clearsWindow ? nil : (freshWindow ?? existing?.modelContextWindow)
         let reportedUsed = normalizedContextUsedTokens(
             contextUsedTokens,
             modelContextWindow: resolvedWindow
@@ -158,7 +161,7 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
         // A call carrying no fresh figure must not relabel the snapshot it would carry forward;
         // a positive report still counts as fresh even when the window bound rejects it.
         let rejectedOverWindow = normalizedPositive(contextUsedTokens) != nil && reportedUsed == nil
-        guard reportedUsed != nil || freshWindow != nil || rejectedOverWindow else { return nil }
+        guard reportedUsed != nil || freshWindow != nil || rejectedOverWindow || clearsWindow else { return nil }
         // A billed prompt-call count can be cumulative across the turn's internal requests, so it
         // never replaces a same-turn occupancy figure. Without one, it replaces a figure stored by
         // an earlier turn, being the later report; oversight never exports it (see

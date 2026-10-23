@@ -3705,11 +3705,14 @@ actor ACPAgentSessionController {
             } else {
                 contextUsedTokens = nil
             }
-            // Resolve from THIS session and response, not the global catalog or the
-            // composer's "default" alias. An explicit unknown model never borrows the
-            // current model's capacity; only an absent model ID can use that identity.
-            let modelRaw = (meta?["modelId"] as? String) ?? discoveredSessionModels?.currentModelRaw
-            modelContextWindow = discoveredSessionModels?.option(matching: modelRaw)?.contextWindowTokens
+            // Grok reports an API routing slug here, which may differ from the catalog
+            // key (including per-effort routing). Prefer a direct match, then THIS
+            // session's confirmed catalog selection, never a global/default guess.
+            let modelOption = discoveredSessionModels?.option(matching: meta?["modelId"] as? String)
+                ?? discoveredSessionModels?.option(matching: discoveredSessionModels?.currentModelRaw)
+            // Zero explicitly withdraws an unresolved capacity. Nil would make no new
+            // window claim and let the estimator retain a different model's old bound.
+            modelContextWindow = modelOption?.contextWindowTokens ?? 0
         } else {
             modelContextWindow = nil
             contextUsedTokens = hasContextBreakdown

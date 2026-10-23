@@ -25,7 +25,7 @@ final class GrokBuildContextUsageTests: XCTestCase {
     }
 
     /// Exercise session/new discovery and session/prompt finalization on a synthetic process only.
-    private func runResponses(_ responses: [[String: Any]]) async throws -> [AIStreamResult] {
+    private func runResponses(_ responses: [[String: Any]], modelSelections: [Int: String] = [:]) async throws -> [AIStreamResult] {
         let directory = try makeTestDirectory()
         let executable = directory.appendingPathComponent("grok")
         try Self.fakeGrokScript.write(to: executable, atomically: true, encoding: .utf8)
@@ -46,6 +46,9 @@ final class GrokBuildContextUsageTests: XCTestCase {
         do {
             _ = try await controller.bootstrap()
             for index in responses.indices {
+                if let model = modelSelections[index] {
+                    try await controller.setSessionModel(model)
+                }
                 try await controller.prompt(AgentMessage(userMessage: index == 2 ? "compact" : "fixture turn"), request: request)
             }
         } catch {
@@ -67,10 +70,12 @@ final class GrokBuildContextUsageTests: XCTestCase {
             json(#"{"stopReason":"end_turn","_meta":{"sessionId":"grok-context-fixture","promptId":"single-call","modelId":"grok-small","totalTokens":25827,"inputTokens":25811,"outputTokens":16,"usage":{"inputTokens":25811,"outputTokens":16,"cachedReadTokens":25600,"modelCalls":1}}}"#),
             // Conversation replacement reseeds totalTokens but does not clear last_turn_usage.
             json(#"{"stopReason":"end_turn","_meta":{"sessionId":"grok-context-fixture","promptId":"compact","modelId":"grok-small","totalTokens":20000,"inputTokens":180000,"outputTokens":1000,"usage":{"inputTokens":0,"outputTokens":0,"modelCalls":0}}}"#),
-            json(#"{"stopReason":"end_turn","_meta":{"sessionId":"grok-context-fixture","promptId":"unknown-window","modelId":"grok-unknown","totalTokens":21000,"inputTokens":20500,"usage":{"inputTokens":20500,"outputTokens":500,"modelCalls":1}}}"#)
+            // The API routing slug can differ from the selected catalog key, including by effort.
+            json(#"{"stopReason":"end_turn","_meta":{"sessionId":"grok-context-fixture","promptId":"large-routing-slug","modelId":"grok-large-reasoning-high","totalTokens":210000,"inputTokens":209500,"usage":{"inputTokens":209500,"outputTokens":500,"modelCalls":1}}}"#),
+            json(#"{"stopReason":"end_turn","_meta":{"sessionId":"grok-context-fixture","promptId":"unknown-window","modelId":"unknown-routing-slug","totalTokens":220000,"inputTokens":219500,"usage":{"inputTokens":219500,"outputTokens":500,"modelCalls":1}}}"#)
         ]
-        let stops = try await runResponses(responses)
-        XCTAssertEqual(stops.count, 4)
+        let stops = try await runResponses(responses, modelSelections: [1: "grok-small", 3: "grok-large-high", 4: "grok-unknown"])
+        XCTAssertEqual(stops.count, 5)
         // Rendering must use the stored per-turn window, even if global discovery changes.
         AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
         let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in
@@ -80,8 +85,9 @@ final class GrokBuildContextUsageTests: XCTestCase {
         session.selectedAgent = .grokBuild
         session.selectedModelRaw = "default"
         let sidebar = AgentRuntimeSidebarViewModel()
-        let expectedCounts = [26278, 25827, 20000, 21000]
-        let expectedWindows: [Int?] = [1_000_000, 128_000, 128_000, nil]
+        let expectedCounts = [26278, 25827, 20000, 210_000, 220_000]
+        // Zero is an explicit withdrawal, never a real context-window capacity.
+        let expectedWindows = [1_000_000, 128_000, 128_000, 1_000_000, 0]
         for (index, stop) in stops.enumerated() {
             XCTAssertEqual(stop.contextUsedTokens, expectedCounts[index])
             XCTAssertEqual(stop.modelContextWindow, expectedWindows[index])
@@ -93,19 +99,46 @@ final class GrokBuildContextUsageTests: XCTestCase {
             XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
             XCTAssertNil(session.vouchedContextCount, "Finalization estimates remain ring-only, not exact occupancy")
             sidebar.update(items: [], codexUsage: session.codexContextUsage, selectedAgent: .grokBuild, selectedModelRaw: "default")
-            if index < 3 {
-                XCTAssertEqual(sidebar.snapshot.effectiveContextWindowTokens, expectedWindows[index])
-                XCTAssertEqual(AgentModeViewModel.observationContextLoad(for: session)?.windowTokens, expectedWindows[index])
-            }
+            let reportedWindow: Int? = expectedWindows[index] > 0 ? expectedWindows[index] : nil
+            XCTAssertEqual(session.contextUsageSnapshot?.window, reportedWindow)
+            XCTAssertEqual(sidebar.snapshot.contextWindowTokens, reportedWindow)
+            XCTAssertEqual(sidebar.snapshot.effectiveContextWindowTokens, reportedWindow ?? 500_000)
+            XCTAssertEqual(AgentModeViewModel.observationContextLoad(for: session)?.windowTokens, reportedWindow)
         }
         XCTAssertEqual(stops.first?.promptTokens, 139_056)
         XCTAssertEqual(stops.first?.completionTokens, 1200)
-        // A response whose model has no advertised capacity must not borrow another session/model's window.
-        XCTAssertNil(stops.last?.modelContextWindow)
-        var unknownWindow = AgentRuntimeSidebarViewModel.ContextSnapshot()
-        unknownWindow.selectedAgent = .grokBuild
-        unknownWindow.selectedModelRaw = "default"
-        XCTAssertEqual(unknownWindow.effectiveContextWindowTokens, 500_000)
+        // Assert the SAME session after the unknown model: no unrelated fresh snapshot can
+        // hide a carried 128k/1M window or a context count rejected against that stale bound.
+        XCTAssertNil(session.codexContextUsage?.modelContextWindow)
+        XCTAssertEqual(sidebar.snapshot.usedTokens, 220_000)
+        XCTAssertEqual(sidebar.snapshot.effectiveContextWindowTokens, 500_000)
+    }
+
+    @MainActor
+    func testExplicitUnknownWindowClearsStoredBoundWithoutFreshCount() {
+        let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in
+            preconditionFailure("Grok usage tests must not start Codex")
+        })
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .grokBuild
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000,
+            modelContextWindow: 128_000, session: session
+        )
+        let sidebar = AgentRuntimeSidebarViewModel()
+        sidebar.update(items: [], codexUsage: session.codexContextUsage, selectedAgent: .grokBuild, selectedModelRaw: "default")
+        let before = sidebar.snapshot
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: 0, session: session
+        )
+        sidebar.update(items: [], codexUsage: session.codexContextUsage, selectedAgent: .grokBuild, selectedModelRaw: "default")
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 100_000)
+        XCTAssertNil(session.contextUsageSnapshot?.window)
+        XCTAssertNotEqual(sidebar.snapshot, before, "A window withdrawal must publish even when the count is unchanged")
+        XCTAssertNil(sidebar.snapshot.contextWindowTokens)
+        XCTAssertEqual(sidebar.snapshot.effectiveContextWindowTokens, 500_000)
+        XCTAssertNil(AgentModeViewModel.observationContextLoad(for: session)?.windowTokens)
     }
 
     @MainActor
@@ -186,6 +219,8 @@ final class GrokBuildContextUsageTests: XCTestCase {
             result = {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}
         elif method == "session/new":
             result = fixture["session"]
+        elif method == "session/set_model":
+            result = {"_meta": {"model": {"Ok": message["params"]["modelId"]}}}
         elif method == "session/prompt":
             result = next(responses)
         else:
