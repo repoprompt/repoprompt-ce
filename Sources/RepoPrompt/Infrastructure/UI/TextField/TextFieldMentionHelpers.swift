@@ -433,6 +433,7 @@ final class SlashSkillMentionHelper {
     private var suggestionRequestID: UInt64 = 0
     private var isProviderConfigured = false
     private var suggestionsQuery: String?
+    private var highlightWasMoved = false
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
 
     /// What a `configure` call should do, given the previous configuration state.
@@ -522,12 +523,14 @@ final class SlashSkillMentionHelper {
 
         if commandSelector == #selector(NSResponder.moveUp(_:)) {
             guard !suggestions.isEmpty else { return false }
+            freezeExplicitSelection()
             highlightedIndex = (highlightedIndex - 1 + suggestions.count) % suggestions.count
             overlay.moveHighlight(by: -1)
             return true
         }
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             guard !suggestions.isEmpty else { return false }
+            freezeExplicitSelection()
             highlightedIndex = (highlightedIndex + 1) % suggestions.count
             overlay.moveHighlight(by: 1)
             return true
@@ -543,16 +546,38 @@ final class SlashSkillMentionHelper {
                 dismiss()
                 return false
             }
-            // Read the live token: the typing debounce may still leave older rows on screen.
-            guard let trigger = detectTrigger(in: textView),
-                  trigger.range == triggerRange,
-                  trigger.query == suggestionsQuery
-            else {
+            guard let trigger = detectTrigger(in: textView) else {
                 dismiss()
                 return false
             }
+            if trigger.range != triggerRange || trigger.query != suggestionsQuery {
+                // Keep completion usable while the typing debounce is pending. Never accept
+                // a row unrelated to the live token, but do not send a matching partial token.
+                let selectedPath = suggestions.indices.contains(highlightedIndex) ? suggestions[highlightedIndex].relativePath : nil
+                let query = trigger.query.lowercased()
+                suggestions.removeAll { suggestion in
+                    var name = suggestion.relativePath.lowercased()
+                    if name.hasPrefix("skill:"), !query.hasPrefix("skill:") {
+                        name = String(name.dropFirst("skill:".count))
+                    }
+                    return !query.isEmpty && !name.contains(query)
+                }
+                guard !suggestions.isEmpty else {
+                    dismiss()
+                    return false
+                }
+                if highlightWasMoved, let index = suggestions.firstIndex(where: { $0.relativePath == selectedPath }) {
+                    highlightedIndex = index
+                } else {
+                    highlightWasMoved = false
+                    highlightedIndex = suggestions.firstIndex(where: { $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame }) ?? 0
+                }
+                triggerRange = trigger.range
+                suggestionsQuery = trigger.query
+            }
             if commandSelector == #selector(NSResponder.insertNewline(_:)),
-               suggestions.contains(where: { $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame })
+               let exactIndex = suggestions.firstIndex(where: { $0.submitsOnExactEnter && $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame }),
+               highlightedIndex == exactIndex || !highlightWasMoved
             {
                 // Let the composer's ordinary Return handler submit the exact typed command.
                 dismiss()
@@ -564,13 +589,18 @@ final class SlashSkillMentionHelper {
         return false
     }
 
-    private func selectSuggestion(at index: Int) {
-        guard suggestions.indices.contains(index) else { return }
+    private func freezeExplicitSelection() {
         refreshTask?.cancel()
         refreshTask = nil
         suggestionTask?.cancel()
         suggestionTask = nil
         suggestionRequestID &+= 1
+        highlightWasMoved = true
+    }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        freezeExplicitSelection()
         highlightedIndex = index
     }
 
@@ -579,10 +609,13 @@ final class SlashSkillMentionHelper {
             suggestions
         }
 
+        var suggestionTaskForTesting: Task<Void, Never>? { suggestionTask }
+
         func setSelectionStateForTesting(suggestions: [MentionSuggestion], triggerRange: NSRange, query: String) {
             self.suggestions = suggestions
             self.triggerRange = triggerRange
             suggestionsQuery = query
+            highlightWasMoved = false
             highlightedIndex = 0
         }
 
@@ -600,6 +633,7 @@ final class SlashSkillMentionHelper {
         overlay.hide()
         suggestions.removeAll()
         suggestionsQuery = nil
+        highlightWasMoved = false
         highlightedIndex = 0
         triggerRange = nil
     }
@@ -631,7 +665,6 @@ final class SlashSkillMentionHelper {
         let overlayWasVisible = trigger.overlayWasVisible
         let requestedQuery = trigger.query
         let expectedRange = trigger.range
-        highlightedIndex = 0
         triggerRange = trigger.range
 
         suggestionTask?.cancel()
@@ -655,6 +688,7 @@ final class SlashSkillMentionHelper {
 
             suggestions = freshSuggestions
             suggestionsQuery = requestedQuery
+            highlightWasMoved = false
             highlightedIndex = 0
             triggerRange = latestTrigger.range
 
