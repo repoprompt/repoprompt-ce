@@ -42,7 +42,9 @@ protocol NativeAgentRuntimeControlling: Actor {
 }
 
 extension NativeAgentRuntimeControlling {
-    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] { [] }
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
+        []
+    }
 
     /// Fail closed for runtimes that have not implemented application proof. In particular,
     /// an old no-op fake must not accidentally certify provider application.

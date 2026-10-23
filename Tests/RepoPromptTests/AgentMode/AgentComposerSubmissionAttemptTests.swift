@@ -1545,7 +1545,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         let suggestions = AgentModeViewModel.mergeClaudeSlashSuggestions(native: native, skills: [], query: "context")
         XCTAssertEqual(suggestions.count, 6)
         XCTAssertEqual(suggestions.first?.relativePath, "context")
-        XCTAssertEqual(suggestions.filter { $0.relativePath == "context" }.count, 1)
+        XCTAssertEqual(suggestions.count(where: { $0.relativePath == "context" }), 1)
     }
 
     func testCompactSkillCollisionKeepsNativeCommandAndExplicitSkillSeparate() async throws {
@@ -1607,7 +1607,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         let suggestions = await viewModel.slashSkillSuggestions(for: "review")
         XCTAssertEqual(suggestions.count, 6)
         XCTAssertEqual(Set(suggestions.map(\.relativePath)).count, 6)
-        XCTAssertEqual(suggestions.filter { $0.relativePath == "review-local" }.count, 1)
+        XCTAssertEqual(suggestions.count(where: { $0.relativePath == "review-local" }), 1)
         XCTAssertEqual(suggestions.first { $0.relativePath == "review-local" }?.subtitle, "Local review skill")
     }
 
@@ -1643,7 +1643,10 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
     var hasActiveSession = true
     var hasTurnInFlight = false
-    var events: AsyncStream<NativeAgentRuntimeEvent> { AsyncStream { $0.finish() } }
+    var events: AsyncStream<NativeAgentRuntimeEvent> {
+        AsyncStream { $0.finish() }
+    }
+
     private let commands: [NativeAgentRuntimeSlashCommand]
     private let holdLookup: Bool
     private let onLookup: (@Sendable () -> Void)?
@@ -1676,9 +1679,15 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
 
     func ensureEventsStreamReady() {}
     func resetEventsStreamForNewRun() {}
-    func currentSessionRef() -> NativeAgentRuntimeSessionRef { .init(sessionID: "slash-test") }
+    func currentSessionRef() -> NativeAgentRuntimeSessionRef {
+        .init(sessionID: "slash-test")
+    }
+
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) {}
-    func shutdown() { hasActiveSession = false }
+    func shutdown() {
+        hasActiveSession = false
+    }
+
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) {}
 
     func startOrResume(existingSessionID: String?, model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, systemPromptOverride: String?) -> NativeAgentRuntimeSessionRef {
@@ -1689,5 +1698,7 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
         preconditionFailure("Slash suggestions must not send provider messages")
     }
 
-    func interruptTurn(reason: String) -> NativeAgentRuntimeInterruptOutcome { .noTurnInFlight }
+    func interruptTurn(reason: String) -> NativeAgentRuntimeInterruptOutcome {
+        .noTurnInFlight
+    }
 }

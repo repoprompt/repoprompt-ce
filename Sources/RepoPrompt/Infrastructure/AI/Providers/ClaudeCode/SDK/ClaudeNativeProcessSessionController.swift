@@ -19,7 +19,7 @@ final actor ClaudeNativeProcessSessionController {
 
     struct RuntimeInitStatus: Equatable {
         struct InitializeResponseSnapshot: Equatable {
-            struct Command: Equatable, Sendable {
+            struct Command: Equatable {
                 let name: String
                 let description: String
                 let argumentHint: String

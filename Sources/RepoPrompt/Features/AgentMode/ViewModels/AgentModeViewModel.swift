@@ -3015,11 +3015,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if agentKind == .claudeCode, !isExplicitSkillNamespaceQuery {
             let commands = await slashSession?.claudeController?.availableSlashCommands() ?? []
             guard requestIsCurrent() else { return [] }
-            let canCompact: Bool
-            if let slashSession {
-                canCompact = await agentSessionLinkCompactSupport(for: slashSession) == .claudeCode
+            let canCompact: Bool = if let slashSession {
+                await agentSessionLinkCompactSupport(for: slashSession) == .claudeCode
             } else {
-                canCompact = false
+                false
             }
             nativeSuggestions = Self.claudeSlashCommandSuggestions(for: query, runtimeCommands: commands, canCompact: canCompact)
         }
@@ -3091,7 +3090,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let compactCommands = commands.filter { $0.name.lowercased() == compact.name }
         var seen: Set<String> = []
-        let suggestions = (exactCommands + compactCommands + commands).compactMap { command -> MentionSuggestion? in
+        return (exactCommands + compactCommands + commands).compactMap { command -> MentionSuggestion? in
             let name = command.name.trimmingCharacters(in: .whitespacesAndNewlines)
             let normalizedName = name.lowercased()
             guard !name.isEmpty, normalizedName.hasPrefix(normalizedQuery),
@@ -3112,7 +3111,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         // Apply the cap only after merging with local skills.
-        return suggestions
     }
 
     static func mergeClaudeSlashSuggestions(

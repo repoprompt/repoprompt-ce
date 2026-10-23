@@ -609,7 +609,9 @@ final class SlashSkillMentionHelper {
             suggestions
         }
 
-        var suggestionTaskForTesting: Task<Void, Never>? { suggestionTask }
+        var suggestionTaskForTesting: Task<Void, Never>? {
+            suggestionTask
+        }
 
         func setSelectionStateForTesting(suggestions: [MentionSuggestion], triggerRange: NSRange, query: String) {
             self.suggestions = suggestions

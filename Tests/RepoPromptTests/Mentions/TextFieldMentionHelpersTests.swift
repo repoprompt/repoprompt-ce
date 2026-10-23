@@ -169,7 +169,7 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         XCTAssertEqual(textView.string, "/computer-use ")
     }
 
-    func testClaudeArgumentHintAndRuntimeSkillKeepExactEnterInCompletion() throws {
+    func testClaudeArgumentHintAndRuntimeSkillKeepExactEnterInCompletion() {
         let rows = AgentModeViewModel.claudeSlashCommandSuggestions(for: "", runtimeCommands: [
             .init(name: "review", description: "Review file", argumentHint: "<file>", builtin: true),
             .init(name: "review-skill", description: "Skill", argumentHint: "")
