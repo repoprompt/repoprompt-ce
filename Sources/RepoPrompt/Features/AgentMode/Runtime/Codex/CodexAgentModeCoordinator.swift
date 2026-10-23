@@ -4395,6 +4395,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         to newAgent: AgentProviderKind,
         session: AgentTabSession
     ) {
+        if oldAgent != newAgent {
+            // Pending Claude occupancy belongs to the old provider, not the shared usage object.
+            session.codexContextUsage?.awaitingPostCompactionUsage = nil
+        }
         if isHeadlessAgent(oldAgent) || isHeadlessAgent(newAgent) {
             session.providerSessionID = nil
             session.providerCleanupHandle = nil

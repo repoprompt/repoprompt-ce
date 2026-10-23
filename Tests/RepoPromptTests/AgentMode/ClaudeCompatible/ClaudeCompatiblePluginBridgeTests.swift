@@ -365,6 +365,46 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
 #if DEBUG
     @MainActor
     final class ClaudeCompactionContextUsageTests: XCTestCase {
+        func testProviderSwitchClearsPendingClaudeCompactionUsage() throws {
+            let viewModel = AgentModeViewModel(
+                testWindowID: -972,
+                testWorkspacePath: FileManager.default.currentDirectoryPath,
+                codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Provider switch must not launch a provider") },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpServerEnabler: { true }
+            )
+            let session = viewModel.session(for: UUID())
+            defer { session.saveDebounceTask?.cancel() }
+            session.selectedAgent = .claudeCode
+            session.appendItem(.user("Historical transcript retained across the provider switch."))
+            session.codexContextUsage = AgentContextUsage(
+                modelContextWindow: 200_000,
+                lastTotalTokens: nil,
+                totalTotalTokens: nil,
+                awaitingPostCompactionUsage: true
+            )
+            let sidebar = AgentRuntimeSidebarViewModel()
+            func refreshSidebar() {
+                sidebar.update(
+                    snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                    codexUsage: session.codexContextUsage
+                )
+            }
+            refreshSidebar()
+            XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertNil(sidebar.snapshot.displayUsedTokens)
+
+            viewModel.test_codexCoordinator.handleProviderSwitch(from: .claudeCode, to: .openCode, session: session)
+            session.selectedAgent = .openCode
+            refreshSidebar()
+
+            XCTAssertNil(session.codexContextUsage?.awaitingPostCompactionUsage)
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 200_000)
+            XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertGreaterThan(try XCTUnwrap(sidebar.snapshot.displayUsedTokens), 0)
+            XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Estimated")
+        }
+
         func testCompactionBoundaryInvalidatesRingUntilFreshOccupancyArrives() async throws {
             for trigger in ["manual", "auto"] {
                 let viewModel = AgentModeViewModel(
