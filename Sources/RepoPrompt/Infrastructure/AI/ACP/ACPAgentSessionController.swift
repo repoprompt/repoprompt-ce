@@ -6,6 +6,21 @@ import RepoPromptProcess
 import RepoPromptSettingsCore
 
 actor ACPAgentSessionController {
+    /// A successful pipe write is not provider acceptance or turn completion. It only proves
+    /// that retrying after a lost response could duplicate input. Independent of controller
+    /// teardown so the caller can classify an interrupted, dequeued steering batch.
+    final class PromptWriteReceipt: Sendable {
+        private let written = OSAllocatedUnfairLock(initialState: false)
+
+        var wasWritten: Bool {
+            written.withLock { $0 }
+        }
+
+        fileprivate func noteWritten() {
+            written.withLock { $0 = true }
+        }
+    }
+
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
         let operationalSeconds: TimeInterval
@@ -762,7 +777,8 @@ actor ACPAgentSessionController {
 
     func prompt(
         _ message: AgentMessage,
-        request overrideRunRequest: ACPRunRequest? = nil
+        request overrideRunRequest: ACPRunRequest? = nil,
+        writeReceipt: PromptWriteReceipt? = nil
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
@@ -770,7 +786,7 @@ actor ACPAgentSessionController {
         if state == .promptRunning, activePromptTurnID != nil {
             throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
         }
-        try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest)
+        try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest, writeReceipt: writeReceipt)
     }
 
     /// Sends exactly `/<name>` to the idle session that still advertises it. The run's current
@@ -819,7 +835,8 @@ actor ACPAgentSessionController {
     private func submitPromptTurn(
         _ payload: PromptPayload,
         sessionID: String,
-        overrideRunRequest: ACPRunRequest?
+        overrideRunRequest: ACPRunRequest?,
+        writeReceipt: PromptWriteReceipt? = nil
     ) async throws {
         suppressSessionLoadReplayUpdates = false
         recentDevinToolCalls.removeAll()
@@ -873,7 +890,8 @@ actor ACPAgentSessionController {
                 params: [
                     "sessionId": sessionID,
                     "prompt": promptBlocks
-                ]
+                ],
+                onWritten: { writeReceipt?.noteWritten() }
             )
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -2451,14 +2469,16 @@ actor ACPAgentSessionController {
 
     private func sendRequest(
         method: String,
-        params: [String: Any]
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> [String: Any] {
-        try await sendRequestResponse(method: method, params: params).result
+        try await sendRequestResponse(method: method, params: params, onWritten: onWritten).result
     }
 
     private func sendRequestResponse(
         method: String,
-        params: [String: Any]
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> RequestResponse {
         guard process != nil else { throw ControllerError.processNotRunning }
 
@@ -2479,6 +2499,7 @@ actor ACPAgentSessionController {
                     "method": method,
                     "params": params
                 ])
+                onWritten?()
             } catch {
                 let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
                 pendingRequest?.timeoutTask?.cancel()
