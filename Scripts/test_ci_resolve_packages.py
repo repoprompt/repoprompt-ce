@@ -98,6 +98,42 @@ class ResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'inventory failed'):
                 resolver.terminate_resolution(process)
 
+    def test_slow_inventory_does_not_consume_signal_grace_period(self):
+        process = mock.Mock(pid=123)
+        clock = 0.0
+        child_alive = True
+        observed_exit = False
+
+        def inventory(session_id):
+            nonlocal clock, observed_exit
+            self.assertEqual(session_id, process.pid)
+            # A valid ps inventory can exceed the one-second SIGKILL grace.
+            clock += 2.0
+            observed_exit = not child_alive
+            return {456} if child_alive else set()
+
+        def send_signal(group, sig):
+            nonlocal child_alive
+            self.assertEqual(group, 456)
+            if sig == signal.SIGKILL:
+                child_alive = False
+
+        def sleep(seconds):
+            nonlocal clock
+            clock += seconds
+
+        with mock.patch.object(resolver, 'session_process_groups', side_effect=inventory), \
+                mock.patch.object(resolver.os, 'killpg', side_effect=send_signal) as signals, \
+                mock.patch.object(resolver.time, 'monotonic', side_effect=lambda: clock), \
+                mock.patch.object(resolver.time, 'sleep', side_effect=sleep):
+            resolver.terminate_resolution(process)
+
+        signals.assert_any_call(456, signal.SIGTERM)
+        signals.assert_any_call(456, signal.SIGKILL)
+        self.assertFalse(child_alive)
+        self.assertTrue(observed_exit, 'cleanup must confirm exit after sending SIGKILL')
+        process.wait.assert_called_once_with(timeout=1)
+
     def test_failed_launcher_cleans_up_reparented_child_before_returning(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

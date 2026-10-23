@@ -59,7 +59,7 @@ Examples:
 
 A successful retry establishes nondeterminism at that tested SHA/environment boundary. It does not establish whether the defect is exclusively in a test, exclusively in product code, or both. Product race fixes must be proven separately.
 
-### 2. The dominant current test clusters are lifecycle/observation ownership
+### 2. The observed clusters require both lifecycle analysis and tested-tree attribution
 
 The top suite counts below count each failed job once per suite; a job can contain several failed methods. They include failures later rescued by reruns.
 
@@ -68,7 +68,7 @@ The top suite counts below count each failed job once per suite; a job can conta
 | NewWindowInitialSelectionTests | 44 | Ongoing catalog/projection/lifecycle cluster. #1463 repairs one lost catalog handoff but does not prove all paths fixed. |
 | ContentReadCancellationTests | 29 | Historical yield-budget cluster; no later occurrence found in this window after #1302 merged October 10. |
 | AgentTranscriptRestorationLifecycleTests | 14 | Ongoing unexpected cancellation and fixture lifetime/cleanup issues. |
-| AgentSessionLinkCodexPromptAdapterTests | 13 | Mainly October 1–6 auth-recovery replay timing; exact replay counters/continuations need observation of actual completion, not invocation. |
+| AgentSessionLinkCodexPromptAdapterTests | 13 | Historical fake-controller lifetime defect, fixed by #1168 on October 1. October 6 failures executed an older synthetic merge tree without the fix, not current main. |
 | ACPPermissionScopeTests | 10 | Concentrated October 4 stale synthetic-provider-launch fixtures, not evidence of ten distinct flaky algorithms. |
 | AgentSessionLaneFirstSaveTests | 9 | Concentrated October 10 authority/bootstrap regression wave; distinguish intentional contract failures from flakes. |
 | AgentRunMCPToolServiceSteerResumeTests | 6 | Mixed real lifecycle behavior and timing; latest failures October 21. |
@@ -76,12 +76,37 @@ The top suite counts below count each failed job once per suite; a job can conta
 | ProviderTransportActivityTests | 6 | October 9 cancellation race; five attempts on one run remained failed. |
 | ConcurrentSameWorkspaceAgentRunAdmissionTests | 5 | Four distinct-workspace failures, plus other methods; residual persistence failure remains open. |
 | AgentTranscriptPaneSnapshotPublicationTests | 5 | Outgoing snapshot precondition races asynchronous publication; #1438 is already merged on the audited base. |
-| WorkspaceSeededPublicationAuthorityRegressionTests | 5 | Process/transport helper exits before second commit; separate from ordinary pure unit tests. |
+| WorkspaceSeededPublicationAuthorityRegressionTests | 5 | Helper prerequisites fail before the intended second-commit deadlock check: live FSEvents receipt rejection on October 5/9/22 and a bounded Git discovery timeout on October 7; October 1 inner detail is truncated. #1185's exact-batch replay repair does not remove the broader live-witness dependency. |
 | AgentTaskRouterRuntimeTests | 4 | Production bootstrap vs readiness stream; #1463-derived observer wait addresses the identified race. |
 
 Specific frequent methods: new-window system-identity selection 17 jobs; content-read final materialization cancellation 17; new-window production lifecycle claims 12; transcript same-tab rebinding 8.
 
 The new-window catalog timeout appears in many unrelated PRs and multiple method names. This pattern matches a shared observer/publication defect rather than each PR independently breaking workspace choice. Still, #1445 is diagnostics only; its existence must not be presented as a completed fix.
+
+The Codex adapter cluster illustrates why a later failure date is insufficient to
+declare a fix ineffective. [#1168](https://github.com/repoprompt/repoprompt-ce/pull/1168)
+replaces a reused, already-finished fake controller with a fresh controller for
+each reconnect, retaining shared dispatch history and exact replay assertions.
+The October 6 [failed run](https://github.com/repoprompt/repoprompt-ce/actions/runs/37488629788)
+still checked out `f2b15692710605d10ed0c432b9b6dbe03da8e9c0`, whose
+[factory returns the old shared controller](https://github.com/repoprompt/repoprompt-ce/blob/f2b15692710605d10ed0c432b9b6dbe03da8e9c0/Tests/RepoPromptTests/AgentMode/SessionLinks/AgentSessionLinkPromptAdapterTests.swift#L333).
+[Its history diverges before #1168](https://github.com/repoprompt/repoprompt-ce/compare/c35921b87ff3724510c03af9ac1b602fc4202b97...f2b15692710605d10ed0c432b9b6dbe03da8e9c0).
+Always check the tested synthetic merge tree and commit ancestry; rerunning an old
+workflow does not incorporate fixes merged since that workflow was created.
+
+The seeded-publication cluster has a different result. The
+[October 22 failure](https://github.com/repoprompt/repoprompt-ce/actions/runs/39778810574/job/119835254022)
+rejects the creation receipt during the **second preparation**, before the ready
+marker and before the lock regression's second pending commit. The witness has
+`eventIDRegressed=true`; stream startup, flush/barriers and stable-root checks
+succeed, and drop/wrap/root-change flags are false. The complete ordered callback
+batches were not retained, so their exact cause cannot be established. The
+[executed tree already contains #1185's exact consecutive batch-replay exception](https://github.com/repoprompt/repoprompt-ce/blob/c2c6a1e88ea658665b80be0477dd372448f69479/Sources/RepoPrompt/Infrastructure/VCS/WorkspaceRootCreationReceiptCoordinator.swift#L380).
+This is a residual live-receipt prerequisite failure, not observed recurrence of
+the second-commit deadlock. `sourceA exists=false` in the caught error reflects
+fixture cleanup running before diagnostic construction, not proof that the
+repositories disappeared during creation. Socket, decode and simulated disk-full
+errors elsewhere in those shard logs belong to other tests.
 
 ### 3. Concurrent admission is a known residual product/fixture boundary, not a proven deflake
 
@@ -132,7 +157,9 @@ Root-shard failure should not wipe healthy build caches. Conversely an unchanged
 | [#908](https://github.com/repoprompt/repoprompt-ce/pull/908), August 30 | Deleted many integration/timing-dependent tests and support scripts, removed the previous day's test-lane policy, and restored one root lane. The actual merge removes roughly 269,000 lines and leaves a reported 953-test suite. It also restores fail-first-suite behavior and accidentally deletes Sentry privacy tests without deleting their main workflow selector. |
 | [#1088](https://github.com/repoprompt/repoprompt-ce/pull/1088), September 28 | Removes unique conductor ticket/environment churn from SwiftPM and directly invokes XCTest after build/discovery. Fixes massive fixed overhead, not app lifecycle races. |
 | [#1152](https://github.com/repoprompt/repoprompt-ce/pull/1152), October 1 | Adds exact expected/executed identities, target inventory, cross-shard receipts, bounded dependency retries, warm-VM owning-module parity, and a fail-closed final Style gate. The reviewed root listing is already 4,039 methods; evidence infrastructure improved, while new asynchronous integration tests accumulated. |
+| [#1168](https://github.com/repoprompt/repoprompt-ce/pull/1168), October 1 | Gives each fake Codex reconnect a fresh controller and open stream. Fixes the historical auth-recovery replay cluster; later failures on old synthetic merge trees did not contain this repair. |
 | [#1177](https://github.com/repoprompt/repoprompt-ce/pull/1177), October 2 | Restores orphaned Sentry privacy coverage exposed by zero-test rejection and turns verified superseded Tip commits into ineligible outcomes. Does not change the actual test-failure semantics. |
+| [#1185](https://github.com/repoprompt/repoprompt-ce/pull/1185), October 5 | Accepts only exact replay of the immediately preceding event batch. Keeps real regressions and discontinuities fail-closed, and explicitly does not claim to eliminate every live seeded-publication prerequisite failure. |
 | [#1302](https://github.com/repoprompt/repoprompt-ce/pull/1302), October 10 | Replaces 10,000-yield polling with a bounded ContinuousClock wait. 29 ContentReadCancellation failed-job occurrences before this fix; none observed after it in this window. Evidence-backed targeted improvement. |
 | [#1390](https://github.com/repoprompt/repoprompt-ce/pull/1390), October 16 | Clears synthetic bootstrap PID affinity after parent routes become authoritative; corrects weekly-vs-five-hour quota fixtures. Stops those specific stale-fixture clusters. It explicitly leaves the catalog checkpoint timeout unresolved. |
 | [#1441](https://github.com/repoprompt/repoprompt-ce/pull/1441), open | Preserves a seeded build after successful compilation when tests fail, preventing unconditional cold retry/cache wiping. Still unmerged when inspected; do not claim it already protects main. |
@@ -170,7 +197,7 @@ is not evidence for this combined head.
 | Snooze cancellation fixture | [#1446](https://github.com/repoprompt/repoprompt-ce/pull/1446) | Replace yield-count assumptions with exact clock-deadline observation. Join the cancelled predecessor after proving it resumed; assert it cannot rearm or expire its replacement. Retire the test clock's tasks during cleanup. |
 | Restoration fixture lifetime | [#1445](https://github.com/repoprompt/repoprompt-ce/pull/1445), diagnostic-only | Track the existing workspace-listener flush tasks. Fixture cleanup joins flushes, in-flight saves, and cancelled debounce tasks, including successors scheduled during a flush, before deleting storage or resetting shared services. A gated real-listener regression covers normal and throwing fixture bodies. This addresses demonstrated late writes; the original unexpected CancellationError's provenance remains unproven. |
 | Grok cancellation fixture | [#1463 shard 4](https://github.com/repoprompt/repoprompt-ce/actions/runs/39927333232/job/120338302666) | Open the FIFO and install the trap before publishing readiness, then use the shell's builtin read, avoiding a post-ready shell fork/wait window. Keep the physical-finalization, final-write, session-removal, and neighbor-preservation assertions. This is a newly observed failure, absent from the 416 retrieved historical logs. Linux fixture exercise is not proof of Darwin behavior. |
-| Resolver child ownership | [Sentry dependency failure](https://github.com/repoprompt/repoprompt-ce/actions/runs/39935261810/job/120376186447), [second run](https://github.com/repoprompt/repoprompt-ce/actions/runs/39929803435/job/120341260088) | A timed-out SwiftPM launcher can leave Git children in different process groups. Cleanup now inventories and stops every live group within that attempt's private session, including after nonzero launcher exit, before retrying. A real subprocess regression reproduced a surviving child with the old cleanup; the new test also protects an unrelated session. The observed later Git working-directory errors are consistent with overlap, not definitive proof of every download failure's cause. |
+| Resolver child ownership | [Sentry dependency failure](https://github.com/repoprompt/repoprompt-ce/actions/runs/39935261810/job/120376186447), [second run](https://github.com/repoprompt/repoprompt-ce/actions/runs/39929803435/job/120341260088) | A timed-out SwiftPM launcher can leave Git children in different process groups. Cleanup now inventories and stops every live group within that attempt's private session, including after nonzero launcher exit, before retrying. Signal grace begins after the first signals, so a slow inventory cannot consume the grace before cleanup can confirm exit. A real subprocess regression reproduced a surviving child with the old cleanup; the new test also protects an unrelated session. The observed later Git working-directory errors are consistent with overlap, not definitive proof of every download failure's cause. |
 | Expired executable on rerun | [missing root build](https://github.com/repoprompt/repoprompt-ce/actions/runs/39440319701/job/120328423401) | Root build artifacts now last seven days, matching execution receipts, instead of one day. Expired runs still require rebuilding; download errors are not test failures. |
 | Incomplete failure inventory | Existing runner returned after the first failed isolated suite | Attempt every assigned suite once. Preserve failure exit status, refuse a success receipt after any failure, and verify exact identities/counts as before. Later suites become visible in the first failed run. |
 | Misleading gate annotations and wasted work | Intentional resolver self-test error strings; opaque aggregate Style failure; queued main commits | Capture expected self-test output, show prerequisite outcomes in the final Style summary, and cancel superseded main CI/Sentry work per ref. Release workflow policy and mandatory gates stay intact. |
@@ -206,6 +233,21 @@ platform validation in the PR description.
 Do not close the concurrent-admission persistence diagnosis or unexpected
 restoration cancellation diagnosis merely because one run is green. The
 additional conflict diagnostics are intended to identify the remaining writer.
+
+The seeded-publication helper remains a concrete fixture follow-up. Its lock
+regression from [#1003](https://github.com/repoprompt/repoprompt-ce/pull/1003)
+must still execute both real pending seeded-root commits, with the first root's
+current authority fence and all-loaded cache already installed. The existing
+`WorkspaceRootCreationWitnessFSEventsBackend` can supply controlled witness
+delivery, but `GitService` does not expose its coordinator as an initializer
+dependency yet. That narrow dependency injection would avoid rewriting a rejected
+receipt. Its backend must preserve a valid real journal cut, because the Store
+uses the receipt's ending event ID to start actual watcher replay. Validate that
+the original lock mutant still fails and current code completes on macOS before
+calling the fixture deterministic; retain live receipt regression/drop/wrap/replay
+and fallback coverage. This does not diagnose the separate source-admission Git
+timeout. No receipt validation or helper assertion is weakened in this PR.
+
 [PR #1441](https://github.com/repoprompt/repoprompt-ce/pull/1441) separately repairs
 conductor's local seeded-cache invalidation/cold-test retry behavior; that change
 is not included here. Release smoke timeouts and provider-specific historical

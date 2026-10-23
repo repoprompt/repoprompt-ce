@@ -36,7 +36,7 @@ def terminate_resolution(process: subprocess.Popen) -> None:
     # Swift's Process creates a new process group for Git children. They remain
     # in this attempt's private session, even after their parent has exited.
     for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 1)):
-        deadline = time.monotonic() + grace
+        deadline = None
         while True:
             process.poll()
             groups = session_process_groups(process.pid)
@@ -46,6 +46,8 @@ def terminate_resolution(process: subprocess.Popen) -> None:
                 except subprocess.TimeoutExpired as error:
                     raise RuntimeError('Dependency launcher has not exited; refusing to retry') from error
                 return
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             for group in groups:
                 try:
                     os.killpg(group, sig)
@@ -55,8 +57,10 @@ def terminate_resolution(process: subprocess.Popen) -> None:
                     # Darwin may report EPERM for a group emptied since the scan.
                     if group in session_process_groups(process.pid):
                         raise
-            if time.monotonic() >= deadline:
-                break
+            if deadline is None:
+                # Inventory can take longer than the kill grace. Start the clock
+                # after signaling, then always inventory again to confirm exit.
+                deadline = time.monotonic() + grace
             time.sleep(0.05)
     raise RuntimeError('Dependency attempt still has live processes; refusing to retry')
 
