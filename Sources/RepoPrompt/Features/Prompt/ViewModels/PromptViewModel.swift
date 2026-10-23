@@ -3293,11 +3293,16 @@ class PromptViewModel: ObservableObject {
             )
         }
 
-        let timing = WorkspaceAgentAdmissionTiming()
+        let timing = manager.makeAgentAdmissionTiming()
         return try await manager.withAgentSessionAdmission(
             workspaceID: expectedWorkspaceID,
             admissionID: UUID(),
             refreshCanonicalState: true,
+            kind: .freshTab,
+            classifyOutcome: { (result: DurableBackgroundComposeTabCreationResult) in
+                if case .created = result { return .committed }
+                return .rejected
+            },
             timing: timing
         ) {
             if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID, timing: timing) {
@@ -3390,7 +3395,7 @@ class PromptViewModel: ObservableObject {
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
             timing.begin(.save)
-            let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            let receipt = await manager.persistAgentAdmission(provisionalIdentity, timing: timing)
             timing.end()
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
@@ -3593,7 +3598,14 @@ class PromptViewModel: ObservableObject {
                 do {
                     outcome = try await manager.withAgentSessionAdmission(
                         workspaceID: identity.workspaceID,
-                        admissionID: UUID()
+                        admissionID: UUID(),
+                        kind: .recovery,
+                        classifyOutcome: { result in
+                            switch result {
+                            case .recovered, .alreadyRecovered, .localOnly: .committed
+                            default: .rejected
+                            }
+                        }
                     ) {
                         await manager.recoverProvisionalAgentAdmission(identity)
                     }

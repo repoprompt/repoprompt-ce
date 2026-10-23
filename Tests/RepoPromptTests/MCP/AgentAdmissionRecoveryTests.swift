@@ -8,6 +8,94 @@ import XCTest
 #if DEBUG
     @MainActor
     final class AgentAdmissionRecoveryTests: XCTestCase {
+        func testAdmissionTimingUsesRealFreshAndExistingTabSaveScopes() async throws {
+            for kind in [WorkspaceAgentAdmissionTiming.Kind.freshTab, .existingTab] {
+                let fixture = try await establishCleanActiveWorkspaceBaseline()
+                let manager = fixture.manager
+                let workspaceID = fixture.workspaceA.id
+                var now = Duration.zero
+                var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+                var advancedSave = false
+                var snapshotReads = 0
+                manager.agentAdmissionTimingFactoryForTesting = {
+                    WorkspaceAgentAdmissionTiming(now: { now }, emit: { report in
+                        XCTAssertEqual(
+                            WorkspaceAgentAdmissionCoordinator.shared.activeCount(for: workspaceID),
+                            0,
+                            "The actual production path must emit after releasing its lease"
+                        )
+                        reports.append(report)
+                    })
+                }
+                manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting { id in
+                    snapshotReads += 1
+                    now += .seconds(2)
+                    return await fixture.client.canonicalWorkspaceSnapshot(id)
+                }
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor _, _, _ in
+                    guard !advancedSave,
+                          WorkspaceAgentAdmissionCoordinator.shared.activeCount(for: workspaceID) > 0
+                    else { return }
+                    advancedSave = true
+                    now += .seconds(44)
+                }
+                var viewModel: AgentModeViewModel?
+                do {
+                    if kind == .freshTab {
+                        let result = try await fixture.prompt.createDurableBackgroundAgentSessionTab(
+                            name: "Timing fixture", sessionID: UUID(), expectedWorkspaceID: workspaceID,
+                            lifecycleAuthority: AgentSessionLifecycleAuthority()
+                        )
+                        if case let .created(_, _, claim) = result {
+                            claim.markAccepted()
+                        } else {
+                            XCTFail("Fresh admission must commit: \(result)")
+                        }
+                    } else {
+                        let model = makeAgentModeViewModel(for: fixture)
+                        viewModel = model
+                        let target = try await model.mcpResolveOrCreateSessionTarget(
+                            tabID: fixture.leftTab.id, sessionID: nil, createIfNeeded: true,
+                            sessionName: "Timing fixture", expectedWorkspaceID: workspaceID
+                        )
+                        model.mcpAcceptSessionTarget(target)
+                    }
+                    XCTAssertTrue(advancedSave)
+                    let report = try XCTUnwrap(reports.first)
+                    XCTAssertEqual(reports.count, 1)
+                    XCTAssertEqual(report.context.kind, kind)
+                    XCTAssertEqual(report.outcome, .committed)
+                    XCTAssertEqual(report.slowestPhase, .save)
+                    XCTAssertEqual(
+                        report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.save.rawValue],
+                        44000,
+                        "Deleting the caller's save begin/end must break attribution"
+                    )
+                    XCTAssertEqual(report.saveAttempts, 1)
+                    XCTAssertEqual(
+                        report.counts[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue],
+                        snapshotReads,
+                        "A no-op write-baseline check must not count as another refresh"
+                    )
+                    XCTAssertEqual(report.totalMilliseconds, 44000 + Double(snapshotReads) * 2000)
+                } catch {
+                    await finishAdmissionTimingFixture(fixture, viewModel: viewModel)
+                    throw error
+                }
+                await finishAdmissionTimingFixture(fixture, viewModel: viewModel)
+            }
+        }
+
+        private func finishAdmissionTimingFixture(_ fixture: Fixture, viewModel: AgentModeViewModel?) async {
+            fixture.manager.agentAdmissionTimingFactoryForTesting = nil
+            fixture.manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting(nil)
+            fixture.manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            // Standalone view models do not get WindowState's normal async teardown.
+            await viewModel?.prepareForWindowClose()
+            fixture.manager.prepareForWindowClose()
+            await fixture.manager.awaitOwnSavesForWindowClose()
+        }
+
         func testToolAdmissionPolicySnapshotPreservesTaskRoleMapping() {
             let cases: [(AgentModelCatalog.TaskLabelKind?, MCPClientTaskRole)] = [
                 (nil, .direct), (.explore, .explore), (.engineer, .engineer),
@@ -705,9 +793,13 @@ import XCTest
             let store = fixture.client.store
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
                 if id == workspaceID {
                     awaitedOwnSaves.count = count
+                    now += .seconds(8)
                 }
             }
 
@@ -723,7 +815,8 @@ import XCTest
                 defer { agentStart.finished = true }
                 do {
                     _ = try await fixture.manager.withAgentSessionAdmission(
-                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true
+                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true,
+                        kind: .freshTab, timing: timing
                     ) { agentStart.count += 1 }
                     return nil
                 } catch {
@@ -768,6 +861,17 @@ import XCTest
             XCTAssertNil(admissionError, "Agent start must await its own in-flight save, not reject it.")
             XCTAssertEqual(agentStart.count, 1)
             XCTAssertEqual(awaitedOwnSaves.count, 1)
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(report.slowestPhase, .save)
+            XCTAssertEqual(report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.save.rawValue], 8000)
+            XCTAssertEqual(
+                report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue],
+                0,
+                "Real canonical refresh must exclude its nested own-save wait"
+            )
+            XCTAssertEqual(report.totalMilliseconds, 8000)
+            XCTAssertEqual(report.counts[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue], 1)
             try await assertCanonicalCleanContainingTab(fixture, workspaceID: workspaceID, tabID: backgroundTab.id)
             try await assertAdmissionPasses(fixture, workspaceID: workspaceID)
         }
