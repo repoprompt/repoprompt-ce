@@ -405,13 +405,18 @@ package actor DirectHeadlessMCPService {
         connection: MCPDomainToolResourceAdmissionController,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        let connectionLease = try await connection.acquire(.appWide)
-        defer { connectionLease.release() }
-        // A standalone runtime is one physical workspace host, not one resource per child.
-        let resourceLease = try await host.acquireFileReadResourceAdmission(windowID: 0)
-        defer { resourceLease.release() }
-        try Task.checkCancellation()
-        return try await operation()
+        let deadline = MCPDomainHeadlessReadSlots.deadline()
+        do {
+            let connectionLease = try await connection.acquire(.appWide, admissionDeadline: deadline)
+            defer { connectionLease.release() }
+            // A standalone runtime is one physical workspace host, not one resource per child.
+            let resourceLease = try await host.acquireFileReadResourceAdmission(windowID: 0, admissionDeadline: deadline)
+            defer { resourceLease.release() }
+            try Task.checkCancellation()
+            return try await operation()
+        } catch is MCPDomainAdmissionDeadline.Expired {
+            throw MCPDomainHeadlessFileReader.ReadError.admissionTimedOut
+        }
     }
 
     private func servePrivateChild(

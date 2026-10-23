@@ -15,14 +15,16 @@ package enum MCPDomainHeadlessFileReader {
         case invalidText
         case changedDuringRead
         case unsafeAdmissionDirectory
+        case admissionTimedOut
 
         package var description: String {
             switch self {
             case .tooLarge: "File exceeds the headless read_file limit of 10,000,000 bytes"
             case .notRegularFile: "read_file requires a regular file"
-            case .invalidText: "File is binary or is not valid UTF-8 text"
+            case .invalidText: "File is not valid UTF-8 text"
             case .changedDuringRead: "File changed during read; retry against the current file"
             case .unsafeAdmissionDirectory: "Unable to safely acquire shared headless file-read admission"
+            case .admissionTimedOut: "Headless file-read admission timed out; retry when active reads have settled"
             }
         }
     }
@@ -35,47 +37,50 @@ package enum MCPDomainHeadlessFileReader {
         slotDirectory: URL? = nil,
         slotCount: Int = MCPDomainToolAdmissionLimits.fileReadPerWindow,
         didReadChunk: @escaping @Sendable (Int) -> Void = { _ in },
-        didWaitForSlot: @escaping @Sendable () -> Void = {}
+        didWaitForSlot: @escaping @Sendable () -> Void = {},
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil,
+        onAdmissionWarning: (@Sendable (Int32) -> Void)? = nil
     ) async throws -> String {
+        try Task.checkCancellation()
         let path = try physicalPath(url)
-        let lease = try await workers.acquire(.appWide)
-        defer { lease.release() }
-        let cancellation = Cancellation()
-        return try await withTaskCancellationHandler {
-            let result: String = try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    continuation.resume(with: Result {
-                        try cancellation.check()
-                        let slot = try acquireSlot(
-                            in: slotDirectory ?? defaultSlotDirectory(), count: slotCount, cancellation: cancellation,
-                            didWait: didWaitForSlot
-                        )
-                        defer { close(slot) }
-                        return try readBlocking(
-                            path: path, startLine: startLine, limit: limit, chunkSize: chunkSize,
-                            cancellation: cancellation, didReadChunk: didReadChunk
-                        )
-                    })
+        let deadline = admissionDeadline ?? MCPDomainHeadlessReadSlots.deadline()
+        do {
+            let lease = try await workers.acquire(.appWide, admissionDeadline: deadline)
+            defer { lease.release() }
+            let cancellation = Cancellation()
+            return try await withTaskCancellationHandler {
+                let result: String = try await withCheckedThrowingContinuation { continuation in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        continuation.resume(with: Result {
+                            try cancellation.check()
+                            let slot = try MCPDomainHeadlessReadSlots.acquire(
+                                directory: slotDirectory, count: slotCount, deadline: deadline,
+                                checkCancellation: cancellation.check, didWait: didWaitForSlot,
+                                warning: onAdmissionWarning
+                            )
+                            defer { if let slot { close(slot) } }
+                            for attempt in 0 ... 1 {
+                                do {
+                                    return try readBlocking(
+                                        path: path, startLine: startLine, limit: limit, chunkSize: chunkSize,
+                                        cancellation: cancellation, didReadChunk: didReadChunk
+                                    )
+                                } catch ReadError.changedDuringRead where attempt == 0 {
+                                    try cancellation.check()
+                                }
+                            }
+                            throw ReadError.changedDuringRead
+                        })
+                    }
                 }
+                try Task.checkCancellation()
+                return result
+            } onCancel: {
+                cancellation.cancel()
             }
-            try Task.checkCancellation()
-            return result
-        } onCancel: {
-            cancellation.cancel()
+        } catch is MCPDomainAdmissionDeadline.Expired {
+            throw ReadError.admissionTimedOut
         }
-    }
-
-    private static func defaultSlotDirectory() throws -> URL {
-        // Unlike TMPDIR, confstr is not a caller-controlled namespace. The OS owns this
-        // private per-user parent, so another UID cannot squat on the shared directory.
-        let length = confstr(_CS_DARWIN_USER_TEMP_DIR, nil, 0)
-        guard length > 1 else { throw ReadError.unsafeAdmissionDirectory }
-        var buffer = [CChar](repeating: 0, count: length)
-        guard confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) == length else {
-            throw ReadError.unsafeAdmissionDirectory
-        }
-        return URL(fileURLWithPath: String(cString: buffer), isDirectory: true)
-            .resolvingSymlinksInPath().appendingPathComponent("repoprompt-ce-headless-file-reads", isDirectory: true)
     }
 
     private final class Cancellation: @unchecked Sendable {
@@ -88,49 +93,6 @@ package enum MCPDomainHeadlessFileReader {
 
         func check() throws {
             if lock.withLock({ cancelled }) { throw CancellationError() }
-        }
-    }
-
-    /// Lock files are never unlinked: unlinking permits a second inode to become a parallel
-    /// authority. CLOEXEC and kernel close-on-exit release slots on teardown/crash as well.
-    private static func acquireSlot(
-        in directory: URL, count: Int, cancellation: Cancellation, didWait: @Sendable () -> Void
-    ) throws -> Int32 {
-        precondition(count > 0)
-        if mkdir(directory.path, 0o700) != 0, errno != EEXIST {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        let directoryFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard directoryFD >= 0 else { throw ReadError.unsafeAdmissionDirectory }
-        defer { close(directoryFD) }
-        var metadata = stat()
-        guard fstat(directoryFD, &metadata) == 0,
-              metadata.st_uid == getuid(), metadata.st_mode & 0o077 == 0
-        else { throw ReadError.unsafeAdmissionDirectory }
-        while true {
-            try cancellation.check()
-            for index in 0 ..< count {
-                let fd = openat(directoryFD, "slot-\(index)", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
-                guard fd >= 0 else { throw ReadError.unsafeAdmissionDirectory }
-                var slotMetadata = stat()
-                guard fstat(fd, &slotMetadata) == 0,
-                      slotMetadata.st_mode & S_IFMT == S_IFREG,
-                      slotMetadata.st_uid == getuid(), slotMetadata.st_mode & 0o077 == 0,
-                      slotMetadata.st_nlink == 1
-                else {
-                    close(fd)
-                    throw ReadError.unsafeAdmissionDirectory
-                }
-                if flock(fd, LOCK_EX | LOCK_NB) == 0 { return fd }
-                let lockError = errno
-                close(fd)
-                guard lockError == EWOULDBLOCK || lockError == EAGAIN else {
-                    throw POSIXError(POSIXErrorCode(rawValue: lockError) ?? .EIO)
-                }
-            }
-            didWait()
-            // Only bounded worker threads wait here, not the Swift cooperative pool.
-            Thread.sleep(forTimeInterval: 0.01)
         }
     }
 
@@ -149,7 +111,8 @@ package enum MCPDomainHeadlessFileReader {
         var selection = Lines(startLine: startLine, limit: limit)
         var line = Data()
         var bytesRead = 0
-        var finished = selection.isComplete
+        let validationOnly = selection.isComplete
+        var finished = false
         while !finished {
             try cancellation.check()
             let chunk = try handle.read(upToCount: min(chunkSize, maximumBytes - bytesRead + 1)) ?? Data()
@@ -162,7 +125,6 @@ package enum MCPDomainHeadlessFileReader {
                 break
             }
             for byte in chunk {
-                guard byte != 0 else { throw ReadError.invalidText }
                 line.append(byte)
                 let delimiterBytes: Int
                 if byte == 10 || byte == 11 || byte == 12 || byte == 13 {
@@ -180,7 +142,7 @@ package enum MCPDomainHeadlessFileReader {
                 line.removeLast(delimiterBytes)
                 try selection.append(line, hasDelimiter: true)
                 line.removeAll(keepingCapacity: true)
-                if selection.isComplete { finished = true
+                if selection.isComplete, !validationOnly { finished = true
                     break
                 }
             }
@@ -218,12 +180,12 @@ package enum MCPDomainHeadlessFileReader {
     /// without following any new symlink, including parent components replaced during admission.
     private static func openWithoutSymlinks(_ path: String) throws -> Int32 {
         let parts = path.split(separator: "/").map(String.init)
-        var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        var directory = open("/", O_SEARCH | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw POSIXError(.EIO) }
         defer { close(directory) }
         for (index, part) in parts.enumerated() {
             let isLeaf = index == parts.count - 1
-            let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | (isLeaf ? 0 : O_DIRECTORY)
+            let flags = O_NOFOLLOW | O_CLOEXEC | (isLeaf ? O_RDONLY | O_NONBLOCK : O_SEARCH)
             let next = openat(directory, part, flags)
             guard next >= 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO, userInfo: [NSFilePathErrorKey: path, "component": part])
@@ -264,7 +226,7 @@ package enum MCPDomainHeadlessFileReader {
         mutating func append(_ data: Data, hasDelimiter: Bool) throws {
             guard String(data: data, encoding: .utf8) != nil else { throw ReadError.invalidText }
             defer { index += 1 }
-            guard index >= firstIndex else { return }
+            guard !isComplete, index >= firstIndex else { return }
             // Foundation's whole-file UTF-8 decoder consumes a BOM only at file offset zero.
             // Keep interior U+FEFF even when line slicing makes it the first output scalar.
             if index == 0, data.starts(with: [0xEF, 0xBB, 0xBF]) {

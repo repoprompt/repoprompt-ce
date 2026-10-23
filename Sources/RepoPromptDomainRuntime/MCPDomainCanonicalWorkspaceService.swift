@@ -81,9 +81,11 @@ package struct DomainCanonicalWorkspaceAdapter {
 /// mutation admission, and response shapes are owned here.
 package struct MCPDomainCanonicalWorkspaceService {
     private let adapter: DomainCanonicalWorkspaceAdapter
+    private let fileReadSlotDirectory: URL?
 
-    package init(adapter: DomainCanonicalWorkspaceAdapter) {
+    package init(adapter: DomainCanonicalWorkspaceAdapter, fileReadSlotDirectory: URL? = nil) {
         self.adapter = adapter
+        self.fileReadSlotDirectory = fileReadSlotDirectory
     }
 
     package func mutateSelection(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -175,12 +177,18 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("missing path")
         }
         let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
-        let text = try await MCPDomainHeadlessFileReader.read(
-            at: url,
-            startLine: args["start_line"]?.intValue,
-            limit: args["limit"]?.intValue
-        )
-        return try .mcp(.string(text))
+        do {
+            let text = try await MCPDomainHeadlessFileReader.read(
+                at: url,
+                startLine: args["start_line"]?.intValue,
+                limit: args["limit"]?.intValue,
+                slotDirectory: fileReadSlotDirectory
+            )
+            return try .mcp(.string(text))
+        } catch let error as POSIXError {
+            // Tool errors describe the requested operation, not hidden physical aliases.
+            throw MCPError.invalidParams("Cannot read requested file (POSIX \(error.code.rawValue): \(String(cString: strerror(error.code.rawValue))))")
+        }
     }
 
     package func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {

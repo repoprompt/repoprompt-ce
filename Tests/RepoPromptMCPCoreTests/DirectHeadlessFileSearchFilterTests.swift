@@ -224,7 +224,7 @@ final class DirectHeadlessFileSearchFilterTests: XCTestCase {
             resolvePath: { rawPath, roots, allowMissingLeaf in
                 try DirectHeadlessDomainContext.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
             }
-        ))
+        ), fileReadSlotDirectory: roots[0].deletingLastPathComponent().appendingPathComponent("read-slots"))
     }
 
     private static func request(_ arguments: [String: Value]) throws -> DomainPhysicalReadRequest {
