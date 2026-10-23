@@ -25,7 +25,7 @@ struct AgentContextPill: View {
     }
 
     private var estimatedUsedTokens: Int? {
-        runtimeVM.snapshot.usedTokens ?? runtimeVM.snapshot.estimatedTranscriptTokens
+        runtimeVM.snapshot.displayUsedTokens
     }
 
     private var contextWindowTokens: Int {
@@ -76,8 +76,10 @@ struct AgentContextPill: View {
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
-        if let usedTokens = estimatedUsedTokens,
-           contextWindowTokens > 0
+        if runtimeVM.snapshot.awaitingPostCompactionUsage {
+            lines.append(runtimeVM.snapshot.displayUsageLabel)
+        } else if let usedTokens = estimatedUsedTokens,
+                  contextWindowTokens > 0
         {
             let usedPercent = min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
             lines.append("Context used: \(Int(usedPercent.rounded()))%")
@@ -88,6 +90,9 @@ struct AgentContextPill: View {
             lines.append("Context usage unavailable")
         }
 
+        if !runtimeVM.snapshot.awaitingPostCompactionUsage {
+            lines.append("Source: \(runtimeVM.snapshot.displayUsageLabel)")
+        }
         lines.append("Selected context: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
@@ -123,6 +128,8 @@ struct AgentContextPill: View {
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
                     usedTokens: estimatedUsedTokens,
+                    sourceLabel: runtimeVM.snapshot.displayUsageLabel,
+                    awaitingPostCompactionUsage: runtimeVM.snapshot.awaitingPostCompactionUsage,
                     style: .compact
                 )
             }

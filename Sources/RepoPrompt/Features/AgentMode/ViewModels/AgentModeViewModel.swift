@@ -16,6 +16,8 @@ struct AgentContextUsage: Codable, Equatable {
     var modelContextWindow: Int?
     var lastTotalTokens: Int?
     var totalTotalTokens: Int?
+    /// Optional for backward-compatible decoding of older usage snapshots; nil means not pending.
+    var awaitingPostCompactionUsage: Bool? = nil
 }
 
 // MARK: - Agent Mode View Model
@@ -7333,7 +7335,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
-            if session.codexContextUsage?.lastTotalTokens == nil {
+            session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp
+            if session.codexContextUsage?.lastTotalTokens == nil || session.contextCompactedAt != nil {
                 session.codexContextUsage = Self.contextUsageFromClaudeProviderTokens(
                     session.providerTokenUsageByTurn,
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
