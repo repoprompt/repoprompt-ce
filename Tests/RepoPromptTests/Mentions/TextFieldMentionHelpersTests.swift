@@ -39,6 +39,62 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         XCTAssertEqual(textView.string, "@Sources/Second.swift ")
     }
 
+    func testSlashEnterPreservesExactCommandEvenWhenAnotherRowIsHighlighted() {
+        let textView = Self.makeSlashTriggerTextView()
+        textView.string = "/compact"
+        textView.setSelectedRange(NSRange(location: 8, length: 0))
+        let helper = SlashSkillMentionHelper()
+        helper.setSelectionStateForTesting(suggestions: [
+            MentionSuggestion(displayName: "/compact-review", relativePath: "compact-review", kind: .skill),
+            MentionSuggestion(displayName: "/compact", relativePath: "compact", kind: .skill)
+        ], triggerRange: NSRange(location: 0, length: 8), query: "compact")
+
+        XCTAssertFalse(helper.handleCommandIfNeeded(textView: textView, commandSelector: #selector(NSResponder.insertNewline(_:)), enabled: true))
+        XCTAssertEqual(textView.string, "/compact")
+        XCTAssertTrue(helper.suggestionsForTesting.isEmpty)
+    }
+
+    func testSlashEnterDoesNotAcceptStaleSuggestionsAfterTypingExactCommand() {
+        let textView = Self.makeSlashTriggerTextView()
+        textView.string = "/compact"
+        textView.setSelectedRange(NSRange(location: 8, length: 0))
+        let helper = SlashSkillMentionHelper()
+        helper.setSelectionStateForTesting(suggestions: [
+            MentionSuggestion(displayName: "/code-review", relativePath: "code-review", kind: .skill)
+        ], triggerRange: NSRange(location: 0, length: 3), query: "co")
+
+        XCTAssertFalse(helper.handleCommandIfNeeded(textView: textView, commandSelector: #selector(NSResponder.insertNewline(_:)), enabled: true))
+        XCTAssertEqual(textView.string, "/compact")
+    }
+
+    func testSlashEnterRejectsStaleQueryEvenWhenTokenLengthIsUnchanged() {
+        let textView = Self.makeSlashTriggerTextView()
+        textView.string = "/compact"
+        textView.setSelectedRange(NSRange(location: 8, length: 0))
+        let helper = SlashSkillMentionHelper()
+        helper.setSelectionStateForTesting(suggestions: [
+            MentionSuggestion(displayName: "/collect", relativePath: "collect", kind: .skill)
+        ], triggerRange: NSRange(location: 0, length: 8), query: "collect")
+
+        XCTAssertFalse(helper.handleCommandIfNeeded(textView: textView, commandSelector: #selector(NSResponder.insertNewline(_:)), enabled: true))
+        XCTAssertEqual(textView.string, "/compact")
+    }
+
+    func testSlashPartialEnterAndExactTabStillCompleteSuggestion() {
+        for (input, selector) in [("/com", #selector(NSResponder.insertNewline(_:))), ("/compact", #selector(NSResponder.insertTab(_:)))] {
+            let textView = Self.makeSlashTriggerTextView()
+            textView.string = input
+            textView.setSelectedRange(NSRange(location: input.utf16.count, length: 0))
+            let helper = SlashSkillMentionHelper()
+            helper.setSelectionStateForTesting(suggestions: [
+                MentionSuggestion(displayName: "/compact", relativePath: "compact", kind: .skill)
+            ], triggerRange: NSRange(location: 0, length: input.utf16.count), query: String(input.dropFirst()))
+
+            XCTAssertTrue(helper.handleCommandIfNeeded(textView: textView, commandSelector: selector, enabled: true))
+            XCTAssertEqual(textView.string, "/compact ")
+        }
+    }
+
     func testSlashSkillConfigurationOutcomeOnlyActivatesOnAnOffToOnTransition() {
         XCTAssertEqual(
             SlashSkillMentionHelper.configurationOutcome(

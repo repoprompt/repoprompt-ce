@@ -19,7 +19,7 @@ final actor ClaudeNativeProcessSessionController {
 
     struct RuntimeInitStatus: Equatable {
         struct InitializeResponseSnapshot: Equatable {
-            struct Command: Equatable {
+            struct Command: Equatable, Sendable {
                 let name: String
                 let description: String
                 let argumentHint: String
@@ -455,6 +455,11 @@ final actor ClaudeNativeProcessSessionController {
 
     func currentSessionRef() async -> SessionRef {
         SessionRef(sessionID: sessionID)
+    }
+
+    func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
+        guard hasActiveSession, !isShuttingDown else { return [] }
+        return initializeResponseSnapshot?.commands ?? []
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {

@@ -2976,6 +2976,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     lazy var acpContextUsageEstimator = ACPContextUsageEstimator()
 
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
+        let sourceTabID = currentTabID
+        let sourceSession = activeSession
+        let sourceControllerID = sourceSession?.claudeController.map(ObjectIdentifier.init)
         let slashSession: TabSession? = {
             if let activeSession {
                 return activeSession
@@ -2995,17 +2998,41 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let skillQuery = isExplicitSkillNamespaceQuery
             ? String(query.dropFirst("skill:".count))
             : query
-        let nativeSuggestions = isExplicitSkillNamespaceQuery ? [] : (slashSession.map {
+        let agentKind = slashSession?.selectedAgent ?? selectedAgent
+        func requestIsCurrent() -> Bool {
+            currentTabID == sourceTabID
+                && activeSession === sourceSession
+                && (activeSession?.selectedAgent ?? selectedAgent) == agentKind
+                && sourceSession?.claudeController.map(ObjectIdentifier.init) == sourceControllerID
+        }
+        var nativeSuggestions = isExplicitSkillNamespaceQuery ? [] : (slashSession.map {
             codexCoordinator.nativeSlashCommandSuggestions(
                 for: $0,
                 query: query,
                 limit: Self.slashSkillSuggestionLimit
             )
         } ?? [])
-        let nativeNames: Set<String> = slashSession?.selectedAgent == .codexExec
-            ? Set(CodexAgentModeCoordinator.NativeSlashCommand.allCases.map { $0.rawValue.lowercased() })
-            : []
-        await refreshSkillCatalog(force: false)
+        if agentKind == .claudeCode, !isExplicitSkillNamespaceQuery {
+            let commands = await slashSession?.claudeController?.availableSlashCommands() ?? []
+            nativeSuggestions = Self.claudeSlashCommandSuggestions(for: query, runtimeCommands: commands)
+        }
+        let nativeNames: Set<String> = switch agentKind {
+        case .codexExec where slashSession != nil:
+            Set(CodexAgentModeCoordinator.NativeSlashCommand.allCases.map { $0.rawValue.lowercased() })
+        case .claudeCode:
+            [AgentProviderControlCommand.Kind.compact.rawValue]
+        default:
+            []
+        }
+        guard requestIsCurrent() else { return [] }
+        let nativeCommandOwner = agentKind == .claudeCode ? "Claude Code" : "Codex"
+        await refreshSkillCatalog(force: false, agentKind: agentKind)
+        guard requestIsCurrent() else { return [] }
+        // Advertisements include user skills too. Prefer the local row/content for those
+        // duplicates; only known native commands require an explicit /skill: escape.
+        nativeSuggestions.removeAll {
+            !nativeNames.contains($0.relativePath.lowercased()) && skillCatalog.contains(name: $0.relativePath)
+        }
         let skillSuggestions = skillCatalog.suggestions(prefix: skillQuery, limit: Self.slashSkillSuggestionLimit)
             .prefix(max(0, Self.slashSkillSuggestionLimit - nativeSuggestions.count))
             .map { suggestion in
@@ -3015,7 +3042,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let relativePath = collidesWithNativeCommand ? "skill:\(suggestion.name)" : suggestion.name
                 let displayName = collidesWithNativeCommand ? "/skill:\(suggestion.name)" : "/\(suggestion.name)"
                 let subtitle = collidesWithNativeCommand
-                    ? ["Slash skill — use /skill:\(suggestion.name) to bypass Codex native /\(suggestion.name)", baseSubtitle]
+                    ? ["Slash skill — use /skill:\(suggestion.name) to bypass \(nativeCommandOwner) native /\(suggestion.name)", baseSubtitle]
                     .compactMap(\.self)
                     .joined(separator: " — ")
                     : baseSubtitle
@@ -3027,6 +3054,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
         return nativeSuggestions + skillSuggestions
+    }
+
+    /// Use advertised headless commands, not the interactive terminal's command catalog.
+    /// `/compact` is also available before the first runtime initialization.
+    static func claudeSlashCommandSuggestions(
+        for query: String,
+        runtimeCommands: [NativeAgentRuntimeSlashCommand]
+    ) -> [MentionSuggestion] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let compact = NativeAgentRuntimeSlashCommand(
+            name: AgentProviderControlCommand.Kind.compact.rawValue,
+            description: "Compact Claude Code conversation context",
+            argumentHint: ""
+        )
+        // An exact command must survive the menu cap even if the runtime lists it last.
+        let exactCommands = runtimeCommands.filter {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedQuery
+        }
+        var seen: Set<String> = []
+        let suggestions = (exactCommands + [compact] + runtimeCommands).compactMap { command -> MentionSuggestion? in
+            let name = command.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedName = name.lowercased()
+            guard !name.isEmpty, normalizedName.hasPrefix(normalizedQuery),
+                  seen.insert(normalizedName).inserted
+            else { return nil }
+            let subtitle = [command.description, command.argumentHint]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " — ")
+            return MentionSuggestion(
+                displayName: "/\(name)",
+                relativePath: name,
+                kind: .skill,
+                subtitle: subtitle.isEmpty ? nil : subtitle
+            )
+        }
+        return Array(suggestions.prefix(Self.slashSkillSuggestionLimit))
     }
 
     func effectiveWorkspacePath(for session: TabSession) throws -> String? {
@@ -20604,8 +20668,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return nil
     }
 
-    func resolvedSlashSkillInvocations(in text: String) -> [ResolvedSlashSkillInvocation] {
+    func resolvedSlashSkillInvocations(in text: String, agentKind: AgentProviderKind? = nil) -> [ResolvedSlashSkillInvocation] {
         Self.extractSlashSkillTokens(from: text).compactMap { token in
+            // Keep Claude's native maintenance command distinct from a same-named local skill.
+            // The skill remains reachable via the existing explicit /skill: namespace.
+            if (agentKind ?? activeSession?.selectedAgent ?? selectedAgent) == .claudeCode,
+               token.name.lowercased() == AgentProviderControlCommand.Kind.compact.rawValue
+            {
+                return nil
+            }
             let resolvedName: String = {
                 let normalizedName = token.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 if normalizedName.lowercased().hasPrefix("skill:") {
@@ -21317,7 +21388,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> String {
         guard !text.isEmpty else { return text }
         await refreshSkillCatalog(force: false, agentKind: agentKind)
-        var invocations = resolvedSlashSkillInvocations(in: text)
+        var invocations = resolvedSlashSkillInvocations(in: text, agentKind: agentKind)
 
         // Defensive fallback: if slash-skill tokens were detected syntactically but none
         // resolved (e.g. a skill was just installed and we missed the dirty signal),
@@ -21326,7 +21397,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let syntacticTokens = Self.extractSlashSkillTokens(from: text)
             if !syntacticTokens.isEmpty {
                 await refreshSkillCatalog(force: true, agentKind: agentKind)
-                invocations = resolvedSlashSkillInvocations(in: text)
+                invocations = resolvedSlashSkillInvocations(in: text, agentKind: agentKind)
             }
         }
 

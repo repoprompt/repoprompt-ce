@@ -432,6 +432,7 @@ final class SlashSkillMentionHelper {
     private var suggestionTask: Task<Void, Never>?
     private var suggestionRequestID: UInt64 = 0
     private var isProviderConfigured = false
+    private var suggestionsQuery: String?
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
 
     /// What a `configure` call should do, given the previous configuration state.
@@ -542,6 +543,21 @@ final class SlashSkillMentionHelper {
                 dismiss()
                 return false
             }
+            // Read the live token: the typing debounce may still leave older rows on screen.
+            guard let trigger = detectTrigger(in: textView),
+                  trigger.range == triggerRange,
+                  trigger.query == suggestionsQuery
+            else {
+                dismiss()
+                return false
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)),
+               suggestions.contains(where: { $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame })
+            {
+                // Let the composer's ordinary Return handler submit the exact typed command.
+                dismiss()
+                return false
+            }
             commitHighlighted(in: textView)
             return true
         }
@@ -563,6 +579,13 @@ final class SlashSkillMentionHelper {
             suggestions
         }
 
+        func setSelectionStateForTesting(suggestions: [MentionSuggestion], triggerRange: NSRange, query: String) {
+            self.suggestions = suggestions
+            self.triggerRange = triggerRange
+            suggestionsQuery = query
+            highlightedIndex = 0
+        }
+
         func clickSuggestionForTesting(at index: Int) {
             overlay.onRowClicked?(0, index)
         }
@@ -576,6 +599,7 @@ final class SlashSkillMentionHelper {
         suggestionRequestID &+= 1
         overlay.hide()
         suggestions.removeAll()
+        suggestionsQuery = nil
         highlightedIndex = 0
         triggerRange = nil
     }
@@ -630,6 +654,7 @@ final class SlashSkillMentionHelper {
             else { return }
 
             suggestions = freshSuggestions
+            suggestionsQuery = requestedQuery
             highlightedIndex = 0
             triggerRange = latestTrigger.range
 
