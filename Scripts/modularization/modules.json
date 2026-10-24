@@ -126,7 +126,8 @@
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
-        "RepoPromptShared"
+        "RepoPromptShared",
+        "RepoPromptVCS"
       ],
       "test_target": "RepoPromptMCPCoreTests",
       "app_free_tests": true
@@ -137,7 +138,8 @@
         "RepoPromptDomainRuntime",
         "RepoPromptMCPCore",
         "RepoPromptShared",
-        "RepoPromptTestSupport"
+        "RepoPromptTestSupport",
+        "RepoPromptVCS"
       ]
     },
     "RepoPromptProcess": {

@@ -956,3 +956,234 @@ private actor ListingSpy {
         await gate.wait()
     }
 }
+
+final class VCSReadRootAuthorizationTests: XCTestCase {
+    func testAppDiscoverySupportsSubdirectoriesAndBareRepositoriesWithoutGrantingScopedReads() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-discovery-\(UUID().uuidString)")
+            .resolvingSymlinksInPath()
+        let root = base.appendingPathComponent("root")
+        let nested = root.appendingPathComponent("nested")
+        let bare = base.appendingPathComponent("bare")
+        let plain = base.appendingPathComponent("plain")
+        for directory in [nested, bare, plain] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runFixtureGit(["init", "--quiet"], at: root)
+        try Self.runFixtureGit(["init", "--bare", "--quiet"], at: bare)
+        let service = GitService()
+        let discovered = try await service.findGitRoot(from: nested)
+        XCTAssertEqual(discovered?.resolvingSymlinksInPath().path, root.path)
+        let nestedKind = try await service.gitRepositoryKind(at: nested)
+        let bareKind = try await service.gitRepositoryKind(at: bare)
+        let plainKind = try await service.gitRepositoryKind(at: plain)
+        XCTAssertEqual(nestedKind, .worktree)
+        XCTAssertEqual(bareKind, .bare)
+        XCTAssertEqual(plainKind, .nonGit)
+        let scoped = await VCSService().resolveRepoForRead(at: nested, authorizedRoots: [nested])
+        XCTAssertNil(scoped, "App discovery must not become an MCP root grant")
+    }
+
+    func testNormalCheckoutReadDoesNotFollowConfiguredExternalWorktree() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-read-binding-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let external = base.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Data("inside".utf8).write(to: root.appendingPathComponent("inside-only.txt"))
+        try Data("outside".utf8).write(to: external.appendingPathComponent("outside-only.txt"))
+        for args in [["init", "--quiet"], ["config", "core.worktree", external.path]] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", root.path] + args
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+        }
+        let status = try await GitService().getStatusPorcelainZ(at: root)
+        let text = String(decoding: status, as: UTF8.self)
+        XCTAssertTrue(text.contains("inside-only.txt"), text)
+        XCTAssertFalse(text.contains("outside-only.txt"), text)
+    }
+
+    func testJujutsuMetadataDoesNotExpandReadRoots() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("jj-read-root-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let external = base.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let service = VCSService(jjRunner: JJCommandRunner { _, _, _ in ("", "", 0) })
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        let initial = await service.resolveRepo(from: root)
+        XCTAssertEqual(initial?.backendKind, .git)
+        let jjDirectory = root.appendingPathComponent(".jj")
+        try FileManager.default.createSymbolicLink(at: jjDirectory, withDestinationURL: external)
+        let symlinkResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(symlinkResult)
+        try FileManager.default.removeItem(at: jjDirectory)
+        try FileManager.default.createDirectory(at: jjDirectory, withIntermediateDirectories: true)
+        let externalStore = external.appendingPathComponent("store")
+        try FileManager.default.createDirectory(at: externalStore.appendingPathComponent("git"), withIntermediateDirectories: true)
+        try Data("git".utf8).write(to: externalStore.appendingPathComponent("type"))
+        try Data("git".utf8).write(to: externalStore.appendingPathComponent("git_target"))
+        try Data(external.path.utf8).write(to: jjDirectory.appendingPathComponent("repo"))
+        let pointerResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(pointerResult)
+        let approvedResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root, external])
+        XCTAssertEqual(approvedResult?.backendKind, .jujutsu)
+        let backend = await service.backend(forRepoRoot: root)
+        XCTAssertEqual(backend.kind, .jujutsu)
+    }
+
+    func testReadBindingPreservesDeniedAndExplicitlyTrustedGitOwnership() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-ownership-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let linked = base.appendingPathComponent("linked")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runFixtureGit(["init", "--quiet"], at: root)
+        try Self.runFixtureGit(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "Fixture"], at: root)
+        try Self.runFixtureGit(["worktree", "add", "--quiet", "--detach", linked.path, "HEAD"], at: root)
+
+        for checkout in [root, linked] {
+            try Data("inside".utf8).write(to: checkout.appendingPathComponent("inside-only.txt"))
+            var environment = ProcessInfo.processInfo.environment
+            environment["GIT_CONFIG_NOSYSTEM"] = "1"
+            environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            environment["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+            environment["GIT_CONFIG_COUNT"] = "1"
+            environment["GIT_CONFIG_KEY_0"] = "safe.directory"
+            environment["GIT_CONFIG_VALUE_0"] = ""
+            environment["GIT_DIR"] = root.appendingPathComponent(".git").path
+            environment["GIT_COMMON_DIR"] = root.appendingPathComponent(".git").path
+            let denied = GitService(inheritedProcessEnvironment: environment)
+            do {
+                _ = try await denied.getStatusPorcelainZ(at: checkout)
+                XCTFail("Explicit binding must not bypass Git's ownership refusal")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("dubious ownership"), String(describing: error))
+            }
+
+            environment["GIT_CONFIG_VALUE_0"] = checkout.resolvingSymlinksInPath().path
+            let trusted = GitService(inheritedProcessEnvironment: environment)
+            let status = try await trusted.getStatusPorcelainZ(at: checkout)
+            XCTAssertTrue(String(decoding: status, as: UTF8.self).contains("inside-only.txt"))
+        }
+    }
+
+    func testAppReadDoesNotAdoptParentWhenRequestedMetadataDisappearsOrIsMalformed() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-parent-fence-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runFixtureGit(["init", "--quiet"], at: base)
+        try Data("outside".utf8).write(to: base.appendingPathComponent("outside-only.txt"))
+        for replacement in ["missing", "malformed", "empty-directory"] {
+            let root = base.appendingPathComponent(replacement)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Self.runFixtureGit(["init", "--quiet"], at: root)
+            let cached = GitService()
+            _ = try await cached.getStatusPorcelainZ(at: root)
+            try FileManager.default.moveItem(at: root.appendingPathComponent(".git"), to: root.appendingPathComponent("saved-metadata"))
+            if replacement == "malformed" {
+                try Data("not a gitfile".utf8).write(to: root.appendingPathComponent(".git"))
+            } else if replacement == "empty-directory" {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+            }
+            for service in [cached, GitService()] {
+                do {
+                    let status = try await service.getStatusPorcelainZ(at: root)
+                    XCTFail("\(replacement) must not adopt enclosing data: \(String(decoding: status, as: UTF8.self))")
+                } catch {
+                    // Both cached and fresh exact-root reads must refuse.
+                }
+            }
+        }
+    }
+
+    func testJujutsuGitStoreTargetsAreScopedAndMalformedPointersFailClosed() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("jj-store-root-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let outside = base.appendingPathComponent("outside")
+        let store = root.appendingPathComponent(".jj/repo/store")
+        let git = store.appendingPathComponent("git")
+        let whitespaceSibling = base.appendingPathComponent("root ")
+        try FileManager.default.createDirectory(at: git, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: whitespaceSibling, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Data("git".utf8).write(to: store.appendingPathComponent("type"))
+        let pointer = store.appendingPathComponent("git_target")
+        let service = VCSService(jjRunner: JJCommandRunner { _, _, _ in ("", "", 0) })
+        for path in [outside.path, whitespaceSibling.path, "../../../../outside", "git\0/../outside", "git\n", "", String(repeating: "./", count: 2100)] {
+            try Data(path.utf8).write(to: pointer)
+            let result = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+            XCTAssertNil(result, "Unexpected grant for \(path.debugDescription)")
+        }
+        try Data("git".utf8).write(to: pointer)
+        let valid = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertEqual(valid?.backendKind, .jujutsu)
+        let literalSpaceTarget = store.appendingPathComponent("git ")
+        try FileManager.default.createDirectory(at: literalSpaceTarget, withIntermediateDirectories: true)
+        try Data("git ".utf8).write(to: pointer)
+        let validLiteralPath = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertEqual(validLiteralPath?.backendKind, .jujutsu)
+        try Data("git".utf8).write(to: pointer)
+        let commonFile = git.appendingPathComponent("commondir")
+        try Data((outside.path + "\n").utf8).write(to: commonFile)
+        let outsideCommon = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(outsideCommon)
+        try FileManager.default.removeItem(at: commonFile)
+        try FileManager.default.removeItem(at: git)
+        try FileManager.default.createSymbolicLink(at: git, withDestinationURL: outside)
+        let symlink = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(symlink)
+        try FileManager.default.removeItem(at: git)
+        try FileManager.default.createDirectory(at: git, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: pointer)
+        try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: outside.appendingPathComponent("target"))
+        try Data("git".utf8).write(to: outside.appendingPathComponent("target"))
+        let metadataSymlink = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(metadataSymlink)
+        try FileManager.default.removeItem(at: pointer)
+        try Data("Simple".utf8).write(to: store.appendingPathComponent("type"))
+        let simple = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertEqual(simple?.backendKind, .jujutsu)
+        try Data("unknown".utf8).write(to: store.appendingPathComponent("type"))
+        let unknown = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(unknown)
+    }
+
+    private static func runFixtureGit(_ arguments: [String], at root: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", root.path] + arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "Git ownership fixture", code: Int(process.terminationStatus))
+        }
+    }
+
+    func testScopedDiscoveryDoesNotReuseParentRepositoryCache() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-read-root-\(UUID().uuidString)")
+        let nested = root.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = VCSService()
+        let unrestricted = await service.resolveRepo(from: nested)
+        XCTAssertEqual(unrestricted?.rootURL.standardizedFileURL.path, root.standardizedFileURL.path)
+        let scoped = await service.resolveRepoForRead(at: nested, authorizedRoots: [nested])
+        XCTAssertNil(scoped)
+        let unauthorizedParent = await service.resolveRepoForRead(at: root, authorizedRoots: [nested])
+        XCTAssertNil(unauthorizedParent)
+        let authorizedParent = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNotNil(authorizedParent)
+    }
+}

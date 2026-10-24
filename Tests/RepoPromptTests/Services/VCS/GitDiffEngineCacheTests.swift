@@ -165,7 +165,7 @@ import XCTest
         }
 
         private func assertSameFingerprintCallerRefresh(oversized: Bool) async throws {
-            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let fixture = try ReviewGitRepositoryFixture(name: "GitDiffEngineCacheCallerRefresh")
             let padding = String(repeating: "let padding = 0\n", count: 256)
             let repo = try fixture.makeRepository(
                 named: "repo",
