@@ -1657,13 +1657,18 @@ class WorkspaceFilesViewModel: ObservableObject {
             hiddenSessionHandledGenerationByRootLifetime.removeValue(forKey: lifetimeKey)
             return true
         }
-        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
-              snapshot.root.kind == .sessionWorktree,
-              snapshot.root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
+        guard let root = await workspaceFileContextStore.roots().first(where: { $0.id == event.rootID }),
+              root.kind == .sessionWorktree,
+              root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
         else { return false }
 
         let handled = hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] ?? 0
         guard event.generation > handled else { return true }
+        guard let records = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: event.modifiedFileIDs,
+            folderIDs: []
+        ) else { return false }
         let expected = handled &+ 1
         guard event.generation == expected, !event.requiresFullResync else {
             cancelHiddenSessionSliceRebases(for: lifetimeKey)
@@ -1671,13 +1676,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             return true
         }
 
-        let modifiedFileIDs = Set(event.modifiedFileIDs)
-        let modifiedFilesByID: [UUID: WorkspaceFileRecord] = Dictionary(uniqueKeysWithValues: snapshot.files.compactMap { file in
-            guard modifiedFileIDs.contains(file.id), file.rootID == event.rootID else { return nil }
-            return (file.id, file)
-        })
+        let modifiedFilesByID = records.filesByID
         let targetsByFileID = await hiddenSessionSliceRebaseTargets(
-            physicalRootPath: snapshot.root.standardizedFullPath,
+            physicalRootPath: root.standardizedFullPath,
             modifiedFilesByID: modifiedFilesByID
         ) ?? [:]
 
@@ -1703,7 +1704,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 rootID: event.rootID,
                 rootLifetimeID: rootLifetimeID,
                 fileID: fileID,
-                physicalRootPath: snapshot.root.standardizedFullPath,
+                physicalRootPath: root.standardizedFullPath,
                 physicalFullPath: file.standardizedFullPath,
                 relativePath: file.standardizedRelativePath,
                 sourceSnapshot: sourceSnapshot,
