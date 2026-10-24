@@ -741,7 +741,16 @@ final class DevinPermissionLevelTests: XCTestCase {
             } catch {
                 XCTAssertTrue(error.localizedDescription.contains("approval"), "\(scenario): \(error)")
             }
+            // Stream failure precedes child-process receipt; wait for the recorded wire
+            // response before disposal can terminate the fixture.
+            let responseRecorded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                guard let data = try? Data(contentsOf: record) else { return false }
+                return (try? JSONSerialization.jsonObject(with: data)) != nil
+            }, object: nil)
+            await fulfillment(of: [responseRecorded], timeout: 2)
             await provider.dispose()
+            let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            XCTAssertEqual(response, ["outcome": "selected", "optionId": "reject_once"], scenario)
         }
     }
 
