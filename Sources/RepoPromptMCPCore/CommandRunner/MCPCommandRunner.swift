@@ -710,7 +710,8 @@ actor MCPCommandRunner {
               (mode, result, winner_session_id, pending_session_ids).
             Multi-poll returns poll metadata plus a snapshots array.
             Responses include failure_reason on failed/cancelled runs
-              (process_crash, timeout, agent_error, resume_history_too_large, cancelled).
+              (process_crash, timeout, agent_error, resume_timed_out,
+              resume_history_too_large, cancelled).
             MCP-started orchestrate runs can dispatch sub-agents;
               sub-agents cannot recursively start additional agent runs.
 
