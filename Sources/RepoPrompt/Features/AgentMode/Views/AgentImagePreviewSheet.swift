@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// Full-size viewer for an Agent Mode image attachment, opened from composer and transcript cards.
@@ -51,6 +52,12 @@ struct AgentImagePreviewSheet: View {
         .background(closeShortcut)
         .onExitCommand { dismiss() }
         .onAppear(perform: loadPreview)
+        .onReceive(AgentAttachmentThumbnailCache.shared.invalidatedPaths.receive(on: DispatchQueue.main)) { paths in
+            guard let path, paths.contains(path) else { return }
+            loadToken?.cancel()
+            loadToken = nil
+            phase = .missing
+        }
         .onDisappear {
             loadToken?.cancel()
             loadToken = nil
@@ -135,7 +142,7 @@ struct AgentImagePreviewSheet: View {
     }
 
     private func revealInFinder() {
-        guard let path else { return }
+        guard canReveal, let path else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 

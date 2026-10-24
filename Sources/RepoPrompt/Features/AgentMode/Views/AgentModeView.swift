@@ -1925,8 +1925,8 @@ struct AgentModeChatDetailView: View {
         return AgentImagePaneDropDelegate(
             controller: imageDropController,
             currentTabID: { tabID },
-            attachImages: { tabID, urls in
-                agentModeVM.attachImagesIfAllowed(tabID: tabID, urls: urls)
+            prepareAttachImages: { tabID in
+                agentModeVM.prepareImageAttachmentIntake(tabID: tabID)
             }
         )
     }

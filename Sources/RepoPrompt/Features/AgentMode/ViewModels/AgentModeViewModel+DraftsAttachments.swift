@@ -340,10 +340,29 @@ extension AgentModeViewModel {
         )
     }
 
+    /// Capture the drop's live owner before asynchronous item providers load. Switching tabs is
+    /// allowed; replacing its session, rebinding it, or switching workspaces invalidates the intake.
+    func prepareImageAttachmentIntake(tabID: UUID) -> ([URL]) -> Void {
+        guard let session = session(for: tabID, createIfNeeded: false) else { return { _ in } }
+        let workspaceID = workspaceManager?.activeWorkspaceID
+        let sessionID = session.activeAgentSessionID
+        return { [weak self, weak session] urls in
+            guard let self, let session,
+                  sessions[tabID] === session,
+                  workspaceManager?.activeWorkspaceID == workspaceID,
+                  session.activeAgentSessionID == sessionID
+            else { return }
+            attachImagesIfAllowed(tabID: tabID, urls: urls)
+        }
+    }
+
     /// Paste and drop entry point: attaches when the guard allows it, otherwise explains why not.
     @discardableResult
     func attachImagesIfAllowed(tabID: UUID, urls: [URL]) -> Bool {
         guard !urls.isEmpty,
+              // A delayed paste/drop must not recreate a tab removed while its providers loaded.
+              let session = session(for: tabID, createIfNeeded: false),
+              !session.bindingTransitionInProgress,
               // Pane drops retain their drag-start tab even after a tab switch, but must not
               // mutate a draft while that tab's reprompt operation owns it.
               repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID)
@@ -511,13 +530,11 @@ extension AgentModeViewModel {
             return
         }
         let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
-        let temporaryRoot = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
-        let move = Task.detached(priority: .utility) {
-            store.retain(attachments, sessionID: sessionID, temporaryRoot: temporaryRoot)
-        }
         let token = UUID()
         attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
-            let result = await move.value
+            let result = await AgentSessionDataService.shared.retainConsumedAttachments(
+                attachments, sessionID: sessionID, store: store, workspaceDirectory: workspaceDirectory
+            )
             guard let self else { return }
             attachmentRetentionTasks[token] = nil
             let movedPaths = attachments

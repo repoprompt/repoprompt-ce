@@ -60,16 +60,17 @@ final class AgentImageDropController: ObservableObject {
     func performPaneDrop(
         currentTabID: UUID?,
         load: (_ completion: @escaping ([AgentImageInputAdapter.PreparedImage]) -> Void) -> Bool,
-        attach: @escaping (_ tabID: UUID, _ prepared: [AgentImageInputAdapter.PreparedImage]) -> Void
+        prepareAttach: (_ tabID: UUID) -> ([AgentImageInputAdapter.PreparedImage]) -> Void
     ) -> Bool {
         let accepts = tracker.classification.map { $0 != .notImages } ?? true
         let target = tracker.takeDropTarget(fallbackTabID: currentTabID)
         publishHighlight()
         isTextViewImageDragActive = false
         guard accepts, let target else { return false }
+        let attach = prepareAttach(target)
         return load { prepared in
             guard !prepared.isEmpty else { return }
-            attach(target, prepared)
+            attach(prepared)
         }
     }
 
@@ -113,7 +114,7 @@ final class AgentImageDropController: ObservableObject {
 struct AgentImagePaneDropDelegate: DropDelegate {
     let controller: AgentImageDropController
     let currentTabID: () -> UUID?
-    let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
+    let prepareAttachImages: (_ tabID: UUID) -> ([URL]) -> Void
     var imageInputAdapter = AgentImageInputAdapter()
 
     static let acceptedTypes: [UTType] = [.image, .fileURL]
@@ -142,15 +143,18 @@ struct AgentImagePaneDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let providers = info.itemProviders(for: Self.acceptedTypes)
         let adapter = imageInputAdapter
-        let attachImages = attachImages
+        let prepareAttachImages = prepareAttachImages
         return controller.performPaneDrop(
             currentTabID: currentTabID(),
             load: { completion in
                 adapter.loadPreparedImages(from: providers, completion: completion)
             },
-            attach: { tabID, prepared in
-                attachImages(tabID, prepared.map(\.url))
-                adapter.cleanupTemporaryFiles(prepared)
+            prepareAttach: { tabID in
+                let attach = prepareAttachImages(tabID)
+                return { prepared in
+                    attach(prepared.map(\.url))
+                    adapter.cleanupTemporaryFiles(prepared)
+                }
             }
         )
     }

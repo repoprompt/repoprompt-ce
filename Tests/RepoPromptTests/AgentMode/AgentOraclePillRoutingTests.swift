@@ -1735,6 +1735,39 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertEqual(session.pendingImageAttachments, [attachment])
     }
 
+    func testEvictionPublishesInvalidationAndFencesAlreadyQueuedCachedThumbnail() async throws {
+        let source = workspaceDirectory.appendingPathComponent("\(UUID().uuidString).png")
+        let png = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="))
+        try png.write(to: source)
+        let cache = AgentAttachmentThumbnailCache.shared
+        let key = AgentAttachmentImageKey.preview(path: source.path, backingScale: 1)
+        let loaded = expectation(description: "Initial image loaded")
+        let initialToken = cache.loadImage(for: key) { result in
+            guard case .image = result else { return XCTFail("Fixture must decode as an image") }
+            loaded.fulfill()
+        }
+        defer { initialToken.cancel() }
+        await fulfillment(of: [loaded], timeout: 5)
+        XCTAssertNotNil(cache.cachedImage(for: key))
+        let invalidated = expectation(description: "Mounted-card invalidation delivered")
+        let subscription = cache.invalidatedPaths.receive(on: DispatchQueue.main).sink { paths in
+            guard paths.contains(source.path) else { return }
+            XCTAssertEqual(cache.availability.cachedAvailability(forPath: source.path), .missing)
+            invalidated.fulfill()
+        }
+        defer { subscription.cancel() }
+        let refreshed = expectation(description: "Queued cached result becomes missing")
+        let queuedToken = cache.loadImage(for: key) { result in
+            guard case .missing = result else { return XCTFail("Eviction must fence the queued cached image") }
+            refreshed.fulfill()
+        }
+        defer { queuedToken.cancel() }
+        try FileManager.default.removeItem(at: source)
+        cache.invalidate(paths: [source.path])
+        await fulfillment(of: [invalidated, refreshed], timeout: 5)
+        XCTAssertNil(cache.cachedImage(for: key))
+    }
+
     func testPasteAndDropAttachWhenAllowed() throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
@@ -1799,9 +1832,11 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 pendingCompletion = completion
                 return true
             },
-            attach: { tabID, prepared in
-                attachedTab = tabID
-                attachedURLs = prepared.map(\.url)
+            prepareAttach: { tabID in
+                { prepared in
+                    attachedTab = tabID
+                    attachedURLs = prepared.map(\.url)
+                }
             }
         )
         XCTAssertTrue(accepted)
@@ -1812,6 +1847,47 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         pendingCompletion?([AgentImageInputAdapter.PreparedImage(url: image, isTemporary: false)])
         XCTAssertEqual(attachedTab, dragStartTab)
         XCTAssertEqual(attachedURLs, [image])
+    }
+
+    func testDelayedPaneDropDoesNotRecreateRemovedSession() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let removedSession = viewModel.session(for: tabID)
+        let source = try writeSourceImage()
+        let controller = AgentImageDropController()
+        var pendingCompletion: (([AgentImageInputAdapter.PreparedImage]) -> Void)?
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: tabID)
+        XCTAssertTrue(controller.performPaneDrop(
+            currentTabID: tabID,
+            load: { pendingCompletion = $0
+                return true
+            },
+            prepareAttach: { tabID in
+                let attach = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+                return { prepared in attach(prepared.map(\.url)) }
+            }
+        ))
+        viewModel.test_removeSession(tabID: tabID)
+        pendingCompletion?([AgentImageInputAdapter.PreparedImage(url: source, isTemporary: false)])
+        XCTAssertNil(viewModel.session(for: tabID, createIfNeeded: false))
+        XCTAssertTrue(removedSession.pendingImageAttachments.isEmpty)
+    }
+
+    func testPreparedDropDoesNotAttachToReplacementOrReboundSession() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let original = viewModel.session(for: tabID)
+        let source = try writeSourceImage()
+        let attachBeforeReplacement = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        viewModel.test_removeSession(tabID: tabID)
+        let replacement = viewModel.session(for: tabID)
+        attachBeforeReplacement([source])
+        XCTAssertTrue(original.pendingImageAttachments.isEmpty)
+        XCTAssertTrue(replacement.pendingImageAttachments.isEmpty)
+        let attachBeforeRebinding = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        replacement.testInstallPersistentSessionBinding(sessionID: UUID())
+        attachBeforeRebinding([source])
+        XCTAssertTrue(replacement.pendingImageAttachments.isEmpty)
     }
 
     func testNonImageDropsAreNotHighlightedOrAccepted() {
@@ -1828,7 +1904,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 loadCalled = true
                 return true
             },
-            attach: { _, _ in XCTFail("Non-image drops must not attach") }
+            prepareAttach: { _ in { _ in XCTFail("Non-image drops must not attach") } }
         )
         XCTAssertFalse(accepted)
         XCTAssertFalse(loadCalled)

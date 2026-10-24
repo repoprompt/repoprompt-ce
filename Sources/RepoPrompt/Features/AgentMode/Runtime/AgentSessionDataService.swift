@@ -189,15 +189,19 @@ actor AgentSessionDataService {
     }
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
-    private var deletedSessionFileURLs: Set<URL> = []
+    /// Actor-owned state shared with the attachment-retention extension.
+    var deletedSessionFileURLs: Set<URL> = []
+    /// Admitted moves share the save/deletion tombstone. Deletion drains them before removing images.
+    var attachmentRetentionTasksByFileURL: [URL: [UUID: Task<AgentSessionAttachmentStore.RetentionResult, Never>]] = [:]
     /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
-    private var deletionAttemptCountByFileURL: [URL: Int] = [:]
+    var deletionAttemptsByFileURL: [URL: DeletionAttempts] = [:]
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var workspaceRootOverrideForTesting: URL?
         private var testWorktreeMergeReconciliationHooks: AgentSessionWorktreeMergeReconciliationHooks?
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
         private var testBeforeDeletionAdmissionHook: (@Sendable (URL) async -> Void)?
+        var testBeforeAttachmentRetentionHook: (@Sendable (URL) async -> Void)?
         /// Passive gate run inside `preparePersistedHydration` once the load result is known.
         private var testAfterHydrationPrepareHook: (@Sendable (UUID) async throws -> Void)?
     #endif
@@ -601,10 +605,6 @@ actor AgentSessionDataService {
 
     private func metadataIndexFileURL(forAgentSessionsFolder folder: URL) -> URL {
         folder.appendingPathComponent("AgentSessionIndex.json")
-    }
-
-    private func agentSessionFilename(for id: UUID) -> String {
-        "AgentSession-\(id.uuidString).json"
     }
 
     private func agentSessionFileURL(id: UUID, in folder: URL) -> URL {
@@ -1843,7 +1843,7 @@ actor AgentSessionDataService {
         try AppProfileLocations.current.validateMetadataFile(fileURL)
         let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
         deletedSessionFileURLs.insert(fileURL)
-        deletionAttemptCountByFileURL[fileURL, default: 0] += 1
+        deletionAttemptsByFileURL[fileURL, default: DeletionAttempts()].activeCount += 1
         #if DEBUG
             let tombstoneWaiters = deletionTombstoneWaitersByURL.removeValue(forKey: fileURL) ?? []
             for waiter in tombstoneWaiters {
@@ -1851,6 +1851,11 @@ actor AgentSessionDataService {
             }
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
+        // Tombstone admission is already closed, so this snapshot covers every possible move.
+        let attachmentMoves = Array(attachmentRetentionTasksByFileURL[fileURL]?.values ?? [:].values)
+        for move in attachmentMoves {
+            _ = await move.value
+        }
         do {
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
@@ -1860,19 +1865,14 @@ actor AgentSessionDataService {
                 try FileManager.default.removeItem(at: fileURL)
             }
         } catch {
-            let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
-            if remainingAttempts == 0 {
-                deletionAttemptCountByFileURL.removeValue(forKey: fileURL)
-                deletedSessionFileURLs.remove(fileURL)
-            } else {
-                deletionAttemptCountByFileURL[fileURL] = remainingAttempts
-            }
+            finishDeletionAttempt(for: fileURL, committed: false)
             await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
-        // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
+        finishDeletionAttempt(for: fileURL, committed: true)
+        // A committed tombstone stays permanent; an overlapping failure must not reopen saves.
     }
 
     private func discardSaveIfSessionWasDeleted(

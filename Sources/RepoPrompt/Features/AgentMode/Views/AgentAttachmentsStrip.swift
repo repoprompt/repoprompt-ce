@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ImageIO
 import SwiftUI
 
@@ -324,6 +325,12 @@ private struct AgentImageAttachmentCard: View {
         .cornerRadius(10)
         .hoverTooltip(isMissing ? "\(title) is no longer available" : title)
         .onAppear(perform: loadThumbnail)
+        .onReceive(AgentAttachmentThumbnailCache.shared.invalidatedPaths.receive(on: DispatchQueue.main)) { paths in
+            guard let path = AgentImageAttachmentAvailabilityResolver.path(for: attachment),
+                  paths.contains(URL(fileURLWithPath: path).standardizedFileURL.path)
+            else { return }
+            loadThumbnail()
+        }
         .onChange(of: attachment.source) { _, _ in
             loadThumbnail()
         }
@@ -506,12 +513,15 @@ final class AgentAttachmentThumbnailCache {
 
     /// Cached existence lookups shared by every card.
     let availability = AgentImageAttachmentAvailabilityResolver()
+    /// Mounted cards must refresh their local phase when an image disappears without a row rewrite.
+    let invalidatedPaths = PassthroughSubject<Set<String>, Never>()
 
     private let thumbnails = NSCache<NSString, AgentAttachmentDecodedImage>()
     private let previews = NSCache<NSString, AgentAttachmentDecodedImage>()
     /// Cache keys stored per path, so a moved or evicted file can drop every rendition.
     private let keysLock = NSLock()
     private var keysByPath: [String: Set<NSString>] = [:]
+    private var invalidationGenerationByPath: [String: UInt64] = [:]
     private let loadQueue = DispatchQueue(label: "com.repoprompt.agent-attachment-thumbnails", qos: .userInitiated)
 
     private init() {
@@ -530,23 +540,42 @@ final class AgentAttachmentThumbnailCache {
     /// Marks `paths` missing and drops their cached renditions (a file was moved out of the
     /// temporary store or evicted by the session cap).
     func invalidate(paths: [String]) {
-        for path in paths {
-            let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
-            availability.record(.missing, forPath: standardized)
-            keysLock.lock()
-            let keys = keysByPath.removeValue(forKey: standardized) ?? []
-            keysLock.unlock()
+        let standardizedPaths = Set(paths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        keysLock.lock()
+        for path in standardizedPaths {
+            invalidationGenerationByPath[path, default: 0] &+= 1
+            availability.record(.missing, forPath: path)
+            let keys = keysByPath.removeValue(forKey: path) ?? []
             for key in keys {
                 thumbnails.removeObject(forKey: key)
                 previews.removeObject(forKey: key)
             }
         }
+        keysLock.unlock()
+        invalidatedPaths.send(standardizedPaths)
     }
 
-    private func noteCachedKey(_ key: AgentAttachmentImageKey) {
+    private func generation(for path: String) -> UInt64 {
         keysLock.lock()
-        keysByPath[key.path, default: []].insert(key.cacheKey)
-        keysLock.unlock()
+        defer { keysLock.unlock() }
+        return invalidationGenerationByPath[path, default: 0]
+    }
+
+    private func record(_ result: AgentAttachmentImageLoadResult, for key: AgentAttachmentImageKey, generation: UInt64) -> AgentAttachmentImageLoadResult {
+        keysLock.lock()
+        defer { keysLock.unlock() }
+        guard invalidationGenerationByPath[key.path, default: 0] == generation else { return .missing }
+        switch result {
+        case let .image(decoded):
+            availability.record(.available, forPath: key.path)
+            store(for: key).setObject(decoded, forKey: key.cacheKey)
+            keysByPath[key.path, default: []].insert(key.cacheKey)
+        case .missing:
+            availability.record(.missing, forPath: key.path)
+        case .undecodable:
+            availability.record(.available, forPath: key.path)
+        }
+        return result
     }
 
     func loadImage(
@@ -554,32 +583,21 @@ final class AgentAttachmentThumbnailCache {
         completion: @escaping (AgentAttachmentImageLoadResult) -> Void
     ) -> AgentAttachmentImageLoadToken {
         let token = AgentAttachmentImageLoadToken()
+        let generation = generation(for: key.path)
         if let cached = cachedImage(for: key) {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 guard !token.isCancelled else { return }
-                completion(.image(cached))
+                completion(self?.generation(for: key.path) == generation ? .image(cached) : .missing)
             }
             return token
         }
 
-        let availability = availability
-        let cache = store(for: key)
         loadQueue.async { [weak self, weak token] in
-            guard let token, !token.isCancelled else { return }
-            let result = Self.decode(key)
-            switch result {
-            case let .image(decoded):
-                availability.record(.available, forPath: key.path)
-                cache.setObject(decoded, forKey: key.cacheKey)
-                self?.noteCachedKey(key)
-            case .missing:
-                availability.record(.missing, forPath: key.path)
-            case .undecodable:
-                availability.record(.available, forPath: key.path)
-            }
-            DispatchQueue.main.async { [weak token] in
+            guard let self, let token, !token.isCancelled else { return }
+            let result = record(Self.decode(key), for: key, generation: generation)
+            DispatchQueue.main.async { [weak self, weak token] in
                 guard let token, !token.isCancelled else { return }
-                completion(result)
+                completion(self?.generation(for: key.path) == generation ? result : .missing)
             }
         }
         return token

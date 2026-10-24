@@ -9,8 +9,8 @@ import UniformTypeIdentifiers
 /// `<workspace>/AgentSessions/attachments/<sessionID>/<attachmentID>.<ext>` so the transcript keeps
 /// rendering them for the life of the session. Deleting the session deletes the folder; a startup
 /// sweep removes folders whose session file no longer exists and stale temporary copies.
-package struct AgentSessionAttachmentStore: Sendable {
-    package struct Limits: Sendable, Equatable {
+package struct AgentSessionAttachmentStore {
+    package struct Limits: Equatable {
         /// Images up to this size are kept byte-for-byte; larger ones are kept as a downscaled copy.
         package var maxRetainedImageBytes: Int64
         /// Long-edge pixel size of the downscaled copy kept for oversized images.
@@ -31,14 +31,19 @@ package struct AgentSessionAttachmentStore: Sendable {
         }
     }
 
-    package struct RetentionResult: Sendable, Equatable {
+    package struct RetentionResult: Equatable {
         /// Rewritten attachments keyed by attachment ID; the source points at the kept copy.
         package var retained: [UUID: AgentImageAttachment]
         /// Kept files removed to bring the session folder back under its cap.
         package var evictedPaths: [String]
+
+        package init(retained: [UUID: AgentImageAttachment], evictedPaths: [String]) {
+            self.retained = retained
+            self.evictedPaths = evictedPaths
+        }
     }
 
-    package struct SweepResult: Sendable, Equatable {
+    package struct SweepResult: Equatable {
         package var removedSessionFolders: [UUID]
         package var removedTemporaryFiles: [String]
     }
@@ -76,10 +81,12 @@ package struct AgentSessionAttachmentStore: Sendable {
     /// pointing out of) the folder never widens what the path authorizes.
     package func isRetainedPath(_ path: String, sessionID: UUID) -> Bool {
         let candidate = URL(fileURLWithPath: path).standardizedFileURL
-        if (try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
-            return false
-        }
-        let prefix = sessionFolderURL(sessionID: sessionID).resolvingSymlinksInPath().path + "/"
+        guard let values = try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
+              values.isSymbolicLink != true, values.isRegularFile == true
+        else { return false }
+        let folder = sessionFolderURL(sessionID: sessionID)
+        guard !isSymbolicLink(folder) else { return false }
+        let prefix = folder.resolvingSymlinksInPath().path + "/"
         let resolved = candidate.resolvingSymlinksInPath().path
         return resolved.hasPrefix(prefix) && !resolved.dropFirst(prefix.count).contains("/")
     }
@@ -87,12 +94,14 @@ package struct AgentSessionAttachmentStore: Sendable {
     /// The kept copy of `attachmentID` in this session's folder, whatever its extension.
     package func locateRetainedFile(attachmentID: UUID, sessionID: UUID) -> URL? {
         let folder = sessionFolderURL(sessionID: sessionID)
+        guard !isSymbolicLink(folder) else { return nil }
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return nil }
         let stem = attachmentID.uuidString
         guard let name = names.sorted().first(where: { ($0 as NSString).deletingPathExtension == stem }) else {
             return nil
         }
-        return folder.appendingPathComponent(name)
+        let candidate = folder.appendingPathComponent(name)
+        return isRetainedPath(candidate.path, sessionID: sessionID) ? candidate : nil
     }
 
     /// Rewrites local attachments whose file no longer exists to their kept copy in this session's
@@ -130,6 +139,9 @@ package struct AgentSessionAttachmentStore: Sendable {
         let folder = sessionFolderURL(sessionID: sessionID)
         var retained: [UUID: AgentImageAttachment] = [:]
         var folderReady = false
+        guard !isSymbolicLink(folder) else {
+            return RetentionResult(retained: [:], evictedPaths: [])
+        }
 
         for attachment in attachments where retained[attachment.id] == nil {
             guard case let .localFile(path) = attachment.source else { continue }
@@ -165,6 +177,7 @@ package struct AgentSessionAttachmentStore: Sendable {
     @discardableResult
     package func enforceSessionCap(sessionID: UUID) -> [String] {
         let folder = sessionFolderURL(sessionID: sessionID)
+        guard !isSymbolicLink(folder) else { return [] }
         let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: folder,
@@ -277,6 +290,11 @@ package struct AgentSessionAttachmentStore: Sendable {
     }
 
     // MARK: - Placement
+
+    /// A per-session link cannot delegate one session's image authority to another folder.
+    private func isSymbolicLink(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true
+    }
 
     private func placeFile(_ source: URL, attachmentID: UUID, in folder: URL) -> URL? {
         let fileManager = FileManager.default

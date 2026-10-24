@@ -77,6 +77,35 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: nestedFile.path))
     }
 
+    func testSymlinkedSessionFolderCannotBorrowAnotherSessionsImages() throws {
+        let store = AgentSessionAttachmentStore(
+            agentSessionsFolder: agentSessionsFolder,
+            limits: .init(maxRetainedImageBytes: .max, downscaledLongEdgePixels: 4096, maxSessionFolderBytes: 0)
+        )
+        let ownerID = UUID()
+        let linkedID = UUID()
+        let attachmentID = UUID()
+        let ownerFolder = store.sessionFolderURL(sessionID: ownerID)
+        try FileManager.default.createDirectory(at: ownerFolder, withIntermediateDirectories: true)
+        let image = ownerFolder.appendingPathComponent("\(attachmentID.uuidString).png")
+        try Data("owner image".utf8).write(to: image)
+        let linkedFolder = store.sessionFolderURL(sessionID: linkedID)
+        try FileManager.default.createSymbolicLink(at: linkedFolder, withDestinationURL: ownerFolder)
+        let linkedImage = linkedFolder.appendingPathComponent(image.lastPathComponent)
+        XCTAssertFalse(store.isRetainedPath(linkedImage.path, sessionID: linkedID))
+        XCTAssertNil(store.locateRetainedFile(attachmentID: attachmentID, sessionID: linkedID))
+        XCTAssertTrue(store.enforceSessionCap(sessionID: linkedID).isEmpty)
+        let temporary = temporaryRoot.appendingPathComponent("new.png")
+        try Data("replacement".utf8).write(to: temporary)
+        let result = store.retain(
+            [AgentImageAttachment(id: attachmentID, source: .localFile(path: temporary.path))],
+            sessionID: linkedID, temporaryRoot: temporaryRoot
+        )
+        XCTAssertTrue(result.retained.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: image), Data("owner image".utf8))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.path))
+    }
+
     func testOversizedImageIsKeptAsDownscaledCopy() throws {
         let limits = AgentSessionAttachmentStore.Limits(
             maxRetainedImageBytes: 1024,
@@ -250,7 +279,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
     }
 
     private func fileSize(_ url: URL) throws -> Int64? {
-        (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
+        try (FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
     }
 
     private func pixelSize(of url: URL) -> CGSize? {
