@@ -1805,7 +1805,8 @@ actor AgentSessionDataService {
             do {
                 try await deleteSessionFileDurably(
                     sessionID: candidate.sessionID,
-                    fileURL: candidate.fileURL
+                    fileURL: candidate.fileURL,
+                    origin: .current
                 )
             } catch {
                 failures[candidate.tabID] = error
@@ -1821,17 +1822,10 @@ actor AgentSessionDataService {
         return failures
     }
 
-    /// Irreversible removal of one session file, bracketed by the durable-deletion reporter.
-    ///
-    /// Phase order is the contract:
-    ///
-    /// 1. **Begin** marks the session in-progress *before* waiting for pending writes or touching the
-    ///    file, so oversight already refuses it while the removal is in flight.
-    /// 2. **Failure** clears only this attempt and preserves durable intent — nothing was deleted.
-    /// 3. **Commit** happens on successful removal *or* an already-absent file, and before any later
-    ///    await, so no metadata cleanup, next batch file, or view-model teardown can run while the
-    ///    session still looks alive to oversight.
-    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL) async throws {
+    /// Admission precedes writer draining and irreversible removal. Failure clears only its own
+    /// attempt; successful removal or an already-absent file commits the permanent fence before
+    /// metadata cleanup or view-model teardown (see AgentSessionDeletionRegistry).
+    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL, origin: AgentSessionDeletionOrigin = .current) async throws {
         #if DEBUG
             if let testBeforeDeletionAdmissionHook {
                 await testBeforeDeletionAdmissionHook(fileURL)
@@ -1841,7 +1835,7 @@ actor AgentSessionDataService {
         // file, so even that cleanup needs an attempt counted by the termination fence. Saves that
         // enter during this hop are covered by the writer drain and the existing post-write checks.
         try AppProfileLocations.current.validateMetadataFile(fileURL)
-        let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
+        let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID, origin: origin)
         deletedSessionFileURLs.insert(fileURL)
         deletionAttemptCountByFileURL[fileURL, default: 0] += 1
         #if DEBUG
@@ -1851,6 +1845,7 @@ actor AgentSessionDataService {
             }
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
+        var fileRemoved = false
         do {
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
@@ -1858,6 +1853,7 @@ actor AgentSessionDataService {
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 try AppProfileLocations.current.validateMetadataFile(fileURL)
                 try FileManager.default.removeItem(at: fileURL)
+                fileRemoved = true
             }
         } catch {
             let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
@@ -1870,7 +1866,7 @@ actor AgentSessionDataService {
             await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
-        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
+        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
         // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
     }
 
