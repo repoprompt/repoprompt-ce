@@ -114,8 +114,8 @@ enum ClaudeCompatiblePluginBridge {
     static func backendEnvironment(
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String
-    ) -> [String: String] {
-        ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
+    ) throws -> [String: String] {
+        try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
     }
 
     static func removedBackendEnvironmentKeys(config: ClaudeCodeCompatibleBackendConfig) -> Set<String> {

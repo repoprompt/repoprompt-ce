@@ -8,18 +8,6 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
             validatedDomains: [.developerID]
         )
-        let localFingerprint = String(repeating: "A", count: 64)
-        let localExpectation = RuntimeLocalSigningExpectation(
-            bundleLeafCertificateSHA256: localFingerprint,
-            registeredLeafCertificateSHA256: localFingerprint,
-            bundleServiceGeneration: 3,
-            registeredServiceGeneration: 3
-        )
-        let local = RuntimeCodeSigningInfo.synthetic(
-            codeIdentifier: RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
-            leafCertificateSHA256: localFingerprint,
-            validatedDomains: [.localSelfSigned]
-        )
         let debug = RuntimeCodeSigningInfo.synthetic(
             codeIdentifier: RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier,
             teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
@@ -31,15 +19,6 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             debugMarker: "keychain",
             signingInfo: official,
             expectedDomain: .officialDeveloperID
-        )
-        assertDecision(
-            marker: "local-self-signed",
-            debugMarker: "keychain",
-            signingInfo: local,
-            localSigningContext: .valid(localExpectation),
-            expectedDomain: .localSelfSigned,
-            expectedLocalCertificateFingerprint: localFingerprint,
-            expectedLocalServiceGeneration: 3
         )
         assertDecision(
             marker: "debug-apple-development",
@@ -54,18 +33,6 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 for: RuntimeSecureStorageDecision(domain: .officialDeveloperID, rejectionReason: nil)
             ).backend === KeychainService.officialV2Shared
         )
-        let localSelection = SecureKeyValueStorageFactory.selection(
-            for: RuntimeSecureStorageDecision(
-                domain: .localSelfSigned,
-                rejectionReason: nil,
-                localCertificateFingerprint: localFingerprint,
-                localServiceGeneration: 3
-            )
-        )
-        XCTAssertEqual(
-            (localSelection.backend as? KeychainService)?.serviceName,
-            KeychainService.localSelfSignedServiceName(fingerprint: localFingerprint, generation: 3)
-        )
         XCTAssertTrue(
             SecureKeyValueStorageFactory.selection(
                 for: RuntimeSecureStorageDecision(
@@ -75,6 +42,54 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 )
             ).backend === KeychainService.debugShared
         )
+    }
+
+    func testVerifiedLocalSigningContinuityDoesNotAuthorizePersistentStorage() {
+        let fingerprint = String(repeating: "A", count: 64)
+        let expectation = RuntimeLocalSigningExpectation(
+            bundleLeafCertificateSHA256: fingerprint,
+            registeredLeafCertificateSHA256: fingerprint,
+            bundleServiceGeneration: 3,
+            registeredServiceGeneration: 3
+        )
+        let signingInfo = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
+            leafCertificateSHA256: fingerprint,
+            validatedDomains: [.localSelfSigned]
+        )
+        let decision = RuntimeCodeSigningPolicy.decision(
+            signingModeMarker: "local-self-signed",
+            debugStorageMarker: "keychain",
+            signingInfo: signingInfo,
+            localSigningContext: .valid(expectation)
+        )
+
+        XCTAssertEqual(
+            decision,
+            RuntimeSecureStorageDecision(
+                domain: .ephemeral,
+                rejectionReason: .localIdentityNotTrustedForPersistence
+            )
+        )
+        let backend = SecureKeyValueStorageFactory.selection(for: decision).backend
+        XCTAssertTrue(backend === EphemeralSecureKeyValueStore.shared)
+        XCTAssertFalse(backend.persistsValuesAcrossLaunches)
+    }
+
+    func testLegacyLocalDomainDecisionCannotSelectKeychain() {
+        // Supplying the former persistent-domain metadata must not bypass policy.
+        for generation in [1, 3] {
+            let decision = RuntimeSecureStorageDecision(
+                domain: .localSelfSigned,
+                rejectionReason: nil,
+                localCertificateFingerprint: String(repeating: "A", count: 64),
+                localServiceGeneration: generation
+            )
+            let backend = SecureKeyValueStorageFactory.selection(for: decision).backend
+            XCTAssertTrue(backend === EphemeralSecureKeyValueStore.shared)
+            XCTAssertFalse(backend.persistsValuesAcrossLaunches)
+            XCTAssertFalse(backend is KeychainService)
+        }
     }
 
     func testPersonalAppleDevelopmentIdentityUsesTeamIsolatedPersistentStorage() {

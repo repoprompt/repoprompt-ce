@@ -3071,6 +3071,7 @@ extension ToolOutputFormatter {
         }
 
         let allIssues = dto.issues + dto.roots.flatMap(\.issues)
+        let stoppedRoots = dto.roots.filter { $0.index.state == .stopped }
         let externalEdgeCount = dto.roots.reduce(0) { count, root in
             count + root.edges.count(where: { $0.from != $0.to })
         }
@@ -3098,10 +3099,17 @@ extension ToolOutputFormatter {
 
         if dto.status == .pending, !hasUsefulResult {
             let path = codeStructurePendingSeedPath(dto: dto, issues: allIssues)
-            var out = [
+            var out = stoppedRoots.isEmpty ? [
                 "## Code Structure ⏳ pending — `\(path)` is not in the code graph yet",
                 "- Retry shortly. If this persists, the file may be excluded or of an unsupported type."
+            ] : [
+                "## Code Structure ⏳ pending — active roots are still indexing; other roots stopped",
+                "- Waiting for `\(path)`. Retry shortly for active roots only."
             ]
+            for root in stoppedRoots {
+                out.append("- Stopped `\(root.root)`: \(codeStructureUnavailableCause(issues: root.issues)).")
+                out.append("- \(codeStructureUnavailableAction(issues: root.issues))")
+            }
             if dto.worktreeScope != nil {
                 if dto.roots.count == 1, let root = dto.roots.first {
                     out.append(codeStructureRootDeclaration(root.root, scope: dto.worktreeScope))
@@ -3119,12 +3127,22 @@ extension ToolOutputFormatter {
             let suffix = hasUsefulResult ? " — \(resultSummary)" : ""
             out = ["## Code Structure ✅\(suffix)"]
         case .partial, .pending:
-            var title = "## Code Structure ⚠️ partial — a retry may return more relationships"
+            var title = stoppedRoots.isEmpty
+                ? "## Code Structure ⚠️ partial — a retry may return more relationships"
+                : "## Code Structure ⚠️ partial — indexing stopped; committed relationships remain available"
             if graphTruncated {
                 title += "; \(codeStructureSizeAction(size: dto.size))"
             }
             out = [title]
             if hasUsefulResult { out.append("- Result: \(resultSummary)") }
+            if !stoppedRoots.isEmpty {
+                let stopIssues = stoppedRoots.flatMap(\.issues)
+                out.append("- \(codeStructureUnavailableCause(issues: stopIssues)).")
+                out.append("- \(codeStructureUnavailableAction(issues: stopIssues))")
+                if dto.roots.contains(where: { $0.index.state == .indexing }) {
+                    out.append("- Other roots are still indexing.")
+                }
+            }
         case .unavailable:
             preconditionFailure("Unavailable replies return above")
         }
@@ -3239,6 +3257,11 @@ extension ToolOutputFormatter {
     private static func codeStructureUnavailableCause(
         issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
     ) -> String {
+        if let terminal = issues.first(where: { $0.code == "graph_budget_exhausted" })
+            ?? issues.first(where: { $0.code == "graph_retry_exhausted" || $0.code == "graph_worker_recovery_exhausted" })
+        {
+            return codeStructureSentenceFragment(terminal.message)
+        }
         if issues.contains(where: { $0.code == "path_not_found" }) {
             return "no requested path resolved"
         }
@@ -3254,6 +3277,12 @@ extension ToolOutputFormatter {
     private static func codeStructureUnavailableAction(
         issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
     ) -> String {
+        if issues.contains(where: { $0.code == "graph_budget_exhausted" }) {
+            return "This generation cannot be resumed with Retry. Reduce indexed scope or resource usage before reloading the root."
+        }
+        if issues.contains(where: { $0.code == "graph_retry_exhausted" || $0.code == "graph_worker_recovery_exhausted" }) {
+            return "Use Code Map Retry to restart indexing; polling cannot restart it."
+        }
         if issues.contains(where: { $0.code == "path_not_found" }) {
             return "Check spelling with get_file_tree, then retry root-relative or root-prefixed."
         }
