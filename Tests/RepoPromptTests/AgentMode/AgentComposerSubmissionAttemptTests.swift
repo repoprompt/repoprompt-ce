@@ -242,8 +242,11 @@ extension AgentComposerSubmissionAttemptTests {
         let previous = keys.map { defaults.object(forKey: $0) }
         defer {
             for (key, value) in zip(keys, previous) {
-                if let value { defaults.set(value, forKey: key) }
-                else { defaults.removeObject(forKey: key) }
+                if let value {
+                    defaults.set(value, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
             }
         }
         for unavailable in [false, true] {
@@ -273,11 +276,17 @@ extension AgentComposerSubmissionAttemptTests {
                 XCTAssertFalse(props.areModelControlsDisabled)
                 XCTAssertEqual(props.manualEffortControl, provider == .codexExec ? .codex : .claude)
 
-                if provider == .codexExec { viewModel.selectReasoningEffort(.low) }
-                else { viewModel.setClaudeEffortLevel(.low) }
+                if provider == .codexExec {
+                    viewModel.selectReasoningEffort(.low)
+                } else {
+                    viewModel.setClaudeEffortLevel(.low)
+                }
                 let updated = viewModel.makeComposerProps(tabID: tabID)
-                if provider == .codexExec { XCTAssertEqual(updated.selectedReasoningEffortRaw, "low") }
-                else { XCTAssertEqual(updated.providerControls?.claudeTools?.effortLevel, .low) }
+                if provider == .codexExec {
+                    XCTAssertEqual(updated.selectedReasoningEffortRaw, "low")
+                } else {
+                    XCTAssertEqual(updated.providerControls?.claudeTools?.effortLevel, .low)
+                }
                 XCTAssertTrue(store.autoEffortEnabled(), "Choosing a fallback must not disable global Auto Effort")
                 session.saveDebounceTask?.cancel()
             }
@@ -997,8 +1006,10 @@ extension AgentComposerSubmissionAttemptTests {
             let (viewModel, _) = try await makeRoutingViewModel(backend: OpenAIDecisionsDecisionService(credentialService: credentials), otherBackends: [jev])
             await viewModel.modelRouterRuntime?.reconcileDemand()
             let selected = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .general)
-            if failureStage == "model_route" { XCTAssertNil(selected) }
-            else { XCTAssertNotNil(selected)
+            if failureStage == "model_route" {
+                XCTAssertNil(selected)
+            } else {
+                XCTAssertNotNil(selected)
                 XCTAssertNil(selected?.reasoningEffortRaw)
             }
             let after = await credentials.readinessSnapshot()
@@ -1198,7 +1209,9 @@ extension AgentComposerSubmissionAttemptTests {
         let viewModel = AgentModeViewModel(
             testWorkspacePath: root.path,
             codexControllerFactory: { _, _, _, _, _, _ in
-                if let codexController { return codexController }
+                if let codexController {
+                    return codexController
+                }
                 preconditionFailure("Routing transaction test must not start Codex")
             },
             headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
@@ -1254,7 +1267,9 @@ private actor ComposerDecisionsClient {
     func judge(_ request: OpenAIDecisionsWireRequest, key: String) throws -> OpenAIDecisionsWireResponse {
         requests.append(request)
         let question = request.questions[0]
-        if question.name == failureStage { throw OpenAIDecisionsRoutingClientError.policyUnavailable }
+        if question.name == failureStage {
+            throw OpenAIDecisionsRoutingClientError.policyUnavailable
+        }
         let selected = if selectCodexModel, question.name == "model_route" {
             try XCTUnwrap(
                 question.choices.first { $0.description?.hasPrefix("Provider: \(AgentProviderKind.codexExec.rawValue);") == true },
@@ -1700,5 +1715,312 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
 
     func interruptTurn(reason: String) -> NativeAgentRuntimeInterruptOutcome {
         .noTurnInFlight
+    }
+}
+
+final class AgentModelPickerOpenRequestGuardTests: XCTestCase {
+    func testAllowsMatchingWindowAndCurrentTab() {
+        let tabID = UUID()
+        let notification = Notification(
+            name: .showAgentModelPicker,
+            object: nil,
+            userInfo: ["windowID": 42]
+        )
+
+        XCTAssertTrue(
+            AgentModelPickerOpenRequestGuard.shouldOpen(
+                notification: notification,
+                composerWindowID: 42,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                hasAvailableAgentProviders: true,
+                modelControlsDisabled: false
+            )
+        )
+    }
+
+    func testRejectsMismatchedWindow() {
+        let tabID = UUID()
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                requestWindowID: 41,
+                composerWindowID: 42,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID
+            )
+        )
+    }
+
+    func testRejectsMissingWindow() {
+        let tabID = UUID()
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                requestWindowID: nil,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID
+            )
+        )
+    }
+
+    func testRejectsMissingComposerTab() {
+        let tabID = UUID()
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                composerCurrentTabID: nil,
+                propsCurrentTabID: tabID
+            )
+        )
+    }
+
+    func testRejectsMismatchedPropsTab() {
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                composerCurrentTabID: UUID(),
+                propsCurrentTabID: UUID()
+            )
+        )
+    }
+
+    func testRejectsMissingProviders() {
+        let tabID = UUID()
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                hasAvailableAgentProviders: false
+            )
+        )
+    }
+
+    func testRejectsDisabledModelControls() {
+        let tabID = UUID()
+        XCTAssertFalse(
+            modelPickerShortcutGuardAllows(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                modelControlsDisabled: true
+            )
+        )
+    }
+
+    private func modelPickerShortcutGuardAllows(
+        requestWindowID: Int? = 42,
+        composerWindowID: Int = 42,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool = true,
+        modelControlsDisabled: Bool = false
+    ) -> Bool {
+        AgentModelPickerOpenRequestGuard.shouldOpen(
+            requestWindowID: requestWindowID,
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled
+        )
+    }
+}
+
+final class AgentEffortPickerOpenRequestGuardTests: XCTestCase {
+    func testRoutesCodexEffortPickerWhenCodexEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertEqual(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            ),
+            .codexReasoningEffort
+        )
+    }
+
+    func testNotificationOverloadRoutesByWindowUserInfo() {
+        let tabID = UUID()
+        let notification = Notification(
+            name: .showAgentEffortPicker,
+            object: nil,
+            userInfo: ["windowID": 42]
+        )
+
+        XCTAssertEqual(
+            AgentEffortPickerOpenRequestGuard.target(
+                notification: notification,
+                composerWindowID: 42,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                hasAvailableAgentProviders: true,
+                modelControlsDisabled: false,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true,
+                claudeEffortsAvailable: false
+            ),
+            .codexReasoningEffort
+        )
+    }
+
+    func testRoutesClaudeEffortPickerWhenClaudeEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertEqual(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .claudeCode,
+                claudeEffortsAvailable: true
+            ),
+            .claudeEffortLevel
+        )
+    }
+
+    func testRejectsAgentsWithoutEffortPicker() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .openCode,
+                codexEffortsAvailable: false,
+                claudeEffortsAvailable: false
+            )
+        )
+    }
+
+    func testRejectsClaudeWhenOnlyCodexEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .claudeCode,
+                codexEffortsAvailable: true,
+                claudeEffortsAvailable: false
+            )
+        )
+    }
+
+    func testRejectsCodexWhenOnlyClaudeEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: false,
+                claudeEffortsAvailable: true
+            )
+        )
+    }
+
+    func testRejectsCodexWhenNoEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: false
+            )
+        )
+    }
+
+    func testRejectsClaudeWhenNoEffortsAreAvailable() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .claudeCode,
+                claudeEffortsAvailable: false
+            )
+        )
+    }
+
+    func testRejectsMismatchedWindow() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                requestWindowID: 41,
+                composerWindowID: 42,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            )
+        )
+    }
+
+    func testRejectsMissingWindow() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                requestWindowID: nil,
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            )
+        )
+    }
+
+    func testRejectsMismatchedTab() {
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: UUID(),
+                propsCurrentTabID: UUID(),
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            )
+        )
+    }
+
+    func testRejectsMissingProviders() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                hasAvailableAgentProviders: false,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            )
+        )
+    }
+
+    func testRejectsDisabledModelControls() {
+        let tabID = UUID()
+        XCTAssertNil(
+            effortPickerShortcutTarget(
+                composerCurrentTabID: tabID,
+                propsCurrentTabID: tabID,
+                modelControlsDisabled: true,
+                selectedAgent: .codexExec,
+                codexEffortsAvailable: true
+            )
+        )
+    }
+
+    private func effortPickerShortcutTarget(
+        requestWindowID: Int? = 42,
+        composerWindowID: Int = 42,
+        composerCurrentTabID: UUID?,
+        propsCurrentTabID: UUID?,
+        hasAvailableAgentProviders: Bool = true,
+        modelControlsDisabled: Bool = false,
+        selectedAgent: AgentProviderKind,
+        codexEffortsAvailable: Bool = false,
+        claudeEffortsAvailable: Bool = false
+    ) -> AgentEffortPickerOpenTarget? {
+        AgentEffortPickerOpenRequestGuard.target(
+            requestWindowID: requestWindowID,
+            composerWindowID: composerWindowID,
+            composerCurrentTabID: composerCurrentTabID,
+            propsCurrentTabID: propsCurrentTabID,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            modelControlsDisabled: modelControlsDisabled,
+            selectedAgent: selectedAgent,
+            codexEffortsAvailable: codexEffortsAvailable,
+            claudeEffortsAvailable: claudeEffortsAvailable
+        )
     }
 }

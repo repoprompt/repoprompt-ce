@@ -64,6 +64,7 @@ extension AgentModeViewModel {
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            codexReasoningEffortOptions: reasoningEffortOptionsForCurrentSelection(),
             acpModelParameterControls: acpControls,
             availableAgents: availableAgents,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
