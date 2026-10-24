@@ -383,6 +383,20 @@ the next pass reclassifies first. Only committed deletion removes the durable ro
 classifications end this launch's attempt without erasing continuity. An exhausted budget likewise
 leaves the intent dormant for the next launch.
 
+A waiting, not active, launch entry blocked by duplicate window incarnations stays waiting, including
+an exact close-parked entry rearmed by the existing close policy. Existing candidate/topology events
+reconsider it once both endpoints are unique, through the same readiness, hydration-proof and
+authorization fences; no timer or new grant path is involved. A transient, identifier-free notice
+explains the duplicate-window wait and clears when no waiting entry is blocked by duplicates.
+The notice is edge-triggered: Dismiss stays dismissed until the duplicate-blocked condition clears
+and returns. Transient incomplete-discovery and dirty-pass exits retain the last completed census,
+so they cannot remove/re-add the notice or reorder warnings. Lasting barriers (restoration not
+admitted, including dormant restoration, not ready, or frozen) clear the condition. A notice evicted
+by five other concurrent warnings is not republished until the condition clears and returns.
+This does not rearm an entry terminalized by a late-duplicate audit or an uncaptured lifecycle
+revocation. Terminal restoration warnings distinguish retained intent from removal for committed
+session deletion; a token-mismatched cleanup never claims removal.
+
 **Committed continuity survives restart or crash.** Scope, link-intent, and worktree transitions
 write affected SQLite rows and receipts atomically; no clean-shutdown marker or final snapshot is
 required. Live decisions and save acknowledgements are separate: pending/failed writes are not

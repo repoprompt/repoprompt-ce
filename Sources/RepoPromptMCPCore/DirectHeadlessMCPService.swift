@@ -349,6 +349,11 @@ package actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
+        // One connection lane per endpoint; the host resource gate below is shared by
+        // the top-level endpoint and every private child in this runtime.
+        let fileReadConnection = MCPDomainToolResourceAdmissionController(
+            limit: MCPDomainToolAdmissionLimits.fileReadConnection
+        )
         await server.withMethodHandler(CallTool.self) { params in
             guard visibleNames.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
@@ -371,17 +376,46 @@ package actor DirectHeadlessMCPService {
                     connection: connection,
                     invocationID: invocationID
                 )
-                let result = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
+                let invocation = MCPDomainHostInvocation(
                     invocationID: invocationID,
                     connectionID: connection.connectionID,
                     resolution: resolution,
                     arguments: arguments,
                     securityContext: security
-                ))
+                )
+                let result: Value = if MCPDomainToolCatalog.admissionClass(for: params.name) == .fileRead {
+                    try await Self.withFileReadAdmission(
+                        host: prepared.runtime.domainHost, connection: fileReadConnection
+                    ) {
+                        try await prepared.runtime.domainHost.invoke(invocation)
+                    }
+                } else {
+                    try await prepared.runtime.domainHost.invoke(invocation)
+                }
                 return Self.successResult(result)
             } catch {
                 return Self.errorResult(Self.wireMessage(for: error))
             }
+        }
+    }
+
+    /// Keep both leases through provider settlement, including cancellation and failure.
+    static func withFileReadAdmission<T: Sendable>(
+        host: MCPDomainHost,
+        connection: MCPDomainToolResourceAdmissionController,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        let deadline = MCPDomainHeadlessReadSlots.deadline()
+        do {
+            let connectionLease = try await connection.acquire(.appWide, admissionDeadline: deadline)
+            defer { connectionLease.release() }
+            // A standalone runtime is one physical workspace host, not one resource per child.
+            let resourceLease = try await host.acquireFileReadResourceAdmission(windowID: 0, admissionDeadline: deadline)
+            defer { resourceLease.release() }
+            try Task.checkCancellation()
+            return try await operation()
+        } catch is MCPDomainAdmissionDeadline.Expired {
+            throw MCPDomainHeadlessFileReader.ReadError.admissionTimedOut
         }
     }
 

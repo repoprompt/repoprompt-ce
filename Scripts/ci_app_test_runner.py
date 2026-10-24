@@ -790,6 +790,7 @@ def run_selected_suites(
 ) -> int:
     executed = []
     skipped = []
+    failures = []
     if suite_methods is not None and (not suites or receipt_path is None):
         print('::error::empty shard or missing receipt destination', file=output)
         return 2
@@ -813,9 +814,10 @@ def run_selected_suites(
                 result = verify_execution(list(suite_methods[suite]), transcript, return_code)
             except ValueError as error:
                 print(f'::error::{suite}: {error}', file=output, flush=True)
-                return return_code or 1
-            executed.extend(result['executed'])
-            skipped.extend(result['skipped'])
+                return_code = return_code or 1
+            else:
+                executed.extend(result['executed'])
+                skipped.extend(result['skipped'])
         print("::endgroup::", file=output, flush=True)
 
         if return_code == 0:
@@ -825,7 +827,14 @@ def run_selected_suites(
             file=output,
             flush=True,
         )
-        return return_code or 1
+        failures.append((suite, return_code))
+    if failures:
+        print(f'::error::Shard {shard_index}/{shard_count}: {len(failures)} of {len(suites)} suites failed; '
+              'all assigned suites were attempted once, no success receipt was published',
+              file=output, flush=True)
+        for suite, status in failures:
+            print(f'  {suite}: exit {status}', file=output, flush=True)
+        return failures[0][1]
     if suite_methods is not None:
         full_listing = listed_tests('\n'.join(method for methods in suite_methods.values() for method in methods))
         assigned = sorted(method for suite in suites for method in suite_methods[suite])

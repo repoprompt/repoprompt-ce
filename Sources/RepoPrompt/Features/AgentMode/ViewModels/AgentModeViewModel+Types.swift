@@ -727,6 +727,12 @@ extension AgentModeViewModel {
         case resumeTimedOut
     }
 
+    /// Exact provider reference known to exceed the resume frame budget in this session.
+    struct CodexOversizedResumeTarget: Equatable {
+        var conversationID: String?
+        var rolloutPath: String?
+    }
+
     struct CodexResumeTimeoutState: Equatable {
         var conversationID: String?
         var rolloutPath: String?

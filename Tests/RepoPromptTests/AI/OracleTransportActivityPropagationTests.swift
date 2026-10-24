@@ -580,7 +580,7 @@ final class OracleImageSerializationTests: XCTestCase {
     func testClaudeStreamJSONParsesTerminalResultAndUsage() throws {
         let output = """
         {"type":"system","subtype":"init"}
-        {"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}
+        {"type":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}
         {"type":"result","subtype":"success","is_error":false,"result":"Done","usage":{"input_tokens":11,"output_tokens":7},"total_cost_usd":0.12}
         """
 
@@ -590,6 +590,58 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(completion.promptTokens, 11)
         XCTAssertEqual(completion.completionTokens, 7)
         XCTAssertEqual(completion.cost, 0.12)
+    }
+
+    func testClaudeStreamJSONPreservesContinuedAnswerWithoutDuplicatingResult() throws {
+        let first = String(repeating: "First section. ", count: 20000) + "\n```swift\nfunc handl"
+        let output = try [
+            jsonText(["type": "assistant", "message": ["stop_reason": "max_tokens", "content": [
+                ["type": "text", "text": first],
+                ["type": "tool_use", "text": "not answer text"]
+            ]]]),
+            jsonText(["type": "user", "message": ["content": "continue"]]),
+            jsonText(["type": "assistant", "parent_tool_use_id": "child", "message": ["content": [
+                ["type": "text", "text": "not the parent reply"]
+            ]]]),
+            jsonText(["type": "assistant", "parent_tool_use_id": NSNull(), "message": ["stop_reason": "end_turn", "content": [
+                ["type": "thinking", "thinking": "private"],
+                ["type": "text", "text": "eRequest() {}\n"],
+                ["type": "text", "text": "```"]
+            ]]]),
+            jsonText(["type": "result", "subtype": "success", "result": "eRequest() {}\n```"])
+        ].joined(separator: "\n")
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+        XCTAssertEqual(completion.text, first + "eRequest() {}\n```")
+    }
+
+    func testClaudeStreamJSONIgnoresNonJSONStdoutDiagnostics() throws {
+        let output = """
+        [SandboxDebug] Preparing sandbox
+        {"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"First "}]}}
+        [SandboxDebug] Sandbox ready
+        {"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"last"}]}}
+        {"type":"result","subtype":"success","is_error":false,"result":"last"}
+        """
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+        XCTAssertEqual(completion.text, "First last")
+    }
+
+    func testClaudeStreamJSONRejectsErrorsAndIncompleteOutput() throws {
+        let assistant = #"{"type":"assistant","message":{"content":[{"type":"text","text":"Partial"}]}}"#
+        let success = #"{"type":"result","subtype":"success","result":"Done"}"#
+        for output in [
+            assistant,
+            assistant + "\n" + #"{"type":"result","is_error":true,"errors":["Failed"]}"#,
+            assistant + "\n" + #"{"type":"error","message":"Failed"}"#,
+            assistant + "\n{malformed}\n" + success,
+            assistant + "\n" + success + "\n{"
+        ] {
+            XCTAssertThrowsError(try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8)))
+        }
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(success.utf8))
+        XCTAssertEqual(completion.text, "Done")
     }
 
     func testClaudeStreamJSONExtractsTerminalError() {

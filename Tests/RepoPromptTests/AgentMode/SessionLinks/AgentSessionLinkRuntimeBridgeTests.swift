@@ -6402,7 +6402,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.host.sendRequests.count, 1, "No polling between events")
 
         await publishTargetActivity(fixture, status: .idle, activity: 2000)
-        await settleDrains { fixture.host.sendRequests.count > 1 }
+        // The host records entry before the asynchronous commit and receipt publication finish.
+        await settleDrains { await self.pendingSend(fixture)?.lastResult != nil }
         let projection = await pendingSend(fixture)
 
         XCTAssertNil(projection?.pending, "The entry must be consumed by the delivery")
