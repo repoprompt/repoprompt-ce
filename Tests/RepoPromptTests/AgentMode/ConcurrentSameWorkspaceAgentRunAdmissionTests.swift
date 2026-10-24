@@ -407,11 +407,24 @@ import XCTest
                 await fixture.cleanup()
             }
             let manager = fixture.window.workspaceManager
-            let initialTabs = try XCTUnwrap(manager.activeWorkspace, file: file, line: line).composeTabs
+            let prompt = fixture.window.promptManager
+            // The post-switch Git-data root starts expanded. Join that load and its
+            // foreground badge update before measuring invalidations caused by Git mode.
+            // Otherwise fixture normalization can consume the retry before this hook runs.
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            let workspace = try XCTUnwrap(manager.activeWorkspace, file: file, line: line)
+            prompt.loadComposeTabsFromWorkspace(workspace)
+            // The reload synchronously schedules (or coalesces into) the badge callback.
+            // This FIFO barrier joins it whether the normalized foreground is dirty or clean.
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            let initialTabs = workspace.composeTabs
             var preparations = 0
-            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
                 guard workspaceID == fixture.workspaceID else { return }
                 preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0, file: file, line: line)
                 // Settings sync can republish the same mode while document preparation
                 // is suspended. The control changes it once, then republishes that value
                 // on the retry; only the real transition may invalidate the capture.
