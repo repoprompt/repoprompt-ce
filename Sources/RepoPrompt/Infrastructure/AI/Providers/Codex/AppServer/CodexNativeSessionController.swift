@@ -1,5 +1,77 @@
 import Foundation
 import OSLog
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+
+private actor CodexInboundStreamTaskStartGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class CodexHookTrustRecoveryRace: @unchecked Sendable {
+    enum Outcome {
+        case succeeded
+        case failed(Error)
+        case deadline
+    }
+
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var continuation: CheckedContinuation<Outcome, Never>?
+
+    func wait() async -> Outcome {
+        lock.lock()
+        if let outcome {
+            lock.unlock()
+            return outcome
+        }
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func resolve(_ outcome: Outcome) {
+        lock.lock()
+        guard self.outcome == nil else {
+            lock.unlock()
+            return
+        }
+        self.outcome = outcome
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: outcome)
+    }
+
+    @discardableResult
+    func resolveSucceeded(commit: () -> Void) -> Bool {
+        lock.lock()
+        guard outcome == nil else {
+            lock.unlock()
+            return false
+        }
+        commit()
+        let resolved = Outcome.succeeded
+        outcome = resolved
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: resolved)
+        return true
+    }
+}
 
 struct CodexTurnStartReceipt: Equatable {
     let provisionalSubmissionID: String
@@ -24,6 +96,13 @@ enum CodexTurnSteerError: Error, LocalizedError, Equatable {
         turnKind: String?,
         failure: CodexAppServerClient.RequestFailure
     )
+
+    /// When returned by `steerUserTurn`, these cases are rejected RPCs, not ambiguous transport failures.
+    var definitivelyRejectsInput: Bool {
+        switch self {
+        case .noActiveTurn, .expectedTurnMismatch, .activeTurnNotSteerable: true
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -53,6 +132,8 @@ enum CodexTurnInterruptError: Error, LocalizedError, Equatable {
 
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
+    var currentSessionReference: CodexNativeSessionController.SessionRef? { get }
+    func routingProcessID() async -> pid_t?
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
 
     func ensureEventsStreamReady()
@@ -77,6 +158,7 @@ protocol CodexSessionControlling: AnyObject {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
+    func outstandingBlockingNativeToolCallNames() async -> [String]
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
@@ -101,6 +183,11 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal
     func setThreadGoalStatus(_ status: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal
     func clearThreadGoal() async throws -> Bool
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint: String
+    ) async throws -> CodexHookInventory
     func pendingTurnFailure(turnID: String?) async -> CodexNativeSessionController.TurnFailure?
     func acknowledgePendingTurnFailure(
         turnID: String?,
@@ -109,16 +196,61 @@ protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
+    func revokeComputerUseAutoApproval()
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
 }
 
 extension CodexSessionControlling {
+    func revokeComputerUseAutoApproval() {}
+
+    var currentSessionReference: CodexNativeSessionController.SessionRef? {
+        nil
+    }
+
+    func routingProcessID() async -> pid_t? {
+        nil
+    }
+
+    func outstandingBlockingNativeToolCallNames() async -> [String] {
+        []
+    }
+
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        throw CodexHookTrustError.unsupportedMethod(method: "hooks/list")
+    }
+
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates _: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint _: String
+    ) async throws -> CodexHookInventory {
+        throw CodexHookTrustError.unsupportedMethod(method: "config/batchWrite")
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
 }
 
 final class CodexNativeSessionController {
+    private struct InboundStreamTaskRecord {
+        let token: UUID
+        let transportGeneration: UInt64
+        let task: Task<Void, Never>
+    }
+
+    private let perfRecorder: any AgentModePerfRecording
+
+    #if DEBUG
+        func debugRecordLifecyclePhaseForTesting() async {
+            await recordLifecyclePhase(
+                .runtimeResolution,
+                outcome: .succeeded,
+                startMS: perfRecorder.timestampMSIfEnabled(),
+                includeTransportGeneration: false
+            )
+        }
+    #endif
+
     private static let logger = Logger(
         subsystem: "com.repoprompt.agents",
         category: "CodexNativeSessionController"
@@ -132,13 +264,13 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
-        private static func lifecycleOutcome(for error: Error) -> AgentModePerfDiagnostics.CodexLifecycleOutcome {
+        private static func lifecycleOutcome(for error: Error) -> AgentPerfCodexLifecycleOutcome {
             error is CancellationError ? .cancelled : .failed
         }
 
         private func recordLifecyclePhase(
-            _ phase: AgentModePerfDiagnostics.CodexLifecyclePhase,
-            outcome: AgentModePerfDiagnostics.CodexLifecycleOutcome,
+            _ phase: AgentPerfCodexLifecyclePhase,
+            outcome: AgentPerfCodexLifecycleOutcome,
             startMS: Double?,
             includeTransportGeneration: Bool
         ) async {
@@ -148,7 +280,7 @@ final class CodexNativeSessionController {
             } else {
                 nil
             }
-            AgentModePerfDiagnostics.recordCodexLifecyclePhase(
+            perfRecorder.recordCodexLifecyclePhase(
                 phase,
                 outcome: outcome,
                 startMS: startMS,
@@ -162,7 +294,15 @@ final class CodexNativeSessionController {
     private static let maxCompletedCanonicalItemScopes = 512
     private static let maxCanonicalCompletionTurnIDs = 128
     private static let maxPendingTurnFailures = 64
-    private static let computerUseMCPServerName = "computer-use"
+    private static let hookTrustWriteMutex = AsyncMutex()
+    private static let maxHookTrustWriteSettlementDeadline: TimeInterval = 30
+    private static let computerUseMCPServerName = MCPIntegrationHelper.computerUseMCPServerName
+    // Controller-scoped: never follows a live settings toggle while requests are outstanding.
+    private var computerUseRequiresUserReview = false
+    private var computerUseAutoApprovalRevoked = false
+    private var computerUseScopePrepared = false
+    private var computerUseAcceptedClientPath: String?
+    private var effectiveComputerUseServerNames: [String] = []
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -563,10 +703,14 @@ final class CodexNativeSessionController {
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
         /// Agent Mode omits this so thread start/resume config is authoritative.
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        var capabilitiesProvider: @MainActor () -> CodexCapabilitySettings = { .disabled }
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        var computerUseClientPathProvider: () -> String? = { CodexNativeSessionController.computerUseClientPath() }
+        var mcpServerEntriesProvider: () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
+        var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
@@ -593,16 +737,20 @@ final class CodexNativeSessionController {
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
             suppressThirdPartyMCPServers: Bool = false,
+            capabilitiesProvider: @escaping @MainActor () -> CodexCapabilitySettings = { .disabled },
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
+            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         ) -> Options {
             Options(
                 requestTimeout: 120,
                 configOverridesProvider: {
                     let featurePolicy = await MainActor.run {
                         (
+                            capabilities: capabilitiesProvider(),
                             goalSupportEnabled: goalSupportEnabledProvider(),
                             reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
                             memoriesEnabled: memoriesEnabledProvider(),
@@ -612,10 +760,13 @@ final class CodexNativeSessionController {
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
+                        capabilities: featurePolicy.capabilities,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        computerUseClientPath: computerUseClientPathProvider(),
+                        serverEntries: mcpServerEntriesProvider()
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -623,10 +774,16 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
+                capabilitiesProvider: capabilitiesProvider,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider
+                computerUseEnabledProvider: computerUseEnabledProvider,
+                computerUseClientPathProvider: computerUseClientPathProvider,
+                mcpServerEntriesProvider: mcpServerEntriesProvider,
+                skillExtraRootsProvider: {
+                    [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
+                }
             )
         }
     }
@@ -634,6 +791,22 @@ final class CodexNativeSessionController {
     enum ClientShutdownBehavior {
         case none
         case stopOnShutdown
+    }
+
+    struct HookTrustFaultInjection {
+        let settlementRecoveryExecutor: (@Sendable () async throws -> Void)?
+        let mutationExecutor: CodexHookTrustMutationExecutor?
+        let threadRebindCommitPreparation: (@Sendable () async -> Void)?
+
+        init(
+            settlementRecoveryExecutor: (@Sendable () async throws -> Void)? = nil,
+            mutationExecutor: CodexHookTrustMutationExecutor? = nil,
+            threadRebindCommitPreparation: (@Sendable () async -> Void)? = nil
+        ) {
+            self.settlementRecoveryExecutor = settlementRecoveryExecutor
+            self.mutationExecutor = mutationExecutor
+            self.threadRebindCommitPreparation = threadRebindCommitPreparation
+        }
     }
 
     private enum ThreadMemoryMode: String {
@@ -657,6 +830,13 @@ final class CodexNativeSessionController {
     private enum InboundStreamKind {
         case notifications
         case serverRequests
+
+        var sourceDescription: String {
+            switch self {
+            case .notifications: "notifications"
+            case .serverRequests: "serverRequests"
+            }
+        }
     }
 
     private struct LifecycleAuthorityReconciliationLineage: Equatable {
@@ -674,6 +854,14 @@ final class CodexNativeSessionController {
         let kind: LifecycleAuthorityObservationKind
     }
 
+    private struct ThreadBindingContext {
+        let existing: SessionRef?
+        let baseInstructions: String
+        let model: String?
+        let reasoningEffort: String?
+        let serviceTier: String?
+    }
+
     private let client: CodexAppServerClient
     private let runID: UUID
     private let tabID: UUID
@@ -685,6 +873,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
+    private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
     private var rawEventLogFileThreadID: String?
@@ -692,6 +881,8 @@ final class CodexNativeSessionController {
 
     private var threadID: String?
     private var threadPath: String?
+    private var activeSessionReference: SessionRef?
+    private var threadBindingContext: ThreadBindingContext?
     private var routingCurrentTurnID: String?
     private var authoritativeLifecycleTurnID: String?
     private var activeTurnIDs: Set<String> = []
@@ -721,11 +912,32 @@ final class CodexNativeSessionController {
         threadID?.isEmpty == false
     }
 
-    private var notificationTask: Task<Void, Never>?
-    private var serverRequestTask: Task<Void, Never>?
+    func routingProcessID() async -> pid_t? {
+        await client.activeExpectedAgentPID(for: runID)
+    }
+
+    var currentSessionReference: SessionRef? {
+        activeSessionReference
+    }
+
+    private let inboundStreamInstallationMutex = AsyncMutex()
+    private let inboundStreamTaskLock = NSLock()
+    /// Protected by `inboundStreamTaskLock`.
+    private var notificationTask: InboundStreamTaskRecord?
+    /// Protected by `inboundStreamTaskLock`.
+    private var serverRequestTask: InboundStreamTaskRecord?
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private let eventsContinuationLock = NSLock()
     private let eventHandlingMutex = AsyncMutex()
+    private let hookOperationMutex = AsyncMutex()
+    private let hookTrustSettlementStateLock = NSLock()
+    /// Protected by `hookTrustSettlementStateLock`. While set, inbound stream closure
+    /// belongs to a planned unsettled-write retirement and must not terminalize this
+    /// otherwise reusable controller.
+    private var retiringHookTrustGeneration: UInt64?
+    /// Protected by `hookTrustSettlementStateLock`. Generations are monotonic and
+    /// retained so a cancelled handler that exits after recovery remains suppressed.
+    private var retiredHookTrustTransportGenerations: Set<UInt64> = []
     private let eventsStream: AsyncStream<Event>
     /// Protected by `eventsContinuationLock`.
     private var lifecycleState: LifecycleState = .fresh
@@ -851,6 +1063,411 @@ final class CodexNativeSessionController {
         )
     }
 
+    private func hookTrustService() -> CodexHookTrustService {
+        CodexHookTrustService(
+            requestExecutor: { [weak self] method, params, timeout in
+                guard let self else { throw CodexAppServerClient.ClientError.invalidResponse }
+                do {
+                    if let requestExecutor {
+                        return try await requestExecutor(method, params, timeout)
+                    }
+                    try await ensureHookTrustTransportReady()
+                    return try await client.request(
+                        method: method,
+                        params: params,
+                        timeout: timeout,
+                        useDefaultTimeout: false
+                    )
+                } catch {
+                    throw mapHookTrustRequestError(error)
+                }
+            },
+            mutationExecutor: { [weak self] method, params, deadline in
+                guard let self else { throw CodexAppServerClient.ClientError.invalidResponse }
+                return try await executeHookTrustMutation(
+                    method: method,
+                    params: params,
+                    deadline: deadline
+                )
+            },
+            executionCWD: workspacePaths.executionDirectory,
+            timeout: options.requestTimeout,
+            writeSettlementDeadline: hookTrustWriteSettlementDeadline
+        )
+    }
+
+    private func executeHookTrustMutation(
+        method: String,
+        params: [String: Any]?,
+        deadline: TimeInterval
+    ) async throws -> CodexHookTrustMutationSettlement {
+        let settlement: CodexHookTrustMutationSettlement
+        do {
+            if let mutationExecutor = hookTrustFaultInjection.mutationExecutor {
+                settlement = try await mutationExecutor(method, params, deadline)
+            } else if let requestExecutor {
+                settlement = try await .response(requestExecutor(method, params, deadline))
+            } else {
+                try await ensureHookTrustTransportReady()
+                settlement = try await .response(
+                    client.requestWithSettlementDeadline(
+                        method: method,
+                        params: params,
+                        deadline: deadline,
+                        onUnsettled: { [weak self] generation in
+                            self?.markHookTrustTransportRetiring(generation: generation)
+                        }
+                    )
+                )
+            }
+        } catch {
+            guard CodexAppServerClient.isTimeoutError(error)
+                || CodexAppServerClient.isAmbiguousMutationError(error)
+            else {
+                throw mapHookTrustRequestError(error)
+            }
+            settlement = .unsettled
+        }
+
+        if case .unsettled = settlement {
+            try await performHookTrustTransportRecovery()
+        }
+        return settlement
+    }
+
+    private func mapHookTrustRequestError(_ error: Error) -> Error {
+        guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error,
+              failure.code == -32601
+        else {
+            return error
+        }
+        return CodexHookTrustService.RequestError.unsupportedMethod
+    }
+
+    private var hookTrustWriteSettlementDeadline: TimeInterval {
+        guard let configured = options.requestTimeout,
+              configured.isFinite,
+              configured > 0
+        else {
+            return Self.maxHookTrustWriteSettlementDeadline
+        }
+        return min(configured, Self.maxHookTrustWriteSettlementDeadline)
+    }
+
+    private func ensureHookTrustTransportReady() async throws {
+        let canUseController = withEventsStateLock {
+            lifecycleState == .binding || lifecycleState == .active
+        }
+        guard canUseController else {
+            throw CodexAppServerClient.ClientError.processNotRunning
+        }
+        try await client.startIfNeeded()
+        try await ensureInboundStreamsStartedForRecovery()
+    }
+
+    private func markHookTrustTransportRetiring(generation: UInt64) {
+        hookTrustSettlementStateLock.lock()
+        retiringHookTrustGeneration = generation
+        hookTrustSettlementStateLock.unlock()
+        recordRetiredHookTrustGeneration(generation)
+        Self.logger.error("Codex hook-trust mutation unsettled; retiring transport generation=\(generation, privacy: .public)")
+        #if DEBUG
+            perfRecorder.event(
+                "provider.codex.hookTrust.transportRetiring",
+                tabID: tabID,
+                fields: [
+                    "settlementDeadlineSeconds": String(hookTrustWriteSettlementDeadline),
+                    "transportGeneration": String(generation)
+                ]
+            )
+        #endif
+    }
+
+    private func recordRetiredHookTrustGeneration(_ generation: UInt64) {
+        hookTrustSettlementStateLock.lock()
+        retiredHookTrustTransportGenerations.insert(generation)
+        if retiredHookTrustTransportGenerations.count > 32,
+           let oldest = retiredHookTrustTransportGenerations.min()
+        {
+            retiredHookTrustTransportGenerations.remove(oldest)
+        }
+        hookTrustSettlementStateLock.unlock()
+    }
+
+    private func shouldSuppressHookTrustStreamEnd(transportGeneration: UInt64?) -> Bool {
+        guard let transportGeneration else { return false }
+        hookTrustSettlementStateLock.lock()
+        defer { hookTrustSettlementStateLock.unlock() }
+        return retiredHookTrustTransportGenerations.contains(transportGeneration)
+    }
+
+    private func finishHookTrustTransportRecovery(succeeded: Bool) {
+        hookTrustSettlementStateLock.lock()
+        let generation = retiringHookTrustGeneration
+        retiringHookTrustGeneration = nil
+        hookTrustSettlementStateLock.unlock()
+        guard let generation else { return }
+        Self.logger.notice("Codex hook-trust settlement recovery finished; generation=\(generation, privacy: .public) succeeded=\(succeeded, privacy: .public)")
+        #if DEBUG
+            perfRecorder.event(
+                "provider.codex.hookTrust.settlementRecoveryFinished",
+                tabID: tabID,
+                fields: [
+                    "succeeded": String(succeeded),
+                    "retiredTransportGeneration": String(generation)
+                ]
+            )
+        #endif
+    }
+
+    private static func isMissingFreshThreadResumeError(
+        _ error: Error,
+        threadID: String,
+        rolloutPath: String?
+    ) -> Bool {
+        guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error,
+              failure.method == "thread/resume",
+              failure.code == -32600
+        else {
+            return false
+        }
+        let normalized = failure.message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let normalizedThreadID = threadID.lowercased()
+        return normalized == "no rollout found for thread id \(normalizedThreadID)"
+            || normalized == "thread not found: \(normalizedThreadID)"
+            || normalized == "thread not loaded: \(normalizedThreadID)"
+            || CodexAppServerClient.isMissingRolloutPathResolutionMessage(
+                failure.message,
+                expectedRolloutPath: rolloutPath
+            )
+    }
+
+    private func prepareHookTrustThreadBindingRestoration() async throws -> ThreadSnapshot {
+        guard let binding = threadBindingContext,
+              let priorReference = activeSessionReference,
+              let priorThreadID = Self.nonEmptyString(priorReference.conversationID)
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+
+        let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
+        if !skillExtraRoots.isEmpty {
+            _ = try await performRequest(
+                method: "skills/extraRoots/set",
+                params: ["extraRoots": skillExtraRoots],
+                timeout: hookTrustWriteSettlementDeadline
+            )
+        }
+
+        if binding.existing != nil {
+            let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
+                guard let memoriesEnabledProvider = options.memoriesEnabledProvider else { return nil }
+                return memoriesEnabledProvider() ? .enabled : .disabled
+            }
+            if let desiredMemoryMode {
+                try await setThreadMemoryMode(
+                    desiredMemoryMode,
+                    threadID: priorThreadID,
+                    timeout: hookTrustWriteSettlementDeadline
+                )
+            }
+        }
+
+        // Armed scopes must re-detect effective collisions on the recovered transport before
+        // re-binding, rather than trusting server names captured by the original start.
+        if computerUseRequiresUserReview {
+            try await inspectComputerUseEffectiveConfiguration()
+        }
+        let configOverrides = try await runtimeConfigOverrides()
+        let result: [String: Any]
+        var startedFreshReplacement = false
+        do {
+            result = try await requestThreadBinding(
+                resumeThreadID: priorThreadID,
+                existing: priorReference,
+                baseInstructions: binding.baseInstructions,
+                model: binding.model,
+                serviceTier: binding.serviceTier,
+                configOverrides: configOverrides,
+                timeout: hookTrustWriteSettlementDeadline
+            )
+        } catch {
+            guard binding.existing == nil,
+                  Self.isMissingFreshThreadResumeError(
+                      error,
+                      threadID: priorThreadID,
+                      rolloutPath: priorReference.rolloutPath
+                  )
+            else {
+                throw error
+            }
+            startedFreshReplacement = true
+            Self.logger.notice("Codex hook-trust recovery could not resume the pre-turn thread; starting a fresh replacement thread")
+            result = try await requestThreadBinding(
+                resumeThreadID: nil,
+                existing: nil,
+                baseInstructions: binding.baseInstructions,
+                model: binding.model,
+                serviceTier: binding.serviceTier,
+                configOverrides: configOverrides,
+                timeout: hookTrustWriteSettlementDeadline
+            )
+        }
+
+        let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: binding.reasoningEffort)
+        guard Self.nonEmptyString(snapshot.conversationID) != nil else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        if !startedFreshReplacement,
+           snapshot.conversationID != priorThreadID
+        {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return snapshot
+    }
+
+    private func recoverHookTrustTransportAfterUnsettledWrite() async throws {
+        let retiredGeneration = currentRetiringHookTrustGeneration()
+        retireInboundStreamTasks(transportGeneration: retiredGeneration)
+
+        let race = CodexHookTrustRecoveryRace()
+        let recoveryTask = Task { [weak self] in
+            guard let self else {
+                race.resolve(.failed(CodexAppServerClient.ClientError.invalidResponse))
+                return
+            }
+            do {
+                try await client.startIfNeeded(
+                    initializationTimeout: hookTrustWriteSettlementDeadline
+                )
+                try await ensureInboundStreamsStartedForRecovery()
+                let snapshot = try await prepareHookTrustThreadBindingRestoration()
+                await hookTrustFaultInjection.threadRebindCommitPreparation?()
+                let didCommit = try await eventHandlingMutex.withLock {
+                    race.resolveSucceeded {
+                        restoreThreadSnapshot(snapshot)
+                    }
+                }
+                if didCommit {
+                    recordAppliedThreadSnapshot(snapshot)
+                }
+            } catch {
+                race.resolve(.failed(error))
+            }
+        }
+        let timeoutTask = Task.detached { [deadline = hookTrustWriteSettlementDeadline] in
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            race.resolve(.deadline)
+        }
+
+        switch await race.wait() {
+        case .succeeded:
+            timeoutTask.cancel()
+        case let .failed(error):
+            timeoutTask.cancel()
+            recoveryTask.cancel()
+            retireAllInboundStreamTasks()
+            await client.stop()
+            throw error
+        case .deadline:
+            recoveryTask.cancel()
+            retireAllInboundStreamTasks()
+            await client.stop()
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "initialize",
+                code: nil,
+                message: "Hook-trust transport recovery timed out after \(hookTrustWriteSettlementDeadline)s",
+                data: nil
+            ))
+        }
+    }
+
+    private func currentRetiringHookTrustGeneration() -> UInt64? {
+        hookTrustSettlementStateLock.lock()
+        defer { hookTrustSettlementStateLock.unlock() }
+        return retiringHookTrustGeneration
+    }
+
+    private func performHookTrustTransportRecovery() async throws {
+        var succeeded = false
+        defer { finishHookTrustTransportRecovery(succeeded: succeeded) }
+        if let settlementRecoveryExecutor = hookTrustFaultInjection.settlementRecoveryExecutor {
+            try await settlementRecoveryExecutor()
+        } else {
+            try await recoverHookTrustTransportAfterUnsettledWrite()
+        }
+        succeeded = true
+    }
+
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        let service = hookTrustService()
+        #if DEBUG
+            let lockWaitStartMS = perfRecorder.timestampMSIfEnabled()
+        #endif
+        do {
+            return try await hookOperationMutex.withLock {
+                #if DEBUG
+                    perfRecorder.durationEvent(
+                        "provider.codex.hookTrust.localLockWait",
+                        startMS: lockWaitStartMS,
+                        tabID: tabID
+                    )
+                #endif
+                return try await service.listHooks()
+            }
+        } catch is CancellationError {
+            throw CodexHookTrustError.cancelled
+        } catch let error as CodexHookTrustError {
+            throw error
+        } catch {
+            throw CodexHookTrustError.malformedListResponse
+        }
+    }
+
+    func trustHooksForCurrentWorkspace(
+        expectedCandidates: [CodexHookTrustCandidate],
+        expectedInventoryFingerprint: String
+    ) async throws -> CodexHookInventory {
+        let service = hookTrustService()
+        #if DEBUG
+            let localLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
+        #endif
+        do {
+            return try await hookOperationMutex.withLock {
+                #if DEBUG
+                    perfRecorder.durationEvent(
+                        "provider.codex.hookTrust.localLockWait",
+                        startMS: localLockWaitStartMS,
+                        tabID: tabID
+                    )
+                    let globalLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
+                #endif
+                return try await Self.hookTrustWriteMutex.withLock {
+                    #if DEBUG
+                        perfRecorder.durationEvent(
+                            "provider.codex.hookTrust.globalLockWait",
+                            startMS: globalLockWaitStartMS,
+                            tabID: tabID
+                        )
+                    #endif
+                    return try await service.trustHooks(
+                        expectedCandidates: expectedCandidates,
+                        expectedInventoryFingerprint: expectedInventoryFingerprint
+                    )
+                }
+            }
+        } catch is CancellationError {
+            throw CodexHookTrustError.cancelled
+        } catch let error as CodexHookTrustError {
+            throw error
+        } catch {
+            throw CodexHookTrustError.batchWriteFailed
+        }
+    }
+
     func cleanupConversation(
         _ handle: ProviderConversationCleanupHandle,
         action: ProviderConversationCleanupAction
@@ -874,7 +1491,9 @@ final class CodexNativeSessionController {
         options: Options? = nil,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
-        requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil
+        requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
+        hookTrustFaultInjection: HookTrustFaultInjection = .init(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.client = client
         self.runID = runID
@@ -885,6 +1504,8 @@ final class CodexNativeSessionController {
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
+        self.hookTrustFaultInjection = hookTrustFaultInjection
+        self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
@@ -897,6 +1518,10 @@ final class CodexNativeSessionController {
     }
 
     deinit {
+        inboundStreamTaskLock.lock()
+        let notificationTask = notificationTask?.task
+        let serverRequestTask = serverRequestTask?.task
+        inboundStreamTaskLock.unlock()
         notificationTask?.cancel()
         serverRequestTask?.cancel()
         finishEventsStreamIfNeeded()
@@ -1149,6 +1774,74 @@ final class CodexNativeSessionController {
         appendRawEventLogRecord(record)
     }
 
+    private func requestThreadBinding(
+        resumeThreadID: String?,
+        existing: SessionRef?,
+        baseInstructions: String,
+        model: String?,
+        serviceTier: String?,
+        configOverrides: [String: Any],
+        timeout: TimeInterval?
+    ) async throws -> [String: Any] {
+        if let resumeThreadID {
+            var params: [String: Any] = ["threadId": resumeThreadID]
+            if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rolloutPath.isEmpty
+            {
+                params["path"] = rolloutPath
+            }
+            if let model {
+                params["model"] = model
+            }
+            Self.addServiceTier(serviceTier, to: &params)
+            if let executionDirectory = workspacePaths.executionDirectory {
+                params["cwd"] = executionDirectory
+            }
+            if !configOverrides.isEmpty {
+                params["config"] = configOverrides
+            }
+            // baseInstructions is intentionally omitted on thread/resume: the app-server
+            // preserves original instructions across resume (confirmed by Codex protocol
+            // tests: resume_switches_models_preserves_base_instructions). Resending them
+            // wastes ~5-6k tokens on every reconnect for no benefit.
+            return try await requestWithCompatibleAppServerRequestValueStyle(
+                method: "thread/resume",
+                timeout: timeout
+            ) { requestValueStyle in
+                var requestParams = params
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
+                return requestParams
+            }
+        }
+
+        var params: [String: Any] = [:]
+        if let model {
+            params["model"] = model
+        }
+        Self.addServiceTier(serviceTier, to: &params)
+        if let executionDirectory = workspacePaths.executionDirectory {
+            params["cwd"] = executionDirectory
+        }
+        if !configOverrides.isEmpty {
+            params["config"] = configOverrides
+        }
+        if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            params["baseInstructions"] = baseInstructions
+        }
+        return try await requestWithCompatibleAppServerRequestValueStyle(
+            method: "thread/start",
+            timeout: timeout
+        ) { requestValueStyle in
+            var requestParams = params
+            requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
+            requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
+            requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
+            return requestParams
+        }
+    }
+
     func startOrResume(existing: SessionRef?, baseInstructions: String) async throws -> SessionRef {
         try await startOrResume(
             existing: existing,
@@ -1199,7 +1892,7 @@ final class CodexNativeSessionController {
             // provisioning. The same client-held runtime is reused at process launch, including when
             // the bundled package is unavailable and a valid override exists only in the login shell.
             #if DEBUG
-                let runtimeResolutionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let runtimeResolutionStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             let runtime: CodexRuntimeAuthority.Runtime
             do {
@@ -1230,7 +1923,7 @@ final class CodexNativeSessionController {
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
                 #if DEBUG
-                    let provisioningStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    let provisioningStartMS = perfRecorder.timestampMSIfEnabled()
                 #endif
                 do {
                     try await options.repoPromptMCPProvisioner(runtime)
@@ -1260,11 +1953,11 @@ final class CodexNativeSessionController {
                 )
             }
             await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
-            await updateClientProcessLaunchPolicy()
+            try await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
             #if DEBUG
-                let spawnInitializeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let spawnInitializeStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             do {
                 try await client.startIfNeeded()
@@ -1287,7 +1980,21 @@ final class CodexNativeSessionController {
                 #endif
                 throw error
             }
+            // Armed scopes must reject effective collisions before thread creation initializes MCP.
+            // Ordinary starts retain their existing configuration path without an extra RPC.
+            if computerUseRequiresUserReview {
+                try await inspectComputerUseEffectiveConfiguration()
+            }
             await ensureInboundStreamsStarted()
+
+            let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
+            if !skillExtraRoots.isEmpty {
+                _ = try await performRequest(
+                    method: "skills/extraRoots/set",
+                    params: ["extraRoots": skillExtraRoots],
+                    timeout: options.requestTimeout
+                )
+            }
 
             if let resumeThreadID {
                 let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
@@ -1295,77 +2002,33 @@ final class CodexNativeSessionController {
                     return memoriesEnabledProvider() ? .enabled : .disabled
                 }
                 if let desiredMemoryMode {
-                    try await setThreadMemoryMode(desiredMemoryMode, threadID: resumeThreadID)
+                    try await setThreadMemoryMode(
+                        desiredMemoryMode,
+                        threadID: resumeThreadID,
+                        timeout: options.requestTimeout
+                    )
                 }
             }
 
-            let configOverrides = await options.configOverridesProvider()
+            let configOverrides = try await runtimeConfigOverrides()
             let result: [String: Any]
             #if DEBUG
-                let threadPhase: AgentModePerfDiagnostics.CodexLifecyclePhase = resumeThreadID == nil
+                let threadPhase: AgentPerfCodexLifecyclePhase = resumeThreadID == nil
                     ? .threadStart
                     : .threadResume
-                let threadRequestStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let threadRequestStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
 
             do {
-                if let resumeThreadID {
-                    var params: [String: Any] = ["threadId": resumeThreadID]
-                    if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !rolloutPath.isEmpty
-                    {
-                        params["path"] = rolloutPath
-                    }
-                    if let model {
-                        params["model"] = model
-                    }
-                    Self.addServiceTier(serviceTier, to: &params)
-                    if let executionDirectory = workspacePaths.executionDirectory {
-                        params["cwd"] = executionDirectory
-                    }
-                    if !configOverrides.isEmpty {
-                        params["config"] = configOverrides
-                    }
-                    // baseInstructions is intentionally omitted on thread/resume: the app-server
-                    // preserves original instructions across resume (confirmed by Codex protocol
-                    // tests: resume_switches_models_preserves_base_instructions). Resending them
-                    // wastes ~5-6k tokens on every reconnect for no benefit.
-                    result = try await requestWithCompatibleAppServerRequestValueStyle(
-                        method: "thread/resume",
-                        timeout: options.requestTimeout
-                    ) { requestValueStyle in
-                        var requestParams = params
-                        requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                        requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                        requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-                        return requestParams
-                    }
-                } else {
-                    var params: [String: Any] = [:]
-                    if let model {
-                        params["model"] = model
-                    }
-                    Self.addServiceTier(serviceTier, to: &params)
-                    if let executionDirectory = workspacePaths.executionDirectory {
-                        params["cwd"] = executionDirectory
-                    }
-                    if !configOverrides.isEmpty {
-                        params["config"] = configOverrides
-                    }
-                    if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        params["baseInstructions"] = baseInstructions
-                    }
-                    result = try await requestWithCompatibleAppServerRequestValueStyle(
-                        method: "thread/start",
-                        timeout: options.requestTimeout
-                    ) { requestValueStyle in
-                        var requestParams = params
-                        requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                        requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                        requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-                        return requestParams
-                    }
-                }
+                result = try await requestThreadBinding(
+                    resumeThreadID: resumeThreadID,
+                    existing: existing,
+                    baseInstructions: baseInstructions,
+                    model: model,
+                    serviceTier: serviceTier,
+                    configOverrides: configOverrides,
+                    timeout: options.requestTimeout
+                )
                 #if DEBUG
                     await recordLifecyclePhase(
                         threadPhase,
@@ -1393,6 +2056,13 @@ final class CodexNativeSessionController {
                 return sessionRef
             }
             try markStartOrResumeSucceeded()
+            threadBindingContext = ThreadBindingContext(
+                existing: existing,
+                baseInstructions: baseInstructions,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier
+            )
             return sessionRef
         } catch {
             try? await eventHandlingMutex.withLockIgnoringCancellation {
@@ -1406,14 +2076,18 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func setThreadMemoryMode(_ mode: ThreadMemoryMode, threadID: String) async throws {
+    private func setThreadMemoryMode(
+        _ mode: ThreadMemoryMode,
+        threadID: String,
+        timeout: TimeInterval?
+    ) async throws {
         _ = try await performRequest(
             method: "thread/memoryMode/set",
             params: [
                 "threadId": threadID,
                 "mode": mode.rawValue
             ],
-            timeout: options.requestTimeout
+            timeout: timeout
         )
     }
 
@@ -1437,6 +2111,17 @@ final class CodexNativeSessionController {
         return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
     }
 
+    func outstandingBlockingNativeToolCallNames() async -> [String] {
+        guard let path = threadPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty
+        else {
+            return []
+        }
+        return await Task.detached(priority: .utility) {
+            Self.persistedOutstandingBlockingNativeToolCallNames(fromRolloutPath: path)
+        }.value
+    }
+
     func setThreadName(_ name: String, threadID explicitThreadID: String?) async throws {
         let validatedName = AgentSession.validatedName(name)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1454,7 +2139,7 @@ final class CodexNativeSessionController {
     }
 
     func getThreadGoal() async throws -> ThreadGoal? {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/get",
@@ -1470,7 +2155,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalObjective(_ objective: String) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedObjective.isEmpty else {
@@ -1489,7 +2174,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalStatus(_ status: ThreadGoalStatus) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/set",
@@ -1503,7 +2188,7 @@ final class CodexNativeSessionController {
     }
 
     func clearThreadGoal() async throws -> Bool {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/clear",
@@ -1558,7 +2243,7 @@ final class CodexNativeSessionController {
         #endif
         let sandboxMode = options.sandboxModeProvider()
         #if DEBUG
-            let turnAcceptanceStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let turnAcceptanceStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             // turn/start can block for extended model reasoning — no timeout.
@@ -1568,8 +2253,8 @@ final class CodexNativeSessionController {
                 useDefaultTimeout: false
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                     mode: sandboxMode,
                     executionDirectory: workspacePaths.executionDirectory
@@ -1952,16 +2637,18 @@ final class CodexNativeSessionController {
         return nil
     }
 
+    func revokeComputerUseAutoApproval() {
+        withEventsStateLock { computerUseAutoApprovalRevoked = true }
+    }
+
     func shutdown() async {
+        revokeComputerUseAutoApproval()
         withEventsStateLock {
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
             }
         }
-        notificationTask?.cancel()
-        notificationTask = nil
-        serverRequestTask?.cancel()
-        serverRequestTask = nil
+        retireAllInboundStreamTasks()
         assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
         completedCanonicalItemScopes.removeAll(keepingCapacity: false)
         completedCanonicalItemScopeOrder.removeAll(keepingCapacity: false)
@@ -1982,7 +2669,7 @@ final class CodexNativeSessionController {
         }
         if clientShutdownBehavior == .stopOnShutdown {
             #if DEBUG
-                let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let shutdownStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             await client.stop()
             #if DEBUG
@@ -1999,6 +2686,7 @@ final class CodexNativeSessionController {
     private func restoreThreadSnapshot(_ snapshot: ThreadSnapshot) {
         threadID = snapshot.conversationID
         threadPath = snapshot.rolloutPath
+        activeSessionReference = snapshot.sessionRef
         routingCurrentTurnID = snapshot.currentTurnID
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
@@ -2021,11 +2709,18 @@ final class CodexNativeSessionController {
 
     private func applyThreadResponse(_ result: [String: Any], fallbackEffort: String?) -> SessionRef {
         let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
+        return applyThreadSnapshot(snapshot)
+    }
+
+    private func applyThreadSnapshot(_ snapshot: ThreadSnapshot) -> SessionRef {
         restoreThreadSnapshot(snapshot)
+        recordAppliedThreadSnapshot(snapshot)
+        return snapshot.sessionRef
+    }
+
+    private func recordAppliedThreadSnapshot(_ snapshot: ThreadSnapshot) {
         #if DEBUG
             ensureRawEventLogFileReadyIfNeeded()
-        #endif
-        #if DEBUG
             writeRawEventLogRecord(kind: "session.threadReady", payload: [
                 "conversationID": snapshot.conversationID,
                 "rolloutPath": snapshot.rolloutPath ?? NSNull(),
@@ -2033,7 +2728,6 @@ final class CodexNativeSessionController {
                 "currentTurnID": snapshot.currentTurnID ?? NSNull()
             ] as [String: Any])
         #endif
-        return snapshot.sessionRef
     }
 
     private static func parseThreadSnapshot(
@@ -2147,11 +2841,26 @@ final class CodexNativeSessionController {
         )
     }
 
-    private func updateClientProcessFeaturePolicy() async {
-        await updateClientProcessLaunchPolicy()
+    private func updateClientProcessFeaturePolicy() async throws {
+        try await updateClientProcessLaunchPolicy()
     }
 
-    private func updateClientProcessLaunchPolicy() async {
+    private func updateClientProcessLaunchPolicy() async throws {
+        if !computerUseScopePrepared {
+            // Admission is immutable for this controller. Readiness must never downgrade its
+            // approval policy to a permissive ordinary-turn preference.
+            computerUseRequiresUserReview = await MainActor.run { options.computerUseEnabledProvider() }
+            if computerUseRequiresUserReview {
+                guard !Self.hasReservedComputerUseEntry(options.mcpServerEntriesProvider()) else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+                }
+                guard let path = options.computerUseClientPathProvider() else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+                }
+                computerUseAcceptedClientPath = path
+            }
+            computerUseScopePrepared = true
+        }
         let featurePolicy = await currentFeaturePolicy()
         await client.updateProcessLaunchPolicy(
             featurePolicy: featurePolicy,
@@ -2164,9 +2873,37 @@ final class CodexNativeSessionController {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
-                computerUseEnabled: options.computerUseEnabledProvider()
+                computerUseEnabled: computerUseRequiresUserReview && computerUseAcceptedClientPath != nil,
+                capabilities: computerUseRequiresUserReview ? .computerUse : options.capabilitiesProvider()
             )
         }
+    }
+
+    private func inspectComputerUseEffectiveConfiguration() async throws {
+        guard computerUseRequiresUserReview else { return }
+        var params: [String: Any] = ["includeLayers": false]
+        if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
+        let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)
+        effectiveComputerUseServerNames = try Self.reservedComputerUseServerNames(config)
+        if computerUseRequiresUserReview { try Self.validateComputerUseConfiguration(config) }
+    }
+
+    private func runtimeConfigOverrides() async throws -> [String: Any] {
+        let overrides = await options.configOverridesProvider()
+        return try Self.computerUseRuntimeConfigOverrides(
+            overrides,
+            computerUseEnabled: computerUseRequiresUserReview,
+            acceptedClientPath: computerUseAcceptedClientPath,
+            effectiveServerNames: effectiveComputerUseServerNames
+        )
+    }
+
+    private var effectiveApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy {
+        computerUseRequiresUserReview ? .onRequest : options.approvalPolicyProvider()
+    }
+
+    private var effectiveApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer {
+        computerUseRequiresUserReview ? .user : options.approvalReviewerProvider()
     }
 
     private static func parseThreadGoalResponse(from result: [String: Any]) throws -> ThreadGoal {
@@ -2293,8 +3030,14 @@ final class CodexNativeSessionController {
     }
 
     private func ensureInboundStreamsStarted() async {
-        await startNotificationStreamIfNeeded()
-        await startServerRequestStreamIfNeeded()
+        try? await ensureInboundStreamsStartedForRecovery()
+    }
+
+    private func ensureInboundStreamsStartedForRecovery() async throws {
+        try await inboundStreamInstallationMutex.withLock {
+            try await startNotificationStreamIfNeeded()
+            try await startServerRequestStreamIfNeeded()
+        }
     }
 
     private func shouldInstallInboundStreamTask() -> Bool {
@@ -2308,16 +3051,60 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func startNotificationStreamIfNeeded() async {
-        guard notificationTask == nil else { return }
-        let stream = await client.subscribeNotifications()
+    private func startNotificationStreamIfNeeded() async throws {
+        try await installInboundStreamIfNeeded(
+            kind: .notifications,
+            acquireSubscription: { [client] in
+                let subscription = try await client.subscribeNotificationsWithTransportGeneration()
+                return (subscription.stream, subscription.transportGeneration)
+            },
+            handleElement: { controller, notification in
+                await controller.handleOrBufferNotification(notification)
+            }
+        )
+    }
+
+    private func startServerRequestStreamIfNeeded() async throws {
+        try await installInboundStreamIfNeeded(
+            kind: .serverRequests,
+            acquireSubscription: { [client] in
+                let subscription = try await client.subscribeServerRequestsWithTransportGeneration()
+                return (subscription.stream, subscription.transportGeneration)
+            },
+            handleElement: { controller, request in
+                await controller.handleOrBufferServerRequest(request)
+            }
+        )
+    }
+
+    private func installInboundStreamIfNeeded<Element>(
+        kind: InboundStreamKind,
+        acquireSubscription: () async throws -> (stream: AsyncStream<Element>, transportGeneration: UInt64),
+        handleElement: @escaping (CodexNativeSessionController, Element) async -> Void
+    ) async throws {
+        guard let healthyGeneration = await client.healthyTransportGeneration() else {
+            retireInboundStreamTask(kind: kind)
+            throw CodexAppServerClient.ClientError.processNotRunning
+        }
+        if reconcileInboundStreamTask(kind: kind, healthyGeneration: healthyGeneration) {
+            return
+        }
+
+        let subscription = try await acquireSubscription()
+        try Task.checkCancellation()
+        guard await client.healthyTransportGeneration() == subscription.transportGeneration else {
+            throw CodexAppServerClient.ClientError.processNotRunning
+        }
         guard shouldInstallInboundStreamTask() else { return }
-        notificationTask = Task { [weak self] in
-            for await notification in stream {
+        let token = UUID()
+        let startGate = CodexInboundStreamTaskStartGate()
+        let task = Task { [weak self] in
+            await startGate.wait()
+            for await element in subscription.stream {
                 guard let self else { return }
                 do {
                     try await eventHandlingMutex.withLock {
-                        await self.handleOrBufferNotification(notification)
+                        await handleElement(self, element)
                     }
                 } catch is CancellationError {
                     return
@@ -2326,30 +3113,108 @@ final class CodexNativeSessionController {
                 }
             }
             guard let self else { return }
-            await handleInboundStreamDidExit(kind: .notifications, source: "notifications")
+            await handleInboundStreamDidExit(
+                kind: kind,
+                source: kind.sourceDescription,
+                ownershipToken: token,
+                transportGeneration: subscription.transportGeneration
+            )
+        }
+        installInboundStreamTask(
+            .init(
+                token: token,
+                transportGeneration: subscription.transportGeneration,
+                task: task
+            ),
+            kind: kind
+        )
+        await startGate.open()
+    }
+
+    private func currentInboundStreamTask(kind: InboundStreamKind) -> InboundStreamTaskRecord? {
+        inboundStreamTaskLock.lock()
+        defer { inboundStreamTaskLock.unlock() }
+        switch kind {
+        case .notifications:
+            return notificationTask
+        case .serverRequests:
+            return serverRequestTask
         }
     }
 
-    private func startServerRequestStreamIfNeeded() async {
-        guard serverRequestTask == nil else { return }
-        let stream = await client.subscribeServerRequests()
-        guard shouldInstallInboundStreamTask() else { return }
-        serverRequestTask = Task { [weak self] in
-            for await request in stream {
-                guard let self else { return }
-                do {
-                    try await eventHandlingMutex.withLock {
-                        await self.handleOrBufferServerRequest(request)
-                    }
-                } catch is CancellationError {
-                    return
-                } catch {
-                    return
-                }
+    private func reconcileInboundStreamTask(
+        kind: InboundStreamKind,
+        healthyGeneration: UInt64
+    ) -> Bool {
+        let existing = currentInboundStreamTask(kind: kind)
+        guard let existing else { return false }
+        guard existing.transportGeneration != healthyGeneration else { return true }
+        retireInboundStreamTask(kind: kind, ownershipToken: existing.token)
+        return false
+    }
+
+    private func retireInboundStreamTask(
+        kind: InboundStreamKind,
+        ownershipToken: UUID? = nil
+    ) {
+        let retired = inboundStreamTaskLock.withLock { () -> InboundStreamTaskRecord? in
+            switch kind {
+            case .notifications:
+                guard ownershipToken == nil || notificationTask?.token == ownershipToken else { return nil }
+                let record = notificationTask
+                notificationTask = nil
+                return record
+            case .serverRequests:
+                guard ownershipToken == nil || serverRequestTask?.token == ownershipToken else { return nil }
+                let record = serverRequestTask
+                serverRequestTask = nil
+                return record
             }
-            guard let self else { return }
-            await handleInboundStreamDidExit(kind: .serverRequests, source: "serverRequests")
         }
+        retired?.task.cancel()
+    }
+
+    private func installInboundStreamTask(
+        _ record: InboundStreamTaskRecord,
+        kind: InboundStreamKind
+    ) {
+        inboundStreamTaskLock.lock()
+        switch kind {
+        case .notifications:
+            notificationTask = record
+        case .serverRequests:
+            serverRequestTask = record
+        }
+        inboundStreamTaskLock.unlock()
+    }
+
+    private func retireInboundStreamTasks(transportGeneration: UInt64?) {
+        guard let transportGeneration else { return }
+        recordRetiredHookTrustGeneration(transportGeneration)
+
+        inboundStreamTaskLock.lock()
+        let notification = notificationTask?.transportGeneration == transportGeneration
+            ? notificationTask
+            : nil
+        let serverRequests = serverRequestTask?.transportGeneration == transportGeneration
+            ? serverRequestTask
+            : nil
+        if notification != nil { notificationTask = nil }
+        if serverRequests != nil { serverRequestTask = nil }
+        inboundStreamTaskLock.unlock()
+        notification?.task.cancel()
+        serverRequests?.task.cancel()
+    }
+
+    private func retireAllInboundStreamTasks() {
+        inboundStreamTaskLock.lock()
+        let notification = notificationTask
+        let serverRequests = serverRequestTask
+        notificationTask = nil
+        serverRequestTask = nil
+        inboundStreamTaskLock.unlock()
+        notification?.task.cancel()
+        serverRequests?.task.cancel()
     }
 
     private func beginBindingSession() {
@@ -2402,12 +3267,38 @@ final class CodexNativeSessionController {
         bufferedInbound.append(inbound)
     }
 
-    private func handleInboundStreamDidExit(kind: InboundStreamKind, source: String) async {
-        switch kind {
-        case .notifications:
-            notificationTask = nil
-        case .serverRequests:
-            serverRequestTask = nil
+    private func handleInboundStreamDidExit(
+        kind: InboundStreamKind,
+        source: String,
+        ownershipToken: UUID,
+        transportGeneration: UInt64?
+    ) async {
+        let stillOwnsSlot = inboundStreamTaskLock.withLock {
+            switch kind {
+            case .notifications:
+                let ownsSlot = notificationTask?.token == ownershipToken
+                if ownsSlot { notificationTask = nil }
+                return ownsSlot
+            case .serverRequests:
+                let ownsSlot = serverRequestTask?.token == ownershipToken
+                if ownsSlot { serverRequestTask = nil }
+                return ownsSlot
+            }
+        }
+        if shouldSuppressHookTrustStreamEnd(transportGeneration: transportGeneration) {
+            let generationDescription = transportGeneration.map(String.init) ?? "unknown"
+            Self.logCodexDebug(
+                "[CodexNativeController] suppressing planned hook-trust transport retirement "
+                    + "source=\(source) generation=\(generationDescription)"
+            )
+            return
+        }
+        guard stillOwnsSlot else {
+            Self.logCodexDebug(
+                "[CodexNativeController] ignoring superseded inbound stream ending "
+                    + "source=\(source)"
+            )
+            return
         }
         do {
             try await eventHandlingMutex.withLock {
@@ -3613,6 +4504,24 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
+        func test_markHookTrustTransportRetiring(generation: UInt64) {
+            markHookTrustTransportRetiring(generation: generation)
+        }
+
+        func test_shouldSuppressHookTrustStreamEnd(transportGeneration: UInt64?) -> Bool {
+            shouldSuppressHookTrustStreamEnd(transportGeneration: transportGeneration)
+        }
+
+        func test_ensureInboundStreamsStarted() async {
+            await ensureInboundStreamsStarted()
+        }
+
+        func test_inboundStreamTransportGenerations() -> (notifications: UInt64?, serverRequests: UInt64?) {
+            inboundStreamTaskLock.withLock {
+                (notificationTask?.transportGeneration, serverRequestTask?.transportGeneration)
+            }
+        }
+
         func test_installThreadState(
             threadID: String,
             authoritativeTurnID: String? = nil,
@@ -3636,6 +4545,21 @@ final class CodexNativeSessionController {
             deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: true)
             pendingTurnFailuresByScope.removeAll(keepingCapacity: true)
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
+        }
+
+        func test_handleServerRequest(method: String, params: [String: CodexJSONValue]) async {
+            await handleServerRequest(.init(id: .int(42), method: method, params: params))
+        }
+
+        func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
+            try await updateClientProcessLaunchPolicy()
+            return (effectiveApprovalPolicy, effectiveApprovalReviewer)
+        }
+
+        func test_computerUseStartupConfig() async throws -> [String: Any] {
+            try await updateClientProcessLaunchPolicy()
+            try await inspectComputerUseEffectiveConfiguration()
+            return try await runtimeConfigOverrides()
         }
 
         func test_handleNotification(
@@ -3711,6 +4635,12 @@ final class CodexNativeSessionController {
             fallbackEffort: String?
         ) -> ThreadSnapshot {
             parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
+        }
+
+        static func test_persistedOutstandingBlockingNativeToolCallNames(
+            fromRolloutPath path: String
+        ) -> [String] {
+            persistedOutstandingBlockingNativeToolCallNames(fromRolloutPath: path)
         }
 
         static func test_toolItemCandidatesCount(from params: [String: Any]) -> Int {
@@ -3891,7 +4821,10 @@ final class CodexNativeSessionController {
         case .authTokensRefresh:
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
-            if Self.isRepoPromptMCPElicitationRequest(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
+            if autoApproveHost || autoApproveCompanion {
+                logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -3900,10 +4833,6 @@ final class CodexNativeSessionController {
                         "_meta": [String: Any]()
                     ]
                 )
-                return
-            }
-            if let autoAcceptResult = await computerUseMCPElicitationAutoAcceptResult(params: params) {
-                await respondToServerRequest(id: request.id, result: autoAcceptResult)
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
@@ -3922,9 +4851,28 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "surface")
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
-            if let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
+            if autoApproveCompanion,
+               let permission = Self.parsePermissionsRequest(
+                   requestID: request.id,
+                   method: method,
+                   params: params,
+                   activeThreadID: threadID,
+                   currentTurnID: routingCurrentTurnID
+               )
+            {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await respondToServerRequest(id: request.id, result: [
+                    "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
+                ])
+                return
+            }
+            if let approvalResult = hostApprovalResult {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -3944,6 +4892,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "surface")
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
@@ -4044,50 +4993,28 @@ final class CodexNativeSessionController {
         }
     }
 
-    private static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
+    private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
+        guard computerUseRequiresUserReview else { return }
+        CodexComputerUseWorkflow.logApprovalDecision(
+            path: path, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
+            approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider(), outcome: outcome
+        )
+    }
+
+    private func shouldAutoApproveComputerUseCompanion(params: [String: Any]) -> Bool {
+        !withEventsStateLock { computerUseAutoApprovalRevoked }
+            && computerUseScopePrepared && computerUseAcceptedClientPath != nil
+            && CodexComputerUseWorkflow.automaticallyApprovesCompanion(
+                armed: computerUseRequiresUserReview,
+                approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider()
+            ) && MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
+    }
+
+    static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
         MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
             requestToolName: nil,
             requestPayload: params
         ) != nil
-    }
-
-    private func computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
-        let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
-        guard computerUseEnabled,
-              options.approvalPolicyProvider() == .never,
-              options.sandboxModeProvider() == .dangerFullAccess,
-              Self.isComputerUseMCPElicitationRequest(params: params)
-        else {
-            return nil
-        }
-        return [
-            "action": "accept",
-            "content": [String: Any](),
-            "_meta": [
-                "repoPromptAutoAccepted": true,
-                "reason": "explicit_computer_use_full_access"
-            ]
-        ]
-    }
-
-    private static func isComputerUseMCPElicitationRequest(params: [String: Any]) -> Bool {
-        let serverCandidates = [
-            "server",
-            "serverName",
-            "server_name",
-            "mcpServer",
-            "mcp_server",
-            "mcpServerName",
-            "mcp_server_name"
-        ]
-        guard let serverName = firstString(in: params, keys: serverCandidates)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !serverName.isEmpty
-        else {
-            return false
-        }
-        return serverName == computerUseMCPServerName
     }
 
     static func parseMCPElicitationRequest(
@@ -4353,7 +5280,9 @@ final class CodexNativeSessionController {
             threadID: threadID,
             turnID: turnID,
             itemID: itemID,
-            questions: parsedQuestions
+            questions: parsedQuestions,
+            repoPromptAutoApprovalVerified: MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: params) != nil,
+            computerUseCompanionVerified: MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
         )
     }
 
@@ -5250,7 +6179,10 @@ final class CodexNativeSessionController {
         var terminalCallIDs: Set<String> = []
         var outputByProcessID: [String: String] = [:]
         var outputByCallID: [String: String] = [:]
+        var outstandingBlockingNativeToolNameByCallID: [String: String] = [:]
     }
+
+    private static let blockingNativeToolNames: Set<String> = ["wait_agent"]
 
     static func commandExecutionRunningUpdate(
         fromToolName toolName: String,
@@ -6771,6 +7703,10 @@ final class CodexNativeSessionController {
                 continue
             }
 
+            if root["type"] as? String == "session_meta" {
+                signals.outstandingBlockingNativeToolNameByCallID.removeAll()
+            }
+
             if let type = root["type"] as? String,
                type == "response_item",
                let payload = root["payload"] as? [String: Any],
@@ -6782,6 +7718,9 @@ final class CodexNativeSessionController {
                     let normalizedName = normalizedExternalToolName(dictString(payload, key: "name"))
                     if let normalizedName {
                         toolNameByCallID[callID] = normalizedName
+                        if blockingNativeToolNames.contains(normalizedName) {
+                            signals.outstandingBlockingNativeToolNameByCallID[callID] = normalizedName
+                        }
                     }
                     if normalizedName == "write_stdin",
                        let argsJSON = dictString(payload, key: "arguments"),
@@ -6792,6 +7731,7 @@ final class CodexNativeSessionController {
 
                 case "function_call_output":
                     guard let callID = dictString(payload, key: "call_id"), !callID.isEmpty else { continue }
+                    signals.outstandingBlockingNativeToolNameByCallID.removeValue(forKey: callID)
                     guard let output = dictString(payload, key: "output"), !output.isEmpty else { continue }
                     guard let normalizedName = toolNameByCallID[callID] else { continue }
 
@@ -7138,6 +8078,13 @@ final class CodexNativeSessionController {
             }
         }
         return signals
+    }
+
+    private static func persistedOutstandingBlockingNativeToolCallNames(
+        fromRolloutPath path: String
+    ) -> [String] {
+        let signals = loadPersistedCommandSignals(fromRolloutPath: path)
+        return Array(Set(signals.outstandingBlockingNativeToolNameByCallID.values)).sorted()
     }
 
     private static func appendPersistedCommandOutput(
@@ -7671,6 +8618,22 @@ final class CodexNativeSessionController {
         return false
     }
 
+    /// Server identity attested by the provider payload. Populated aliases must agree:
+    /// a conflicting payload yields multiple names and fails closed downstream.
+    private func attestedMCPServerNames(in candidate: [String: Any]) -> Set<String> {
+        var names = Set<String>()
+        for key in [
+            "server", "serverName", "server_name", "mcpServer", "mcp_server", "mcpServerName", "mcp_server_name"
+        ] {
+            guard let value = stringValue(from: candidate, keys: [key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else { continue }
+            names.insert(value.lowercased().replacingOccurrences(of: "_", with: "-"))
+        }
+        return names
+    }
+
     private func normalizedToolName(from candidate: [String: Any]) -> String? {
         let explicitName = stringValue(from: candidate, keys: [
             "name", "toolName", "tool_name", "functionName", "function_name", "callName", "call_name"
@@ -7678,6 +8641,21 @@ final class CodexNativeSessionController {
         let typeRaw = normalizedTypeString(from: candidate)
         let raw = (explicitName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         let lowered = raw.lowercased()
+
+        // The provider-attested server outranks generic action aliases, so companion
+        // calls keep provenance even when the action name resembles a shell or web tool.
+        let attestedServers = attestedMCPServerNames(in: candidate)
+        if !raw.isEmpty, attestedServers == [Self.computerUseMCPServerName] {
+            // Already-qualified names carry their own provenance.
+            if lowered.hasPrefix("mcp__") { return raw }
+            return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
+        }
+        // Anything short of an exact companion attestation — foreign, conflicting, or
+        // absent — carrying a companion-looking name must never group: strip the
+        // claimed prefix and fail closed.
+        if let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw) {
+            return stripped
+        }
 
         if lowered == "local_shell"
             || lowered == "shell"
@@ -8296,15 +9274,93 @@ final class CodexNativeSessionController {
         )
     }
 
+    /// Inspect the app-server's effective configuration before installing the companion.
+    /// This also catches trusted project/managed layers, not just the owned home's file.
+    static func reservedComputerUseServerNames(_ response: [String: Any]) throws -> [String] {
+        guard let config = response["config"] as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        guard let rawServers = config["mcp_servers"] else { return [] }
+        guard let servers = rawServers as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        return servers.keys.filter { $0.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }.sorted()
+    }
+
+    static func validateComputerUseConfiguration(_ response: [String: Any]) throws {
+        guard try reservedComputerUseServerNames(response).isEmpty else {
+            throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+        }
+    }
+
+    /// Preserve the ordinary static overlay without discovering or rewriting companion entries.
+    /// For armed scopes, the actual thread boundary remains authoritative even when an
+    /// injected/default override provider evaluated readiness differently.
+    static func computerUseRuntimeConfigOverrides(
+        _ proposed: [String: Any],
+        computerUseEnabled: Bool,
+        acceptedClientPath: String?,
+        effectiveServerNames: [String]
+    ) throws -> [String: Any] {
+        guard computerUseEnabled else { return proposed }
+        let prefixes = ["mcp_servers.computer-use", "mcp_servers.\"computer-use\""]
+        var overrides = proposed.filter { key, _ in
+            let lower = key.lowercased()
+            return !prefixes.contains { lower == $0 || lower.hasPrefix("\($0).") }
+        }
+        if var servers = overrides["mcp_servers"] as? [String: Any] {
+            servers = servers.filter { $0.key.caseInsensitiveCompare(computerUseMCPServerName) != .orderedSame }
+            overrides["mcp_servers"] = servers
+        }
+        overrides["features.computer_use"] = computerUseEnabled
+        if computerUseEnabled {
+            guard effectiveServerNames.isEmpty else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+            }
+            guard let acceptedClientPath else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+            }
+            overrides["mcp_servers.computer-use"] = ["command": acceptedClientPath, "args": ["mcp"], "enabled": true] as [String: Any]
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
+        } else {
+            for name in effectiveServerNames {
+                let component = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: name)
+                overrides["mcp_servers.\(component).enabled"] = false
+            }
+        }
+        return overrides
+    }
+
+    static func hasReservedComputerUseEntry(_ entries: [MCPIntegrationHelper.CodexServerEntry]) -> Bool {
+        entries.contains { $0.normalizedName.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }
+    }
+
+    /// Locate only the installed companion executable; never import a personal Codex home.
+    static func computerUseClientPath(fileManager: FileManager = .default) -> String? {
+        let applications = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        let suffix = "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+        for directory in applications {
+            for appName in ["ChatGPT.app", "Codex.app"] {
+                let path = directory.appendingPathComponent(appName, isDirectory: true)
+                    .appendingPathComponent(suffix).path
+                if fileManager.isExecutableFile(atPath: path) { return path }
+            }
+        }
+        return nil
+    }
+
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
+        capabilities: CodexCapabilitySettings = .disabled,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        computerUseClientPath: String? = computerUseClientPath(),
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries()
     ) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
+        let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
@@ -8319,17 +9375,23 @@ final class CodexNativeSessionController {
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled
+                computerUseEnabled: readyComputerUse,
+                capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            computerUseEnabled: readyComputerUse,
+            computerUseClientPath: computerUseClientPath
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
+        }
+        if readyComputerUse {
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
         }
         overrides["features.code_mode.direct_only_tool_namespaces"] = ["mcp__RepoPromptCE"]
         return overrides
@@ -8339,19 +9401,17 @@ final class CodexNativeSessionController {
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         enabledMCPServerNames: Set<String>,
         suppressThirdPartyMCPServers: Bool,
-        computerUseEnabled: Bool
+        computerUseEnabled: Bool,
+        computerUseClientPath: String? = computerUseClientPath()
     ) -> [String: Any] {
         var effectiveEnabledNames = suppressThirdPartyMCPServers
             ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
             : enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: {
-               $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
-           })
-        {
-            effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        // A saved enabled entry never grants computer use to an ordinary turn.
+        effectiveEnabledNames = effectiveEnabledNames.filter {
+            $0.caseInsensitiveCompare(Self.computerUseMCPServerName) != .orderedSame
         }
-        return CodexOverrides.appServerMCPServerMap(
+        var overrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
                 enabledNormalizedNames: effectiveEnabledNames,
@@ -8359,6 +9419,24 @@ final class CodexNativeSessionController {
                 exceptBroken: []
             )
         )
+        // Optional servers can be omitted from the first turn while discovery is pending.
+        // Require only RepoPrompt for these app-owned threads; leave global/third-party policy alone.
+        let repoPromptKey = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: MCPIntegrationHelper.repoPromptMCPServerName)
+        overrides["mcp_servers.\(repoPromptKey).required"] = true
+        let companionKey = "mcp_servers.\(MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: computerUseMCPServerName))"
+        if computerUseEnabled, let computerUseClientPath, !hasReservedComputerUseEntry(serverEntries) {
+            // Codex recursively merges config layers. Only introduce a full definition when
+            // the reserved name is absent; never overlay a saved transport or approval policy.
+            overrides[companionKey] = [
+                "command": computerUseClientPath,
+                "args": ["mcp"],
+                "enabled": true
+            ] as [String: Any]
+            overrides.removeValue(forKey: "\(companionKey).enabled")
+        }
+        // Existing entries were disabled above. Do not synthesize an enabled=false-only
+        // entry: Codex validates transport even for disabled servers.
+        return overrides
     }
 }
 

@@ -78,10 +78,12 @@ package class DiffGenerationUtility {
         newContent: [String],
         action: FileAction,
         diffPrecision: DiffPrecision = .normal,
+        processedFileContent: [LineData]? = nil,
         searchStartLine: Int = 0,
         mcpAmbiguityCheck: Bool = false,
         replaceAll: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> [DiffChunk] {
         switch action {
         case .create:
@@ -102,10 +104,12 @@ package class DiffGenerationUtility {
                     newContent: newContent,
                     diffPrecision: diffPrecision,
                     lineIndexMap: lineIndexMap,
+                    processedFileContent: processedFileContent,
                     searchStartLine: searchStartLine,
                     mcpAmbiguityCheck: mcpAmbiguityCheck,
                     replaceAll: replaceAll,
-                    tabPromotionEnabled: tabPromotionEnabled
+                    tabPromotionEnabled: tabPromotionEnabled,
+                    requireWholeLineMatch: requireWholeLineMatch
                 )
             } else if isStartSelectorEmpty, isEndSelectorEmpty {
                 return generateRewriteDiff(fileContent: fileContent, newContent: newContent)
@@ -275,16 +279,22 @@ package class DiffGenerationUtility {
      */
 
     /// 🚩 Offset-aware search-block diff
+    ///
+    /// Matched file lines are replaced wholesale. When `requireWholeLineMatch` is set,
+    /// a candidate is only accepted if every matched line passes `isWholeLineMatch`, so
+    /// capped-key or fuzzy-probe candidates cannot drop text the search did not cover.
     package static func generateDiffWithSearchBlock(
         fileContent: [String],
         searchBlock: [String],
         newContent: [String],
         diffPrecision: DiffPrecision = .normal,
         lineIndexMap: [String: [Int]]? = nil,
+        processedFileContent: [LineData]? = nil,
         searchStartLine: Int = 0,
         mcpAmbiguityCheck: Bool = false,
         replaceAll: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> [DiffChunk] {
         guard !fileContent.isEmpty else { throw DiffGenerationError.emptyContent }
         guard !searchBlock.isEmpty else { throw DiffGenerationError.invalidSelector }
@@ -308,34 +318,31 @@ package class DiffGenerationUtility {
 
         // Handle replace_all by finding multiple matches
         if replaceAll {
+            let processedFile = processedFileContent ?? fileContent.map {
+                processLine($0, precision: diffPrecision)
+            }
+            let fullIndexMap = lineIndexMap ?? buildLineIndexMapHigh(content: processedFile)
             var allChunks: [DiffChunk] = []
             allChunks.reserveCapacity(1)
             var currentStartLine = searchStartLine
 
             while currentStartLine < fileContent.count {
-                // ➊ Search only after `currentStartLine`
-                let fileSlice = fileContent[currentStartLine...]
-                let processedFileSlice = fileSlice.map { processLine($0, precision: diffPrecision) }
-
-                let sliceIndexMap = lineIndexMap ?? buildLineIndexMapHigh(content: processedFileSlice)
-
-                // ➋ Locate match *inside* the slice
-                let localMatch: Int
+                // ➊ Locate the next match using full-file coordinates.
+                let globalMatch: Int
                 do {
-                    localMatch = try await findBestMatchUsingNGrams(
+                    globalMatch = try await findBestMatchUsingNGrams(
                         selector: processedSearch,
-                        in: processedFileSlice,
-                        lineIndexMap: sliceIndexMap,
-                        mcpAmbiguityCheck: false // Skip ambiguity check for replace_all
+                        in: processedFile,
+                        lineIndexMap: fullIndexMap,
+                        mcpAmbiguityCheck: false, // Skip ambiguity check for replace_all
+                        minimumMatchIndex: currentStartLine
                     )
                 } catch DiffGenerationError.noMatchFound {
                     break // No more matches found
                 }
 
-                if localMatch == -1 { break }
+                if globalMatch == -1 { break }
 
-                // Convert to absolute indices in original file
-                let globalMatch = localMatch + currentStartLine
                 let globalEnd = globalMatch + sanitizedSearch.count
 
                 guard globalEnd <= fileContent.count else {
@@ -344,6 +351,12 @@ package class DiffGenerationUtility {
 
                 // ➌ Produce diff for this match (same as single-match logic)
                 let oldBlock = Array(fileContent[globalMatch ..< globalEnd])
+                if requireWholeLineMatch,
+                   !isWholeLineMatch(fileLines: oldBlock, searchLines: sanitizedSearch)
+                {
+                    currentStartLine = globalMatch + 1
+                    continue
+                }
                 let correctedNew = IndentCorrectionUtility.reIndentUsingSearchBlock(
                     oldBlock: oldBlock,
                     searchBlock: sanitizedSearch,
@@ -409,6 +422,11 @@ package class DiffGenerationUtility {
 
         // ➌ Produce diff
         let oldBlock = Array(fileContent[globalMatch ..< globalEnd])
+        if requireWholeLineMatch,
+           !isWholeLineMatch(fileLines: oldBlock, searchLines: sanitizedSearch)
+        {
+            throw DiffGenerationError.noMatchFound
+        }
         let correctedNew = IndentCorrectionUtility.reIndentUsingSearchBlock(
             oldBlock: oldBlock,
             searchBlock: sanitizedSearch,
@@ -495,7 +513,13 @@ package class DiffGenerationUtility {
 
     /// Finds the best match for a selector in the given content using an n-gram similarity search,
     /// then refines that match in a smaller window.
-    package static func findBestMatchUsingNGrams(selector: [LineData], in content: [LineData], lineIndexMap: [String: [Int]], mcpAmbiguityCheck: Bool = false) async throws -> Int {
+    package static func findBestMatchUsingNGrams(
+        selector: [LineData],
+        in content: [LineData],
+        lineIndexMap: [String: [Int]],
+        mcpAmbiguityCheck: Bool = false,
+        minimumMatchIndex: Int = 0
+    ) async throws -> Int {
         // 1) Basic validation - ensure inputs are valid
         guard !selector.isEmpty else {
             throw DiffGenerationError.invalidSelector
@@ -512,7 +536,12 @@ package class DiffGenerationUtility {
         let quickIndex: Int? = if mcpAmbiguityCheck {
             try matchSelectorFastWithAmbiguityCheck(selector: selector, content: content, lineIndex: lineIndexMap)
         } else {
-            try matchSelectorFast(selector: selector, content: content, lineIndex: lineIndexMap)
+            try matchSelectorFast(
+                selector: selector,
+                content: content,
+                lineIndex: lineIndexMap,
+                minimumMatchIndex: minimumMatchIndex
+            )
         }
 
         if let quickIndex {
@@ -885,8 +914,10 @@ package class DiffGenerationUtility {
     }
 
     /// Internal normalisation pipeline – **all** string surgery happens here.
+    /// `wholeLine` (the `isWholeLineMatch` key) stops after step 4: no length cap and
+    /// no trailing-delimiter strip, so a line never equals one that lacks its last token.
     @inline(__always)
-    private static func normalized(_ raw: String) -> String {
+    private static func normalized(_ raw: String, wholeLine: Bool = false) -> String {
         // 1. Decode HTML entities & lowercase.
         var s = raw.decodingHTMLEntities().lowercased()
 
@@ -914,6 +945,8 @@ package class DiffGenerationUtility {
         // 4. Collapse separator runs.
         s = collapseSeparatorRuns(s)
 
+        if wholeLine { return s }
+
         // 5. Cap to 150 chars to bound fuzzy-match CPU.
         if s.count > 150 { s = String(s.prefix(150)) }
 
@@ -933,6 +966,23 @@ package class DiffGenerationUtility {
     package static func canonicalKey(_ raw: String) -> String? {
         let key = normalized(raw)
         return key.isEmpty ? nil : key
+    }
+
+    /// True when each matched file line equals its search line under the matcher's own
+    /// normalisation (indentation, whitespace, case, …) but **without** the 150-char
+    /// key cap or the trailing-delimiter strip. Rejects candidates admitted only by capped
+    /// keys, unverified middle lines, the fuzzy probe, or a missing trailing `=`/`:`/`->`
+    /// token, all of which would replace text the search did not cover.
+    package static func isWholeLineMatch(fileLines: [String], searchLines: [String]) -> Bool {
+        guard fileLines.count == searchLines.count else { return false }
+        return zip(fileLines, searchLines).allSatisfy { fileLine, searchLine in
+            wholeLineKey(fileLine) == wholeLineKey(searchLine)
+        }
+    }
+
+    @inline(__always)
+    private static func wholeLineKey(_ raw: String) -> String {
+        String.removeIndentationTag(normalized(raw, wholeLine: true))
     }
 
     /// Returns the strict & loose hash keys plus the cleaned text for a line.
@@ -1244,7 +1294,8 @@ package class DiffGenerationUtility {
         content: [LineData],
         lineIndex: [String: [Int]],
         maxFuzzyKeys maxKeys: Int = 400,
-        fuzzyThreshold sim: Double = 0.90
+        fuzzyThreshold sim: Double = 0.90,
+        minimumMatchIndex: Int = 0
     ) throws -> Int? {
         // ── Guard rails ─────────────────────────────────────────────────────────
         guard !selector.isEmpty, !content.isEmpty else {
@@ -1274,7 +1325,9 @@ package class DiffGenerationUtility {
 
         /// ── Helper: candidate list for selector line 0 --------------------------
         func strictOrLoosePositions(for line: LineData) -> [Int] {
-            lineIndex[line.removedTagsHigh] ?? lineIndex[line.removedTags] ?? []
+            let strict = (lineIndex[line.removedTagsHigh] ?? []).filter { $0 >= minimumMatchIndex }
+            if !strict.isEmpty { return strict }
+            return (lineIndex[line.removedTags] ?? []).filter { $0 >= minimumMatchIndex }
         }
 
         var starts = strictOrLoosePositions(for: selector[0])
@@ -1294,13 +1347,15 @@ package class DiffGenerationUtility {
             var seen = 0
             for (k, pos) in lineIndex {
                 if seen >= maxKeys { break }
+                let positionsAtOrAfterMinimum = pos.filter { $0 >= minimumMatchIndex }
+                guard !positionsAtOrAfterMinimum.isEmpty else { continue }
                 seen += 1
                 let coeff = sKey.diceCoefficient(against: k)
                 if enableDetailedLogging {
                     print("  🔍 Fuzzy probe test \(seen)/\(maxKeys): \(sKey) ↔ \(k)  Dice: \(coeff)")
                 }
                 guard coeff >= fuzzyThresh else { continue }
-                for p in pos {
+                for p in positionsAtOrAfterMinimum {
                     starts.append(p)
                     fuzzyScoreMap[p] = max(fuzzyScoreMap[p] ?? 0, coeff)
                 }
@@ -1320,9 +1375,13 @@ package class DiffGenerationUtility {
                 var collected: [Int] = []
                 var scanned = 0
                 for (k, pos) in lineIndex where scanned < maxKeys {
+                    let positionsAtOrAfterMinimum = pos.filter { $0 >= minimumMatchIndex }
+                    guard !positionsAtOrAfterMinimum.isEmpty else { continue }
                     scanned += 1
                     if sKey.diceCoefficient(against: k) >= fuzzyThresh {
-                        collected += pos.compactMap { $0 > 0 ? $0 - 1 : nil }
+                        collected += positionsAtOrAfterMinimum.compactMap {
+                            $0 > minimumMatchIndex ? $0 - 1 : nil
+                        }
                     }
                 }
                 second = collected

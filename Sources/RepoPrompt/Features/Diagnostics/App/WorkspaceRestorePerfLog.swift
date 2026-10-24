@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 #if DEBUG
     import os
@@ -150,3 +151,82 @@ import Foundation
         }
     }
 #endif
+
+/// App-owned forwarding implementation; source ordering and logger buffering stay unchanged.
+struct AppWorkspaceRestorePerfRecorder: WorkspaceRestorePerfRecording {
+    var isEnabled: Bool {
+        #if DEBUG
+            WorkspaceRestorePerfLog.isEnabled
+        #else
+            false
+        #endif
+    }
+
+    func timestampMSIfEnabled() -> Double? {
+        #if DEBUG
+            WorkspaceRestorePerfLog.timestampMSIfEnabled()
+        #else
+            nil
+        #endif
+    }
+
+    func timestampMS() -> Double {
+        #if DEBUG
+            WorkspaceRestorePerfLog.timestampMS()
+        #else
+            CFAbsoluteTimeGetCurrent() * 1000
+        #endif
+    }
+
+    func elapsedMS(since startMS: Double) -> Double {
+        #if DEBUG
+            WorkspaceRestorePerfLog.elapsedMS(since: startMS)
+        #else
+            timestampMS() - startMS
+        #endif
+    }
+
+    func formatMS(_ value: Double) -> String {
+        #if DEBUG
+            WorkspaceRestorePerfLog.formatMS(value)
+        #else
+            String(format: "%.1fms", value)
+        #endif
+    }
+
+    func formatElapsedMS(since startMS: Double) -> String {
+        #if DEBUG
+            WorkspaceRestorePerfLog.formatElapsedMS(since: startMS)
+        #else
+            formatMS(elapsedMS(since: startMS))
+        #endif
+    }
+
+    func shortID(_ id: UUID?) -> String {
+        #if DEBUG
+            WorkspaceRestorePerfLog.shortID(id)
+        #else
+            id?.uuidString.prefix(8).description ?? "nil"
+        #endif
+    }
+
+    @MainActor func nextAgentActivationTrueCount() -> Int {
+        #if DEBUG
+            WorkspaceRestorePerfLog.nextAgentActivationTrueCount()
+        #else
+            0
+        #endif
+    }
+
+    func log(_ message: @autoclosure () -> String) {
+        #if DEBUG
+            WorkspaceRestorePerfLog.log(message())
+        #endif
+    }
+
+    func event(_ name: String, fields: [String: String] = [:]) {
+        #if DEBUG
+            WorkspaceRestorePerfLog.event(name, fields: fields)
+        #endif
+    }
+}

@@ -1,16 +1,40 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
-package enum DomainMutationJournalStatus: String, Codable, Sendable {
+package enum DomainMutationJournalStatus: String, Codable {
     case admitted
     case committing
     case applied
     case cancelledBeforeCommit = "cancelled_before_commit"
     case failedBeforeCommit = "failed_before_commit"
     case indeterminateAfterCommit = "indeterminate_after_commit"
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+        if rawValue == "failed_before_write" {
+            // Schema-v1 builds emitted this spelling. Delete this alias when v1 documents are no longer accepted;
+            // encoding below rewrites the record with the canonical current spelling.
+            self = .failedBeforeCommit
+            return
+        }
+        guard let status = Self(rawValue: rawValue) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Cannot initialize DomainMutationJournalStatus from invalid String value \(rawValue)"
+            )
+        }
+        self = status
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
-package struct DomainMutationJournalRecord: Codable, Sendable {
+package struct DomainMutationJournalRecord: Codable {
     package let key: String
     package let operationID: String
     package let toolName: String
@@ -74,7 +98,7 @@ package struct DomainMutationJournalRecord: Codable, Sendable {
     }
 }
 
-package struct DomainMutationJournalDocument: Codable, Sendable {
+package struct DomainMutationJournalDocument: Codable {
     package static let schemaVersion = 1
 
     var version: Int
@@ -88,18 +112,18 @@ package struct DomainMutationJournalDocument: Codable, Sendable {
     }
 }
 
-package struct DomainMutationJournalTicket: Hashable, Sendable {
+package struct DomainMutationJournalTicket: Hashable {
     package let key: String
     package let fingerprint: String
     package let ownerInvocationID: UUID
 }
 
-package enum DomainMutationJournalBegin: Sendable {
+package enum DomainMutationJournalBegin {
     case execute(DomainMutationJournalTicket)
     case replay(Value)
 }
 
-package enum DomainMutationJournalError: Error, Equatable, LocalizedError, Sendable {
+package enum DomainMutationJournalError: Error, Equatable, LocalizedError {
     case corruptOrFutureJournal
     case operationIDCollision(String)
     case operationInProgress(String)
@@ -398,7 +422,7 @@ package actor DomainMutationCommitState {
     }
 }
 
-package struct DomainMutationPhysicalRootMapping: Hashable, Sendable {
+package struct DomainMutationPhysicalRootMapping: Hashable {
     package let canonicalRoot: String
     package let physicalRoot: String
 
@@ -408,24 +432,28 @@ package struct DomainMutationPhysicalRootMapping: Hashable, Sendable {
     }
 }
 
-package struct DomainMutationCommitController: Sendable {
+package struct DomainMutationCommitController {
     private let admitOperation: @Sendable ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void
     private let physicalGuardOperation: @Sendable () async throws -> DomainMutationPhysicalCommitGuard?
+    private let physicalCapabilityOperation: @Sendable () async throws -> DomainMutationPhysicalCapability?
     private let commitOperation: @Sendable () async throws -> Void
 
     package init(
         admitPhysicalTargets: @Sendable @escaping ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void = { _, _ in },
         physicalMutationGuard: @Sendable @escaping () async throws -> DomainMutationPhysicalCommitGuard? = { nil },
+        physicalMutationCapability: @Sendable @escaping () async throws -> DomainMutationPhysicalCapability? = { nil },
         willCommit: @Sendable @escaping () async throws -> Void
     ) {
         admitOperation = admitPhysicalTargets
         physicalGuardOperation = physicalMutationGuard
+        physicalCapabilityOperation = physicalMutationCapability
         commitOperation = willCommit
     }
 
     package init(operation: @Sendable @escaping () async throws -> Void) {
         admitOperation = { _, _ in }
         physicalGuardOperation = { nil }
+        physicalCapabilityOperation = { nil }
         commitOperation = operation
     }
 
@@ -440,13 +468,19 @@ package struct DomainMutationCommitController: Sendable {
         try await physicalGuardOperation()
     }
 
+    package func physicalMutationCapability() async throws -> DomainMutationPhysicalCapability? {
+        try await physicalCapabilityOperation()
+    }
+
     package func willCommit() async throws {
         try await commitOperation()
     }
 }
 
 package enum MCPDomainMutationCommitContext {
-    @TaskLocal package static var controller: DomainMutationCommitController?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    package static let controllerTaskLocal = BoxedTaskLocal<DomainMutationCommitController?>(nil)
+    package static var controller: DomainMutationCommitController? { controllerTaskLocal.get() }
 
     package static func admitPhysicalTargets(
         _ paths: [String],
@@ -457,6 +491,10 @@ package enum MCPDomainMutationCommitContext {
 
     package static func physicalMutationGuard() async throws -> DomainMutationPhysicalCommitGuard? {
         try await controller?.physicalMutationGuard()
+    }
+
+    package static func physicalMutationCapability() async throws -> DomainMutationPhysicalCapability? {
+        try await controller?.physicalMutationCapability()
     }
 
     package static func willCommit() async throws {

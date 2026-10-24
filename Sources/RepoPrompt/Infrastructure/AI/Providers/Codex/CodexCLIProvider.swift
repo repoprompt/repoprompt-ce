@@ -1,9 +1,29 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptProcess
 
 final class CodexCLIProvider: AIProvider {
     private struct StreamAttemptFailure: Error {
         let underlying: Error
         let emittedOutput: Bool
+    }
+
+    /// Codex's app server only accepts image file paths, so request-scoped images are staged.
+    private static func stageImages(_ images: [AITransientImage]) async throws -> OracleTransientImageStaging? {
+        do {
+            return try await OracleTransientImageStaging.stage(images)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Codex could not securely stage Oracle image input in temporary storage."
+            )
+        }
+    }
+
+    private static func attachments(for staging: OracleTransientImageStaging?) -> [AgentImageAttachment] {
+        staging?.files.map { AgentImageAttachment(source: .localFile(path: $0.path), title: $0.title) } ?? []
     }
 
     private struct ReconciledTerminalTurn: Equatable {
@@ -80,6 +100,7 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private let workingDirectory: String?
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let enableDebugLogging: Bool
     private let defaultRequestTimeout: TimeInterval
     private let testRequestTimeout: TimeInterval
@@ -88,6 +109,7 @@ final class CodexCLIProvider: AIProvider {
     private let appServerReadyHook: (() async throws -> Void)?
     private let sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)?
     private let authRecovery: any CodexManagedAuthRecovering
+    private let perfRecorder: any AgentModePerfRecording
     private let initialBackoff: TimeInterval = 1.0
     private let maxBackoff: TimeInterval = 8.0
     private let reminderBlock = """
@@ -101,6 +123,7 @@ final class CodexCLIProvider: AIProvider {
 
     init(
         workingDirectory: String? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         enableDebugLogging: Bool = false,
         defaultRequestTimeout: TimeInterval? = nil,
         testRequestTimeout: TimeInterval? = nil,
@@ -109,9 +132,11 @@ final class CodexCLIProvider: AIProvider {
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory
+        self.launchSnapshot = launchSnapshot
         self.enableDebugLogging = enableDebugLogging
         self.defaultRequestTimeout = defaultRequestTimeout ?? (45 * 60)
         self.testRequestTimeout = testRequestTimeout ?? 30
@@ -122,16 +147,18 @@ final class CodexCLIProvider: AIProvider {
         self.maxRetries = maxRetries ?? 2
         self.appServerReadyHook = appServerReadyHook
         self.authRecovery = authRecovery
+        self.perfRecorder = perfRecorder
         self.sessionControllerFactory = sessionControllerFactory
         _ = logCollector
 
         // Ensure RepoPrompt MCP server entry exists before building overrides.
-        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery(launchSnapshot: launchSnapshot)
     }
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let baseInstructions = buildBaseInstructions(from: aiMessage)
-        let prompt = buildPrompt(from: aiMessage)
+        let transientImages = aiMessage.transientImages
+        let prompt = promptAppendingImageTitles(buildPrompt(from: aiMessage), images: transientImages)
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
@@ -149,9 +176,12 @@ final class CodexCLIProvider: AIProvider {
                 }
 
                 do {
+                    let imageStaging = try await Self.stageImages(transientImages)
+                    defer { imageStaging?.cleanup() }
                     try await streamViaAppServer(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: Self.attachments(for: imageStaging),
                         requestedModelIdentifier: requestedModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -304,6 +334,7 @@ final class CodexCLIProvider: AIProvider {
     private func streamViaAppServer(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -328,6 +359,7 @@ final class CodexCLIProvider: AIProvider {
                     try await runSingleStreamAttempt(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: images,
                         requestedModelIdentifier: activeModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -423,6 +455,7 @@ final class CodexCLIProvider: AIProvider {
     private func runSingleStreamAttempt(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -464,7 +497,7 @@ final class CodexCLIProvider: AIProvider {
                 )
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
-                    images: [],
+                    images: images,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
@@ -899,7 +932,7 @@ final class CodexCLIProvider: AIProvider {
         return AIProviderError.invalidConfiguration(detail: "Codex app-server timed out after \(seconds)s. Please try again shortly.")
     }
 
-    private func makeInteractiveSessionController(
+    func makeInteractiveSessionController(
         appServerClient: CodexAppServerClient?,
         excludeServers: Set<String>,
         requestTimeout: TimeInterval
@@ -911,18 +944,9 @@ final class CodexCLIProvider: AIProvider {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
         }
 
-        let interactiveConfigOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
-        let options = CodexNativeSessionController.Options(
-            requestTimeout: requestTimeout,
-            configOverridesProvider: { interactiveConfigOverrides },
-            approvalPolicyProvider: { .never },
-            sandboxModeProvider: { .readOnly },
-            approvalReviewerProvider: { .user },
-            authTokensRefreshHandler: nil,
-            goalSupportEnabledProvider: { false },
-            reasoningSummariesEnabledProvider: { false },
-            memoriesEnabledProvider: { false },
-            computerUseEnabledProvider: { false }
+        let options = interactiveSessionOptions(
+            excludeServers: excludeServers,
+            requestTimeout: requestTimeout
         )
 
         return CodexNativeSessionController(
@@ -934,13 +958,14 @@ final class CodexCLIProvider: AIProvider {
             options: options,
             // The transport is owned by the outer request lifecycle, not by the
             // single-turn controller.
-            clientShutdownBehavior: .none
+            clientShutdownBehavior: .none,
+            perfRecorder: perfRecorder
         )
     }
 
     private func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(launchSnapshot: launchSnapshot)
     }
 
     private func withActiveRequestAppServerClient<T>(
@@ -995,6 +1020,25 @@ final class CodexCLIProvider: AIProvider {
         return overrides
     }
 
+    func interactiveSessionOptions(
+        excludeServers: Set<String>,
+        requestTimeout: TimeInterval
+    ) -> CodexNativeSessionController.Options {
+        let configOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
+        return CodexNativeSessionController.Options(
+            requestTimeout: requestTimeout,
+            configOverridesProvider: { configOverrides },
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            authTokensRefreshHandler: nil,
+            goalSupportEnabledProvider: { false },
+            reasoningSummariesEnabledProvider: { false },
+            memoriesEnabledProvider: { false },
+            computerUseEnabledProvider: { false }
+        )
+    }
+
     private func appServerSelection(
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
@@ -1010,6 +1054,12 @@ final class CodexCLIProvider: AIProvider {
 
     private func buildBaseInstructions(from aiMessage: AIMessage) -> String {
         aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func promptAppendingImageTitles(_ prompt: String, images: [AITransientImage]) -> String {
+        let titles = images.compactMap(\.titleAnnotation)
+        guard !titles.isEmpty else { return prompt }
+        return ([prompt] + titles).filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     private func buildPrompt(from aiMessage: AIMessage) -> String {
@@ -1145,7 +1195,7 @@ final class CodexCLIProvider: AIProvider {
                 return message
             case .processNotRunning:
                 return "Codex app-server process is not running."
-            case .processExited:
+            case .processExited, .stdoutFrameBudgetExceeded:
                 return clientError.localizedDescription
             case .invalidResponse:
                 return "Codex app-server returned an invalid response."

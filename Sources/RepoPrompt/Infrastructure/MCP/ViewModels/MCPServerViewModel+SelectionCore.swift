@@ -1,5 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {
     nonisolated static let codeMapsGloballyDisabledMCPMessage = "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
@@ -56,7 +60,7 @@ extension MCPServerViewModel {
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
     func selectedRecordsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> [WorkspaceFileRecord] {
         do {
@@ -83,7 +87,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollections(
-        for context: TabContextSnapshot,
+        for context: MCPTabContextSnapshot,
         codeMapUsageOverride: CodeMapUsage? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> SelectionReplyAssembler.SelectionCollections {
@@ -106,9 +110,19 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
-        if let frozenLookupContext = context.frozenLookupContext {
-            return frozenLookupContext
+    func lookupContext(for context: MCPTabContextSnapshot) async -> WorkspaceLookupContext {
+        if let authority = context.frozenFileToolAuthority,
+           let workspaceManager
+        {
+            do {
+                try await authority.validate(
+                    workspaceManager: workspaceManager,
+                    store: promptVM.workspaceFileContextStore
+                )
+                return authority.lookupContext
+            } catch {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
         }
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(
@@ -121,10 +135,10 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollectionsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> SelectionReplyAssembler.SelectionCollections {
-        let metadata: RequestMetadata = if let metadataOverride {
+        let metadata: MCPRequestMetadata = if let metadataOverride {
             metadataOverride
         } else {
             await captureRequestMetadata()
@@ -143,11 +157,11 @@ extension MCPServerViewModel {
 
     @MainActor
     func physicalSelectionForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> StoredSelection {
         do {
-            let metadata: RequestMetadata = if let metadataOverride {
+            let metadata: MCPRequestMetadata = if let metadataOverride {
                 metadataOverride
             } else {
                 await captureRequestMetadata()
@@ -493,11 +507,11 @@ extension MCPServerViewModel {
             switch reason {
             case .unsupportedFileType:
                 .unmapped(terminal: true)
-            case .gitTerminal:
+            case .rootTerminal:
                 .unmapped(terminal: true)
             case let .demandUnavailable(reason):
                 demandUnavailableDisposition(reason)
-            case .rootNotLoaded, .fileNotCataloged, .gitTransient, .busy,
+            case .rootNotLoaded, .fileNotCataloged, .rootTransient, .busy,
                  .rejected, .routeConflict, .registrationFailed, .runtimeFailure,
                  .staleCurrentness, .cancelled:
                 .pending

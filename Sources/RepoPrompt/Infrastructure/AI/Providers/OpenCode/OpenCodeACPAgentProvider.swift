@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {
@@ -27,6 +29,19 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
     var providerID: ACPProviderID {
         .openCode
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        let category = input.category?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let configID = input.configID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if category == "thought_level" || configID == "effort" {
+            return .thinking
+        }
+        return nil
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
@@ -105,7 +120,8 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
         return try ACPPromptContentBuilder.blocks(
             text: text,
-            attachments: request.attachments
+            attachments: request.attachments,
+            transientImages: message.transientImages
         )
     }
 

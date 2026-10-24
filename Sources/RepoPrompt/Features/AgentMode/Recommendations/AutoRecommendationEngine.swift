@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // Import AIModel for type-safe model references
 
@@ -54,6 +55,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokBuildCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -122,10 +124,17 @@ final class AutoRecommendationEngine {
     // MARK: - Chat Model Recommendation
 
     private func computeChatModelRecommendation(status: ProviderStatusSnapshot) -> ChatModelRecommendation? {
-        let inAppPlanning = BestPracticeProfiles.bestInAppPlanningReview
         let bestPlanning = BestPracticeProfiles.bestPlanning
-        let apiPlanningModelString = AIModel.gpt54Pro.rawValue
-        let apiPlanningModelLabel = AIModel.gpt54Pro.displayName
+        let codexPlanningRaw = Self.preferredCodexFamilyModelRaw(
+            "sol",
+            effort: .high,
+            fallback: .gpt61SolHigh
+        )
+        let codexPlanningModel = AIModel.codexCustom(name: codexPlanningRaw)
+        let codexPlanningLabel = AgentModelCatalog.displayName(for: codexPlanningRaw, agentKind: .codexExec)
+        let apiPlanningModel = AIModel.gpt61SolHigh
+        let apiPlanningModelString = apiPlanningModel.rawValue
+        let apiPlanningModelLabel = apiPlanningModel.displayName
 
         // Build available options
         var codexOption: ChatBackendOption?
@@ -137,8 +146,8 @@ final class AutoRecommendationEngine {
             codexOption = ChatBackendOption(
                 kind: .codex,
                 displayName: "Codex CLI (Recommended)",
-                modelString: inAppPlanning.modelString,
-                description: "\(inAppPlanning.modelLabel) – strong reasoning with practical limits",
+                modelString: codexPlanningModel.rawValue,
+                description: "\(codexPlanningLabel) – strong reasoning with practical limits",
                 tradeoffs: [
                     "• Strong reasoning without extended wait times",
                     "• Won't exhaust weekly usage limits quickly",
@@ -147,8 +156,7 @@ final class AutoRecommendationEngine {
             )
         }
 
-        // OpenAI API option - shows reasoning but higher cost. GPT-5.6 Sol is ChatGPT Pro export/planning guidance,
-        // not an OpenAI API model in RepoPrompt's guidance.
+        // OpenAI API option - use the current Sol model with explicit high reasoning.
         if status.openAI == .ready {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
@@ -158,7 +166,7 @@ final class AutoRecommendationEngine {
                 tradeoffs: [
                     "• API-backed planning and review when Codex CLI is unavailable",
                     "• Visible reasoning traces",
-                    "• GPT-5.6 Sol is Codex CLI / ChatGPT Pro guidance, not an API availability claim"
+                    "• GPT-6.1 Sol is available through the OpenAI Responses API"
                 ]
             )
         }
@@ -186,15 +194,15 @@ final class AutoRecommendationEngine {
 
         if codexOption != nil {
             defaultBackend = .codex
-            priorityPath = ["Codex CLI (\(inAppPlanning.modelLabel))", "OpenAI API", "Claude Code"]
+            priorityPath = ["Codex CLI (\(codexPlanningLabel))", "OpenAI API", "Claude Code"]
         } else if openAIOption != nil {
             defaultBackend = .openAI
             priorityPath = ["OpenAI API (\(apiPlanningModelLabel))", "Claude Code"]
-            upgradeHint = "Connect Codex CLI for \(inAppPlanning.modelLabel) – strong reasoning with practical usage limits (requires OpenAI Plus/Pro)."
+            upgradeHint = "Connect Codex CLI for \(codexPlanningLabel) – strong reasoning with practical usage limits (requires OpenAI Plus/Pro)."
         } else if claudeCodeOption != nil {
             defaultBackend = .claudeCode
             priorityPath = ["Claude Code"]
-            upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(inAppPlanning.modelLabel) – balances quality with usage limits."
+            upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(codexPlanningLabel) – balances quality with usage limits."
         } else {
             return nil
         }
@@ -235,11 +243,12 @@ final class AutoRecommendationEngine {
 
         // Priority 2: Codex CLI
         if status.codexCLI == .ready {
+            let modelRaw = Self.preferredCodexFamilyModelRaw("sol", effort: .medium, fallback: .gpt61SolMedium)
             codexOption = ChatBackendOption(
                 kind: .codex,
                 displayName: "Codex CLI",
-                modelString: AIModel.codexCliGpt56SolMedium.rawValue,
-                description: "GPT-5.6 Sol Medium via Codex CLI",
+                modelString: AIModel.codexCustom(name: modelRaw).rawValue,
+                description: "\(AgentModelCatalog.displayName(for: modelRaw, agentKind: .codexExec)) via Codex CLI",
                 tradeoffs: [
                     "• Superior reasoning capabilities",
                     "• Excellent for complex tasks",
@@ -253,8 +262,8 @@ final class AutoRecommendationEngine {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
                 displayName: "OpenAI API",
-                modelString: AIModel.gpt54.rawValue,
-                description: "GPT-5.4 via OpenAI API",
+                modelString: AIModel.gpt61Sol.rawValue,
+                description: "GPT-6.1 Sol via OpenAI API",
                 tradeoffs: [
                     "• Superior reasoning capabilities",
                     "• Pay-per-use pricing",
@@ -291,6 +300,14 @@ final class AutoRecommendationEngine {
         )
     }
 
+    private static func preferredCodexFamilyModelRaw(
+        _ family: String,
+        effort: CodexReasoningEffort,
+        fallback: AgentModel
+    ) -> String {
+        AgentModelCatalog.preferredCodexFamilyModelRaw(family, effort: effort) ?? fallback.rawValue
+    }
+
     // MARK: - Context Builder Recommendation
 
     private func computeContextBuilderRecommendation(
@@ -308,9 +325,11 @@ final class AutoRecommendationEngine {
         // Cursor is a fallback only; it does not take priority over existing recommended providers.
         // Note: codexExec agent requires Codex CLI specifically, not just OpenAI API key
         if status.codexCLI == .ready {
+            let modelRaw = preferredCodexFamilyModelRaw("luna", effort: .low, fallback: .gpt6LunaLow)
+            let model = AgentModel.resolvedModel(forRaw: modelRaw, agentKind: .codexExec) ?? .gpt6LunaLow
             return ContextBuilderRecommendation(
                 recommendedAgent: .codexExec,
-                recommendedModel: .gpt56SolLow,
+                recommendedModel: model,
                 rationale: BestPracticeProfiles.contextBuilderRationale
             )
         } else if status.claudeCodeCLI == .ready {
@@ -318,22 +337,22 @@ final class AutoRecommendationEngine {
                 recommendedAgent: .claudeCode,
                 recommendedModel: .claudeSonnet,
                 rationale: "Claude Code with Sonnet provides strong context building with good balance of speed and quality.",
-                upgradeHint: "For best context building, connect Codex CLI with GPT-5.6 Sol Low. Requires OpenAI Plus/Pro subscription."
+                upgradeHint: "For best context building, connect Codex CLI with GPT-6 Luna Low. Requires OpenAI Plus/Pro subscription."
             )
         } else if status.cursorCLI == .ready {
             return ContextBuilderRecommendation(
                 recommendedAgent: .cursor,
                 recommendedModel: .cursorComposer2,
                 rationale: "Cursor CLI with Composer 2 can handle context building when the preferred Codex or Claude Code providers are not configured.",
-                upgradeHint: "For best context building, connect Codex CLI with GPT-5.6 Sol Low or Claude Code with Sonnet."
+                upgradeHint: "For best context building, connect Codex CLI with GPT-6 Luna Low or Claude Code with Sonnet."
             )
         }
 
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restores a usable saved Context Builder agent, using its catalog default when the saved model is absent or blank.
+    /// Invalid nonempty models or unavailable agents fall back through the same recommendation ranking as the wizard.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
@@ -341,34 +360,49 @@ final class AutoRecommendationEngine {
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
-           !modelRaw.isEmpty,
-           AgentModelCatalog.isAgentAvailable(agent, availability: availability),
-           isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
+           AgentModelCatalog.isAgentAvailable(agent, availability: availability)
         {
-            return AgentModelCatalog.normalizeSelection(
-                agentRaw: agent.rawValue,
-                modelRaw: modelRaw,
-                availability: availability
-            )
+            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if modelRaw.isEmpty {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: nil,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
+            if isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability) {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: modelRaw,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
         }
 
         let status = ProviderStatusSnapshot(
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokBuildCLI: availability.grokBuildAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
                 modelRaw: recommendation.recommendedModel.rawValue,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(
+            availability: availability,
+            surface: .headless
+        ).first(where: {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
@@ -376,8 +410,12 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
+            case .grokBuild:
+                enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
+            case .antigravity, .devin:
+                false
             }
         }) else {
             return nil
@@ -432,14 +470,20 @@ final class AutoRecommendationEngine {
 
     // MARK: - MCP Agent Defaults Recommendation
 
-    /// Build a connection-aware availability context from provider status.
-    private func mcpAgentAvailabilityContext(from status: ProviderStatusSnapshot) -> AgentModelCatalog.AvailabilityContext {
+    /// Keep CLI readiness/filtering separate from providers whose availability is runtime-owned.
+    func mcpAgentAvailabilityContext(
+        from status: ProviderStatusSnapshot,
+        runtimeAvailability: AgentModelCatalog.AvailabilityContext
+    ) -> AgentModelCatalog.AvailabilityContext {
         let backendStore = ClaudeCodeCompatibleBackendStore.shared
         return AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: status.claudeCodeCLI == .ready,
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
+            grokBuildAvailable: status.grokBuildCLI == .ready,
+            antigravityAvailable: runtimeAvailability.antigravityAvailable,
+            devinAvailable: runtimeAvailability.devinAvailable,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid
@@ -451,8 +495,9 @@ final class AutoRecommendationEngine {
         actualStatus: ProviderStatusSnapshot,
         recommendedStatus: ProviderStatusSnapshot
     ) -> MCPAgentDefaultsRecommendation? {
-        let availability = mcpAgentAvailabilityContext(from: actualStatus)
-        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus)
+        let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
+        let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
+        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
         let profileStore = AgentModelsProfileRoleDefaultsStore(
             overrides: profile(for: scope).mcpAgentRoleOverrides
         )
@@ -499,7 +544,7 @@ final class AutoRecommendationEngine {
         // Suggest upgrade if only some CLIs are available
         let upgradeHint: String? = {
             if recommendedStatus.codexCLI != .ready {
-                return "Connect Codex CLI for GPT-5.6 Sol Low (explore/discovery), GPT-5.6 Sol Medium (engineer and design fallback), and GPT-5.6 Sol High (pair/Oracle)."
+                return "Connect Codex CLI for GPT-6 Luna Low (explore/discovery), GPT-6.1 Sol Medium (engineer and design fallback), and GPT-6.1 Sol High (pair/Oracle)."
             }
             if recommendedStatus.claudeCodeCLI != .ready {
                 return "Connect Claude Code for Claude Opus (design/pair). Best for architecture and creative work."
@@ -602,9 +647,12 @@ final class AutoRecommendationEngine {
         case .claudeCode:
             rec.claudeCodeOption?.modelString ?? AIModel.claudeCodeOpus.rawValue
         case .codex:
-            rec.codexOption?.modelString ?? AIModel.codexCliGpt56SolHigh.rawValue
+            rec.codexOption?.modelString ?? AIModel.codexCustom(
+                name: Self.preferredCodexFamilyModelRaw("sol", effort: .high, fallback: .gpt61SolHigh)
+            ).rawValue
         case .openAI:
-            rec.openAIOption?.modelString ?? AIModel.gpt54Pro.rawValue
+            rec.openAIOption?.modelString
+                ?? AIModel.gpt61SolHigh.rawValue
         }
         let trimmedModel = modelString.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedModel.isEmpty ? nil : trimmedModel

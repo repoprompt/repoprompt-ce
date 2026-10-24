@@ -9,7 +9,7 @@
   },
   "catalog": {
     "global_tools": ["app_settings", "bind_context", "manage_workspaces"],
-    "window_tools": ["manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+    "window_tools": ["manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "agent_session_link", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
     "normalized_schema_golden": "Tests/RepoPromptTests/MCP/ToolCatalogSnapshotTests.swift",
     "actions": {
       "app_settings": ["list", "get", "set", "options"],
@@ -26,9 +26,10 @@
       "agent_explore": ["start", "poll", "wait", "cancel"],
       "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
       "agent_manage": ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"],
+      "agent_session_link": ["list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on", "snooze_auto_wake", "request_attention", "get_interaction", "respond", "steer"],
       "history": ["list_sessions", "search", "time", "get_session"]
     },
-    "canonical_discriminated_action_count": 86,
+    "canonical_discriminated_action_count": 98,
     "actionless_tool_count": 12,
     "actionless_tools": {
       "get_code_structure": {
@@ -145,8 +146,8 @@
         "behavior": "defaults_to_action",
         "default_action": "snapshot",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
-          "marker": "args[\"op\"]?.stringValue ?? \"snapshot\""
+          "path": "Sources/RepoPromptDomainRuntime/MCPPromptContextOperation.swift",
+          "marker": "let defaultOperation = toolName == \"workspace_context\" ? \"snapshot\" : \"get\""
         }
       },
       {
@@ -154,8 +155,8 @@
         "behavior": "defaults_to_action",
         "default_action": "get",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
-          "marker": "args[\"op\"]?.stringValue ?? \"get\""
+          "path": "Sources/RepoPromptDomainRuntime/MCPPromptContextOperation.swift",
+          "marker": "let defaultOperation = toolName == \"workspace_context\" ? \"snapshot\" : \"get\""
         }
       },
       {
@@ -226,6 +227,16 @@
         }
       },
       {
+        "tool": "agent_session_link",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionLinkMCPToolService.swift",
+          "marker": "agent_session_link op is required.",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
         "tool": "history",
         "behavior": "source_declares_typed_error_reply",
         "error_type": "HistoryToolReply.error(HistoryErrorReply)",
@@ -240,7 +251,7 @@
   "policy": {
     "admission": {
       "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
-      "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "agent_session_link", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
       "small_read": ["get_code_structure", "get_file_tree", "oracle_chat_log"],
       "file_read": ["read_file"],
       "git_read": ["git"],
@@ -248,17 +259,17 @@
     },
     "execution": {
       "long_synchronous": ["oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "context_builder", "file_search"],
-      "lifecycle_managed": ["agent_explore", "agent_run"],
+      "lifecycle_managed": ["agent_explore", "agent_run", "agent_session_link"],
       "interactive": ["apply_edits", "ask_user", "wait_for_next_user_instruction"],
       "workspace_lifecycle": ["bind_context", "manage_workspaces", "git", "manage_worktree"],
       "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
     },
     "advertisement_profiles": {
-      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_session_link_control", "agent_reasoning_control", "agent_session_control"],
       "discover_granted_capabilities": ["user_interaction"],
       "agent_mode_restricted_capabilities": ["workspace_mutate", "conversation_helper", "conversation_send"],
       "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
-      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log", "agent_session_link_control"],
       "agent_mode_claude_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "agent_mode_codex_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "agent_mode_open_code_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
@@ -288,6 +299,7 @@
       "agent_explore": ["agent_explore_control"],
       "agent_run": ["agent_external_control"],
       "agent_manage": ["agent_external_control"],
+      "agent_session_link": ["agent_session_link_control"],
       "share_thoughts": ["agent_reasoning_control"],
       "set_status": ["agent_session_control"],
       "wait_for_next_user_instruction": ["agent_reasoning_control"],
@@ -302,7 +314,8 @@
       "agent_mode_claude_engineer": "canonical",
       "agent_mode_codex_engineer": "suppress_read_only_hint",
       "agent_mode_open_code_engineer": "canonical",
-      "agent_mode_cursor_engineer": "canonical"
+      "agent_mode_cursor_engineer": "canonical",
+      "agent_mode_grok_build_engineer": "canonical"
     },
     "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
     "resolved_tool_policy_projection": {
@@ -314,7 +327,8 @@
       "agent_mode_claude_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
       "agent_mode_codex_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
       "agent_mode_open_code_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
-      "agent_mode_cursor_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
+      "agent_mode_cursor_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+      "agent_mode_grok_build_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
     }
   },
   "dependencies": {
@@ -331,15 +345,10 @@
     "presenter": "WorkspaceApprovalManager",
     "ordering": "single_fifo_active_request",
     "late_response": "ignored",
-    "presenter_loss": "default_deny",
-    "existing_test": {
-      "citation": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay",
-      "source_file": "Tests/RepoPromptTests/MCP/WorkspaceApprovalCancellationTests.swift"
-    },
-    "m4_owner_test": "RepoPromptDomainRuntimeTests.DomainMutationApprovalBrokerTests/testRequestsArePresentedAndSettledInFIFOOrder"
+    "presenter_loss": "default_deny"
   },
   "main_actor": {
-    "mcp_local_declaration_count": 42,
+    "mcp_local_declaration_count": 44,
     "mcp_local_declaration_sites": [
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
@@ -365,6 +374,16 @@
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift",
         "kind": "struct",
         "symbol": "AgentRunMCPToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionLinkMCPToolService.swift",
+        "kind": "struct",
+        "symbol": "AgentSessionLinkMCPToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentSessionTargetOperationGuard.swift",
+        "kind": "enum",
+        "symbol": "AgentSessionTargetOperationGuard"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
@@ -611,10 +630,6 @@
       "post_drain_refresh": "bound_workspace_tab_selection_and_revision_only"
     },
     "request_hops": ["main_actor_scheduled", "main_actor_entered", "main_actor_exited"],
-    "existing_test": {
-      "citation": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift"
-    },
     "per_tool_source_guarded_hops": {
       "app_settings": ["GlobalSettingsStore"],
       "bind_context": ["WindowRoutingService"],
@@ -639,6 +654,7 @@
       "agent_explore": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
       "agent_run": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
       "agent_manage": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "agent_session_link": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
       "share_thoughts": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
       "set_status": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
       "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
@@ -654,13 +670,14 @@
         "context_builder": ["ContextBuilderAgentViewModel"],
         "agent_explore": ["AgentExploreMCPToolService"],
         "agent_run": ["AgentRunMCPToolService", "AgentExternalMCPRunStarter", "AgentMCPStartWorktreeCoordinator"],
-        "agent_manage": ["AgentManageMCPToolService"]
+        "agent_manage": ["AgentManageMCPToolService"],
+        "agent_session_link": ["AgentSessionLinkMCPToolService"]
       }
     }
   },
   "sdk_stdio": {
     "package": "https://github.com/repoprompt/swift-sdk.git",
-    "revision": "85dec2fc7a27252bc33dc7728be6af6b3bd398c0",
+    "revision": "5716de85a976a8f70dedc9cb000e50aaa0d8cc5b",
     "source_evidence": {
       "transport": "Sources/MCP/Base/Transports/StdioTransport.swift",
       "server": "Sources/MCP/Server/Server.swift",
@@ -682,10 +699,6 @@
       {
         "citation": "RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished",
         "source_file": "Tests/RepoPromptTests/MCP/Control/JSONRPCBridgeLedgerTests.swift"
-      },
-      {
-        "citation": "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive",
-        "source_file": "Tests/RepoPromptTests/MCP/Control/ProcessLauncherDescriptorInheritanceTests.swift"
       }
     ]
   },
@@ -695,7 +708,7 @@
     "reason": "The preserved record says authorization-UI behavior was not probed and startup_scan_approved is false.",
     "prohibited_claim": "Direct packaged-child Keychain access works.",
     "prescribed_fallback": "Parent-owned secure storage and a minimum-scope in-memory credential handoff; debug alternate-in-memory storage remains nonpersistent.",
-    "secure_account_catalog_count": 23,
+    "secure_account_catalog_count": 24,
     "observation_status": "not_observed_approval_required",
     "record_classification": "unresolved_procedure_record_not_empirical_evidence",
     "prescribed_measurement_milestone": "before_M5_credential_transport"

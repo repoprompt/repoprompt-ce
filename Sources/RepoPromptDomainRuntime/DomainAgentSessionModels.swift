@@ -93,6 +93,38 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         }
     }
 
+    package struct ModelParameterSelection: Codable, Equatable, Sendable {
+        package let providerID: String
+        package let baseModelRaw: String
+        package let kind: String
+        package let configID: String
+        package let valueRaw: String
+
+        package init(
+            providerID: String,
+            baseModelRaw: String,
+            kind: String,
+            configID: String,
+            valueRaw: String
+        ) {
+            self.providerID = providerID
+            self.baseModelRaw = baseModelRaw
+            self.kind = kind
+            self.configID = configID
+            self.valueRaw = valueRaw
+        }
+
+        package func asObject() -> [String: Value] {
+            [
+                "provider_id": .string(providerID),
+                "base_model": .string(baseModelRaw),
+                "kind": .string(kind),
+                "config_id": .string(configID),
+                "value": .string(valueRaw)
+            ]
+        }
+    }
+
     package struct WorktreeBinding: Codable, Equatable, Sendable {
         package let id: String
         package let repositoryID: String
@@ -224,6 +256,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             case question
             case userInput = "user_input"
             case approval
+            case hookApproval = "hook_approval"
             case mcpElicitation = "mcp_elicitation"
         }
 
@@ -394,10 +427,44 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         }
     }
 
+    package struct HookGate: Equatable, Sendable {
+        package enum Status: String, Equatable, Sendable {
+            case approvedAll = "approved_all"
+            case approvedSelected = "approved_selected"
+            case continuedWithoutHooks = "continued_without_hooks"
+            case resolvedExternally = "resolved_externally"
+        }
+
+        package let status: Status
+        package let approvedHookCount: Int
+        package let skippedHookCount: Int?
+        package let resolvedAt: Date
+
+        package init(status: Status, approvedHookCount: Int, skippedHookCount: Int?, resolvedAt: Date) {
+            self.status = status
+            self.approvedHookCount = approvedHookCount
+            self.skippedHookCount = skippedHookCount
+            self.resolvedAt = resolvedAt
+        }
+
+        package func asObject() -> [String: Value] {
+            var object: [String: Value] = [
+                "status": .string(status.rawValue),
+                "approved_hook_count": .int(approvedHookCount),
+                "resolved_at": .string(DomainAgentRunSnapshot.timestamp(resolvedAt))
+            ]
+            if let skippedHookCount {
+                object["skipped_hook_count"] = .int(skippedHookCount)
+            }
+            return object
+        }
+    }
+
     package enum FailureReason: String, Equatable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
+        case resumeHistoryTooLarge = "resume_history_too_large"
         case cancelled
 
         /// Fallback heuristic for restored/legacy snapshots whose terminal
@@ -433,10 +500,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     package let agentDisplayName: String?
     package let modelRaw: String?
     package let reasoningEffortRaw: String?
+    package let modelParameterSelections: [ModelParameterSelection]
     package let status: Status
     package let statusText: String?
     package let latestAssistantPreview: String?
     package let interaction: Interaction?
+    package let hookGate: HookGate?
     package let transcriptItemCount: Int
     package let updatedAt: Date
     package let parentSessionID: UUID?
@@ -453,10 +522,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         agentDisplayName: String?,
         modelRaw: String?,
         reasoningEffortRaw: String?,
+        modelParameterSelections: [ModelParameterSelection] = [],
         status: Status,
         statusText: String?,
         latestAssistantPreview: String?,
         interaction: Interaction?,
+        hookGate: HookGate? = nil,
         transcriptItemCount: Int,
         updatedAt: Date,
         parentSessionID: UUID?,
@@ -472,10 +543,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         self.agentDisplayName = agentDisplayName
         self.modelRaw = modelRaw
         self.reasoningEffortRaw = reasoningEffortRaw
+        self.modelParameterSelections = modelParameterSelections
         self.status = status
         self.statusText = statusText
         self.latestAssistantPreview = latestAssistantPreview
         self.interaction = interaction
+        self.hookGate = hookGate
         self.transcriptItemCount = transcriptItemCount
         self.updatedAt = updatedAt
         self.parentSessionID = parentSessionID
@@ -512,6 +585,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             object["interaction"] = .object(interaction.asObject())
             object["interaction_id"] = .string(interaction.id.uuidString)
         }
+        if let hookGate {
+            object["hook_gate"] = .object(hookGate.asObject())
+        }
         if let failureReason {
             object["failure_reason"] = .string(failureReason.rawValue)
         }
@@ -529,12 +605,16 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         object["session"] = .object(session)
 
         if agentRaw != nil || modelRaw != nil {
-            object["agent"] = .object([
+            var agent: [String: Value] = [
                 "id": agentRaw.map(Value.string) ?? .null,
                 "name": agentDisplayName.map(Value.string) ?? .null,
                 "model": modelRaw.map(Value.string) ?? .null,
                 "reasoning_effort": reasoningEffortRaw.map(Value.string) ?? .null
-            ])
+            ]
+            if !modelParameterSelections.isEmpty {
+                agent["model_parameters"] = .array(modelParameterSelections.map { .object($0.asObject()) })
+            }
+            object["agent"] = .object(agent)
         }
         if !worktreeBindings.isEmpty {
             let values = worktreeBindings.map { Value.object($0.asObject()) }

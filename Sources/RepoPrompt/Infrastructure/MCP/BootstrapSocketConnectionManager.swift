@@ -323,19 +323,34 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         updateState(.cancelled)
     }
 
-    func abortForExecutionWatchdog() async {
+    func abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext) async {
         if !isClosing {
             mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
-            await sendTerminateNotification(
-                reason: .toolExecutionWatchdog,
-                message: "Unresponsive tool execution exceeded the watchdog deadline"
-            )
+            // Establish terminal ownership before the first await so ordinary
+            // shutdown cannot race the watchdog's ingress snapshot.
             isClosing = true
             healthMonitoringTask?.cancel()
             healthMonitoringTask = nil
             closeWatchTask?.cancel()
             closeWatchTask = nil
         }
+
+        // An ordinary stop may already have marked this connection closing while
+        // awaiting an uncooperative handler. Its socket can still be live, so the
+        // transport's nonisolated entry seals outstanding IDs before it waits for
+        // the actor to finish any ordinary response write. Repeated calls remain
+        // idempotent through the transport ledger.
+        let terminateControlFrame = encodedTerminateNotification(
+            reason: .toolExecutionWatchdog,
+            message: MCPExecutionWatchdogTerminalContext.message
+        )
+        let deliveredErrorCount = await transport.sendExecutionWatchdogTerminalErrors(
+            context: context,
+            trailingControlFrame: terminateControlFrame
+        )
+        mcpConnectionLog(
+            "Delivered \(deliveredErrorCount) watchdog JSON-RPC terminal error(s) for bootstrap connection \(connectionID)"
+        )
 
         // Delivery must stop immediately even if ordinary shutdown has already
         // started and is blocked on the uncooperative handler.
@@ -373,21 +388,26 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     }
 
     private func sendTerminateNotification(reason: TerminationReason, message: String?) async {
-        guard handshakeComplete else { return }
-        let notification = RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
-            reason: reason,
-            message: message
-        )
-        guard let data = notification.encodedJSONLine() else {
-            bootstrapLog.warning("Failed to encode terminate notification")
-            return
-        }
+        guard let data = encodedTerminateNotification(reason: reason, message: message) else { return }
 
         do {
             try await transport.send(data)
         } catch {
             bootstrapLog.debug("Failed to send terminate notification: \(error)")
         }
+    }
+
+    private func encodedTerminateNotification(reason: TerminationReason, message: String?) -> Data? {
+        guard handshakeComplete else { return nil }
+        let notification = RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+            reason: reason,
+            message: message
+        )
+        guard let data = notification.encodedJSONLine() else {
+            bootstrapLog.warning("Failed to encode terminate notification")
+            return nil
+        }
+        return data
     }
 
     /// Sends a progress notification to the CLI.

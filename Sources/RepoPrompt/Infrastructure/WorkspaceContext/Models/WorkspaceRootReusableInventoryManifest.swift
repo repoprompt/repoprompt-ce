@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct WorkspaceRootReusableInventoryResourcePolicy: Equatable {
     static let `default` = WorkspaceRootReusableInventoryResourcePolicy()

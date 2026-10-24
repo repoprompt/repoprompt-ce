@@ -7,10 +7,6 @@ enum CodexOverrides {
         "features.goals": false,
         "features.computer_use": false,
         "features.plugins": false,
-        // Disable MCP elicitation until RepoPrompt supports the mcpServer/elicitation/request
-        // server request and its {action, content, _meta} response contract. Without this,
-        // Codex routes MCP tool approvals through elicitation by default (ToolCallMcpElicitation
-        // is stable + enabled), which RepoPrompt treats as unsupported and fails the run.
         "features.tool_call_mcp_elicitation": false,
         "features.tool_suggest": false,
         "memories.generate_memories": false,
@@ -18,10 +14,7 @@ enum CodexOverrides {
     ]
 
     private static let computerUseEnabledConfig: [String: Bool] = [
-        "features.computer_use": true,
-        "features.plugins": true,
-        "features.tool_call_mcp_elicitation": true,
-        "features.tool_suggest": true
+        "features.computer_use": true
     ]
 
     enum ReasoningSummary: String {
@@ -35,16 +28,31 @@ enum CodexOverrides {
         var goalsEnabled: Bool
         var memoriesEnabled: Bool
         var computerUseEnabled: Bool
+        var capabilities: CodexCapabilitySettings
 
-        static let defaultDisabled = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: false)
-        static let enabledForGoals = FeaturePolicy(goalsEnabled: true, memoriesEnabled: false, computerUseEnabled: false)
-        static let enabledForComputerUse = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: true)
-
-        static func resolved(goalsEnabled: Bool, memoriesEnabled: Bool, computerUseEnabled: Bool) -> FeaturePolicy {
+        static let defaultDisabled = FeaturePolicy(
+            goalsEnabled: false,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            capabilities: .disabled
+        )
+        static let enabledForGoals = FeaturePolicy(
+            goalsEnabled: true,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            capabilities: .disabled
+        )
+        static func resolved(
+            goalsEnabled: Bool,
+            memoriesEnabled: Bool,
+            computerUseEnabled: Bool,
+            capabilities: CodexCapabilitySettings = .disabled
+        ) -> FeaturePolicy {
             FeaturePolicy(
                 goalsEnabled: goalsEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled
+                computerUseEnabled: computerUseEnabled,
+                capabilities: capabilities
             )
         }
     }
@@ -166,6 +174,10 @@ enum CodexOverrides {
 
     private static func forcedConfig(featurePolicy: FeaturePolicy) -> [String: Bool] {
         var config = forcedDisabledConfig
+        config["features.apps"] = featurePolicy.capabilities.appsEnabled
+        config["features.plugins"] = featurePolicy.capabilities.pluginsEnabled
+        config["features.tool_call_mcp_elicitation"] = featurePolicy.capabilities.mcpElicitationEnabled
+        config["features.tool_suggest"] = featurePolicy.capabilities.toolSuggestionsEnabled
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true
         }

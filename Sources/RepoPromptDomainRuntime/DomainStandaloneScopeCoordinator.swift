@@ -195,10 +195,12 @@ package actor DomainStandaloneScopeCoordinator {
 
     private func bindInitialContextIfUnambiguous(_ state: ScopeState) async {
         let catalog = await workspaceStore.snapshot()
-        let requestedRoots = Set(state.workingDirectories.map(\.standardizedFileURL.path))
+        let requestedRoots = Set(state.workingDirectories.map {
+            $0.standardizedFileURL.resolvingSymlinksInPath().path
+        })
         let matches = catalog.workspaces.compactMap { workspace -> DomainContextIdentity? in
             let workspaceRoots = Set(workspace.document.metadata.repoPaths.map {
-                URL(fileURLWithPath: $0).standardizedFileURL.path
+                URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
             })
             guard requestedRoots == workspaceRoots else { return nil }
             if let activeContextID = workspace.document.metadata.activeContextID,

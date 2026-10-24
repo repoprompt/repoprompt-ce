@@ -45,7 +45,7 @@ def object_schema(*, required: list[str], properties: dict[str, object]) -> dict
     return {"type": "object", "required": required, "properties": properties}
 
 
-def contract(checks: list[dict], *, floor: str = "0.147.0") -> dict:
+def contract(checks: list[dict], *, floor: str = "0.156.1") -> dict:
     return {
         "schemaVersion": 1,
         "minimumCodexVersion": floor,
@@ -61,20 +61,20 @@ def response_path(path: str, presence: str, nullable: bool) -> dict:
 class CodexAppServerSchemaGateTests(unittest.TestCase):
     def test_version_parser_accepts_cli_output_and_orders_prereleases(self) -> None:
         self.assertEqual(
-            gate.parse_version("codex-cli 0.147.0\n", label="test"),
-            gate.SemanticVersion(0, 147, 0),
+            gate.parse_version("codex-cli 0.156.1\n", label="test"),
+            gate.SemanticVersion(0, 156, 1),
         )
         self.assertEqual(
-            gate.parse_version("0.147.0-rc.2+build.7", label="test"),
-            gate.SemanticVersion(0, 147, 0, ("rc", "2")),
+            gate.parse_version("0.156.1-rc.2+build.7", label="test"),
+            gate.SemanticVersion(0, 156, 1, ("rc", "2")),
         )
         self.assertLess(
-            gate.parse_version("0.147.0-rc.2", label="test"),
-            gate.parse_version("0.147.0", label="test"),
+            gate.parse_version("0.156.1-rc.2", label="test"),
+            gate.parse_version("0.156.1", label="test"),
         )
         self.assertLess(
-            gate.parse_version("0.147.0-2", label="test"),
-            gate.parse_version("0.147.0-rc", label="test"),
+            gate.parse_version("0.156.1-2", label="test"),
+            gate.parse_version("0.156.1-rc", label="test"),
         )
         with self.assertRaisesRegex(gate.GateError, "could not parse"):
             gate.parse_version("Codex unknown", label="test")
@@ -87,7 +87,11 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ClientRequest.json", "initialize"),
             ("ClientRequest.json", "account/login/start"),
             ("ClientRequest.json", "account/login/cancel"),
+            ("ClientRequest.json", "account/rateLimits/read"),
             ("ClientRequest.json", "model/list"),
+            ("ClientRequest.json", "hooks/list"),
+            ("ClientRequest.json", "config/batchWrite"),
+            ("ClientRequest.json", "skills/extraRoots/set"),
             ("ClientRequest.json", "thread/start"),
             ("ClientRequest.json", "thread/resume"),
             ("ClientRequest.json", "thread/memoryMode/set"),
@@ -102,6 +106,7 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ClientRequest.json", "thread/compact/start"),
             ("ClientNotification.json", "initialized"),
             ("ServerNotification.json", "account/login/completed"),
+            ("ServerNotification.json", "account/rateLimits/updated"),
             ("ServerNotification.json", "turn/started"),
             ("ServerNotification.json", "turn/completed"),
             ("ServerNotification.json", "thread/compacted"),
@@ -128,7 +133,7 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ServerRequest.json", "item/fileChange/requestApproval"),
         }
 
-        self.assertEqual(len(checks), 42)
+        self.assertEqual(len(checks), 47)
         self.assertEqual({(check["union"], check["method"]) for check in checks}, expected)
 
     def test_bundle_validation_accepts_declared_fields_nested_paths_and_enum(self) -> None:
@@ -666,7 +671,7 @@ out.mkdir(parents=True, exist_ok=True)
 }), encoding="utf-8")
 """
             fake_codex.write_text(
-                script_template % (repr(str(marker)), repr("codex-cli 0.147.0")),
+                script_template % (repr(str(marker)), repr("codex-cli 0.156.1")),
                 encoding="utf-8",
             )
             fake_codex.chmod(0o755)
@@ -688,7 +693,7 @@ out.mkdir(parents=True, exist_ok=True)
                 )
 
             self.assertEqual(result, 0, stderr.getvalue())
-            self.assertIn("Codex CLI: 0.147.0", stdout.getvalue())
+            self.assertIn("Codex CLI: 0.156.1", stdout.getvalue())
             generated_args = json.loads(marker.read_text(encoding="utf-8"))
             self.assertEqual(
                 generated_args[:3],
@@ -697,7 +702,7 @@ out.mkdir(parents=True, exist_ok=True)
             self.assertIn("--out", generated_args)
 
             fake_codex.write_text(
-                script_template % (repr(str(marker)), repr("codex-cli 0.147.0-rc.1")),
+                script_template % (repr(str(marker)), repr("codex-cli 0.156.1-rc.1")),
                 encoding="utf-8",
             )
             fake_codex.chmod(0o755)
@@ -705,7 +710,7 @@ out.mkdir(parents=True, exist_ok=True)
                 json.dumps(
                     contract(
                         [{"union": "ClientNotification.json", "method": "initialized"}],
-                        floor="0.147.0",
+                        floor="0.156.1",
                     )
                 ),
                 encoding="utf-8",
@@ -717,7 +722,7 @@ out.mkdir(parents=True, exist_ok=True)
                 )
             self.assertEqual(result, 1)
             self.assertIn(
-                "installed Codex CLI 0.147.0-rc.1 is below the contract floor 0.147.0",
+                "installed Codex CLI 0.156.1-rc.1 is below the contract floor 0.156.1",
                 stderr.getvalue(),
             )
 

@@ -286,7 +286,7 @@ When questions arise during coordination, reason through them yourself. If you'r
 | Start a fresh agent | `agent_run op=start model_id=<role> session_name="..." message="..." detach=true/false` |
 | Steer an existing agent | `agent_run op=steer session_id="..." message="..." wait=true` |
 | Wait for an agent | `agent_run op=wait session_id="..."` |
-| Wait for first of multiple agents | `agent_run op=wait session_ids=["...", "..."] timeout=60` |
+| Wait for first of multiple agents | `agent_run op=wait session_ids=["...", "..."]` |
 | Poll without blocking | `agent_run op=poll session_id="..."` |
 | Poll multiple agents | `agent_run op=poll session_ids=["...", "..."]` |
 \(cleanupQuickReferenceRow)| Read plan/context | `read_file`, `get_file_tree`, `file_search` |
@@ -309,7 +309,7 @@ When questions arise during coordination, reason through them yourself. If you'r
 - 🚫 Writing detailed step-by-step instructions for dispatched agents — they can reason for themselves
 - 🚫 Dispatching parallel agents to overlapping files without warning them about each other
 - 🚫 Waiting idle for an agent when you could be dispatching the next independent item or preparing the next brief
-- 🚫 Forgetting to check on dispatched agents — they may block on permission approvals; poll periodically to keep them unblocked
+- 🚫 Forgetting to check on dispatched agents — they may block on permission approvals; use `op=wait` with the configured subagent wait when there is no useful independent work
 - 🚫 Creating 5 work items when the task is naturally 2 — decompose to the right granularity, not a target number
 - 🚫 Repeating project conventions from CLAUDE.md in dispatch briefs — the agents will read those themselves
 - 🚫 Forwarding user-to-orchestrator commentary (preferences, criticisms, meta-instructions about how you should operate) into a peer-agent brief — translate the actionable parts into the technical task and keep the rest between you and the user

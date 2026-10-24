@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.
@@ -946,6 +948,8 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "session_admin":
+            return SessionAdminToolOutputFormatter.format(args: args, value: result)
         case "history":
             return formatHistory(args: args, value: result)
         default:
@@ -971,8 +975,9 @@ extension ToolOutputFormatter {
         }
 
         let op = args["op"]?.stringValue ?? "history"
-        let status = object["scan_truncated"]?.boolValue == true ? "⚠️" : statusIcon(success: true)
-        let lowerBoundSuffix = object["totals_are_lower_bounds"]?.boolValue == true ? " (lower bound)" : ""
+        let incomplete = isHistoryScanIncomplete(object)
+        let status = incomplete ? "⚠️" : statusIcon(success: true)
+        let lowerBoundSuffix = incomplete ? " (lower bound)" : ""
         var lines: [String] = []
         switch op {
         case "list_sessions":
@@ -980,7 +985,7 @@ extension ToolOutputFormatter {
             let sessions = object["sessions"]?.arrayValue ?? []
             lines.append("## History Sessions \(status)")
             lines.append("- **Total sessions**: \(total)\(lowerBoundSuffix) • **Returned**: \(sessions.count)")
-            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
                 lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
@@ -1007,7 +1012,7 @@ extension ToolOutputFormatter {
             let results = object["results"]?.arrayValue ?? []
             lines.append("## History Search \(status)")
             lines.append("- **Total matches**: \(total)\(lowerBoundSuffix) • **Returned**: \(results.count)")
-            if total == 0 { lines.append("- **Status**: No matching turns found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching turns found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results {
@@ -1031,7 +1036,7 @@ extension ToolOutputFormatter {
             let groups = object["groups"]?.arrayValue ?? []
             lines.append("## History Time \(status)")
             lines.append("- **Total sessions**: \(totalSessions)\(lowerBoundSuffix) • **Active duration**: \(totalDuration)s\(lowerBoundSuffix) • **Groups**: \(groups.count)")
-            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
+            if totalSessions == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups {
@@ -1067,6 +1072,17 @@ extension ToolOutputFormatter {
             lines.append("## History Session \(status)")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
+            if let usage = object["token_usage_summary"]?.objectValue {
+                let providerInput = usage["provider_input_tokens"]?.intValue ?? 0
+                let providerOutput = usage["provider_output_tokens"]?.intValue ?? 0
+                let codexTotal = usage["codex_total_tokens"]?.intValue
+                if providerInput > 0 || providerOutput > 0 || codexTotal != nil {
+                    var usageLine = "- **Provider tokens**: input \(providerInput), output \(providerOutput)"
+                    if let codexTotal { usageLine += ", Codex cumulative \(codexTotal)" }
+                    usageLine += " • attributed runs: \(usage["attributed_run_count"]?.intValue ?? 0)"
+                    lines.append(usageLine)
+                }
+            }
             if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
             if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1092,6 +1108,18 @@ extension ToolOutputFormatter {
                 }
                 if let toolSummary = nonEmpty(turn["tool_call_summary"]?.stringValue) {
                     lines.append("- **Tools**: \(toolSummary)")
+                }
+                let runIDs = turn["run_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                if !runIDs.isEmpty {
+                    lines.append("- **Run IDs**: \(runIDs.joined(separator: ", "))")
+                }
+                let tokenUsage = turn["token_usage"]?.arrayValue ?? []
+                for usageValue in tokenUsage {
+                    guard let usage = usageValue.objectValue else { continue }
+                    let input = usage["input_tokens"]?.intValue ?? 0
+                    let output = usage["output_tokens"]?.intValue ?? 0
+                    let run = nonEmpty(usage["run_id"]?.stringValue) ?? "unattributed"
+                    lines.append("- **Token usage** (`\(run)`): input \(input), output \(output)")
                 }
                 let entries = turn["entries"]?.arrayValue ?? []
                 for entryValue in entries {
@@ -1138,7 +1166,17 @@ extension ToolOutputFormatter {
         return max(1, min(value, 20000))
     }
 
+    private static func isHistoryScanIncomplete(_ object: [String: Value]) -> Bool {
+        object["scan_complete"]?.boolValue == false
+            || object["scan_truncated"]?.boolValue == true
+            || object["totals_are_lower_bounds"]?.boolValue == true
+            || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+    }
+
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if isHistoryScanIncomplete(object) {
+            lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
+        }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
             guard let diagnostic = value.objectValue,
@@ -1942,54 +1980,28 @@ extension ToolOutputFormatter {
     static func formatReadFile(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
         let path = args["path"]?.stringValue ?? "(unknown)"
         let lang = languageTag(forPath: path)
+        // Failure markers take precedence over both decoded and projected content.
+        if case let .object(obj) = value,
+           let failureText = readFileFailureText(from: obj, requestedPath: path)
+        {
+            return [.text(failureText)]
+        }
         // Preferred DTO decoding
         if let dto = value.decode(ToolResultDTOs.ReadFileReply.self) {
-            let displayPath = dto.displayPath ?? path
-            if let errorCode = dto.errorCode, dto.retryable == true {
-                let text = readFileRetryableFailure(
-                    path: displayPath,
-                    error: dto.errorMessage ?? dto.message ?? "Read failed with a retryable workspace error.",
-                    errorCode: errorCode,
-                    retryAfterMilliseconds: dto.retryAfterMilliseconds,
-                    worktreeScope: dto.worktreeScope
-                )
-                return [.text(text)]
-            }
-            let text = readFile(
-                path: displayPath,
-                first: dto.firstLine,
-                last: dto.lastLine,
-                total: dto.totalLines,
-                language: lang,
-                message: dto.message,
-                content: dto.content,
-                worktreeScope: dto.worktreeScope
-            )
-            return [.text(text)]
+            return formatDecodedReadFileReply(dto, requestedPath: path, language: lang)
         }
         // Fallback: value is an object with expected keys but decode failed
         if case let .object(obj) = value {
-            let content = obj["content"]?.stringValue ?? ""
-            let total = obj["total_lines"]?.intValue
-                ?? Int(obj["total_lines"]?.stringValue ?? "")
-                ?? content.components(separatedBy: "\n").count
-            let first = obj["first_line"]?.intValue
-                ?? Int(obj["first_line"]?.stringValue ?? "")
-                ?? (content.isEmpty ? 0 : 1)
-            let last = obj["last_line"]?.intValue
-                ?? Int(obj["last_line"]?.stringValue ?? "")
-                ?? total
-            let message = obj["message"]?.stringValue
-            let text = readFile(
-                path: path,
-                first: first,
-                last: last,
-                total: total,
-                language: lang,
-                message: message,
-                content: content
-            )
-            return [.text(text)]
+            if let projected = projectedReadFileReply(from: obj, requestedPath: path) {
+                return formatDecodedReadFileReply(projected, requestedPath: path, language: lang)
+            }
+            return [.text(readFileUnreadableResult(
+                path: obj["display_path"]?.stringValue ?? path,
+                message: obj["error"]?.stringValue
+                    ?? obj["message"]?.stringValue
+                    ?? "The read_file result had missing file content or invalid line metadata.",
+                worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+            ))]
         }
         // Fallback: legacy string response (assume whole content)
         if let s = value.stringValue {
@@ -2007,6 +2019,135 @@ extension ToolOutputFormatter {
         }
         // Final fallback: present JSON
         return formatGeneric(value: value)
+    }
+
+    private static func formatDecodedReadFileReply(
+        _ dto: ToolResultDTOs.ReadFileReply,
+        requestedPath: String,
+        language: String
+    ) -> [MCP.Tool.Content] {
+        let displayPath = dto.displayPath ?? requestedPath
+        guard validReadFileRange(dto) else {
+            return [.text(readFileUnreadableResult(
+                path: displayPath,
+                message: "The read_file result had invalid line metadata.",
+                worktreeScope: dto.worktreeScope
+            ))]
+        }
+        let text = readFile(
+            path: displayPath,
+            first: dto.firstLine,
+            last: dto.lastLine,
+            total: dto.totalLines,
+            language: language,
+            message: dto.message,
+            content: dto.content,
+            worktreeScope: dto.worktreeScope
+        )
+        return [.text(text)]
+    }
+
+    /// Rebuilds a reply when JSON decode into `ReadFileReply` fails, for example because
+    /// line fields arrived as whole JSON numbers stored as `.double`.
+    ///
+    /// Content-only legacy objects may infer a range. Supplied line metadata must be
+    /// complete and integral; malformed metadata must not be replaced with success.
+    private static func projectedReadFileReply(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> ToolResultDTOs.ReadFileReply? {
+        guard let content = obj["content"]?.stringValue else { return nil }
+        let hasLineMetadata = ["first_line", "last_line", "total_lines"].contains { obj[$0] != nil }
+        let first: Int
+        let last: Int
+        let total: Int
+        if hasLineMetadata {
+            guard let parsedFirst = wholeNumberInt(obj["first_line"]),
+                  let parsedLast = wholeNumberInt(obj["last_line"]),
+                  let parsedTotal = wholeNumberInt(obj["total_lines"])
+            else { return nil }
+            first = parsedFirst
+            last = parsedLast
+            total = parsedTotal
+        } else {
+            guard !content.isEmpty else { return nil }
+            first = 1
+            total = content.components(separatedBy: "\n").count
+            last = total
+        }
+        return ToolResultDTOs.ReadFileReply(
+            content: content,
+            totalLines: total,
+            firstLine: first,
+            lastLine: last,
+            message: obj["message"]?.stringValue,
+            displayPath: obj["display_path"]?.stringValue ?? requestedPath,
+            worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) },
+            errorMessage: obj["error"]?.stringValue,
+            errorCode: obj["error_code"]?.stringValue,
+            retryable: obj["retryable"]?.boolValue,
+            retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"])
+        )
+    }
+
+    private static func validReadFileRange(_ dto: ToolResultDTOs.ReadFileReply) -> Bool {
+        guard dto.totalLines >= 0, dto.firstLine >= 0, dto.lastLine >= 0 else { return false }
+        if dto.totalLines == 0 {
+            return dto.content.isEmpty && dto.firstLine == 0 && dto.lastLine == 0
+        }
+        guard dto.firstLine > 0, dto.lastLine <= dto.totalLines else { return false }
+        if dto.lastLine >= dto.firstLine { return true }
+        // The provider supports limit=0 and start_line beyond EOF without an error.
+        return dto.content.isEmpty && dto.lastLine == min(dto.firstLine - 1, dto.totalLines)
+    }
+
+    private static func readFileFailureText(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> String? {
+        let hasError = ["error", "error_code"].contains { key in
+            guard let value = obj[key] else { return false }
+            if case .null = value { return false }
+            return true
+        }
+        guard hasError || obj["retryable"]?.boolValue == true else { return nil }
+        let path = obj["display_path"]?.stringValue ?? requestedPath
+        let message = obj["error"]?.stringValue ?? obj["message"]?.stringValue ?? "The read_file request failed."
+        let errorCode = obj["error_code"]?.stringValue
+        let scope = obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+        if obj["retryable"]?.boolValue == true, let errorCode, !errorCode.isEmpty {
+            return readFileRetryableFailure(
+                path: path,
+                error: message,
+                errorCode: errorCode,
+                retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"]),
+                worktreeScope: scope
+            )
+        }
+        return readFileUnreadableResult(
+            path: path,
+            message: message,
+            worktreeScope: scope,
+            errorCode: errorCode,
+            retryable: obj["retryable"]?.boolValue
+        )
+    }
+
+    /// Parses line counts from MCP `Value` ints, digit strings, or whole doubles.
+    /// Fractional doubles are rejected so a corrupt `1.5` cannot become a line number.
+    private static func wholeNumberInt(_ value: Value?) -> Int? {
+        guard let value else { return nil }
+        switch value {
+        case let .int(int):
+            return int
+        case let .string(string):
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let .double(double):
+            guard double.isFinite else { return nil }
+            return Int(exactly: double)
+        default:
+            return nil
+        }
     }
 
     private static func readFileRetryableFailure(
@@ -2032,6 +2173,24 @@ extension ToolOutputFormatter {
             out.append("- **Retry after**: \(retryAfterMilliseconds) ms")
         }
         out.append("- **Message**: \(error)")
+        out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
+        return out.joined(separator: "\n")
+    }
+
+    private static func readFileUnreadableResult(
+        path: String,
+        message: String,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?,
+        errorCode: String? = nil,
+        retryable: Bool? = nil
+    ) -> String {
+        var out: [String] = []
+        out.append("## File Read \(statusIcon(success: false))")
+        out.append("- **Path**: `\(path)`")
+        out.append("- **Status**: Unreadable tool result")
+        if let errorCode { out.append("- **Code**: \(errorCode)") }
+        if let retryable { out.append("- **Retryable**: \(retryable ? "yes" : "no")") }
+        out.append("- **Message**: \(message)")
         out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
         return out.joined(separator: "\n")
     }
@@ -2415,8 +2574,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        // Build main section using our existing helper
-        let text = chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
+            ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2500,7 +2659,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Ask Oracle ✅")
+            ?? askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -4338,17 +4498,25 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)\(heading)\n"))
-                let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
-                blocks.append(contentsOf: planBlocks)
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)\(heading)\n"))
+                    let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
+                    blocks.append(contentsOf: planBlocks)
+                }
             }
 
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)## Code Review\n"))
-                let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
-                blocks.append(contentsOf: reviewBlocks)
+                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)## Code Review\n"))
+                    let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
+                    blocks.append(contentsOf: reviewBlocks)
+                }
             }
 
             // Follow-up hint
@@ -4370,6 +4538,82 @@ extension ToolOutputFormatter {
             return blocks
         }
         return formatGeneric(value: value)
+    }
+
+    private static func formatOracleGroup(
+        value: Value,
+        heading: String
+    ) -> String? {
+        guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
+              let count = dto.oracleCount,
+              let results = dto.oracleResults,
+              count == results.count,
+              count > 1
+        else { return nil }
+
+        let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+        guard ordered.enumerated().allSatisfy({ offset, lane in
+            lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+        }) else { return nil }
+
+        var lines = [heading]
+        if let status = dto.status {
+            lines.append("- Oracle group status: \(status)")
+        }
+        if let groupID = dto.oracleGroupID {
+            lines.append("- Oracle group: `\(groupID)`")
+        }
+        let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
+            let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
+            case .completed: .completed
+            case .failed: .failed
+            case .cancelled: .cancelled
+            case nil: .unavailable
+            }
+            return OracleLaneMarkdownPayload.Lane(
+                laneIndex: lane.laneIndex,
+                chatID: lane.chatID,
+                providerID: lane.executionProfile?.providerID ?? lane.providerID,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+                status: status,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse,
+                errorCode: lane.error?.code,
+                errorMessage: lane.error?.message
+            )
+        })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
+            lines.append("")
+            lines.append(preamble)
+        }
+        let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
+        if !laneMarkdown.isEmpty {
+            lines.append("")
+            lines.append(laneMarkdown)
+        }
+        if let warnings = dto.warnings {
+            for warning in warnings {
+                lines.append("")
+                lines.append("Warning [\(warning.code)]: \(warning.message)")
+            }
+        }
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
+        }
+        // MCP clients may concatenate adjacent text blocks with no separator;
+        // end with a line break so the end marker stays on its own line.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
@@ -4435,7 +4679,7 @@ extension ToolOutputFormatter {
 
         switch dto.op.lowercased() {
         case "list":
-            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [])
+            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [], totalCount: dto.totalCount)
         case "show":
             if let worktree = dto.worktree ?? dto.worktrees?.first {
                 appendManageWorktreeDetails(&out, worktree: worktree)
@@ -4474,6 +4718,13 @@ extension ToolOutputFormatter {
         default:
             break
         }
+        if let pending = dto.pendingApplication {
+            out.append("")
+            out.append("### Pending Switch")
+            out.append("- **State**: \(pending.state) (applies after: \(pending.appliesAfter); continuation: \(pending.continuation))")
+            out.append("- **Relocation ID**: `\(pending.relocationID)`")
+            out.append("- \(pending.detail)")
+        }
 
         if let graph = dto.graph {
             out.append("")
@@ -4500,10 +4751,15 @@ extension ToolOutputFormatter {
 
     private static func appendManageWorktreeList(
         _ out: inout [String],
-        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO]
+        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO],
+        totalCount: Int?
     ) {
         out.append("")
-        out.append("### Worktrees (\(worktrees.count))")
+        if let totalCount, totalCount != worktrees.count {
+            out.append("### Worktrees (\(worktrees.count) of \(totalCount))")
+        } else {
+            out.append("### Worktrees (\(worktrees.count))")
+        }
         guard !worktrees.isEmpty else {
             out.append("_No worktrees found._")
             return
@@ -5702,6 +5958,20 @@ extension ToolOutputFormatter {
                 agentLine += " · reasoning `\(reasoning)`"
             }
             lines.append(agentLine)
+            if let parameters = agent?["model_parameters"]?.arrayValue,
+               !parameters.isEmpty
+            {
+                let selected = parameters.compactMap { parameter -> String? in
+                    guard let selection = parameter.objectValue,
+                          let configID = selection["config_id"]?.stringValue,
+                          let value = selection["value"]?.stringValue
+                    else { return nil }
+                    return "`\(configID)=\(value)`"
+                }
+                if !selected.isEmpty {
+                    lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                }
+            }
         }
         if let interactionKind, !interactionKind.isEmpty {
             lines.append("- Interaction: **\(interactionKind)**")
@@ -6038,6 +6308,15 @@ extension ToolOutputFormatter {
         if let sessionID = object["session_id"]?.stringValue, !sessionID.isEmpty {
             lines.append("- Session: `\(sessionID)`")
         }
+        if rawOp == "set_session_pin", let pinned = object["pinned"]?.boolValue {
+            lines.append("- Pinned: **\(pinned ? "yes" : "no")**")
+            if let changed = object["changed"]?.boolValue {
+                lines.append("- Changed: \(changed ? "yes" : "no")")
+            }
+        }
+        if rawOp == "reorder_pinned_sessions", let ids = object["session_ids"]?.arrayValue {
+            lines.append("- Pinned order: \(ids.compactMap(\.stringValue).joined(separator: ", "))")
+        }
         if let workflowName = object["workflow_name"]?.stringValue, !workflowName.isEmpty {
             lines.append("- Workflow: `\(workflowName)`")
         }
@@ -6049,6 +6328,20 @@ extension ToolOutputFormatter {
                     agentLine += " · `\(model)`"
                 }
                 lines.append(agentLine)
+                if let parameters = agentObject["model_parameters"]?.arrayValue,
+                   !parameters.isEmpty
+                {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "`\(configID)=\(value)`"
+                    }
+                    if !selected.isEmpty {
+                        lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                    }
+                }
             }
         } else if let agent = object["agent"]?.stringValue, !agent.isEmpty {
             lines.append("- Agent: **\(agent)**")
@@ -6098,8 +6391,12 @@ extension ToolOutputFormatter {
                     // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
-                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
-                    let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
+                    // Devin effort IDs are grouped by their catalog family, not by suffix parsing.
+                    let devinEntry = agentPrefix == "devin:" ? DevinModelCatalog.current.entry(matching: afterColon) : nil
+                    let groupingEffort = devinEntry.map { $0.thinking?.choiceRaw }
+                        ?? agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    let base = devinEntry.map { $0.thinking == nil ? afterColon : $0.familyID }
+                        ?? agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
                     if let groupingEffort, seen.contains(familyKey) {
@@ -6112,7 +6409,7 @@ extension ToolOutputFormatter {
                     } else if let groupingEffort, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = agentListFamilyDisplayName(
+                        let baseName = devinEntry?.familyDisplayName ?? agentListFamilyDisplayName(
                             modelName,
                             modelID: afterColon,
                             groupingEffort: groupingEffort
@@ -6139,10 +6436,47 @@ extension ToolOutputFormatter {
                         lines.append("  `\(agentPrefix)\(family.base)-{\(effortList)}` — \(family.name)")
                     }
                 }
+                for model in models {
+                    guard let modelObject = model.objectValue,
+                          let modelID = modelObject["model_id"]?.stringValue,
+                          let parameters = modelObject["model_parameters"]?.arrayValue,
+                          !parameters.isEmpty
+                    else { continue }
+                    lines.append("  Parameters for `\(modelID)`:")
+                    for parameter in parameters {
+                        guard let parameterObject = parameter.objectValue,
+                              let configID = parameterObject["config_id"]?.stringValue,
+                              let parameterName = parameterObject["name"]?.stringValue,
+                              let choices = parameterObject["choices"]?.arrayValue
+                        else { continue }
+                        let choiceValues = choices.compactMap {
+                            $0.objectValue?["value"]?.stringValue
+                        }.joined(separator: "|")
+                        let current = parameterObject["current_value"]?.stringValue
+                        let currentSuffix = current.map { " (current: `\($0)`)" } ?? ""
+                        lines.append("    `\(configID)` — \(parameterName): `{\(choiceValues)}`\(currentSuffix)")
+                    }
+                }
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
-            lines.append("- Sessions: **\(sessions.count)**")
+            if let scope = object["scope"]?.stringValue {
+                lines.append("- Scope: `\(scope)` (not a workspace inventory)")
+            }
+            if let note = object["note"]?.stringValue {
+                lines.append("- Note: \(note)")
+            }
+            if object["scope"]?.stringValue == "spawned_by_caller" {
+                let matching = object["matching_child_count"]?.intValue ?? sessions.count
+                lines.append("- Matching child sessions: **\(matching)** · returned **\(sessions.count)**; workspace inventory not requested")
+                if let workspaceID = object["workspace_id"]?.stringValue {
+                    lines.append("- Current workspace: `\(workspaceID)`")
+                }
+            } else if object["scope"]?.stringValue == "unresolved_caller" {
+                lines.append("- Session discovery unavailable; no workspace count was determined")
+            } else {
+                lines.append("- Sessions: **\(sessions.count)**")
+            }
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }
                 let name = session["name"]?.stringValue ?? "Unnamed"
@@ -6155,6 +6489,19 @@ extension ToolOutputFormatter {
                 }
                 if !state.isEmpty { parts.append(state) }
                 if !agent.isEmpty { parts.append(agent) }
+                if rawOp == "list_pinned_sessions", let order = session["pinned_order"]?.intValue {
+                    parts.append("manual rank \(order)")
+                }
+                if let parameters = agentObject?["model_parameters"]?.arrayValue {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "\(configID)=\(value)"
+                    }
+                    if !selected.isEmpty { parts.append(selected.joined(separator: ",")) }
+                }
                 lines.append("  - \(parts.joined(separator: " · "))")
             }
         }
@@ -6171,6 +6518,22 @@ extension ToolOutputFormatter {
             lines.append("- Deleted: **\(deletedCount)** sessions")
             if skippedCount > 0 {
                 lines.append("- Skipped: **\(skippedCount)** sessions")
+            }
+            if let result = object["result"]?.stringValue { lines.append("- Result: `\(result)`") }
+            // Every item is listed, so a caller can see what was deleted, not only what failed.
+            for (key, label) in [("deleted_sessions", "deleted"), ("skipped_sessions", "skipped"), ("unprocessed_sessions", "unprocessed")] {
+                for entry in object[key]?.arrayValue ?? [] {
+                    guard let item = entry.objectValue else { continue }
+                    let id = item["session_id"]?.stringValue ?? "unknown"
+                    let name = item["name"]?.stringValue.map { " (\($0))" } ?? ""
+                    guard let code = item["code"]?.stringValue ?? item["reason"]?.stringValue else {
+                        lines.append("  - `\(id)`\(name) — \(label)")
+                        continue
+                    }
+                    let detail = item["detail"]?.stringValue ?? item["message"]?.stringValue ?? ""
+                    let next = item["next_step"]?.stringValue ?? "Inspect the session in the app."
+                    lines.append("  - `\(id)`\(name) — \(label) `\(code)`: \(detail) Next: \(next)")
+                }
             }
         }
         if let returned = object["returned_turn_count"]?.intValue,

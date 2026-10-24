@@ -141,6 +141,7 @@ struct AgentModeDetailWithSidebarView: View {
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 oracleViewModel: oracleViewModel,
                 selectionCoordinator: selectionCoordinator,
+                workspaceSearchService: workspaceSearchService,
                 activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
                 agentModeVM: agentModeVM,
                 windowID: windowID,
@@ -209,6 +210,7 @@ struct AgentModeDetailWithSidebarView: View {
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 oracleViewModel: oracleViewModel,
                 selectionCoordinator: selectionCoordinator,
+                workspaceSearchService: workspaceSearchService,
                 activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
                 agentModeVM: agentModeVM,
                 windowID: windowID,
@@ -341,6 +343,8 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    let workspaceSearchService: WorkspaceSearchService
+    @StateObject private var fileBrowseModel: AgentContextFileBrowseModel
     let activeAgentSessionID: UUID?
     let agentModeVM: AgentModeViewModel
     let windowID: Int
@@ -354,6 +358,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
         contextBuilderAgentVM: ContextBuilderAgentViewModel,
         oracleViewModel: OracleViewModel,
         selectionCoordinator: WorkspaceSelectionCoordinator,
+        workspaceSearchService: WorkspaceSearchService,
         activeAgentSessionID: UUID?,
         agentModeVM: AgentModeViewModel,
         windowID: Int,
@@ -367,6 +372,21 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
         self.contextBuilderAgentVM = contextBuilderAgentVM
         self.oracleViewModel = oracleViewModel
         self.selectionCoordinator = selectionCoordinator
+        self.workspaceSearchService = workspaceSearchService
+        _fileBrowseModel = StateObject(wrappedValue: AgentContextFileBrowseModel(
+            service: AgentContextFileBrowseService(
+                store: promptManager.workspaceFileContextStore,
+                searchService: workspaceSearchService
+            ),
+            estimator: AgentContextFileSizeEstimator()
+        ) { paths, targetState, identity, lookupContext in
+            await selectionCoordinator.setPreResolvedFilePathsInSelection(
+                paths,
+                targetState: targetState,
+                for: identity,
+                lookupContext: lookupContext
+            )
+        })
         self.activeAgentSessionID = activeAgentSessionID
         self.agentModeVM = agentModeVM
         self.windowID = windowID
@@ -390,6 +410,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
                         contextBuilderAgentVM: contextBuilderAgentVM,
                         oracleViewModel: oracleViewModel,
                         selectionCoordinator: selectionCoordinator,
+                        fileBrowseModel: fileBrowseModel,
                         windowID: windowID,
                         currentTabID: currentTabID,
                         activeAgentSessionID: activeAgentSessionID,

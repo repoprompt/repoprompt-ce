@@ -6,6 +6,12 @@ import Foundation
 /// relevant root-index references, and searches merge root-local candidates into the exact
 /// historical global rank order without rebuilding or mutating a shared C index.
 actor WorkspaceSearchService {
+    private struct RefreshFlightToken: Equatable {
+        let bindingEpoch: UInt64
+        let rebuildSerial: UInt64
+        let targetGeneration: UInt64
+    }
+
     private struct PreparedIndex {
         let generation: UInt64
         let diagnostics: WorkspaceCatalogDiagnostics
@@ -37,7 +43,13 @@ actor WorkspaceSearchService {
     private var pendingRebuildGeneration: UInt64?
     private var activeRebuildGeneration: UInt64?
     private var rebuildSerial: UInt64 = 0
-    private var appliedIndexListenerTask: Task<Void, Never>?
+    private var currentRefreshFlightToken: RefreshFlightToken?
+    private weak var boundStore: WorkspaceFileContextStore?
+    private var boundRootScope: WorkspaceLookupRootScope?
+    private var bindingEpoch: UInt64 = 0
+    private var freshnessListenerSerial: UInt64 = 0
+    private var isFreshnessListenerRunning = false
+    private var catalogChangeListenerTask: Task<Void, Never>?
     private var pendingRebuildTask: Task<Void, Never>?
     private var automaticIndexBuildDelayNanoseconds: UInt64
     private var discardedAutomaticRebuildCompletions = 0
@@ -62,7 +74,10 @@ actor WorkspaceSearchService {
         private var debugDebounceCancellationCount = 0
         private var debugLastEntryCount = 0
         private var searchDidCaptureGenerationHandler: (@Sendable (UInt64?) async -> Void)?
+        private var catalogChangeWillHandleHandler: (@Sendable (WorkspaceSearchCatalogChangeEvent) async -> Void)?
+        private var projectionNeutralGenerationDidCommitHandler: (@Sendable (UInt64) async -> Void)?
         private var automaticRebuildDidStartHandler: (@Sendable (UInt64) async -> Void)?
+        private var automaticRebuildDidCommitHandler: (@Sendable (UInt64) async -> Void)?
     #endif
 
     init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
@@ -70,7 +85,7 @@ actor WorkspaceSearchService {
     }
 
     deinit {
-        appliedIndexListenerTask?.cancel()
+        catalogChangeListenerTask?.cancel()
         pendingRebuildTask?.cancel()
     }
 
@@ -122,10 +137,28 @@ actor WorkspaceSearchService {
             searchDidCaptureGenerationHandler = handler
         }
 
+        func setCatalogChangeWillHandleHandler(
+            _ handler: (@Sendable (WorkspaceSearchCatalogChangeEvent) async -> Void)?
+        ) {
+            catalogChangeWillHandleHandler = handler
+        }
+
+        func setProjectionNeutralGenerationDidCommitHandler(
+            _ handler: (@Sendable (UInt64) async -> Void)?
+        ) {
+            projectionNeutralGenerationDidCommitHandler = handler
+        }
+
         func setAutomaticRebuildDidStartHandler(
             _ handler: (@Sendable (UInt64) async -> Void)?
         ) {
             automaticRebuildDidStartHandler = handler
+        }
+
+        func setAutomaticRebuildDidCommitHandler(
+            _ handler: (@Sendable (UInt64) async -> Void)?
+        ) {
+            automaticRebuildDidCommitHandler = handler
         }
 
         static func authoritativeGlobalResultsForTesting(
@@ -153,20 +186,51 @@ actor WorkspaceSearchService {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         debounceNanoseconds: UInt64 = 50_000_000
     ) async {
-        appliedIndexListenerTask?.cancel()
-        let stream = await store.appliedIndexEvents()
-        appliedIndexListenerTask = Task { [weak self, store] in
+        freshnessListenerSerial &+= 1
+        let listenerSerial = freshnessListenerSerial
+        catalogChangeListenerTask?.cancel()
+        catalogChangeListenerTask = nil
+        isFreshnessListenerRunning = false
+        cancelRefreshFlight()
+
+        let isSameBinding = boundStore === store && boundRootScope == rootScope
+        if !isSameBinding {
+            bindingEpoch &+= 1
+            readyRootPathIndexes = []
+            currentSnapshotGeneration = nil
+            currentIndexedGeneration = nil
+            currentDiagnostics = nil
+            latestObservedCatalogGeneration = nil
+            isReadyIndexUsable = true
+        }
+        boundStore = store
+        boundRootScope = rootScope
+        let epoch = bindingEpoch
+
+        let stream = await store.searchCatalogChangeEvents(rootScope: rootScope)
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial
+        else { return }
+        isFreshnessListenerRunning = true
+        catalogChangeListenerTask = Task { [weak self, weak store] in
             for await event in stream {
-                await self?.handleAppliedIndexEvent(
+                guard !Task.isCancelled, let store else { return }
+                await self?.handleSearchCatalogChangeEvent(
                     event,
                     store: store,
                     rootScope: rootScope,
+                    epoch: epoch,
+                    listenerSerial: listenerSerial,
                     debounceNanoseconds: debounceNanoseconds
                 )
             }
         }
 
         let catalogGeneration = await store.catalogGeneration(rootScope: rootScope)
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial,
+              isFreshnessListenerRunning
+        else { return }
         latestObservedCatalogGeneration = catalogGeneration
         if catalogGeneration != currentIndexedGeneration,
            catalogGeneration != pendingRebuildGeneration,
@@ -182,21 +246,17 @@ actor WorkspaceSearchService {
     }
 
     func stopKeepingFresh() {
-        appliedIndexListenerTask?.cancel()
-        appliedIndexListenerTask = nil
-        pendingRebuildTask?.cancel()
-        pendingRebuildTask = nil
-        pendingRebuildGeneration = nil
-        activeRebuildGeneration = nil
+        freshnessListenerSerial &+= 1
+        isFreshnessListenerRunning = false
+        catalogChangeListenerTask?.cancel()
+        catalogChangeListenerTask = nil
+        cancelRefreshFlight()
     }
 
     @discardableResult
     func rebuildIndex(from snapshot: WorkspaceSearchCatalogSnapshot) async -> UInt64 {
-        rebuildSerial &+= 1
+        cancelRefreshFlight()
         let serial = rebuildSerial
-        pendingRebuildTask?.cancel()
-        pendingRebuildTask = nil
-        pendingRebuildGeneration = nil
         activeRebuildGeneration = snapshot.generation
         latestObservedCatalogGeneration = snapshot.generation
 
@@ -210,6 +270,7 @@ actor WorkspaceSearchService {
         }
         commit(prepared)
         activeRebuildGeneration = nil
+        await reconcileBoundCatalogAfterManualRebuild()
         return snapshot.generation
     }
 
@@ -219,11 +280,14 @@ actor WorkspaceSearchService {
     }
 
     func reset() async {
-        rebuildSerial &+= 1
-        appliedIndexListenerTask?.cancel()
-        appliedIndexListenerTask = nil
-        pendingRebuildTask?.cancel()
-        pendingRebuildTask = nil
+        cancelRefreshFlight()
+        bindingEpoch &+= 1
+        freshnessListenerSerial &+= 1
+        isFreshnessListenerRunning = false
+        catalogChangeListenerTask?.cancel()
+        catalogChangeListenerTask = nil
+        boundStore = nil
+        boundRootScope = nil
         readyRootPathIndexes = []
         currentSnapshotGeneration = nil
         currentIndexedGeneration = nil
@@ -237,109 +301,162 @@ actor WorkspaceSearchService {
     func search(_ query: String, limit: Int = 300) async -> WorkspaceSearchQueryResult {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedLimit = max(0, limit)
-        let stale = isSearchStale
-        let pendingGenerationAtSearchStart = pendingGeneration
-        let observedGenerationAtSearchStart = latestObservedCatalogGeneration
-        let isReadyIndexUsableAtSearchStart = isReadyIndexUsable
-        guard boundedLimit > 0 else {
-            return queryResult(query: query, results: [], isStale: stale)
-        }
-
-        guard isReadyIndexUsableAtSearchStart, currentIndexedGeneration != nil else {
-            return queryResult(query: query, results: [], isStale: stale)
-        }
-
         let rootPathIndexesAtSearchStart = readyRootPathIndexes
         let generationAtSearchStart = currentIndexedGeneration
         let snapshotGenerationAtSearchStart = currentSnapshotGeneration
-        #if DEBUG
-            if let searchDidCaptureGenerationHandler {
-                await searchDidCaptureGenerationHandler(generationAtSearchStart)
-            }
-        #endif
+        let pendingGenerationAtSearchStart = pendingGeneration
+        let pendingRebuildGenerationAtSearchStart = pendingRebuildGeneration
+        let activeRebuildGenerationAtSearchStart = activeRebuildGeneration
+        let observedGenerationAtSearchStart = latestObservedCatalogGeneration
+        let isReadyIndexUsableAtSearchStart = isReadyIndexUsable
+        let storeAtSearchStart = boundStore
+        let rootScopeAtSearchStart = boundRootScope
+        let bindingEpochAtSearchStart = bindingEpoch
+        let wasBoundAtSearchStart = rootScopeAtSearchStart != nil
 
         let results: [WorkspaceSearchCatalogEntry]
-        if trimmed.isEmpty {
-            for index in rootPathIndexesAtSearchStart {
-                index.recordEmptyQueryShadowParity(limit: boundedLimit)
-            }
-            results = Self.mergeRootEntries(rootPathIndexesAtSearchStart, limit: boundedLimit)
+        if boundedLimit == 0 || !isReadyIndexUsableAtSearchStart || generationAtSearchStart == nil {
+            results = []
         } else {
-            results = await withTaskGroup(of: [WorkspaceSearchCatalogEntry].self) { group in
-                group.addTask {
-                    await Self.searchRootIndexes(
-                        rootPathIndexesAtSearchStart,
-                        query: trimmed,
-                        limit: boundedLimit
-                    )
+            #if DEBUG
+                if let searchDidCaptureGenerationHandler {
+                    await searchDidCaptureGenerationHandler(generationAtSearchStart)
                 }
-                let value = await group.next() ?? []
-                group.cancelAll()
-                return value
+            #endif
+            if trimmed.isEmpty {
+                for index in rootPathIndexesAtSearchStart {
+                    index.recordEmptyQueryShadowParity(limit: boundedLimit)
+                }
+                results = Self.mergeRootEntries(rootPathIndexesAtSearchStart, limit: boundedLimit)
+            } else {
+                results = await withTaskGroup(of: [WorkspaceSearchCatalogEntry].self) { group in
+                    group.addTask {
+                        await Self.searchRootIndexes(
+                            rootPathIndexesAtSearchStart,
+                            query: trimmed,
+                            limit: boundedLimit
+                        )
+                    }
+                    let value = await group.next() ?? []
+                    group.cancelAll()
+                    return value
+                }
             }
+        }
+
+        var observedGenerationForResult = observedGenerationAtSearchStart
+        var bindingValidationSucceeded = !wasBoundAtSearchStart
+        if let storeAtSearchStart, let rootScopeAtSearchStart {
+            let wasCancelledBeforeValidation = Task.isCancelled
+            let authoritativeGeneration = await storeAtSearchStart.catalogGeneration(rootScope: rootScopeAtSearchStart)
+            let wasCancelledDuringValidation = wasCancelledBeforeValidation || Task.isCancelled
+            if !wasCancelledDuringValidation,
+               isCurrentBinding(
+                   store: storeAtSearchStart,
+                   rootScope: rootScopeAtSearchStart,
+                   epoch: bindingEpochAtSearchStart
+               )
+            {
+                latestObservedCatalogGeneration = authoritativeGeneration
+                observedGenerationForResult = authoritativeGeneration
+                bindingValidationSucceeded = true
+            }
+        }
+
+        var stale = Self.isSearchStale(
+            indexedGeneration: generationAtSearchStart,
+            observedGeneration: observedGenerationForResult,
+            pendingGeneration: pendingRebuildGenerationAtSearchStart,
+            activeGeneration: activeRebuildGenerationAtSearchStart,
+            isReadyIndexUsable: isReadyIndexUsableAtSearchStart
+        )
+        if wasBoundAtSearchStart, !bindingValidationSucceeded {
+            stale = true
+        }
+        if currentIndexedGeneration != generationAtSearchStart {
+            stale = true
         }
         return WorkspaceSearchQueryResult(
             query: query,
             indexedGeneration: generationAtSearchStart,
             snapshotGeneration: snapshotGenerationAtSearchStart,
             pendingGeneration: pendingGenerationAtSearchStart,
-            observedGeneration: observedGenerationAtSearchStart,
+            observedGeneration: observedGenerationForResult,
             results: results,
             isIndexReady: generationAtSearchStart != nil && isReadyIndexUsableAtSearchStart,
             isStale: stale
         )
     }
 
-    private var isSearchStale: Bool {
-        guard let currentIndexedGeneration else {
-            return pendingRebuildGeneration != nil || activeRebuildGeneration != nil || latestObservedCatalogGeneration != nil
+    private static func isSearchStale(
+        indexedGeneration: UInt64?,
+        observedGeneration: UInt64?,
+        pendingGeneration: UInt64?,
+        activeGeneration: UInt64?,
+        isReadyIndexUsable: Bool
+    ) -> Bool {
+        guard let indexedGeneration else {
+            return pendingGeneration != nil || activeGeneration != nil || observedGeneration != nil
         }
-        if let latestObservedCatalogGeneration, latestObservedCatalogGeneration != currentIndexedGeneration {
+        if let observedGeneration, observedGeneration != indexedGeneration {
             return true
         }
-        if let pendingRebuildGeneration, pendingRebuildGeneration != currentIndexedGeneration {
+        if let pendingGeneration, pendingGeneration != indexedGeneration {
             return true
         }
-        if let activeRebuildGeneration, activeRebuildGeneration != currentIndexedGeneration {
+        if let activeGeneration, activeGeneration != indexedGeneration {
             return true
         }
         return !isReadyIndexUsable
     }
 
-    private func queryResult(
-        query: String,
-        results: [WorkspaceSearchCatalogEntry],
-        isStale: Bool
-    ) -> WorkspaceSearchQueryResult {
-        WorkspaceSearchQueryResult(
-            query: query,
-            indexedGeneration: currentIndexedGeneration,
-            snapshotGeneration: currentSnapshotGeneration,
-            pendingGeneration: pendingGeneration,
-            observedGeneration: latestObservedCatalogGeneration,
-            results: results,
-            isIndexReady: currentIndexedGeneration != nil && isReadyIndexUsable,
-            isStale: isStale
-        )
-    }
-
-    private func handleAppliedIndexEvent(
-        _ event: WorkspaceAppliedIndexBatchEvent,
+    private func handleSearchCatalogChangeEvent(
+        _ event: WorkspaceSearchCatalogChangeEvent,
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
+        epoch: UInt64,
+        listenerSerial: UInt64,
         debounceNanoseconds: UInt64
     ) async {
-        if event.isRootUnload {
-            dropReadyRootIndex(rootID: event.rootID)
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial,
+              isFreshnessListenerRunning
+        else { return }
+        #if DEBUG
+            await catalogChangeWillHandleHandler?(event)
+        #endif
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial,
+              isFreshnessListenerRunning
+        else { return }
+        if event.kind == .rootUnloaded {
+            dropReadyRootIndex(matching: event)
         }
 
         let catalogGeneration = await store.catalogGeneration(rootScope: rootScope)
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial,
+              isFreshnessListenerRunning
+        else { return }
         latestObservedCatalogGeneration = catalogGeneration
         if catalogGeneration == currentIndexedGeneration,
            pendingRebuildGeneration == nil,
            activeRebuildGeneration == nil
         {
             return
+        }
+        if event.kind == .generationAdvancedWithoutProjectionChange {
+            guard event.catalogGeneration == catalogGeneration else {
+                // A later catalog event is already buffered. Let that event either commit the
+                // newest projection-neutral generation or schedule the required rebuild.
+                return
+            }
+            if advanceReadyIndexGenerationWithoutProjectionRebuild(to: catalogGeneration) {
+                #if DEBUG
+                    await projectionNeutralGenerationDidCommitHandler?(catalogGeneration)
+                #endif
+                return
+            }
         }
         if catalogGeneration == pendingRebuildGeneration || catalogGeneration == activeRebuildGeneration {
             return
@@ -352,18 +469,102 @@ actor WorkspaceSearchService {
         )
     }
 
+    private func advanceReadyIndexGenerationWithoutProjectionRebuild(to generation: UInt64) -> Bool {
+        guard currentRefreshFlightToken == nil,
+              pendingRebuildGeneration == nil,
+              activeRebuildGeneration == nil,
+              currentSnapshotGeneration != nil,
+              currentIndexedGeneration != nil
+        else { return false }
+
+        currentSnapshotGeneration = generation
+        currentIndexedGeneration = generation
+        if let diagnostics = currentDiagnostics {
+            currentDiagnostics = WorkspaceCatalogDiagnostics(
+                generation: generation,
+                rootScope: diagnostics.rootScope,
+                rootCount: diagnostics.rootCount,
+                folderCount: diagnostics.folderCount,
+                fileCount: diagnostics.fileCount
+            )
+        }
+        return true
+    }
+
+    private func isCurrentBinding(
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope,
+        epoch: UInt64
+    ) -> Bool {
+        bindingEpoch == epoch && boundStore === store && boundRootScope == rootScope
+    }
+
+    private func reconcileBoundCatalogAfterManualRebuild() async {
+        guard isFreshnessListenerRunning,
+              let store = boundStore,
+              let rootScope = boundRootScope
+        else { return }
+        let epoch = bindingEpoch
+        let listenerSerial = freshnessListenerSerial
+        let catalogGeneration = await store.catalogGeneration(rootScope: rootScope)
+        guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
+              freshnessListenerSerial == listenerSerial,
+              isFreshnessListenerRunning
+        else { return }
+        latestObservedCatalogGeneration = catalogGeneration
+        if catalogGeneration != currentIndexedGeneration,
+           catalogGeneration != pendingRebuildGeneration,
+           catalogGeneration != activeRebuildGeneration
+        {
+            scheduleRebuild(
+                from: store,
+                rootScope: rootScope,
+                targetGeneration: catalogGeneration,
+                debounceNanoseconds: 0
+            )
+        }
+    }
+
+    private func cancelRefreshFlight() {
+        rebuildSerial &+= 1
+        currentRefreshFlightToken = nil
+        pendingRebuildTask?.cancel()
+        pendingRebuildTask = nil
+        pendingRebuildGeneration = nil
+        activeRebuildGeneration = nil
+    }
+
     private func scheduleRebuild(
         from store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
         targetGeneration: UInt64,
         debounceNanoseconds: UInt64
     ) {
-        pendingRebuildGeneration = targetGeneration
+        guard isFreshnessListenerRunning,
+              boundStore === store,
+              boundRootScope == rootScope
+        else { return }
+        if currentRefreshFlightToken?.targetGeneration == targetGeneration {
+            return
+        }
+        if currentRefreshFlightToken == nil, currentIndexedGeneration == targetGeneration {
+            return
+        }
+
         #if DEBUG
-            if pendingRebuildTask != nil {
+            if currentRefreshFlightToken != nil, pendingRebuildGeneration != nil {
                 debugDebounceCancellationCount += 1
             }
         #endif
+        rebuildSerial &+= 1
+        let token = RefreshFlightToken(
+            bindingEpoch: bindingEpoch,
+            rebuildSerial: rebuildSerial,
+            targetGeneration: targetGeneration
+        )
+        currentRefreshFlightToken = token
+        pendingRebuildGeneration = targetGeneration
+        activeRebuildGeneration = nil
         pendingRebuildTask?.cancel()
         pendingRebuildTask = Task { [weak self, store] in
             if debounceNanoseconds > 0 {
@@ -373,11 +574,11 @@ actor WorkspaceSearchService {
                     return
                 }
             }
+            guard !Task.isCancelled else { return }
             await self?.rebuildFromStoreIfCurrent(
                 store: store,
                 rootScope: rootScope,
-                targetGeneration: targetGeneration,
-                debounceNanoseconds: debounceNanoseconds
+                token: token
             )
         }
     }
@@ -385,16 +586,21 @@ actor WorkspaceSearchService {
     private func rebuildFromStoreIfCurrent(
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
-        targetGeneration: UInt64,
-        debounceNanoseconds: UInt64
+        token: RefreshFlightToken
     ) async {
-        guard pendingRebuildGeneration == targetGeneration || activeRebuildGeneration == targetGeneration else { return }
+        guard ownsRefreshFlight(token, store: store, rootScope: rootScope),
+              pendingRebuildGeneration == token.targetGeneration
+        else { return }
         pendingRebuildGeneration = nil
-        activeRebuildGeneration = targetGeneration
+        activeRebuildGeneration = token.targetGeneration
+
         let snapshot = await store.searchCatalogSnapshot(rootScope: rootScope)
+        guard ownsRefreshFlight(token, store: store, rootScope: rootScope),
+              !Task.isCancelled
+        else { return }
         latestObservedCatalogGeneration = snapshot.generation
-        guard snapshot.generation == targetGeneration else {
-            activeRebuildGeneration = nil
+        guard snapshot.generation == token.targetGeneration else {
+            retireRefreshFlight(token)
             scheduleRebuild(
                 from: store,
                 rootScope: rootScope,
@@ -405,33 +611,95 @@ actor WorkspaceSearchService {
         }
 
         #if DEBUG
-            await automaticRebuildDidStartHandler?(targetGeneration)
+            await automaticRebuildDidStartHandler?(token.targetGeneration)
         #endif
+        guard ownsRefreshFlight(token, store: store, rootScope: rootScope),
+              !Task.isCancelled
+        else { return }
         if automaticIndexBuildDelayNanoseconds > 0 {
-            try? await Task.sleep(nanoseconds: automaticIndexBuildDelayNanoseconds)
+            do {
+                try await Task.sleep(nanoseconds: automaticIndexBuildDelayNanoseconds)
+            } catch {
+                return
+            }
         }
+        guard ownsRefreshFlight(token, store: store, rootScope: rootScope),
+              !Task.isCancelled
+        else { return }
         let prepared = Self.prepareIndex(from: snapshot)
+        let authoritativeGeneration = await store.catalogGeneration(rootScope: rootScope)
+        guard ownsRefreshFlight(token, store: store, rootScope: rootScope) else { return }
         #if DEBUG
             recordPreparedIndexWork(prepared)
         #endif
-        guard !Task.isCancelled,
-              latestObservedCatalogGeneration == prepared.generation,
-              pendingRebuildGeneration == nil || pendingRebuildGeneration == prepared.generation,
-              activeRebuildGeneration == prepared.generation
-        else {
+        latestObservedCatalogGeneration = authoritativeGeneration
+
+        let generationStillMatches = !Task.isCancelled &&
+            authoritativeGeneration == prepared.generation &&
+            latestObservedCatalogGeneration == prepared.generation
+        guard generationStillMatches else {
             discardedAutomaticRebuildCompletions += 1
-            if activeRebuildGeneration == prepared.generation {
-                activeRebuildGeneration = nil
-            }
+            retireRefreshFlight(token)
+            scheduleRebuild(
+                from: store,
+                rootScope: rootScope,
+                targetGeneration: authoritativeGeneration,
+                debounceNanoseconds: 0
+            )
             return
         }
+        guard !Self.hasDuplicateRootIdentities(prepared.rootPathIndexes) else {
+            #if DEBUG
+                assertionFailure("Prepared search index contains duplicate root identities")
+            #endif
+            discardedAutomaticRebuildCompletions += 1
+            retireRefreshFlight(token)
+            return
+        }
+
         commit(prepared)
-        activeRebuildGeneration = nil
-        pendingRebuildTask = nil
+        retireRefreshFlight(token)
+        #if DEBUG
+            await automaticRebuildDidCommitHandler?(prepared.generation)
+        #endif
     }
 
-    private func dropReadyRootIndex(rootID: UUID) {
-        readyRootPathIndexes.removeAll { $0.identity.rootID == rootID }
+    private func ownsRefreshFlight(
+        _ token: RefreshFlightToken,
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope
+    ) -> Bool {
+        currentRefreshFlightToken == token &&
+            isFreshnessListenerRunning &&
+            isCurrentBinding(store: store, rootScope: rootScope, epoch: token.bindingEpoch)
+    }
+
+    private func retireRefreshFlight(_ token: RefreshFlightToken) {
+        guard currentRefreshFlightToken == token else { return }
+        currentRefreshFlightToken = nil
+        pendingRebuildTask = nil
+        pendingRebuildGeneration = nil
+        activeRebuildGeneration = nil
+    }
+
+    private func dropReadyRootIndex(matching event: WorkspaceSearchCatalogChangeEvent) {
+        guard let lifetimeID = event.rootLifetimeID else { return }
+        readyRootPathIndexes.removeAll {
+            $0.identity.rootID == event.rootID && $0.identity.lifetimeID == lifetimeID
+        }
+    }
+
+    private static func hasDuplicateRootIdentities(
+        _ rootPathIndexes: [WorkspaceSearchRootPathIndex]
+    ) -> Bool {
+        var identities = Set<WorkspaceSearchRootPathIndexIdentity>()
+        var rootIDs = Set<UUID>()
+        for rootPathIndex in rootPathIndexes {
+            guard identities.insert(rootPathIndex.identity).inserted,
+                  rootIDs.insert(rootPathIndex.identity.rootID).inserted
+            else { return true }
+        }
+        return false
     }
 
     private func commit(_ prepared: PreparedIndex) {

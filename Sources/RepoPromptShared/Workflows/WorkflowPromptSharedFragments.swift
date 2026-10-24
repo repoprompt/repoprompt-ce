@@ -131,7 +131,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 
 **Use `detach: true`** when dispatching concurrent items — otherwise the orchestrator blocks on the first agent and can't start the second.
 
-Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending.
+Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. Omit `timeout` for the configured subagent wait (factory default: two minutes); shorten it for closer supervision or lengthen it for well-scoped independent work. Completion, questions, and parent steering can end the wait early. Avoid repetitive status-only polling.
 
 \(example(variant,
 	mcp: """
@@ -141,7 +141,7 @@ Then pass `session_ids` (array) to `agent_run op=wait` to block until the **firs
 {"tool":"agent_run","args":{"op":"start","model_id":"\(defaultRole)","session_name":"2/N: <goal B>","message":"<brief B>","detach":true}}
 
 // Then wait for the first session that needs attention
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"]}}
 
 // Or poll all current snapshots without blocking
 {"tool":"agent_run","args":{"op":"poll","session_ids":["<session_id_A>","<session_id_B>"]}}
@@ -154,14 +154,14 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_n
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_name="2/N: <goal B>" message="<brief B>" detach=true'
 
 # Then wait for the first session that needs attention
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"]'
 
 # Or poll all current snapshots without blocking
 rpce-cli -w <window_id> -e 'agent_run op=poll session_ids=["<uuid1>","<uuid2>"]'
 ```
 """))
 
-Handle the finished agent, then wait again on the remaining `pending_session_ids`. While waiting, summarize completed work or prepare the next brief — be a pipeline, not a sequential loop.
+Handle the finished agent and summarize completed work. Do useful independent work, such as preparing the next brief, before blocking again on the remaining `pending_session_ids` — be a pipeline, not a sequential loop.
 """
 	}
 
@@ -253,7 +253,19 @@ rpce-cli -w <window_id> -e 'agent_manage op=cleanup_sessions session_ids=["<sess
 ```
 """))
 
-Explore-agent sessions are good to dismiss right away — narrow reconnaissance, no follow-up value. Keep heavier agent sessions if you might revisit them.
+Explore-agent sessions are good to dismiss right away — narrow reconnaissance, no follow-up value. Keep heavier agent sessions if you might revisit them. Cleanup is optional and must not gate the task result. If cleanup times out, loses its control handle, or reports a transport closure, inspect `agent_manage list_sessions` once before retrying; a missing/already-absent session is terminal success, and repeated retries without new state are wasteful.
+"""
+	}
+
+	/// Provider-cost and lifecycle guardrails shared by agent-heavy workflows.
+	static func sharedAgentReliabilityGuardrails() -> String {
+		"""
+Before a paid agent or Oracle call, verify the durable inputs it depends on: the intended workspace/worktree binding, current file selection, and any referenced export or review artifact. Treat admission failures as pre-provider failures unless the result explicitly says a provider started; repair the named binding, authorization, or context prerequisite before one bounded retry rather than changing models or creating duplicate sessions.
+
+Treat lifecycle outcomes as state-machine results, not generic transient errors:
+- `partialSuccessAfterCommit` or `mutation_state=indeterminate_after_commit`: do not replay the mutation. Inspect the exact operation/session/worktree state once and continue from observed state.
+- Expired wait/control handle: do not poll the same handle repeatedly. Resolve the persisted session with `agent_manage list_sessions`, then use the supported resume/steer path or start a new run only when the old session cannot be resumed.
+- Repeated identical failure with no external state change: stop retrying, preserve the evidence, and report the blocker.
 """
 	}
 
@@ -293,7 +305,10 @@ rpce-cli -w <window_id> -e 'call file_actions {"action":"delete","path":"/absolu
 		includeStrayPlanExportCleanup: Bool = false
 	) -> String {
 		guard includeSessionCleanupGuidance else { return "" }
-		var blocks: [String] = [sharedSessionCleanupHint(variant: variant)]
+		var blocks: [String] = [
+			sharedAgentReliabilityGuardrails(),
+			sharedSessionCleanupHint(variant: variant),
+		]
 		if includeStrayPlanExportCleanup {
 			blocks.append(sharedStrayPlanExportCleanupHint(variant: variant))
 		}

@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentModelsSettingsView.swift
 //  RepoPrompt
@@ -44,7 +46,8 @@ struct AgentModelsSettingsView: View {
         workspaceName: String? = nil,
         settingsManager: (any SettingsManaging)? = nil,
         onNavigate: ((SettingsTab) -> Void)? = nil,
-        viewModel: AgentModelsSettingsViewModel? = nil
+        viewModel: AgentModelsSettingsViewModel? = nil,
+        repromptCurrentProvider: @escaping () -> AgentProviderKind? = { nil }
     ) {
         self.promptVM = promptVM
         self.apiSettingsVM = apiSettingsVM
@@ -56,7 +59,8 @@ struct AgentModelsSettingsView: View {
             apiSettingsVM: apiSettingsVM,
             workspaceID: workspaceID,
             workspaceName: workspaceName,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            repromptCurrentProvider: repromptCurrentProvider
         ))
     }
 
@@ -350,21 +354,107 @@ struct AgentModelsSettingsView: View {
 
     private var oracleSection: some View {
         settingsCard {
-            sectionHeader(title: "Oracle Model", subtitle: "Used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
+            sectionHeader(
+                title: "Oracle Models",
+                subtitle: "Choose a primary Oracle and up to four additional models. Grouped requests run each model independently and keep results separate in roster order."
+            )
 
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(0 ..< viewModel.oracleCount, id: \.self) { index in
+                    oracleRow(at: index)
+                }
+
+                Button {
+                    viewModel.addOracle()
+                } label: {
+                    Label("Add Oracle", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!viewModel.canAddOracle)
+                .hoverTooltip(
+                    viewModel.canAddOracle
+                        ? "Add another Oracle model."
+                        : "Choose an Oracle first, or remove an Oracle to stay within the five-model limit."
+                )
+
+                Divider()
+                oracleReconciliationGuidanceEditor
+                Divider()
+                AgentRepromptSettingsEditor(viewModel: viewModel)
+            }
+        }
+    }
+
+    private var oracleReconciliationGuidanceEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Reconciliation guidance")
+                .font(.callout.weight(.medium))
+            Text("Used when two or more Oracle answers are returned to the calling agent. The agent reconciles them; no extra synthesis model runs. Changes affect future requests. Blank text restores the default; the lane manifest and end marker remain fixed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextEditor(text: $viewModel.oracleReconciliationGuidanceDraft)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .frame(height: 160)
+                .padding(6)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                }
+                .accessibilityLabel("Oracle reconciliation guidance")
+
+            HStack {
+                Button("Save") { viewModel.saveOracleReconciliationGuidanceDraft() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || !viewModel.isOracleGuidanceDraftDirty)
+                    .accessibilityLabel("Save Oracle reconciliation guidance")
+                Button("Restore Default") { viewModel.restoreDefaultOracleReconciliationGuidance() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || (
+                        !viewModel.isOracleGuidanceDraftDirty && viewModel.profileSnapshot.oracleReconciliationGuidance == nil
+                    ))
+                    .accessibilityLabel("Restore default Oracle reconciliation guidance")
+                if viewModel.oracleGuidanceHasConflict {
+                    Button("Reload Current Text") { viewModel.reloadOracleReconciliationGuidanceDraft() }
+                        .accessibilityLabel("Reload Oracle reconciliation guidance")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            if viewModel.oracleGuidanceHasConflict {
+                Text("Settings or scope changed while you were editing. Reload the current text before saving; this discards your draft.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func oracleRow(at index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 12) {
+                Text(viewModel.oracleLabel(at: index))
+                    .font(.callout.weight(.medium))
+                    .frame(width: 112, alignment: .leading)
+
                 AIModelDropdown(
                     promptViewModel: promptVM,
                     showSettingsPopover: $showSettingsPopover,
                     windowID: windowID,
                     useBorderlessStyle: false,
                     isInGeneralSettings: true,
-                    destination: viewModel.oracleModelDestination
+                    destination: index == 0
+                        ? viewModel.oracleModelDestination
+                        : viewModel.additionalOracleModelDestination(at: index - 1)
                 )
 
                 Spacer(minLength: 0)
 
-                if viewModel.showsRecommendationActions,
+                if index == 0,
+                   viewModel.showsRecommendationActions,
                    let recommendedName = viewModel.recommendedOracleModelName,
                    !viewModel.isOracleRecommendationSatisfied
                 {
@@ -377,6 +467,14 @@ struct AgentModelsSettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                } else if index > 0 {
+                    Button(role: .destructive) {
+                        viewModel.removeOracle(at: index - 1)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTooltip("Remove \(viewModel.oracleLabel(at: index))")
                 }
             }
 
@@ -384,10 +482,11 @@ struct AgentModelsSettingsView: View {
                 Image(systemName: "cpu")
                     .foregroundColor(.secondary)
                     .font(.caption)
-                Text("Using: \(viewModel.currentOracleModelName)")
+                Text("Using: \(viewModel.oracleModelName(at: index))")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+            .padding(.leading, 124)
         }
     }
 
@@ -443,6 +542,30 @@ struct AgentModelsSettingsView: View {
                         .cornerRadius(6)
                     }
 
+                    if let providerID = viewModel.selectedContextBuilderAgent.acpProviderID {
+                        let expectedScope = viewModel.editingScope
+                        let expectedModelRaw = viewModel.selectedContextBuilderModelRaw
+                        ACPModelParameterProbeView(
+                            modelRaw: expectedModelRaw,
+                            providerID: providerID,
+                            probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                            pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                            isEnabled: true
+                        ) { configID, value in
+                            viewModel.setContextBuilderModelParameter(
+                                ACPModelParameterSelection.thinkingPin(
+                                    configID: configID,
+                                    valueRaw: value,
+                                    providerID: providerID,
+                                    modelRaw: expectedModelRaw
+                                ),
+                                expectedProviderID: providerID,
+                                expectedModelRaw: expectedModelRaw,
+                                expectedScope: expectedScope
+                            )
+                        }
+                    }
+
                     Spacer(minLength: 0)
 
                     if viewModel.showsRecommendationActions,
@@ -476,7 +599,7 @@ struct AgentModelsSettingsView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundColor(.secondary)
-                    Text("Connect Claude Code, Codex, OpenCode, or Cursor to configure role defaults.")
+                    Text("Connect Claude Code, Codex, OpenCode, Cursor, or Grok Build to configure role defaults.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer(minLength: 0)
@@ -584,6 +707,33 @@ struct AgentModelsSettingsView: View {
                     .cornerRadius(4)
                 }
                 .fixedSize()
+
+                if let providerID = resolution.effective.agent.acpProviderID {
+                    // Capture the write target at render time; the view model re-checks it against
+                    // LIVE state before writing, so a stale menu (a scope switch while it was
+                    // open leaves the discovery key identical) cannot write to the old scope.
+                    let expectedScope = viewModel.editingScope
+                    let expectedModelRaw = resolution.effective.modelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                        pinnedValueRaw: resolution.thinkingParameterValueRaw
+                    ) { configID, value in
+                        viewModel.setRoleModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            for: resolution.role,
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
+                        )
+                    }
+                }
             }
 
             let pinState = resolution.pinState

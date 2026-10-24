@@ -12,13 +12,17 @@ final class AgentModeProviderBindingService {
         self.preferences = preferences
     }
 
-    func topLevelSettingsControlsBinding(providerID: AgentProviderBindingID) -> AgentProviderControlsBinding {
-        preferences.topLevelSettingsControlsBinding(providerID: providerID)
+    func topLevelSettingsControlsBinding(
+        providerID: AgentProviderBindingID,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil
+    ) -> AgentProviderControlsBinding {
+        preferences.topLevelSettingsControlsBinding(providerID: providerID, claudeEffortLevel: claudeEffortLevel)
     }
 
     func controlsBinding(
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String? = nil,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent: Bool,
         externallyManagedReason: String?
@@ -26,6 +30,7 @@ final class AgentModeProviderBindingService {
         preferences.controlsBinding(
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
+            claudeEffortLevel: claudeEffortLevel,
             permissionProfile: permissionProfile,
             isSubagent: isSubagent,
             externallyManagedReason: externallyManagedReason
@@ -37,6 +42,22 @@ final class AgentModeProviderBindingService {
         profile: AgentProviderPermissionProfile
     ) -> AgentProviderRuntimePermissionBinding {
         preferences.runtimePermission(for: agent, profile: profile)
+    }
+
+    /// Snapshots human-owned Codex capability preferences for a direct Agent Mode launch.
+    /// MCP-related sessions remain restricted for their lifetime regardless of preference state.
+    func codexCapabilitiesForLaunch(isMCPRelated: Bool) -> CodexCapabilitySettings {
+        guard !isMCPRelated,
+              let tools = preferences
+              .topLevelSettingsControlsBinding(providerID: .codex)
+              .codexTools
+        else { return .disabled }
+        return CodexCapabilitySettings(
+            appsEnabled: tools.appsEnabled,
+            pluginsEnabled: tools.pluginsEnabled,
+            mcpElicitationEnabled: tools.mcpElicitationEnabled,
+            toolSuggestionsEnabled: tools.toolSuggestionsEnabled
+        )
     }
 
     func permissionProfileForMCPActivation(isSubagent: Bool) -> AgentProviderPermissionProfile {
@@ -190,7 +211,7 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
-            case .openCode:
+            case .openCode, .antigravity:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
@@ -223,6 +244,12 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .grokBuild, .devin:
+                // These providers take their permission level as a launch-time CLI flag
+                // (`--always-approve` / `--permission-mode`); it applies to newly launched
+                // processes and never mutates a running controller. The next run builds a
+                // fresh controller because `isCompatibleWith` keys on that flag.
+                break
             }
         }
 

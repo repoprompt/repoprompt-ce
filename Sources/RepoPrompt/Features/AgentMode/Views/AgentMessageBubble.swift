@@ -1,4 +1,7 @@
 import AppKit
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
 import SwiftUI
 
 extension EnvironmentValues {
@@ -14,6 +17,7 @@ extension EnvironmentValues {
 /// - Uses the shared message timestamp formatter so timestamp labels stay consistent.
 /// - Observes FontScaleManager so footer text follows Agent Mode text size.
 private struct MessageFooterStrip: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let text: String
     let timestamp: Date
     let isTrailing: Bool
@@ -63,7 +67,7 @@ private struct MessageFooterStrip: View {
         if let runtimeFooter {
             if let completedDate = runtimeFooter.completedDate {
                 #if DEBUG
-                    let _ = AgentModePerfDiagnostics.increment("timeline.messageFooter.completed")
+                    let _ = perfRecorder.increment("timeline.messageFooter.completed")
                 #endif
                 let elapsed = AgentRuntimeDurationFormatter.string(from: runtimeFooter.anchorDate, to: completedDate)
                 Text("\(runtimeFooter.statusText) \(elapsed)")
@@ -73,18 +77,18 @@ private struct MessageFooterStrip: View {
             } else if agentWindowIsFocused {
                 TimelineView(.periodic(from: .now, by: 1)) { timeline in
                     #if DEBUG
-                        let _ = AgentModePerfDiagnostics.increment("timeline.messageFooter.tick")
+                        let _ = perfRecorder.increment("timeline.messageFooter.tick")
                     #endif
                     runtimeFooterText(runtimeFooter, now: timeline.date)
                 }
                 #if DEBUG
                 .onAppear {
-                        AgentModePerfDiagnostics.increment("timeline.messageFooter.liveMount")
+                        perfRecorder.increment("timeline.messageFooter.liveMount")
                     }
                 #endif
             } else {
                 #if DEBUG
-                    let _ = AgentModePerfDiagnostics.increment("timeline.messageFooter.unfocused")
+                    let _ = perfRecorder.increment("timeline.messageFooter.unfocused")
                 #endif
                 runtimeFooterText(runtimeFooter, now: Date())
             }
@@ -158,6 +162,33 @@ private struct MessageFooterStrip: View {
                 showCopied = false
             }
         }
+    }
+}
+
+// MARK: - Lane Update Accessibility
+
+/// Speaks when a lane update was delivered, with date context always included.
+///
+/// The visible timestamp may omit the date, which is fine beside a row the user can see in sequence;
+/// a spoken row has no such context. Scoped to its own modifier so only lane-update rows observe the
+/// timestamp environment.
+private struct LaneUpdateDeliveryAccessibilityValue: ViewModifier {
+    let date: Date
+    @Environment(\.messageTimestampNow) private var messageTimestampNow
+    @Environment(\.calendar) private var calendar
+    @Environment(\.locale) private var locale
+
+    func body(content: Content) -> some View {
+        content.accessibilityValue(Text(
+            verbatim: AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: MessageTimestampFormatter.string(
+                    from: date,
+                    includeDateContext: true,
+                    now: messageTimestampNow,
+                    calendar: calendar,
+                    locale: locale
+                ))
+        ))
     }
 }
 
@@ -337,8 +368,11 @@ struct AgentMessageBubble: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
-                    if item.codexGoalMode != nil || item.workflow != nil {
+                    if item.codexGoalMode != nil || item.workflow != nil || item.crossSessionAttribution != nil {
                         HStack(spacing: 6) {
+                            if let attribution = item.crossSessionAttribution {
+                                crossSessionAttributionBadge(attribution)
+                            }
                             if let codexGoalMode = item.codexGoalMode {
                                 codexGoalModeBadge(codexGoalMode, hasWorkflow: item.workflow != nil)
                             }
@@ -400,6 +434,36 @@ struct AgentMessageBubble: View {
         .hoverTooltip(tooltip)
         .accessibilityLabel(Text(labelText))
         .accessibilityHint(Text(tooltip))
+    }
+
+    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
+    ///
+    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
+    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
+    /// accessibility text rather than the label, which would otherwise dominate the bubble.
+    private func crossSessionAttributionBadge(_ attribution: AgentCrossSessionAttribution) -> some View {
+        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = (name?.isEmpty == false)
+            ? name!
+            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
+        let label = "From \(displayName)"
+        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
+
+        return HStack(spacing: 4) {
+            Image(systemName: "eye.fill")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            Text(label)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundColor(.purple)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.purple.opacity(0.15))
+        .clipShape(Capsule())
+        .hoverTooltip(detail)
+        .accessibilityLabel(Text(label))
+        .accessibilityHint(Text(detail))
     }
 
     private func workflowBadge(_ workflow: AgentWorkflowDefinition) -> some View {
@@ -783,9 +847,14 @@ struct AgentMessageBubble: View {
                     RoundedRectangle(cornerRadius: 16)
                         .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
                 )
+            } else if let laneUpdate = laneUpdatePresentation {
+                laneUpdateRow(laneUpdate)
             } else {
                 HStack(spacing: 6) {
-                    Text(item.text)
+                    if let attribution = item.crossSessionAttribution {
+                        crossSessionAttributionBadge(attribution)
+                    }
+                    Text(verbatim: item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundColor(.secondary)
 
@@ -807,6 +876,97 @@ struct AgentMessageBubble: View {
                 )
             }
         }
+    }
+
+    // MARK: - Lane Update Row
+
+    /// The structured row for an accepted lane-update item, or `nil` for every other system row.
+    ///
+    /// Keyed off the exact canonical marker plus independently validated metadata: a legacy row, a
+    /// malformed blob, and an overflow-only batch keep the system styling but show only the generic
+    /// body rather than a partially formatted lane list. Every string is rendered with
+    /// `Text(verbatim:)` because lane labels are target-derived and must never reach Markdown parsing.
+    private var laneUpdatePresentation: AgentLaneUpdateDisplayAttribution.RowPresentation? {
+        AgentLaneUpdateDisplayAttribution.rowPresentation(for: item)
+    }
+
+    /// Body-size lane lines under a fixed RepoPrompt header, so which overseen session did what is
+    /// scannable at the user's chosen font scale instead of buried in one small sentence.
+    private func laneUpdateRow(
+        _ presentation: AgentLaneUpdateDisplayAttribution.RowPresentation
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: fontPreset.scaledMetric(8 as CGFloat)) {
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                .foregroundColor(.accentColor)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledMetric(3 as CGFloat)) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(verbatim: AgentLaneUpdateDisplayAttribution.RowPresentation.title)
+                        .font(fontPreset.standardFontSemibold)
+                        .foregroundColor(.primary)
+                    Spacer(minLength: 8)
+                    MessageTimestampText(date: item.timestamp)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                        .foregroundColor(.secondary.opacity(0.7))
+                }
+
+                Text(verbatim: presentation.summary)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(Array(presentation.lanes.enumerated()), id: \.offset) { _, lane in
+                    laneUpdateLaneLine(lane)
+                }
+
+                if let additional = presentation.additionalLanesText {
+                    Text(verbatim: additional)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+
+                if let overflowNote = presentation.overflowNote {
+                    Text(verbatim: overflowNote)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: presentation.accessibilityLabel))
+        .modifier(LaneUpdateDeliveryAccessibilityValue(date: item.timestamp))
+    }
+
+    /// `“Label” — status`: the label in primary semibold, RepoPrompt's observation in secondary, so
+    /// the two can never be mistaken for one string even when a label contains a dash.
+    private func laneUpdateLaneLine(
+        _ lane: AgentLaneUpdateDisplayAttribution.RowPresentation.Lane
+    ) -> some View {
+        var line = Text(verbatim: lane.quotedLabel)
+            .font(fontPreset.standardFontSemibold)
+            .foregroundColor(.primary)
+        if let statusChange = lane.statusChange {
+            line = line + Text(verbatim: " \u{2014} \(statusChange.to.currentStatePhrase)")
+                .font(fontPreset.standardFont)
+                .foregroundColor(.secondary)
+        }
+        return line
+            .fixedSize(horizontal: false, vertical: true)
+            .hoverTooltip(lane.statusChange?.changeDescription)
     }
 
     // MARK: - Error Bubble

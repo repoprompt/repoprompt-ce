@@ -1,8 +1,10 @@
+import AppKit
 import Foundation
 import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
 final class MCPAskUserToolProvider: MCPAppToolProviding {
@@ -23,14 +25,16 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         let resolveAgentModeTabID = execution.resolveAgentModeTabID
         return DomainLongRunningInteractionAdapter(
             isAvailable: { request in
-                guard let connectionID = request.clientID,
+                guard let invocationContext = try? MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser),
+                      let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID,
                       let targetWindow = await MainActor.run(body: {
                           try? requireTargetWindow()
                       })
                 else {
                     return false
                 }
-                switch await ServerNetworkManager.shared.runPurpose(for: connectionID) {
+                switch await execution.liveRunPurpose(connectionID) {
                 case .discoverRun:
                     guard let tabContext = try? await requireCurrentTabContext(
                         MCPWindowToolName.askUser
@@ -59,11 +63,14 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 }
             },
             resolveDefaultTimeoutSeconds: { request in
-                guard let connectionID = request.clientID else {
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser)
+                guard let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID
+                else {
                     throw MCPError.invalidParams("ask_user requires an active MCP connection")
                 }
                 return try await Self.resolveDefaultTimeoutSeconds(
-                    connectionID: connectionID,
+                    invocationContext: invocationContext,
                     dependencies: execution
                 )
             },
@@ -150,27 +157,28 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 ],
                 required: ["questions"]
             )
-        ) { [dependencies] _, args in
-            try await Self.executeAskUser(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeAskUser(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
     /// Execute the ask_user tool - routes to appropriate UI based on run purpose.
     private static func executeAskUser(
         args: [String: Value],
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         // Get connection ID and determine run purpose for routing.
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_user requires an active MCP connection")
         }
-        let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        let purpose = await dependencies.liveRunPurpose(connectionID)
 
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
         let defaultTimeout = try await resolveDefaultTimeoutSeconds(
-            connectionID: connectionID,
+            invocationContext: invocationContext,
             dependencies: dependencies
         )
         let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
@@ -213,7 +221,12 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             // For non-MCP-controlled sessions, surface the tab so the user can
             // see and answer the question. MCP-controlled runs handle interactions
             // programmatically via `respond`, so pulling focus would be disruptive.
-            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID) {
+            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID),
+               !Self.prefersNotificationOverActivation(
+                   isAppActive: NSApp?.isActive == true,
+                   preferences: GlobalSettingsStore.shared.notificationPreferences()
+               )
+            {
                 _ = await targetWindow.revealPendingInteraction(
                     tabID: tabID,
                     surface: .agentQuestion
@@ -247,11 +260,14 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
     }
 
     private static func resolveDefaultTimeoutSeconds(
-        connectionID: UUID,
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> TimeInterval {
+        guard let connectionID = invocationContext.connectionID else {
+            throw MCPError.invalidParams("ask_user requires an active MCP connection")
+        }
         let targetWindow = try dependencies.requireTargetWindow()
-        switch await ServerNetworkManager.shared.runPurpose(for: connectionID) {
+        switch await dependencies.liveRunPurpose(connectionID) {
         case .discoverRun:
             let tabContext = try await dependencies.requireCurrentTabContext(MCPWindowToolName.askUser)
             guard let runID = tabContext.runID else {
@@ -293,6 +309,19 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         } onCancel: {
             Task { await coordinator.cancel(requestID: requestID) }
         }
+    }
+
+    /// Opt-in (`notifications.mcp_ask_user_notify_instead_of_activate`): while RepoPrompt is in the
+    /// background, let the attention-notification reconciler surface the question instead of pulling
+    /// the app to the front. Default behavior (reveal the tab) is unchanged.
+    nonisolated static func prefersNotificationOverActivation(
+        isAppActive: Bool,
+        preferences: NotificationPreferences
+    ) -> Bool {
+        !isAppActive
+            && preferences.enabled
+            && preferences.agentInteractions
+            && preferences.mcpAskUserNotifyInsteadOfActivate
     }
 
     nonisolated static func resolvedInteractionTimeoutSeconds(

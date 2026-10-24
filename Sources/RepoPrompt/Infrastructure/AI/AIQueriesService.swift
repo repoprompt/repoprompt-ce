@@ -1,59 +1,12 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID
 
-/// Groups all token-usage info so we can extend it later.
-public struct ChatTokenInfo: Codable, Equatable {
-    public let promptTokens: Int?
-    public let completionTokens: Int?
-    public let cost: Double?
-
-    public init(
-        promptTokens: Int? = nil,
-        completionTokens: Int? = nil,
-        cost: Double? = nil
-    ) {
-        self.promptTokens = promptTokens
-        self.completionTokens = completionTokens
-        self.cost = cost
-    }
-}
-
-public enum ChatStreamTerminalOutcome: Sendable, Equatable {
-    case completed
-    case incomplete(reason: String)
-}
-
-/// A normalized provider stream event. A terminal outcome exists only when the provider explicitly reports completion or incomplete termination; ordinary stream exhaustion remains non-terminal.
-public struct ChatStreamOutput {
-    public let text: String
-    public let reasoning: String?
-    public let tokens: ChatTokenInfo
-    public let terminalOutcome: ChatStreamTerminalOutcome?
-    public let cleanupHandle: ProviderConversationCleanupHandle?
-    public let isTransportActivity: Bool
-
-    public var isFinal: Bool {
-        terminalOutcome == .completed
-    }
-
-    public init(
-        text: String,
-        reasoning: String?,
-        tokens: ChatTokenInfo,
-        terminalOutcome: ChatStreamTerminalOutcome? = nil,
-        cleanupHandle: ProviderConversationCleanupHandle? = nil,
-        isTransportActivity: Bool = false
-    ) {
-        self.text = text
-        self.reasoning = reasoning
-        self.tokens = tokens
-        self.terminalOutcome = terminalOutcome
-        self.cleanupHandle = cleanupHandle
-        self.isTransportActivity = isTransportActivity
-    }
-}
+public typealias ChatTokenInfo = RepoPromptDomainRuntime.ChatTokenInfo
+public typealias ChatStreamTerminalOutcome = RepoPromptDomainRuntime.ChatStreamTerminalOutcome
+public typealias ChatStreamOutput = RepoPromptDomainRuntime.ChatStreamOutput
 
 struct PartialBuffer {
     var chunks: [String] = []
@@ -268,6 +221,23 @@ public class AIQueriesService {
     ) async -> ProviderConversationCleanupOutcome
 
     private let taskManager = TaskManager()
+
+    #if DEBUG
+        /// Cancellation-connected replacement transport. Registration is acknowledged before
+        /// returning to sendMessage, including cancellation that raced registration.
+        func registerControlledStreamForTesting(
+            id: ChatStreamID,
+            continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation,
+            producer: Task<Void, Never>
+        ) async {
+            await taskManager.storeContinuation(continuation, for: id)
+            await taskManager.addTask(producer, for: id)
+        }
+
+        func removeControlledStreamForTesting(id: ChatStreamID) async {
+            await taskManager.removeTask(for: id)
+        }
+    #endif
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool

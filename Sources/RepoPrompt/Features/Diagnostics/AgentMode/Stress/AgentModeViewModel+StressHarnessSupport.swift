@@ -90,11 +90,13 @@
             session.assistantDeltaFlushTask = nil
             session.pendingInstructions = []
             session.pendingClaudeSteeringInstructions = []
+            session.settlePendingManagedACPSteeringAsNotAccepted()
             session.pendingACPSteeringInstructions = []
             session.codexFallbackPumpTask?.cancel()
             session.codexFallbackPumpTask = nil
             session.codexFallbackQueue = []
             session.codexFallbackDispatchInFlight = nil
+            session.codexFallbackHookGateOwnerBlocker = nil
             session.codexPendingTurnKind = nil
             session.codexAuthoritativeActiveTurn = nil
             session.codexAnonymousActiveTurn = nil

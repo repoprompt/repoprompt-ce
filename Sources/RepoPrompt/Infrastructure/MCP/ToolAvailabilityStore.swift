@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import Logging
 import MCP // For ServerNetworkManager.broadcastToolListChanged()
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Shared runtime & persistence layer for per-tool enable/disable flags.
@@ -40,13 +41,18 @@ final class ToolAvailabilityStore: ObservableObject {
 
     static let shared = ToolAvailabilityStore()
     private var cancellables = Set<AnyCancellable>()
+    private let defaults: UserDefaults
 
-    private init() {
-        let saved = UserDefaults.standard.stringArray(forKey: Self.defaultsKey) ?? []
-        disabledTools = Set(saved)
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let saved = Set(defaults.stringArray(forKey: Self.defaultsKey) ?? [])
+        disabledTools = Set(saved.map { $0 == "agent_self" ? "self_compact" : $0 })
         globallySuppressedTools = Self.suppressedToolNames(
             codeMapsGloballyDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
+        if disabledTools != saved {
+            save()
+        }
 
         GlobalSettingsStore.shared.$codeMapsGloballyDisabled
             .removeDuplicates()
@@ -105,6 +111,16 @@ final class ToolAvailabilityStore: ObservableObject {
         // Notify all connected clients without blocking the main actor
         scheduleBroadcast()
     }
+
+    #if DEBUG
+        /// Exercise the synchronous published withdrawal path without persistence or debounce work.
+        /// Only an enabled tool may be temporarily withdrawn; the final store value is unchanged.
+        func debugDisableAndReenableWithoutPersistenceForTesting(_ name: String) {
+            precondition(isEnabled(name))
+            disabledTools.insert(name)
+            disabledTools.remove(name)
+        }
+    #endif
 
     /// Registers newly discovered `Tool`s so the UI can present them.
     func registerTools(_ tools: [Tool]) {
@@ -183,11 +199,13 @@ final class ToolAvailabilityStore: ObservableObject {
                 changed = true
             }
         }
-        if changed { save() } // only persist when needed
+        if changed {
+            save()
+        } // only persist when needed
     }
 
     private func save() {
-        UserDefaults.standard.set(Array(disabledTools), forKey: Self.defaultsKey)
+        defaults.set(Array(disabledTools), forKey: Self.defaultsKey)
     }
 
     private static let defaultsKey = "mcp.disabledTools"

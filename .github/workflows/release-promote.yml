@@ -161,6 +161,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Reject dormant rollout roles and sibling publication
+        run: |
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+            --declaration release-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json
+
       - name: Prepare Sentry promotion token file
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}

@@ -1,6 +1,9 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 /// Explicit app-process physical capability adapters used by domain-owned tool bindings.
 /// Presentation and AppKit interactions remain on MainActor; schema, policy, and catalog
@@ -20,12 +23,34 @@ enum MCPAppFileReadResult {
     case nonSelecting(reply: ToolResultDTOs.ReadFileReply)
 }
 
+enum MCPStoreBackedFileTreeEmptyReason: Equatable {
+    case requestedPathOutsideLoadedRoots
+    case selectionEmpty
+    case rootProjectionEmpty
+}
+
 /// Namespace for independently injected app-process capability families.
 /// No provider receives an unrestricted aggregate of every app capability.
 enum MCPAppPhysicalCapabilityAdapters {
+    enum PromptExportPhaseHookPoint: String, Hashable {
+        case beforeDurableWrite
+        case afterDurableWrite
+    }
+
+    typealias PromptExportPhaseHook = @MainActor @Sendable (PromptExportPhaseHookPoint) async -> Void
+
+    #if DEBUG
+        @MainActor private static var promptExportPhaseHookForTesting: PromptExportPhaseHook?
+
+        @MainActor
+        static func setPromptExportPhaseHookForTesting(_ hook: PromptExportPhaseHook?) {
+            promptExportPhaseHookForTesting = hook
+        }
+    #endif
+
     struct ContextBuilderTabResolution {
         let identity: WorkspaceSelectionIdentity
-        let nestedTabContext: MCPServerViewModel.TabContextSnapshot
+        let nestedTabContext: MCPTabContextSnapshot
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
         let bindCaller: Bool
@@ -35,6 +60,9 @@ enum MCPAppPhysicalCapabilityAdapters {
     }
 
     typealias ExecuteTool = @Sendable (_ args: [String: Value]) async throws -> Value
+    typealias LiveRunPurpose = @Sendable (_ connectionID: UUID) async -> MCPRunPurpose
+    typealias SupportsProgressNotifications = @Sendable (_ connectionID: UUID) async -> Bool
+    typealias SendHeartbeatProgress = @Sendable (_ connectionID: UUID, _ tool: String, _ stage: String, _ message: String) async -> Void
     typealias WorkspaceSearch = @Sendable (
         _ pattern: String,
         _ mode: SearchMode,
@@ -52,8 +80,8 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ rootScope: WorkspaceLookupRootScope
     ) async throws -> SearchResults
     typealias RequireTargetWindow = @MainActor @Sendable () throws -> WindowState
-    typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabContextSnapshot
-    typealias RequireAgentModeConnection = @Sendable (_ toolName: String) async throws -> UUID
+    typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPTabContextSnapshot
+    typealias RequireAgentModeConnection = @Sendable (_ context: ToolInvocationContext, _ toolName: String) async throws -> UUID
     typealias ResolveAgentModeTabID = @Sendable (
         _ args: [String: Value],
         _ connectionID: UUID?,
@@ -111,6 +139,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ agentModeSessionID: UUID?,
         _ agentModeRunID: UUID?,
         _ mode: HeadlessMode,
+        _ execution: ResolvedOracleExecution,
         _ prompt: String,
         _ selection: StoredSelection,
         _ lookupContext: WorkspaceLookupContext?,
@@ -119,32 +148,32 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ progressReporter: ContextBuilderMCPProgressReporter?,
         _ activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply
-    typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPServerViewModel.RequestMetadata
+    typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPRequestMetadata
     typealias ResolveImplicitContextBuilderGitTarget = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata
+        _ metadata: MCPRequestMetadata
     ) async throws -> ContextBuilderReviewTargetResolution?
     typealias ValidateContextBuilderGitArtifactSelection = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ target: ContextBuilderReviewTarget
     ) async throws -> Void
     typealias ResolveTabContextSnapshot = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ toolName: String
-    ) throws -> MCPServerViewModel.ResolvedTabContextSnapshot
+    ) throws -> MCPResolvedTabContextSnapshot
     typealias UpdateCurrentTabContext = @MainActor @Sendable (
         _ toolName: String,
-        _ mutation: (inout MCPServerViewModel.TabContextSnapshot) -> Void
+        _ mutation: (inout MCPTabContextSnapshot) -> Void
     ) async throws -> Void
     typealias SelectedRecordsForCurrentTabContext = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ lookupContextOverride: WorkspaceLookupContext?
     ) async throws -> [WorkspaceFileRecord]
     typealias PhysicalSelectionForCurrentTabContext = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ lookupContextOverride: WorkspaceLookupContext?
     ) async throws -> StoredSelection
     typealias ResolveSelectedFilesForCodeStructure = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ lookupContext: WorkspaceLookupContext,
         _ maximumSeedCount: Int
     ) async throws -> [WorkspaceFileRecord]
@@ -172,24 +201,25 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async -> Void
     typealias FreezePromptGitReviewContext = @MainActor @Sendable (
-        _ context: MCPServerViewModel.TabContextSnapshot
+        _ context: MCPTabContextSnapshot
     ) async -> FrozenPromptGitReviewContext
     typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
-    typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async -> WorkspaceLookupContext
+    typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPRequestMetadata) async -> WorkspaceLookupContext
+    typealias RequiredFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPRequestMetadata) async throws -> MCPFrozenFileToolAuthority
     typealias ResolveMutationFileToolContext = @MainActor @Sendable (
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ toolName: String
     ) async throws -> (
-        resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        resolvedContext: MCPResolvedTabContextSnapshot,
         lookupContext: WorkspaceLookupContext
     )
-    typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPServerViewModel.TabContextSnapshot) async -> StoredSelection
+    typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPTabContextSnapshot) async -> StoredSelection
     typealias BuildCurrentSelectionReply = @MainActor @Sendable (
         _ includeBlocks: Bool,
         _ display: FilePathDisplay,
         _ extraInvalid: [String],
         _ viewMode: String?,
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        _ resolvedContext: MCPResolvedTabContextSnapshot,
         _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildSelectionPreviewReply = @MainActor @Sendable (
@@ -200,7 +230,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
         _ lookupContext: WorkspaceLookupContext,
-        _ virtualContext: MCPServerViewModel.TabContextSnapshot?,
+        _ virtualContext: MCPTabContextSnapshot?,
         _ reviewGitContext: FrozenPromptGitReviewContext?
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildSelectionMutationReply = @MainActor @Sendable (
@@ -210,7 +240,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ extraInvalid: [String],
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
-        _ virtualContext: MCPServerViewModel.TabContextSnapshot?,
+        _ virtualContext: MCPTabContextSnapshot?,
         _ lookupContext: WorkspaceLookupContext,
         _ reviewGitContext: FrozenPromptGitReviewContext?
     ) async throws -> ToolResultDTOs.SelectionReply
@@ -233,8 +263,8 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ mode: WorkspacePreResolvedFullFileMutationMode
     ) -> StoredSelection
     typealias CommitManageSelectionArtifactMutation = @MainActor @Sendable (
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ resolvedContext: MCPResolvedTabContextSnapshot,
+        _ metadata: MCPRequestMetadata,
         _ expectedPhysicalSelection: StoredSelection,
         _ requestedPhysicalSelection: StoredSelection,
         _ lookupContext: WorkspaceLookupContext,
@@ -275,54 +305,61 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ lookupRootScope: WorkspaceLookupRootScope
     ) async -> (selection: StoredSelection, result: MCPServerViewModel.MCPSelectionSlicesMutationResult, mutated: Bool)
     typealias PersistResolvedTabContextSnapshot = @MainActor @Sendable (
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ resolvedContext: MCPResolvedTabContextSnapshot,
+        _ metadata: MCPRequestMetadata,
         _ mutated: Bool
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?, _ operationID: String) async throws -> MCPFileActionMutationAcknowledgement
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
-    typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
-    typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> MCPAppFileReadResult
+    typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int, emptyReason: MCPStoreBackedFileTreeEmptyReason?)
+    typealias ReadFile = @MainActor @Sendable (
+        _ input: WorkspaceExactFileInput,
+        _ startLine1Based: Int?,
+        _ lineCount: Int?,
+        _ lookupContext: WorkspaceLookupContext
+    ) async throws -> MCPAppFileReadResult
     typealias ReadSelectedAuthorizedGitArtifact = @MainActor @Sendable (
         _ requestedPath: String,
         _ translatedLookupPath: String,
         _ startLine1Based: Int?,
         _ lineCount: Int?,
-        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ metadata: MCPRequestMetadata,
         _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.ReadFileReply?
     typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (
         _ reply: ToolResultDTOs.ReadFileReply,
         _ requestedPath: String,
         _ absolutePhysicalPath: String,
-        _ metadata: MCPServerViewModel.RequestMetadata
-    ) async throws -> Void
-    typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
+        _ metadata: MCPRequestMetadata,
+        _ authority: MCPFrozenFileToolAuthority
+    ) async throws -> Bool
+    typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPRequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
     typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (
         _ mode: SearchMode,
         _ contextLines: Int,
         _ reply: ToolResultDTOs.SearchResultDTO,
         _ resolvedPhysicalPaths: [String],
-        _ metadata: MCPServerViewModel.RequestMetadata
-    ) async throws -> Void
+        _ metadata: MCPRequestMetadata,
+        _ authority: MCPFrozenFileToolAuthority
+    ) async throws -> Bool
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?
-    typealias BuildTabWorkspaceContext = @MainActor @Sendable (_ context: MCPServerViewModel.TabContextSnapshot, _ include: Set<String>, _ display: FilePathDisplay, _ copyPresetOverride: CopyPreset?, _ presentationActiveContext: Bool) async throws -> ToolResultDTOs.PromptContextDTO
-    typealias SelectedFilesWithStats = @MainActor @Sendable (_ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> ToolResultDTOs.SelectedFilesReply
+    typealias BuildTabWorkspaceContext = @MainActor @Sendable (_ context: MCPTabContextSnapshot, _ include: Set<String>, _ display: FilePathDisplay, _ copyPresetOverride: CopyPreset?, _ presentationActiveContext: Bool) async throws -> ToolResultDTOs.PromptContextDTO
+    typealias SelectedFilesWithStats = @MainActor @Sendable (_ resolvedContext: MCPResolvedTabContextSnapshot) async throws -> ToolResultDTOs.SelectedFilesReply
     typealias SelectionCollectionsForCurrentTabContext = @MainActor @Sendable () async throws -> MCPServerViewModel.SelectionReplyAssembler.SelectionCollections
     typealias BuildCopyPresetContextDTO = @MainActor @Sendable (_ active: CopyPreset, _ effective: CopyPreset) -> ToolResultDTOs.CopyPresetContextDTO
     typealias BuildCopyPresetsListDTO = @MainActor @Sendable () -> [ToolResultDTOs.CopyPresetListItemDTO]
     typealias CopyPresetDescriptorDTO = @MainActor @Sendable (_ preset: CopyPreset) -> ToolResultDTOs.CopyPresetDescriptorDTO
     typealias BuildExportSelectedFileInfos = @MainActor @Sendable (
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot?,
+        _ resolvedContext: MCPResolvedTabContextSnapshot?,
         _ cfg: PromptContextResolved,
         _ selectionOverride: StoredSelection?,
         _ display: FilePathDisplay
     ) async throws -> [ToolResultDTOs.SelectedFileInfo]
-    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabContextSnapshot) async -> String
+    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPTabContextSnapshot) async -> String
     typealias WritePromptExportFile = @MainActor @Sendable (
         _ path: String,
         _ content: String,
@@ -338,9 +375,16 @@ enum MCPAppPhysicalCapabilityAdapters {
         let executeAgentExplore: ExecuteTool
         let executeAgentRun: ExecuteTool
         let executeAgentManage: ExecuteTool
+        let executeAgentSessionLink: ExecuteTool
+        let executeBecomeOverseer: ExecuteTool
+        let executeAgentSelf: ExecuteTool
+        let executeSessionAdmin: ExecuteTool
         let requireTargetWindow: RequireTargetWindow
         let requireCurrentTabContext: RequireCurrentTabContext
         let requireAgentModeConnection: RequireAgentModeConnection
+        let liveRunPurpose: LiveRunPurpose
+        let supportsProgressNotifications: SupportsProgressNotifications
+        let sendHeartbeatProgress: SendHeartbeatProgress
         let resolveAgentModeTabID: ResolveAgentModeTabID
         let resolveContextBuilderTab: ResolveContextBuilderTab
         let bindTabForConnection: BindTabForConnection
@@ -352,6 +396,13 @@ enum MCPAppPhysicalCapabilityAdapters {
         let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
         let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
         let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+
+        /// Compatibility for args-only app bindings: capture before the injected operation suspends.
+        /// Never infer a local origin or fetch a successor request's routing on a missing bridge.
+        func requireAgentModeConnection(_ toolName: String) async throws -> UUID {
+            let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
+            return try await requireAgentModeConnection(invocationContext, toolName)
+        }
     }
 
     struct Context {
@@ -381,6 +432,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let workspaceSearch: WorkspaceSearch
         let parseManageSelectionInputs: ParseManageSelectionInputs
         let resolveFileToolLookupContext: ResolveFileToolLookupContext
+        let requiredFileToolLookupContext: RequiredFileToolLookupContext
         let resolveMutationFileToolContext: ResolveMutationFileToolContext
         let stabilizedVirtualSelection: StabilizedVirtualSelection
         let freezePromptGitReviewContext: FreezePromptGitReviewContext
@@ -427,5 +479,12 @@ enum MCPAppPhysicalCapabilityAdapters {
         let buildTabClipboardContent: BuildTabClipboardContent
         let writePromptExportFile: WritePromptExportFile
         let latestTokenBreakdown: LatestTokenBreakdown
+
+        @MainActor
+        func reachExportPhaseHook(_ phase: PromptExportPhaseHookPoint) async {
+            #if DEBUG
+                await MCPAppPhysicalCapabilityAdapters.promptExportPhaseHookForTesting?(phase)
+            #endif
+        }
     }
 }

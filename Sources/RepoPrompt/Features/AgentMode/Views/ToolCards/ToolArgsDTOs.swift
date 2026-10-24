@@ -228,14 +228,14 @@ enum ToolArgsDTOs {
         enum CodingKeys: String, CodingKey {
             case op
             case message
-            case sessionID = "session_id"
-            case sessionName = "session_name"
+            case sessionID = "sessionId"
+            case sessionName
             case agent
             case model
-            case workflowID = "workflow_id"
-            case workflowName = "workflow_name"
-            case reasoningEffort = "reasoning_effort"
-            case interactionID = "interaction_id"
+            case workflowID = "workflowId"
+            case workflowName
+            case reasoningEffort
+            case interactionID = "interactionId"
             case response
             case decision
             case reason
@@ -243,7 +243,7 @@ enum ToolArgsDTOs {
             case detach
             case timeout
             case wait
-            case timeoutSeconds = "timeout_seconds"
+            case timeoutSeconds
         }
 
         init(from decoder: Decoder) throws {

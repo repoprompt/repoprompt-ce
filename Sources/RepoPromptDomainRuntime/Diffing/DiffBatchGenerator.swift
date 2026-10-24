@@ -35,15 +35,18 @@ package enum DiffBatchGenerator {
         edits: [Edit],
         precision prec: DiffPrecision,
         mcpAmbiguityCheck: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> (chunks: [DiffChunk], outcomes: [EditOutcome], previews: [String]) {
         var cursor = DiffEditCursor()
+        var claimedSpans: [Range<Int>] = [] // original lines that accepted chunks consume
+        var claimedInsertions: [Int] = [] // original lines before which accepted pure insertions land
         var outcomes: [EditOutcome] = []
         var allChunks: [DiffChunk] = []
         outcomes.reserveCapacity(edits.count)
         allChunks.reserveCapacity(edits.count)
 
-        // Pre‑compute the high‑precision line‑index for first‑hit optimisation.
+        // Precompute matching data once so replace-all edits can keep full-file coordinates.
         var processed: [DiffGenerationUtility.LineData] = []
         processed.reserveCapacity(orig.count)
         for line in orig {
@@ -60,25 +63,42 @@ package enum DiffBatchGenerator {
 
                 let diff = try await DiffGenerationUtility.generateDiff(
                     fileContent: orig,
-                    lineIndexMap: start == 0 ? indexMap : nil, // optimisation only for first search
+                    lineIndexMap: start == 0 || edit.replaceAll ? indexMap : nil,
                     startSelector: nil,
                     endSelector: nil,
                     searchBlock: edit.search.isEmpty ? nil : edit.search,
                     newContent: sanitizedContent,
                     action: edit.search.isEmpty ? .rewrite : .modify,
                     diffPrecision: prec,
+                    processedFileContent: edit.replaceAll ? processed : nil,
                     searchStartLine: start,
                     mcpAmbiguityCheck: edit.replaceAll ? false : mcpAmbiguityCheck,
                     replaceAll: edit.replaceAll,
-                    tabPromotionEnabled: tabPromotionEnabled
+                    tabPromotionEnabled: tabPromotionEnabled,
+                    requireWholeLineMatch: requireWholeLineMatch
                 )
 
                 guard !diff.isEmpty else {
                     throw DiffGenerationError.emptyContent
                 }
 
+                // Matched against the original, two edits whose chunks consume the same line (or one inserting
+                // inside the other's span) would each be applied by position, so one would remove the other's
+                // line (#1296). Refuse the later edit whole; it claims nothing and doesn't move the cursor.
+                guard !diff.contains(where: { conflicts($0, claimedSpans, claimedInsertions) }) else {
+                    throw OverlappingEditError()
+                }
+                for chunk in diff {
+                    if chunk.oldLineCount == 0 {
+                        claimedInsertions.append(chunk.startLine)
+                    } else {
+                        claimedSpans.append(chunk.startLine ..< chunk.startLine + chunk.oldLineCount)
+                    }
+                }
+
                 // Cursor bookkeeping
-                cursor.advanceCursor(for: edit.search, firstChunk: diff.first)
+                // A replace-all consumed every match it changed, so a repeat of its search starts after its last chunk.
+                cursor.advanceCursor(for: edit.search, firstChunk: edit.replaceAll ? diff.last : diff.first)
 
                 // Success bookkeeping
                 allChunks.append(contentsOf: diff)
@@ -92,5 +112,18 @@ package enum DiffBatchGenerator {
             }
         }
         return (allChunks, outcomes, [])
+    }
+
+    private static func conflicts(_ chunk: DiffChunk, _ spans: [Range<Int>], _ insertions: [Int]) -> Bool {
+        let start = chunk.startLine
+        guard chunk.oldLineCount > 0 else { return spans.contains { $0.lowerBound < start && start < $0.upperBound } }
+        let span = start ..< start + chunk.oldLineCount
+        return spans.contains { $0.overlaps(span) } || insertions.contains { span.lowerBound < $0 && $0 < span.upperBound }
+    }
+
+    private struct OverlappingEditError: LocalizedError {
+        var errorDescription: String? {
+            "search block overlaps an earlier edit in this batch; combine the edits or send them separately"
+        }
     }
 }

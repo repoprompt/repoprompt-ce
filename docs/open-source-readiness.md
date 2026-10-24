@@ -48,7 +48,7 @@ The root [`Package.swift`](../Package.swift) uses exact versions or fixed revisi
 
 | Dependency | Current manifest form | Current `Package.resolved` state | Readiness note |
 | --- | --- | --- | --- |
-| `https://github.com/repoprompt/swift-sdk.git` | `revision` | `85dec2fc7a27252bc33dc7728be6af6b3bd398c0` | Pinned. |
+| `https://github.com/repoprompt/swift-sdk.git` | `revision` | `5716de85a976a8f70dedc9cb000e50aaa0d8cc5b` | Pinned. |
 | `https://github.com/repoprompt/swift-tree-sitter.git` | `revision` | `a778ef4fb7f0d3ad00185f42ce83c688373c4361` | Customized wrapper fork pinned to one remote authority. |
 | `https://github.com/jamesrochabrun/SwiftAnthropic` | `revision` | `b7d030cd7453f314c780f5492385f73d704cbd5d` | Pinned. |
 | `https://github.com/repoprompt/SwiftOpenAI` | `revision` | `1211782eb337e7968124448a20d9260df1952012` | Pinned. |

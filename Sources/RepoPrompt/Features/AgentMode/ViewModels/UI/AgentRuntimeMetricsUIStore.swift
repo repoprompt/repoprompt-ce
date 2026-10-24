@@ -1,7 +1,9 @@
 import Foundation
+import RepoPromptInstrumentation
 
 @MainActor
 final class AgentRuntimeMetricsUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let runtimeVM = AgentRuntimeSidebarViewModel()
     @Published private(set) var revision: Int = 0
 
@@ -27,7 +29,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
             revision &+= 1
         }
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "runtimeMetrics",
                 published: didPublish,
                 details: [

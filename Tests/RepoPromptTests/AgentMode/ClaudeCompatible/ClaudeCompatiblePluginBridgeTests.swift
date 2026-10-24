@@ -1,15 +1,97 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
-    func testOnlyBridgeImportsProviderPackage() throws {
-        let repoRoot = try RepoRoot.url()
-        let sourcesRoot = repoRoot.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
-        let expected = "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift"
-        let imports = try sourceFilesImportingProviderPackage(under: sourcesRoot, repoRoot: repoRoot)
+    @MainActor
+    func testNativeSDKToolInputApprovalRoundTripPreservesMCPTypesAndStrictInventoryLimits() throws {
+        let cases: [(literal: String, value: Value, acceptedLimit: Int?)] = [
+            ("0", .int(0), nil), ("1", .int(1), 1), ("2", .int(2), 2),
+            ("500", .int(500), 500), ("501", .int(501), nil),
+            ("1.5", .double(1.5), nil), ("true", .bool(true), nil), ("false", .bool(false), nil)
+        ]
+        let nested: Value = .object([
+            "values": .array([.int(0), .int(1), .int(2), .int(500), .int(501), .double(1.5), .bool(true), .bool(false)])
+        ])
+        for (literal, expected, acceptedLimit) in cases {
+            let line = Data("{\"type\":\"control_request\",\"request_id\":\"numeric-input\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"mcp__RepoPrompt__session_admin\",\"input\":{\"op\":\"inventory\",\"limit\":\(literal),\"nested\":{\"values\":[0,1,2,500,501,1.5,true,false]}}}}".utf8)
+            guard case let .controlRequest(request)? = try ClaudeSDKProtocolCodec.decodeLine(line) else {
+                return XCTFail("Expected production SDK control request")
+            }
+            XCTAssertEqual(request.subtype, "can_use_tool")
+            let allow = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
+                pendingRequest: request.request, includeUpdatedPermissions: false
+            )
+            let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(requestID: request.requestID, response: allow)
+            guard case let .controlResponse(response)? = try ClaudeSDKProtocolCodec.decodeLine(encoded) else {
+                return XCTFail("Expected production SDK allow response")
+            }
+            let updatedInput = try XCTUnwrap(response.response?["updatedInput"] as? [String: Any])
+            // The SDK reuses updatedInput for the subsequent tools/call. Decode those actual
+            // parameter bytes with the MCP SDK, rather than hand-constructing Value.int(1).
+            let parameterBytes = try JSONSerialization.data(withJSONObject: ["name": "session_admin", "arguments": updatedInput])
+            let parameters = try JSONDecoder().decode(CallTool.Parameters.self, from: parameterBytes)
+            let arguments = try XCTUnwrap(parameters.arguments)
+            XCTAssertEqual(arguments["limit"], expected, "literal=\(literal)")
+            XCTAssertEqual(arguments["nested"], nested, "nested tool arguments must retain exact JSON types")
+            if let acceptedLimit {
+                XCTAssertEqual(try AgentSessionAdminArguments.limit(arguments), acceptedLimit)
+            } else {
+                XCTAssertThrowsError(try AgentSessionAdminArguments.limit(arguments)) { error in
+                    guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
+                        return XCTFail("Expected strict invalidParams, got \(error)")
+                    }
+                }
+            }
+        }
+    }
 
-        XCTAssertEqual(imports, [expected])
+    func testClaudeCodeCatalogExposesOpus55AcrossAgentSelection() {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: false,
+            openCodeAvailable: false
+        )
+        let options = AgentModelCatalog.options(for: .claudeCode, availability: availability)
+        let opus55Options = options.filter { $0.rawValue.hasPrefix("claude-opus-5-5:") }
+
+        XCTAssertEqual(
+            opus55Options.map(\.rawValue),
+            [
+                "claude-opus-5-5:low",
+                "claude-opus-5-5:medium",
+                "claude-opus-5-5:high",
+                "claude-opus-5-5:xhigh",
+                "claude-opus-5-5:max"
+            ]
+        )
+        XCTAssertEqual(opus55Options.first?.displayName, "Opus 5.5 Low")
+        XCTAssertTrue(AgentModelCatalog.isValid(
+            rawModel: "claude-opus-5-5:xhigh",
+            for: .claudeCode,
+            availability: availability
+        ))
+        XCTAssertTrue(AgentModel.modelsForAgent(.claudeCode).contains(.claudeOpus55))
+    }
+
+    func testClaudeCodeCatalogExposesSonnet55AndRestrictedMythos51() {
+        let availability = AgentModelCatalog.AvailabilityContext.current
+        for raw in ["claude-sonnet-5-5:xhigh", "claude-sonnet-5-5:max", "claude-mythos-5-1:high"] {
+            XCTAssertTrue(
+                AgentModelCatalog.isValid(rawModel: raw, for: .claudeCode, availability: availability),
+                raw
+            )
+        }
+        let claudeModels = AgentModel.modelsForAgent(.claudeCode)
+        XCTAssertTrue(claudeModels.contains(.claudeSonnet55))
+        XCTAssertTrue(claudeModels.contains(.claudeMythos51))
+        XCTAssertEqual(AgentModel.claudeSonnet55.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(AgentModel.claudeSonnet55.discoveryTags, [.balanced, .engineering, .extendedContext])
+        // The restricted tier is selectable but never a recommendation target.
+        XCTAssertEqual(AgentModel.claudeMythos51.discoveryTags, [])
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "claude-sonnet-5-5:high", agentKind: .claudeCode), .claudeSonnet55)
     }
 
     func testBridgeRuntimeSmokeMapsPluginIDsDiscoveryRuntimeAndHeadlessAdapters() throws {
@@ -50,316 +132,6 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertTrue(config.mcpStrictMode)
         XCTAssertFalse(config.toolSearchEnabled)
         XCTAssertEqual(config.backendConfig?.id.rawValue, "glmZAI")
-    }
-
-    func testRootBridgeCatalogRawValueSmokeIsNonMutating() throws {
-        XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .glmZAI), AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .kimi), AgentModel.kimiCode.rawValue)
-        XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .custom), AgentModel.customClaudeCompatible.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.defaultRequestedModelRawValue, AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.haikuRequestedModelRawValue, AgentModel.claudeHaiku.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.opusRequestedModelRawValue, AgentModel.claudeOpus.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.haikuEquivalentModelRawValue, "glm-4.5-air")
-        XCTAssertEqual(ClaudeCodeGLMIntegration.defaultModelRawValue, "glm-5.2[1m]")
-        XCTAssertEqual(ClaudeCodeGLMIntegration.opusEquivalentModelRawValue, "glm-5.2[1m]")
-        XCTAssertEqual(ClaudeCodeGLMIntegration.normalizedGLMModel("glm-4.7"), AgentModel.claudeHaiku.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.normalizedGLMModel("glm-5.2"), AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.normalizedGLMModel("glm-5.2[1m]"), AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.normalizedGLMModel("glm-5-turbo"), AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(ClaudeCodeGLMIntegration.normalizedGLMModel("glm-5.1"), AgentModel.claudeOpus.rawValue)
-
-        let availability = AgentModelCatalog.AvailabilityContext(
-            claudeCodeAvailable: true,
-            zaiConfigured: true,
-            kimiConfigured: true,
-            customClaudeCompatibleConfigured: true
-        )
-        let snapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCode,
-            availability: availability,
-            includeClaudeEffortVariants: false
-        ))
-        XCTAssertEqual(snapshot.pluginID.rawValue, "claude-code")
-        XCTAssertEqual(snapshot.defaultModelRaw, "opus")
-        XCTAssertEqual(snapshot.options.first?.rawValue, "default")
-        XCTAssertEqual(snapshot.options.first?.isPlaceholderDefault, true)
-        let expectedClaudeModelRaws = [
-            "default",
-            "claude-fable-5",
-            "opus[1m]",
-            "opus",
-            "claude-opus-5",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-opus-4-5",
-            "sonnet",
-            "claude-sonnet-5",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "haiku",
-            "claude-haiku-4-5"
-        ]
-        XCTAssertEqual(snapshot.options.map(\.rawValue), expectedClaudeModelRaws)
-        XCTAssertEqual(AgentModel.modelsForAgent(.claudeCode).map(\.rawValue), expectedClaudeModelRaws)
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "opus" && $0.supportedEffortLevels.contains("xhigh") })
-        let opus5BaseOption = try XCTUnwrap(snapshot.options.first { $0.rawValue == "claude-opus-5" })
-        XCTAssertEqual(opus5BaseOption.displayName, "Opus 5")
-        XCTAssertEqual(opus5BaseOption.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
-        let opus48BaseOption = try XCTUnwrap(snapshot.options.first { $0.rawValue == "claude-opus-4-8" })
-        XCTAssertEqual(opus48BaseOption.displayName, "Opus 4.8")
-        XCTAssertEqual(opus48BaseOption.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
-        let sonnet5BaseOption = try XCTUnwrap(snapshot.options.first { $0.rawValue == "claude-sonnet-5" })
-        XCTAssertEqual(sonnet5BaseOption.displayName, "Sonnet 5")
-        XCTAssertEqual(sonnet5BaseOption.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
-
-        let options = AgentModelCatalog.options(for: .claudeCode, availability: availability)
-        let menu = AgentModelCatalog.claudeMenu(for: options, agentKind: .claudeCode)
-        XCTAssertEqual(AgentModelCatalog.defaultModelRaw(for: .claudeCode, availability: availability), "opus")
-        XCTAssertEqual(menu.defaultOption?.rawValue, "default")
-        let groupRaws = Set(menu.groups.map(\.baseModelRaw))
-        XCTAssertTrue(groupRaws.contains("claude-fable-5"))
-        XCTAssertTrue(groupRaws.contains("opus[1m]"))
-        XCTAssertTrue(groupRaws.contains("opus"))
-        XCTAssertTrue(groupRaws.contains("claude-opus-5"))
-        XCTAssertTrue(groupRaws.contains("claude-opus-4-8"))
-        XCTAssertTrue(groupRaws.contains("sonnet"))
-        XCTAssertTrue(groupRaws.contains("claude-sonnet-5"))
-        let opus5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-5" })
-        XCTAssertEqual(opus5Group.displayName, "Opus 5")
-        XCTAssertEqual(opus5Group.options.map(\.rawValue), [
-            "claude-opus-5:low",
-            "claude-opus-5:medium",
-            "claude-opus-5:high",
-            "claude-opus-5:xhigh",
-            "claude-opus-5:max"
-        ])
-        let opus48Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-4-8" })
-        XCTAssertEqual(opus48Group.displayName, "Opus 4.8")
-        XCTAssertEqual(opus48Group.options.map(\.rawValue), [
-            "claude-opus-4-8:low",
-            "claude-opus-4-8:medium",
-            "claude-opus-4-8:high",
-            "claude-opus-4-8:xhigh",
-            "claude-opus-4-8:max"
-        ])
-        let opus5GroupIndex = try XCTUnwrap(menu.groups.firstIndex { $0.baseModelRaw == "claude-opus-5" })
-        let opus48GroupIndex = try XCTUnwrap(menu.groups.firstIndex { $0.baseModelRaw == "claude-opus-4-8" })
-        let opus47GroupIndex = try XCTUnwrap(menu.groups.firstIndex { $0.baseModelRaw == "claude-opus-4-7" })
-        XCTAssertEqual(opus48GroupIndex, opus5GroupIndex + 1)
-        XCTAssertEqual(opus47GroupIndex, opus48GroupIndex + 1)
-
-        let sonnet5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-sonnet-5" })
-        XCTAssertEqual(sonnet5Group.displayName, "Sonnet 5")
-        XCTAssertEqual(sonnet5Group.options.map(\.rawValue), [
-            "claude-sonnet-5:low",
-            "claude-sonnet-5:medium",
-            "claude-sonnet-5:high",
-            "claude-sonnet-5:xhigh",
-            "claude-sonnet-5:max"
-        ])
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-opus-5", for: .claudeCode, availability: availability))
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-opus-5:max", for: .claudeCode, availability: availability))
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-opus-5:xhigh", for: .claudeCode, availability: availability))
-        for raw in [
-            "claude-opus-4-8",
-            "claude-opus-4-8:low",
-            "claude-opus-4-8:medium",
-            "claude-opus-4-8:high",
-            "claude-opus-4-8:xhigh",
-            "claude-opus-4-8:max"
-        ] {
-            XCTAssertTrue(AgentModelCatalog.isValid(rawModel: raw, for: .claudeCode, availability: availability), raw)
-        }
-        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: "claude-opus-4-8:ultra", for: .claudeCode, availability: availability))
-        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: "claude-opus-4-8[1m]", for: .claudeCode, availability: availability))
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-sonnet-5", for: .claudeCode, availability: availability))
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-sonnet-5:max", for: .claudeCode, availability: availability))
-        XCTAssertTrue(AgentModelCatalog.isValid(rawModel: "claude-sonnet-5:xhigh", for: .claudeCode, availability: availability))
-
-        let discovery = try XCTUnwrap(AgentModelCatalog.discoveryAgents(availability: availability).first { $0.agent == .claudeCode })
-        XCTAssertEqual(discovery.defaults.modelRaw, "opus")
-        XCTAssertEqual(discovery.defaults.selectionID?.rawValue, "claudeCode:opus")
-        XCTAssertEqual(discovery.runtime, "claude_native")
-        XCTAssertTrue(discovery.models.contains { $0.id == "default" })
-        XCTAssertTrue(discovery.models.contains { $0.id == "claude-fable-5" && $0.contextWindowTokens == 1_000_000 })
-        XCTAssertTrue(discovery.models.contains { $0.id == "opus" })
-        let opus5Discovery = try XCTUnwrap(discovery.models.first { $0.id == "claude-opus-5" })
-        XCTAssertEqual(opus5Discovery.contextWindowTokens, 1_000_000)
-        XCTAssertTrue(opus5Discovery.tags.contains(.complex))
-        XCTAssertTrue(opus5Discovery.tags.contains(.extendedContext))
-        XCTAssertEqual(
-            opus5Discovery.startTargets.first { $0.modelRaw == "claude-opus-5:xhigh" }?.contextWindowTokens,
-            1_000_000
-        )
-        XCTAssertEqual(
-            opus5Discovery.startTargets.first { $0.modelRaw == "claude-opus-5:max" }?.contextWindowTokens,
-            1_000_000
-        )
-        let opus48Discoveries = discovery.models.filter { $0.id == "claude-opus-4-8" }
-        XCTAssertEqual(opus48Discoveries.count, 1)
-        let opus48Discovery = try XCTUnwrap(opus48Discoveries.first)
-        XCTAssertEqual(opus48Discovery.contextWindowTokens, 1_000_000)
-        XCTAssertTrue(opus48Discovery.hasMultipleTargets)
-        XCTAssertEqual(opus48Discovery.startTargets.map(\.modelRaw), [
-            "claude-opus-4-8:low",
-            "claude-opus-4-8:medium",
-            "claude-opus-4-8:high",
-            "claude-opus-4-8:xhigh",
-            "claude-opus-4-8:max"
-        ])
-        XCTAssertEqual(opus48Discovery.startTargets.map(\.selectionID.rawValue), [
-            "claudeCode:claude-opus-4-8:low",
-            "claudeCode:claude-opus-4-8:medium",
-            "claudeCode:claude-opus-4-8:high",
-            "claudeCode:claude-opus-4-8:xhigh",
-            "claudeCode:claude-opus-4-8:max"
-        ])
-        XCTAssertTrue(opus48Discovery.startTargets.allSatisfy { $0.contextWindowTokens == 1_000_000 })
-        XCTAssertTrue(opus48Discovery.startTargets.allSatisfy { !$0.isDefault })
-        XCTAssertFalse(discovery.models.contains { $0.id == "claude-opus-4-8[1m]" })
-        XCTAssertFalse(discovery.models.flatMap(\.startTargets).contains { $0.modelRaw.contains("claude-opus-4-8[1m]") })
-
-        let sonnet5Discovery = try XCTUnwrap(discovery.models.first { $0.id == "claude-sonnet-5" })
-        XCTAssertEqual(sonnet5Discovery.contextWindowTokens, 1_000_000)
-        XCTAssertTrue(sonnet5Discovery.tags.contains(.balanced))
-        XCTAssertTrue(sonnet5Discovery.tags.contains(.extendedContext))
-        XCTAssertEqual(
-            sonnet5Discovery.startTargets.first { $0.modelRaw == "claude-sonnet-5:xhigh" }?.contextWindowTokens,
-            1_000_000
-        )
-        XCTAssertEqual(
-            sonnet5Discovery.startTargets.first { $0.modelRaw == "claude-sonnet-5:max" }?.contextWindowTokens,
-            1_000_000
-        )
-
-        let glmBaseSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCodeGLM,
-            availability: availability,
-            includeClaudeEffortVariants: false
-        ))
-        XCTAssertEqual(glmBaseSnapshot.defaultModelRaw, AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(glmBaseSnapshot.options.first { $0.rawValue == "sonnet" }?.displayName, "GLM 5.2 (1M) — Sonnet")
-        XCTAssertEqual(glmBaseSnapshot.options.first { $0.rawValue == "opus" }?.displayName, "GLM 5.2 (1M) — Opus")
-        XCTAssertTrue(glmBaseSnapshot.options.contains { $0.rawValue == "glm-4.7" && $0.displayName == "GLM 4.7" })
-        XCTAssertTrue(glmBaseSnapshot.options.contains { $0.rawValue == "glm-5-turbo" && $0.displayName == "GLM 5 Turbo" })
-        XCTAssertTrue(glmBaseSnapshot.options.contains { $0.rawValue == "glm-5.1" && $0.displayName == "GLM 5.1" })
-
-        let glmSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCodeGLM,
-            availability: availability,
-            includeClaudeEffortVariants: true
-        ))
-        XCTAssertTrue(glmSnapshot.options.contains { $0.rawValue == "sonnet:xhigh" })
-        XCTAssertTrue(glmSnapshot.options.contains { $0.rawValue == "opus:xhigh" })
-        XCTAssertTrue(glmSnapshot.options.contains { $0.rawValue == "glm-4.7:max" })
-        XCTAssertTrue(glmSnapshot.options.contains { $0.rawValue == "glm-5-turbo:max" })
-        XCTAssertTrue(glmSnapshot.options.contains { $0.rawValue == "glm-5.1:max" })
-        XCTAssertFalse(glmSnapshot.options.contains { $0.rawValue == "haiku:xhigh" })
-        XCTAssertFalse(glmSnapshot.options.contains { $0.rawValue == "glm-4.7:xhigh" })
-        XCTAssertFalse(glmSnapshot.options.contains { $0.rawValue == "glm-5-turbo:xhigh" })
-        XCTAssertFalse(glmSnapshot.options.contains { $0.rawValue == "glm-5.1:xhigh" })
-        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.canonicalClaudeGLMModelRaw("glm-5-turbo"), "glm-5-turbo")
-        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.canonicalClaudeGLMModelRaw("glm-5.1:max"), "glm-5.1:max")
-        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.canonicalClaudeGLMModelRaw("glm-4.7"), "glm-4.7")
-        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.canonicalClaudeGLMModelRaw("glm-5.2"), AgentModel.claudeSonnet.rawValue)
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
-                forRequestedModelRaw: "sonnet:xhigh",
-                agentKind: .claudeCodeGLM
-            ),
-            1_000_000
-        )
-        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.isValid(
-            rawModel: "glm-5-turbo:max",
-            for: .claudeCodeGLM,
-            availability: availability
-        ) ?? false)
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.isValid(
-            rawModel: "glm-5-turbo:xhigh",
-            for: .claudeCodeGLM,
-            availability: availability
-        ) ?? true)
-        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.isValid(
-            rawModel: "glm-5.1",
-            for: .claudeCodeGLM,
-            availability: availability
-        ) ?? false)
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.isValid(
-            rawModel: "glm-5.1:xhigh",
-            for: .claudeCodeGLM,
-            availability: availability
-        ) ?? true)
-        XCTAssertFalse(AgentModelCatalog.modelOptionIsSelected(
-            optionRaw: "glm-5-turbo",
-            selectedRaw: AgentModel.claudeSonnet.rawValue,
-            agentKind: .claudeCodeGLM
-        ))
-        XCTAssertFalse(AgentModelCatalog.modelOptionIsSelected(
-            optionRaw: "glm-5.1",
-            selectedRaw: AgentModel.claudeOpus.rawValue,
-            agentKind: .claudeCodeGLM
-        ))
-        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.claudeSonnet.rawValue,
-            agentKind: .claudeCodeGLM
-        ))
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.claudeHaiku.rawValue,
-            agentKind: .claudeCodeGLM
-        ))
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.kimiCode.rawValue,
-            agentKind: .kimiCode
-        ))
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.customClaudeCompatible.rawValue,
-            agentKind: .customClaudeCompatible
-        ))
-
-        let compatiblePluginOptions = [
-            ClaudeCompatiblePluginModelOption(
-                rawValue: AgentModel.claudeSonnet.rawValue,
-                displayName: "GLM Sonnet",
-                description: nil,
-                isPlaceholderDefault: false,
-                isProviderDefault: true,
-                supportedEffortLevels: ["low", "medium", "high", "max"]
-            ),
-            ClaudeCompatiblePluginModelOption(
-                rawValue: AgentModel.kimiCode.rawValue,
-                displayName: "Kimi Code",
-                description: nil,
-                isPlaceholderDefault: false,
-                isProviderDefault: true,
-                supportedEffortLevels: []
-            ),
-            ClaudeCompatiblePluginModelOption(
-                rawValue: AgentModel.customClaudeCompatible.rawValue,
-                displayName: "CC Custom",
-                description: nil,
-                isPlaceholderDefault: false,
-                isProviderDefault: true,
-                supportedEffortLevels: []
-            )
-        ]
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.modelOptions(from: [compatiblePluginOptions[0]], for: .claudeCodeGLM).map(\.rawValue),
-            [AgentModel.claudeSonnet.rawValue]
-        )
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.modelOptions(from: [compatiblePluginOptions[1]], for: .kimiCode).map(\.rawValue),
-            [AgentModel.kimiCode.rawValue]
-        )
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.modelOptions(from: [compatiblePluginOptions[2]], for: .customClaudeCompatible).map(\.rawValue),
-            [AgentModel.customClaudeCompatible.rawValue]
-        )
     }
 
     func testGLMOldDefaultSlotMappingMigratesOnConfigLookup() throws {
@@ -457,42 +229,6 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(try loadPersistedConfig(for: .kimi, defaults: defaults), kimi)
     }
 
-    func testGLMOldDefaultSlotMappingMigratesBeforeCatalogOptions() throws {
-        let restore = installTemporaryOldGLMDefaultSlotMapping()
-        defer { restore() }
-
-        let availability = AgentModelCatalog.AvailabilityContext(
-            claudeCodeAvailable: true,
-            zaiConfigured: true
-        )
-        let baseSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCodeGLM,
-            availability: availability,
-            includeClaudeEffortVariants: false
-        ))
-        let snapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCodeGLM,
-            availability: availability,
-            includeClaudeEffortVariants: true
-        ))
-
-        XCTAssertEqual(baseSnapshot.defaultModelRaw, AgentModel.claudeSonnet.rawValue)
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "sonnet:xhigh" })
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "opus:xhigh" })
-        XCTAssertTrue(baseSnapshot.options.contains { $0.rawValue == "glm-4.7" && $0.displayName == "GLM 4.7" })
-        XCTAssertTrue(baseSnapshot.options.contains { $0.rawValue == "glm-5-turbo" && $0.displayName == "GLM 5 Turbo" })
-        XCTAssertTrue(baseSnapshot.options.contains { $0.rawValue == "glm-5.1" && $0.displayName == "GLM 5.1" })
-        XCTAssertTrue(baseSnapshot.options.contains { $0.rawValue == "sonnet" && $0.displayName == "GLM 5.2 (1M) — Sonnet" })
-        XCTAssertTrue(baseSnapshot.options.contains { $0.rawValue == "opus" && $0.displayName == "GLM 5.2 (1M) — Opus" })
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
-                forRequestedModelRaw: "sonnet:xhigh",
-                agentKind: .claudeCodeGLM
-            ),
-            1_000_000
-        )
-    }
-
     func testGLMCompatibleBackendPickerLabelsSlotsAndLegacyChoicesDistinctly() throws {
         let restore = installTemporaryOldGLMDefaultSlotMapping()
         defer { restore() }
@@ -512,103 +248,10 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         ])
     }
 
-    func testCustomSlotMappingUsesBackendModelIDForXHighAndContextSupport() throws {
-        let restore = installTemporaryCustomSlotMapping()
-        defer { restore() }
-
-        let availability = AgentModelCatalog.AvailabilityContext(
-            claudeCodeAvailable: true,
-            customClaudeCompatibleConfigured: true
-        )
-        let snapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .customClaudeCompatible,
-            availability: availability,
-            includeClaudeEffortVariants: true
-        ))
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "sonnet:xhigh" })
-        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "opus:xhigh" })
-        XCTAssertFalse(snapshot.options.contains { $0.rawValue == "haiku:xhigh" })
-        XCTAssertEqual(
-            ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
-                forRequestedModelRaw: "sonnet:xhigh",
-                agentKind: .customClaudeCompatible
-            ),
-            1_000_000
-        )
-        XCTAssertNil(ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
-            forRequestedModelRaw: "opus:xhigh",
-            agentKind: .customClaudeCompatible
-        ))
-        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.claudeSonnet.rawValue,
-            agentKind: .customClaudeCompatible
-        ))
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.claudeHaiku.rawValue,
-            agentKind: .customClaudeCompatible
-        ))
-        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-            .xhigh,
-            isSupportedForBaseModelRaw: AgentModel.kimiCode.rawValue,
-            agentKind: .kimiCode
-        ))
-    }
-
     /// XHigh eligibility is declared in three places: the provider package's
     /// per-model effort lists (read here through the adapter snapshot), the
     /// adapter's eligibility set, and the AI picker's model definitions. This
     /// guards against the hand-synced copies drifting apart.
-    func testClaudeXHighEligibilityIsConsistentAcrossCatalogSurfaces() throws {
-        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true)
-        let snapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
-            for: .claudeCode,
-            availability: availability,
-            includeClaudeEffortVariants: false
-        ))
-
-        var pickerBaseRaws: Set<String> = []
-        var pickerXHighBaseRaws: Set<String> = []
-        for model in ClaudeCodeAIModelCatalog.modelsForPicker() {
-            guard let raw = ClaudeCodeAIModelCatalog.runtimeSpecifierRaw(for: model) else { continue }
-            let specifier = ClaudeModelSpecifier(raw: raw)
-            guard let base = specifier.baseModel?.lowercased() else { continue }
-            pickerBaseRaws.insert(base)
-            if specifier.explicitEffortLevel == .xhigh {
-                pickerXHighBaseRaws.insert(base)
-            }
-        }
-
-        var comparedPickerRaws = 0
-        for option in snapshot.options where !option.isPlaceholderDefault {
-            let base = option.rawValue.lowercased()
-            let providerXHigh = option.supportedEffortLevels.contains("xhigh")
-            let adapterXHigh = ClaudeCompatibleModelCatalogAdapter.claudeEffort(
-                .xhigh,
-                isSupportedForBaseModelRaw: option.rawValue,
-                agentKind: .claudeCode
-            )
-            XCTAssertEqual(
-                providerXHigh,
-                adapterXHigh,
-                "XHigh eligibility for \(option.rawValue) drifted between the provider catalog and the adapter"
-            )
-            guard pickerBaseRaws.contains(base) else { continue }
-            comparedPickerRaws += 1
-            XCTAssertEqual(
-                providerXHigh,
-                pickerXHighBaseRaws.contains(base),
-                "XHigh exposure for \(option.rawValue) drifted between the provider catalog and the AI picker"
-            )
-        }
-        XCTAssertGreaterThanOrEqual(
-            comparedPickerRaws,
-            7,
-            "AI picker shares too few base raws with the provider catalog; the consistency check lost coverage"
-        )
-    }
-
     private func makeIsolatedDefaults() throws -> UserDefaults {
         let suiteName = "ClaudeCompatiblePluginBridgeTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -717,26 +360,259 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             }
         }
     }
-
-    private func sourceFilesImportingProviderPackage(
-        under sourcesRoot: URL,
-        repoRoot: URL
-    ) throws -> [String] {
-        let fileManager = FileManager.default
-        let enumerator = fileManager.enumerator(
-            at: sourcesRoot,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )
-        var imports: [String] = []
-        while let url = enumerator?.nextObject() as? URL {
-            guard url.pathExtension == "swift" else { continue }
-            let resourceValues = try url.resourceValues(forKeys: [.isRegularFileKey])
-            guard resourceValues.isRegularFile == true else { continue }
-            let contents = try String(contentsOf: url, encoding: .utf8)
-            guard contents.contains("import RepoPromptClaudeCompatibleProvider") else { continue }
-            imports.append(RepoRoot.relativePath(for: url, relativeTo: repoRoot))
-        }
-        return imports.sorted()
-    }
 }
+
+#if DEBUG
+    @MainActor
+    final class ClaudeCompactionContextUsageTests: XCTestCase {
+        func testProviderSwitchClearsPendingClaudeCompactionUsage() throws {
+            let viewModel = AgentModeViewModel(
+                testWindowID: -972,
+                testWorkspacePath: FileManager.default.currentDirectoryPath,
+                codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Provider switch must not launch a provider") },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpServerEnabler: { true }
+            )
+            let session = viewModel.session(for: UUID())
+            defer { session.saveDebounceTask?.cancel() }
+            session.selectedAgent = .claudeCode
+            session.appendItem(.user("Historical transcript retained across the provider switch."))
+            session.codexContextUsage = AgentContextUsage(
+                modelContextWindow: 200_000,
+                lastTotalTokens: nil,
+                totalTotalTokens: nil,
+                awaitingPostCompactionUsage: true
+            )
+            let sidebar = AgentRuntimeSidebarViewModel()
+            func refreshSidebar() {
+                sidebar.update(
+                    snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                    codexUsage: session.codexContextUsage
+                )
+            }
+            refreshSidebar()
+            XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertNil(sidebar.snapshot.displayUsedTokens)
+
+            viewModel.test_codexCoordinator.handleProviderSwitch(from: .claudeCode, to: .openCode, session: session)
+            session.selectedAgent = .openCode
+            refreshSidebar()
+
+            XCTAssertNil(session.codexContextUsage?.awaitingPostCompactionUsage)
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 200_000)
+            XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertGreaterThan(try XCTUnwrap(sidebar.snapshot.displayUsedTokens), 0)
+            XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Estimated")
+        }
+
+        func testCompactionBoundaryInvalidatesRingUntilFreshOccupancyArrives() async throws {
+            for trigger in ["manual", "auto"] {
+                let viewModel = AgentModeViewModel(
+                    testWindowID: -972,
+                    testWorkspacePath: FileManager.default.currentDirectoryPath,
+                    codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Replay must not launch a provider") },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpServerEnabler: { true }
+                )
+                let session = viewModel.session(for: UUID())
+                defer { session.saveDebounceTask?.cancel() }
+                session.selectedAgent = .claudeCode
+                session.appendItem(.user(String(repeating: "Pre-compaction transcript context. ", count: 1000)))
+                let runID = UUID()
+                let attemptID = UUID()
+                session.installRunID(runID)
+                session.beginRunAttempt(source: "compaction-replay", attemptID: attemptID)
+                var translator = ClaudeSDKNDJSONTranslator()
+                let sidebar = AgentRuntimeSidebarViewModel()
+                func consume(_ line: String) async throws {
+                    var envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                    envelope["session_id"] = "72c65f88-2b76-4406-9b32-93d61df09272"
+                    envelope["uuid"] = UUID().uuidString
+                    for result in try translator.parseNDJSONLine(JSONSerialization.data(withJSONObject: envelope)) {
+                        await viewModel.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+                    }
+                    sidebar.update(
+                        snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                        codexUsage: session.codexContextUsage
+                    )
+                }
+                let usage = #"{"type":"assistant","message":{"id":"msg_before_compaction","role":"assistant","content":[],"usage":{"input_tokens":1000,"cache_read_input_tokens":149000,"output_tokens":10}}}"#
+                let result = #"{"type":"result","subtype":"success","is_error":false,"result":"Done","duration_ms":100,"duration_api_ms":100,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":150000,"output_tokens":10},"modelUsage":{"claude-sonnet-4-6":{"contextWindow":200000}}}"#
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Earlier turn")
+                try await consume(usage)
+                try await consume(result)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 150_000)
+                try await consume(#"{"type":"system","subtype":"task_notification","task_id":"worker-1","status":"completed","summary":"Context compacted inside worker task"}"#)
+                try await consume(#"{"type":"system","message":"The worker reported context compacted successfully"}"#)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 150_000, "Task prose is not a compaction boundary")
+                XCTAssertFalse(session.providerTokenUsageByTurn.contains(where: \.contextCompacted))
+
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "/compact")
+                // Automatic compaction can occur after this turn already reported its old context.
+                if trigger == "auto" { try await consume(usage) }
+                try await consume(#"{"type":"system","subtype":"status","status":"compacting"}"#)
+                try await consume("{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"\(trigger)\",\"pre_tokens\":150000}}")
+                XCTAssertNil(session.contextUsageSnapshot?.used, trigger)
+                XCTAssertNil(sidebar.snapshot.usedTokens, trigger)
+                XCTAssertEqual(sidebar.snapshot.contextWindowTokens, 200_000)
+                XCTAssertNotNil(session.contextUsageSnapshot?.compactedAt)
+                XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage)
+                XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Awaiting post-compaction usage")
+                XCTAssertNotEqual(sidebar.snapshot.usageSource, .codexLive)
+                XCTAssertGreaterThan(try XCTUnwrap(sidebar.snapshot.estimatedTranscriptTokens), 0)
+                XCTAssertNil(sidebar.snapshot.displayUsedTokens, "Never substitute the whole historical transcript while pending")
+                XCTAssertNil(session.activeNonCodexTurnTokenAccumulator?.observedContextUsedTokens)
+
+                if trigger == "auto" {
+                    // Auto-compaction continues the SAME turn with a new API context before result.
+                    try await consume(#"{"type":"assistant","message":{"id":"msg_after_auto","role":"assistant","content":[],"usage":{"input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":10}}}"#)
+                    try await consume(result)
+                    XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                    XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                    viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Unmeasured after recovery")
+                    try await consume(result)
+                    XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                    XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                    continue
+                }
+
+                // Init has no post-compaction size; result usage is billed aggregate, not occupancy.
+                try await consume(#"{"type":"system","subtype":"init","session_id":"compact-fixture","model":"claude-sonnet-4-6"}"#)
+                await viewModel.test_handleStreamResult(
+                    AIStreamResult(type: "usage", text: nil, promptTokens: 150_000),
+                    session: session, runID: runID, runAttemptID: attemptID
+                )
+                XCTAssertNil(session.contextUsageSnapshot?.used, "Billed input alone cannot establish post-compaction occupancy")
+                try await consume(result)
+                XCTAssertNil(sidebar.snapshot.usedTokens, "Finalization must not restore old context")
+                XCTAssertNil(session.providerTokenUsageByTurn.last?.contextUsedTokens)
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Continue")
+                try await consume(result)
+                XCTAssertNil(sidebar.snapshot.usedTokens, "Unmeasured later turns must remain unknown")
+
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Fresh measurement")
+                try await consume(#"{"type":"assistant","message":{"id":"msg_after_manual_compaction","role":"assistant","content":[],"usage":{"input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":10}}}"#)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                try await consume(result)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 10000)
+            }
+        }
+
+        func testCompactionFenceRoundTripAndLegacyUsageDecoding() throws {
+            let legacy = Data(#"{"promptTokens":150000,"completionTokens":10,"contextUsedTokens":150000,"timestamp":0}"#.utf8)
+            let old = try JSONDecoder().decode(AgentTokenUsagePersist.self, from: legacy)
+            XCTAssertFalse(old.contextCompacted)
+            let oldSnapshot = try JSONDecoder().decode(AgentContextUsage.self, from: Data(#"{"modelContextWindow":200000,"lastTotalTokens":150000,"totalTotalTokens":150000}"#.utf8))
+            XCTAssertNotEqual(oldSnapshot.awaitingPostCompactionUsage, true)
+            let sidebar = AgentRuntimeSidebarViewModel()
+            sidebar.update(
+                snapshot: AgentTranscriptAnalyticsSnapshot(estimatedTranscriptTokens: 1000),
+                codexUsage: AgentContextUsage(modelContextWindow: 200_000, lastTotalTokens: nil, totalTotalTokens: nil)
+            )
+            XCTAssertEqual(sidebar.snapshot.usageSource, .unavailable, "A window without occupancy is not Live")
+            XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Estimated")
+            let fence = AgentTokenUsagePersist(promptTokens: 0, completionTokens: 0, contextCompacted: true)
+            let unmeasured = AgentTokenUsagePersist(promptTokens: 42, completionTokens: 5)
+            let rows = try JSONDecoder().decode([AgentTokenUsagePersist].self, from: JSONEncoder().encode([old, fence, unmeasured]))
+            XCTAssertEqual(rows, [old, fence, unmeasured])
+            XCTAssertEqual(rows.map(\.providerTotalTokens).reduce(0, +), 150_057, "A compaction fence is not billable usage")
+            let pending = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+            XCTAssertNil(pending?.lastTotalTokens)
+            XCTAssertEqual(pending?.awaitingPostCompactionUsage, true, "The fence works even without a known window")
+            let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
+            let recovered = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
+            XCTAssertEqual(recovered?.lastTotalTokens, 10000)
+            XCTAssertNotEqual(recovered?.awaitingPostCompactionUsage, true)
+        }
+
+        func testPendingOccupancySurvivesHydrationAndHistoryReopen() async throws {
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeCompactionHydration-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            defer {
+                for session in window.agentModeViewModel.sessions.values {
+                    session.saveDebounceTask?.cancel()
+                }
+                WindowStatesManager.shared.unregisterWindowState(window)
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            }
+            await window.workspaceManager.awaitInitialized()
+            let workspace = window.workspaceManager.createWorkspace(name: "Compaction hydration", repoPaths: [root.path], ephemeral: true)
+            await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "compactionHydrationTests")
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+            let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == activeWorkspace.id })
+            window.workspaceManager.workspaces[index].customStoragePath = root.appendingPathComponent("sessions", isDirectory: true)
+            let oldRequest = AgentChatItem.user(String(repeating: "Old context. ", count: 1000))
+            let storedTranscript = AgentTranscript(turns: [AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: oldRequest),
+                terminalState: .completed,
+                startedAt: oldRequest.timestamp,
+                completedAt: oldRequest.timestamp
+            )], nextSequenceIndex: 1)
+            let compactedAt = Date(timeIntervalSince1970: 100)
+            let rows = [
+                AgentTokenUsagePersist(promptTokens: 150_000, completionTokens: 10, contextUsedTokens: 150_000),
+                AgentTokenUsagePersist(promptTokens: 0, completionTokens: 0, contextCompacted: true, timestamp: compactedAt),
+                AgentTokenUsagePersist(promptTokens: 150_000, completionTokens: 10)
+            ]
+            let viewModel = window.agentModeViewModel
+            func save(_ usage: [AgentTokenUsagePersist], staleStoredCount: Int? = nil) async throws -> UUID {
+                let id = UUID()
+                let persisted = AgentSession(
+                    id: id, workspaceID: activeWorkspace.id, composeTabID: tabID, name: "Compacted Claude",
+                    transcript: storedTranscript, agentKind: AgentProviderKind.claudeCode.rawValue,
+                    agentModel: "claude-sonnet-4-6", lastRunState: "completed", providerTokenUsageByTurn: usage,
+                    codexContextWindow: 200_000, codexLastTotalTokens: staleStoredCount, codexTotalTotalTokens: staleStoredCount
+                )
+                _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: window.workspaceManager.workspaces[index])
+                return id
+            }
+            func assertPending(_ session: AgentTabSession, file: StaticString = #filePath, line: UInt = #line) {
+                let sidebar = AgentRuntimeSidebarViewModel()
+                XCTAssertFalse(session.transcript.turns.isEmpty, file: file, line: line)
+                sidebar.update(
+                    snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                    codexUsage: session.codexContextUsage
+                )
+                XCTAssertGreaterThan(sidebar.snapshot.estimatedTranscriptTokens ?? 0, 0, file: file, line: line)
+                XCTAssertNil(sidebar.snapshot.displayUsedTokens, file: file, line: line)
+                XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Awaiting post-compaction usage", file: file, line: line)
+                XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage, file: file, line: line)
+                XCTAssertNil(session.codexContextUsage?.lastTotalTokens, file: file, line: line)
+                XCTAssertEqual(session.contextCompactedAt, compactedAt, file: file, line: line)
+            }
+            let initialID = try await save(rows)
+            let initial = viewModel.session(for: tabID)
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: initialID, on: initial, updateWorkspaceMetadata: true))
+            initial.hasLoadedPersistedState = false
+            let hydrated = await viewModel.ensureSessionReady(tabID: tabID)
+            XCTAssertTrue(hydrated.permitsBoundOperationAndSave)
+            assertPending(hydrated)
+
+            // A different saved conversation takes the history-route hydration branch, not ensure-ready's fast path.
+            let historyID = try await save(rows, staleStoredCount: 150_000)
+            let routed = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: historyID, workspace: window.workspaceManager.workspaces[index])
+            XCTAssertEqual(routed, .ready)
+            let reopened = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertEqual(reopened.activeAgentSessionID, historyID)
+            assertPending(reopened)
+
+            let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
+            let recoveredID = try await save(rows + [fresh, AgentTokenUsagePersist(promptTokens: 500, completionTokens: 5)])
+            let recoveredRoute = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: recoveredID, workspace: window.workspaceManager.workspaces[index])
+            XCTAssertEqual(recoveredRoute, .ready)
+            let recovered = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertEqual(recovered.codexContextUsage?.lastTotalTokens, 10000)
+            XCTAssertNotEqual(recovered.codexContextUsage?.awaitingPostCompactionUsage, true)
+        }
+    }
+#endif

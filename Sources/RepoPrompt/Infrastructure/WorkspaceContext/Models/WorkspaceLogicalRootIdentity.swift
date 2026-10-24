@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 enum WorkspaceLogicalRootIdentity {
     struct RootDescriptor {

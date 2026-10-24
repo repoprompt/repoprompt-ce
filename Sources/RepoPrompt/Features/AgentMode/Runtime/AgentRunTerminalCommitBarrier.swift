@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 extension AgentSessionRunState {
     var isTerminalForCommit: Bool {
@@ -63,7 +64,7 @@ final class AgentRunTerminalCommitBarrier {
         let providerDrainGeneration: UInt64
         let providerBuffersAreDrained: () -> Bool
         let prepareProviderState: () -> (@MainActor () async -> Void)?
-        let postCommit: () -> Void
+        let postCommit: (_ revision: AgentRunTerminalCommitRevision, _ publicationResult: AgentRunTerminalPublicationResult) -> Void
 
         init(
             binding: AgentRunTerminalSessionBinding,
@@ -83,7 +84,7 @@ final class AgentRunTerminalCommitBarrier {
             providerDrainGeneration: UInt64 = 0,
             providerBuffersAreDrained: @escaping () -> Bool = { true },
             prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil },
-            postCommit: @escaping () -> Void = {}
+            postCommit: @escaping (_ revision: AgentRunTerminalCommitRevision, _ publicationResult: AgentRunTerminalPublicationResult) -> Void = { _, _ in }
         ) {
             self.binding = binding
             self.ownership = ownership
@@ -129,7 +130,11 @@ final class AgentRunTerminalCommitBarrier {
     private var consumedProviderSuccessorOrder: [UUID] = []
     private let maxConsumedProviderSuccessorTombstones = 512
 
-    init() {}
+    private let perfRecorder: any AgentModePerfRecording
+
+    init(perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
+        self.perfRecorder = perfRecorder
+    }
 
     @discardableResult
     func commit(_ request: Request) async -> AgentRunTerminalCommitRevision? {
@@ -175,6 +180,12 @@ final class AgentRunTerminalCommitBarrier {
                     revision: existingRevision,
                     publicationResult: publicationResult
                 )
+            }
+            if let result = lifecycle.lastTerminalPublicationResult {
+                binding.hooks.onSelfCompactTerminalSettled(existingRevision, result) { [weak self] in
+                    guard let self else { return false }
+                    return terminalTeardownTasks[existingRevision.ownership] == nil
+                }
             }
             return existingRevision
         }
@@ -311,6 +322,9 @@ final class AgentRunTerminalCommitBarrier {
         binding.hooks.updateBindings()
         if request.notifyTurnComplete {
             binding.hooks.notifyAgentTurnComplete()
+        } else if request.terminalState == .failed {
+            // Successors and queued follow-ups only exist for completed turns, so a failure is final.
+            binding.hooks.notifyAgentTurnFailed(request.errorText ?? binding.latestFailureText)
         }
         binding.hooks.scheduleSave()
         let publicationResult = await binding.hooks.publishTerminalCommit(
@@ -339,18 +353,22 @@ final class AgentRunTerminalCommitBarrier {
         )
         lifecycle.completeTerminalCommit()
         recordTerminalBarrierState(false, request: request)
-        request.postCommit()
+        request.postCommit(revision, publicationResult)
 
         if let followUpInstruction {
             binding.hooks.startFollowUpRun(followUpInstruction)
+        }
+        binding.hooks.onSelfCompactTerminalSettled(revision, publicationResult) { [weak self] in
+            guard let self else { return false }
+            return terminalTeardownTasks[revision.ownership] == nil
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.increment("run.terminal.commit.accepted", tabID: binding.tabID)
-            AgentModePerfDiagnostics.increment(
+            perfRecorder.increment("run.terminal.commit.accepted", tabID: binding.tabID)
+            perfRecorder.increment(
                 "run.terminal.commit.accepted.\(request.terminalState.rawValue)",
                 tabID: binding.tabID
             )
@@ -407,7 +425,7 @@ final class AgentRunTerminalCommitBarrier {
         binding: AgentRunTerminalSessionBinding,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
-    ) -> String? {
+    ) -> AgentRunPendingInstruction? {
         guard revision.successorKind != nil,
               revision.providerSuccessorID == nil,
               let publicationResult
@@ -450,7 +468,8 @@ final class AgentRunTerminalCommitBarrier {
         lifecycle: AgentRunAttemptLifecycle
     ) async {
         await awaitTerminalPublication(for: ownership, lifecycle: lifecycle)
-        guard lifecycle.lastTerminalCommitRevision?.ownership == ownership else { return }
+        // The task is keyed by the captured attempt, not by the mutable live binding revision.
+        // A rebind during publication must not erase the original cleanup evidence.
         await terminalTeardownTasks[ownership]?.value
     }
 
@@ -462,11 +481,11 @@ final class AgentRunTerminalCommitBarrier {
         guard let teardown else { return nil }
         let task = Task { @MainActor [weak self] in
             #if DEBUG
-                AgentModePerfDiagnostics.increment("run.terminal.teardown.started", tabID: tabID)
+                perfRecorder.increment("run.terminal.teardown.started", tabID: tabID)
             #endif
             await teardown()
             #if DEBUG
-                AgentModePerfDiagnostics.increment("run.terminal.teardown.completed", tabID: tabID)
+                perfRecorder.increment("run.terminal.teardown.completed", tabID: tabID)
             #endif
             self?.terminalTeardownTasks[ownership] = nil
         }
@@ -483,8 +502,8 @@ final class AgentRunTerminalCommitBarrier {
 
     private func recordRejection(_ reason: String, request: Request) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment("run.terminal.commit.rejected.\(reason)", tabID: request.binding.tabID)
-            AgentModePerfDiagnostics.event(
+            perfRecorder.increment("run.terminal.commit.rejected.\(reason)", tabID: request.binding.tabID)
+            perfRecorder.event(
                 "run.terminal.commitRejected",
                 tabID: request.binding.tabID,
                 fields: [

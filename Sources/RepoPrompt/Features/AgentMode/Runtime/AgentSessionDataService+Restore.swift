@@ -1,16 +1,18 @@
 import Foundation
+import RepoPromptInstrumentation
 
 extension AgentSessionDataService {
     func buildSidebarIndexStream(
         _ request: AgentSessionSidebarBuildRequest,
         batchSize: Int = 8
     ) -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error> {
-        AsyncThrowingStream { continuation in
+        let restorePerfRecorder = restorePerfRecorder
+        return AsyncThrowingStream { continuation in
             let service = self
             let effectiveBatchSize = max(batchSize, 1)
             let task = Task {
                 #if DEBUG
-                    let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let streamStartMS = restorePerfRecorder.timestampMSIfEnabled()
                     var yieldedBatchCount = 0
                     var yieldedEntryCount = 0
                     var preferredEntriesYielded = 0
@@ -18,33 +20,33 @@ extension AgentSessionDataService {
                     var prioritizedYielded = false
                     var yieldDurationMS: Double = 0
                     func logYieldComplete() {
-                        WorkspaceRestorePerfLog.event(
+                        restorePerfRecorder.event(
                             "agentSessionIndex.streamYieldComplete",
                             fields: [
-                                "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                                "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
                                 "batches": "\(yieldedBatchCount)",
                                 "entriesYielded": "\(yieldedEntryCount)",
                                 "preferredEntriesYielded": "\(preferredEntriesYielded)",
                                 "nonPreferredEntriesYielded": "\(nonPreferredEntriesYielded)",
                                 "prioritizedYielded": "\(prioritizedYielded)",
-                                "yieldDuration": WorkspaceRestorePerfLog.formatMS(yieldDurationMS),
-                                "total": streamStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                                "yieldDuration": restorePerfRecorder.formatMS(yieldDurationMS),
+                                "total": streamStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                             ]
                         )
                     }
                 #endif
                 do {
                     #if DEBUG
-                        let metadataStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        let metadataStartMS = restorePerfRecorder.timestampMSIfEnabled()
                     #endif
                     let records = try await service.sidebarStreamMetadataRecords(for: request.workspace)
                     #if DEBUG
-                        WorkspaceRestorePerfLog.event(
+                        restorePerfRecorder.event(
                             "agentSessionIndex.streamMetadataFetched",
                             fields: [
-                                "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                                "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
                                 "records": "\(records.count)",
-                                "duration": metadataStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
+                                "duration": metadataStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured",
                                 "batchSize": "\(effectiveBatchSize)",
                                 "hasPrioritizedTab": "\(request.prioritizedTabID != nil)"
                             ]
@@ -52,18 +54,18 @@ extension AgentSessionDataService {
                     #endif
                     try Task.checkCancellation()
                     #if DEBUG
-                        let projectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        let projectionStartMS = restorePerfRecorder.timestampMSIfEnabled()
                     #endif
-                    let projection = Self.projectSidebarIndex(records: records, request: request)
+                    let projection = Self.projectSidebarIndex(records: records, request: request, restorePerfRecorder: restorePerfRecorder)
                     #if DEBUG
-                        WorkspaceRestorePerfLog.event(
+                        restorePerfRecorder.event(
                             "agentSessionIndex.streamProjected",
                             fields: [
-                                "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                                "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
                                 "entries": "\(projection.entriesBySessionID.count)",
                                 "preferredTabs": "\(projection.preferredEntryByTabID.count)",
                                 "orderedPreferred": "\(projection.orderedPreferredEntries.count)",
-                                "duration": projectionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                                "duration": projectionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                             ]
                         )
                     #endif
@@ -95,12 +97,12 @@ extension AgentSessionDataService {
                        let prioritizedEntry = projection.preferredEntryByTabID[prioritizedTabID]
                     {
                         #if DEBUG
-                            let yieldStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                            let yieldStartMS = restorePerfRecorder.timestampMSIfEnabled()
                         #endif
                         yieldBatch(entries: [prioritizedEntry])
                         #if DEBUG
                             if let yieldStartMS {
-                                yieldDurationMS += WorkspaceRestorePerfLog.elapsedMS(since: yieldStartMS)
+                                yieldDurationMS += restorePerfRecorder.elapsedMS(since: yieldStartMS)
                             }
                             prioritizedYielded = true
                         #endif
@@ -112,24 +114,24 @@ extension AgentSessionDataService {
                         pending.append(entry)
                         if pending.count >= effectiveBatchSize {
                             #if DEBUG
-                                let yieldStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                                let yieldStartMS = restorePerfRecorder.timestampMSIfEnabled()
                             #endif
                             yieldBatch(entries: pending)
                             #if DEBUG
                                 if let yieldStartMS {
-                                    yieldDurationMS += WorkspaceRestorePerfLog.elapsedMS(since: yieldStartMS)
+                                    yieldDurationMS += restorePerfRecorder.elapsedMS(since: yieldStartMS)
                                 }
                             #endif
                             pending.removeAll(keepingCapacity: true)
                         }
                     }
                     #if DEBUG
-                        let pendingYieldStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        let pendingYieldStartMS = restorePerfRecorder.timestampMSIfEnabled()
                     #endif
                     yieldBatch(entries: pending)
                     #if DEBUG
                         if let pendingYieldStartMS, !pending.isEmpty {
-                            yieldDurationMS += WorkspaceRestorePerfLog.elapsedMS(since: pendingYieldStartMS)
+                            yieldDurationMS += restorePerfRecorder.elapsedMS(since: pendingYieldStartMS)
                         }
                     #endif
 
@@ -141,7 +143,7 @@ extension AgentSessionDataService {
                             entriesBySessionID[entry.id] = entry
                         }
                         #if DEBUG
-                            let yieldStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                            let yieldStartMS = restorePerfRecorder.timestampMSIfEnabled()
                         #endif
                         continuation.yield(
                             AgentSessionSidebarBuildBatch(
@@ -151,7 +153,7 @@ extension AgentSessionDataService {
                         )
                         #if DEBUG
                             if let yieldStartMS {
-                                yieldDurationMS += WorkspaceRestorePerfLog.elapsedMS(since: yieldStartMS)
+                                yieldDurationMS += restorePerfRecorder.elapsedMS(since: yieldStartMS)
                             }
                             yieldedBatchCount += 1
                             yieldedEntryCount += nonPreferredEntries.count
@@ -168,13 +170,13 @@ extension AgentSessionDataService {
                 } catch {
                     #if DEBUG
                         if !Task.isCancelled {
-                            WorkspaceRestorePerfLog.event(
+                            restorePerfRecorder.event(
                                 "agentSessionIndex.streamFailure",
                                 fields: [
-                                    "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                                    "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
                                     "batches": "\(yieldedBatchCount)",
                                     "entriesYielded": "\(yieldedEntryCount)",
-                                    "total": streamStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
+                                    "total": streamStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured",
                                     "error": String(describing: error)
                                 ]
                             )
@@ -208,7 +210,7 @@ extension AgentSessionDataService {
         _ request: AgentSessionSidebarBuildRequest
     ) async throws -> AgentSessionSidebarBuildResult {
         #if DEBUG
-            let targetedStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let targetedStartMS = restorePerfRecorder.timestampMSIfEnabled()
             func logTargetedBuilt(
                 source: String,
                 tabID: UUID?,
@@ -216,17 +218,17 @@ extension AgentSessionDataService {
                 recordsScanned: Int?,
                 result: AgentSessionSidebarBuildResult
             ) {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentSessionIndex.prioritizedTargetedBuilt",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
-                        "explicitSession": WorkspaceRestorePerfLog.shortID(explicitSessionID),
+                        "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
+                        "tabID": restorePerfRecorder.shortID(tabID),
+                        "explicitSession": restorePerfRecorder.shortID(explicitSessionID),
                         "source": source,
                         "recordsScanned": recordsScanned.map { "\($0)" } ?? "unknown",
                         "entries": "\(result.entriesBySessionID.count)",
                         "preferredTabs": "\(result.preferredSessionIDByTabID.count)",
-                        "duration": targetedStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": targetedStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -413,24 +415,25 @@ extension AgentSessionDataService {
 
     private static func projectSidebarIndex(
         records: [AgentSessionMetadataRecord],
-        request: AgentSessionSidebarBuildRequest
+        request: AgentSessionSidebarBuildRequest,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording
     ) -> SidebarIndexProjection {
         #if DEBUG
-            let projectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            let sortStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let projectionStartMS = restorePerfRecorder.timestampMSIfEnabled()
+            let sortStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let sortedRecords = records.sortedForAgentSessionMetadataIndex()
         #if DEBUG
-            let sortDurationMS = sortStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let recordMapStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let sortDurationMS = sortStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
+            let recordMapStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         var recordBySessionID: [UUID: AgentSessionMetadataRecord] = [:]
         for record in sortedRecords where recordBySessionID[record.id] == nil {
             recordBySessionID[record.id] = record
         }
         #if DEBUG
-            let recordMapDurationMS = recordMapStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let explicitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let recordMapDurationMS = recordMapStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
+            let explicitStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var explicitCandidates = 0
             var explicitEntries = 0
         #endif
@@ -459,8 +462,8 @@ extension AgentSessionDataService {
             #endif
         }
         #if DEBUG
-            let explicitDurationMS = explicitStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let preferredStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let explicitDurationMS = explicitStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
+            let preferredStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var preferredCandidates = 0
         #endif
 
@@ -494,8 +497,8 @@ extension AgentSessionDataService {
             preferredEntryByTabID[tabID] = entry
         }
         #if DEBUG
-            let preferredDurationMS = preferredStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let orderedSortStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let preferredDurationMS = preferredStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
+            let orderedSortStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
 
         let orderedPreferredEntries = preferredEntryByTabID.values.sorted { lhs, rhs in
@@ -519,11 +522,11 @@ extension AgentSessionDataService {
             return lhs.id.uuidString < rhs.id.uuidString
         }
         #if DEBUG
-            let orderedSortDurationMS = orderedSortStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            WorkspaceRestorePerfLog.event(
+            let orderedSortDurationMS = orderedSortStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
+            restorePerfRecorder.event(
                 "agentSessionIndex.projection",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                    "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
                     "records": "\(records.count)",
                     "sortedRecords": "\(sortedRecords.count)",
                     "recordMapCount": "\(recordBySessionID.count)",
@@ -535,12 +538,12 @@ extension AgentSessionDataService {
                     "preferredEntries": "\(preferredEntryByTabID.count)",
                     "entries": "\(entriesBySessionID.count)",
                     "orderedPreferred": "\(orderedPreferredEntries.count)",
-                    "sortDuration": sortDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "recordMapDuration": recordMapDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "explicitDuration": explicitDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "preferredDuration": preferredDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "orderedSortDuration": orderedSortDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "total": projectionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "sortDuration": sortDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured",
+                    "recordMapDuration": recordMapDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured",
+                    "explicitDuration": explicitDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured",
+                    "preferredDuration": preferredDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured",
+                    "orderedSortDuration": orderedSortDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured",
+                    "total": projectionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -556,7 +559,7 @@ extension AgentSessionDataService {
         _ request: AgentSessionHydrationRequest
     ) async throws -> AgentSessionHydrationPayload? {
         #if DEBUG
-            let prepareStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var loadDurationMS: Double?
             var transcriptDurationMS: Double?
             var presentationDurationMS: Double?
@@ -569,29 +572,29 @@ extension AgentSessionDataService {
                 error: Error? = nil
             ) {
                 var fields: [String: String] = [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
-                    "tabID": WorkspaceRestorePerfLog.shortID(request.tabID),
-                    "sessionID": WorkspaceRestorePerfLog.shortID(request.sessionID),
+                    "workspaceID": restorePerfRecorder.shortID(request.workspace.id),
+                    "tabID": restorePerfRecorder.shortID(request.tabID),
+                    "sessionID": restorePerfRecorder.shortID(request.sessionID),
                     "outcome": outcome,
-                    "loadDuration": loadDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
-                    "transcriptDuration": transcriptDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
-                    "presentationDuration": presentationDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
+                    "loadDuration": loadDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun",
+                    "transcriptDuration": transcriptDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun",
+                    "presentationDuration": presentationDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun",
                     "canonicalLiveItems": canonicalLiveItems.map { "\($0)" } ?? "notRun",
                     "turns": turns.map { "\($0)" } ?? "notRun",
                     "needsReloadMigrationSave": needsReloadMigrationSave.map { "\($0)" } ?? "notRun",
                     "frozenTailLimitNormalizationNeeded": frozenTailLimitNormalizationNeeded.map { "\($0)" } ?? "notRun",
-                    "total": prepareStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "total": prepareStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
                 if let error {
                     fields["error"] = String(describing: error)
                 }
-                WorkspaceRestorePerfLog.event("agentSessionHydration.prepare", fields: fields)
+                restorePerfRecorder.event("agentSessionHydration.prepare", fields: fields)
             }
         #endif
         do {
             try Task.checkCancellation()
             #if DEBUG
-                let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let loadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             guard let agentSession = try await loadAgentSession(
                 id: request.sessionID,
@@ -599,17 +602,18 @@ extension AgentSessionDataService {
             ) else {
                 #if DEBUG
                     if let loadStartMS {
-                        loadDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: loadStartMS)
+                        loadDurationMS = restorePerfRecorder.elapsedMS(since: loadStartMS)
                     }
                     logPrepare(outcome: "missingSession")
+                    try await runAfterHydrationPrepareHookForTesting(sessionID: request.sessionID)
                 #endif
                 return nil
             }
             #if DEBUG
                 if let loadStartMS {
-                    loadDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: loadStartMS)
+                    loadDurationMS = restorePerfRecorder.elapsedMS(since: loadStartMS)
                 }
-                let transcriptStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let transcriptStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
 
             let persistedRunState = agentSession.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
@@ -652,13 +656,13 @@ extension AgentSessionDataService {
             )
             #if DEBUG
                 if let transcriptStartMS {
-                    transcriptDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: transcriptStartMS)
+                    transcriptDurationMS = restorePerfRecorder.elapsedMS(since: transcriptStartMS)
                 }
             #endif
 
             try Task.checkCancellation()
             #if DEBUG
-                let presentationStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let presentationStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             let builtPresentation = AgentSessionRestoreSupport.buildTranscriptPresentation(
                 from: compactedTranscript,
@@ -671,7 +675,7 @@ extension AgentSessionDataService {
             )
             #if DEBUG
                 if let presentationStartMS {
-                    presentationDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: presentationStartMS)
+                    presentationDurationMS = restorePerfRecorder.elapsedMS(since: presentationStartMS)
                 }
             #endif
             try Task.checkCancellation()
@@ -701,6 +705,7 @@ extension AgentSessionDataService {
                     needsReloadMigrationSave: needsReloadMigrationSave,
                     frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
                 )
+                try await runAfterHydrationPrepareHookForTesting(sessionID: request.sessionID)
             #endif
             return AgentSessionHydrationPayload(
                 sessionID: request.sessionID,

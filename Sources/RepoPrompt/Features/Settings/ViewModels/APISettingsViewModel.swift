@@ -1,4 +1,7 @@
 import Combine
+import RepoPromptProcess
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import SwiftUI
 
 #if DEBUG
@@ -302,6 +305,17 @@ public class APISettingsViewModel: ObservableObject {
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
+    // Grok Build CLI / ACP
+    @Published var isGrokBuildConnected: Bool = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+    @Published var grokBuildError: String? = nil
+    @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
+    private var grokBuildLogCollector: CLIProcessLogCollector?
+
+    /// Installed-runtime inputs are refreshed when CLI Providers or Agent Decisions is shown.
+    /// They intentionally remain separate from current-process Router verification.
+    @Published private(set) var isAntigravityRuntimeInstalled = false
+    @Published private(set) var isDevinRuntimeInstalled = false
+    @Published private(set) var directConnectedCLIProviders: Set<AgentProviderKind> = []
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -351,6 +365,13 @@ public class APISettingsViewModel: ObservableObject {
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
+    private var cursorModelsRefreshTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringCursorModels = false
+    @Published private(set) var cursorModelDiscoveryMessage: String?
+    private var grokBuildModelsTask: Task<Void, Never>?
+    private var devinModelsTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringDevinModels = false
+    @Published private(set) var devinModelDiscoveryMessage: String?
     private var openRouterModelsTask: Task<Void, Never>?
     private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
@@ -382,6 +403,9 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            grokBuildAvailable: isGrokBuildConnected,
+            antigravityAvailable: isAntigravityRuntimeInstalled,
+            devinAvailable: isDevinRuntimeInstalled,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -402,6 +426,34 @@ public class APISettingsViewModel: ObservableObject {
         agentAvailability = next
     }
 
+    /// Refreshes the shared predicates used by every direct CLI Provider card. This is UI
+    /// connection state only: routing still validates executable metadata independently.
+    func refreshDirectCLIProviderConnectionState() {
+        let antigravityInstalled = antigravityRuntimeInstalledProvider()
+        let devinInstalled = devinRuntimeInstalledProvider()
+        if isAntigravityRuntimeInstalled != antigravityInstalled {
+            isAntigravityRuntimeInstalled = antigravityInstalled
+        }
+        if isDevinRuntimeInstalled != devinInstalled {
+            isDevinRuntimeInstalled = devinInstalled
+        }
+        refreshDirectConnectedCLIProviders()
+        refreshAgentAvailability()
+    }
+
+    private func refreshDirectConnectedCLIProviders() {
+        var providers: Set<AgentProviderKind> = []
+        if isCodexConnected { providers.insert(.codexExec) }
+        if isClaudeCodeConnected { providers.insert(.claudeCode) }
+        if isOpenCodeConnected { providers.insert(.openCode) }
+        if isCursorConnected { providers.insert(.cursor) }
+        if isGrokBuildConnected { providers.insert(.grokBuild) }
+        if isAntigravityRuntimeInstalled { providers.insert(.antigravity) }
+        if isDevinRuntimeInstalled { providers.insert(.devin) }
+        guard providers != directConnectedCLIProviders else { return }
+        directConnectedCLIProviders = providers
+    }
+
     /// Safety net behind the explicit `refreshAgentAvailability()` calls: recompute
     /// whenever any published input of the availability context changes, so mutation
     /// paths without an explicit refresh still converge. The main-queue hop defers the
@@ -412,12 +464,16 @@ public class APISettingsViewModel: ObservableObject {
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isAntigravityRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
+            $isDevinRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
+            self?.refreshDirectConnectedCLIProviders()
             self?.refreshAgentAvailability()
         }
     }
@@ -432,10 +488,18 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            devinAvailable: isDevinRuntimeInstalled,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
         )
+    }
+
+    /// Provider availability safe for automatic routing. Persisted connection flags are only
+    /// configuration hints; Router may choose a provider only after this process has verified it.
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        contextBuilderRestorationAvailabilityContext
     }
 
     var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
@@ -443,6 +507,7 @@ public class APISettingsViewModel: ObservableObject {
             claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
             codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
             cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            grokBuildCLI: recommendationAvailability(isConnected: isGrokBuildConnected, provider: .grokBuild),
             openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
         )
     }
@@ -484,6 +549,12 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
+        case .grokBuild:
+            isGrokBuildConnected
+        case .antigravity:
+            isAntigravityRuntimeInstalled
+        case .devin:
+            isDevinRuntimeInstalled
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -531,7 +602,8 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
-            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor }
+            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
+            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -573,6 +645,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
+        let wasGrokBuildConnected = isGrokBuildConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
@@ -583,13 +656,22 @@ public class APISettingsViewModel: ObservableObject {
         }
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
-        guard wasCursorConnected != isCursorConnected else { return }
-        if isCursorConnected {
-            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-        } else {
-            stopCursorModelsSubscription(clearModels: true)
+        isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+        if wasGrokBuildConnected != isGrokBuildConnected {
+            if isGrokBuildConnected {
+                startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopGrokBuildModelsSubscription(clearModels: true)
+            }
         }
-        Task { await updateAvailableModels() }
+        if wasCursorConnected != isCursorConnected {
+            if isCursorConnected {
+                startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopCursorModelsSubscription(clearModels: true)
+            }
+            Task { await updateAvailableModels() }
+        }
     }
 
     private func refreshClaudeCodeGLMAvailability() {
@@ -990,6 +1072,9 @@ public class APISettingsViewModel: ObservableObject {
 
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
+    private let cursorModelPollingService: CursorACPModelPollingService
+    private let antigravityRuntimeInstalledProvider: @MainActor () -> Bool
+    private let devinRuntimeInstalledProvider: @MainActor () -> Bool
     private let codexModelPollingService: CodexModelPollingService
     private let codexManagedAuthRecovery: any CodexManagedAuthRecovering
     private let codexSessionFence: CodexManagedSessionFence
@@ -1003,23 +1088,34 @@ public class APISettingsViewModel: ObservableObject {
         keyManager: KeyManager,
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
+        cursorModelPollingService: CursorACPModelPollingService = .shared,
         codexManagedAuthRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
         codexSessionFence: CodexManagedSessionFence = .shared,
         codexExecutablePreflight: @escaping @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution = { collector in
             await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
         },
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
-        contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
+        contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil,
+        antigravityRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
+            AntigravityRuntimeManager.installedRuntimeSync() != nil
+        },
+        devinRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
+            DevinRuntimeLocator.isInstalledSync()
+        }
     ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
+        self.antigravityRuntimeInstalledProvider = antigravityRuntimeInstalledProvider
+        self.devinRuntimeInstalledProvider = devinRuntimeInstalledProvider
         self.codexModelPollingService = codexModelPollingService
+        self.cursorModelPollingService = cursorModelPollingService
         self.codexManagedAuthRecovery = codexManagedAuthRecovery
         self.codexSessionFence = codexSessionFence
         self.codexExecutablePreflight = codexExecutablePreflight
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
+        refreshDirectCLIProviderConnectionState()
         installAgentAvailabilityObservers()
         refreshAgentAvailability()
         if loadStoredDataOnInit {
@@ -1027,16 +1123,40 @@ public class APISettingsViewModel: ObservableObject {
                 guard let self else { return }
                 await loadStoredDataIfNeeded()
                 guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                refreshDevinModels()
+                if let devinModelsTask {
+                    await devinModelsTask.value
+                }
                 await validateCachedContextBuilderProvidersIfNeeded()
             }
         }
     }
 
+    // A non-visual managed runtime leases this same live settings owner. Closing the source
+    // window withdraws only its UI lease; subscriptions stay process-owned until the last
+    // managed runtime settles. No availability snapshot or replacement settings loader is used.
+    private(set) var managedRuntimeLeaseCount = 0
+    private var windowCloseRequested = false
+
+    func retainForManagedRuntime() {
+        precondition(!hasPreparedForWindowClose)
+        managedRuntimeLeaseCount += 1
+    }
+
+    func releaseManagedRuntime() {
+        guard managedRuntimeLeaseCount > 0 else { return }
+        managedRuntimeLeaseCount -= 1
+        if managedRuntimeLeaseCount == 0, windowCloseRequested { prepareForWindowClose() }
+    }
+
     func prepareForWindowClose() {
-        guard !hasPreparedForWindowClose else { return }
+        windowCloseRequested = true
+        guard managedRuntimeLeaseCount == 0, !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil
+        devinModelsTask?.cancel()
+        devinModelsTask = nil
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1050,8 +1170,8 @@ public class APISettingsViewModel: ObservableObject {
         stopCodexModelsSubscription()
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
-        cursorModelsTask?.cancel()
-        cursorModelsTask = nil
+        stopCursorModelsSubscription()
+        stopGrokBuildModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -1065,6 +1185,7 @@ public class APISettingsViewModel: ObservableObject {
 
     deinit {
         initialLoadTask?.cancel()
+        devinModelsTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -1072,7 +1193,9 @@ public class APISettingsViewModel: ObservableObject {
         groqModelsTask?.cancel()
         codexModelsTask?.cancel()
         openCodeModelsTask?.cancel()
+        cursorModelsRefreshTask?.cancel()
         cursorModelsTask?.cancel()
+        grokBuildModelsTask?.cancel()
         openRouterModelsTask?.cancel()
         customModelsTask?.cancel()
         contextBuilderProviderValidationTask?.cancel()
@@ -1196,6 +1319,7 @@ public class APISettingsViewModel: ObservableObject {
         let codexPublicationToken = codexSessionFence.capturePublicationToken()
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
+        let shouldValidateGrokBuild = isGrokBuildConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1207,7 +1331,8 @@ public class APISettingsViewModel: ObservableObject {
             async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+            async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
@@ -1218,6 +1343,7 @@ public class APISettingsViewModel: ObservableObject {
             )
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
             if codexPublicationAllowed,
                isCodexConnected,
                isVerifiedContextBuilderProvider(.codexExec)
@@ -1302,17 +1428,37 @@ public class APISettingsViewModel: ObservableObject {
         {
             return true
         }
-        return await OpenCodeACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        let service = OpenCodeACPModelPollingService.shared
+        let outcome = await service.refreshNow(workspacePath: nil)
+        if outcome == .noModelsAdvertised {
+            // Preserve the prior Boolean contract: empty discovery verified the connection only
+            // when a usable retained registry snapshot existed.
+            return await service.latestSnapshot() != nil
+        }
+        return outcome == .updated || outcome == .unchanged
     }
 
     private func probeCachedCursorConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        if let latest = await CursorACPModelPollingService.shared.latestSnapshot(),
+        if let latest = await cursorModelPollingService.latestSnapshot(),
            latest.isLiveDiscovery
         {
             return true
         }
-        return await CursorACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        return await cursorModelPollingService.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        let outcome = await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        // Historically any completed Grok discovery, including readiness-only discovery with
+        // no model catalog, verified the connection for preflight.
+        return outcome == .updated || outcome == .unchanged || outcome == .noModelsAdvertised
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -1383,8 +1529,7 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask = nil
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
-        cursorModelsTask?.cancel()
-        cursorModelsTask = nil
+        stopCursorModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -1541,6 +1686,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
+        if isGrokBuildConnected { startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopGrokBuildModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
         if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
@@ -1706,6 +1852,33 @@ public class APISettingsViewModel: ObservableObject {
         return host == "api.openai.com" || host.hasSuffix(".openai.com")
     }
 
+    func refreshDevinModels(force: Bool = false) {
+        guard devinModelsTask == nil else { return }
+        isDiscoveringDevinModels = true
+        devinModelDiscoveryMessage = nil
+        devinModelsTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await DevinModelDiscoveryService.shared.discoverIfNeeded(force: force)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringDevinModels = false
+            switch outcome {
+            case .notInstalled:
+                devinModelDiscoveryMessage = "Devin CLI is not installed."
+            case let .discovered(modelCount):
+                devinModelDiscoveryMessage = "\(modelCount) models advertised by Devin."
+            case .noModelsAdvertised:
+                devinModelDiscoveryMessage = "Devin ACP advertised no selectable models."
+            case let .failed(message):
+                devinModelDiscoveryMessage = "Model discovery failed: \(message)"
+            case .cancelled:
+                devinModelDiscoveryMessage = nil
+            }
+            refreshAgentAvailability()
+            await updateAvailableModels()
+            devinModelsTask = nil
+        }
+    }
+
     func updateAvailableModels() async {
         var modelSet = Set<AIModel>()
 
@@ -1822,6 +1995,14 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if isGrokBuildConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
+        }
+
+        if DevinRuntimeLocator.isInstalledSync() {
+            modelSet.formUnion(AIModel.modelsForProvider(.devin))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1886,10 +2067,12 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .grokBuild: "grok_build"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .devin: "devin"
         }
     }
 
@@ -1907,11 +2090,11 @@ public class APISettingsViewModel: ObservableObject {
             case .anthropic:
                 anthropicApiKey = trimmedKey
                 isAnthropicKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.claude4Sonnet, reason: "api_settings.validate_key.default_seed.anthropic")
+                seedPreferredComposeModelIfMissing(AIModel.claudeSonnet55, reason: "api_settings.validate_key.default_seed.anthropic")
             case .openAI:
                 openAIApiKey = trimmedKey
                 isOpenAIKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.gpt54Mini, reason: "api_settings.validate_key.default_seed.openai")
+                seedPreferredComposeModelIfMissing(AIModel.gpt6Luna, reason: "api_settings.validate_key.default_seed.openai")
             case .gemini:
                 geminiApiKey = trimmedKey
                 isGeminiKeyValid = true
@@ -1922,7 +2105,7 @@ public class APISettingsViewModel: ObservableObject {
             case .openRouter:
                 openRouterApiKey = trimmedKey
                 isOpenRouterKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.openrouterClaude4Sonnet, reason: "api_settings.validate_key.default_seed.openrouter")
+                seedPreferredComposeModelIfMissing(AIModel.openrouterClaudeSonnet55, reason: "api_settings.validate_key.default_seed.openrouter")
             case .azure:
                 azureBaseURL = ""
                 azureApiKey = ""
@@ -1963,6 +2146,10 @@ public class APISettingsViewModel: ObservableObject {
             case .openCode:
                 break
             case .cursor:
+                break
+            case .grokBuild:
+                break
+            case .devin:
                 break
             }
 
@@ -2023,6 +2210,10 @@ public class APISettingsViewModel: ObservableObject {
         case .openCode:
             break
         case .cursor:
+            break
+        case .grokBuild:
+            break
+        case .devin:
             break
         }
         await updateAvailableModels()
@@ -2814,6 +3005,7 @@ public class APISettingsViewModel: ObservableObject {
     // MARK: - Claude Code
 
     func testClaudeCodeConnection() async throws -> Bool {
+        let wasConnected = isClaudeCodeConnected
         let previousStatus = claudeCodeCLIStatus
         let collector = CLIProcessLogCollector()
         collector.append("Claude Code connection test started")
@@ -2832,6 +3024,9 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             collector.append("Claude Code provider disposed")
             isClaudeCodeConnected = ok
+            if !ok || !wasConnected {
+                await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
+            }
             setContextBuilderProviderVerified(.claudeCode, verified: ok)
             if ok {
                 claudeCodeCLIStatus = .binaryPresent
@@ -2855,6 +3050,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Disposing Claude Code provider resources after failure")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
+            await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
             isClaudeCodeConnected = false
             setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)
@@ -3254,7 +3450,7 @@ public class APISettingsViewModel: ObservableObject {
         applyCodexConnectionPhase(.testingAppServer)
 
         // Use an owned non-agent Codex client so health-check failures cannot poison chat or polling.
-        let provider = CodexCLIProvider(logCollector: collector)
+        let provider = CodexCLIProvider(logCollector: collector, perfRecorder: AIProviderFactory.perfRecorder)
         collector.append("Created Codex CLI provider for health check")
 
         do {
@@ -3525,6 +3721,29 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Cursor CLI / ACP
 
+    #if DEBUG
+        func test_waitForCursorModelRefresh() async {
+            await cursorModelsRefreshTask?.value
+        }
+    #endif
+
+    func refreshCursorModels() {
+        guard !hasPreparedForWindowClose, isCursorConnected, cursorModelsRefreshTask == nil else { return }
+        isDiscoveringCursorModels = true
+        cursorModelDiscoveryMessage = nil
+        cursorModelsRefreshTask = Task { [weak self] in
+            let result = await cursorModelPollingService.refreshCatalog(workspacePath: nil)
+            guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringCursorModels = false
+            cursorModelsRefreshTask = nil
+            if let message = result.errorMessage {
+                cursorModelDiscoveryMessage = "\(message) Try Refresh Models again."
+            } else if let count = result.advertisedCount {
+                cursorModelDiscoveryMessage = "\(count) models advertised."
+            }
+        }
+    }
+
     func testCursorConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
         collector.append("Cursor Agent CLI connection test started")
@@ -3536,13 +3755,22 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Starting Cursor ACP model discovery preflight")
 
         do {
-            let snapshot = try await CursorACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let snapshot = try await cursorModelPollingService.discoverOnce(workspacePath: nil)
             let cursorOptions = AgentModelCatalog.options(
                 for: .cursor,
                 availability: AgentModelCatalog.AvailabilityContext(cursorAvailable: true, zaiConfigured: false)
             )
             if let snapshot {
                 collector.append("Discovered \(snapshot.models.options.count) Cursor model option(s)")
+                let reconciliationIssues = CursorAIModelCatalog.reconciliationIssues(comparedTo: snapshot.models)
+                if reconciliationIssues.isEmpty {
+                    collector.append("Release-gated Cursor model metadata matches the live catalog")
+                } else {
+                    collector.append("Release-gated Cursor model metadata has \(reconciliationIssues.count) live difference(s)")
+                    for issue in reconciliationIssues {
+                        collector.append("Cursor metadata difference: \(issue)")
+                    }
+                }
                 availableCursorModelOptions = cursorOptions
             } else {
                 collector.append("Cursor ACP preflight completed without dynamic model metadata; using Auto fallback")
@@ -3612,16 +3840,16 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available."
+            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available."
         }
         if lowered.contains("permission denied") {
-            return "Permission denied. Ensure the `cursor-agent` executable is accessible."
+            return "Permission denied. Ensure the Cursor `cursor-agent` or `agent` executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
             return "Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
         }
         if lowered.contains("does not advertise acp") || lowered.contains("acp support") {
-            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` works."
+            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` or `agent acp --help` identifies Cursor ACP."
         }
         return message
     }
@@ -3649,7 +3877,7 @@ public class APISettingsViewModel: ObservableObject {
         guard !hasPreparedForWindowClose else { return }
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in
-            let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            let stream = await cursorModelPollingService.subscribe(workspacePath: workspacePath)
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
@@ -3668,10 +3896,167 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func stopCursorModelsSubscription(clearModels: Bool = false) {
+        cursorModelsRefreshTask?.cancel()
+        cursorModelsRefreshTask = nil
+        isDiscoveringCursorModels = false
+        cursorModelDiscoveryMessage = nil
         cursorModelsTask?.cancel()
         cursorModelsTask = nil
         if clearModels {
             availableCursorModelOptions = []
+        }
+    }
+
+    // MARK: - Grok Build CLI / ACP
+
+    func testGrokBuildConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Grok Build CLI connection test started")
+        grokBuildLogCollector = collector
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+        collector.append("Starting Grok Build ACP model discovery preflight")
+
+        do {
+            let snapshot = try await GrokBuildACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let grokOptions = AgentModelCatalog.options(
+                for: .grokBuild,
+                availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+            )
+            if let snapshot {
+                collector.append("Discovered \(snapshot.models.options.count) Grok Build model option(s)")
+                availableGrokBuildModelOptions = grokOptions
+            } else {
+                collector.append("Grok Build ACP preflight completed without dynamic model metadata; using Default")
+                availableGrokBuildModelOptions = grokOptions
+            }
+            isGrokBuildConnected = true
+            setContextBuilderProviderVerified(.grokBuild, verified: true)
+            grokBuildError = nil
+            UserDefaults.standard.set(true, forKey: "GrokBuildCLIConnected")
+            startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            await updateAvailableModels()
+            collector.append("Grok Build CLI marked as connected")
+            grokBuildLogCollector = nil
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isGrokBuildConnected = false
+            setContextBuilderProviderVerified(.grokBuild, verified: false)
+            grokBuildError = Self.friendlyGrokBuildMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+            stopGrokBuildModelsSubscription(clearModels: true)
+            await updateAvailableModels()
+            let finalMessage = grokBuildError ?? error.localizedDescription
+            collector.append("User guidance: \(finalMessage)")
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectGrokBuild() {
+        isGrokBuildConnected = false
+        setContextBuilderProviderVerified(.grokBuild, verified: false)
+        grokBuildError = nil
+        UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+        stopGrokBuildModelsSubscription(clearModels: true)
+        Task {
+            await updateAvailableModels()
+        }
+        NotificationCenter.default.post(
+            name: .grokBuildConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    static func friendlyGrokBuildMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source):
+                return source?.localizedDescription ?? "Unknown Grok Build CLI error"
+            default:
+                return error.localizedDescription
+            }
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
+            return "Grok Build CLI was not found. Install it (`npm i -g @xai-official/grok` or https://x.ai/cli/install.sh) and ensure `grok agent stdio` is available."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `grok` executable is accessible."
+        }
+        if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
+            return "Grok Build is not authenticated. Run `grok login` or set `XAI_API_KEY`."
+        }
+        if lowered.contains("stdio") {
+            return "Installed Grok Build CLI does not advertise the ACP stdio subcommand. Update Grok Build and ensure `grok agent --help` lists `stdio`."
+        }
+        if lowered.contains("authentication required") {
+            return "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Providers, then try Connect again."
+        }
+        return message
+    }
+
+    func hasGrokBuildTrace() -> Bool {
+        grokBuildLogCollector?.isEmpty == false
+    }
+
+    func dumpGrokBuildTrace() throws -> URL {
+        guard let collector = grokBuildLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-GrokBuildTrace",
+            title: "Grok Build CLI Connection Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
+        guard grokBuildModelsTask == nil else { return }
+        grokBuildModelsTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    availableGrokBuildModelOptions = AgentModelCatalog.options(
+                        for: .grokBuild,
+                        availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+                    )
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.grokBuild, verified: true)
+                    }
+                }
+                await self?.updateAvailableModels()
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription(clearModels: Bool = false) {
+        grokBuildModelsTask?.cancel()
+        grokBuildModelsTask = nil
+        if clearModels {
+            availableGrokBuildModelOptions = []
         }
     }
 

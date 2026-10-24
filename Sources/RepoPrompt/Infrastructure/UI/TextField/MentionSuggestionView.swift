@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  MentionSuggestionView.swift
 //  RepoPrompt

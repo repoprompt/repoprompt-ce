@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 private func acpLeaseLog(_ message: @autoclosure () -> String) {
     guard AgentRuntimeProviderService.enableDebugLogging else { return }
@@ -154,7 +155,8 @@ extension MCPBootstrapReadinessError: LocalizedError {
 /// 1. `acquire()` — registers routing, acquires the gate, installs and arms the policy
 /// 2. PID-owned policies release the gate immediately; routing state stays retained by the lease
 /// 3. `releaseWhenRouted()` — waits for routing (or timeout) and cleans retained state
-/// 4. `cancelAndCleanup()` — emergency cleanup on cancellation
+/// 4. `cancelAndCleanup(preservingCommittedRoute:)` — emergency cleanup on cancellation. A caller
+///    whose agent-mode run outlives the cancelled attempt may keep that run's committed live route.
 ///
 /// ## Additional operations (agent-mode specific)
 /// - `releaseWithoutRoutingWait()` — releases gate immediately (when no fresh connection is expected)
@@ -163,10 +165,12 @@ actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
     private var spec: MCPBootstrapLeaseSpec
+    private let perfRecorder: any AgentModePerfRecording
     private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
+    private let routingStateOwner: (@MainActor @Sendable () -> Bool)?
     private let routeAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision
 
     private var hasAcquired = false
@@ -199,22 +203,37 @@ actor MCPBootstrapLease {
     ///   - policyInstaller: Installs the per-run connection policy. Defaults to calling
     ///     `ServerNetworkManager.shared.installClientConnectionPolicy(...)`.
     ///   - expectedPIDPolicyArmer: Confirms the intended pending policy is uniquely PID-owned.
-    ///   - policyClearer: Clears the per-run connection policy on failure/timeout. Defaults to calling
-    ///     `ServerNetworkManager.shared.clearClientConnectionPolicy(...)`.
+    ///   - policyClearer: Clears the per-run connection policy on failure, timeout, or cancellation.
+    ///     Defaults to calling `ServerNetworkManager.shared.revokeClientConnectionPolicy(...)`, which
+    ///     also tears down the run's live routing and catalog observation through
+    ///     `cleanupRunRoutingState(for:)` — not merely the pending policy queue.
+    ///   - routingStateOwner: Optional attempt fence for shared run state; gate ownership is independent.
+    ///   - routeAuthorityResolver: Decides whether the run's route is committed on a live connection.
+    ///     Defaults to `ServerNetworkManager.shared.confirmCommittedRunRouteOrFenceRevocation(...)`.
     init(
         spec: MCPBootstrapLeaseSpec,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         mcpServerEnabler: (() async -> Bool)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
+        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
         routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil
     ) {
         self.spec = spec
+        self.perfRecorder = perfRecorder
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
+        self.routingStateOwner = routingStateOwner
         self.routeAuthorityResolver = routeAuthorityResolver ?? Self.defaultRouteAuthorityResolver
+    }
+
+    /// Default callers own their run scope; cold resumes additionally fence replacement state.
+    private func ownsRoutingState() async -> Bool {
+        guard let routingStateOwner else { return true }
+        return await routingStateOwner()
     }
 
     // MARK: - Core Lifecycle
@@ -425,13 +444,20 @@ actor MCPBootstrapLease {
 
     private func releaseRouting(
         selection: RoutingWaitSelection,
-        progressReporter: MCPBootstrapRoutingProgressReporter?
+        progressReporter: MCPBootstrapRoutingProgressReporter?,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
     ) async -> MCPRoutingWaitOutcome {
         guard !hasReleased else {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing release ignored because lease already released")
             return .failed(.cleanedUp)
         }
         hasReleased = true
+        guard await ownsRoutingState() else {
+            let outcome: MCPRoutingWaitOutcome = Task.isCancelled ? .cancelled : .failed(.signalled)
+            routingTerminalOutcome = outcome
+            await releaseOwnedGate(reason: "routing_superseded")
+            return outcome
+        }
 
         let timeoutMs: Int
         let waitPolicy: MCPRoutingWaitPolicy?
@@ -480,6 +506,9 @@ actor MCPBootstrapLease {
         let releaseResult = await pendingReleaseResult
         ownsGate = false
         var outcome = releaseResult.routingOutcome
+        if await !ownsRoutingState() {
+            outcome = Task.isCancelled ? .cancelled : .failed(.signalled)
+        }
 
         // A committed route can cross the waiter deadline before its notification is delivered.
         // Resolve that race through the route owner's conditional revocation fence. A fenced
@@ -494,6 +523,19 @@ actor MCPBootstrapLease {
             }
         case .routed, .failed, .cancelled:
             break
+        }
+
+        if outcome == .routed,
+           let beforeRoutingCleanup,
+           await !beforeRoutingCleanup()
+        {
+            if Task.isCancelled {
+                outcome = .cancelled
+                await cancelAndCleanup()
+            } else {
+                outcome = .failed(.signalled)
+                await failAndCleanup()
+            }
         }
 
         // Publish the finalized result to this run's lease before any awaited diagnostics or
@@ -542,10 +584,14 @@ actor MCPBootstrapLease {
     }
 
     /// Fail-closed routing readiness that consumes the typed absolute-deadline core.
-    func requireRouting(timeoutMs: Int = 10000) async throws {
+    func requireRouting(
+        timeoutMs: Int = 10000,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
+    ) async throws {
         let outcome = await releaseRouting(
             selection: .absolute(timeoutMs: timeoutMs),
-            progressReporter: nil
+            progressReporter: nil,
+            beforeRoutingCleanup: beforeRoutingCleanup
         )
         switch outcome {
         case .routed:
@@ -575,6 +621,13 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
+        let ownsState = await ownsRoutingState()
+        // The ownership hop may have let another caller start the single-flight clear.
+        if policyClearOperation != nil {
+            await clearPolicyOnce()
+            return
+        }
+        guard ownsState else { return }
         let operation = Task { await self.policyClearer(self.spec) }
         policyClearOperation = operation
         await operation.value
@@ -587,6 +640,12 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
+        let ownsState = await ownsRoutingState()
+        if let existing = routingCleanupOperation {
+            await existing.value
+            return
+        }
+        guard ownsState else { return }
         let operation = Task { await AgentRunCoordinator.shared.cleanupRouting(runID: self.spec.runID) }
         routingCleanupOperation = operation
         await operation.value
@@ -661,6 +720,10 @@ actor MCPBootstrapLease {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() ignored because lease already released")
             return
         }
+        guard await ownsRoutingState() else {
+            await failAndCleanup()
+            return
+        }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() signaling routing failure")
         await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
         _ = await releaseWhenRouted()
@@ -671,17 +734,32 @@ actor MCPBootstrapLease {
         cleanupRequested = true
         hasReleased = true
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndCleanup() signaling failure and clearing policy")
-        await performCancellationCleanup(reason: "failed")
+        await performCancellationCleanup(reason: "failed", preservesCommittedAgentModeRoute: false)
     }
 
     /// Cancellation path: signal failure, release any gate ownership that materializes,
     /// clear installed policy, and clean up routing. Cleanup remains retryable while a
     /// queued gate acquisition is still suspended.
-    func cancelAndCleanup() async {
+    ///
+    /// An agent-mode lease is scoped to one turn *attempt*, but providers that keep a process alive
+    /// between turns reuse the run ID, so the run's committed route and catalog observation can
+    /// predate and outlive this attempt. A caller that knows its run survives the cancellation — for
+    /// example an Auto-wake retracted before its provider call on a still-owned process run — passes
+    /// `preservingCommittedRoute: true`. The route authority then decides, exactly as the timeout path
+    /// already does (see `releaseRouting`): a route still committed on a live connection is kept, and
+    /// anything else is fenced and fully revoked. The unapplied one-shot pending policy is left to be
+    /// collapsed by the run's next install or pruned by its TTL, as after a successful attempt.
+    ///
+    /// The default revokes the run, which is correct whenever the cancellation ends the run's scope
+    /// (user Stop, provider identity reset, tab or session teardown) or the caller cannot tell.
+    func cancelAndCleanup(preservingCommittedRoute: Bool = false) async {
         cleanupRequested = true
         hasReleased = true
-        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cancelAndCleanup() signaling failure and releasing gate")
-        await performCancellationCleanup(reason: "cancelled")
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cancelAndCleanup(preservingCommittedRoute: \(preservingCommittedRoute)) signaling failure and releasing gate")
+        await performCancellationCleanup(
+            reason: "cancelled",
+            preservesCommittedAgentModeRoute: preservingCommittedRoute
+        )
     }
 
     private var shouldAbortAcquire: Bool {
@@ -750,7 +828,7 @@ actor MCPBootstrapLease {
                 event: event,
                 fields: diagnosticFields
             )
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "mcp.routing.\(event)",
                 tabID: spec.tabID,
                 fields: diagnosticFields
@@ -758,7 +836,7 @@ actor MCPBootstrapLease {
         #endif
     }
 
-    private func performCancellationCleanup(reason: String) async {
+    private func performCancellationCleanup(reason: String, preservesCommittedAgentModeRoute: Bool) async {
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: spec.runID,
@@ -770,13 +848,34 @@ actor MCPBootstrapLease {
                 ]
             )
         #endif
+        guard await ownsRoutingState() else {
+            await releaseOwnedGate(reason: reason)
+            if let operation = policyClearOperation { await operation.value }
+            if let operation = routingCleanupOperation { await operation.value }
+            return
+        }
         if routingRegistered, !didSignalRoutingFailure {
             didSignalRoutingFailure = true
             await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
         }
         await releaseOwnedGate(reason: reason)
         if policyInstalled {
-            await clearPolicyOnce()
+            if preservesCommittedAgentModeRoute,
+               await cancellationFindsCommittedAgentModeRoute()
+            {
+                #if DEBUG
+                    await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                        runID: spec.runID,
+                        event: "lease_cancelled_route_preserved",
+                        fields: [
+                            "client_name": spec.clientName ?? "nil",
+                            "gate_id": spec.gateID.uuidString
+                        ]
+                    )
+                #endif
+            } else {
+                await clearPolicyOnce()
+            }
         }
         if routingRegistered {
             await cleanupRoutingOnce()
@@ -796,6 +895,20 @@ actor MCPBootstrapLease {
                 ]
             )
         #endif
+    }
+
+    /// Whether a cancelled attempt found its run's route still committed on a live connection.
+    ///
+    /// Only agent-mode leases qualify: their run can outlive the attempt. A clear already started on
+    /// another path — including one that began while the authority was being sampled — is joined
+    /// rather than second-guessed. Not read-only: when the route is not committed the resolver fences
+    /// the run, and the caller must then perform the full revoke.
+    private func cancellationFindsCommittedAgentModeRoute() async -> Bool {
+        guard spec.purpose == .agentModeRun, policyClearOperation == nil,
+              await ownsRoutingState()
+        else { return false }
+        let decision = await routeAuthorityResolver(spec)
+        return decision == .committed && policyClearOperation == nil
     }
 
     private func performDeferredRoutingCleanup(reason: String) async {

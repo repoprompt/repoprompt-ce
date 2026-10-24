@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Settings view for Context Builder configuration.
@@ -134,10 +135,15 @@ struct ContextBuilderSettingsView: View {
                     }
                     Slider(
                         value: Binding(
-                            get: { Double(contextBuilderVM.analysisTokenBudget) },
+                            get: {
+                                Double(ContextBuilderDefaults.normalizedAnalysisTokenBudget(
+                                    contextBuilderVM.analysisTokenBudget
+                                ))
+                            },
                             set: { contextBuilderVM.analysisTokenBudget = Int($0) }
                         ),
-                        in: 40000 ... 200_000,
+                        in: Double(ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound)
+                            ... Double(ContextBuilderDefaults.analysisTokenBudgetRange.upperBound),
                         step: 5000
                     )
                     Text("Sets the target size of the context package when Context Builder will immediately produce a plan, review, or answer.")

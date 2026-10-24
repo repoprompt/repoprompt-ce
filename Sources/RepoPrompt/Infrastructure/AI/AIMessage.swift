@@ -1,207 +1,12 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import SwiftOpenAI
 
-/// A single conversation entry
-struct ConversationEntry {
-    enum Role {
-        case user
-        case assistant
-    }
+typealias ConversationEntry = RepoPromptDomainRuntime.ConversationEntry
+typealias AIMessage = RepoPromptDomainRuntime.AIMessage
 
-    let role: Role
-    let content: String
-}
-
-/// Keep each piece separate. We also provide "XML getters" for certain fields.
-struct AIMessage {
-    /// The main system prompt
-    let systemPrompt: String
-
-    /// Any "meta" instructions, each stored separately
-    let metaPrompts: [String]
-
-    /// The entire file tree (if any)
-    let fileTree: String
-
-    /// File blocks (each block is one file's content)
-    let fileBlocks: [String]
-
-    /// Git diff content (optional)
-    let gitDiff: String?
-
-    /// NEW: Full conversation array, user + AI in order
-    let conversationMessages: [ConversationEntry]
-
-    let temperature: Double?
-
-    /// User-defined ordering of prompt sections
-    let promptSectionsOrder: [PromptSection]
-
-    /// Sections that should be excluded from the prompt
-    let disabledPromptSections: Set<PromptSection>
-
-    /// Duplicate the user‑instruction block at the very top of the prompt
-    let duplicateUserInstructionsAtTop: Bool
-
-    // MARK: - XML Getter Properties
-
-    /// System prompt in XML
-    var systemPromptXML: String {
-        guard !systemPrompt.isEmpty else { return "" }
-        return """
-        <system_prompt>
-        \(systemPrompt)
-        </system_prompt>
-        """
-    }
-
-    /// Meta prompts in XML
-    var metaPromptsXML: String {
-        guard !metaPrompts.isEmpty else { return "" }
-        var result = "<meta_prompts>\n"
-        for meta in metaPrompts {
-            result += meta + "\n\n"
-        }
-        result += "</meta_prompts>"
-        return result
-    }
-
-    /// File tree in XML
-    var fileTreeXML: String {
-        guard !fileTree.isEmpty else { return "" }
-        return """
-        <file_tree>
-        \(fileTree)
-        </file_tree>
-        """
-    }
-
-    /// File blocks in XML
-    var fileBlocksXML: String {
-        guard !fileBlocks.isEmpty else { return "" }
-        var result = "<file_contents>\n"
-        for block in fileBlocks {
-            result += block + "\n\n"
-        }
-        result += "</file_contents>"
-        return result
-    }
-
-    /// Git diff in XML
-    var gitDiffXML: String {
-        guard let diff = gitDiff, !diff.isEmpty else { return "" }
-        return """
-        <git_diff>
-        \(diff)
-        </git_diff>
-        """
-    }
-
-    /// Combine the main sections, skipping anything empty
-    var combinedXML: String {
-        let sections = [
-            systemPromptXML,
-            metaPromptsXML,
-            fileTreeXML,
-            fileBlocksXML,
-            gitDiffXML
-        ]
-        return sections
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
-    }
-
-    init(
-        systemPrompt: String,
-        metaPrompts: [String] = [],
-        fileTree: String = "",
-        fileBlocks: [String] = [],
-        gitDiff: String? = nil,
-        conversationMessages: [ConversationEntry] = [],
-        temperature: Double?,
-        promptSectionsOrder: [PromptSection],
-        disabledPromptSections: Set<PromptSection>,
-        duplicateUserInstructionsAtTop: Bool = false
-    ) {
-        self.systemPrompt = systemPrompt
-        self.metaPrompts = metaPrompts
-        self.fileTree = fileTree
-        self.fileBlocks = fileBlocks
-        self.gitDiff = gitDiff
-        self.conversationMessages = conversationMessages
-        self.temperature = temperature
-        self.promptSectionsOrder = promptSectionsOrder
-        self.disabledPromptSections = disabledPromptSections
-        self.duplicateUserInstructionsAtTop = duplicateUserInstructionsAtTop
-    }
-
-    /// Simpler initializer for "system prompt + user message" usage
-    /// (e.g. older single-user instructions approach).
-    init(systemPrompt: String, userMessage: String, temperature: Double? = nil) {
-        self.systemPrompt = systemPrompt
-        metaPrompts = []
-        fileTree = ""
-        fileBlocks = []
-        gitDiff = nil
-        self.temperature = temperature
-        // Store the single user message in conversationMessages
-        conversationMessages = [
-            ConversationEntry(role: .user, content: userMessage)
-        ]
-        // Use library defaults for prompt ordering
-        promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
-        disabledPromptSections = []
-        duplicateUserInstructionsAtTop = false
-    }
-
-    /// Builds the text block that must be *prepended* to the **final** user
-    /// message, respecting the prompt‑ordering UI.
-    ///
-    /// - Parameters:
-    ///   - embedSystemPrompt:  If `true` the `systemPrompt` is appended to the
-    ///     tail instead of being sent as an independent `.system` role.
-    /// - Returns: A single string, without leading / trailing blank lines.
-    func buildTail(embedSystemPrompt: Bool) -> String {
-        var parts: [String] = []
-
-        // ───── 1)  Optional *top* copy of the user instructions  ─────
-        if duplicateUserInstructionsAtTop,
-           let userBlock = conversationMessages.last(where: { $0.role == .user })?.content,
-           !userBlock.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            parts.append(userBlock)
-        }
-
-        // ───── 2)  Auto‑generated sections in caller‑defined order  ─────
-        for section in promptSectionsOrder where !disabledPromptSections.contains(section) {
-            switch section {
-            case .fileMap:
-                if !fileTree.isEmpty { parts.append(fileTreeXML) }
-            case .fileContents:
-                if !fileBlocks.isEmpty { parts.append(fileBlocksXML) }
-            case .metaPrompts:
-                if !metaPrompts.isEmpty {
-                    parts.append(metaPrompts.joined(separator: "\n"))
-                }
-            case .gitDiff:
-                if let diff = gitDiff, !diff.isEmpty {
-                    parts.append(gitDiffXML)
-                }
-            case .userInstructions:
-                // User-authored block, never auto-prepended.
-                continue
-            }
-        }
-
-        // ───── 3)  Inline system prompt (optional)  ─────
-        if embedSystemPrompt, !systemPrompt.isEmpty {
-            if !parts.isEmpty { parts.append("") } // blank line separator
-            parts.append(systemPrompt)
-        }
-
-        return parts.joined(separator: "\n\n")
-    }
-
+extension AIMessage {
     /// Generates the full array of `ChatCompletionParameters.Message` objects
     /// that an OpenAI‑style chat endpoint expects.
     ///
@@ -227,7 +32,15 @@ struct AIMessage {
             let role: ChatCompletionParameters.Message.Role = (entry.role == .user)
                 ? .user
                 : .assistant
-            msgs.append(.init(role: role, content: .text(text)))
+            if entry.role == .user, idx == lastUserIndex, !transientImages.isEmpty {
+                msgs.append(.init(role: role, content: openAIChatContent(text: text)))
+            } else {
+                msgs.append(.init(role: role, content: .text(text)))
+            }
+        }
+
+        if lastUserIndex == nil, !transientImages.isEmpty {
+            msgs.append(.init(role: .user, content: openAIChatContent(text: tail)))
         }
 
         return msgs
@@ -248,9 +61,10 @@ struct AIMessage {
 
         var items: [SwiftOpenAI.InputItem] = []
         var firstUser = true
+        let lastUserIndex = conversationMessages.lastIndex { $0.role == .user }
 
         // 2. Walk through the stored conversation.
-        for entry in conversationMessages {
+        for (index, entry) in conversationMessages.enumerated() {
             switch entry.role {
             case .user:
                 var text = entry.content
@@ -259,9 +73,14 @@ struct AIMessage {
                     firstUser = false
                 }
 
+                let content = if index == lastUserIndex, !transientImages.isEmpty {
+                    openAIResponsesContent(text: text)
+                } else {
+                    SwiftOpenAI.MessageContent.text(text)
+                }
                 let msg = SwiftOpenAI.InputMessage(
                     role: "user",
-                    content: .text(text)
+                    content: content
                 )
                 items.append(.message(msg))
 
@@ -275,16 +94,48 @@ struct AIMessage {
             }
         }
 
-        // 3. Edge-case: no user message yet but there *is* a tail.
-        if items.isEmpty, !additions.isEmpty {
-            let msg = SwiftOpenAI.InputMessage(
-                role: "user",
-                content: .text(additions)
-            )
+        // 3. Edge-case: no user message yet. Preserve the text-only behavior of
+        // adding context only when there are no existing conversation items.
+        if lastUserIndex == nil,
+           !transientImages.isEmpty || items.isEmpty && !additions.isEmpty
+        {
+            let content = transientImages.isEmpty
+                ? SwiftOpenAI.MessageContent.text(additions)
+                : openAIResponsesContent(text: additions)
+            let msg = SwiftOpenAI.InputMessage(role: "user", content: content)
             items.append(.message(msg))
         }
 
         return .array(items)
+    }
+
+    private func openAIChatContent(text: String) -> ChatCompletionParameters.Message.ContentType {
+        var parts: [ChatCompletionParameters.Message.ContentType.MessageContent] = []
+        if !text.isEmpty {
+            parts.append(.text(text))
+        }
+        for image in transientImages {
+            if let annotation = image.titleAnnotation {
+                parts.append(.text(annotation))
+            }
+            guard let imageURL = URL(string: image.openAIDataURL) else { continue }
+            parts.append(.imageUrl(.init(url: imageURL, detail: nil)))
+        }
+        return .contentArray(parts)
+    }
+
+    private func openAIResponsesContent(text: String) -> SwiftOpenAI.MessageContent {
+        var parts: [SwiftOpenAI.ContentItem] = []
+        if !text.isEmpty {
+            parts.append(.text(SwiftOpenAI.TextContent(text: text)))
+        }
+        for image in transientImages {
+            if let annotation = image.titleAnnotation {
+                parts.append(.text(SwiftOpenAI.TextContent(text: annotation)))
+            }
+            parts.append(.image(SwiftOpenAI.ImageContent(detail: "auto", imageUrl: image.openAIDataURL)))
+        }
+        return .array(parts)
     }
 
     // MARK: - Temperature helpers

@@ -2,6 +2,69 @@
 
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
+## Claude status-line compatibility experiment (debug only)
+
+This is an explicit one-process probe, not a replacement quota source or persistent usage cache. It tests whether the installed Claude CLI invokes its documented status-line command during RepoPrompt's native headless run. It makes no independent account HTTP requests and reads no credentials.
+
+Prepare a new private directory (the path must not already exist):
+
+```bash
+python3 Scripts/diagnostics/claude_statusline_probe.py prepare /tmp/rpce-statusline-probe-UNIQUE
+python3 Tests/Diagnostics/test_claude_statusline_probe.py
+make dev-test FILTER=ClaudeStatusLineCompatibilityProbeTests
+```
+
+After separately authorizing and building/launching the debug app, pass `--claude-statusline-probe /tmp/rpce-statusline-probe-UNIQUE/settings.json` as an app launch argument. Only the first new first-party Claude native process claims it; existing processes and compatible backends are not instrumented. Start one ordinary user-requested Claude turn, then inspect `invocations.ndjson` in that private directory. Do not launch synthetic turns just to collect usage. There is no installation into user/project settings: `--settings` supplies only the session's status-line override. The probe deliberately does not run the user's original status-line script.
+
+Records contain receipt time, byte count, sanitized CLI version, and only five-hour/seven-day percentages and reset timestamps. Percentages remain 0–100; omitted values remain unknown. Receipt time and repeated identical values do not establish measurement freshness or account identity. No records feed the usage UI or router. The collector has a two-second timeout, 64 KiB input limit and 256 KiB log cap. Its fixed `RPCE_STATUSLINE_PROBE` stdout sentinel is deliberate: check whether it leaks into the native event stream or affects the turn. Do not ship that sentinel as a production status line.
+
+Managed settings can override the probe. Zero invocations are inconclusive without a known-working authorized interactive control, and results apply only to the tested CLI version/configuration. Keep the output private; remove the temporary directory manually after inspection. The `claimed` marker is intentionally not automatically reset, including after a failed launch.
+
+## Agent admission slow-phase diagnostics
+
+Agent identity admission automatically emits `event=agentAdmission.slow` through the
+`WorkspaceAgentAdmission` OSLog category when a completed admission scope takes at
+least five seconds (including rejection, cancellation, and thrown failure). It uses
+`SuspendingClock`, excluding machine sleep like the coordinator's `DispatchTime`
+uptime measurements. It adds no timers, sleeps, retries, or asynchronous operations.
+It intentionally ships in release (see the [source-layout exception](architecture/source-layout.md#app-visible-diagnostics-retained-in-the-repopromptapp-target)).
+There is no setting to enable and no persisted diagnostic state to clean up.
+
+`workspace=` and `correlation=` use exactly the coordinator's `redactedID` hashes,
+so a slow report can be joined to its queue/acquire/release events without exposing
+raw IDs. `kind=` is one of `fresh_tab`, `existing_tab`, `recovery`, `discard`;
+`outcome=` is `committed`, `rejected`, `cancelled`, or `threw`. Committed means the
+scope accepted its result, not that a provider turn succeeded. Other fields contain
+only fixed phase names, millisecond durations, and counts. Titles, paths, prompt
+text, raw identifiers, and raw errors are never included.
+
+`queue_wait` covers lease acquisition; `refresh` covers canonical snapshot read,
+decode, and reconciliation; `catalog_refresh` separately covers catalog adoption
+awaits (including conflict replay). `save` covers admission persistence and own-save
+waits/convergence; `other` covers remaining lease-held preparation/projection and
+recovery. Durations are exclusive, so nested save waits are not also refresh time.
+`holdMS` aggregates all phases except queue wait. `refreshCount` excludes no-op
+baseline checks and recursive re-entry. `saveAttempts` counts actual persistence
+attempts, including the second attempt on a pre-commit conflict replay, separately
+from save phase entries. Logging happens after releasing this admission's lease;
+a queued successor may already hold the workspace by the time the report emits.
+
+For a future 44-second stall, correlation keys join the phase report to coordinator
+events, while kind/outcome distinguish admission, recovery and discard scopes.
+**MainActor contention is not separable by these phases**: it can inflate any
+phase spanning a suspension, including queue resumption. These are elapsed times,
+not CPU measurements or proof of an underlying cause. A scope that never exits
+still emits no slow report; existing coordinator events remain complementary.
+No threshold enforcement or admission behavior changes are implied.
+
+Deterministic coverage uses an injected clock at the real admission entry points:
+`make dev-test FILTER='WorkspaceAgentAdmissionTimingTests|ConcurrentSameWorkspaceAgentRunAdmissionTests|AgentAdmissionRecoveryTests'`.
+It exercises fresh/existing-tab persistence scopes, the real canonical refresh's
+own-save wait, threshold/outcome/correlation accounting, and emission after lease
+release without wall-clock timing assertions.
+No live launch is required for these tests; capturing a real slow admission still
+requires a separately authorized running-app investigation.
+
 ## Quality gate before adding a test
 
 Add a test only when all four answers are concrete:
@@ -40,6 +103,10 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
 ```
 
+Root `dev-test` jobs build tests in the normal developer environment, then run `swift test --skip-build` in a disposable home and temporary directory using the CI runner's sandbox contract. `FILTER` and `TEST_PRODUCT` are forwarded to that execution; provider-package jobs are unchanged. The sandbox is shared for the local invocation and removed afterward (hosted CI still isolates each suite). Plain `swift test` does not supply this isolation and cannot run the root-authority fixtures safely.
+
+`FILTER` matches suite and method names, never file names. A test file commonly holds several suites named after the contracts they pin, none of them named after the file, so filtering by a filename selects nothing — and a zero-test run exits `0`, reporting `Executed 0 tests, with 0 failures`, which reads as a pass. Check the printed executed count before treating a focused run as evidence; if it is zero, take a real suite name from the file (or `swift test list`) and filter on that.
+
 Use the narrowest relevant filter while iterating. Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, test harness behavior, or many unrelated suites:
 
 ```bash
@@ -47,33 +114,230 @@ make dev-test
 make dev-provider-test
 ```
 
-A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted app-test workflow discovers current methods through `swift test list`, counts methods per suite, assigns suites to four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. That CI mechanism is not a contributor-maintained registry.
+A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted root-test workflow discovers one current root XCTest population through `swift test list`, counts methods per suite, assigns every discovered suite to one of four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. Root CI has no contract/integration tier split or contributor-maintained registry; provider-package tests remain a separate lane.
+
+## Provider subprocess isolation
+
+Provider CLI launches fail closed in processes hosting the XCTest runtime, including nested
+XCTest runners and release-mode test bundles. Detection does not inspect user arguments or
+inherited XCTest environment variables, so those production inputs cannot cause a refusal.
+**Separate non-XCTest child processes spawned by tests are not guarded.** Such fixtures must
+use synthetic commands or injected provider doubles, never an installed provider CLI.
+
+Inject controller/provider doubles rather than relying on an installed CLI. Intentional fixture-process
+tests can set `allowsProviderProcessLaunchForTesting: true` on their `CLIProcessConfiguration`
+or `ACPAgentSessionController`, or scope a launch/probe with
+`ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true)`. These opt-ins are local
+to the configured instance or task, not a process-global environment switch. Mark a process
+`.tool` only for genuinely non-provider tooling, such as Git worktree operations.
+
+## Oracle settled-response recovery
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed `ask_oracle` / `oracle_send` with `export_response:true`; `make dev-test FILTER=OracleGroupBoundaryTests` | Optional export failure retains the settled answer and chat IDs with a safe `oracle_export_error`; no automatic paid replay | Pre-settlement validation/send failures still throw. Recover through returned chat IDs. The deterministic fixture is not live filesystem proof. |
+
+## Oracle reconciliation and progress lifetime
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Reopen an Agent Mode transcript and open a saved `ask_oracle` / `oracle_send` card; `make dev-test FILTER=OracleLaneCoverageTests` | Fresh disk restoration routes to the exact primary chat for both fitting lane digests and summary-budget fallback, while preserving lane coverage | Conflicting or malformed lane identities must not route to another chat or fall back to the latest chat |
+| Complete or fail an Oracle request during progress delivery; `make dev-test FILTER=MCPToolHeartbeatTests` | A gated in-flight heartbeat drains before the tool call returns or rethrows; cancellation preserves the operation's settled result | Cancellation alone does not complete an already-running async progress callback; the deterministic gate is not live transport proof |
+
+The inventory-first reconciliation guidance in `OracleGroupDeliveryContract` showed a paired GPT score gain in the local r02 experiment, but failed its final holdout factual/format gates (more false acceptances) and produced longer answers. Delivery-string tests verify the guidance contract, not reconciliation accuracy.
+
+## Oracle reconciliation settings editor
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Settings → Agent Models → beneath Oracle roster; background Cua controls labeled `Oracle reconciliation guidance`, `Save Oracle reconciliation guidance`, `Restore default Oracle reconciliation guidance`, `Reload Oracle reconciliation guidance`; `make dev-test FILTER=AgentModelsSettingsViewModelStaleEditTests` | Typing does not write; Save persists only guidance in the selected whole profile; blank/Restore Default removes the override. Dirty drafts survive unrelated refreshed profile edits (including same-page Add Oracle), and Save preserves those edits. Conflict is derived from guidance baseline or actual write-destination mismatch; Reload Current Text discards a conflicting draft. Switching between workspaces using the same global profile does not invalidate a global draft. The whole-profile cache/live guard refuses an uncached edit without retrying that click; after refresh, a new explicit Save succeeds if guidance and destination still match, preserving unrelated edits. Clean drafts follow settings notifications. | Global/workspace routing is authoritative; nil workspace guidance uses the built-in default, not global fieldwise inheritance. The existing Settings persistence banner owns pending-save/recovery warnings. GUI driving requires an authorized matching artifact; VM tests are not GUI proof. |
+| Save guidance, start grouped `ask_oracle` / `oracle_send` or Context Builder plan/question/review, then change settings while discovery/lanes are pending; inspect returned text and optional export; `make dev-test FILTER='OraclePresetExecutionTests\|ContextBuilderOraclePresetTests\|ContextBuilderOracleGroupStateTests\|OracleGuidanceContractTests\|OracleGroupDeliveryContractTests\|OracleGroupBoundaryTests'` | The pending request retains its captured guidance in inline and exported results; a later continuation uses new scoped text without changing the conversation roster/prompt. Absent/blank overrides use unchanged default delivery; an explicit override equal to the default remains metadata. N=1 delivery is unchanged. | Caller-facing policy only: lane prompts and canonical history contain no guidance. Direct headless delivery retains the built-in default. Live provider uploads/paid requests and app lifecycle need separate authorization; deterministic transport hooks prove capture/serialization, not live model behavior. |
+
+## Oracle image delivery
+
+Feature map (app-backed only):
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed CE MCP `oracle_send`, or Agent Mode-bound `ask_oracle`, with `images:[{path,title?}]` | Correct description of a pattern absent from filename/title/question; thumbnail visible, saved and restored without original bytes/path; persisted `ask_oracle.images` / `oracle_send.images` redacted; outside-root path rejected with indexed error and no new turn | Already-running matching debug artifact/CLI with verified repository/worktree, commit and dirty-patch provenance (CLI version alone is insufficient), exclusive coordination for the singleton app, loaded authorized fixture root, supported credentials and inspected **entire** Oracle roster. Coordinator approval immediately before uploads/paid prompts; lifecycle approval separately. |
+| Paste/drop an image into an Agent Mode composer (Devin, Codex and Grok receive its path as a text note; `@path` agents already see it), then ask the agent to consult the Oracle | Agent passes the listed attachment path in `ask_oracle.images`; every lane describes the pasted pattern; transcripts keep thumbnails only | Only the owning agent session's own files in the managed `agent_attachments` store are authorized, at their exact path; sibling attachments and other outside-root paths stay rejected. Consumed attachment files are deleted when the turn ends, so only in-flight turn images are reliably available. Same app/approval prerequisites as above. |
+
+Tool discovery and CLI help (`rpce-cli-debug -l` / `-e 'describe oracle_send'`; `describe ask_oracle` on the owning Agent Mode connection) consume the app's tool schema; direct-headless discovery uses the canonical schema and explicitly rejects images. The generated reference is `docs/spec/mcp-domain-canonical-tool-definitions.generated.json`. Neither CLI adds automatic attachment forwarding: the agent must supply `images:[{path,title?}]`.
+
+`make dev-test FILTER='OracleGroupBoundaryTests|OracleImageContractTests|MCPAskOracleWorktreeTests|OracleImageAttachmentLoaderTests'` exercises image loading, start/continuation dispatch, invalid-path rejection, and transcript redaction. The dispatch fixture captures original bytes without a provider call; it is not live image-delivery proof.
+
+Ordinary smoke and packaged initialize/tools-list are **not image-delivery proof**.
+Ordinary CLI connections use `oracle_send`; `ask_oracle` requires an owning Agent Mode session. Both accept images on starts and continuations, and apply the same workspace-root, exact session-attachment, and provider capability checks. Supply a fresh `mode:"chat"`,
+`new_chat:true`, `message`, and nonempty `images` JSON request. Do not include keys,
+raw image bytes or base64. Inspect roster/settings before approval: `model` changes
+only the primary lane; additional Oracle lanes can multiply uploads and cost.
+Use a small generated PNG in a disposable loaded root (neutral filename/title),
+with a simple colored shape/count pattern and a separately recorded expected answer.
+Run this once per approved route; capture command and returned answer/error as
+evidence. A successful RPC alone remains **INCONCLUSIVE**.
+
+Then inspect the resulting preview and saved/restored history through the real app
+(Cua Driver background delivery only). Inspect the disposable session's JSON for
+thumbnail-only storage and redacted tool arguments; retain only sanitized evidence,
+never full prompt/base64 payloads. Submit a second request pointing outside the loaded
+root only with approval; expect indexed loader rejection and no added Oracle turn.
+Unit regressions prove pre-read/pre-dispatch ordering; screenshots cannot prove it.
+Clean up only the created fixtures/session/workspace after evidence capture (use
+`trash` for files); do not stop a visible app. No production profile or keys should be
+copied into fixtures. Direct-headless Oracle rejects images. Originals are this-turn-only;
+continuations do not automatically resend them or use saved thumbnails. Missing
+credentials, unsupported negotiated capabilities or unapproved uploads mean **not run**,
+not PASS.
+
+## Cursor model controls: live verification map
+
+Use conductor for build/health checks (`make dev-build`, `make dev-smoke`); launch/relaunch requires approval. Drive the UI with Cua Driver in background delivery.
+
+| Feature | User / agent path | Observable proof | Prerequisites / traps |
+| --- | --- | --- | --- |
+| Cursor model refresh | Settings → CLI Providers → expand Cursor CLI → Refresh Models | Spinner finishes; result reports models advertised by Cursor, or a retryable error; previous models/selections survive failure | Authenticated `agent acp`. Advertised count is not selectable count: model membership remains release-gated. |
+| Cursor effort pins | Settings → Agent Models (or Models popover) → choose Cursor and an effort-bearing model → effort chip → select advertised choice | Chip reflects choice; reopen surface and inspect persisted model parameters via `agent_manage list_agents`; run applies the advertised config ID / wire value | Models such as Composer may advertise speed only, so no effort chip. Switch models and confirm pins stay per-model. Unsupported saved pins must not be erased by discovery. |
+
+Focused checks: `make dev-test FILTER=Cursor` covers discovery, refresh failure/retry, runtime parameter resolution, per-model persistence, and exact ACP binding. A successful metadata probe alone does not prove the UI or effective inference routing.
+
+## Workspace projection decode diagnostics
+
+This is a bounded, opt-in diagnostic, not a cache or a CI timing gate. It calls
+the production `WorkspaceManagerViewModel.decodeDomainWorkspaceProjection`
+boundary on MainActor, including JSON decoding and both existing compose-tab
+normalization passes. Default decoding, normalization, and persistence are
+unchanged. The harness owns 1, 5, or 20 value consumers; it does not create
+windows, activate workspaces, save documents, or start the app.
+
+### Protocol fixed before measurement
+
+Protocol version: 1. Normalization instrumentation version: 1 (independent of
+the document's schema version). Fixtures contain only generated data with fixed
+UUIDs, timestamps, field order, and text. Counts are usage hypotheses, not
+verified production percentiles. No padding or transcript sidecars are used.
+
+| Workload | Compose/stashed tabs | Selected paths per tab | Presets | Prompt bytes per tab |
+| --- | ---: | ---: | ---: | ---: |
+| ordinary | 2/0 | 20 | 2 | 2048 |
+| busy | 10/5 | 100 | 10 | 8192 |
+| large | 25/20 | 250 | 20 | 16384 |
+
+Tabs include expanded folders and selection slices; presets include selections.
+The harness reports the exact encoded input sizes. Modern fixtures explicitly
+supply IDs and dates. Legacy missing-field normalization generates IDs/dates and
+is tested separately, not silently made deterministic or changed for this run.
+
+For every workload and N = 1, 5, 20, collect all four scenarios (36 cells):
+
+1. `newRevision`: fresh consumers receive revision 1.
+2. `changedDigest`: establish revision 1 outside measurement, then deliver 2.
+3. `dirtySequence`: establish 1, then deliver distinct revisions 2, 3, 4, 5
+   without writing/changing the shared URL or any disk metadata.
+4. `failureCorrection`: establish 1, deliver malformed JSON, then valid revision
+   2 at that same URL. Failed decode leaves the consumer's previous value intact.
+
+The helper accepts bytes rather than authoritative revisions; reported revisions
+are fixture provenance. Failure is injected at this presentation boundary because
+domain metadata validation can reject malformed JSON before it reaches the UI.
+Each delivery finishes synchronously before the next begins: no sleeps, polling,
+wall-clock deadlines, or random schedules. Consumers are serialized by MainActor,
+as the current presentation bridge serializes this synchronous work.
+
+Five warmups per cell precede 30 retained trials, in three blocks of ten. Rotate
+cell order in each block. Fixture construction, encoding, baseline establishment,
+memory reads, correctness assertions, and output serialization are outside timed
+decode intervals. Keep the hardware, toolchain, build, power state, and competing
+load comparable. Never run another build during collection.
+
+Record raw decode attempts/successes/failures, normalization invocations/mutations,
+total and p50/p95 attempt wall time, normalization time (nested, not additive),
+MainActor occupied wall time, and delivery-loop wall time. Current expected counts
+per trial are N/2N decodes/normalizations for the first two scenarios, 4N/8N for
+dirty values, and 2N attempts/N failures/2N normalizations for correction. These
+are diagnostic expectations of the current implementation, not permanent tests
+requiring duplicate work. No timing threshold is asserted by XCTest.
+
+Report cache entries/bytes as zero (there is no projection decode cache), separately
+from peak/settled consumer value counts and serialized-size-equivalent retained
+bytes. The latter is a documented proxy, **not heap allocation accounting**; Swift
+copy-on-write sharing and allocator retention prevent inferring heap use from JSON
+size. Snapshot process RSS, physical footprint, and CPU before/after each scenario
+and after clearing consumers. Process memory peaks are boundary-sampled lower
+bounds, not allocation high-water marks. Memory observation is outside timing.
+The process CPU interval includes correctness checks and counter reads, so it is
+not decoder-only CPU. Diagnostic retained bytes use sample count times the fixed
+sample stride, excluding Array spare capacity and the recorder's lock/object.
+
+Reports contain only numeric provenance, fixed scenario/workload enums, counters,
+and durations. The recorder has a hard 128-attempt capacity, counts dropped
+attempts, has no global registration, and retains no bytes, paths, errors, names,
+document hashes, or user UUIDs. Task-local scopes expire on return/throw. A trial
+with overflow, missing data, count/output mismatches, or nonfinite timing is invalid;
+fail the diagnostic rather than discarding slow/invalid trials. Retain failure
+status and the conductor log; reruns are separate campaigns.
+
+### Decision gate
+
+Evaluate only after completing the matrix:
+
+- Proportional: equivalent decode counts grow with N, and aggregate decode time
+  divided by N times the one-consumer time is between 0.75 and 1.25 at both 5 and
+  20 consumers for the same workload/scenario.
+- Material: on a justified realistic workload, p95 decode/normalization MainActor
+  occupation reaches 16.7 ms per publication, redundant work beyond one decode
+  contributes at least 8 ms, and decoding accounts for at least 25% of complete
+  presentation projection occupation.
+- Both conditions, optimized measurements, and workload realism evidence are
+  required before designing a cache. Duplicate counts alone are insufficient.
+
+This first-stage helper harness deliberately excludes bridge snapshot acquisition,
+digest/self-echo skips, UI application, task queueing, and full window retention.
+Conductor's current root test lane uses Debug. Consequently its report always
+marks the optimization gate `inconclusive`: it cannot establish optimized cost,
+the fraction of complete presentation time, or production workload prevalence.
+Do not compare these Debug numbers against Release responsiveness thresholds.
+Follow-up optimized integration evidence must include those missing boundaries
+before authorizing a shared bounded cache. If either condition is false, do not
+cache; investigate the measured dominant path instead.
+
+### Entry point and cleanup
+
+Run correctness coverage normally:
+
+```sh
+make dev-test FILTER=RepoPromptTests.WorkspaceProjectionDecodeTests
+```
+
+Opt in to the finite diagnostic through the existing conductor scale-test flag:
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test \
+  --filter RepoPromptTests.WorkspaceProjectionDecodeTests/testMeasurementMatrix \
+  --async --request-key issue-1041-decode-matrix
+./conductor job wait --request-key issue-1041-decode-matrix
+```
+
+The harness emits `WORKSPACE_DECODE_MATRIX` JSON records to the conductor log:
+one record per cell, including all 30 trial summaries, and a final decision record.
+This bounds retained evidence without introducing a production export surface or
+another executable. Keep logs outside the repository or in ignored build artifacts;
+never commit raw test/conductor output. The harness clears values and scoped
+recorders at each trial; it makes no preference changes and creates no files.
+Unrelated test-runner output is not a privacy-safe shareable report: extract only
+the typed matrix records. Ordinary test runs skip the diagnostic unless opted in.
 
 ## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
 
-For local strict codemap E2E coverage, opt in with either `RPCE_RUN_CODEMAP_E2E=1` or the marker file `/tmp/RepoPromptCE-codemap-e2e-opt-in`:
+Use the retained deterministic CodeMap tests for local coverage:
 
 ```bash
-RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTests
-touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
+make dev-test FILTER=CodeMapGoldenTests
+make dev-test FILTER=CodeMapArtifactContainerTests
 ```
 
-Run this strict gate when changes touch CodeMap generation, syntax parsing, or Tree-sitter support. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
-
-## Scale-sensitive contract gates
-
-Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. High-cardinality contracts remain explicit opt-ins:
-
-```bash
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.GitLoadedRootAuthorityEvidenceTests/testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests/testManifestScaleStreamsOneHundredThousandOrMillionWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.FileSystemAcceptedIngressBarrierTests/testSyntheticHundredThousandPathReplayWhenEnabled
-```
-
-Use direct `swift test` only for these explicit environment-gated scale checks so the gate reaches the XCTest process. Prefer `make dev-test` for lower-cost routine variants and ordinary focused validation.
+Run these when changes touch CodeMap generation, syntax parsing, artifact storage, or Tree-sitter support. The packaged-app live codemap projection-demand gate is documented later in this guide.
 
 ## Performance and optimization evidence
 
@@ -81,34 +345,18 @@ Define the workload, acceptance threshold, comparable environment, sample count,
 
 Use focused before/after measurements to attribute a change, then exercise the full affected boundary before making repository-wide performance claims. Store durable evidence only when it has continuing review value; otherwise keep raw logs and machine-specific samples local. Do not create a replacement executable registry, method census, append-only repository scoreboard, or mandatory artifact hierarchy merely to track test counts.
 
-## Live Agent Mode file-tool performance diagnostic
+## Live Codex Desktop direct-headless worktree routing
 
-`Scripts/benchmark_agent_mode_file_tools.py` measures paired `file_search` and `read_file` calls from exactly two concurrent Explore sessions: the normal workspace root and a linked worktree. It requires an already-running RepoPrompt CE DEBUG app and never launches, stops, or relaunches the app.
+Run this release acceptance only from a Codex Desktop task whose repository root is an existing linked worktree and whose RepoPrompt launcher selects `--backend headless` with that exact root in `REPOPROMPT_MCP_WORKING_DIRS`. The canonical checkout must already belong to one saved RepoPrompt CE workspace. This lane validates an installed release candidate; it does not build, install, launch, stop, or relaunch RepoPrompt, create a workspace, or create a worktree.
 
-```bash
-python3 Scripts/benchmark_agent_mode_file_tools.py \
-  --window-id 1 \
-  --marker debugDiagnosticsToolName \
-  --path Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnostics.swift
-```
+Record the saved workspace file hash and `git worktree list --porcelain` before starting. In the same Codex task:
 
-By default the driver creates a detached temporary worktree and removes it only when it remains clean and both sessions are terminal; pass `--worktree /absolute/path` to use and preserve an existing linked worktree from the same Git common directory. The manifest records the benchmark worktree's SHA and dirty state. Each run writes a private (`0700`), non-overwriting directory under `/tmp/rpce-agent-file-tools/v1/`; use `--output-root` to override it. Artifacts include provenance, raw CLI calls and agent logs, capture/runtime snapshots, `samples.ndjson`, and `summary.json`, and may contain sensitive workspace snippets, so review them before sharing. Samples and exact workload counts/order come from DEBUG capture timelines (`Received` through the `event_completion` `MainActorExited`); start/wait binding metadata independently proves local-versus-worktree route provenance, while compacted agent logs validate only surfaced call arguments and the final response. Latency is report-only and has no arbitrary failure threshold. Harness, tool-count, nonempty-marker, read-success, and cleanup invariants are enforced.
+1. Call `bind_context` with `op=status`. Require a bound context from the saved canonical workspace, then use `get_file_tree`, `read_file`, and `git status` to prove the task's linked worktree is the physical execution root. A path that exists only in the canonical checkout must remain outside the root fence.
+2. Start two detached `agent_run` sessions with `worktree=@current` and bounded read-only instructions that report a worktree-only marker. Save both returned session IDs and require them to be distinct.
+3. Reconcile both exact session IDs with `agent_run op=wait` and inspect them with `agent_manage op=list_sessions`. Require both terminal snapshots to report the same exact `worktree_root_path`, repository identity, and worktree identity, and require both markers to come from that worktree. Cancel and reconcile any nonterminal session before ending the task. Nested `orchestrate` acceptance belongs to the separate direct-headless workflow/tool-policy change and is not a release gate for this standalone routing change.
+4. Recheck `git worktree list --porcelain`, the saved workspace file hash, and workspace catalog count. Require no added worktree, no changed saved workspace, no temporary workspace, and no durable worktree binding. Repeat once with an explicit different existing selector and require only that session's physical root to change.
 
-Offline replay performs no CLI, model, or app calls and accepts either a checked-in fixture or a prior artifact directory:
-
-```bash
-python3 Scripts/benchmark_agent_mode_file_tools.py \
-  --replay Scripts/Fixtures/agent-mode-file-tools/v1/paired-success
-```
-
-The checked-in success and negative fixtures are privacy-scrubbed subsets derived from real paired captures. They retain relevant event/stage timing shapes but contain no raw agent prose, user paths, UUIDs, or raw logs.
-
-Pure harness validation:
-
-```bash
-python3 -m py_compile Scripts/benchmark_agent_mode_file_tools.py Scripts/test_agent_mode_file_tools_benchmark.py
-python3 Scripts/test_agent_mode_file_tools_benchmark.py
-```
+The Codex Desktop pre-start app-CLI isolation fallback remains in place through this acceptance and the release that contains the fix. Removing or bypassing it is a separate post-release change after the recorded acceptance passes; a failed or unavailable direct-headless check leaves the fallback unchanged.
 
 ## Live large-workspace worktree-startup diagnostic
 
@@ -494,10 +742,9 @@ The smoke lane uses a script-owned app worktree and temporary roots. It checks:
   UUID/path/type evidence plus binding and per-file root/path evidence to
   exclude cross-root/non-Git substitutions;
 - main/worktree/non-Git marker searches do not leak across explicit root filters;
-- non-Git search/read work and codemap returns an explicit typed unavailable
-  status and issue code rather than a
-  graph from another root, with exactly one attributed `get_code_structure`
-  work record and zero Git commands;
+- non-Git search/read work and the code map returns that root's own current
+  marker content rather than a graph from another root, with exactly one
+  attributed `get_code_structure` work record and zero Git commands;
 - watcher create, edit, rename, and delete converge via bounded polling of
   successful exact-binding raw search records;
 - before, during, and after every ordinary/linked-worktree add/remove, the
@@ -518,7 +765,8 @@ The smoke lane uses a script-owned app worktree and temporary roots. It checks:
   folder” rejection is accepted. Generic or mismatched failures are rejected,
   and the surviving root must still succeed through exact binding/path evidence.
   The separate non-Git codemap check instead requires the current non-Git root
-  remain present in the binding with typed `git_root_unavailable` evidence.
+  remain present in the binding and serve successful current-marker code-map
+  structure evidence.
 
 The harness records and checks parent and child terminal status, removes only
 roots it added, cancels/waits only sessions it started, and removes registered,
@@ -618,6 +866,14 @@ self-attest:
 }
 ```
 
+Baseline validation compares the schema, gate, metric, configuration, privacy,
+and fixture-digest inventories, not individual correctness scenario keys, and
+the non-Git checks contribute no performance metric. A previously accepted
+same-fixture baseline therefore stays valid across the non-Git scenario change;
+record the changed scenario set in the run's acceptance notes instead of
+bumping the schema version, loosening thresholds, or self-accepting a baseline
+from the feature run.
+
 The release gate deliberately refuses a missing, hand-written/unaccepted,
 different-fixture, wrong-count, missing-inventory, zero, `NaN`, or infinite
 baseline:
@@ -680,8 +936,14 @@ The command passes only when all of these gates pass:
    removal, that exact session/context must terminalize or be cancelled and an
    atomic probe of its old full path must return typed empty revocation with the
    linked root absent from binding and no primary/cross-root fallback.
-5. Non-Git search/read succeeds, structure is typed terminal, and the scoped
-   build/projection/catalog counters remain unchanged. Watcher
+5. Non-Git search/read succeeds and structure maps the root's current on-disk
+   bytes: the scoped engine is present, reports `source_kind:filesystem` and
+   `manifest_mode:not_applicable`, records no manifest write or queued manifest
+   mutation byte, and a subsequent edit replaces the old marker with the new one
+   in the next structure reply. Build/projection/catalog counters are not
+   required to move, because automatic indexing may already have completed and
+   content-addressed reuse can avoid extraction; process absence is proven by
+   the native injected-spawner test, not by this mode text. Watcher
    create/edit/rename/delete publishes only current structure and markers.
    Strict directory overflow returns empty `budget`, `attempted:2`, `limit:1`,
    and zero downstream build/projection/catalog demand.
@@ -714,8 +976,9 @@ The command passes only when all of these gates pass:
    session and has no 1,000-session cap.
 
 Any missing raw evidence, missing retry delay, stale path/content/marker,
-privacy leak, non-Git codemap work, latency/resource regression, nonterminal
-agent, ambiguous ownership, or incomplete cleanup is a hard failure. On an
+privacy leak, non-Git manifest persistence, stale non-Git marker,
+latency/resource regression, nonterminal agent, ambiguous ownership, or
+incomplete cleanup is a hard failure. On an
 interrupted run, use the existing `cleanup` command with the artifact path; it
 releases or proves expiry of recorded codemap holds and removes recorded added
 roots only when its independent ownership checks pass. Temporary non-Git roots
@@ -778,29 +1041,6 @@ correctness evidence yields `incomplete`. Any recorded invalid attempt yields
 `fail`; it is never silently excluded from campaign validity. Never infer a gate
 from configured route names, untyped text, generic tool failures, or additional
 valid samples.
-
-### 100k and 1M synthetic hooks
-
-The routine namespace-manifest scale contract uses a lower record count with a
-small batch size so ordinary root-suite timing still exercises exact record/read
-counts, more than 100 initial spill runs, and bounded buffer bytes:
-
-```bash
-make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticEntriesRemainWithinConfiguredBatchBytes
-```
-
-The 100K/configured namespace-manifest version uses the same executable oracle
-and remains separate from ordinary root-suite timing:
-
-```bash
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-```
-
-These hooks validate spill/streaming scale, not live Agent Mode latency. The
-live 100k/1M workspace campaign still needs the route, resource, correctness,
-and teardown thresholds above.
 
 Script-only validation, with no app or CLI calls:
 

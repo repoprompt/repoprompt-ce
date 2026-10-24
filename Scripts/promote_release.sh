@@ -21,6 +21,13 @@ ARCHIVE_BASENAME="${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}"
 SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"
 SENTRY_DEPLOY_ENVIRONMENT="${REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT:-production}"
 SENTRY_API_BASE_URL="${REPOPROMPT_SENTRY_API_BASE_URL:-https://sentry.io/api/0}"
+SENTRY_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS:-10}"
+SENTRY_REQUEST_TIMEOUT_SECONDS="${REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS:-60}"
+RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-10}"
+RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS:-120}"
+RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS="${REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS:-600}"
+RELEASE_DOWNLOAD_ATTEMPTS=9
+SENTRY_OPERATION_ATTEMPTS=3
 DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
 DMG_NAME="$ARCHIVE_BASENAME.dmg"
@@ -60,6 +67,115 @@ require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
 }
 
+PKG_NAME="$ARCHIVE_BASENAME.pkg"
+ROLLOUT_MANIFEST_NAME="$ARCHIVE_BASENAME-stable-rollout.json"
+STABLE_ROLLOUT_TOOL="$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py"
+APPLE_IDENTITY_POLICY="$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json"
+ROLLOUT_DECLARATION="$ROOT_DIR/release-rollout.json"
+RELEASE_ARTIFACT_ROLE=""
+PRIMARY_ARTIFACT_NAME=""
+PRIMARY_ARTIFACT=""
+ROLLOUT_MANIFEST=""
+
+# The reviewed release-rollout.json in the tagged source is the single role
+# authority. PR2 promotes legacy/preparer application releases only; the
+# transition and successor roles fail unconditionally until successor rollout
+# enablement, with no override.
+resolve_release_artifact_role() {
+    require_file "$ROLLOUT_DECLARATION"
+    require_file "$APPLE_IDENTITY_POLICY"
+    require_file "$STABLE_ROLLOUT_TOOL"
+    RELEASE_ARTIFACT_ROLE="$(python3 "$STABLE_ROLLOUT_TOOL" current-role --declaration "$ROLLOUT_DECLARATION")"
+    case "$RELEASE_ARTIFACT_ROLE" in
+    legacy | preparer)
+        PRIMARY_ARTIFACT_NAME="$UPDATE_ZIP_NAME"
+        ;;
+    transition | successor)
+        fail "Stable promotion for the $RELEASE_ARTIFACT_ROLE rollout role is dormant until successor rollout enablement"
+        ;;
+    *)
+        fail "Unsupported rollout role: $RELEASE_ARTIFACT_ROLE"
+        ;;
+    esac
+    python3 "$STABLE_ROLLOUT_TOOL" workflow-guard \
+        --declaration "$ROLLOUT_DECLARATION" \
+        --policy "$APPLE_IDENTITY_POLICY"
+}
+
+require_resolved_role() {
+    [[ -n "$RELEASE_ARTIFACT_ROLE" ]] || fail "Rollout role has not been resolved from release-rollout.json"
+}
+
+# Application-style roles (legacy/preparer/successor) distribute a ZIP+DMG pair;
+# the transition role is a package-only artifact with no DMG.
+release_role_ships_dmg() {
+    require_resolved_role
+    case "$RELEASE_ARTIFACT_ROLE" in
+    legacy | preparer | successor) return 0 ;;
+    transition) return 1 ;;
+    *) fail "Unsupported rollout role: $RELEASE_ARTIFACT_ROLE" ;;
+    esac
+}
+
+source_asset_names() {
+    require_resolved_role
+    case "$RELEASE_ARTIFACT_ROLE" in
+    legacy | preparer | successor)
+        printf '%s\n' "$UPDATE_ZIP_NAME" "$DMG_NAME" "$APPCAST_NAME" "$CHECKSUMS_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    transition)
+        printf '%s\n' "$PKG_NAME" "$APPCAST_NAME" "$CHECKSUMS_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    esac
+}
+
+update_asset_names() {
+    require_resolved_role
+    case "$RELEASE_ARTIFACT_ROLE" in
+    legacy | preparer | successor)
+        printf '%s\n' "$UPDATE_ZIP_NAME" "$APPCAST_NAME" "$CHECKSUMS_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    transition)
+        printf '%s\n' "$PKG_NAME" "$APPCAST_NAME" "$CHECKSUMS_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    esac
+}
+
+checksum_asset_names() {
+    require_resolved_role
+    case "$RELEASE_ARTIFACT_ROLE" in
+    legacy | preparer | successor)
+        printf '%s\n' "$APPCAST_NAME" "$DMG_NAME" "$UPDATE_ZIP_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    transition)
+        printf '%s\n' "$APPCAST_NAME" "$PKG_NAME" "$ARTIFACT_MANIFEST_NAME" "$ROLLOUT_MANIFEST_NAME"
+        ;;
+    esac
+}
+
+validate_bounded_positive_integer() {
+    local name="$1" value="$2" maximum="$3"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer"
+    (( value <= maximum )) || fail "$name must not exceed $maximum seconds"
+}
+
+validate_sentry_network_bounds() {
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS "$SENTRY_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS "$SENTRY_REQUEST_TIMEOUT_SECONDS" 300
+    (( SENTRY_CONNECT_TIMEOUT_SECONDS <= SENTRY_REQUEST_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_SENTRY_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_SENTRY_REQUEST_TIMEOUT_SECONDS"
+}
+
+validate_release_download_bounds() {
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" 60
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" 300
+    validate_bounded_positive_integer REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS "$RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS" 1200
+    (( RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+    (( RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS <= RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS )) ||
+        fail "REPOPROMPT_RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS must not exceed REPOPROMPT_RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS"
+}
+
 require_release_tag_matches_metadata() {
     [[ "$RELEASE_TAG" == "v$MARKETING_VERSION" ]] ||
         fail "Release tag must match release metadata: expected v$MARKETING_VERSION, got ${RELEASE_TAG:-<missing>}"
@@ -74,6 +190,7 @@ cleanup() {
 trap cleanup EXIT
 
 prepare_sentry_api_access() {
+    validate_sentry_network_bounds
     require_env REPOPROMPT_SENTRY_ORG
     require_env REPOPROMPT_SENTRY_PROJECT
     local token="${SENTRY_AUTH_TOKEN:-}"
@@ -110,6 +227,8 @@ sentry_api_request() {
     local args=(
         --silent
         --show-error
+        --connect-timeout "$SENTRY_CONNECT_TIMEOUT_SECONDS"
+        --max-time "$SENTRY_REQUEST_TIMEOUT_SECONDS"
         --output "$output_file"
         --write-out '%{http_code}'
         --request "$method"
@@ -120,19 +239,36 @@ sentry_api_request() {
         args+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
     fi
 
-    local status
-    status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")" ||
-        fail "Unable to call the Sentry deploy API"
-    if [[ "$status" == "403" ]]; then
-        fail "Sentry deploy API rejected the organization token (HTTP 403); verify org:ci access to $REPOPROMPT_SENTRY_ORG/$REPOPROMPT_SENTRY_PROJECT"
+    local status curl_status
+    if status="$(curl "${args[@]}" "$(sentry_deploy_endpoint)")"; then
+        curl_status=0
+    else
+        curl_status=$?
     fi
-    [[ "$status" =~ ^2[0-9][0-9]$ ]] ||
-        fail "Sentry deploy API request failed with HTTP $status"
+    if (( curl_status != 0 )); then
+        printf 'transport:%s' "$curl_status"
+        return 0
+    fi
+    [[ "$status" =~ ^[0-9]{3}$ ]] || fail "Sentry deploy API returned an invalid HTTP status"
+    printf '%s' "$status"
+}
+
+sentry_request_ambiguous() {
+    [[ "$1" == transport:* || "$1" =~ ^5[0-9][0-9]$ ]]
 }
 
 list_matching_sentry_deploys() {
     local output_file="$1"
-    sentry_api_request GET "$output_file"
+    local status
+    status="$(sentry_api_request GET "$output_file")"
+    if sentry_request_ambiguous "$status"; then
+        printf 'ambiguous'
+        return 0
+    fi
+    if [[ "$status" == "403" ]]; then
+        fail "Sentry deploy API rejected the organization token (HTTP 403); verify org:ci access to $REPOPROMPT_SENTRY_ORG/$REPOPROMPT_SENTRY_PROJECT"
+    fi
+    [[ "$status" =~ ^2[0-9][0-9]$ ]] || fail "Sentry deploy API request failed with HTTP $status"
     jq -e '
         type == "array" and
         all(.[]; has("environment") and (.environment | type == "string") and
@@ -150,19 +286,12 @@ preflight_sentry_deploy_access() {
     prepare_sentry_api_access
     local matches
     matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-preflight.json")"
+    [[ "$matches" != "ambiguous" ]] || fail "Unable to call the Sentry deploy API within the configured deadline or server-error boundary"
     [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
     printf 'OK: Sentry deploy access verified for %s.\n' "$SENTRY_RELEASE_NAME"
 }
 
 record_verified_sentry_deploy_if_needed() {
-    local matches
-    matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
-    [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
-    if (( matches > 0 )); then
-        printf 'OK: Sentry production deploy already recorded for %s.\n' "$RELEASE_TAG"
-        return
-    fi
-
     local body_file="$TMP_DIR/sentry-deploy-create.json"
     jq -n \
         --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
@@ -170,14 +299,41 @@ record_verified_sentry_deploy_if_needed() {
         --arg project "$REPOPROMPT_SENTRY_PROJECT" \
         '{environment: $environment, name: $name, projects: [$project]}' > "$body_file"
     chmod 600 "$body_file"
-    sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file"
-    jq -e \
-        --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
-        --arg name "$RELEASE_TAG" \
-        '.environment == $environment and .name == $name' \
-        "$TMP_DIR/sentry-deploy-created.json" >/dev/null ||
-        fail "Sentry deploy API returned a malformed create response"
-    printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
+    local matches status attempt
+    for ((attempt = 1; attempt <= SENTRY_OPERATION_ATTEMPTS; attempt++)); do
+        matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-record.json")"
+        if [[ "$matches" == "ambiguous" ]]; then
+            continue
+        fi
+        [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count existing Sentry deploys"
+        if (( matches > 0 )); then
+            printf 'OK: Sentry production deploy already recorded for %s.\n' "$RELEASE_TAG"
+            return 0
+        fi
+        status="$(sentry_api_request POST "$TMP_DIR/sentry-deploy-created.json" "$body_file")"
+        if sentry_request_ambiguous "$status"; then
+            matches="$(list_matching_sentry_deploys "$TMP_DIR/sentry-deploy-reconcile.json")"
+            if [[ "$matches" == "ambiguous" ]]; then
+                continue
+            fi
+            [[ "$matches" =~ ^[0-9]+$ ]] || fail "Unable to count Sentry deploys during reconciliation"
+            if (( matches > 0 )); then
+                printf 'OK: Sentry production deploy confirmed after an ambiguous response for %s.\n' "$RELEASE_TAG"
+                return 0
+            fi
+            continue
+        fi
+        [[ "$status" =~ ^2[0-9][0-9]$ ]] || fail "Sentry deploy API request failed with HTTP $status"
+        jq -e \
+            --arg environment "$SENTRY_DEPLOY_ENVIRONMENT" \
+            --arg name "$RELEASE_TAG" \
+            '.environment == $environment and .name == $name' \
+            "$TMP_DIR/sentry-deploy-created.json" >/dev/null ||
+            fail "Sentry deploy API returned a malformed create response"
+        printf 'OK: recorded Sentry production deploy for %s.\n' "$RELEASE_TAG"
+        return 0
+    done
+    fail "Unable to reconcile Sentry deploy state after bounded transport or HTTP 5xx responses; no further mutation was attempted"
 }
 
 source_gh() {
@@ -189,43 +345,71 @@ update_gh() {
 }
 
 curl_anonymous() {
-    env -u GH_TOKEN -u GITHUB_TOKEN curl \
-        --fail \
-        --location \
-        --retry 8 \
-        --retry-delay 3 \
-        --retry-all-errors \
-        "$@"
+    validate_release_download_bounds
+    local started now remaining attempt_timeout connect_timeout attempt curl_status=28 stdout_file
+    stdout_file="$(mktemp "${TMPDIR:-/tmp}/repoprompt-release-curl.XXXXXX")"
+    started="$(date +%s)"
+    for ((attempt = 1; attempt <= RELEASE_DOWNLOAD_ATTEMPTS; attempt++)); do
+        now="$(date +%s)"
+        remaining=$((RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS - (now - started)))
+        (( remaining > 0 )) || break
+        attempt_timeout="$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS"
+        (( attempt_timeout <= remaining )) || attempt_timeout="$remaining"
+        connect_timeout="$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS"
+        (( connect_timeout <= attempt_timeout )) || connect_timeout="$attempt_timeout"
+        : > "$stdout_file"
+        if env -u GH_TOKEN -u GITHUB_TOKEN curl \
+            --fail \
+            --location \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$attempt_timeout" \
+            "$@" > "$stdout_file"
+        then
+            cat "$stdout_file"
+            rm -f "$stdout_file"
+            return 0
+        else
+            curl_status=$?
+        fi
+        (( attempt < RELEASE_DOWNLOAD_ATTEMPTS )) || break
+        now="$(date +%s)"
+        remaining=$((RELEASE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS - (now - started)))
+        (( remaining > 3 )) || break
+        sleep 3
+    done
+    rm -f "$stdout_file"
+    return "$curl_status"
 }
 
 asset_snapshot() {
     jq -c '[.assets[] | {name, id, size, updatedAt, digest}] | sort_by(.name)'
 }
 
+assert_exact_asset_names() {
+    local release_json="$1"
+    local release_label="$2"
+    shift 2
+    local expected_json
+    expected_json="$(printf '%s\n' "$@" | jq -R . | jq -s 'sort')"
+    jq -e --argjson expected "$expected_json" \
+        '([.assets[].name] | sort) == $expected' \
+        <<< "$release_json" >/dev/null ||
+        fail "$release_label must contain exactly: $*"
+}
+
 assert_exact_release_assets() {
     local release_json="$1"
     local release_label="$2"
-    jq -e \
-        --arg zip "$UPDATE_ZIP_NAME" \
-        --arg dmg "$DMG_NAME" \
-        --arg appcast "$APPCAST_NAME" \
-        --arg checksums "$CHECKSUMS_NAME" \
-        --arg manifest "$ARTIFACT_MANIFEST_NAME" \
-        '([.assets[].name] | sort) == ([$zip, $dmg, $appcast, $checksums, $manifest] | sort)' \
-        <<< "$release_json" >/dev/null ||
-        fail "$release_label must contain exactly: $UPDATE_ZIP_NAME, $DMG_NAME, $APPCAST_NAME, $CHECKSUMS_NAME, $ARTIFACT_MANIFEST_NAME"
+    local names=()
+    while IFS= read -r name; do names+=("$name"); done < <(source_asset_names)
+    assert_exact_asset_names "$release_json" "$release_label" "${names[@]}"
 }
 
 assert_exact_update_assets() {
     local release_json="$1"
-    jq -e \
-        --arg zip "$UPDATE_ZIP_NAME" \
-        --arg appcast "$APPCAST_NAME" \
-        --arg checksums "$CHECKSUMS_NAME" \
-        --arg manifest "$ARTIFACT_MANIFEST_NAME" \
-        '([.assets[].name] | sort) == ([$zip, $appcast, $checksums, $manifest] | sort)' \
-        <<< "$release_json" >/dev/null ||
-        fail "Public updater release must contain exactly: $UPDATE_ZIP_NAME, $APPCAST_NAME, $CHECKSUMS_NAME, $ARTIFACT_MANIFEST_NAME"
+    local names=()
+    while IFS= read -r name; do names+=("$name"); done < <(update_asset_names)
+    assert_exact_asset_names "$release_json" "Public updater release" "${names[@]}"
 }
 
 derive_sparkle_public_key() {
@@ -236,10 +420,10 @@ derive_sparkle_public_key() {
 validate_checksum_manifest() {
     (
         cd "$SOURCE_ASSETS_DIR"
-        printf '%s\n' "$APPCAST_NAME" "$DMG_NAME" "$UPDATE_ZIP_NAME" "$ARTIFACT_MANIFEST_NAME" | sort > "$TMP_DIR/expected-checksum-files.txt"
+        checksum_asset_names | sort > "$TMP_DIR/expected-checksum-files.txt"
         awk '{ print $2 }' "$CHECKSUMS_NAME" | sort > "$TMP_DIR/checksum-files.txt"
         diff -u "$TMP_DIR/expected-checksum-files.txt" "$TMP_DIR/checksum-files.txt" ||
-            fail "$CHECKSUMS_NAME must contain exactly the reviewed ZIP, DMG, appcast, and artifact manifest"
+            fail "$CHECKSUMS_NAME must contain exactly the reviewed release asset set for the $RELEASE_ARTIFACT_ROLE role"
         shasum -a 256 -c "$CHECKSUMS_NAME"
     )
 }
@@ -314,42 +498,23 @@ validate_dmg_matches_zip_app() {
 }
 
 validate_appcast() {
-    local appcast_values="$TMP_DIR/appcast-values.tsv"
-    python3 - "$APPCAST" > "$appcast_values" <<'PYTHON'
-import sys
-import xml.etree.ElementTree as ET
+    require_resolved_role
+    python3 "$STABLE_ROLLOUT_TOOL" validate \
+        --declaration "$ROLLOUT_DECLARATION" \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --version-env "$ROOT_DIR/version.env" \
+        --release-tag "$RELEASE_TAG" \
+        --release-commit "$RELEASE_COMMIT" \
+        --migration-phase "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['expectedMigrationPhase'])" "$ROLLOUT_DECLARATION")" \
+        --allowed-roles legacy,preparer \
+        --enclosure "$PRIMARY_ARTIFACT" \
+        --app-artifact-manifest "$ARTIFACT_MANIFEST" \
+        --appcast "$APPCAST" \
+        --manifest "$ROLLOUT_MANIFEST"
 
-sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-root = ET.parse(sys.argv[1]).getroot()
-items = root.findall("./channel/item")
-if len(items) != 1:
-    raise SystemExit(f"appcast must contain exactly one item, got {len(items)}")
-enclosures = items[0].findall("enclosure")
-if len(enclosures) != 1:
-    raise SystemExit(f"appcast item must contain exactly one enclosure, got {len(enclosures)}")
-item = items[0]
-enclosure = enclosures[0]
-values = [
-    enclosure.attrib.get("url", ""),
-    enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
-    enclosure.attrib.get("length", ""),
-    item.findtext(f"{{{sparkle}}}version", default=""),
-    item.findtext(f"{{{sparkle}}}shortVersionString", default=""),
-]
-print("\t".join(values))
-PYTHON
-
-    local enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
-    IFS=$'\t' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
-    [[ "$enclosure_url" == "$PUBLIC_UPDATE_BASE_URL/$UPDATE_ZIP_NAME" ]] ||
-        fail "Appcast enclosure URL mismatch: $enclosure_url"
+    local enclosure_signature
+    enclosure_signature="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['appcastItems'][0]['edSignature'])" "$ROLLOUT_MANIFEST")"
     [[ -n "$enclosure_signature" ]] || fail "Appcast enclosure is missing an EdDSA signature"
-    [[ "$enclosure_length" == "$(stat -f %z "$UPDATE_ZIP")" ]] ||
-        fail "Appcast enclosure length does not match $UPDATE_ZIP_NAME"
-    [[ "$appcast_build" == "$BUILD_NUMBER" ]] ||
-        fail "Appcast build mismatch: expected $BUILD_NUMBER, got $appcast_build"
-    [[ "$appcast_marketing" == "$MARKETING_VERSION" ]] ||
-        fail "Appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
 
     local private_key_file="$TMP_DIR/sparkle-private-key"
     local committed_public_key_file="$TMP_DIR/sparkle-public-key"
@@ -361,22 +526,61 @@ PYTHON
     [[ "$derived_public_key" == "$committed_public_key" ]] ||
         fail "Protected Sparkle private key does not match the app bundle SUPublicEDKey"
     archive_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
-        "$SIGN_UPDATE" --ed-key-file - -p "$UPDATE_ZIP" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$PRIMARY_ARTIFACT" |
         tr -d '\r\n')"
     [[ "$archive_signature" == "$enclosure_signature" ]] ||
         fail "Protected Sparkle private key does not reproduce the reviewed appcast signature"
     printf '%s' "$committed_public_key" > "$committed_public_key_file"
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift" \
-        "$committed_public_key_file" "$enclosure_signature" "$UPDATE_ZIP"
+        "$committed_public_key_file" "$enclosure_signature" "$PRIMARY_ARTIFACT"
+
+    verify_sibling_enclosures "$committed_public_key_file"
+}
+
+# Every predecessor sibling stays on its own immutable per-tag updater URL.
+# Each sibling's enclosure is re-downloaded and proven by exact size, SHA-256
+# digest, and EdDSA signature under the unchanged committed key, and each
+# predecessor rollout manifest is re-downloaded and proven against the SHA-256
+# binding reviewed in release-rollout.json. Predecessor binaries are verified
+# in place and never copied into the current release.
+verify_sibling_enclosures() {
+    local committed_public_key_file="$1"
+    local sibling_values="$TMP_DIR/sibling-values.tsv"
+    python3 "$STABLE_ROLLOUT_TOOL" sibling-values --manifest "$ROLLOUT_MANIFEST" > "$sibling_values"
+    local sibling_dir="$TMP_DIR/sibling-enclosures"
+    mkdir -p "$sibling_dir"
+    local position role tag url size sha256 signature manifest_name manifest_sha256
+    local sibling_asset sibling_manifest actual_digest
+    while IFS=$'\t' read -r position role tag url size sha256 signature manifest_name manifest_sha256; do
+        [[ "$tag" != "$RELEASE_TAG" ]] ||
+            fail "Sibling appcast items must stay on their own updater tags, found current tag $tag"
+        sibling_asset="$sibling_dir/$position-$(basename "$url")"
+        curl_anonymous "$url" --output "$sibling_asset"
+        [[ "$(stat -f %z "$sibling_asset")" == "$size" ]] ||
+            fail "Sibling enclosure length mismatch for $url"
+        actual_digest="$(shasum -a 256 "$sibling_asset" | awk '{ print $1 }')"
+        [[ "$actual_digest" == "$sha256" ]] ||
+            fail "Sibling enclosure digest mismatch for $url"
+        xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift" \
+            "$committed_public_key_file" "$signature" "$sibling_asset"
+        sibling_manifest="$sibling_dir/$position-$manifest_name"
+        curl_anonymous \
+            "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$tag/$manifest_name" \
+            --output "$sibling_manifest"
+        actual_digest="$(shasum -a 256 "$sibling_manifest" | awk '{ print $1 }')"
+        [[ "$actual_digest" == "$manifest_sha256" ]] ||
+            fail "Sibling rollout manifest digest mismatch for tag $tag"
+    done < "$sibling_values"
 }
 
 verify_source_release() {
+    resolve_release_artifact_role
     require_env RELEASE_TAG
     require_env RELEASE_COMMIT
     require_env SOURCE_GH_TOKEN
     require_env SPARKLE_PRIVATE_KEY
     require_release_tag_matches_metadata
-    for command in codesign curl diff ditto gh hdiutil jq plutil python3 shasum stat xcrun; do
+    for command in cat codesign curl date diff ditto gh hdiutil jq mktemp plutil python3 shasum sleep stat xcrun; do
         require_command "$command"
     done
     require_file "$SIGN_UPDATE"
@@ -420,19 +624,24 @@ verify_source_release() {
         --pattern "$CHECKSUMS_NAME"
     CHECKSUMS="$SOURCE_ASSETS_DIR/$CHECKSUMS_NAME"
     verify_reviewed_checksums_digest
+    local download_args=()
+    local expected_asset
+    while IFS= read -r expected_asset; do
+        [[ "$expected_asset" == "$CHECKSUMS_NAME" ]] && continue
+        download_args+=(--pattern "$expected_asset")
+    done < <(source_asset_names)
     source_gh release download "$RELEASE_TAG" \
         --repo "$SOURCE_GITHUB_REPOSITORY" \
         --dir "$SOURCE_ASSETS_DIR" \
-        --pattern "$UPDATE_ZIP_NAME" \
-        --pattern "$DMG_NAME" \
-        --pattern "$APPCAST_NAME" \
-        --pattern "$ARTIFACT_MANIFEST_NAME"
+        "${download_args[@]}"
     recheck_source_assets
 
     UPDATE_ZIP="$SOURCE_ASSETS_DIR/$UPDATE_ZIP_NAME"
     DMG="$SOURCE_ASSETS_DIR/$DMG_NAME"
+    PRIMARY_ARTIFACT="$SOURCE_ASSETS_DIR/$PRIMARY_ARTIFACT_NAME"
     APPCAST="$SOURCE_ASSETS_DIR/$APPCAST_NAME"
     ARTIFACT_MANIFEST="$SOURCE_ASSETS_DIR/$ARTIFACT_MANIFEST_NAME"
+    ROLLOUT_MANIFEST="$SOURCE_ASSETS_DIR/$ROLLOUT_MANIFEST_NAME"
     validate_checksum_manifest
 
     ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
@@ -479,10 +688,13 @@ recheck_source_assets() {
 verify_strictly_newer_build() {
     local latest_json_file="$TMP_DIR/latest-release.json"
     local latest_status latest_json latest_tag latest_appcast latest_build
+    validate_release_download_bounds
     if ! latest_status="$(env -u GH_TOKEN -u GITHUB_TOKEN curl \
         --location \
         --silent \
         --show-error \
+        --connect-timeout "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
         --header "Authorization: Bearer $PUBLIC_UPDATE_GH_TOKEN" \
         --header "Accept: application/vnd.github+json" \
         --output "$latest_json_file" \
@@ -505,17 +717,7 @@ verify_strictly_newer_build() {
     curl_anonymous \
         "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$latest_tag/$APPCAST_NAME" \
         --output "$latest_appcast"
-    latest_build="$(python3 - "$latest_appcast" <<'PYTHON'
-import sys
-import xml.etree.ElementTree as ET
-
-sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-items = ET.parse(sys.argv[1]).getroot().findall("./channel/item")
-if len(items) != 1:
-    raise SystemExit("latest stable appcast must contain exactly one item")
-print(items[0].findtext(f"{{{sparkle}}}version", default=""))
-PYTHON
-)"
+    latest_build="$(python3 "$STABLE_ROLLOUT_TOOL" max-build --appcast "$latest_appcast")"
     [[ "$BUILD_NUMBER" =~ ^[0-9]+$ && "$latest_build" =~ ^[0-9]+$ ]] ||
         fail "Stable build numbers must be numeric: current=$BUILD_NUMBER latest=$latest_build"
     (( BUILD_NUMBER > latest_build )) ||
@@ -527,17 +729,20 @@ verify_existing_update_release() {
     local existing_assets_dir="$TMP_DIR/existing-update-assets"
     assert_exact_update_assets "$update_release_json"
     mkdir -p "$existing_assets_dir"
+    local download_args=()
+    local expected_asset
+    while IFS= read -r expected_asset; do
+        download_args+=(--pattern "$expected_asset")
+    done < <(update_asset_names)
     update_gh release download "$RELEASE_TAG" \
         --repo "$PUBLIC_UPDATE_REPOSITORY" \
         --dir "$existing_assets_dir" \
-        --pattern "$UPDATE_ZIP_NAME" \
-        --pattern "$APPCAST_NAME" \
-        --pattern "$CHECKSUMS_NAME" \
-        --pattern "$ARTIFACT_MANIFEST_NAME"
-    cmp "$UPDATE_ZIP" "$existing_assets_dir/$UPDATE_ZIP_NAME"
+        "${download_args[@]}"
+    cmp "$PRIMARY_ARTIFACT" "$existing_assets_dir/$PRIMARY_ARTIFACT_NAME"
     cmp "$APPCAST" "$existing_assets_dir/$APPCAST_NAME"
     cmp "$CHECKSUMS" "$existing_assets_dir/$CHECKSUMS_NAME"
     cmp "$ARTIFACT_MANIFEST" "$existing_assets_dir/$ARTIFACT_MANIFEST_NAME"
+    cmp "$ROLLOUT_MANIFEST" "$existing_assets_dir/$ROLLOUT_MANIFEST_NAME"
 }
 
 prepare_update_release() {
@@ -560,10 +765,11 @@ prepare_update_release() {
     fi
 
     update_gh release create "$RELEASE_TAG" \
-        "$UPDATE_ZIP" \
+        "$PRIMARY_ARTIFACT" \
         "$APPCAST" \
         "$CHECKSUMS" \
         "$ARTIFACT_MANIFEST" \
+        "$ROLLOUT_MANIFEST" \
         --repo "$PUBLIC_UPDATE_REPOSITORY" \
         --target main \
         --draft \
@@ -617,34 +823,44 @@ publish_reviewed_release() {
 
 verify_anonymous_publish() {
     local published_update_appcast="$TMP_DIR/published-update-appcast.xml"
-    local published_update_zip="$TMP_DIR/published-update-$UPDATE_ZIP_NAME"
+    local published_update_primary="$TMP_DIR/published-update-$PRIMARY_ARTIFACT_NAME"
     local published_update_checksums="$TMP_DIR/published-update-$CHECKSUMS_NAME"
     local published_update_manifest="$TMP_DIR/published-update-$ARTIFACT_MANIFEST_NAME"
-    local published_source_zip="$TMP_DIR/published-source-$UPDATE_ZIP_NAME"
+    local published_update_rollout="$TMP_DIR/published-update-$ROLLOUT_MANIFEST_NAME"
+    local published_source_rollout="$TMP_DIR/published-source-$ROLLOUT_MANIFEST_NAME"
+    local published_source_primary="$TMP_DIR/published-source-$PRIMARY_ARTIFACT_NAME"
     local published_source_dmg="$TMP_DIR/published-source-$DMG_NAME"
     local published_source_appcast="$TMP_DIR/published-source-$APPCAST_NAME"
     local published_source_checksums="$TMP_DIR/published-source-$CHECKSUMS_NAME"
     local published_source_manifest="$TMP_DIR/published-source-$ARTIFACT_MANIFEST_NAME"
 
     curl_anonymous "$PUBLIC_FEED_URL" --output "$published_update_appcast"
-    curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$UPDATE_ZIP_NAME" --output "$published_update_zip"
+    curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$PRIMARY_ARTIFACT_NAME" --output "$published_update_primary"
     curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$CHECKSUMS_NAME" --output "$published_update_checksums"
     curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$ARTIFACT_MANIFEST_NAME" --output "$published_update_manifest"
-    curl_anonymous "$SOURCE_RELEASE_BASE_URL/$UPDATE_ZIP_NAME" --output "$published_source_zip"
-    curl_anonymous "$SOURCE_RELEASE_BASE_URL/$DMG_NAME" --output "$published_source_dmg"
+    curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$ROLLOUT_MANIFEST_NAME" --output "$published_update_rollout"
+    curl_anonymous "$SOURCE_RELEASE_BASE_URL/$PRIMARY_ARTIFACT_NAME" --output "$published_source_primary"
+    if release_role_ships_dmg; then
+        curl_anonymous "$SOURCE_RELEASE_BASE_URL/$DMG_NAME" --output "$published_source_dmg"
+    fi
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$APPCAST_NAME" --output "$published_source_appcast"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$CHECKSUMS_NAME" --output "$published_source_checksums"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$ARTIFACT_MANIFEST_NAME" --output "$published_source_manifest"
+    curl_anonymous "$SOURCE_RELEASE_BASE_URL/$ROLLOUT_MANIFEST_NAME" --output "$published_source_rollout"
 
     cmp "$APPCAST" "$published_update_appcast"
-    cmp "$UPDATE_ZIP" "$published_update_zip"
+    cmp "$PRIMARY_ARTIFACT" "$published_update_primary"
     cmp "$CHECKSUMS" "$published_update_checksums"
     cmp "$ARTIFACT_MANIFEST" "$published_update_manifest"
-    cmp "$UPDATE_ZIP" "$published_source_zip"
-    cmp "$DMG" "$published_source_dmg"
+    cmp "$PRIMARY_ARTIFACT" "$published_source_primary"
+    if release_role_ships_dmg; then
+        cmp "$DMG" "$published_source_dmg"
+    fi
     cmp "$APPCAST" "$published_source_appcast"
     cmp "$CHECKSUMS" "$published_source_checksums"
     cmp "$ARTIFACT_MANIFEST" "$published_source_manifest"
+    cmp "$ROLLOUT_MANIFEST" "$published_update_rollout"
+    cmp "$ROLLOUT_MANIFEST" "$published_source_rollout"
 
     local update_latest_url source_latest_url
     update_latest_url="$(curl_anonymous \
@@ -663,18 +879,20 @@ verify_anonymous_publish() {
     printf 'OK: anonymous release smoke passed for %s.\n' "$RELEASE_TAG"
 }
 
-case "$MODE" in
-    verify)
-        verify_source_release
-        ;;
-    promote)
-        verify_source_release
-        preflight_sentry_deploy_access
-        publish_reviewed_release
-        verify_anonymous_publish
-        record_verified_sentry_deploy_if_needed
-        ;;
-    *)
-        fail "Usage: $0 verify|promote"
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        verify)
+            verify_source_release
+            ;;
+        promote)
+            verify_source_release
+            preflight_sentry_deploy_access
+            publish_reviewed_release
+            verify_anonymous_publish
+            record_verified_sentry_deploy_if_needed
+            ;;
+        *)
+            fail "Usage: $0 verify|promote"
+            ;;
+    esac
+fi

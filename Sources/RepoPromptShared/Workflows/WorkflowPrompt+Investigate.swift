@@ -74,7 +74,7 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="<k
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Poll periodically or use `op=wait` so you can approve requests and keep them unblocked. This applies to every detached agent in this workflow.
+> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the configured subagent wait when there is no useful independent work; it returns when approval is needed so you can keep them unblocked. This applies to every detached agent in this workflow.
 
 ### Phase 2: Broad Context Gathering (via \(builderName) — REQUIRED)
 
@@ -169,12 +169,12 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=pair session_name="Inves
 \(example(variant,
 	mcp: """
 ```json
-{"tool":"agent_run","args":{"op":"wait","session_id":"<pair_session_id>","timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_id":"<pair_session_id>"}}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=wait session_id=<pair_uuid> timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_id=<pair_uuid>'
 ```
 """))
 

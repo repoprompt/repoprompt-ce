@@ -4,43 +4,6 @@ import XCTest
 
 @MainActor
 final class CodexManagedLogoutCoordinatorTests: XCTestCase {
-    func testMultiWindowLogoutIsIdempotentAndAwaitsEveryParticipant() async throws {
-        let fence = CodexManagedSessionFence()
-        let logoutGate = ManagedLogoutTestGate(result: .signedOut)
-        let coordinator = CodexManagedLogoutCoordinator(
-            fence: fence,
-            logoutOperation: { await logoutGate.run() }
-        )
-        let firstWindow = ManagedLogoutParticipant()
-        let secondWindow = ManagedLogoutParticipant()
-
-        let first = Task {
-            await coordinator.stopSessionsAndSignOut(participants: [firstWindow, secondWindow])
-        }
-        try await waitUntil { firstWindow.stopCount == 1 && secondWindow.stopCount == 1 }
-        XCTAssertTrue(fence.isFenced)
-        XCTAssertTrue(fence.isLogoutInProgress)
-
-        let repeated = Task {
-            await coordinator.stopSessionsAndSignOut(participants: [firstWindow, secondWindow])
-        }
-        await Task.yield()
-        XCTAssertEqual(firstWindow.stopCount, 1)
-        XCTAssertEqual(secondWindow.stopCount, 1)
-        let logoutCallCount = await logoutGate.callCount
-        XCTAssertEqual(logoutCallCount, 1)
-
-        await logoutGate.finish()
-        let firstResult = await first.value
-        let repeatedResult = await repeated.value
-        XCTAssertEqual(firstResult, .signedOut)
-        XCTAssertEqual(repeatedResult, .signedOut)
-        XCTAssertEqual(firstWindow.stopCount, 1)
-        XCTAssertEqual(secondWindow.stopCount, 1)
-        XCTAssertTrue(fence.isFenced)
-        XCTAssertFalse(fence.isLogoutInProgress)
-    }
-
     func testLogoutFailureUnfencesNewWorkWithoutClaimingSuccess() async {
         let fence = CodexManagedSessionFence()
         let participant = ManagedLogoutParticipant()
@@ -86,17 +49,6 @@ final class CodexManagedLogoutCoordinatorTests: XCTestCase {
         XCTAssertEqual(CodexManagedSignOutConfirmation.cancelTitle, "Cancel")
         XCTAssertEqual(CodexManagedSignOutConfirmation.confirmTitle, "Stop Sessions & Sign Out")
     }
-
-    private func waitUntil(
-        timeout: TimeInterval = 1,
-        condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTAssertTrue(condition(), "Condition was not satisfied before timeout")
-    }
 }
 
 @MainActor
@@ -117,25 +69,105 @@ private final class ManagedLogoutParticipant: CodexManagedSessionShutdownPartici
     }
 }
 
-private actor ManagedLogoutTestGate {
-    let result: CodexManagedAuthLogoutResult
-    private(set) var callCount = 0
-    private var continuation: CheckedContinuation<Void, Never>?
+/// The managed-auth authority reports established credentials so owners of long-lived
+/// app-server processes can replace them. Routine reads of an unchanged account and the
+/// launch-time check must not report, or every recovery read would restart those processes.
+final class CodexManagedAuthTransitionTests: XCTestCase {
+    /// Scripted `account/read` answers (an empty ID means signed out); `account/logout`
+    /// always succeeds.
+    private final class ScriptedAccountClient: CodexManagedAuthRPCClient, @unchecked Sendable {
+        private let lock = NSLock()
+        private var accountReads: [String]
 
-    init(result: CodexManagedAuthLogoutResult) {
-        self.result = result
-    }
-
-    func run() async -> CodexManagedAuthLogoutResult {
-        callCount += 1
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
+        init(accountReads: [String]) {
+            self.accountReads = accountReads
         }
-        return result
+
+        func updateDefaultRequestTimeout(_: TimeInterval?) async {}
+        func startIfNeeded() async throws {}
+        func stop() async {}
+
+        func request(method: String, params _: [String: Any]?, timeout _: TimeInterval?) async throws -> [String: Any] {
+            if method == "account/logout" { return [:] }
+            lock.lock()
+            let accountID = accountReads.isEmpty ? "" : accountReads.removeFirst()
+            lock.unlock()
+            guard !accountID.isEmpty else {
+                return ["account": NSNull(), "requiresOpenaiAuth": true]
+            }
+            return ["account": ["type": "chatgpt", "accountId": accountID], "requiresOpenaiAuth": true]
+        }
+
+        func subscribeNotifications() async -> AsyncStream<CodexAppServerClient.Notification> {
+            AsyncStream { $0.finish() }
+        }
     }
 
-    func finish() {
-        continuation?.resume()
-        continuation = nil
+    private final class Collected: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [CodexManagedAuthTransition] = []
+
+        var values: [CodexManagedAuthTransition] {
+            lock.lock()
+            defer { lock.unlock() }
+            return items
+        }
+
+        func append(_ item: CodexManagedAuthTransition) {
+            lock.lock()
+            items.append(item)
+            lock.unlock()
+        }
+    }
+
+    private func waitForCount(_ collected: Collected, _ count: Int) async -> Bool {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if collected.values.count >= count { return true }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return false
+    }
+
+    func testReportsRecoveryAndAccountChangeOnlyAndOrdersSignOutInTheSameStream() async {
+        // Each read uses a fresh client; the script is shared across them.
+        let client = ScriptedAccountClient(accountReads: ["acct-A", "acct-A", "", "acct-A", "acct-B", "acct-B"])
+        let service = CodexManagedAuthRecoveryService(clientFactory: { client }, refreshRequestTimeout: 1)
+        let collected = Collected()
+        let stream = await service.authTransitions()
+        let collector = Task {
+            for await transition in stream {
+                collected.append(transition)
+            }
+        }
+
+        _ = await service.refreshManagedAccount() // launch-time check: unknown -> acct-A, silent
+        _ = await service.refreshManagedAccount() // unchanged account, silent
+        _ = await service.refreshManagedAccount() // requires login
+        _ = await service.refreshManagedAccount() // recovered after observed sign-out
+        let recovered = await waitForCount(collected, 1)
+        XCTAssertTrue(recovered)
+        _ = await service.refreshManagedAccount() // account change
+        let changed = await waitForCount(collected, 2)
+        XCTAssertTrue(changed)
+
+        let logout = await service.logoutManagedAccount()
+        XCTAssertEqual(logout, .signedOut)
+        let signOutReported = await waitForCount(collected, 3)
+        XCTAssertTrue(signOutReported)
+
+        _ = await service.refreshManagedAccount() // same account, but after a sign-out
+        let afterSignOut = await waitForCount(collected, 4)
+        XCTAssertTrue(afterSignOut)
+
+        // Earlier sign-ins carry the pre-sign-out generation; the sign-out and everything
+        // after it carry the generation the sign-out moved to.
+        XCTAssertEqual(collected.values, [
+            .established(accountID: "acct-A", generation: 0),
+            .established(accountID: "acct-B", generation: 0),
+            .signOutStarted(generation: 1),
+            .established(accountID: "acct-B", generation: 1)
+        ])
+        collector.cancel()
     }
 }

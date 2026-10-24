@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension MCPServerViewModel {
     nonisolated static func makeTokenStats(
@@ -105,7 +106,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func prepareMCPTokenAccounting(
-        context: TabContextSnapshot,
+        context: MCPTabContextSnapshot,
         effectiveSelection: StoredSelection,
         collections: SelectionReplyAssembler.SelectionCollections,
         resolvedContext: PromptContextResolved,
@@ -366,7 +367,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func virtualTokenSignature(
-        context: TabContextSnapshot,
+        context: MCPTabContextSnapshot,
         selection: StoredSelection,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
@@ -391,7 +392,7 @@ extension MCPServerViewModel {
     @MainActor
     private func enqueueVirtualTokenRefresh(
         signature: MCPVirtualTokenSignature,
-        context: TabContextSnapshot,
+        context: MCPTabContextSnapshot,
         effectiveSelection: StoredSelection,
         resolvedContext: PromptContextResolved,
         collections: SelectionReplyAssembler.SelectionCollections,

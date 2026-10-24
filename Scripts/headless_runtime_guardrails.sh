@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 runtime_sources="Sources/RepoPromptDomainRuntime"
-direct_sources="Sources/RepoPromptMCP"
+direct_sources=("Sources/RepoPromptMCP" "Sources/RepoPromptMCPCore")
+direct_core="Sources/RepoPromptMCPCore"
 
 if grep -R -n -E '^[[:space:]]*import[[:space:]]+(AppKit|SwiftUI)([[:space:]]|$)' "$runtime_sources"; then
   echo "error: RepoPromptDomainRuntime must remain independent of AppKit and SwiftUI" >&2
@@ -17,14 +18,19 @@ for forbidden in \
   MCPDomainCanonicalToolManifest \
   RECORD_MCP_WINDOW_TOOL_CATALOG \
   MCPServerViewModel; do
-  if grep -R -n --include='*.swift' --include='*.json' "$forbidden" "$runtime_sources" "$direct_sources"; then
+  if grep -R -n --include='*.swift' --include='*.json' "$forbidden" "$runtime_sources" "${direct_sources[@]}"; then
     echo "error: forbidden duplicate or app-owned headless authority: $forbidden" >&2
     exit 1
   fi
 done
 
+# The retired MCP ServiceRegistry is a whole symbol, not a substring of unrelated registries.
+if grep -R -n -w --include='*.swift' ServiceRegistry Sources; then
+  echo "error: retired M7 migration authority remains in production sources: ServiceRegistry" >&2
+  exit 1
+fi
+
 for retired in \
-  ServiceRegistry \
   MCPWindowToolRuntime \
   MCPWindowToolDependencies \
   MCPWindowToolContext \
@@ -58,23 +64,23 @@ if [[ ! -f "$canonical_file" ]]; then
   exit 1
 fi
 
-if find "$runtime_sources" "$direct_sources" -type f \( -iname '*tool*manifest*.json' -o -iname '*schema*manifest*.json' \) -print -quit | grep -q .; then
+if find "$runtime_sources" "${direct_sources[@]}" -type f \( -iname '*tool*manifest*.json' -o -iname '*schema*manifest*.json' \) -print -quit | grep -q .; then
   echo "error: headless canonical schemas must not be copied into a resource manifest" >&2
   exit 1
 fi
 
-if ! grep -q 'MCPStdioServerTransport' "$direct_sources/DirectHeadlessMCPService.swift"; then
+if ! grep -q 'MCPStdioServerTransport' "$direct_core/DirectHeadlessMCPService.swift"; then
   echo "error: headless backend must use its terminal-aware bounded stdio transport" >&2
   exit 1
 fi
 
-if grep -E -q '(^|[^[:alnum:]_])StdioTransport\(' "$direct_sources/DirectHeadlessMCPService.swift"; then
+if grep -E -q '(^|[^[:alnum:]_])StdioTransport\(' "$direct_core/DirectHeadlessMCPService.swift"; then
   echo "error: headless backend must not install the SDK stdio dispatcher" >&2
   exit 1
 fi
 
 canonical_workspace_service="$runtime_sources/MCPDomainCanonicalWorkspaceService.swift"
-direct_workspace_adapter="$direct_sources/DirectHeadlessWorkspaceBackends.swift"
+direct_workspace_adapter="$direct_core/DirectHeadlessWorkspaceBackends.swift"
 if [[ ! -f "$canonical_workspace_service" ]] \
   || ! grep -q 'MCPDomainCanonicalWorkspaceService' "$direct_workspace_adapter"; then
   echo "error: direct workspace tools must adapt the canonical domain workspace service" >&2

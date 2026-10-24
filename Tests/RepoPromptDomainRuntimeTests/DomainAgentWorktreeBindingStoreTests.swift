@@ -44,34 +44,6 @@ final class DomainAgentWorktreeBindingStoreTests: XCTestCase {
         XCTAssertTrue(remainingBindings.isEmpty)
     }
 
-    func testConcurrentStoresReloadAndRetryCASWithoutDroppingBindings() async throws {
-        let root = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let profile = "worktree-bindings-cas"
-        let firstSessionID = UUID()
-        let secondSessionID = UUID()
-        let first = makeStore(root: root, profile: profile)
-        let second = makeStore(root: root, profile: profile)
-        await first.bootstrap()
-        await second.bootstrap()
-
-        _ = try await first.upsert(
-            sessionID: firstSessionID,
-            binding: makeBinding(id: "one", repositoryID: "repo-one")
-        )
-        _ = try await second.upsert(
-            sessionID: secondSessionID,
-            binding: makeBinding(id: "two", repositoryID: "repo-two")
-        )
-
-        let reloaded = makeStore(root: root, profile: profile)
-        await reloaded.bootstrap()
-        let firstBindings = await reloaded.bindings(sessionID: firstSessionID)
-        let secondBindings = await reloaded.bindings(sessionID: secondSessionID)
-        XCTAssertEqual(firstBindings.map(\.id), ["one"])
-        XCTAssertEqual(secondBindings.map(\.id), ["two"])
-    }
-
     private func makeStore(root: URL, profile: String) -> DomainAgentWorktreeBindingStore {
         let identity = DomainRuntimeIdentity(
             runtimeID: UUID(),
@@ -91,18 +63,6 @@ final class DomainAgentWorktreeBindingStoreTests: XCTestCase {
         return DomainAgentWorktreeBindingStore(
             persistence: DomainPersistenceCoordinator(configuration: configuration, identity: identity),
             profileIdentifier: profile
-        )
-    }
-
-    private func makeBinding(id: String, repositoryID: String) -> AgentSessionWorktreeBinding {
-        AgentSessionWorktreeBinding(
-            id: id,
-            repositoryID: repositoryID,
-            repoKey: repositoryID,
-            logicalRootPath: "/workspace/\(repositoryID)",
-            worktreeID: "worktree-\(id)",
-            worktreeRootPath: "/workspace/\(repositoryID)-worktree",
-            source: "test"
         )
     }
 

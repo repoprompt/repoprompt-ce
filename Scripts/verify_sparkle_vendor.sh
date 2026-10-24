@@ -52,6 +52,7 @@ def snapshot(root: Path):
 actual = {}
 for relative in [
     "Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework",
+    "Sparkle.xcframework/macos-arm64_x86_64/dSYMs",
     "bin",
 ]:
     actual.update(snapshot(vendor / relative))
@@ -97,6 +98,7 @@ PYTHON
 }
 
 compare_trees "$TRUSTED_FRAMEWORK" "$SOURCE_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+compare_trees "$TRUSTED_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/dSYMs" "$SOURCE_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/dSYMs"
 compare_trees "$TRUSTED_VENDOR/bin" "$SOURCE_VENDOR/bin"
 if [[ -n "$CANDIDATE_FRAMEWORK" ]]; then
     [[ -d "$CANDIDATE_FRAMEWORK" ]] || fail "Missing built Sparkle framework: $CANDIDATE_FRAMEWORK"

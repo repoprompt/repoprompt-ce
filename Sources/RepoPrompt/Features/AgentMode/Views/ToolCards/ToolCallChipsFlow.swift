@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 /// Displays tool calls as a single wrapping Text with inline SF Symbol icons.

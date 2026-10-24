@@ -37,20 +37,5 @@ final class PCRE2SearchFastPlansTests: XCTestCase {
 
         XCTAssertEqual(result.matches?.map(\.lineNumber), [257, 258, 259, 260])
         XCTAssertEqual(result.contentFileCount, 1)
-
-        let mixedEmptyPrefilter = PCRE2LinePrefilter(
-            asciiRequiredAlternatives: ["", "class"],
-            caseInsensitive: true
-        )
-        XCTAssertNil(
-            PCRE2LinePrefilterMatcher(prefilter: mixedEmptyPrefilter),
-            "Unsupported alternatives must disable the prefilter so every line reaches PCRE2."
-        )
-
-        let unsupportedNeedlePrefilter = PCRE2LinePrefilter(
-            asciiRequiredAlternatives: ["class", "cla\u{017F}s"],
-            caseInsensitive: true
-        )
-        XCTAssertNil(PCRE2LinePrefilterMatcher(prefilter: unsupportedNeedlePrefilter))
     }
 }

@@ -9,6 +9,8 @@ package enum MCPToolExecutionSettlement: String, Equatable, Sendable {
 package enum MCPToolExecutionCancellationOrigin: String, Equatable, Sendable {
     case watchdogDeadline = "watchdog_deadline"
     case requestCancellation = "request_cancellation"
+    case clientDeadline = "client_deadline"
+    case serverExportEnvelope = "server_export_envelope"
 }
 
 package struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError, Sendable {
@@ -30,11 +32,13 @@ package enum MCPToolExecutionWatchdogEvent: Equatable, Sendable {
         MCPToolExecutionSettlement,
         cancellationRequested: Bool
     )
+    case cleanupGraceCappedByOuterEnvelope
     case cleanupGraceExpired(resolvedDisposition: MCPToolExecutionCleanupDisposition)
     case detachedForSettlement
 }
 
 package enum MCPToolExecutionWatchdogError: Error, Equatable, Sendable {
+    case admissionEnvelopeExpired
     case executionTimedOut(settlement: MCPToolExecutionSettlement)
     case executionDetached
     case cleanupUnresponsive
@@ -119,6 +123,7 @@ package enum MCPToolExecutionWatchdog {
             case deferred
             case settleDetached
             case settleAbandoned
+            case settleForceDisconnected
         }
 
         enum DetachPreparation {
@@ -131,6 +136,7 @@ package enum MCPToolExecutionWatchdog {
             case detaching
             case detached
             case abandoned
+            case forceDisconnecting
         }
 
         private let lock = NSLock()
@@ -150,6 +156,8 @@ package enum MCPToolExecutionWatchdog {
                     return .settleDetached
                 case .abandoned:
                     return .settleAbandoned
+                case .forceDisconnecting:
+                    return .settleForceDisconnected
                 }
             }
         }
@@ -191,10 +199,23 @@ package enum MCPToolExecutionWatchdog {
         func abandon() -> ResultBox<T>? {
             lock.withLock {
                 switch mode {
-                case .detached, .abandoned:
+                case .detached, .abandoned, .forceDisconnecting:
                     return nil
                 case .running, .detaching:
                     mode = .abandoned
+                    defer { completed = nil }
+                    return completed
+                }
+            }
+        }
+
+        func forceDisconnect() -> ResultBox<T>? {
+            lock.withLock {
+                switch mode {
+                case .detached, .abandoned, .forceDisconnecting:
+                    return nil
+                case .running, .detaching:
+                    mode = .forceDisconnecting
                     defer { completed = nil }
                     return completed
                 }
@@ -231,6 +252,7 @@ package enum MCPToolExecutionWatchdog {
     package static func execute<T: Sendable>(
         deadline: Duration,
         cancellationGrace: Duration,
+        cleanupNotAfter: Duration? = nil,
         cleanupDisposition: MCPToolExecutionCleanupDisposition = .forceDisconnect,
         settlementSlot: MCPCodeStructureSettlementRegistry.Slot? = nil,
         environment: MCPToolExecutionWatchdogEnvironment = .continuous(),
@@ -239,9 +261,11 @@ package enum MCPToolExecutionWatchdog {
         onDetachedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
         onAbandonedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
         onForceDisconnectedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
+        operationCompletionInstant: @escaping @Sendable () -> Duration? = { nil },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        let deadlineInstant = environment.now() + deadline
+        let watchdogStart = environment.now()
+        let deadlineInstant = watchdogStart + deadline
         let (stream, continuation) = AsyncStream<Event<T>>.makeStream()
         let tasks = TaskStore()
         let operationState = settlementSlot == nil ? OperationState<T>() : nil
@@ -267,7 +291,9 @@ package enum MCPToolExecutionWatchdog {
             } catch {
                 result = .failure(error)
             }
-            let completionTime = environment.now()
+            // A caller may begin work before watchdog installation; its recorded completion
+            // instant remains authoritative even when Task.value is observed later.
+            let completionTime = operationCompletionInstant() ?? environment.now()
             let box = ResultBox(result: result, completionTime: completionTime)
             if let settlementSlot {
                 let operationSettlement = settlement(for: box)
@@ -298,6 +324,8 @@ package enum MCPToolExecutionWatchdog {
                     await onDetachedSettlement(settlement(for: box))
                 case .settleAbandoned:
                     await onAbandonedSettlement(settlement(for: box))
+                case .settleForceDisconnected:
+                    await onForceDisconnectedSettlement(settlement(for: box))
                 }
             }
         }
@@ -392,25 +420,46 @@ package enum MCPToolExecutionWatchdog {
                     deadlineDidExpire = true
                     operationTask.cancel()
                     await environment.beforeCleanupGraceTaskRegistration()
-                    let graceTask = Task {
-                        do {
-                            try await environment.sleep(cancellationGrace)
-                            guard !Task.isCancelled else { return }
-                            await environment.eventDidProduce(.cleanupGraceExpired)
-                            continuation.yield(.cleanupGraceExpired)
-                        } catch {
-                            // Cancellation is the normal path when the operation settles.
-                        }
+                    let cancellationStart = environment.now()
+                    let outerRemainingGrace = cleanupNotAfter.map {
+                        max(.zero, $0 - cancellationStart)
                     }
-                    tasks.append(graceTask)
+                    let effectiveCancellationGrace = outerRemainingGrace.map {
+                        min(cancellationGrace, $0)
+                    } ?? cancellationGrace
+                    let graceWasCapped = effectiveCancellationGrace < cancellationGrace
+                    let graceTask: Task<Void, Never>? = if effectiveCancellationGrace > .zero {
+                        Task {
+                            do {
+                                try await environment.sleep(effectiveCancellationGrace)
+                                guard !Task.isCancelled else { return }
+                                await environment.eventDidProduce(.cleanupGraceExpired)
+                                continuation.yield(.cleanupGraceExpired)
+                            } catch {
+                                // Cancellation is the normal path when the operation settles.
+                            }
+                        }
+                    } else {
+                        nil
+                    }
+                    if let graceTask {
+                        tasks.append(graceTask)
+                    }
                     await onEvent(.deadlineExpired)
                     await onEvent(.cancellationRequested(origin: .watchdogDeadline))
+                    if graceWasCapped {
+                        await onEvent(.cleanupGraceCappedByOuterEnvelope)
+                    }
+                    if graceTask == nil {
+                        await environment.eventDidProduce(.cleanupGraceExpired)
+                        continuation.yield(.cleanupGraceExpired)
+                    }
 
                 case .cleanupGraceExpired:
                     guard deadlineDidExpire else { continue }
 
                     if let settlementSlot {
-                        switch settlementSlot.resolveGraceExpiry() {
+                        switch settlementSlot.resolveGraceExpiry(now: environment.now()) {
                         case .settled:
                             continue
 
@@ -449,8 +498,12 @@ package enum MCPToolExecutionWatchdog {
 
                     switch cleanupDisposition {
                     case .forceDisconnect:
+                        let completed = operationState?.forceDisconnect()
                         tasks.cancelAll()
                         continuation.finish()
+                        if let completed {
+                            await onForceDisconnectedSettlement(settlement(for: completed))
+                        }
                         await onEvent(.cleanupGraceExpired(resolvedDisposition: .forceDisconnect))
                         throw MCPToolExecutionWatchdogError.cleanupUnresponsive
 
@@ -493,7 +546,7 @@ package enum MCPToolExecutionWatchdog {
                 await onEvent(.cancellationRequested(origin: .requestCancellation))
             }
             if let settlementSlot {
-                switch settlementSlot.cancel() {
+                switch settlementSlot.cancel(now: environment.now()) {
                 case let .abandoned(completedSettlement):
                     if let completedSettlement {
                         Task { await onAbandonedSettlement(completedSettlement) }

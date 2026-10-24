@@ -3,6 +3,10 @@ import Foundation
 package struct DomainCredentialScope: Codable, Hashable, Sendable {
     package let providerIdentifier: String
     package let runID: UUID
+    package let launchID: UUID?
+    package let oracleGroupID: OracleGroupID?
+    package let oracleLaneID: OracleLaneID?
+    package let oracleGroupClaimID: UUID?
     package let principalID: UUID
     package let purpose: String
     package let accountIdentifierDigest: String?
@@ -10,12 +14,20 @@ package struct DomainCredentialScope: Codable, Hashable, Sendable {
     package init(
         providerIdentifier: String,
         runID: UUID,
+        launchID: UUID? = nil,
+        oracleGroupID: OracleGroupID? = nil,
+        oracleLaneID: OracleLaneID? = nil,
+        oracleGroupClaimID: UUID? = nil,
         principalID: UUID,
         purpose: String,
         accountIdentifierDigest: String? = nil
     ) {
         self.providerIdentifier = providerIdentifier
         self.runID = runID
+        self.launchID = launchID
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneID = oracleLaneID
+        self.oracleGroupClaimID = oracleGroupClaimID
         self.principalID = principalID
         self.purpose = purpose
         self.accountIdentifierDigest = accountIdentifierDigest
@@ -241,6 +253,14 @@ package actor DomainCredentialEnvelopeStore {
         lifetime: Duration = .seconds(60)
     ) throws -> DomainCredentialEnvelopeDescriptor {
         guard !isShuttingDown, !bytes.isEmpty else { throw DomainCredentialEnvelopeError.unavailable }
+        let oracleIdentityCount = [
+            scope.oracleGroupID != nil,
+            scope.oracleLaneID != nil,
+            scope.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || (oracleIdentityCount == 3 && scope.launchID != nil) else {
+            throw DomainCredentialEnvelopeError.scopeMismatch
+        }
         guard bytes.count <= Self.maximumPayloadBytes else {
             throw DomainCredentialEnvelopeError.payloadTooLarge
         }
@@ -428,6 +448,101 @@ package actor DomainCredentialEnvelopeStore {
     #endif
 }
 
+package struct DomainChildLaunchLanePlan: Hashable, Sendable {
+    package let launchID: UUID
+    package let providerIdentifier: String
+    package let oracleLaneID: OracleLaneID?
+
+    package init(
+        launchID: UUID = UUID(),
+        providerIdentifier: String,
+        oracleLaneID: OracleLaneID? = nil
+    ) {
+        self.launchID = launchID
+        self.providerIdentifier = providerIdentifier
+        self.oracleLaneID = oracleLaneID
+    }
+}
+
+package enum DomainChildLaunchPlanError: Error, Equatable, Sendable {
+    case invalidLaneCount
+    case invalidLanePrefix
+    case duplicateLaunchID
+    case carrierMismatch
+}
+
+package struct DomainChildLaunchPlan: Sendable {
+    package let runID: UUID
+    package let oracleGroupID: OracleGroupID?
+    package let oracleGroupClaimID: UUID?
+    package let lanes: [DomainChildLaunchLanePlan]
+    package let approvalMetadata: [String: String]
+
+    package init(
+        runID: UUID,
+        oracleGroupID: OracleGroupID? = nil,
+        oracleGroupClaimID: UUID? = nil,
+        lanes: [DomainChildLaunchLanePlan],
+        approvalMetadata: [String: String] = [:]
+    ) throws {
+        guard (1 ... OracleRosterContract.maximumCount).contains(lanes.count) else {
+            throw DomainChildLaunchPlanError.invalidLaneCount
+        }
+        guard Set(lanes.map(\.launchID)).count == lanes.count else {
+            throw DomainChildLaunchPlanError.duplicateLaunchID
+        }
+        let oracleLanes = lanes.compactMap(\.oracleLaneID)
+        if oracleGroupID != nil || oracleGroupClaimID != nil || !oracleLanes.isEmpty {
+            guard oracleGroupID != nil,
+                  oracleGroupClaimID != nil,
+                  oracleLanes.count == lanes.count,
+                  oracleLanes.map(\.index) == Array(lanes.indices)
+            else {
+                throw DomainChildLaunchPlanError.invalidLanePrefix
+            }
+        }
+        self.runID = runID
+        self.oracleGroupID = oracleGroupID
+        self.oracleGroupClaimID = oracleGroupClaimID
+        self.lanes = lanes
+        var metadata = approvalMetadata
+        metadata["lane_count"] = "\(lanes.count)"
+        metadata["providers"] = lanes.map(\.providerIdentifier).joined(separator: ",")
+        if let oracleGroupID { metadata["oracle_group_id"] = oracleGroupID.rawValue.uuidString }
+        self.approvalMetadata = metadata
+    }
+}
+
+package struct DomainChildLaunchCarrierBundle: Sendable {
+    package let plan: DomainChildLaunchPlan
+    package let carriers: [DomainChildLaunchCarrier]
+
+    package init(plan: DomainChildLaunchPlan, carriers: [DomainChildLaunchCarrier]) throws {
+        guard carriers.count == plan.lanes.count,
+              carriers.map(\.runID).allSatisfy({ $0 == plan.runID }),
+              carriers.map(\.launchID) == plan.lanes.map(\.launchID),
+              carriers.map(\.providerIdentifier) == plan.lanes.map { Optional($0.providerIdentifier) },
+              carriers.map(\.oracleLaneID) == plan.lanes.map(\.oracleLaneID),
+              carriers.allSatisfy({
+                  $0.oracleGroupID == plan.oracleGroupID
+                      && $0.oracleGroupClaimID == plan.oracleGroupClaimID
+              })
+        else {
+            throw DomainChildLaunchPlanError.carrierMismatch
+        }
+        self.plan = plan
+        self.carriers = carriers
+    }
+
+    package var singleCarrier: DomainChildLaunchCarrier? {
+        carriers.count == 1 ? carriers[0] : nil
+    }
+
+    package func carrier(for laneID: OracleLaneID) -> DomainChildLaunchCarrier? {
+        carriers.first { $0.oracleLaneID == laneID }
+    }
+}
+
 package struct DomainChildLaunchCarrier: Sendable {
     package static let endpointEnvironmentKey = "REPOPROMPT_MCP_PRIVATE_ENDPOINT"
     package static let launchTokenEnvironmentKey = "REPOPROMPT_MCP_LAUNCH_TOKEN"
@@ -435,19 +550,38 @@ package struct DomainChildLaunchCarrier: Sendable {
     package static let clientPrincipalEnvironmentKey = "REPOPROMPT_MCP_CLIENT_PRINCIPAL"
     package static let providerIdentifierEnvironmentKey = "REPOPROMPT_MCP_PROVIDER_IDENTIFIER"
     package static let runIDEnvironmentKey = "REPOPROMPT_MCP_RUN_ID"
+    package static let launchIDEnvironmentKey = "REPOPROMPT_MCP_LAUNCH_ID"
+    package static let oracleGroupIDEnvironmentKey = "REPOPROMPT_MCP_ORACLE_GROUP_ID"
+    package static let oracleLaneIDEnvironmentKey = "REPOPROMPT_MCP_ORACLE_LANE_ID"
+    package static let oracleGroupClaimIDEnvironmentKey = "REPOPROMPT_MCP_ORACLE_GROUP_CLAIM_ID"
 
     package let runID: UUID
+    package let launchID: UUID
+    package let providerIdentifier: String?
+    package let oracleGroupID: OracleGroupID?
+    package let oracleLaneID: OracleLaneID?
+    package let oracleGroupClaimID: UUID?
     package let launchTokenID: UUID
     package let credentialEnvelope: DomainCredentialEnvelopeDescriptor?
     package let environment: [String: String]
 
     package init(
         runID: UUID,
+        launchID: UUID = UUID(),
+        providerIdentifier: String? = nil,
+        oracleGroupID: OracleGroupID? = nil,
+        oracleLaneID: OracleLaneID? = nil,
+        oracleGroupClaimID: UUID? = nil,
         launchTokenID: UUID,
         credentialEnvelope: DomainCredentialEnvelopeDescriptor?,
         environment: [String: String]
     ) {
         self.runID = runID
+        self.launchID = launchID
+        self.providerIdentifier = providerIdentifier
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneID = oracleLaneID
+        self.oracleGroupClaimID = oracleGroupClaimID
         self.launchTokenID = launchTokenID
         self.credentialEnvelope = credentialEnvelope
         self.environment = environment
@@ -458,45 +592,101 @@ package struct DomainPrivateChildLaunchHarness: Sendable {
     package typealias IssueLaunchToken = @Sendable (
         _ request: DomainRunLaunchReservationRequest
     ) async throws -> DomainRunLaunchToken
+    package typealias RevokeLaunchToken = @Sendable (_ tokenID: UUID) async -> Void
 
     private let endpointDescriptor: String
     private let issueLaunchToken: IssueLaunchToken
+    private let revokeLaunchToken: RevokeLaunchToken
     private let credentialStore: DomainCredentialEnvelopeStore
 
     package init(
         endpointDescriptor: String,
         credentialStore: DomainCredentialEnvelopeStore,
-        issueLaunchToken: @escaping IssueLaunchToken
+        issueLaunchToken: @escaping IssueLaunchToken,
+        revokeLaunchToken: @escaping RevokeLaunchToken = { _ in }
     ) {
         self.endpointDescriptor = endpointDescriptor
         self.credentialStore = credentialStore
         self.issueLaunchToken = issueLaunchToken
+        self.revokeLaunchToken = revokeLaunchToken
     }
 
     package func prepare(
         request: DomainRunLaunchReservationRequest,
         credential: (bytes: [UInt8], scope: DomainCredentialScope)? = nil
     ) async throws -> DomainChildLaunchCarrier {
+        let oracleIdentityCount = [
+            request.oracleGroupID != nil,
+            request.oracleLaneID != nil,
+            request.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || oracleIdentityCount == 3 else {
+            throw DomainRunLaunchTokenError.incompleteOracleIdentity
+        }
+        if let credential {
+            let scope = credential.scope
+            let isGrouped = request.oracleGroupID != nil
+                || request.oracleLaneID != nil
+                || request.oracleGroupClaimID != nil
+            let identityMatches = if isGrouped {
+                scope.launchID == request.launchID
+                    && scope.oracleGroupID == request.oracleGroupID
+                    && scope.oracleLaneID == request.oracleLaneID
+                    && scope.oracleGroupClaimID == request.oracleGroupClaimID
+            } else {
+                (scope.launchID == nil || scope.launchID == request.launchID)
+                    && (scope.oracleGroupID == nil || scope.oracleGroupID == request.oracleGroupID)
+                    && (scope.oracleLaneID == nil || scope.oracleLaneID == request.oracleLaneID)
+                    && (scope.oracleGroupClaimID == nil
+                        || scope.oracleGroupClaimID == request.oracleGroupClaimID)
+            }
+            guard scope.providerIdentifier == request.providerIdentifier,
+                  scope.runID == request.runID,
+                  identityMatches
+            else {
+                throw DomainCredentialEnvelopeError.scopeMismatch
+            }
+        }
         let token = try await issueLaunchToken(request)
         let descriptor: DomainCredentialEnvelopeDescriptor?
-        if let credential {
-            descriptor = try await credentialStore.issue(bytes: credential.bytes, scope: credential.scope)
-        } else {
-            descriptor = nil
+        do {
+            if let credential {
+                descriptor = try await credentialStore.issue(bytes: credential.bytes, scope: credential.scope)
+            } else {
+                descriptor = nil
+            }
+        } catch {
+            await revokeLaunchToken(token.tokenID)
+            throw error
         }
         var environment = [
             DomainChildLaunchCarrier.endpointEnvironmentKey: endpointDescriptor,
             DomainChildLaunchCarrier.launchTokenEnvironmentKey: token.material,
             DomainChildLaunchCarrier.clientPrincipalEnvironmentKey: request.clientPrincipal,
             DomainChildLaunchCarrier.providerIdentifierEnvironmentKey: request.providerIdentifier,
-            DomainChildLaunchCarrier.runIDEnvironmentKey: request.runID.uuidString
+            DomainChildLaunchCarrier.runIDEnvironmentKey: request.runID.uuidString,
+            DomainChildLaunchCarrier.launchIDEnvironmentKey: request.launchID.uuidString
         ]
+        if let groupID = request.oracleGroupID {
+            environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey] = groupID.rawValue.uuidString
+        }
+        if let laneID = request.oracleLaneID {
+            environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey] = "\(laneID.index)"
+        }
+        if let claimID = request.oracleGroupClaimID {
+            environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey] = claimID.uuidString
+        }
         if let descriptor {
             environment[DomainChildLaunchCarrier.credentialEnvelopeEnvironmentKey] =
                 descriptor.envelopeID.uuidString
         }
         return DomainChildLaunchCarrier(
             runID: request.runID,
+            launchID: request.launchID,
+            providerIdentifier: request.providerIdentifier,
+            oracleGroupID: request.oracleGroupID,
+            oracleLaneID: request.oracleLaneID,
+            oracleGroupClaimID: request.oracleGroupClaimID,
             launchTokenID: token.tokenID,
             credentialEnvelope: descriptor,
             environment: environment

@@ -1,4 +1,6 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class PathMatchingRecoveryTests: XCTestCase {

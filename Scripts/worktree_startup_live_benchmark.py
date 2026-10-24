@@ -2220,6 +2220,40 @@ def self_test_command(_args: argparse.Namespace) -> int:
         expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
         expected_file_path=str(fixture_file), expected_file_type="swift", expected_content=marker,
     )["ok"]
+
+    def structure_marker_evidence(response: Any, expected_marker: str) -> dict[str, Any]:
+        return codemap_structure_evidence(
+            response, expected_root_id=fixture_root_id,
+            expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+            expected_file_path=str(fixture_file), expected_marker=expected_marker,
+            expected_file_type="swift",
+        )
+
+    checks["codemap_structure_current_marker_accepted"] = (
+        structure_marker_evidence(actual_structure, marker)["codemap_content_present"] is True
+    )
+    empty_structure = json.loads(json.dumps(actual_structure))
+    empty_structure["_benchmark_response"]["files"] = []
+    empty_structure["_benchmark_response"]["summary"]["files"] = 0
+    try:
+        structure_marker_evidence(empty_structure, marker)
+        checks["codemap_structure_empty_files_rejected"] = False
+    except BenchmarkError:
+        checks["codemap_structure_empty_files_rejected"] = True
+    stale_structure = json.loads(json.dumps(actual_structure))
+    stale_structure["_benchmark_response"]["files"][0]["content"] = f"{marker}_STALE_V0"
+    try:
+        structure_marker_evidence(stale_structure, f"{marker}_CURRENT_V1")
+        checks["codemap_structure_stale_marker_rejected"] = False
+    except BenchmarkError:
+        checks["codemap_structure_stale_marker_rejected"] = True
+    unavailable_structure = json.loads(json.dumps(actual_structure))
+    unavailable_structure["_benchmark_response"]["status"] = "unavailable"
+    try:
+        structure_marker_evidence(unavailable_structure, marker)
+        checks["codemap_structure_unavailable_status_rejected"] = False
+    except BenchmarkError:
+        checks["codemap_structure_unavailable_status_rejected"] = True
     wrong_binding = dict(actual_search)
     wrong_binding["_benchmark_binding"] = dict(
         actual_search["_benchmark_binding"], repo_paths=["/tmp/another-root"]
@@ -8330,11 +8364,13 @@ def smoke_command(args: argparse.Namespace) -> int:
             expected_file_path=str(non_git / "NonGit.swift"), expected_file_type="file",
             expected_content=non_git_marker,
         )
-        non_git_structure_evidence = structured_removed_evidence(
+        non_git_structure_evidence = structured_success_evidence(
             non_git_structure, "get_code_structure",
             expected_root_id=non_git_root_identity["id"],
             expected_root_path=non_git_root_identity["path"],
             expected_root_type=non_git_root_identity["type"],
+            expected_file_path=str(non_git / "NonGit.swift"), expected_file_type="swift",
+            expected_content=non_git_marker, require_only_file=False,
         )
         results["non-git-root"] = {
             "ok": (
@@ -9134,14 +9170,15 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             "downstream_counter_deltas": overflow_deltas,
         }
 
-        # Non-Git roots must serve search/read while producing no codemap engine work.
+        # Non-Git roots must map their current on-disk bytes without manifest persistence.
         non_git = Path(tempfile.mkdtemp(prefix="rpce-codemap-gate-nongit-"))
         owned_dirs.append(non_git)
         privacy_allowlist.append(non_git)
         non_git_ownership = create_codemap_temp_ownership_marker(
             non_git, artifact_id=artifact.name, plan_sha256=plan["plan_sha256"]
         )
-        non_git_marker = f"RPCE_CODEMAP_NON_GIT_{uuid.uuid4().hex}"
+        non_git_marker = f"RPCE_CODEMAP_NON_GIT_{uuid.uuid4().hex}_V1"
+        non_git_edited_marker = non_git_marker.replace("_V1", "_V2")
         non_git_file = non_git / "NonGit.swift"
         non_git_file.write_text(f"struct {non_git_marker} {{}}\n", encoding="utf-8")
         added_non_git = runner.call(
@@ -9162,9 +9199,6 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
              "recent_publication_limit": 0, "root_limit": 256}, check=False,
         )
         non_git_identity = runtime_root_identity(non_git_runtime, str(non_git))
-        before_non_git = codemap_debug_action(
-            runner, plan, "codemap_root_snapshot", target_root_id=non_git_identity["id"]
-        )
         non_git_search = runner.call(
             "codemap-non-git-search", "file_search",
             {"pattern": non_git_marker, "regex": False,
@@ -9177,6 +9211,17 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         non_git_structure = runner.call(
             "codemap-non-git-structure", "get_code_structure",
+            {"paths": [str(non_git_file)], "signatures": True, "size": "medium",
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        non_git_edit = runner.call(
+            "codemap-non-git-edit", "apply_edits",
+            {"path": str(non_git_file), "search": non_git_marker,
+             "replace": non_git_edited_marker,
+             "context_id": plan["scope"]["context_id"]}, check=False,
+        )
+        non_git_edited_structure = runner.call(
+            "codemap-non-git-edited-structure", "get_code_structure",
             {"paths": [str(non_git_file)], "signatures": True, "size": "medium",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
@@ -9195,24 +9240,48 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             expected_file_path=str(non_git_file), expected_file_type="file",
             expected_content=non_git_marker,
         )["ok"]
-        non_git_terminal = structured_removed_evidence(
-            non_git_structure, "get_code_structure", expected_root_id=non_git_identity["id"],
+        # Both structure evidence calls are fail-closed: codemap_structure_evidence raises
+        # BenchmarkError on an unsuccessful reply, a missing file, or a missing/stale marker,
+        # which the gate records as an operational error and a failed decision.
+        non_git_structure_evidence = codemap_structure_evidence(
+            non_git_structure, expected_root_id=non_git_identity["id"],
             expected_root_path=non_git_identity["path"], expected_root_type=non_git_identity["type"],
+            expected_file_path=str(non_git_file), expected_marker=non_git_marker,
+            expected_file_type="swift",
         )
-        non_git_deltas = {
-            key: codemap_counter_delta(before_non_git["snapshot"], after_non_git["snapshot"], key)
-            for key in ("builds", "graph_index_batches_started", "graph_index_catalog_candidates")
-        }
-        non_git_engine_absent = (
-            find_value(before_non_git["response"], "engine_present") is False
-            and find_value(after_non_git["response"], "engine_present") is False
+        non_git_edited_evidence = codemap_structure_evidence(
+            non_git_edited_structure, expected_root_id=non_git_identity["id"],
+            expected_root_path=non_git_identity["path"], expected_root_type=non_git_identity["type"],
+            expected_file_path=str(non_git_file), expected_marker=non_git_edited_marker,
+            expected_file_type="swift",
         )
-        results["non-git-zero-codemap-work"] = {
-            "ok": non_git_search_ok and non_git_read_ok and non_git_terminal["ok"]
-            and non_git_engine_absent and all(value == 0 for value in non_git_deltas.values()),
-            "typed_terminal": non_git_terminal,
-            "engine_present": not non_git_engine_absent,
-            "counter_deltas": non_git_deltas,
+        non_git_edited_files = tool_payload(
+            non_git_edited_structure, "get_code_structure"
+        ).get("files") or []
+        non_git_stale_marker_absent = not any(
+            non_git_marker in str(item.get("content") or "")
+            for item in non_git_edited_files if isinstance(item, dict)
+        )
+        non_git_engine_present = find_value(after_non_git["response"], "engine_present") is True
+        non_git_source_kind = find_value(after_non_git["response"], "source_kind")
+        non_git_manifest_mode = find_value(after_non_git["response"], "manifest_mode")
+        non_git_manifest_absent = (
+            after_non_git["snapshot"].get("manifest_writes") == 0
+            and after_non_git["snapshot"].get("queued_manifest_mutation_bytes") == 0
+        )
+        results["non-git-filesystem-codemaps"] = {
+            "ok": non_git_search_ok and non_git_read_ok and non_git_engine_present
+            and non_git_source_kind == "filesystem"
+            and non_git_manifest_mode == "not_applicable"
+            and non_git_manifest_absent
+            and call_succeeded(non_git_edit) and non_git_stale_marker_absent,
+            "structure": non_git_structure_evidence,
+            "edited_structure": non_git_edited_evidence,
+            "stale_marker_absent": non_git_stale_marker_absent,
+            "engine_present": non_git_engine_present,
+            "source_kind": non_git_source_kind,
+            "manifest_mode": non_git_manifest_mode,
+            "manifest_persistence_absent": non_git_manifest_absent,
         }
 
         # Watcher lifecycle requires current structure and marker publication at each live state.

@@ -197,6 +197,12 @@ enum ContextBuilderFollowUpFinalizationMonitor {
                     continue
                 }
                 group.cancelAll()
+                if case .timedOut = next {
+                    // Select the timeout before cancellation can finalize a response.
+                    // Stop the stream before the task group joins its children: a
+                    // completion waiter may need stream teardown in order to settle.
+                    await cancelStreaming()
+                }
                 return next
             }
             return .cancelled
@@ -209,8 +215,6 @@ enum ContextBuilderFollowUpFinalizationMonitor {
             }
             return response
         case let .timedOut(timeout):
-            // The timeout outcome is already fixed before cancellation can trigger finalization.
-            await cancelStreaming()
             throw ChatToolError.internalError(timeout.message)
         case let .contextBuilderFailed(error):
             throw error

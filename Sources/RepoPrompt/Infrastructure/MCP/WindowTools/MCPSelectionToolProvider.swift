@@ -2,6 +2,9 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 @MainActor
 final class MCPSelectionToolProvider: MCPAppToolProviding {
@@ -119,36 +122,37 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
                 ],
                 required: []
             )
-        ) { [self] _, args in
-            try await Value(executeManageSelection(args: args))
+        ) { [self] invocation, args in
+            try await Value(executeManageSelection(args: args, invocationContext: invocation.context))
         }
     }
 
-    private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
+    private func executeManageSelection(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.SelectionReply {
         #if DEBUG
-            let metadata = await dependencies.context.captureRequestMetadata()
+            let metadata = invocationContext.metadata
             let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
             let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
                 WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
                     agentSessionID: $0
                 )
             }
-            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
-                try await executeManageSelectionWithRetry(args: args)
+            return try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(tag) {
+                try await executeManageSelectionWithRetry(args: args, invocationContext: invocationContext)
             }
         #else
-            return try await executeManageSelectionWithRetry(args: args)
+            return try await executeManageSelectionWithRetry(args: args, invocationContext: invocationContext)
         #endif
     }
 
     private func executeManageSelectionWithRetry(
-        args: [String: Value]
+        args: [String: Value],
+        invocationContext: ToolInvocationContext
     ) async throws -> ToolResultDTOs.SelectionReply {
         do {
-            return try await executeManageSelectionAttempt(args: args)
+            return try await executeManageSelectionAttempt(args: args, invocationContext: invocationContext)
         } catch is ArtifactCommitConflict {
             do {
-                return try await executeManageSelectionAttempt(args: args)
+                return try await executeManageSelectionAttempt(args: args, invocationContext: invocationContext)
             } catch let retryConflict as ArtifactCommitConflict {
                 throw MCPError.internalError(
                     "Canonical selection changed concurrently (\(retryConflict.reason)). Retry manage_selection."
@@ -157,7 +161,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         }
     }
 
-    private func executeManageSelectionAttempt(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
+    private func executeManageSelectionAttempt(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.SelectionReply {
         try Task.checkCancellation()
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         let rawPaths = args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -174,14 +178,14 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         let strict = args["strict"]?.boolValue ?? false
         let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
         let includeBlocks = view == "content"
-        let metadata = await dependencies.context.captureRequestMetadata()
+        let metadata = invocationContext.metadata
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain)
         let drainRequirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement = op == "get"
             ? .canonicalSelection
             : .mirroredSelectionAndMetrics
-        guard try await dependencies.files.drainReadFileAutoSelection(metadata, drainRequirement) == .completed else {
-            throw CancellationError()
+        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+            try await dependencies.files.drainReadFileAutoSelection(metadata, drainRequirement)
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain, transition: .completed)
         try Task.checkCancellation()
@@ -605,10 +609,10 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
     }
 
     private func persistAndReply(
-        resolvedContext: inout MCPServerViewModel.ResolvedTabContextSnapshot,
-        metadata: MCPServerViewModel.RequestMetadata,
+        resolvedContext: inout MCPResolvedTabContextSnapshot,
+        metadata: MCPRequestMetadata,
         lookupContext: WorkspaceLookupContext,
-        baseContext: MCPServerViewModel.TabContextSnapshot,
+        baseContext: MCPTabContextSnapshot,
         selection: StoredSelection,
         includeBlocks: Bool,
         display: FilePathDisplay,

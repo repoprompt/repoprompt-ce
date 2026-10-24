@@ -1,13 +1,22 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 
 extension MCPServerViewModel {
     struct DomainReadAppExecutionContext {
+        let invocationContext: ToolInvocationContext
         let metadata: RequestMetadata
         let resolvedTabContext: ResolvedTabContextSnapshot
         let lookupContext: WorkspaceLookupContext
+        let frozenFileToolAuthority: FrozenFileToolAuthority?
         let targetWindowID: Int
+        let fileToolDependencies: MCPFileToolProvider.Dependencies
+    }
+
+    private func requiresFrozenFileAuthority(toolName: String) -> Bool {
+        MCPAppToolGroup.files.orderedToolNames.contains(toolName)
+            && toolName != MCPWindowToolName.fileActions
     }
 
     @MainActor
@@ -209,7 +218,8 @@ extension MCPServerViewModel {
     @MainActor
     func resolveDomainReadContext(
         toolName: String,
-        requirement: DomainReadContextRequirement
+        requirement: DomainReadContextRequirement,
+        invocationContext explicitInvocationContext: ToolInvocationContext? = nil
     ) async throws -> DomainReadInvocationContext {
         // History and oracle transcript lookup have always been workspace-independent. Do not even
         // capture MainActor routing metadata for them.
@@ -217,26 +227,19 @@ extension MCPServerViewModel {
             return DomainReadInvocationContext(handle: nil, connectionID: nil)
         }
 
-        let metadata: RequestMetadata
+        // The actual binding supplies this captured packet explicitly. Direct internal
+        // callers must establish an explicit trusted-local scope, never infer one from nil.
+        let invocationContext = try explicitInvocationContext
+            ?? MCPInvocationContextBridge.require(toolName: toolName)
+        let metadata = invocationContext.metadata
         if let admitted = MCPDomainAdmittedContextValues.current {
-            guard admitted.windowID == windowID else {
-                throw MCPError.internalError(
-                    "Admitted domain context window \(admitted.windowID) does not match provider window \(windowID)"
-                )
+            guard admitted.windowID == windowID,
+                  admitted.connectionID == metadata.connectionID,
+                  metadata.tabContextHint?.tabID == admitted.contextID,
+                  metadata.tabContextHint?.workspaceID == admitted.workspaceID
+            else {
+                throw MCPError.internalError("Admitted domain context does not match the captured app invocation")
             }
-            metadata = await RequestMetadata(
-                connectionID: admitted.connectionID,
-                clientName: nil,
-                windowID: admitted.windowID,
-                runPurpose: ServerNetworkManager.shared.runPurpose(for: admitted.connectionID),
-                tabContextHint: TabContextHint(
-                    tabID: admitted.contextID,
-                    workspaceID: admitted.workspaceID,
-                    windowID: admitted.windowID
-                )
-            )
-        } else {
-            metadata = await captureRequestMetadata()
         }
         let connectionID = metadata.connectionID
 
@@ -265,6 +268,7 @@ extension MCPServerViewModel {
                 toolName: toolName,
                 requirement: requirement,
                 metadata: metadata,
+                invocationContext: invocationContext,
                 resolved: resolved
             )
         }
@@ -300,6 +304,14 @@ extension MCPServerViewModel {
                 connectionID: connectionID,
                 diagnostic: "workspace authority unavailable"
             )
+        }
+
+        // File authority must be complete before coordinator registration or rebinding so a
+        // retryable hydration failure cannot replace the connection's last usable domain route.
+        let prevalidatedFileAuthority: FrozenFileToolAuthority? = if requiresFrozenFileAuthority(toolName: toolName) {
+            try await targetServer.requiredFileToolLookupContext(from: metadata)
+        } else {
+            nil
         }
 
         do {
@@ -419,14 +431,46 @@ extension MCPServerViewModel {
                     diagnostic: "bound run identity changed before execution"
                 )
             }
-            let invocation = DomainReadInvocationContext(handle: handle, connectionID: connectionID)
+            let lookupContext: WorkspaceLookupContext = if let prevalidatedFileAuthority {
+                prevalidatedFileAuthority.lookupContext
+            } else {
+                await targetServer.lookupContext(for: context)
+            }
+            let executionHandle: DomainReadContextHandle
+            if requiresFrozenFileAuthority(toolName: toolName) {
+                let currentHandle = try await coordinator.resolveReadContext(connection: registration)
+                guard currentHandle.context == targetContext,
+                      Self.domainReadBindingSatisfiesRequestedRun(
+                          requestedRunID: context.runID,
+                          resolvedBindingKind: currentHandle.bindingKind
+                      )
+                else {
+                    return try domainReadUnavailable(
+                        toolName: toolName,
+                        requirement: requirement,
+                        connectionID: connectionID,
+                        diagnostic: "bound context changed while file authority was resolving"
+                    )
+                }
+                executionHandle = currentHandle
+            } else {
+                executionHandle = handle
+            }
+            let invocation = DomainReadInvocationContext(handle: executionHandle, connectionID: connectionID)
             domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+                invocationContext: invocationContext,
                 metadata: metadata,
                 resolvedTabContext: resolved,
-                lookupContext: targetServer.lookupContext(for: context),
-                targetWindowID: context.windowID
+                lookupContext: lookupContext,
+                frozenFileToolAuthority: prevalidatedFileAuthority,
+                targetWindowID: context.windowID,
+                fileToolDependencies: targetServer.domainReadFileToolDependencies()
             )
             return invocation
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as MCPError {
+            throw error
         } catch {
             return try domainReadUnavailable(
                 toolName: toolName,
@@ -442,6 +486,7 @@ extension MCPServerViewModel {
         toolName: String,
         requirement: DomainReadContextRequirement,
         metadata: RequestMetadata,
+        invocationContext: ToolInvocationContext,
         resolved: ResolvedTabContextSnapshot
     ) async throws -> DomainReadInvocationContext {
         let context = resolved.snapshot
@@ -481,11 +526,38 @@ extension MCPServerViewModel {
             refreshesDomainRouting: false
         )
         let targetServer = WindowStatesManager.shared.window(withID: context.windowID)?.mcpServer ?? self
+        let frozenFileToolAuthority: FrozenFileToolAuthority? = if requiresFrozenFileAuthority(toolName: toolName) {
+            try await targetServer.requiredFileToolLookupContext(from: metadata)
+        } else {
+            nil
+        }
+        let lookupContext = if let frozenFileToolAuthority {
+            frozenFileToolAuthority.lookupContext
+        } else {
+            await targetServer.lookupContext(for: context)
+        }
+        if requiresFrozenFileAuthority(toolName: toolName) {
+            let currentResolved = try targetServer.resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName
+            )
+            guard targetServer.fileToolLookupSnapshotMatches(context, currentResolved.snapshot) else {
+                return try domainReadUnavailable(
+                    toolName: toolName,
+                    requirement: requirement,
+                    connectionID: metadata.connectionID,
+                    diagnostic: "fallback context changed while file authority was resolving"
+                )
+            }
+        }
         domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+            invocationContext: invocationContext,
             metadata: metadata,
             resolvedTabContext: resolved,
-            lookupContext: targetServer.lookupContext(for: context),
-            targetWindowID: context.windowID
+            lookupContext: lookupContext,
+            frozenFileToolAuthority: frozenFileToolAuthority,
+            targetWindowID: context.windowID,
+            fileToolDependencies: targetServer.domainReadFileToolDependencies()
         )
         return invocation
     }

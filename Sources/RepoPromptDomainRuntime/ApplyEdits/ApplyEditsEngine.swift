@@ -153,19 +153,139 @@ package struct ApplyEditsEngine {
         let resolved = fallback.resolveBatch(edits: edits, in: originalText)
         let effectiveEdits = resolved.edits
 
-        if let literalResult = tryLiteralBatch(
+        // A literal pass classifies the batch. All literal: done. None literal: every edit
+        // is matched against the original. Mixed: replay in request order, so no edit sees
+        // a later edit's result and a failing sibling never re-routes a literal success
+        // through the line-level fallback (#1262).
+        let literal = applyLiteralEdits(effectiveEdits, to: originalText)
+
+        if literal.outcomes.count == effectiveEdits.count {
+            return buildResult(
+                originalText: originalText,
+                updatedText: literal.text,
+                diffChunks: rewriteChunks(from: originalText, to: literal.text, editCount: effectiveEdits.count),
+                note: "Applied via exact literal replacement",
+                editsRequested: effectiveEdits.count,
+                editsApplied: literal.outcomes.count,
+                status: .success,
+                outcomes: verbose ? literal.outcomes : nil,
+                path: path,
+                verbose: verbose,
+                options: options
+            )
+        }
+
+        let tabPromotionEnabled = batchTabPromotionEnabled(effectiveEdits, path: path)
+
+        if literal.outcomes.isEmpty {
+            return try await applyBatchDiff(
+                edits: effectiveEdits,
+                originalText: originalText,
+                path: path,
+                tabPromotionEnabled: tabPromotionEnabled,
+                verbose: verbose,
+                options: options
+            )
+        }
+
+        return try await replayMixedBatch(
             edits: effectiveEdits,
             originalText: originalText,
             path: path,
+            tabPromotionEnabled: tabPromotionEnabled,
             verbose: verbose,
             options: options
-        ) {
-            return literalResult
+        )
+    }
+
+    private struct LiteralBatchPass {
+        var text: String
+        var outcomes: [EditOutcome] = []
+    }
+
+    /// Classifier: applies, in order, every edit that `literalReplacement` accepts on the
+    /// progressively updated text, and skips the rest.
+    private func applyLiteralEdits(_ edits: [ApplyEditsOperation], to originalText: String) -> LiteralBatchPass {
+        var pass = LiteralBatchPass(text: originalText)
+        for (idx, edit) in edits.enumerated() {
+            guard let updated = literalReplacement(of: edit, in: pass.text) else { continue }
+            pass.text = updated
+            pass.outcomes.append(EditOutcome(index: idx, status: "success", error: nil))
+        }
+        return pass
+    }
+
+    /// An edit applies literally when its search has exactly one match in `text`, or at
+    /// least one for `replaceAll`. Returns the updated text, or nil.
+    private func literalReplacement(of edit: ApplyEditsOperation, in text: String) -> String? {
+        let matches = text.ranges(of: edit.search)
+        if edit.replaceAll, !matches.isEmpty {
+            return text.replacingOccurrences(of: edit.search, with: edit.replace)
+        }
+        guard !edit.replaceAll, matches.count == 1 else { return nil }
+        var updated = text
+        updated.replaceSubrange(matches[0], with: edit.replace)
+        return updated
+    }
+
+    private static let repeatedSearchRefusal =
+        "search repeats in this batch and has no unique exact match; use a distinct search for each edit"
+
+    /// Mixed batches: each edit, in request order, runs against the text the edits before
+    /// it left. A literal hit is spliced. Otherwise, an edit whose search appears once in
+    /// the batch takes the line-level fallback alone, with the ambiguity check on. An edit
+    /// whose search repeats in the batch is refused, because line-level matching cannot
+    /// tell its intended occurrence from one a previous edit wrote. At least one edit
+    /// applies: until one does the text is unchanged, so the classifier's first literal
+    /// edit hits here too.
+    private func replayMixedBatch(
+        edits: [ApplyEditsOperation],
+        originalText: String,
+        path: String,
+        tabPromotionEnabled: Bool,
+        verbose: Bool,
+        options: ApplyEditsExecutionOptions
+    ) async throws -> ApplyEditsResult {
+        let searchCounts = Dictionary(edits.map { ($0.search, 1) }, uniquingKeysWith: +)
+        var text = originalText
+        var outcomes: [EditOutcome] = []
+        for (idx, edit) in edits.enumerated() {
+            if let updated = literalReplacement(of: edit, in: text) {
+                text = updated
+                outcomes.append(EditOutcome(index: idx, status: "success", error: nil))
+                continue
+            }
+            if searchCounts[edit.search, default: 0] > 1 {
+                outcomes.append(EditOutcome(index: idx, status: "failed", error: Self.repeatedSearchRefusal))
+                continue
+            }
+            let fallback = try await generateFallbackChunks(
+                edits: [edit],
+                baseText: text,
+                tabPromotionEnabled: tabPromotionEnabled
+            )
+            // One edit in, one outcome out.
+            outcomes += fallback.outcomes.map { EditOutcome(index: idx, status: $0.status, error: $0.error) }
+            guard fallback.outcomes.contains(where: { $0.status == "success" }) else { continue }
+            let current = text
+            text = try EditFlowPerf.measure(
+                EditFlowPerf.Stage.ApplyEdits.patchApply,
+                EditFlowPerf.Dimensions(chunkCount: fallback.chunks.count)
+            ) {
+                try patchApplier.apply(chunks: fallback.chunks, to: current)
+            }
         }
 
-        return try await applyBatchDiff(
-            edits: effectiveEdits,
+        let applied = outcomes.count(where: { $0.status == "success" })
+        return buildResult(
             originalText: originalText,
+            updatedText: text,
+            diffChunks: rewriteChunks(from: originalText, to: text, editCount: edits.count),
+            note: nil,
+            editsRequested: edits.count,
+            editsApplied: applied,
+            status: applied == edits.count ? .success : .partial,
+            outcomes: outcomes,
             path: path,
             verbose: verbose,
             options: options
@@ -176,18 +296,69 @@ package struct ApplyEditsEngine {
         edits: [ApplyEditsOperation],
         originalText: String,
         path: String,
+        tabPromotionEnabled: Bool,
         verbose: Bool,
         options: ApplyEditsExecutionOptions
     ) async throws -> ApplyEditsResult {
-        let preparation = prepareOriginal(for: originalText)
-        let combinedSearch = edits.map(\.search).joined(separator: "\n")
-        let combinedReplace = edits.map(\.replace).joined(separator: "\n")
-        let tabPromotionEnabled = String.shouldPromoteLeadingEscapedTabs(
-            path: path,
-            searchRaw: combinedSearch.isEmpty ? nil : combinedSearch,
-            replaceRaw: combinedReplace.isEmpty ? nil : combinedReplace
+        let (chunks, outcomes) = try await generateFallbackChunks(
+            edits: edits,
+            baseText: originalText,
+            tabPromotionEnabled: tabPromotionEnabled
         )
 
+        let applied = outcomes.count(where: { $0.status == "success" })
+        if applied == 0 {
+            return ApplyEditsResult(
+                updatedText: originalText,
+                diffChunks: [],
+                unifiedDiff: nil,
+                toolCardUnifiedDiff: nil,
+                stats: nil,
+                note: nil,
+                fileCreated: false,
+                fileOverwritten: false,
+                editsRequested: edits.count,
+                editsApplied: 0,
+                status: .failed,
+                outcomes: outcomes
+            )
+        }
+
+        let updatedText = try EditFlowPerf.measure(
+            EditFlowPerf.Stage.ApplyEdits.patchApply,
+            EditFlowPerf.Dimensions(chunkCount: chunks.count)
+        ) {
+            try patchApplier.apply(
+                chunks: chunks,
+                to: originalText
+            )
+        }
+
+        let status: ApplyEditsStatus = applied == edits.count ? .success : .partial
+        return buildResult(
+            originalText: originalText,
+            updatedText: updatedText,
+            diffChunks: chunks,
+            note: nil,
+            editsRequested: edits.count,
+            editsApplied: applied,
+            status: status,
+            outcomes: outcomes,
+            path: path,
+            verbose: verbose,
+            options: options
+        )
+    }
+
+    /// Line-level fallback matching for edits without a usable literal match. Outcome
+    /// indices are positions in `edits`. Matches must be genuine whole-line matches
+    /// because matched lines are replaced wholesale.
+    private func generateFallbackChunks(
+        edits: [ApplyEditsOperation],
+        baseText: String,
+        tabPromotionEnabled: Bool
+    ) async throws -> (chunks: [DiffChunk], outcomes: [EditOutcome]) {
+        let preparation = prepareOriginal(for: baseText)
         let editModels: [Edit] = edits.compactMap { edit in
             let searchLines = DiffEncodingUtils.encode(edit.search, usesSpaces: preparation.usesSpaces)
             let contentLines = DiffEncodingUtils.encode(edit.replace, usesSpaces: preparation.usesSpaces)
@@ -210,116 +381,48 @@ package struct ApplyEditsEngine {
 
         let (chunks, outcomes, _) = try await EditFlowPerf.measure(
             EditFlowPerf.Stage.ApplyEdits.diffGeneration,
-            EditFlowPerf.Dimensions(fileBytes: originalText.utf8.count, editCount: editModels.count)
+            EditFlowPerf.Dimensions(fileBytes: baseText.utf8.count, editCount: editModels.count)
         ) {
             try await DiffBatchGenerator.generate(
                 originalLines: preparation.encoded,
                 edits: editModels,
                 precision: .high,
                 mcpAmbiguityCheck: shouldCheckAmbiguity,
-                tabPromotionEnabled: tabPromotionEnabled
+                tabPromotionEnabled: tabPromotionEnabled,
+                requireWholeLineMatch: true
             )
         }
+        return (chunks, outcomes)
+    }
 
-        let applied = outcomes.count(where: { $0.status == "success" })
-        if applied == 0 {
-            return ApplyEditsResult(
-                updatedText: originalText,
-                diffChunks: [],
-                unifiedDiff: nil,
-                toolCardUnifiedDiff: nil,
-                stats: nil,
-                note: nil,
-                fileCreated: false,
-                fileOverwritten: false,
-                editsRequested: editModels.count,
-                editsApplied: 0,
-                status: .failed,
-                outcomes: outcomes
-            )
-        }
-
-        let updatedText = try EditFlowPerf.measure(
-            EditFlowPerf.Stage.ApplyEdits.patchApply,
-            EditFlowPerf.Dimensions(chunkCount: chunks.count)
-        ) {
-            try patchApplier.apply(
-                chunks: chunks,
-                to: originalText
-            )
-        }
-
-        let status: ApplyEditsStatus = applied == editModels.count ? .success : .partial
-        return buildResult(
-            originalText: originalText,
-            updatedText: updatedText,
-            diffChunks: chunks,
-            note: nil,
-            editsRequested: editModels.count,
-            editsApplied: applied,
-            status: status,
-            outcomes: outcomes,
+    /// Escaped-tab promotion is decided once per request over every edit, so a LaTeX
+    /// marker in any search or replacement disables it for each fallback edit.
+    private func batchTabPromotionEnabled(_ edits: [ApplyEditsOperation], path: String) -> Bool {
+        let combinedSearch = edits.map(\.search).joined(separator: "\n")
+        let combinedReplace = edits.map(\.replace).joined(separator: "\n")
+        return String.shouldPromoteLeadingEscapedTabs(
             path: path,
-            verbose: verbose,
-            options: options
+            searchRaw: combinedSearch.isEmpty ? nil : combinedSearch,
+            replaceRaw: combinedReplace.isEmpty ? nil : combinedReplace
         )
     }
 
-    private func tryLiteralBatch(
-        edits: [ApplyEditsOperation],
-        originalText: String,
-        path: String,
-        verbose: Bool,
-        options: ApplyEditsExecutionOptions
-    ) -> ApplyEditsResult? {
-        var newText = originalText
-        var outcomes: [EditOutcome] = []
-        var appliedCount = 0
-
-        for (idx, edit) in edits.enumerated() {
-            let matches = newText.ranges(of: edit.search)
-            if edit.replaceAll {
-                guard !matches.isEmpty else { return nil }
-                newText = newText.replacingOccurrences(of: edit.search, with: edit.replace)
-                outcomes.append(EditOutcome(index: idx, status: "success", error: nil))
-                appliedCount += 1
-            } else {
-                guard matches.count == 1 else { return nil }
-                newText.replaceSubrange(matches[0], with: edit.replace)
-                outcomes.append(EditOutcome(index: idx, status: "success", error: nil))
-                appliedCount += 1
-            }
-        }
-
+    private func rewriteChunks(from originalText: String, to newText: String, editCount: Int) -> [DiffChunk] {
         let preparation = prepareOriginal(for: originalText)
         let newLinesRaw = String.splitContentPreservingLineEndings(newText).0
         let desiredIndentationType = preparation.usesSpaces ? "s" : "t"
         let encodedNew = newLinesRaw.map {
             String.encodeIndentationWithConversion($0, desiredIndentationType: desiredIndentationType)
         }
-        let chunks = EditFlowPerf.measure(
+        return EditFlowPerf.measure(
             EditFlowPerf.Stage.ApplyEdits.diffGeneration,
-            EditFlowPerf.Dimensions(fileBytes: originalText.utf8.count, editCount: edits.count)
+            EditFlowPerf.Dimensions(fileBytes: originalText.utf8.count, editCount: editCount)
         ) {
             DiffGenerationUtility.generateRewriteDiff(
                 fileContent: preparation.encoded,
                 newContent: encodedNew
             )
         }
-
-        return buildResult(
-            originalText: originalText,
-            updatedText: newText,
-            diffChunks: chunks,
-            note: "Applied via exact literal replacement",
-            editsRequested: edits.count,
-            editsApplied: appliedCount,
-            status: .success,
-            outcomes: verbose ? outcomes : nil,
-            path: path,
-            verbose: verbose,
-            options: options
-        )
     }
 
     private func buildResult(
@@ -536,7 +639,8 @@ package struct DefaultDiffChunkGenerator: DiffChunkGenerator {
                 searchStartLine: 0,
                 mcpAmbiguityCheck: !replaceAll,
                 replaceAll: replaceAll,
-                tabPromotionEnabled: tabPromotionEnabled
+                tabPromotionEnabled: tabPromotionEnabled,
+                requireWholeLineMatch: true
             )
         } catch let err as DiffGenerationError {
             switch err {

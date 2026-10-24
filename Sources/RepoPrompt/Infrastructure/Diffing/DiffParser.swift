@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // File: RepoPrompt/Models/DiffParserUtils.swift
 
 import Foundation

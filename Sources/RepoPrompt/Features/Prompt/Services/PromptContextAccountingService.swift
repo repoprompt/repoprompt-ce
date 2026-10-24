@@ -1,4 +1,8 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 
 /// Dormant value-based orchestration for resolving persisted workspace selections into prompt-entry
 /// snapshots and token-accounting inputs. This service intentionally has no PromptViewModel or
@@ -911,7 +915,8 @@ actor PromptContextAccountingService {
                        case .loadContent = contentPolicy,
                        content == nil
                     {
-                        missingPaths.append(file.standardizedRelativePath)
+                        // Folder descendants are derived context, so unreadable descendants stay
+                        // best-effort instead of being reported as missing explicit selections.
                         continue
                     }
                     let entry = ResolvedPromptFileEntry(

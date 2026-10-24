@@ -3,76 +3,115 @@ import Foundation
 import XCTest
 
 final class MCPDomainResponseDeliveryTrackerTests: XCTestCase {
-    func testMatchingResponseDrainsAcceptedRequestAfterPhysicalDelivery() async {
+    func testAcceptedPublicationTracksExactTypedIDsThroughCompleteDelivery() async throws {
         let tracker = MCPDomainResponseDeliveryTracker()
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#))
-        let before = tracker.snapshot()
-        XCTAssertEqual(before.pendingRequestCount, 1)
-
-        let waiter = Task { await tracker.waitUntilDrained() }
-        tracker.recordDeliveredServerFrame(Self.frame(#"{"jsonrpc":"2.0","id":1,"result":{}}"#))
-
-        let drained = await waiter.value
-        XCTAssertTrue(drained)
-        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 0)
-    }
-
-    func testNotificationsAndUnmatchedResponsesDoNotChangePendingRequests() {
-        let tracker = MCPDomainResponseDeliveryTracker()
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#))
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":"a","method":"tools/call"}"#))
-        tracker.recordDeliveredServerFrame(Self.frame(#"{"jsonrpc":"2.0","id":"b","result":{}}"#))
-        tracker.recordDeliveredServerFrame(Self.frame(#"{"jsonrpc":"2.0","method":"notifications/progress"}"#))
-
-        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
-    }
-
-    func testBatchRequestsAndResponsesDrainByCanonicalIDType() async {
-        let tracker = MCPDomainResponseDeliveryTracker()
-        tracker.recordAcceptedClientFrame(Self.frame(#"[{"jsonrpc":"2.0","id":1,"method":"one"},{"jsonrpc":"2.0","id":"1","method":"two"},{"jsonrpc":"2.0","method":"note"}]"#))
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(1))
+        let requests = frame(#"[{"id":7,"method":"ping"},{"id":"7","method":"ping"}]"#)
+        XCTAssertTrue(tracker.publishClientFrame(requests) {
+            if case .enqueued = continuation.yield(requests) {
+                return true
+            }
+            return false
+        })
+        var iterator = stream.makeAsyncIterator()
+        let published = try await iterator.next()
+        XCTAssertEqual(published, requests)
         XCTAssertEqual(tracker.snapshot().pendingRequestCount, 2)
-
-        tracker.recordDeliveredServerFrame(Self.frame(#"[{"jsonrpc":"2.0","id":"1","result":{}},{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}]"#))
-        let drained = await tracker.waitUntilDrained()
-        XCTAssertTrue(drained)
+        tracker.recordDeliveredServerFrame(frame(#"{"id":7,"result":{}}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordDeliveredServerFrame(frame(#"{"id":"7","result":{}}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 0)
+        continuation.finish()
     }
 
-    func testCloseResumesWaitersFalseAndRejectsLaterAccounting() async {
-        let tracker = MCPDomainResponseDeliveryTracker()
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#))
-        let waiter = Task { await tracker.waitUntilDrained() }
-        await Task.yield()
-        tracker.close()
-
-        let drained = await waiter.value
-        XCTAssertFalse(drained)
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":8,"method":"tools/call"}"#))
-        let snapshot = tracker.snapshot()
-        XCTAssertTrue(snapshot.isTerminal)
-        XCTAssertEqual(snapshot.pendingRequestCount, 1)
-    }
-
-    func testResetClearsTerminalPendingAndWaiterState() async {
-        let tracker = MCPDomainResponseDeliveryTracker()
-        tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":9,"method":"tools/call"}"#))
-        let waiter = Task { await tracker.waitUntilDrained() }
-        for _ in 0 ..< 100 where tracker.snapshot().waiterCount == 0 {
-            await Task.yield()
+    func testRejectedPublicationRollsBackRequestAndCancellationWithoutErasingSiblingDebt() {
+        for terminated in [false, true] {
+            let tracker = MCPDomainResponseDeliveryTracker()
+            tracker.recordAcceptedClientFrame(frame(#"[{"id":7,"method":"ping"},{"id":"7","method":"ping"}]"#))
+            let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(1))
+            // A continuation alone does not keep the consumer stream alive.
+            withExtendedLifetime(stream) {
+                if terminated {
+                    continuation.finish()
+                } else {
+                    guard case .enqueued = continuation.yield(frame(#"{"method":"notifications/progress"}"#)) else {
+                        return XCTFail("The real stream must be full before the rejected publication")
+                    }
+                }
+                // The duplicate numeric7 must not be erased by rollback; its attempted cancellation
+                // must also be undone. The independent string7 remains outstanding throughout.
+                let rejected = frame(#"[{"id":7,"method":"ping"},{"id":8,"method":"ping"},{"method":"notifications/cancelled","params":{"requestId":7}}]"#)
+                var rejectionWasObserved = false
+                XCTAssertFalse(tracker.publishClientFrame(rejected) {
+                    switch continuation.yield(rejected) {
+                    case .dropped:
+                        rejectionWasObserved = !terminated
+                    case .terminated:
+                        rejectionWasObserved = terminated
+                    case .enqueued:
+                        XCTFail("Publication must be rejected")
+                    @unknown default:
+                        XCTFail("Unexpected stream yield result")
+                    }
+                    return false
+                })
+                XCTAssertTrue(rejectionWasObserved)
+                XCTAssertEqual(tracker.snapshot().pendingRequestCount, 2)
+                tracker.recordDeliveredServerFrame(frame(#"{"id":7,"result":{}}"#))
+                XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+                tracker.recordDeliveredServerFrame(frame(#"{"id":"7","result":{}}"#))
+                XCTAssertEqual(tracker.snapshot().pendingRequestCount, 0)
+                continuation.finish()
+            }
         }
-        XCTAssertEqual(tracker.snapshot().waiterCount, 1)
-        tracker.reset()
-
-        let resetWaiterResult = await waiter.value
-        XCTAssertFalse(resetWaiterResult)
-        let snapshot = tracker.snapshot()
-        XCTAssertFalse(snapshot.isTerminal)
-        XCTAssertEqual(snapshot.pendingRequestCount, 0)
-        XCTAssertEqual(snapshot.waiterCount, 0)
-        let drained = await tracker.waitUntilDrained()
-        XCTAssertTrue(drained)
     }
 
-    private static func frame(_ json: String) -> Data {
+    func testAcceptedCancellationPublicationRetiresOnlyItsExactTypedDebt() async throws {
+        let tracker = MCPDomainResponseDeliveryTracker()
+        tracker.recordAcceptedClientFrame(frame(#"[{"id":7,"method":"ping"},{"id":"7","method":"ping"}]"#))
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(1))
+        let cancellation = frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)
+        XCTAssertTrue(tracker.publishClientFrame(cancellation) {
+            if case .enqueued = continuation.yield(cancellation) {
+                return true
+            }
+            return false
+        })
+        var iterator = stream.makeAsyncIterator()
+        let published = try await iterator.next()
+        XCTAssertEqual(published, cancellation)
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordDeliveredServerFrame(frame(#"{"id":7,"result":{}}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordDeliveredServerFrame(frame(#"{"id":"7","result":{}}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 0)
+        continuation.finish()
+    }
+
+    func testStaleGenerationAndTerminalPublicationNeverInvokeThePublisher() {
+        let tracker = MCPDomainResponseDeliveryTracker()
+        let oldGeneration = tracker.currentGeneration
+        tracker.reset()
+        let request = frame(#"{"id":7,"method":"ping"}"#)
+        var publisherCalled = false
+        XCTAssertFalse(tracker.publishClientFrame(request, expectedGeneration: oldGeneration) {
+            publisherCalled = true
+            return true
+        })
+        XCTAssertFalse(publisherCalled)
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 0)
+        tracker.recordAcceptedClientFrame(request, expectedGeneration: tracker.currentGeneration)
+        tracker.close()
+        XCTAssertFalse(tracker.publishClientFrame(request, expectedGeneration: tracker.currentGeneration) {
+            publisherCalled = true
+            return true
+        })
+        XCTAssertFalse(publisherCalled)
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        XCTAssertTrue(tracker.snapshot().isTerminal)
+    }
+
+    private func frame(_ json: String) -> Data {
         Data(json.utf8)
     }
 }

@@ -1,23 +1,68 @@
 import Foundation
 import MCP
 
-package struct DomainProtectedMutationOperation: Hashable, Sendable {
+package struct DomainProtectedMutationOperation: Hashable {
     package let toolName: String
     package let action: String
 }
 
-package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, Sendable {
-    case partialSuccessAfterCommit(operationID: String)
+package enum DomainProtectedMutationState: String, Equatable {
+    case unknown
+    case applied
+    case notApplied = "not_applied"
+    case indeterminateAfterCommit = "indeterminate_after_commit"
+}
 
-    package var errorDescription: String? {
-        switch self {
-        case let .partialSuccessAfterCommit(operationID):
-            "Protected mutation crossed its durable commit boundary but reply settlement was interrupted. Inspect state before retrying operation ID \(operationID)."
-        }
+package struct DomainProtectedMutationSettlement: Equatable {
+    package let state: DomainProtectedMutationState
+    package let operationID: String
+
+    package init(state: DomainProtectedMutationState, operationID: String) {
+        self.state = state
+        self.operationID = operationID
     }
 }
 
-package struct MCPDomainProtectedMutationToolProvider: Sendable {
+package enum MCPDomainProtectedMutationSettlementContext {
+    @TaskLocal
+    package static var observer: (@Sendable (DomainProtectedMutationSettlement) -> Void)?
+
+    package static func report(_ state: DomainProtectedMutationState, operationID: String) {
+        observer?(DomainProtectedMutationSettlement(state: state, operationID: operationID))
+    }
+}
+
+package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, CustomStringConvertible {
+    /// The mutation crossed its durable commit boundary but settlement was interrupted.
+    /// `underlyingErrorCategory` is a bounded, privacy-safe label derived from the underlying
+    /// error (e.g. "cancelled", "policyError", "journalError",
+    /// "unknown") and is safe to log and include in diagnostic output. It never contains
+    /// user content.
+    case partialSuccessAfterCommit(operationID: String, underlyingErrorCategory: String)
+
+    package var settlement: DomainProtectedMutationSettlement {
+        switch self {
+        case let .partialSuccessAfterCommit(operationID, _):
+            DomainProtectedMutationSettlement(
+                state: .indeterminateAfterCommit,
+                operationID: operationID
+            )
+        }
+    }
+
+    package var description: String {
+        switch self {
+        case let .partialSuccessAfterCommit(operationID, underlyingErrorCategory):
+            "Protected mutation crossed its durable commit boundary but reply settlement was interrupted (\(underlyingErrorCategory)). Inspect state before retrying operation ID \(operationID)."
+        }
+    }
+
+    package var errorDescription: String? {
+        description
+    }
+}
+
+package struct MCPDomainProtectedMutationToolProvider {
     private let policyStore: DomainMutationPolicyStore
     private let journal: DomainMutationJournal
 
@@ -80,7 +125,7 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
     package static func isProtectedFamily(_ toolName: String) -> Bool {
         [
             "manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces",
-            "file_actions", "apply_edits", "manage_worktree",
+            "file_actions", "apply_edits", "manage_worktree"
         ].contains(toolName)
     }
 
@@ -96,20 +141,17 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 ? .init(toolName: toolName, action: action)
                 : nil
         case "prompt":
-            let action = arguments["op"]?.stringValue ?? "get"
-            if ["set", "append", "clear", "select_preset"].contains(action) {
-                return .init(toolName: toolName, action: action)
-            }
-            if action == "export" {
-                return .init(toolName: toolName, action: action)
-            }
-            return nil
+            return promptContextMutationOperation(
+                toolName: toolName,
+                arguments: arguments,
+                allowedOperations: [.set, .append, .clear, .export, .selectPreset]
+            )
         case "workspace_context":
-            let action = arguments["op"]?.stringValue ?? "snapshot"
-            if action == "select_preset" || action == "export" {
-                return .init(toolName: toolName, action: action)
-            }
-            return nil
+            return promptContextMutationOperation(
+                toolName: toolName,
+                arguments: arguments,
+                allowedOperations: [.export, .selectPreset]
+            )
         case "bind_context":
             let action = arguments["op"]?.stringValue ?? "list"
             return action == "bind" ? .init(toolName: toolName, action: action) : nil
@@ -117,13 +159,13 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             let action = arguments["action"]?.stringValue ?? "list"
             return [
                 "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder",
-                "select_tab", "create_tab", "close_tab",
+                "select_tab", "create_tab", "close_tab"
             ].contains(action) ? .init(toolName: toolName, action: action) : nil
         case "file_actions":
             let action = arguments["action"]?.stringValue ?? ""
             return action.isEmpty ? nil : .init(toolName: toolName, action: action)
         case "apply_edits":
-            let action: String = if arguments["rewrite"] != nil {
+            let action = if arguments["rewrite"] != nil {
                 "rewrite"
             } else if arguments["edits"] != nil {
                 "batch"
@@ -142,6 +184,16 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         }
     }
 
+    private static func promptContextMutationOperation(
+        toolName: String,
+        arguments: [String: Value],
+        allowedOperations: [MCPPromptContextOperation]
+    ) -> DomainProtectedMutationOperation? {
+        let operation = MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments)
+        guard allowedOperations.contains(operation) else { return nil }
+        return .init(toolName: toolName, action: operation.rawValue)
+    }
+
     private static func executeDurableMutation(
         operation: DomainProtectedMutationOperation,
         arguments: [String: Value],
@@ -157,29 +209,37 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         // the server-created request identity so continue/abort/retry remain recoverable.
         let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 }
             ?? securityContext.invocationID.uuidString
+        MCPDomainProtectedMutationSettlementContext.report(.unknown, operationID: operationID)
 
         // Authenticate the operation before invoking the physical backend. Exact root scope is
         // authorized again when that backend has translated and resolved the real target.
-        let initialAuthorization = try await policyStore.authorize(
-            context: securityContext,
-            toolName: operation.toolName,
-            action: operation.action,
-            workspaceID: securityContext.workspaceID,
-            canonicalRoots: Self.canonicalRoots(
+        let initialAuthorization: DomainMutationAuthorizationSnapshot
+        let fingerprint: String
+        do {
+            try Task.checkCancellation()
+            initialAuthorization = try await policyStore.authorize(
+                context: securityContext,
+                toolName: operation.toolName,
+                action: operation.action,
+                workspaceID: securityContext.workspaceID,
+                canonicalRoots: Self.canonicalRoots(
+                    operation: operation,
+                    arguments: effectiveArguments,
+                    securityContext: securityContext,
+                    includeAuthoritativeRoots: false
+                )
+            )
+            try Task.checkCancellation()
+            fingerprint = try mutationFingerprint(
                 operation: operation,
                 arguments: effectiveArguments,
-                securityContext: securityContext,
-                includeAuthoritativeRoots: false
+                workspaceID: securityContext.workspaceID,
+                pathFence: nil
             )
-        )
-        try Task.checkCancellation()
-
-        let fingerprint = try mutationFingerprint(
-            operation: operation,
-            arguments: effectiveArguments,
-            workspaceID: securityContext.workspaceID,
-            pathFence: nil
-        )
+        } catch {
+            MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+            throw error
+        }
         let key = "\(operation.toolName).\(operation.action):request:\(securityContext.mutationRequestKey)"
         let begin = try await journal.begin(
             key: key,
@@ -194,9 +254,11 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         )
         switch begin {
         case let .replay(result):
+            MCPDomainProtectedMutationSettlementContext.report(.applied, operationID: operationID)
             return result
         case let .execute(ticket):
             let commitState = DomainMutationCommitState()
+            let backendOwnsCommitFence = Self.backendOwnsCommitFence(operation)
             let admissionState = DomainMutationPhysicalAdmissionState(
                 operation: operation,
                 securityContext: securityContext,
@@ -211,8 +273,17 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                     try await admissionState.admit(paths: paths, rootMappings: mappings)
                 },
                 physicalMutationGuard: {
-                    guard await commitState.hasBegunCommit() else { return nil }
-                    return try await admissionState.physicalMutationGuard()
+                    if await commitState.hasBegunCommit() {
+                        return try await admissionState.physicalMutationGuard()
+                    }
+                    // A backend that owns its commit fence evaluates admitted targets (and spawns
+                    // its final command) before reaching that fence; expose the admitted path
+                    // fence for revalidation without beginning the commit.
+                    guard backendOwnsCommitFence else { return nil }
+                    return try await admissionState.admittedPhysicalMutationGuard()
+                },
+                physicalMutationCapability: {
+                    try await admissionState.physicalMutationCapability()
                 },
                 willCommit: {
                     try await commitState.beginIfNeeded {
@@ -221,29 +292,44 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 }
             )
             do {
-                let result = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+                let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
                     try await binding(effectiveArguments)
                 }
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if Task.isCancelled, didBeginCommit {
-                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
-                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                    try await finishIndeterminateAfterCommitAndThrow(
+                        journal: journal,
+                        ticket: ticket,
+                        operationID: operationID,
+                        underlyingError: CancellationError()
+                    )
                 }
                 try await detachedFinishApplied(journal: journal, ticket: ticket, result: result)
+                MCPDomainProtectedMutationSettlementContext.report(.applied, operationID: operationID)
                 return result
             } catch let error as DomainProtectedMutationError {
                 throw error
             } catch {
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if didBeginCommit {
-                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
-                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                    try await finishIndeterminateAfterCommitAndThrow(
+                        journal: journal,
+                        ticket: ticket,
+                        operationID: operationID,
+                        underlyingError: error
+                    )
                 }
-                try? await detachedFinishBeforeCommit(
-                    journal: journal,
-                    ticket: ticket,
-                    cancelled: error is CancellationError
-                )
+                do {
+                    try await detachedFinishBeforeCommit(
+                        journal: journal,
+                        ticket: ticket,
+                        cancelled: MCPToolExecutionCancelledError.matches(error)
+                    )
+                    MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+                } catch {
+                    // Preserve the provider failure while leaving settlement unknown if the authority
+                    // could not durably confirm its before-commit terminal state.
+                }
                 throw error
             }
         }
@@ -274,13 +360,22 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
-        if operation.toolName == "manage_worktree" {
+        // Physical worktree operations resolve selectors (including absolute bound-worktree
+        // paths) in the backend. Authorize their canonical mapping at physical admission,
+        // not the untrusted spelling here. Non-physical operations retain this scope check.
+        if operation.toolName == "manage_worktree", !requiresPhysicalAdmission(operation) {
             insertAbsoluteRoot(
                 arguments["repo_root"]?.stringValue?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
         return roots
+    }
+
+    /// Operations whose backend invokes `willCommit` from its own final pre-mutation fence, after
+    /// deterministic preconditions, rather than before invoking the backend.
+    private static func backendOwnsCommitFence(_ operation: DomainProtectedMutationOperation) -> Bool {
+        operation.toolName == "manage_worktree" && operation.action == "create"
     }
 
     private static func requiresPhysicalAdmission(_ operation: DomainProtectedMutationOperation) -> Bool {
@@ -349,6 +444,40 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             try await journal.finishIndeterminateAfterCommit(ticket)
         }.value
     }
+
+    /// Returns a bounded, privacy-safe category label for the underlying error.
+    /// The label is safe to log; it never contains user content, file paths, or message text.
+    private static func errorCategory(for error: Error?) -> String {
+        guard let error else { return "cancelled" }
+        if MCPToolExecutionCancelledError.matches(error) {
+            return "cancelled"
+        }
+        switch error {
+        case is DomainMutationPolicyError:
+            return "policyError"
+        case is DomainMutationJournalError:
+            return "journalError"
+        default:
+            return "unknown"
+        }
+    }
+
+    private static func finishIndeterminateAfterCommitAndThrow(
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket,
+        operationID: String,
+        underlyingError: Error? = nil
+    ) async throws -> Never {
+        try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
+        MCPDomainProtectedMutationSettlementContext.report(
+            .indeterminateAfterCommit,
+            operationID: operationID
+        )
+        throw DomainProtectedMutationError.partialSuccessAfterCommit(
+            operationID: operationID,
+            underlyingErrorCategory: errorCategory(for: underlyingError)
+        )
+    }
 }
 
 private actor DomainMutationPhysicalAdmissionState {
@@ -360,6 +489,7 @@ private actor DomainMutationPhysicalAdmissionState {
     private let ticket: DomainMutationJournalTicket
     private var authorization: DomainMutationAuthorizationSnapshot
     private var pathFence: DomainMutationPathFenceSnapshot?
+    private var physicalCapability: DomainMutationPhysicalCapability?
 
     init(
         operation: DomainProtectedMutationOperation,
@@ -385,6 +515,12 @@ private actor DomainMutationPhysicalAdmissionState {
     ) async throws {
         try Task.checkCancellation()
         guard !paths.isEmpty else { throw DomainMutationPathFenceError.scopeUnavailable }
+        guard Self.supportsPhysicalCapability(operation)
+            || Self.supportsPathFenceOnly(operation)
+            || !requiresPhysicalAdmission
+        else {
+            throw DomainMutationPhysicalCapabilityError.unsupportedOperation("\(operation.toolName).\(operation.action)")
+        }
         var mappings = suppliedMappings
         if securityContext.principal.kind == .appProxy,
            securityContext.principal.assurance == .verifiedProcess
@@ -414,9 +550,16 @@ private actor DomainMutationPhysicalAdmissionState {
             requestedPaths: paths.map(Self.standardized),
             authorizedRoots: physicalRoots
         )
-        try await journal.attachPathFence(fence, to: ticket)
+        let combinedFence = Self.combinedPathFence(pathFence, fence)
+        let capability: DomainMutationPhysicalCapability? = if Self.supportsPhysicalCapability(operation) {
+            try DomainMutationPhysicalCapability.open(snapshot: combinedFence)
+        } else {
+            nil
+        }
+        try await journal.attachPathFence(combinedFence, to: ticket)
         self.authorization = authorization
-        pathFence = fence
+        pathFence = combinedFence
+        physicalCapability = capability
     }
 
     func prepareCommit() async throws {
@@ -431,6 +574,12 @@ private actor DomainMutationPhysicalAdmissionState {
         try await journal.markCommitting(ticket)
     }
 
+    /// The guard for already-admitted targets, or `nil` before any admission.
+    func admittedPhysicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {
+        guard pathFence != nil else { return nil }
+        return try physicalMutationGuard()
+    }
+
     func physicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {
         guard let pathFence else {
             if requiresPhysicalAdmission {
@@ -438,7 +587,52 @@ private actor DomainMutationPhysicalAdmissionState {
             }
             return nil
         }
-        return DomainMutationPhysicalCommitGuard(snapshot: pathFence)
+        guard physicalCapability != nil
+            || !requiresPhysicalAdmission
+            || Self.supportsPathFenceOnly(operation)
+        else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+        }
+        return DomainMutationPhysicalCommitGuard(snapshot: pathFence, capability: physicalCapability)
+    }
+
+    func physicalMutationCapability() throws -> DomainMutationPhysicalCapability? {
+        guard let physicalCapability else {
+            if requiresPhysicalAdmission, !Self.supportsPathFenceOnly(operation) {
+                throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+            }
+            return nil
+        }
+        return physicalCapability
+    }
+
+    private static func supportsPathFenceOnly(_ operation: DomainProtectedMutationOperation) -> Bool {
+        operation.toolName == "manage_worktree"
+    }
+
+    private static func supportsPhysicalCapability(_ operation: DomainProtectedMutationOperation) -> Bool {
+        switch operation.toolName {
+        case "file_actions":
+            ["create", "move", "rename"].contains(operation.action)
+        case "apply_edits":
+            true
+        case "prompt", "workspace_context":
+            operation.action == "export"
+        default:
+            false
+        }
+    }
+
+    private static func combinedPathFence(
+        _ existing: DomainMutationPathFenceSnapshot?,
+        _ incoming: DomainMutationPathFenceSnapshot
+    ) -> DomainMutationPathFenceSnapshot {
+        guard let existing else { return incoming }
+        let roots = Array(Set(existing.authorizedRoots + incoming.authorizedRoots))
+            .sorted { $0.originalPath < $1.originalPath }
+        let entries = Array(Set(existing.entries + incoming.entries))
+            .sorted { $0.requestedPath < $1.requestedPath }
+        return DomainMutationPathFenceSnapshot(authorizedRoots: roots, entries: entries)
     }
 
     private static func nearestExistingAncestor(of path: String) -> String? {

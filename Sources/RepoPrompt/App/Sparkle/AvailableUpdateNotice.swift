@@ -60,6 +60,25 @@ struct AvailableUpdateNotice: Equatable {
     let shortCommitSHA: String?
     let date: Date?
     let releaseNotes: String?
+    let downloadURL: URL?
+
+    init(
+        channel: UpdateChannel,
+        version: String,
+        buildNumber: String?,
+        shortCommitSHA: String?,
+        date: Date?,
+        releaseNotes: String?,
+        downloadURL: URL? = nil
+    ) {
+        self.channel = channel
+        self.version = version
+        self.buildNumber = buildNumber
+        self.shortCommitSHA = shortCommitSHA
+        self.date = date
+        self.releaseNotes = releaseNotes
+        self.downloadURL = downloadURL
+    }
 
     var versionLabel: String {
         let trimmedVersion = version.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -130,6 +149,24 @@ struct AvailableUpdateNotice: Equatable {
             }
             let tipBuild = normalizedBuildNumber.map { "Tip Build \($0)" } ?? "Tip Update"
             return "Install \(tipBuild) (\(context.joined(separator: ", ")))…"
+        }
+    }
+
+    var manualDownloadButtonTitle: String {
+        switch channel {
+        case .stable:
+            "Download Update Manually"
+        case .tip:
+            normalizedBuildNumber.map { "Download Tip Build \($0) Manually" } ?? "Download Tip Update Manually"
+        }
+    }
+
+    var menuManualDownloadTitle: String {
+        switch channel {
+        case .stable:
+            "Download Update \(versionLabel) Manually…"
+        case .tip:
+            normalizedBuildNumber.map { "Download Tip Build \($0) Manually…" } ?? "Download Tip Update Manually…"
         }
     }
 

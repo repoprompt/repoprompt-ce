@@ -17,6 +17,8 @@ public struct MentionSuggestion: Identifiable, Equatable {
     public var children: [MentionSuggestion]?
     public var subtitle: String? // Optional secondary text (e.g. skill description)
     public var commitDisplayText: String? // Text inserted after resolving a plain-text @ tag
+    /// Opt-in for verified Claude built-ins that do not need argument completion.
+    public var submitsOnExactEnter: Bool = false
 }
 
 /// Payload attached to the attributed token inside the editor.

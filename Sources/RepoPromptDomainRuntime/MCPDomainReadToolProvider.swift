@@ -99,10 +99,16 @@ package struct MCPDomainReadToolProvider {
     package typealias ReleaseContext = @Sendable (
         _ context: DomainReadInvocationContext
     ) async -> Void
+    package typealias ResolveFailure = @Sendable (
+        _ toolName: String,
+        _ arguments: [String: Value],
+        _ error: Error
+    ) throws -> Value?
 
     private let resolveContext: ResolveContext
     private let refreshContext: RefreshContext
     private let releaseContext: ReleaseContext
+    private let resolveFailure: ResolveFailure
     private let backend: MCPDomainReadToolBackend
     private let sideEffects: DomainReadSideEffectCoordinator
 
@@ -110,12 +116,14 @@ package struct MCPDomainReadToolProvider {
         resolveContext: @escaping ResolveContext,
         refreshContext: @escaping RefreshContext = { $0 },
         releaseContext: @escaping ReleaseContext = { _ in },
+        resolveFailure: @escaping ResolveFailure = { _, _, _ in nil },
         backend: MCPDomainReadToolBackend,
         sideEffects: DomainReadSideEffectCoordinator
     ) {
         self.resolveContext = resolveContext
         self.refreshContext = refreshContext
         self.releaseContext = releaseContext
+        self.resolveFailure = resolveFailure
         self.backend = backend
         self.sideEffects = sideEffects
     }
@@ -143,7 +151,17 @@ package struct MCPDomainReadToolProvider {
         // Historical parameter failures must win over unrelated routing/workspace failures.
         try validateTopLevelArguments(toolName: toolName, arguments: arguments)
         let requirement = contextRequirement(toolName)
-        let context = try await resolveContext(toolName, requirement)
+        let context: DomainReadInvocationContext
+        do {
+            context = try await resolveContext(toolName, requirement)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if let value = try resolveFailure(toolName, arguments, error) {
+                return value
+            }
+            throw error
+        }
         do {
             try Task.checkCancellation()
             if requirement == .workspaceRequired, context.handle == nil {

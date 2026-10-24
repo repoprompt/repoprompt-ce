@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Settings Managing Protocol
@@ -57,6 +58,18 @@ protocol SettingsManaging {
     func setWorkspaceAgentModelsProfile(workspaceID: UUID, profile: AgentModelsSettingsProfile)
     func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile
     func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope)
+    func setAgentModelsRoleModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        roleRawValue: String,
+        displayedSelectionID: AgentModelSelectionID,
+        scope: AgentModelsEditingScope
+    )
+    func setAgentModelsContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        agentRaw: String?,
+        modelRaw: String,
+        scope: AgentModelsEditingScope
+    )
     func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope)
     func commitWorkspace(_ workspaceID: UUID)
     func discardWindowOverrides(for workspaceID: UUID)
@@ -365,6 +378,34 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
 
     func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope) {
         store.setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
+    }
+
+    func setAgentModelsRoleModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        roleRawValue: String,
+        displayedSelectionID: AgentModelSelectionID,
+        scope: AgentModelsEditingScope
+    ) {
+        store.setAgentModelsRoleModelParameter(
+            selections,
+            roleRawValue: roleRawValue,
+            displayedSelectionID: displayedSelectionID,
+            scope: scope
+        )
+    }
+
+    func setAgentModelsContextBuilderModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        agentRaw: String?,
+        modelRaw: String,
+        scope: AgentModelsEditingScope
+    ) {
+        store.setAgentModelsContextBuilderModelParameter(
+            selections,
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            scope: scope
+        )
     }
 
     func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope) {

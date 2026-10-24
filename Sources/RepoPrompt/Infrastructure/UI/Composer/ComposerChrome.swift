@@ -76,6 +76,14 @@ struct ComposerChrome<Main: View, Strip: View>: View {
                     .fill(highlightColor.opacity(0.04))
                 RoundedRectangle(cornerRadius: bubbleCornerRadius)
                     .stroke(highlightColor.opacity(0.25), lineWidth: 1)
+            } else if DebugBuildIdentity.isEnabled {
+                // DEBUG-only identity ring at the send decision point; an explicit highlight wins.
+                RoundedRectangle(cornerRadius: bubbleCornerRadius)
+                    .stroke(
+                        DebugBuildIdentity.accentColor.opacity(DebugBuildIdentity.composerRingOpacity),
+                        lineWidth: 1
+                    )
+                    .accessibilityHidden(true)
             }
 
             VStack(spacing: bubbleInnerSpacing) {

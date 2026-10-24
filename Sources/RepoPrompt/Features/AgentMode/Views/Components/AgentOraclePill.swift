@@ -1,3 +1,6 @@
+import AppKit
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Oracle Pill
@@ -90,12 +93,7 @@ enum AgentOraclePillLogic {
             let sameAgentLegacyRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil }
             if !sameAgentLegacyRunMatches.isEmpty { return sameAgentLegacyRunMatches }
 
-            if let activeAgentSessionID,
-               renderable.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
-            {
-                return []
-            }
-            return renderable.filter(isUnownedLegacy)
+            // A new process run must not hide completed Oracle results from the same agent session.
         }
 
         if let activeAgentSessionID {
@@ -110,8 +108,26 @@ enum AgentOraclePillLogic {
         in sessions: [ChatSession],
         streamingSessionIDs: Set<UUID>
     ) -> ChatSession? {
-        latestStreamingSession(in: sessions, streamingSessionIDs: streamingSessionIDs)
+        guard let latest = latestStreamingSession(in: sessions, streamingSessionIDs: streamingSessionIDs)
             ?? sessions.max(by: { $0.savedAt < $1.savedAt })
+        else { return nil }
+        guard let groupID = latest.oracleGroupID else { return latest }
+        return sessions.first(where: {
+            $0.oracleGroupID == groupID && $0.oracleLaneIndex == 0
+        }) ?? latest
+    }
+
+    static func canCopyAll(_ session: ChatSession) -> Bool {
+        session.oracleGroupID != nil && (session.oracleGroupSize ?? 1) > 1
+    }
+
+    static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
+        let configured = 1 + configuredAdditionalCount
+        guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }),
+              latest.oracleGroupID != nil
+        else { return configured }
+        let projected = min(max(latest.oracleGroupSize ?? 1, 1), 5)
+        return max(configured, projected)
     }
 
     static func latestStreamingSession(
@@ -181,6 +197,7 @@ enum AgentOraclePillLogic {
 /// Pill that appears when there are oracle chat sessions for the current tab.
 /// More prominent when streaming. Clicking opens a wide popover with chat transcript.
 struct AgentOraclePill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
     let currentTabID: UUID?
@@ -195,10 +212,18 @@ struct AgentOraclePill: View {
         let actionPolicy: ChatTranscriptActionPolicy
     }
 
+    private enum CopyAllFeedback: String {
+        case copying = "Copying…"
+        case copied = "Copied!"
+        case failed = "Copy Failed"
+    }
+
     @State private var presentedPopover: PopoverPresentation?
+    @State private var copyAllFeedback: CopyAllFeedback?
     @State private var autoScrollEnabled = false
     @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var settingsStore = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -221,8 +246,28 @@ struct AgentOraclePill: View {
         )
     }
 
+    private var currentTabSessions: [ChatSession] {
+        currentTabID.map(oracleViewModel.sessions(forTabID:)) ?? []
+    }
+
+    private var oracleCount: Int {
+        let workspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
+        let configuredAdditional = settingsStore
+            .effectiveAgentModelsProfile(workspaceID: workspaceID)
+            .additionalOracleModelRaws.count
+        return AgentOraclePillLogic.aggregateOracleCount(
+            configuredAdditionalCount: configuredAdditional,
+            sessions: currentTabSessions
+        )
+    }
+
     private var isStreaming: Bool {
         guard let latestTabSession else { return false }
+        if let groupID = latestTabSession.oracleGroupID {
+            return currentTabSessions.contains {
+                $0.oracleGroupID == groupID && oracleViewModel.streamingSessions.contains($0.id)
+            }
+        }
         return oracleViewModel.streamingSessions.contains(latestTabSession.id)
     }
 
@@ -243,13 +288,27 @@ struct AgentOraclePill: View {
         return session.name
     }
 
+    func memberDotState(for session: ChatSession) -> OracleMemberPresentation.Status {
+        oracleViewModel.oracleMemberPresentation(for: session).status
+    }
+
+    private func laneDotColor(for session: ChatSession) -> Color {
+        switch memberDotState(for: session) {
+        case .streaming: Color.purple
+        case .failed: Color.red
+        case .completed: Color.green
+        case .cancelled: Color.orange
+        case .unknown: Color.secondary
+        }
+    }
+
     private var hasAnySessions: Bool {
         latestTabSession != nil
     }
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.oracle")
+            let _ = perfRecorder.increment("ui.body.statusPills.oracle")
         #endif
         Group {
             if hasAnySessions {
@@ -267,7 +326,7 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text("Oracle")
+                        Text(oracleCount > 1 ? "Oracles · \(oracleCount)" : "Oracle")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
@@ -282,7 +341,12 @@ struct AgentOraclePill: View {
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
-                .hoverTooltip(isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab", .top)
+                .hoverTooltip(
+                    oracleCount > 1
+                        ? (isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats for this tab")
+                        : (isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab"),
+                    .top
+                )
                 .animation(.easeInOut(duration: 0.2), value: isStreaming)
             } else {
                 Color.clear.frame(width: 0, height: 0)
@@ -331,6 +395,13 @@ struct AgentOraclePill: View {
         }
     }
 
+    private func groupMemberSessions(for session: ChatSession) -> [ChatSession] {
+        guard let groupID = session.oracleGroupID else { return [] }
+        return currentTabSessions
+            .filter { $0.oracleGroupID == groupID }
+            .sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
+    }
+
     @ViewBuilder
     private func oraclePopoverContent(_ presentation: PopoverPresentation) -> some View {
         // Popover dimensions scale so chat messages don't feel cramped at
@@ -355,6 +426,59 @@ struct AgentOraclePill: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if let session = presentedSession(for: presentation),
+                   AgentOraclePillLogic.canCopyAll(session)
+                {
+                    Button(copyAllFeedback?.rawValue ?? "Copy All") {
+                        copyAllLanes(containing: session)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(copyAllFeedback == .copying)
+                }
+            }
+
+            if let presented = presentedSession(for: presentation) {
+                let members = groupMemberSessions(for: presented)
+                if members.count > 1 {
+                    HStack(spacing: 6) {
+                        ForEach(members) { member in
+                            let laneIndex = member.oracleLaneIndex ?? 0
+                            let status = oracleViewModel.oracleMemberPresentation(for: member)
+                            let label = OracleViewModel.oracleLabel(laneIndex: laneIndex)
+                            Button {
+                                openRequestGeneration &+= 1
+                                present(
+                                    sessionID: member.id,
+                                    isExplicit: presentation.isExplicit,
+                                    actionPolicy: presentation.actionPolicy,
+                                    generation: openRequestGeneration
+                                )
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(laneDotColor(for: member))
+                                        .frame(width: 6, height: 6)
+                                    Text("\(label) · \(status.status.rawValue)")
+                                        .lineLimit(1)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityLabel("\(label): \(status.status.rawValue)")
+                            .hoverTooltip(
+                                [member.oracleModelRaw, status.status.rawValue, status.errorMessage]
+                                    .compactMap(\.self).joined(separator: "\n")
+                            )
+                        }
+                    }
+                    if let errorMessage = oracleViewModel.oracleMemberPresentation(for: presented).errorMessage {
+                        Text(errorMessage)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
             }
 
             ChatMessagesView(
@@ -371,6 +495,27 @@ struct AgentOraclePill: View {
         }
         .padding(14)
         .frame(width: popoverWidth)
+    }
+
+    private func copyAllLanes(containing session: ChatSession) {
+        copyAllFeedback = .copying
+        Task { @MainActor in
+            let feedback: CopyAllFeedback
+            do {
+                let payload = try await oracleViewModel.oracleGroupCopyPayload(containing: session)
+                let markdown = OracleLaneMarkdownFormatter.format(payload)
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                feedback = pasteboard.setString(markdown, forType: .string) ? .copied : .failed
+            } catch {
+                feedback = .failed
+            }
+            copyAllFeedback = feedback
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if copyAllFeedback == feedback {
+                copyAllFeedback = nil
+            }
+        }
     }
 
     private func reconcilePresentedSession() {
@@ -404,12 +549,20 @@ struct AgentOraclePill: View {
         actionPolicy: ChatTranscriptActionPolicy,
         generation: UInt64
     ) {
+        let session = currentTabSessions.first { $0.id == sessionID }
+        let previousKey = presentedPopover.flatMap { presentedSession(for: $0) }
+            .flatMap(OracleGroupPresentation.Key.init(session:))
+        let nextKey = session.flatMap(OracleGroupPresentation.Key.init(session:))
+        let shouldLoad = presentedPopover == nil || previousKey != nextKey
         presentedPopover = PopoverPresentation(
             id: generation,
             sessionID: sessionID,
             isExplicit: isExplicit,
             actionPolicy: actionPolicy
         )
+        if shouldLoad, nextKey != nil, let session {
+            Task { await oracleViewModel.loadOracleGroupPresentation(containing: session) }
+        }
     }
 
     private func openLatestStreamingPopover() {

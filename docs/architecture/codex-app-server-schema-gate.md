@@ -21,10 +21,15 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.147.0**.
-- Local validation accepts 0.147.0 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.147.0`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.159.0**.
+- Local validation accepts 0.159.0 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.159.0`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
+
+This schema baseline and exact CI pin are distinct from
+`CodexRuntimeAuthority.minimumExternalVersion`, the compatibility floor for an explicitly selected
+custom executable. That external floor remains 0.149.0 unless an observed consumed request or
+response incompatibility requires it to move.
 
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
 schema, then update the CI pin and contract floor together. Do not copy the complete generated
@@ -35,8 +40,9 @@ requirement.
 
 The initial projection covers:
 
-- the client requests RPCE sends for initialization, model discovery, thread lifecycle, goals,
-  turns, interruption, steering, compaction, and the optional memory-mode setting;
+- the client requests RPCE sends for initialization, model discovery, hook discovery, hook-trust
+  config writes, thread lifecycle, goals, turns, interruption, steering, compaction, and the optional
+  memory-mode setting;
 - request fields RPCE always or conditionally emits, including nested initialize metadata, turn-input
   variants, sandbox-policy variants, and detection of newly required upstream fields;
 - incoming parameter and response paths RPCE reads, with explicit required, optional, conditional,
@@ -52,7 +58,14 @@ The versioned contract is fail-closed: missing or unknown keys are errors. Metho
 local `$ref`, `allOf`, `oneOf`, and `anyOf` composition and accepts both single-value `enum`
 and `const` discriminators, so upstream organizational refactors do not create false removals.
 
-The hardened 0.147.0 baseline checks 42 methods, 186 parameter paths, and 78 response paths. A failure names
+For `config/batchWrite`, the generated `ConfigEdit.value` schema is unconstrained (`true`), so the
+gate declares the closest available projection, `edits[].value`; the dynamic
+hook-key → `{trusted_hash}` object shape cannot be expressed by the current checker.
+
+After a trust write, the post-write `hooks/list` result is the semantic success authority;
+`config/batchWrite.status` alone is not.
+
+The current 0.159.0 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -73,7 +86,7 @@ differences:
    eligibility, but resume config does not reconcile an existing stored thread's persisted mode. RPCE
    therefore calls experimental `thread/memoryMode/set` with `enabled` or `disabled` before
    `thread/resume` so resumed startup observes the requested mode. It does not issue a redundant
-   post-start request. The 0.147.0 runtime floor and `experimentalApi` initialization capability make
+   post-start request. The 0.156.1 schema floor and `experimentalApi` initialization capability make
    resume reconciliation a required contract rather than an optional compatibility fallback.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
@@ -133,6 +146,72 @@ The bounded comparison also recorded these explicit gaps rather than hiding them
 - `item/tool/call` is recognized but deliberately rejected with a JSON-RPC error because RPCE does
   not implement dynamic client-side tool execution; therefore the success response is not part of
   this contract.
+
+## 0.149.0 rotation findings (2026-08-21)
+
+The repository candidate flow verified both official `rust-v0.149.0` macOS packages, including
+their complete layouts, architectures, OpenAI signing identities, and trusted timestamps. The
+pinned CLI passes the bounded app-server projection. Upstream changed a hook `command` from
+optional and nullable to conditionally present but non-null when present; RepoPrompt's decoder
+already accepts that bounded shape.
+
+Codex 0.149.0 also changes upstream app and plugin availability. RepoPrompt does not inherit those
+runtime defaults: `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
+`features.tool_suggest` are explicitly false on every Codex launch/config surface by default. Four
+independent, human-owned settings can enable these capabilities separately for directly started
+native Agent Mode app-server sessions. Each setting is absent/default false and is intentionally
+absent from the MCP `app_settings` catalog. Standard chat, headless exec, and every MCP-related
+Agent Mode session force all four false for the session lifetime, including after live control ends.
+
+## 0.156.0 rotation findings (2026-09-23)
+
+The repository candidate flow found and intentionally reviewed one package-policy change:
+both official `rust-v0.156.0` macOS packages add the same native voice runtime under
+`codex-resources/voice/`. The reviewed manifest pins its complete 52-entry tree, all 30
+thin Mach-Os per target, official archive/checksum digests, normalized payload hashes, and
+OpenAI signing metadata. Release re-signing preserves audio input only for the voice host;
+all other new voice libraries and plugins receive no entitlements.
+
+The exact 0.156.0 CLI passes the bounded experimental projection unchanged at 45 methods,
+193 parameter paths, and 93 response paths. No new outgoing request requires 0.156.0, so
+explicit custom runtimes from the separately proven 0.149.0 compatibility floor remain
+supported. The schema contract and CI pin move to 0.156.0 to keep deterministic validation
+aligned with the bundled runtime, without adding a version adapter or weakening checks.
+
+Upstream `LICENSE` and `NOTICE` remain byte-identical to the previous copies. The new voice
+runtime ships its own notice, source provenance, and licences for GStreamer, GLib, Opus,
+PCRE2/SLJIT, libffi, proxy-libintl, and zlib; exact copies are included in the flat Codex
+legal inventory and covered by its `SHA256SUMS`.
+
+## 0.156.1 patch rotation findings (2026-09-23)
+
+The official `rust-v0.156.1` macOS packages preserve the 52-entry layout, 30-Mach-O
+inventory, signing identities, and closed-world entitlement profile of 0.156.0.
+The bounded experimental app-server projection remains unchanged at 45 methods,
+193 parameter paths, and 93 response paths. The exact schema/CI pin advances to
+0.156.1; the separately proven external-runtime compatibility floor remains 0.149.0.
+
+Upstream `LICENSE` and `NOTICE` and the packaged voice notice, source manifest, and
+licences are byte-identical to 0.156.0. The patch release adds GPT-6 Sol and Luna to
+Codex's model catalog; model availability remains runtime-discovered rather than
+hard-coded by RepoPrompt.
+
+## 0.159.0 rotation findings (2026-09-29)
+
+The official `rust-v0.159.0` macOS packages preserve the 52-entry layout, 30-Mach-O
+inventory, signing identities, and closed-world entitlement profile of 0.156.1.
+The exact official arm64 CLI passes the unchanged experimental app-server projection
+at 45 methods, 193 parameter paths, and 93 response paths. The bundle, schema floor,
+and exact CI pin advance together; the external-runtime floor remains 0.149.0 because
+no newly consumed protocol requirement was identified.
+
+Upstream `LICENSE` and `NOTICE` and the packaged voice notice, source manifest, and
+licences remain byte-identical to 0.156.1. A direct CLI comparison with the same
+eligible ChatGPT account established GPT-6.1 Sol discovery and execution with 0.159.0,
+while 0.156.1 omitted the model and rejected its explicit request. Model availability
+and reasoning efforts continue to come from runtime discovery. The earliest compatible
+CLI version was not established, and these artifact/schema checks alone do not prove
+upgraded-app behavior.
 
 ## Files and tests
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 
 protocol DeltaReplayPreparing: Actor {
     func prepare(

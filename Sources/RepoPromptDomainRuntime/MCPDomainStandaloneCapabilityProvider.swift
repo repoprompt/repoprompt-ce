@@ -4,7 +4,7 @@ import MCP
 /// Protocol-neutral argument carrier used by physical capability backends.
 /// Backends decode only the request type for the capability they implement; MCP `Value`
 /// never appears in a backend protocol signature.
-package struct DomainPhysicalToolRequest: Sendable {
+package struct DomainPhysicalToolRequest {
     package let argumentsJSON: Data
     package let securityContext: DomainToolInvocationSecurityContext?
 
@@ -22,7 +22,7 @@ package struct DomainPhysicalToolRequest: Sendable {
     }
 }
 
-package struct DomainPhysicalReadRequest: Sendable {
+package struct DomainPhysicalReadRequest {
     package let request: DomainPhysicalToolRequest
     package let context: DomainReadInvocationContext
     package let sideEffects: MCPDomainReadSideEffectEmitter
@@ -38,14 +38,14 @@ package struct DomainPhysicalReadRequest: Sendable {
     }
 }
 
-package struct DomainPhysicalToolResult: Sendable {
+package struct DomainPhysicalToolResult {
     package let json: Data
 
     package init(json: Data) {
         self.json = json
     }
 
-    package init<T: Encodable>(_ value: T) throws {
+    package init(_ value: some Encodable) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         json = try encoder.encode(value)
@@ -95,6 +95,13 @@ package protocol DomainAgentCapabilityBackend: Sendable {
     func explore(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func run(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func manage(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
+    /// Cross-window oversight-link operations.
+    ///
+    /// Standalone/headless compositions have no windows and therefore no live top-level Agent
+    /// sessions to grant or observe, so a conforming backend is expected to fail closed. The binding
+    /// still exists because the canonical catalog must stay complete: a tool that is absent from one
+    /// composition would be an ungated hole rather than a denial.
+    func monitorSessionLink(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func shareThoughts(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func publishStatus(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func waitForInstruction(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
@@ -104,7 +111,7 @@ package protocol DomainHistoryCapabilityBackend: Sendable {
     func inspectHistory(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult
 }
 
-package struct MCPDomainStandaloneCapabilityBackends: Sendable {
+package struct MCPDomainStandaloneCapabilityBackends {
     package let global: any DomainGlobalControlBackend
     package let workspace: any DomainWorkspaceCapabilityBackend
     package let filesystem: any DomainFilesystemMutationBackend
@@ -132,7 +139,7 @@ package struct MCPDomainStandaloneCapabilityBackends: Sendable {
     }
 }
 
-package struct MCPDomainStandaloneToolInstallation: Sendable {
+package struct MCPDomainStandaloneToolInstallation {
     package let globalRegistration: MCPDomainToolRegistrationHandle
     package let standaloneRegistration: MCPDomainToolRegistrationHandle
     package let scopeID: DomainStandaloneScopeID
@@ -274,7 +281,37 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.fileActions, backends.filesystem.manageFiles),
             binding(MCPWindowToolName.applyEdits, backends.filesystem.applyFileEdits),
             binding(MCPWindowToolName.oracleUtils, backends.conversation.accessOracleUtilities),
-            binding(MCPWindowToolName.askOracle, backends.conversation.startOracleConversation),
+            binding(MCPWindowToolName.askOracle) { request in
+                let args = try request.mcpArguments()
+                if args["chat_id"] != nil, args["chat_id"]?.stringValue == nil {
+                    throw MCPError.invalidParams("ask_oracle chat_id must be a string")
+                }
+                if args["new_chat"] != nil, args["new_chat"]?.boolValue == nil {
+                    throw MCPError.invalidParams("ask_oracle new_chat must be a boolean")
+                }
+                if args["model"] != nil, args["model"]?.stringValue == nil {
+                    throw MCPError.invalidParams("ask_oracle model must be a string")
+                }
+                let route: OracleConversationRoute
+                do {
+                    route = try OracleConversationRoute.resolve(
+                        chatID: args["chat_id"]?.stringValue,
+                        newChat: args["new_chat"]?.boolValue ?? false,
+                        modelOverride: args["model"]?.stringValue,
+                        whenMissingChatID: .startNew
+                    )
+                } catch {
+                    throw MCPError.invalidParams(error.localizedDescription)
+                }
+                switch route {
+                case .start:
+                    return try await backends.conversation.startOracleConversation(request)
+                case .continuation:
+                    return try await backends.conversation.continueOracleConversation(request)
+                case .implicitContinuation:
+                    throw MCPError.internalError("ask_oracle resolved an invalid implicit continuation route")
+                }
+            },
             binding(MCPWindowToolName.oracleSend, backends.conversation.continueOracleConversation),
             binding(MCPWindowToolName.manageWorktree, backends.versionControl.manageWorktree),
             binding(MCPWindowToolName.contextBuilder, backends.conversation.buildContext),
@@ -282,9 +319,21 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.agentExplore, backends.agent.explore),
             binding(MCPWindowToolName.agentRun, backends.agent.run),
             binding(MCPWindowToolName.agentManage, backends.agent.manage),
+            binding(MCPWindowToolName.agentSessionLink, backends.agent.monitorSessionLink),
+            binding(MCPWindowToolName.sessionAdmin) { _ in
+                throw MCPError.invalidParams("session_admin is not available for this session.")
+            },
+            binding(MCPWindowToolName.becomeOverseer) { _ in
+                throw MCPError.invalidParams("become_overseer is not available for this session.")
+            },
+            // Direct-headless has no app-owned Agent Mode run or registration-time self origin.
+            // Keep the canonical catalog complete while failing closed even if a caller names it.
+            binding(MCPWindowToolName.agentSelf) { _ in
+                throw MCPError.invalidParams("self_compact is not available for this session.")
+            },
             binding(MCPWindowToolName.shareThoughts, backends.agent.shareThoughts),
             binding(MCPWindowToolName.setStatus, backends.agent.publishStatus),
-            binding(MCPWindowToolName.waitForNextInstruction, backends.agent.waitForInstruction),
+            binding(MCPWindowToolName.waitForNextInstruction, backends.agent.waitForInstruction)
         ]
     }
 

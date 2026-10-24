@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class AgentFileTagSuggestionService {

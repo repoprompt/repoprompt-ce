@@ -32,7 +32,8 @@ struct ProviderConversationCleanupRegistry {
             return .unsupported(message: "Provider \(handle.provider) has resumable session metadata but no verified conversation cleanup API.")
 
         case Self.normalizedProvider(AgentProviderKind.openCode.rawValue),
-             Self.normalizedProvider(AgentProviderKind.cursor.rawValue):
+             Self.normalizedProvider(AgentProviderKind.cursor.rawValue),
+             Self.normalizedProvider(AgentProviderKind.grokBuild.rawValue):
             return .unsupported(message: "ACP provider \(handle.provider) has session metadata but no verified conversation cleanup API.")
 
         default:

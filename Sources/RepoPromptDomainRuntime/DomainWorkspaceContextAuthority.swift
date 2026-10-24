@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 package enum DomainExternalReloadActivity: Equatable {
     case changed
@@ -6,7 +7,15 @@ package enum DomainExternalReloadActivity: Equatable {
     case recoveryPending
 }
 
-package struct DomainWorkspaceStore {
+#if DEBUG
+    /// Read-only evidence from the existing canonical record, not a saved-document API.
+    package struct DomainWorkspaceSavedStateForTesting: Equatable {
+        package let revision: UInt64
+        package let digest: String
+    }
+#endif
+
+package struct DomainWorkspaceStore: Sendable {
     private let authority: DomainWorkspaceContextAuthority
 
     init(authority: DomainWorkspaceContextAuthority) {
@@ -15,6 +24,19 @@ package struct DomainWorkspaceStore {
 
     package func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await authority.readySnapshot()
+    }
+
+    /// A bounded routing read. It never starts or waits for whole-catalog bootstrap.
+    package func readLocation(matching selector: DomainWorkspaceReadSelector) async -> DomainWorkspaceLocationSelection {
+        await authority.readLocation(matching: selector)
+    }
+
+    package func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        await authority.activationSnapshot(workspaceID: workspaceID, fileURL: fileURL)
+    }
+
+    package func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try await authority.exactRootSelection(canonicalRootPath: canonicalRootPath)
     }
 
     package func subscribe() async -> DomainWorkspaceSnapshotSubscription {
@@ -31,10 +53,42 @@ package struct DomainWorkspaceStore {
     }
 
     #if DEBUG
+        package func testSetBeforeBootstrapPersistence(_ hook: (@Sendable () async -> Void)?) async {
+            await authority.testSetBeforeBootstrapPersistence(hook)
+        }
+
+        package func testSetAfterExactRootSavedMarkerRead(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetAfterExactRootSavedMarkerRead(hook)
+        }
+
+        package func savedStateForTesting(_ workspaceID: UUID) async -> DomainWorkspaceSavedStateForTesting? {
+            await authority.savedStateForTesting(workspaceID)
+        }
+
         package func testSetBeforeExternalReconciliation(
             _ hook: (@Sendable (UUID) async -> Void)?
         ) async {
             await authority.testSetBeforeExternalReconciliation(hook)
+        }
+
+        package func testSetBeforeWorkingPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetBeforeWorkingPersistence(hook)
+        }
+
+        package func testSetBeforeSavedPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetBeforeSavedPersistence(hook)
+        }
+
+        package func testSetAfterWorkspaceMutationGateAcquired(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetAfterWorkspaceMutationGateAcquired(hook)
         }
     #endif
 
@@ -55,6 +109,14 @@ package struct DomainWorkspaceStore {
     /// must not influence mutation admission, recovery CAS baselines, or authority health.
     package func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await authority.canonicalWorkspaceSnapshot(workspaceID)
+    }
+
+    package func agentAdmissionSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceAdmissionSnapshot {
+        await authority.agentAdmissionSnapshot(workspaceID)
+    }
+
+    package func transitionDiagnostics(_ workspaceID: UUID) async -> [DomainWorkspaceTransitionDiagnostic] {
+        await authority.transitionDiagnostics(workspaceID)
     }
 }
 
@@ -127,7 +189,28 @@ actor DomainWorkspaceContextAuthority {
     private static let maximumCASRecoveryAttempts = 2
 
     #if DEBUG
+        private var testBeforeBootstrapPersistence: (@Sendable () async -> Void)?
+
+        func testSetBeforeBootstrapPersistence(_ hook: (@Sendable () async -> Void)?) {
+            testBeforeBootstrapPersistence = hook
+        }
+
+        private var testAfterExactRootSavedMarkerRead: (@Sendable (UUID) async -> Void)?
+
+        func testSetAfterExactRootSavedMarkerRead(_ hook: (@Sendable (UUID) async -> Void)?) {
+            testAfterExactRootSavedMarkerRead = hook
+        }
+
         private var testBeforeExternalReconciliation: (@Sendable (UUID) async -> Void)?
+        private var testBeforeWorkingPersistence: (@Sendable (UUID) async -> Void)?
+        private var testBeforeSavedPersistence: (@Sendable (UUID) async -> Void)?
+        private var testAfterUnchangedPersistence: (@Sendable (UUID) async -> Void)?
+
+        func testSetAfterUnchangedPersistence(_ hook: (@Sendable (UUID) async -> Void)?) {
+            testAfterUnchangedPersistence = hook
+        }
+
+        private var testAfterWorkspaceMutationGateAcquired: (@Sendable (UUID) async -> Void)?
     #endif
 
     private enum DirtyExternalRebaseResult {
@@ -147,16 +230,28 @@ actor DomainWorkspaceContextAuthority {
         var health: DomainAuthorityHealth
         var externalDocument: DomainWorkspaceDocument?
         var fileMetadata: DomainFileMetadata
+        var diagnosticDirtyOrigin: DomainWorkspaceTransitionDiagnostic.DirtyOrigin?
+        var diagnosticLastSave: DomainWorkspaceTransitionDiagnostic.LastSave?
     }
 
     private let identity: DomainRuntimeIdentity
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    private var workspaceIDsByReadName: [String: Set<UUID>] = [:]
+    private var workspaceLocationGenerations: [UUID: UInt64] = [:]
+    private var unreadableLocationIDs: Set<UUID> = []
+    private var nextWorkspaceLocationGeneration: UInt64 = 0
+    #if DEBUG
+        func savedStateForTesting(_ workspaceID: UUID) -> DomainWorkspaceSavedStateForTesting? {
+            records[workspaceID].map { .init(revision: $0.revisions.savedRevision, digest: $0.savedDigest) }
+        }
+    #endif
     /// Awaited in-memory registrations used only by read routing. They are not catalog entries and
     /// never persist ephemeral/test workspaces. A later command invalidates the overlay.
     private var readRegistrations: [UUID: DomainWorkspaceSnapshot] = [:]
     private var unavailableWorkspaces: [UUID: DomainPersistenceBootstrap.UnavailableWorkspace] = [:]
+    private var deletedWorkspaceIDs: Set<UUID> = []
     private var globalOperations = BoundedDomainOperationIndex(capacity: maximumGlobalOperations)
     private var health: DomainAuthorityHealth = .writable
     private var catalogRevision: UInt64 = 0
@@ -166,6 +261,9 @@ actor DomainWorkspaceContextAuthority {
     private var catalogMutationInProgress = false
     private var catalogMutationWaiters: [CheckedContinuation<Void, Never>] = []
     private var didBootstrap = false
+    private var transitionBuffer = DomainWorkspaceTransitionBuffer()
+    private var nextSaveGeneration: UInt64 = 0
+    private var pendingDiagnosticSaves: [UUID: (workspaceID: UUID, generation: UInt64, state: DomainWorkspaceTransitionDiagnostic.SaveState)] = [:]
 
     init(
         identity: DomainRuntimeIdentity,
@@ -184,7 +282,15 @@ actor DomainWorkspaceContextAuthority {
             task = bootstrapTask
         } else {
             let persistence = persistence
-            let created = Task { await persistence.bootstrap() }
+            #if DEBUG
+                let beforePersistence = testBeforeBootstrapPersistence
+                let created = Task {
+                    await beforePersistence?()
+                    return await persistence.bootstrap()
+                }
+            #else
+                let created = Task { await persistence.bootstrap() }
+            #endif
             bootstrapTask = created
             task = created
         }
@@ -195,6 +301,7 @@ actor DomainWorkspaceContextAuthority {
         let durableOperations = loaded.deletedOperations
             + loaded.workspaces.flatMap(\.operations)
         globalOperations.replace(with: durableOperations)
+        deletedWorkspaceIDs = loaded.deletedWorkspaceIDs
         unavailableWorkspaces = Dictionary(uniqueKeysWithValues: loaded.unavailableWorkspaces.map {
             ($0.workspaceID, $0)
         })
@@ -216,6 +323,12 @@ actor DomainWorkspaceContextAuthority {
             )
             return (workspace.document.workspaceID, record)
         })
+        for record in records.values {
+            updateWorkspaceLocationIndex(previous: nil, next: record)
+        }
+        for workspaceID in records.keys {
+            recordReconstruction(workspaceID)
+        }
         didBootstrap = true
         bootstrapTask = nil
         publish(
@@ -239,8 +352,83 @@ actor DomainWorkspaceContextAuthority {
                 let lhs = $0.document.metadata.name.localizedCaseInsensitiveCompare($1.document.metadata.name)
                 if lhs != .orderedSame { return lhs == .orderedAscending }
                 return $0.document.workspaceID.uuidString < $1.document.workspaceID.uuidString
-            }
+            },
+            // A stale unavailable entry must not declare a recovered or deleted member missing.
+            unavailableWorkspaceIDs: Set(unavailableWorkspaces.keys)
+                .subtracting(records.keys)
+                .subtracting(deletedWorkspaceIDs)
         )
+    }
+
+    /// Canonical records alone issue location evidence. A read registration cannot revive a
+    /// deleted identity, bypass unavailable storage, or publish a partial catalog during startup.
+    func readLocation(matching selector: DomainWorkspaceReadSelector) -> DomainWorkspaceLocationSelection {
+        guard didBootstrap else { return .notReady }
+        let workspaceID: UUID
+        switch selector {
+        case let .id(id):
+            workspaceID = id
+        case let .exactName(name):
+            // An unavailable member may have an unknown current name. Do not invent uniqueness.
+            guard health.acceptsMutations, unavailableWorkspaces.isEmpty, unreadableLocationIDs.isEmpty else {
+                return .unavailable
+            }
+            let matches = workspaceIDsByReadName[Self.readNameKey(name)] ?? []
+            guard matches.count <= 1 else { return .ambiguous }
+            guard let id = matches.first else { return .notRegistered }
+            workspaceID = id
+        }
+        guard !deletedWorkspaceIDs.contains(workspaceID) else { return .notRegistered }
+        guard let record = records[workspaceID] else {
+            return unavailableWorkspaces[workspaceID] == nil ? .notRegistered : .unavailable
+        }
+        guard record.health.acceptsMutations,
+              let generation = workspaceLocationGenerations[workspaceID]
+        else { return .unavailable }
+        return .matched(.init(
+            runtimeID: identity.runtimeID, lifecycleGeneration: identity.lifecycleGeneration,
+            locationGeneration: generation, workspaceID: workspaceID,
+            name: record.document.metadata.name,
+            directory: record.document.fileURL.deletingLastPathComponent().standardizedFileURL
+        ))
+    }
+
+    private static func readNameKey(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private func updateWorkspaceLocationIndex(previous: WorkspaceRecord?, next: WorkspaceRecord) {
+        let id = next.document.workspaceID
+        let nextName = Self.readNameKey(next.document.metadata.name)
+        if let previous, Self.readNameKey(previous.document.metadata.name) != nextName {
+            removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
+        }
+        workspaceIDsByReadName[nextName, default: []].insert(id)
+        if next.health.acceptsMutations { unreadableLocationIDs.remove(id) }
+        else { unreadableLocationIDs.insert(id) }
+        if previous?.document.fileURL != next.document.fileURL
+            || previous?.document.metadata.name != next.document.metadata.name
+            || previous?.health.acceptsMutations != next.health.acceptsMutations
+            || workspaceLocationGenerations[id] == nil
+        {
+            nextWorkspaceLocationGeneration &+= 1
+            workspaceLocationGenerations[id] = nextWorkspaceLocationGeneration
+        }
+    }
+
+    private func removeReadName(_ name: String, workspaceID: UUID) {
+        workspaceIDsByReadName[name]?.remove(workspaceID)
+        if workspaceIDsByReadName[name]?.isEmpty == true { workspaceIDsByReadName.removeValue(forKey: name) }
+    }
+
+    @discardableResult
+    private func removeCanonicalRecord(_ id: UUID) -> WorkspaceRecord? {
+        guard let previous = records.removeValue(forKey: id) else { return nil }
+        removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
+        workspaceLocationGenerations.removeValue(forKey: id)
+        unreadableLocationIDs.remove(id)
+        return previous
     }
 
     func workspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
@@ -251,6 +439,117 @@ actor DomainWorkspaceContextAuthority {
     /// overlay is routing-only and must never leak into recovery health or revision baselines.
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
+    }
+
+    /// Read and evidence are captured in one actor turn. Routing overlays never participate.
+    func agentAdmissionSnapshot(_ workspaceID: UUID) -> DomainWorkspaceAdmissionSnapshot {
+        let snapshot = canonicalWorkspaceSnapshot(workspaceID)
+        recordTransition(.admissionAttempted, workspaceID: workspaceID, operation: .agentAdmission)
+        let accepted = snapshot?.health.acceptsMutations == true && snapshot?.revisions.dirtyRevision == nil
+        let diagnostic = recordTransition(
+            accepted ? .admissionPassed : .admissionRejected,
+            workspaceID: workspaceID,
+            operation: .agentAdmission
+        )
+        return .init(snapshot: snapshot, diagnostic: diagnostic)
+    }
+
+    func transitionDiagnostics(_ workspaceID: UUID) -> [DomainWorkspaceTransitionDiagnostic] {
+        transitionBuffer.entries.filter { $0.workspaceID == workspaceID }
+    }
+
+    /// A persistence await can let another command finish and publish diagnostic evidence.
+    /// Carry that live evidence forward, never a captured copy; all decision-bearing fields
+    /// still come exclusively from the caller's existing canonical transition.
+    private func installRecordPreservingDiagnostics(_ record: WorkspaceRecord) {
+        let workspaceID = record.document.workspaceID
+        let current = records[workspaceID]
+        var replacement = record
+        // A new saved baseline ends the old dirty lineage. Keep its origin only for a
+        // clean transition's dirtyCleared event, or while the same dirty lineage advances.
+        let continuesDirtyLineage = current?.revisions.dirtyRevision != nil
+            && current?.revisions.savedRevision == record.revisions.savedRevision
+            && (current?.revisions.workingRevision ?? 0) <= record.revisions.workingRevision
+        replacement.diagnosticDirtyOrigin = record.revisions.dirtyRevision == nil || continuesDirtyLineage
+            ? current?.diagnosticDirtyOrigin : nil
+        replacement.diagnosticLastSave = current?.diagnosticLastSave
+        updateWorkspaceLocationIndex(previous: current, next: replacement)
+        records[workspaceID] = replacement
+    }
+
+    private func recordReconstruction(_ workspaceID: UUID) {
+        if let dirty = records[workspaceID]?.revisions.dirtyRevision,
+           records[workspaceID]?.diagnosticDirtyOrigin == nil
+        {
+            records[workspaceID]?.diagnosticDirtyOrigin = .init(revision: dirty, operation: .reconstruction, operationID: nil)
+        }
+        if records[workspaceID]?.revisions.dirtyRevision == nil,
+           records[workspaceID]?.diagnosticDirtyOrigin != nil
+        {
+            recordTransition(.dirtyCleared, workspaceID: workspaceID, operation: .reconstruction)
+            records[workspaceID]?.diagnosticDirtyOrigin = nil
+        }
+        recordTransition(.reconstructed, workspaceID: workspaceID, operation: .reconstruction)
+    }
+
+    @discardableResult
+    private func recordTransition(
+        _ transition: DomainWorkspaceTransitionDiagnostic.Transition,
+        workspaceID: UUID,
+        operation: DomainWorkspaceTransitionDiagnostic.Operation,
+        operationID: UUID? = nil,
+        saveGeneration: UInt64? = nil,
+        error: DomainCommandErrorCode? = nil
+    ) -> DomainWorkspaceTransitionDiagnostic {
+        let record = records[workspaceID]
+        let pending = pendingDiagnosticSaves.values.filter { $0.workspaceID == workspaceID }
+        let entry = DomainWorkspaceTransitionDiagnostic(
+            runtimeID: identity.runtimeID, lifecycleGeneration: identity.lifecycleGeneration,
+            workspaceID: workspaceID, sequence: transitionBuffer.nextSequence(),
+            uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            catalogRevision: catalogRevision, snapshotSequence: publicationSequence,
+            revisions: record?.revisions,
+            workingDiffersFromSaved: record.map { $0.document.contentDigest != $0.savedDigest },
+            dirtyOrigin: record?.diagnosticDirtyOrigin,
+            pendingSaveState: pending.contains { $0.state == .started } ? .started : pending.isEmpty ? .none : .scheduled,
+            lastSave: record?.diagnosticLastSave, pendingSaveCount: pending.count,
+            saveGeneration: saveGeneration ?? pending.map(\.generation).max(),
+            transition: transition, operation: operation, operationID: operationID,
+            admissionState: .classify(health: record?.health, revisions: record?.revisions, pendingSaveCount: pending.count), error: error
+        )
+        transitionBuffer.append(entry)
+        return entry
+    }
+
+    /// Opening one workspace must not wait for unrelated documents and recovery journals.
+    /// Mutations still use the fully bootstrapped command authority. This cold read uses the
+    /// same persisted catalog, tombstones and working journal as bootstrap, without publishing
+    /// a partial catalog or installing a second mutable record store.
+    func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        if didBootstrap {
+            return .init(workspace: canonicalWorkspaceSnapshot(workspaceID), publicationSequence: publicationSequence, catalogRevision: catalogRevision)
+        }
+        let refreshed = await persistence.refreshWorkspace(workspaceID: workspaceID, fallbackFileURL: fileURL, requireCatalogMembership: true)
+        // Bootstrap may have completed while the file read was suspended. Its current working
+        // state wins over the earlier disk read, including a concurrent retirement or deletion.
+        if didBootstrap {
+            return .init(workspace: canonicalWorkspaceSnapshot(workspaceID), publicationSequence: publicationSequence, catalogRevision: catalogRevision)
+        }
+        let workspace: DomainWorkspaceSnapshot? = if let refreshed, refreshed.health.acceptsMutations, !refreshed.workspaceIsDeleted,
+                                                     let loaded = refreshed.workspace
+        {
+            DomainWorkspaceSnapshot(
+                document: loaded.document,
+                revisions: loaded.revisions,
+                health: loaded.health,
+                contexts: loaded.document.metadata.contexts.map {
+                    DomainContextSnapshot(metadata: $0, revisions: loaded.contextRevisions[$0.identity.contextID] ?? loaded.revisions, health: loaded.health)
+                }
+            )
+        } else {
+            nil
+        }
+        return .init(workspace: workspace, publicationSequence: publicationSequence, catalogRevision: refreshed?.catalogRevision ?? catalogRevision)
     }
 
     func contextSnapshot(_ identity: DomainContextIdentity) -> DomainContextSnapshot? {
@@ -309,6 +608,13 @@ actor DomainWorkspaceContextAuthority {
         return snapshot()
     }
 
+    func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        await bootstrap()
+        await acquireCatalogMutation()
+        defer { releaseCatalogMutation() }
+        return try await selectExactRoot(canonicalRootPath: canonicalRootPath)
+    }
+
     func readySubscription() async -> DomainWorkspaceSnapshotSubscription {
         await bootstrap()
         return subscribe()
@@ -326,6 +632,50 @@ actor DomainWorkspaceContextAuthority {
     }
 
     func execute(_ envelope: DomainWorkspaceCommandEnvelope) async -> DomainCommandOutcome {
+        guard case let .saveWorkspaceDocument(workspaceID) = envelope.command else {
+            return await executeCommand(envelope)
+        }
+        // Track the command lifetime, including validation/replay failures before disk I/O.
+        // This does not claim ownership of any presentation-layer debounce or user intent.
+        nextSaveGeneration &+= 1
+        let generation = nextSaveGeneration
+        let token = UUID()
+        pendingDiagnosticSaves[token] = (workspaceID, generation, .scheduled)
+        recordTransition(
+            .saveScheduled,
+            workspaceID: workspaceID,
+            operation: .saveWorkspace,
+            operationID: envelope.operationID,
+            saveGeneration: generation
+        )
+        let outcome = await executeCommand(envelope, diagnosticSaveGeneration: generation)
+        pendingDiagnosticSaves.removeValue(forKey: token)
+        let terminal: DomainWorkspaceTransitionDiagnostic.Transition = switch outcome.disposition {
+        case .applied, .unchanged:
+            .saveCompleted
+        case .deduplicated:
+            outcome.errorCode == nil ? .saveCompleted : .saveFailed
+        case .conflict:
+            outcome.errorCode == .stateConflict ? .saveSuperseded : .saveFailed
+        default:
+            outcome.errorCode == .cancelled ? .saveCancelled : .saveFailed
+        }
+        records[workspaceID]?.diagnosticLastSave = .init(
+            generation: generation, operationID: envelope.operationID,
+            attemptedRevision: envelope.expectedWorkspaceRevision ?? outcome.before?.workingRevision, transition: terminal, error: outcome.errorCode
+        )
+        recordTransition(
+            terminal,
+            workspaceID: workspaceID,
+            operation: .saveWorkspace,
+            operationID: envelope.operationID,
+            saveGeneration: generation,
+            error: outcome.errorCode
+        )
+        return outcome
+    }
+
+    private func executeCommand(_ envelope: DomainWorkspaceCommandEnvelope, diagnosticSaveGeneration: UInt64? = nil) async -> DomainCommandOutcome {
         await bootstrap()
         let fingerprint = envelope.fingerprint
         let workspaceID = envelope.workspaceID
@@ -340,14 +690,25 @@ actor DomainWorkspaceContextAuthority {
         {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: diagnostic
             )
         }
+        if rejectsEphemeralPersistence(envelope.command) {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .invalid,
+                errorCode: .invalidDocument,
+                diagnostic: "ephemeral_workspace_not_persistable"
+            )
+        }
         if let workspaceID, unavailableWorkspaces[workspaceID] != nil {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .readOnly,
                 errorCode: .runtimeReadOnlyDegraded,
                 diagnostic: "workspace_document_unavailable"
@@ -356,6 +717,7 @@ actor DomainWorkspaceContextAuthority {
         guard health.acceptsMutations else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .readOnly,
                 errorCode: .runtimeReadOnlyDegraded,
                 diagnostic: "runtime_authority_not_writable"
@@ -364,19 +726,45 @@ actor DomainWorkspaceContextAuthority {
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
+            )
+        }
+        if envelope.conflictRecoveryPolicy == .failClosed,
+           envelope.expectedWorkspaceRevision == nil
+        {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .invalid,
+                errorCode: .stateConflict,
+                diagnostic: "fail_closed_requires_workspace_revision"
             )
         }
 
         let outcome: DomainCommandOutcome = switch envelope.command {
         case let .createWorkspace(document):
             await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
+        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath):
+            await resolveOrCreateWorkspaceForExactRoot(
+                document,
+                canonicalRootPath: canonicalRootPath,
+                envelope: envelope,
+                fingerprint: fingerprint
+            )
         case let .replaceWorkingDocument(document):
             await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
-            await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            await saveWorkspace(
+                workspaceID,
+                envelope: envelope,
+                fingerprint: fingerprint,
+                allowsCASRecovery: envelope.conflictRecoveryPolicy != .failClosed,
+                allowsExternalRecovery: envelope.conflictRecoveryPolicy != .failClosed,
+                diagnosticSaveGeneration: diagnosticSaveGeneration
+            )
         case let .resolveExternalConflict(workspaceID, acceptExternal, protectedAgentIdentities):
             await resolveExternalConflict(
                 workspaceID,
@@ -419,9 +807,25 @@ actor DomainWorkspaceContextAuthority {
         }
     }
 
+    private func rejectsEphemeralPersistence(_ command: DomainWorkspaceCommand) -> Bool {
+        switch command {
+        case let .createWorkspace(document),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _),
+             let .replaceWorkingDocument(document):
+            document.metadata.isEphemeral
+        case let .saveWorkspaceDocument(workspaceID),
+             let .resolveExternalConflict(workspaceID, _, _):
+            records[workspaceID]?.document.metadata.isEphemeral == true
+        case .deleteWorkspace:
+            false
+        }
+    }
+
     private func commandDocument(_ command: DomainWorkspaceCommand) -> DomainWorkspaceDocument? {
         switch command {
-        case let .createWorkspace(document), let .replaceWorkingDocument(document):
+        case let .createWorkspace(document),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _),
+             let .replaceWorkingDocument(document):
             document
         case .saveWorkspaceDocument, .deleteWorkspace, .resolveExternalConflict:
             nil
@@ -455,7 +859,9 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if prior.disposition == .applied || prior.disposition == .unchanged,
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
@@ -479,13 +885,19 @@ actor DomainWorkspaceContextAuthority {
                 disposition: prior.disposition,
                 resultingDigest: prior.resultingDigest
             )
-            return prior.outcome(workspace: makeSnapshot(record))
+            return replayOutcome(
+                prior,
+                command: envelope.command,
+                fallbackWorkspace: makeSnapshot(record)
+            )
         }
         if let prior = globalOperations[envelope.operationID] {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if prior.disposition == .applied || prior.disposition == .unchanged,
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
@@ -504,9 +916,66 @@ actor DomainWorkspaceContextAuthority {
                 disposition: prior.disposition,
                 resultingDigest: prior.resultingDigest
             )
-            return prior.outcome(workspace: workspaceID.flatMap(canonicalWorkspaceSnapshot))
+            return replayOutcome(
+                prior,
+                command: envelope.command,
+                fallbackWorkspace: workspaceID.flatMap(canonicalWorkspaceSnapshot)
+            )
         }
         return nil
+    }
+
+    private func replayOutcome(
+        _ prior: DomainRecordedOperation,
+        command: DomainWorkspaceCommand,
+        fallbackWorkspace: DomainWorkspaceSnapshot?
+    ) -> DomainCommandOutcome {
+        guard case .resolveOrCreateWorkspaceForExactRoot = command,
+              prior.disposition == .applied || prior.disposition == .unchanged
+        else {
+            return prior.outcome(workspace: fallbackWorkspace)
+        }
+
+        // Records retain only a command fingerprint, so validate where the command is known.
+        // Exact-root success has always required identity and provenance; generic records have not.
+        guard let resultingWorkspaceID = prior.resultingWorkspaceID,
+              prior.exactRootResolution == .created || prior.exactRootResolution == .reused
+        else {
+            return failedReplayOutcome(
+                prior,
+                errorCode: .invalidDocument,
+                diagnostic: "exact_root_record_missing_result_identity_or_provenance"
+            )
+        }
+        if let record = records[resultingWorkspaceID] {
+            return prior.outcome(workspace: makeSnapshot(record))
+        }
+        return failedReplayOutcome(
+            prior,
+            errorCode: .workspaceUnavailable,
+            diagnostic: deletedWorkspaceIDs.contains(resultingWorkspaceID)
+                ? "recorded_result_workspace_deleted"
+                : "recorded_result_workspace_unavailable"
+        )
+    }
+
+    private func failedReplayOutcome(
+        _ prior: DomainRecordedOperation,
+        errorCode: DomainCommandErrorCode,
+        diagnostic: String
+    ) -> DomainCommandOutcome {
+        DomainCommandOutcome(
+            operationID: prior.operationID,
+            disposition: .failed,
+            before: prior.before,
+            after: prior.after,
+            catalogRevision: catalogRevision,
+            resultingDigest: prior.resultingDigest,
+            errorCode: errorCode,
+            diagnostic: diagnostic,
+            workspace: nil,
+            exactRootResolution: prior.exactRootResolution
+        )
     }
 
     func reloadExternalChanges() async -> DomainExternalReloadActivity {
@@ -548,6 +1017,7 @@ actor DomainWorkspaceContextAuthority {
             let previousHealth = health
             health = durableCatalog.health
             catalogRevision = max(catalogRevision, durableCatalog.catalogRevision)
+            deletedWorkspaceIDs = durableCatalog.deletedWorkspaceIDs
             for operation in durableCatalog.deletedOperations
                 + durableCatalog.workspaces.flatMap(\.operations)
             {
@@ -557,7 +1027,7 @@ actor DomainWorkspaceContextAuthority {
                 $0.uuidString < $1.uuidString
             }) {
                 unavailableWorkspaces.removeValue(forKey: workspaceID)
-                if records.removeValue(forKey: workspaceID) != nil {
+                if removeCanonicalRecord(workspaceID) != nil {
                     readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
@@ -579,7 +1049,7 @@ actor DomainWorkspaceContextAuthority {
                 where records[workspace.document.workspaceID] == nil
             {
                 let workspaceID = workspace.document.workspaceID
-                records[workspaceID] = makeRecord(from: workspace)
+                installRecordPreservingDiagnostics(makeRecord(from: workspace))
                 readRegistrations.removeValue(forKey: workspaceID)
                 unavailableWorkspaces.removeValue(forKey: workspaceID)
                 changed = true
@@ -623,7 +1093,7 @@ actor DomainWorkspaceContextAuthority {
                 recoveryPending = true
                 continue
             }
-            records[workspaceID] = makeRecord(from: recovered)
+            installRecordPreservingDiagnostics(makeRecord(from: recovered))
             readRegistrations.removeValue(forKey: workspaceID)
             unavailableWorkspaces.removeValue(forKey: workspaceID)
             changed = true
@@ -652,7 +1122,7 @@ actor DomainWorkspaceContextAuthority {
                 guard records[workspaceID]?.revisions == current.revisions else { continue }
                 if let recovered, recovered.health.acceptsMutations {
                     current = makeRecord(from: recovered)
-                    records[workspaceID] = current
+                    installRecordPreservingDiagnostics(current)
                     readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
@@ -702,7 +1172,7 @@ actor DomainWorkspaceContextAuthority {
                 }
                 if record.fileMetadata != metadata || recoveredExternalDegradation {
                     record.fileMetadata = metadata
-                    records[workspaceID] = record
+                    installRecordPreservingDiagnostics(record)
                 }
                 if recoveredExternalDegradation {
                     publish(
@@ -722,7 +1192,7 @@ actor DomainWorkspaceContextAuthority {
                 // returning file is detected by the next metadata change.
                 if record.fileMetadata != metadata {
                     record.fileMetadata = metadata
-                    records[workspaceID] = record
+                    installRecordPreservingDiagnostics(record)
                 }
                 if !record.health.acceptsMutations {
                     recoveryPending = true
@@ -734,7 +1204,7 @@ actor DomainWorkspaceContextAuthority {
                 let shouldPublish = record.health != degraded
                 record.health = degraded
                 record.fileMetadata = metadata
-                records[workspaceID] = record
+                installRecordPreservingDiagnostics(record)
                 recoveryPending = true
                 if shouldPublish {
                     publish(
@@ -747,6 +1217,22 @@ actor DomainWorkspaceContextAuthority {
                     )
                 }
             case let .changed(document, metadata):
+                if document.metadata.isEphemeral || record.document.metadata.isEphemeral {
+                    record.document = document
+                    record.fileMetadata = metadata
+                    installRecordPreservingDiagnostics(record)
+                    readRegistrations.removeValue(forKey: workspaceID)
+                    publish(
+                        kind: .externalReloaded,
+                        workspaceID: workspaceID,
+                        contextID: nil,
+                        operationID: nil,
+                        revisions: record.revisions,
+                        diagnostic: "ephemeral_external_reload_not_persisted"
+                    )
+                    changed = true
+                    continue
+                }
                 #if DEBUG
                     if let testBeforeExternalReconciliation {
                         await testBeforeExternalReconciliation(workspaceID)
@@ -774,6 +1260,24 @@ actor DomainWorkspaceContextAuthority {
             _ hook: (@Sendable (UUID) async -> Void)?
         ) {
             testBeforeExternalReconciliation = hook
+        }
+
+        func testSetBeforeWorkingPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testBeforeWorkingPersistence = hook
+        }
+
+        func testSetBeforeSavedPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testBeforeSavedPersistence = hook
+        }
+
+        func testSetAfterWorkspaceMutationGateAcquired(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testAfterWorkspaceMutationGateAcquired = hook
         }
     #endif
 
@@ -814,6 +1318,19 @@ actor DomainWorkspaceContextAuthority {
             guard var record = records[workspaceID], record.health.acceptsMutations else {
                 return .failed
             }
+            guard record.document.metadata.consolidatedIntoWorkspaceID
+                == localDocument.metadata.consolidatedIntoWorkspaceID,
+                externalDocument.metadata.consolidatedIntoWorkspaceID
+                == localDocument.metadata.consolidatedIntoWorkspaceID
+            else { return .recoveryPending }
+            // A stale process must not replay its whole workspace over Agent tabs (or pinned
+            // tabs) that appeared in the newer saved document. Fail closed rather than silently
+            // orphaning those sessions.
+            guard Self.protectedAgentIdentityConflict(
+                local: externalDocument,
+                external: localDocument,
+                callerClaims: []
+            ) == nil else { return .recoveryPending }
             let before = record.revisions
             let restoresCapturedDocument = record.document.contentDigest != localDocument.contentDigest
             let revisions: DomainRevisionState
@@ -864,7 +1381,7 @@ actor DomainWorkspaceContextAuthority {
                 record.health = .writable
                 record.externalDocument = nil
                 record.fileMetadata = fileMetadata
-                records[workspaceID] = record
+                installRecordPreservingDiagnostics(record)
                 readRegistrations.removeValue(forKey: workspaceID)
                 publish(
                     kind: .workingStateCommitted,
@@ -894,7 +1411,7 @@ actor DomainWorkspaceContextAuthority {
                         current.health = .degradedReadOnly(
                             reason: "workspace_persistence_rebase_failed"
                         )
-                        records[workspaceID] = current
+                        installRecordPreservingDiagnostics(current)
                         publish(
                             kind: .degraded,
                             workspaceID: workspaceID,
@@ -913,7 +1430,7 @@ actor DomainWorkspaceContextAuthority {
                     current.health = .degradedReadOnly(
                         reason: "workspace_persistence_rebase_failed"
                     )
-                    records[workspaceID] = current
+                    installRecordPreservingDiagnostics(current)
                     publish(
                         kind: .degraded,
                         workspaceID: workspaceID,
@@ -937,9 +1454,17 @@ actor DomainWorkspaceContextAuthority {
               var record = records[workspaceID],
               record.health.acceptsMutations
         else { return .failed }
+        guard record.document.metadata.consolidatedIntoWorkspaceID
+            == localDocument.metadata.consolidatedIntoWorkspaceID
+        else { return .recoveryPending }
         guard record.document.contentDigest != localDocument.contentDigest else {
             return .applied
         }
+        guard Self.protectedAgentIdentityConflict(
+            local: record.document,
+            external: localDocument,
+            callerClaims: []
+        ) == nil else { return .recoveryPending }
 
         let before = record.revisions
         let nextWorking = before.workingRevision &+ 1
@@ -964,6 +1489,7 @@ actor DomainWorkspaceContextAuthority {
                     contextUpdate.tombstones
                 ) { _, new in new },
                 operations: record.operations,
+                requiresMatchingConsolidationLifecycle: true,
                 now: Date()
             )
             catalogRevision = max(catalogRevision, persisted.catalogRevision)
@@ -975,7 +1501,7 @@ actor DomainWorkspaceContextAuthority {
             record.operationIndex.replace(with: persisted.journal.operations)
             record.health = .writable
             record.externalDocument = nil
-            records[workspaceID] = record
+            installRecordPreservingDiagnostics(record)
             readRegistrations.removeValue(forKey: workspaceID)
             publish(
                 kind: .workingStateCommitted,
@@ -999,7 +1525,7 @@ actor DomainWorkspaceContextAuthority {
                 current.health = .degradedReadOnly(
                     reason: "workspace_persistence_replay_failed"
                 )
-                records[workspaceID] = current
+                installRecordPreservingDiagnostics(current)
                 publish(
                     kind: .degraded,
                     workspaceID: workspaceID,
@@ -1017,7 +1543,7 @@ actor DomainWorkspaceContextAuthority {
                 current.health = .degradedReadOnly(
                     reason: "workspace_persistence_replay_failed"
                 )
-                records[workspaceID] = current
+                installRecordPreservingDiagnostics(current)
                 publish(
                     kind: .degraded,
                     workspaceID: workspaceID,
@@ -1048,6 +1574,11 @@ actor DomainWorkspaceContextAuthority {
                     fileMetadata: fileMetadata
                 )
             }
+            guard Self.protectedAgentIdentityConflict(
+                local: record.document,
+                external: externalDocument,
+                callerClaims: []
+            ) == nil else { return .recoveryPending }
 
             let before = record.revisions
             let next = before.workingRevision &+ 1
@@ -1085,7 +1616,7 @@ actor DomainWorkspaceContextAuthority {
                 record.health = .writable
                 record.externalDocument = nil
                 record.fileMetadata = fileMetadata
-                records[workspaceID] = record
+                installRecordPreservingDiagnostics(record)
                 readRegistrations.removeValue(forKey: workspaceID)
                 publish(
                     kind: .externalReloaded,
@@ -1113,7 +1644,7 @@ actor DomainWorkspaceContextAuthority {
                         current.health = .degradedReadOnly(
                             reason: "workspace_external_reload_persistence_failed"
                         )
-                        records[workspaceID] = current
+                        installRecordPreservingDiagnostics(current)
                         publish(
                             kind: .degraded,
                             workspaceID: workspaceID,
@@ -1132,7 +1663,7 @@ actor DomainWorkspaceContextAuthority {
                     current.health = .degradedReadOnly(
                         reason: "workspace_external_reload_persistence_failed"
                     )
-                    records[workspaceID] = current
+                    installRecordPreservingDiagnostics(current)
                     publish(
                         kind: .degraded,
                         workspaceID: workspaceID,
@@ -1148,19 +1679,171 @@ actor DomainWorkspaceContextAuthority {
         return .recoveryPending
     }
 
-    private func createWorkspace(
+    private func resolveOrCreateWorkspaceForExactRoot(
         _ document: DomainWorkspaceDocument,
+        canonicalRootPath: String,
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
         await acquireCatalogMutation()
         defer { releaseCatalogMutation() }
+
+        if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
+            return recorded
+        }
+        guard WorkspaceExactRootPath.contains(
+            canonicalComparisonPath: canonicalRootPath,
+            in: document.metadata.repoPaths
+        )
+        else {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .invalid,
+                errorCode: .invalidDocument,
+                diagnostic: "folder_open_root_mismatch"
+            )
+        }
+
+        let selection: DomainExactRootSelection
+        do {
+            selection = try await selectExactRoot(canonicalRootPath: canonicalRootPath)
+        } catch {
+            return persistenceFailureOutcome(envelope, record: nil, error: error)
+        }
+        if case let .matched(snapshot) = selection,
+           let existing = records[snapshot.document.workspaceID]
+        {
+            return await unchangedOutcome(
+                envelope,
+                fingerprint: fingerprint,
+                record: existing,
+                exactRootResolution: .reused
+            )
+        }
+        switch selection {
+        case .recoveryBlocked:
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_restoration_incomplete",
+                exactRootResolution: .recoveryBlocked
+            )
+        case .matched, .changed:
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_selection_changed"
+            )
+        case .noMatch:
+            break
+        }
+        guard records[document.workspaceID] == nil else {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_workspace_id_collision"
+            )
+        }
+
+        return await createWorkspace(
+            document,
+            envelope: envelope,
+            fingerprint: fingerprint,
+            acquireMutationGate: false,
+            exactRootResolution: .created
+        )
+    }
+
+    /// Both callers hold the catalog gate. Saves and external reloads can still reenter during
+    /// saved-file I/O, so validate all exact-root candidates before returning a selection.
+    private func selectExactRoot(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try Task.checkCancellation()
+        let matchingRecords = exactRootRecords(canonicalRootPath: canonicalRootPath)
+        let before = matchingRecords.mapValues(makeSnapshot)
+        var eligibleMatches: [WorkspaceRecord] = []
+        var hasRecoveryBlockedMatch = false
+        for record in matchingRecords.values {
+            let metadata = record.document.metadata
+            guard !metadata.isSystemWorkspace,
+                  !metadata.isHiddenInMenus,
+                  !metadata.isEphemeral,
+                  metadata.consolidatedIntoWorkspaceID == nil
+            else { continue }
+            guard record.revisions.dirtyRevision != nil else {
+                eligibleMatches.append(record)
+                continue
+            }
+            switch try await persistence.savedConsolidationMarkerStatus(for: record.document) {
+            case .unmarked:
+                eligibleMatches.append(record)
+            case .marked, .unreadable:
+                hasRecoveryBlockedMatch = true
+            }
+            #if DEBUG
+                await testAfterExactRootSavedMarkerRead?(record.document.workspaceID)
+            #endif
+        }
+        try Task.checkCancellation()
+        guard before == exactRootRecords(canonicalRootPath: canonicalRootPath).mapValues(makeSnapshot) else {
+            return .changed
+        }
+
+        eligibleMatches.sort {
+            Self.exactRootCandidateRank(for: $0) < Self.exactRootCandidateRank(for: $1)
+        }
+        if let existing = eligibleMatches.first {
+            return .matched(makeSnapshot(existing))
+        }
+        return hasRecoveryBlockedMatch ? .recoveryBlocked : .noMatch
+    }
+
+    private func exactRootRecords(canonicalRootPath: String) -> [UUID: WorkspaceRecord] {
+        records.filter { _, record in
+            WorkspaceExactRootPath.contains(
+                canonicalComparisonPath: canonicalRootPath,
+                in: record.document.metadata.repoPaths
+            )
+        }
+    }
+
+    private static func exactRootCandidateRank(for record: WorkspaceRecord) -> WorkspaceExactRootCandidateRank {
+        let metadata = record.document.metadata
+        return WorkspaceExactRootCandidateRank(
+            lastUsed: metadata.lastUsed,
+            name: metadata.name,
+            workspaceID: metadata.workspaceID
+        )
+    }
+
+    private func createWorkspace(
+        _ document: DomainWorkspaceDocument,
+        envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
+        acquireMutationGate: Bool = true,
+        exactRootResolution: DomainExactRootResolution? = nil
+    ) async -> DomainCommandOutcome {
+        if acquireMutationGate {
+            await acquireCatalogMutation()
+        }
+        defer {
+            if acquireMutationGate {
+                releaseCatalogMutation()
+            }
+        }
         if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
             return recorded
         }
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
@@ -1168,10 +1851,11 @@ actor DomainWorkspaceContextAuthority {
         }
         if let existing = records[document.workspaceID] {
             if existing.document.contentDigest == document.contentDigest {
-                return await unchangedOutcome(envelope, record: existing)
+                return await unchangedOutcome(envelope, fingerprint: fingerprint, record: existing)
             }
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "workspace_already_exists"
@@ -1180,6 +1864,7 @@ actor DomainWorkspaceContextAuthority {
         guard envelope.expectedWorkspaceRevision == nil || envelope.expectedWorkspaceRevision == 0 else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "workspace_does_not_exist_at_expected_revision"
@@ -1199,12 +1884,14 @@ actor DomainWorkspaceContextAuthority {
             before: nil,
             after: revisions,
             catalogRevision: catalogRevision &+ 1,
-            resultingDigest: document.contentDigest
+            resultingDigest: document.contentDigest,
+            exactRootResolution: exactRootResolution
         )
         let recorded = DomainRecordedOperation(
             fingerprint: fingerprint,
             recordedAt: Date(),
-            outcome: provisional
+            outcome: provisional,
+            resultingWorkspaceID: document.workspaceID
         )
         do {
             let persisted = try await persistence.persistCreated(
@@ -1231,7 +1918,8 @@ actor DomainWorkspaceContextAuthority {
                 externalDocument: nil,
                 fileMetadata: .missing
             )
-            records[document.workspaceID] = record
+            installRecordPreservingDiagnostics(record)
+            deletedWorkspaceIDs.remove(document.workspaceID)
             globalOperations.insert(recorded)
             let outcome = DomainCommandOutcome(
                 operationID: envelope.operationID,
@@ -1240,7 +1928,8 @@ actor DomainWorkspaceContextAuthority {
                 after: record.revisions,
                 catalogRevision: catalogRevision,
                 resultingDigest: document.contentDigest,
-                workspace: makeSnapshot(record)
+                workspace: makeSnapshot(record),
+                exactRootResolution: exactRootResolution
             )
             publish(
                 kind: .workspaceCreated,
@@ -1290,6 +1979,7 @@ actor DomainWorkspaceContextAuthority {
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
@@ -1298,13 +1988,14 @@ actor DomainWorkspaceContextAuthority {
         guard let record = records[workspaceID] else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_not_found"
             )
         }
         guard record.health.acceptsMutations else {
-            return healthRejectionOutcome(envelope, record: record)
+            return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         if let expected = envelope.expectedWorkspaceRevision,
            expected != record.revisions.workingRevision
@@ -1332,17 +2023,25 @@ actor DomainWorkspaceContextAuthority {
                 operation: operation,
                 now: operation.recordedAt
             )
-            records.removeValue(forKey: workspaceID)
-            globalOperations.insert(operation)
+            removeCanonicalRecord(workspaceID)
+            deletedWorkspaceIDs.insert(workspaceID)
             catalogRevision = deleted.catalogRevision
+            let cleanupDiagnostic = deleted.tombstone.operation.diagnostic
             let outcome = DomainCommandOutcome(
                 operationID: envelope.operationID,
                 disposition: .applied,
                 before: record.revisions,
                 after: nil,
                 catalogRevision: catalogRevision,
-                resultingDigest: nil
+                resultingDigest: nil,
+                diagnostic: cleanupDiagnostic
             )
+            globalOperations.insert(DomainRecordedOperation(
+                fingerprint: fingerprint,
+                recordedAt: operation.recordedAt,
+                outcome: outcome,
+                resultingWorkspaceID: operation.resultingWorkspaceID
+            ))
             publish(
                 kind: .workspaceDeleted,
                 workspaceID: workspaceID,
@@ -1350,7 +2049,7 @@ actor DomainWorkspaceContextAuthority {
                 operationID: envelope.operationID,
                 origin: envelope.origin,
                 revisions: nil,
-                diagnostic: nil
+                diagnostic: cleanupDiagnostic
             )
             recordMetric(envelope: envelope, outcome: outcome, byteCount: 0)
             return outcome
@@ -1383,9 +2082,19 @@ actor DomainWorkspaceContextAuthority {
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
+        await acquireCatalogMutation()
+        defer { releaseCatalogMutation() }
+
+        #if DEBUG
+            await testAfterWorkspaceMutationGateAcquired?(document.workspaceID)
+        #endif
+        if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
+            return recorded
+        }
         guard document.workspaceID == envelope.workspaceID else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: "workspace_identity_mismatch"
@@ -1396,13 +2105,36 @@ actor DomainWorkspaceContextAuthority {
         while let current = records[document.workspaceID] {
             var record = current
             guard record.health.acceptsMutations else {
-                return healthRejectionOutcome(envelope, record: record)
+                return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
+            }
+            if isDurableReplay,
+               record.document.metadata.consolidatedIntoWorkspaceID
+               != document.metadata.consolidatedIntoWorkspaceID
+            {
+                return conflictOutcome(
+                    envelope,
+                    record: record,
+                    diagnostic: "workspace_consolidation_lifecycle_changed_after_refresh"
+                )
             }
             if !isDurableReplay,
                let expected = envelope.expectedWorkspaceRevision,
                expected != record.revisions.workingRevision
             {
                 return conflictOutcome(envelope, record: record, diagnostic: "workspace_revision_mismatch")
+            }
+            if isDurableReplay,
+               let identityConflict = Self.protectedAgentIdentityConflict(
+                   local: record.document,
+                   external: document,
+                   callerClaims: []
+               )
+            {
+                return conflictOutcome(
+                    envelope,
+                    record: record,
+                    diagnostic: "durable_replay_\(identityConflict)"
+                )
             }
             let changedContextIDs = Self.changedContextIDs(from: record.document, to: document)
             if let expectedContext = envelope.expectedContextRevision {
@@ -1424,7 +2156,7 @@ actor DomainWorkspaceContextAuthority {
                 }
             }
             guard record.document.contentDigest != document.contentDigest else {
-                return await unchangedOutcome(envelope, record: record)
+                return await unchangedOutcome(envelope, fingerprint: fingerprint, record: record)
             }
 
             let changedContextID = changedContextIDs.count == 1 ? changedContextIDs.first : nil
@@ -1452,8 +2184,13 @@ actor DomainWorkspaceContextAuthority {
             )
             let recorded = DomainRecordedOperation(fingerprint: fingerprint, recordedAt: Date(), outcome: provisional)
             let operations = record.operations + [recorded]
+            let requiresDirtyLifecycleFence = before.dirtyRevision != nil
+                && envelope.conflictRecoveryPolicy != .failClosed
             let persisted: DomainPersistenceWorkingCommit
             do {
+                #if DEBUG
+                    await testBeforeWorkingPersistence?(document.workspaceID)
+                #endif
                 persisted = try await persistence.persistWorking(
                     document: document,
                     expectedRevision: before.workingRevision,
@@ -1461,6 +2198,8 @@ actor DomainWorkspaceContextAuthority {
                     contextRevisions: contextUpdate.revisions,
                     contextTombstones: record.contextTombstones.merging(contextUpdate.tombstones) { _, new in new },
                     operations: operations,
+                    requiresMatchingConsolidationLifecycle: isDurableReplay || requiresDirtyLifecycleFence,
+                    requiresMatchingSavedDigest: isDurableReplay,
                     now: recorded.recordedAt
                 )
                 catalogRevision = max(catalogRevision, persisted.catalogRevision)
@@ -1481,6 +2220,20 @@ actor DomainWorkspaceContextAuthority {
                             envelope,
                             record: records[document.workspaceID] ?? record,
                             error: DomainPersistenceError.cancelled
+                        )
+                    }
+                    if envelope.conflictRecoveryPolicy == .failClosed {
+                        let refreshed = records[document.workspaceID]
+                        return DomainCommandOutcome(
+                            operationID: envelope.operationID,
+                            disposition: .conflict,
+                            before: before,
+                            after: refreshed?.revisions,
+                            catalogRevision: catalogRevision,
+                            resultingDigest: refreshed?.document.contentDigest,
+                            errorCode: .stateConflict,
+                            diagnostic: "durable_workspace_revision_mismatch",
+                            workspace: refreshed.map(makeSnapshot)
                         )
                     }
                     if !isDurableReplay {
@@ -1510,7 +2263,7 @@ actor DomainWorkspaceContextAuthority {
             record.contextTombstones = persisted.journal.contextTombstones
             record.operations = persisted.journal.operations
             record.operationIndex.replace(with: persisted.journal.operations)
-            records[document.workspaceID] = record
+            installRecordPreservingDiagnostics(record)
             globalOperations.insert(recorded)
             let applied = DomainCommandOutcome(
                 operationID: envelope.operationID,
@@ -1536,6 +2289,7 @@ actor DomainWorkspaceContextAuthority {
 
         return recordTransientOutcome(
             envelope: envelope,
+            fingerprint: fingerprint,
             disposition: .invalid,
             errorCode: .workspaceUnavailable,
             diagnostic: "workspace_requires_explicit_create_command"
@@ -1548,18 +2302,20 @@ actor DomainWorkspaceContextAuthority {
         fingerprint: String,
         validateExpectedRevision: Bool = true,
         allowsCASRecovery: Bool = true,
-        allowsExternalRecovery: Bool = true
+        allowsExternalRecovery: Bool = true,
+        diagnosticSaveGeneration: UInt64? = nil
     ) async -> DomainCommandOutcome {
         guard var record = records[workspaceID] else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_not_found"
             )
         }
         guard record.health.acceptsMutations else {
-            return healthRejectionOutcome(envelope, record: record)
+            return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         if validateExpectedRevision,
            let expected = envelope.expectedWorkspaceRevision,
@@ -1568,7 +2324,7 @@ actor DomainWorkspaceContextAuthority {
             return conflictOutcome(envelope, record: record, diagnostic: "workspace_revision_mismatch")
         }
         guard record.revisions.dirtyRevision != nil else {
-            return await unchangedOutcome(envelope, record: record)
+            return await unchangedOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         let before = record.revisions
         let after = DomainRevisionState(
@@ -1586,7 +2342,20 @@ actor DomainWorkspaceContextAuthority {
         )
         let recorded = DomainRecordedOperation(fingerprint: fingerprint, recordedAt: Date(), outcome: provisional)
         let operations = record.operations + [recorded]
+        if let token = pendingDiagnosticSaves.first(where: { $0.value.generation == diagnosticSaveGeneration })?.key {
+            pendingDiagnosticSaves[token]?.state = .started
+        }
+        recordTransition(
+            .saveStarted,
+            workspaceID: workspaceID,
+            operation: .saveWorkspace,
+            operationID: envelope.operationID,
+            saveGeneration: diagnosticSaveGeneration
+        )
         do {
+            #if DEBUG
+                await testBeforeSavedPersistence?(workspaceID)
+            #endif
             let saved = try await persistence.persistSaved(
                 document: record.document,
                 expectedWorkingRevision: before.workingRevision,
@@ -1602,7 +2371,7 @@ actor DomainWorkspaceContextAuthority {
             record.contextRevisions = saved.journal.contextRevisions
             record.operations = saved.journal.operations
             record.operationIndex.replace(with: saved.journal.operations)
-            records[workspaceID] = record
+            installRecordPreservingDiagnostics(record)
             globalOperations.insert(recorded)
         } catch let error as DomainPersistenceError {
             if case .stateConflict = error {
@@ -1614,7 +2383,9 @@ actor DomainWorkspaceContextAuthority {
                     return conflictOutcome(
                         envelope,
                         record: records[workspaceID] ?? record,
-                        diagnostic: "durable_save_revision_mismatch_after_replay"
+                        diagnostic: envelope.conflictRecoveryPolicy == .failClosed
+                            ? "durable_save_revision_mismatch"
+                            : "durable_save_revision_mismatch_after_replay"
                     )
                 }
                 switch await replayCapturedWorkingDocument(
@@ -1628,7 +2399,8 @@ actor DomainWorkspaceContextAuthority {
                         fingerprint: fingerprint,
                         validateExpectedRevision: false,
                         allowsCASRecovery: false,
-                        allowsExternalRecovery: allowsExternalRecovery
+                        allowsExternalRecovery: allowsExternalRecovery,
+                        diagnosticSaveGeneration: diagnosticSaveGeneration
                     )
                 case .recoveryPending:
                     return conflictOutcome(
@@ -1639,6 +2411,7 @@ actor DomainWorkspaceContextAuthority {
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
+                        fingerprint: fingerprint,
                         record: records[workspaceID] ?? record
                     )
                 }
@@ -1650,7 +2423,9 @@ actor DomainWorkspaceContextAuthority {
                 return conflictOutcome(
                     envelope,
                     record: record,
-                    diagnostic: "external_document_changed_during_recovered_save"
+                    diagnostic: envelope.conflictRecoveryPolicy == .failClosed
+                        ? "external_document_changed_during_save"
+                        : "external_document_changed_during_recovered_save"
                 )
             }
 
@@ -1689,7 +2464,8 @@ actor DomainWorkspaceContextAuthority {
                         fingerprint: fingerprint,
                         validateExpectedRevision: false,
                         allowsCASRecovery: allowsCASRecovery,
-                        allowsExternalRecovery: false
+                        allowsExternalRecovery: false,
+                        diagnosticSaveGeneration: diagnosticSaveGeneration
                     )
                 case .recoveryPending:
                     return conflictOutcome(
@@ -1700,6 +2476,7 @@ actor DomainWorkspaceContextAuthority {
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
+                        fingerprint: fingerprint,
                         record: records[workspaceID] ?? record
                     )
                 }
@@ -1707,7 +2484,7 @@ actor DomainWorkspaceContextAuthority {
                 current.health = .degradedReadOnly(reason: "external_workspace_decode_failed")
                 current.externalDocument = nil
                 current.fileMetadata = metadata
-                records[workspaceID] = current
+                installRecordPreservingDiagnostics(current)
                 publish(
                     kind: .degraded,
                     workspaceID: workspaceID,
@@ -1717,10 +2494,10 @@ actor DomainWorkspaceContextAuthority {
                     revisions: current.revisions,
                     diagnostic: "external_workspace_decode_failed"
                 )
-                return healthRejectionOutcome(envelope, record: current)
+                return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: current)
             case let .unchanged(metadata), let .missing(metadata):
                 current.fileMetadata = metadata
-                records[workspaceID] = current
+                installRecordPreservingDiagnostics(current)
                 return conflictOutcome(
                     envelope,
                     record: current,
@@ -1771,6 +2548,7 @@ actor DomainWorkspaceContextAuthority {
         else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_has_no_external_conflict"
@@ -1791,6 +2569,7 @@ actor DomainWorkspaceContextAuthority {
         {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .protectedAgentIdentityConflict,
                 diagnostic: diagnostic
@@ -1879,7 +2658,7 @@ actor DomainWorkspaceContextAuthority {
         globalOperations.insert(operation)
         record.health = .writable
         record.externalDocument = nil
-        records[workspaceID] = record
+        installRecordPreservingDiagnostics(record)
         let outcome = DomainCommandOutcome(
             operationID: envelope.operationID,
             disposition: .applied,
@@ -1926,6 +2705,26 @@ actor DomainWorkspaceContextAuthority {
         diagnostic: String?
     ) {
         publicationSequence &+= 1
+        if let workspaceID, var record = records[workspaceID] {
+            let operation: DomainWorkspaceTransitionDiagnostic.Operation = switch kind {
+            case .savedDocumentCommitted: .savedCommit
+            case .externalReloaded: .externalReload
+            default: .workingCommit
+            }
+            if let dirty = record.revisions.dirtyRevision {
+                if record.diagnosticDirtyOrigin == nil {
+                    record.diagnosticDirtyOrigin = .init(revision: dirty, operation: operation, operationID: operationID)
+                    records[workspaceID] = record
+                }
+                if kind == .workingStateCommitted || kind == .externalReloaded {
+                    recordTransition(.dirtySet, workspaceID: workspaceID, operation: operation, operationID: operationID)
+                }
+            } else if record.diagnosticDirtyOrigin != nil {
+                recordTransition(.dirtyCleared, workspaceID: workspaceID, operation: operation, operationID: operationID)
+                record.diagnosticDirtyOrigin = nil
+                records[workspaceID] = record
+            }
+        }
         let event = DomainWorkspaceEvent(
             runtimeID: identity.runtimeID,
             sequence: publicationSequence,
@@ -1975,14 +2774,15 @@ actor DomainWorkspaceContextAuthority {
         health = refreshed.health
         catalogRevision = max(catalogRevision, refreshed.catalogRevision)
         if refreshed.workspaceIsDeleted {
-            records.removeValue(forKey: workspaceID)
+            removeCanonicalRecord(workspaceID)
             unavailableWorkspaces.removeValue(forKey: workspaceID)
+            deletedWorkspaceIDs.insert(workspaceID)
             return
         }
         guard let workspace = refreshed.workspace else {
             if var previous {
                 previous.health = .degradedReadOnly(reason: "workspace_document_unavailable")
-                records[workspaceID] = previous
+                installRecordPreservingDiagnostics(previous)
             }
             return
         }
@@ -1998,7 +2798,8 @@ actor DomainWorkspaceContextAuthority {
         } else {
             nil
         }
-        records[workspaceID] = WorkspaceRecord(
+        deletedWorkspaceIDs.remove(workspaceID)
+        installRecordPreservingDiagnostics(WorkspaceRecord(
             document: workspace.document,
             savedDigest: workspace.savedDigest,
             revisions: workspace.revisions,
@@ -2012,12 +2813,14 @@ actor DomainWorkspaceContextAuthority {
             health: priorConflictDocument == nil ? workspace.health : previous?.health ?? workspace.health,
             externalDocument: priorConflictDocument,
             fileMetadata: workspace.fileMetadata
-        )
+        ))
         unavailableWorkspaces.removeValue(forKey: workspaceID)
+        recordReconstruction(workspaceID)
     }
 
     private func healthRejectionOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
         record: WorkspaceRecord
     ) -> DomainCommandOutcome {
         let disposition: DomainCommandDisposition
@@ -2027,6 +2830,7 @@ actor DomainWorkspaceContextAuthority {
         case .writable:
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .failed,
                 errorCode: .persistenceFailure,
                 diagnostic: "unexpected_writable_health_rejection"
@@ -2046,6 +2850,7 @@ actor DomainWorkspaceContextAuthority {
         }
         return recordTransientOutcome(
             envelope: envelope,
+            fingerprint: fingerprint,
             disposition: disposition,
             errorCode: errorCode,
             diagnostic: diagnostic
@@ -2133,9 +2938,11 @@ actor DomainWorkspaceContextAuthority {
 
     private func unchangedOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
-        record original: WorkspaceRecord
+        fingerprint: String,
+        record original: WorkspaceRecord,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) async -> DomainCommandOutcome {
-        var record = original
+        let record = original
         let outcome = DomainCommandOutcome(
             operationID: envelope.operationID,
             disposition: .unchanged,
@@ -2143,10 +2950,11 @@ actor DomainWorkspaceContextAuthority {
             after: record.revisions,
             catalogRevision: catalogRevision,
             resultingDigest: record.document.contentDigest,
-            workspace: makeSnapshot(record)
+            workspace: makeSnapshot(record),
+            exactRootResolution: exactRootResolution
         )
         let operation = DomainRecordedOperation(
-            fingerprint: envelope.fingerprint,
+            fingerprint: fingerprint,
             recordedAt: Date(),
             outcome: outcome
         )
@@ -2157,12 +2965,36 @@ actor DomainWorkspaceContextAuthority {
                 operation: operation,
                 now: operation.recordedAt
             )
+            #if DEBUG
+                await testAfterUnchangedPersistence?(record.document.workspaceID)
+            #endif
             catalogRevision = max(catalogRevision, persisted.catalogRevision)
-            record.operations = persisted.journal.operations
-            record.operationIndex.replace(with: persisted.journal.operations)
-            records[record.document.workspaceID] = record
+            // Only publish receipt bookkeeping. Save and external reconciliation can
+            // advance the workspace while persistence is suspended, even with the
+            // catalog gate held. Neither the captured record nor the returned journal
+            // is permission to overwrite the current document, revisions, or health.
+            if var current = records[record.document.workspaceID] {
+                let persistedIDs = Set(persisted.journal.operations.map(\.operationID))
+                let concurrentOperations = current.operations.filter { !persistedIDs.contains($0.operationID) }
+                current.operations = Array(
+                    (persisted.journal.operations + concurrentOperations).suffix(Self.maximumWorkspaceOperations)
+                )
+                current.operationIndex.replace(with: current.operations)
+                installRecordPreservingDiagnostics(current)
+            }
             globalOperations.insert(operation)
-            return outcome
+            // Keep the receipt's historical revision fields, as replay does, but
+            // attach the current snapshot so callers cannot re-publish stale state.
+            return DomainCommandOutcome(
+                operationID: outcome.operationID,
+                disposition: outcome.disposition,
+                before: outcome.before,
+                after: outcome.after,
+                catalogRevision: catalogRevision,
+                resultingDigest: outcome.resultingDigest,
+                workspace: records[record.document.workspaceID].map(makeSnapshot),
+                exactRootResolution: exactRootResolution
+            )
         } catch {
             return persistenceFailureOutcome(envelope, record: record, error: error)
         }
@@ -2210,9 +3042,11 @@ actor DomainWorkspaceContextAuthority {
 
     private func recordTransientOutcome(
         envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
         disposition: DomainCommandDisposition,
         errorCode: DomainCommandErrorCode,
-        diagnostic: String
+        diagnostic: String,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) -> DomainCommandOutcome {
         let workspace = envelope.workspaceID.flatMap(canonicalWorkspaceSnapshot)
         let outcome = DomainCommandOutcome(
@@ -2224,10 +3058,11 @@ actor DomainWorkspaceContextAuthority {
             resultingDigest: workspace?.document.contentDigest,
             errorCode: errorCode,
             diagnostic: diagnostic,
-            workspace: workspace
+            workspace: workspace,
+            exactRootResolution: exactRootResolution
         )
         globalOperations.insert(DomainRecordedOperation(
-            fingerprint: envelope.fingerprint,
+            fingerprint: fingerprint,
             recordedAt: Date(),
             outcome: outcome
         ))
@@ -2310,10 +3145,11 @@ private extension DomainWorkspaceCommandEnvelope {
     var workspaceID: UUID? {
         switch command {
         case let .createWorkspace(document): document.workspaceID
+        case let .resolveOrCreateWorkspaceForExactRoot(document, _): document.workspaceID
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID
-            case let .resolveExternalConflict(workspaceID, _, _): workspaceID
+        case let .resolveExternalConflict(workspaceID, _, _): workspaceID
         }
     }
 }

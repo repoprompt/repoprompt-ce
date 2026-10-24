@@ -23,11 +23,13 @@ struct AgentContextControlDrawerView: View {
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    @ObservedObject var fileBrowseModel: AgentContextFileBrowseModel
     let windowID: Int
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var hoveredTab: AgentContextDrawerUIStore.Tab?
     @State private var observedSwitchKey: AgentContextDrawerSwitchKey?
@@ -47,10 +49,6 @@ struct AgentContextControlDrawerView: View {
             activeAgentSessionID: activeAgentSessionID,
             worktreeBindingsProvider: worktreeBindingsProvider
         )
-    }
-
-    private var selectionSummary: AgentContextSelectionSummary {
-        exportContext.selectionSummary
     }
 
     private var currentSwitchKey: AgentContextDrawerSwitchKey {
@@ -73,16 +71,23 @@ struct AgentContextControlDrawerView: View {
         tokenBlankingSelection != nil
     }
 
-    private var resolvedFileCodemapCountSummary: AgentContextFileCodemapCountSummary? {
-        modelCoordinator.loadedFileCodemapCountSummary(for: exportContext.modelRequestIdentity)
+    private func resolvedFileCodemapCountSummary(
+        for renderSnapshot: AgentContextExportRenderSnapshot
+    ) -> AgentContextFileCodemapCountSummary? {
+        modelCoordinator.loadedFileCodemapCountSummary(for: renderSnapshot.modelRequestIdentity)
     }
 
-    private var fileCodemapCountSummary: AgentContextFileCodemapCountSummary {
-        resolvedFileCodemapCountSummary ?? AgentContextFileCodemapCountSummary.intent(from: selectionSummary)
+    private func fileCodemapCountSummary(
+        for renderSnapshot: AgentContextExportRenderSnapshot
+    ) -> AgentContextFileCodemapCountSummary {
+        resolvedFileCodemapCountSummary(for: renderSnapshot)
+            ?? AgentContextFileCodemapCountSummary.intent(from: renderSnapshot.selectionSummary)
     }
 
-    private var fileCodemapCountReadiness: AgentContextFileCodemapCountReadiness {
-        let identity = exportContext.modelRequestIdentity
+    private func fileCodemapCountReadiness(
+        for renderSnapshot: AgentContextExportRenderSnapshot
+    ) -> AgentContextFileCodemapCountReadiness {
+        let identity = renderSnapshot.modelRequestIdentity
         if hasPendingSwitchKeyChange { return unknownFileCodemapCountReadiness }
         if selectedFilesBlankingIdentity == identity {
             return modelCoordinator.displayedFileCodemapCountReadiness(for: identity) ?? unknownFileCodemapCountReadiness
@@ -92,7 +97,7 @@ struct AgentContextControlDrawerView: View {
         }
         return AgentSelectedFilesModelCoordinator.unresolvedFileCodemapCountReadiness(
             for: identity,
-            summary: fileCodemapCountSummary
+            summary: fileCodemapCountSummary(for: renderSnapshot)
         )
     }
 
@@ -101,18 +106,21 @@ struct AgentContextControlDrawerView: View {
     }
 
     var body: some View {
+        let renderSnapshot = exportContext.makeRenderSnapshot()
+
         VStack(spacing: 0) {
             header
             Divider()
-            topTabs
+            topTabs(renderSnapshot)
             Divider()
-            tabContent
+            tabContent(renderSnapshot)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
         .clipped()
         .onAppear {
+            modelCoordinator.perfRecorder = perfRecorder
             if observedSwitchKey == nil {
                 observedSwitchKey = currentSwitchKey
             }
@@ -134,7 +142,7 @@ struct AgentContextControlDrawerView: View {
             guard exportContext.tabMatchesSelectionChange(change) else { return }
             updateBlankingTargetsIfNeeded()
         }
-        .onChange(of: exportContext.modelRequestIdentity) { _, _ in
+        .onChange(of: renderSnapshot.modelRequestIdentity) { _, _ in
             updateBlankingTargetsIfNeeded()
         }
         .onChange(of: modelCoordinator.isLoading) { _, _ in
@@ -148,10 +156,10 @@ struct AgentContextControlDrawerView: View {
         }
     }
 
-    private var topTabs: some View {
+    private func topTabs(_ renderSnapshot: AgentContextExportRenderSnapshot) -> some View {
         HStack(spacing: 0) {
             topTabButton(tab: .files, title: "Selections") {
-                selectionCountPill
+                selectionCountPill(renderSnapshot)
             }
             topTabButton(tab: .prompt, title: "Prompt") {
                 Image(systemName: "wand.and.stars")
@@ -169,8 +177,8 @@ struct AgentContextControlDrawerView: View {
 
     /// Compact `files | codemaps` count pill shown before the Selections tab label.
     /// Resolved models use materialized row counts so this matches the Files/Codemaps subtabs.
-    private var selectionCountPill: some View {
-        let readiness = fileCodemapCountReadiness
+    private func selectionCountPill(_ renderSnapshot: AgentContextExportRenderSnapshot) -> some View {
+        let readiness = fileCodemapCountReadiness(for: renderSnapshot)
         return HStack(spacing: 4) {
             countText(readiness.file)
                 .foregroundColor(countForegroundColor(readiness.file))
@@ -283,6 +291,7 @@ struct AgentContextControlDrawerView: View {
         modelCoordinator.cancelLoading(keepLoadedModel: false)
         selectedFilesBlankingIdentity = request.identity
         captureTokenBlankingSelection()
+        modelCoordinator.perfRecorder = perfRecorder
         modelCoordinator.refreshIfNeeded(request, force: true, preserveDisplayedModel: false)
         observedSwitchKey = newKey
         clearCompletedSelectedFilesBlankingIfNeeded(currentIdentity: request.identity)
@@ -306,6 +315,7 @@ struct AgentContextControlDrawerView: View {
         selectedFilesBlankingIdentity = request.identity
         captureTokenBlankingSelection()
         if shouldRefreshTarget {
+            modelCoordinator.perfRecorder = perfRecorder
             modelCoordinator.refreshIfNeeded(request, force: true, preserveDisplayedModel: false)
         }
         clearCompletedSelectedFilesBlankingIfNeeded(currentIdentity: request.identity)
@@ -378,14 +388,16 @@ struct AgentContextControlDrawerView: View {
     }
 
     @ViewBuilder
-    private var tabContent: some View {
+    private func tabContent(_ renderSnapshot: AgentContextExportRenderSnapshot) -> some View {
         switch detailStore.activeTab {
         case .files:
             AgentContextDrawerFilesTab(
                 detailStore: detailStore,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
-                isSwitchBlankingRows: isSwitchBlankingSelectedFiles
+                renderSnapshot: renderSnapshot,
+                isSwitchBlankingRows: isSwitchBlankingSelectedFiles,
+                browseModel: fileBrowseModel
             )
         case .builder:
             AgentContextDrawerBuilderTab(
@@ -398,6 +410,7 @@ struct AgentContextControlDrawerView: View {
                 promptManager: promptManager,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
+                renderSnapshot: renderSnapshot,
                 isSwitchBlankingSelectedFiles: isSwitchBlankingSelectedFiles
             )
         }

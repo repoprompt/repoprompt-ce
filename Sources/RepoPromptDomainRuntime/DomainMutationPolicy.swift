@@ -90,11 +90,15 @@ package struct DomainMutationAuthorizationSnapshot: Hashable, Sendable {
     package let canonicalRoots: Set<String>
 }
 
-package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendable {
+package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, CustomStringConvertible, Sendable {
     case principalMissing
     case principalUnverified
+    case peerExecutableMissing(processID: Int32)
     case runtimeIdentityMismatch
     case routingContextUnavailable
+    /// The run-scoped connection has no resolvable authoritative routing context.
+    /// This does not imply that publication is pending or that retrying will restore it.
+    case routingBindingUnavailable
     case grantMissing
     case grantExpired
     case grantRevoked
@@ -103,16 +107,21 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendab
     case invalidGrant(String)
     case administratorTTYRequired
 
-    package var errorDescription: String? {
+    /// MCP tool failures interpolate the thrown error, so `description` is the caller-visible text.
+    package var description: String {
         switch self {
         case .principalMissing:
             "Protected mutation denied because no client principal was installed."
         case .principalUnverified:
             "Protected mutation denied because the client principal is not verified."
+        case let .peerExecutableMissing(processID):
+            "Protected mutation denied because the RepoPrompt MCP helper (pid \(processID)) is running an executable that no longer exists on disk, usually because RepoPrompt CE was updated after the helper started. Reconnect the MCP server to start a current helper."
         case .runtimeIdentityMismatch:
             "Protected mutation denied because the runtime generation changed."
         case .routingContextUnavailable:
             "Protected mutation denied because the connection has no authoritative routing registration."
+        case .routingBindingUnavailable:
+            "Protected mutation denied because the run-scoped routing binding is unavailable or its context cannot be resolved. Inspect the connection binding and workspace/context state before reconnecting or retrying."
         case .grantMissing:
             "Protected mutation denied because no active grant covers this operation."
         case .grantExpired:
@@ -128,6 +137,10 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendab
         case .administratorTTYRequired:
             "Protected mutation grants may only be changed by a verified local TTY administrator."
         }
+    }
+
+    package var errorDescription: String? {
+        description
     }
 }
 
@@ -189,6 +202,11 @@ package actor DomainMutationPolicyStore {
             throw DomainMutationPolicyError.runtimeIdentityMismatch
         }
         guard context.principal.assurance != .displayNameOnly else {
+            if context.principal.verificationFailure == .executableMissing,
+               let processID = context.principal.processID
+            {
+                throw DomainMutationPolicyError.peerExecutableMissing(processID: processID)
+            }
             throw DomainMutationPolicyError.principalUnverified
         }
 
@@ -206,6 +224,12 @@ package actor DomainMutationPolicyStore {
             )
         }
         guard context.hasAuthoritativeRoutingContext else {
+            // Missing routing can mean an unbound connection, a removed context, or an
+            // unavailable workspace in either app or headless mode. Principal kind alone
+            // cannot establish that a binding publication is pending or safely retryable.
+            if context.principal.kind == .runScoped {
+                throw DomainMutationPolicyError.routingBindingUnavailable
+            }
             throw DomainMutationPolicyError.routingContextUnavailable
         }
         let hasEphemeralGrant = context.ephemeralGrantedToolNames.contains(toolName)

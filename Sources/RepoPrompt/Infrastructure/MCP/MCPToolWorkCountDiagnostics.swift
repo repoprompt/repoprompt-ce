@@ -21,6 +21,7 @@ enum MCPToolWorkCountDiagnostics {
         let requestIdentity: MCPRequestTimelineIdentity?
         let source: String
         let readBytes: Int
+        let diskReadRecordCount: Int
         let returnedBytes: Int
         let returnedLines: Int
         let decodeMicroseconds: Int
@@ -112,6 +113,7 @@ enum MCPToolWorkCountDiagnostics {
             let requestIdentity: MCPRequestTimelineIdentity?
             private var source = "unknown"
             private var readBytes = 0
+            private var diskReadRecordCount = 0
             private var returnedBytes = 0
             private var returnedLines = 0
             private var decodeMicroseconds = 0
@@ -125,6 +127,7 @@ enum MCPToolWorkCountDiagnostics {
                 lock.lock()
                 source = "disk"
                 readBytes += max(0, bytes)
+                diskReadRecordCount += 1
                 self.decodeMicroseconds += max(0, decodeMicroseconds)
                 lock.unlock()
             }
@@ -155,6 +158,7 @@ enum MCPToolWorkCountDiagnostics {
                     requestIdentity: requestIdentity,
                     source: source,
                     readBytes: readBytes,
+                    diskReadRecordCount: diskReadRecordCount,
                     returnedBytes: returnedBytes,
                     returnedLines: returnedLines,
                     decodeMicroseconds: decodeMicroseconds,
@@ -291,6 +295,17 @@ enum MCPToolWorkCountDiagnostics {
         #endif
     }
 
+    static func readFileDiskReadRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void {
+        #if DEBUG
+            let capture = currentReadFileCapture
+            return { bytes, decodeMicroseconds in
+                capture?.recordDiskRead(bytes: bytes, decodeMicroseconds: decodeMicroseconds)
+            }
+        #else
+            return { _, _ in }
+        #endif
+    }
+
     static func readFileExternalRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void {
         #if DEBUG
             let capture = currentReadFileCapture
@@ -330,4 +345,10 @@ enum MCPToolWorkCountDiagnostics {
             return Int(clamping: (end - start) / 1000)
         }
     #endif
+}
+
+struct AppWorkspaceExternalReadWorkRecorder: WorkspaceExternalReadWorkRecording {
+    func makeRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void {
+        MCPToolWorkCountDiagnostics.readFileExternalRecorder()
+    }
 }

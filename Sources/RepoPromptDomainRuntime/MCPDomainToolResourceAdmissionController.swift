@@ -72,7 +72,41 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         self.limit = limit
     }
 
-    package func acquire(_ resource: Resource) async throws -> Lease {
+    package func acquire(
+        _ resource: Resource,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil
+    ) async throws -> Lease {
+        guard let admissionDeadline else {
+            return try await acquireWithoutDeadline(resource)
+        }
+        try admissionDeadline.check()
+        return try await withThrowingTaskGroup(of: Lease.self) { group in
+            group.addTask {
+                try await self.acquireWithoutDeadline(resource)
+            }
+            group.addTask {
+                try await admissionDeadline.waitUntilExpired()
+            }
+            do {
+                guard let lease = try await group.next() else { throw CancellationError() }
+                group.cancelAll()
+                try? await group.waitForAll()
+                do {
+                    try admissionDeadline.check()
+                    return lease
+                } catch {
+                    lease.release()
+                    throw error
+                }
+            } catch {
+                group.cancelAll()
+                try? await group.waitForAll()
+                throw error
+            }
+        }
+    }
+
+    private func acquireWithoutDeadline(_ resource: Resource) async throws -> Lease {
         try Task.checkCancellation()
 
         let waiterID = UUID()
@@ -135,7 +169,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         let waiters: [Waiter] = lock.withLock {
             guard !isClosed else { return [] }
             isClosed = true
-            let waiters = waitersByResource.values.flatMap { $0 }
+            let waiters = waitersByResource.values.flatMap(\.self)
             waitersByResource.removeAll()
             resourceByWaiterID.removeAll()
             cancelledWaiterIDs.removeAll()

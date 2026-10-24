@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFoundation
 
 struct PromptFileEntrySnapshot {
     let fileID: UUID

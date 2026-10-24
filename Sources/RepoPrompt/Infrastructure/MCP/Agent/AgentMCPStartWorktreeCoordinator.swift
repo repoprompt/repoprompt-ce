@@ -1,5 +1,10 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
+import RepoPromptProcess
+import RepoPromptSettingsCore
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 @MainActor
 struct AgentMCPStartWorktreeCoordinator {
@@ -9,6 +14,7 @@ struct AgentMCPStartWorktreeCoordinator {
         _ startupContext: WorktreeStartupContext?,
         _ initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
     ) throws -> Void
+    typealias PreBindingCommitObserver = @MainActor () async -> Void
 
     struct Request {
         enum Mode: Equatable {
@@ -66,17 +72,23 @@ struct AgentMCPStartWorktreeCoordinator {
     let vcsService: VCSService
     let gitTargetResolver: GitRepoTargetResolver
     private let transitionObserver: TransitionObserver?
+    private let preBindingCommitObserver: PreBindingCommitObserver?
+    private let startupPhaseEventSink: any WorktreeStartupPhaseEventSink
 
     init(
         operationName: String,
         vcsService: VCSService,
         gitTargetResolver: GitRepoTargetResolver,
-        transitionObserver: TransitionObserver? = nil
+        transitionObserver: TransitionObserver? = nil,
+        preBindingCommitObserver: PreBindingCommitObserver? = nil,
+        startupPhaseEventSink: any WorktreeStartupPhaseEventSink
     ) {
         self.operationName = operationName
         self.vcsService = vcsService
         self.gitTargetResolver = gitTargetResolver
         self.transitionObserver = transitionObserver
+        self.preBindingCommitObserver = preBindingCommitObserver
+        self.startupPhaseEventSink = startupPhaseEventSink
     }
 
     func containsArguments(_ args: [String: Value]) -> Bool {
@@ -150,17 +162,25 @@ struct AgentMCPStartWorktreeCoordinator {
         request: Request,
         target: AgentModeViewModel.MCPSessionTarget,
         targetWindow: WindowState,
+        expectedWorkspaceID: UUID,
         startupContext: WorktreeStartupContext? = nil
     ) async throws {
         guard let targetSessionID = target.sessionID else {
             throw MCPError.internalError("\(operationName) target did not resolve a session ID for worktree binding.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
+        try agentModeVM.requireCurrentMCPWorkspaceTarget(
+            target,
+            expectedWorkspaceID: expectedWorkspaceID
+        )
         if let startupContext {
             guard startupContext.agentSessionID == targetSessionID else {
                 throw MCPError.internalError("\(operationName) startup context does not belong to the target Agent session.")
             }
-            WorktreeStartupInstrumentation.record(.worktreePreparationStarted, context: startupContext)
+            startupPhaseEventSink.record(WorktreeStartupPhaseEvent(
+                phase: .worktreePreparationStarted,
+                context: startupContext
+            ))
         }
         try Task.checkCancellation()
         if request.hasExplicitWorktreeArgs {
@@ -173,15 +193,25 @@ struct AgentMCPStartWorktreeCoordinator {
             do {
                 let context = try await resolveRepositoryContext(
                     request: request,
-                    targetWindow: targetWindow
+                    target: target,
+                    targetWindow: targetWindow,
+                    expectedWorkspaceID: expectedWorkspaceID
                 )
-                try validateRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
+                try validateRuntimeRoot(
+                    context.logicalRoot,
+                    targetWindow: targetWindow,
+                    expectedWorkspaceID: expectedWorkspaceID
+                )
                 let worktree: GitWorktreeDescriptor
                 let initializationReceipt: GitWorktreeCreationReceipt?
                 let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
                 let expectedOwnerBindingGeneration = await targetWindow.promptManager
                     .workspaceFileContextStore
                     .nextSessionWorktreeOwnershipGeneration(ownerID: targetSessionID)
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    target,
+                    expectedWorkspaceID: expectedWorkspaceID
+                )
                 switch request.mode {
                 case .none:
                     throw MCPError.internalError("\(operationName) worktree preparation reached an unexpected empty worktree mode.")
@@ -197,6 +227,10 @@ struct AgentMCPStartWorktreeCoordinator {
                         )
                         initializationReceipt = nil
                         initializationFallbackReason = nil
+                        try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                            target,
+                            expectedWorkspaceID: expectedWorkspaceID
+                        )
                     } catch let error as GitRepoTargetResolverError {
                         throw MCPError.invalidParams(error.message)
                     }
@@ -211,6 +245,13 @@ struct AgentMCPStartWorktreeCoordinator {
                     worktree = result.descriptor
                     initializationReceipt = result.initializationReceipt
                     initializationFallbackReason = result.initializationFallbackReason
+                    try await requirePreBindingCommitAuthority(
+                        target: target,
+                        expectedWorkspaceID: expectedWorkspaceID,
+                        createdWorktree: result.descriptor,
+                        repository: context.repo,
+                        agentModeVM: agentModeVM
+                    )
                     #if DEBUG
                         if let startupContext {
                             var decision = WorktreeStartupInstrumentation.ReceiptCoordinatorDecision()
@@ -222,6 +263,14 @@ struct AgentMCPStartWorktreeCoordinator {
                     #endif
                 }
                 try Task.checkCancellation()
+                await preBindingCommitObserver?()
+                try await requirePreBindingCommitAuthority(
+                    target: target,
+                    expectedWorkspaceID: expectedWorkspaceID,
+                    createdWorktree: request.mode == .create ? worktree : nil,
+                    repository: context.repo,
+                    agentModeVM: agentModeVM
+                )
                 let identity = try persistVisualIdentity(for: worktree, request: request)
                 let rootPrefix = try repositoryRelativeRootPrefix(
                     logicalRoot: context.logicalRoot,
@@ -301,7 +350,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     let metricTag = startupContext.flatMap {
                         WorktreeStartupInstrumentation.benchmarkMetricTag(correlationID: $0.correlationID)
                     }
-                    _ = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(metricTag) {
+                    _ = try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(metricTag) {
                         try await agentModeVM.transitionWorktreeBindings(
                             desiredBindings,
                             forSessionID: targetSessionID,
@@ -349,6 +398,10 @@ struct AgentMCPStartWorktreeCoordinator {
         }
 
         try Task.checkCancellation()
+        try agentModeVM.requireCurrentMCPWorkspaceTarget(
+            target,
+            expectedWorkspaceID: expectedWorkspaceID
+        )
         let bindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID, tabID: target.tabID)
         if !bindings.isEmpty {
             try await materializeRoots(
@@ -357,6 +410,64 @@ struct AgentMCPStartWorktreeCoordinator {
                 targetWindow: targetWindow
             )
             try Task.checkCancellation()
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+        }
+    }
+
+    private func requirePreBindingCommitAuthority(
+        target: AgentModeViewModel.MCPSessionTarget,
+        expectedWorkspaceID: UUID,
+        createdWorktree: GitWorktreeDescriptor?,
+        repository: GitRepoDescriptor,
+        agentModeVM: AgentModeViewModel
+    ) async throws {
+        do {
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+        } catch {
+            if let createdWorktree {
+                try await removeUncommittedWorktree(createdWorktree, repository: repository)
+            }
+            throw error
+        }
+    }
+
+    private func removeUncommittedWorktree(
+        _ worktree: GitWorktreeDescriptor,
+        repository: GitRepoDescriptor
+    ) async throws {
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(
+            command: "git",
+            processPurpose: .tool,
+            workingDirectory: repository.rootPath,
+            enableDebugLogging: false
+        ))
+        let result: CLIProcessRunner.Result
+        do {
+            result = try await runner.run(
+                args: ["worktree", "remove", "--force", "--", worktree.path],
+                stdin: nil,
+                outputMode: .none,
+                timeout: 30
+            )
+        } catch {
+            await vcsService.invalidateCache(for: URL(fileURLWithPath: worktree.path))
+            throw error
+        }
+        // The removal bypasses VCSService; drop the removed path's caches and all shared listings.
+        await vcsService.invalidateCache(for: URL(fileURLWithPath: worktree.path))
+        guard result.status == 0 else {
+            let stderr = String(data: result.stderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = stderr ?? "git worktree remove failed"
+            throw MCPError.internalError(
+                "Workspace admission changed before \(operationName) could bind its new worktree, and the uncommitted worktree could not be removed: \(detail)"
+            )
         }
     }
 
@@ -394,6 +505,7 @@ struct AgentMCPStartWorktreeCoordinator {
         sessionID: UUID,
         targetWindow: WindowState
     ) async throws {
+        try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
         let store = targetWindow.promptManager.workspaceFileContextStore
         let physicalRootPaths = Set(bindings.map {
             standardizedPath($0.worktreeRootPath)
@@ -419,12 +531,21 @@ struct AgentMCPStartWorktreeCoordinator {
 
     private func resolveRepositoryContext(
         request: Request,
-        targetWindow: WindowState
+        target: AgentModeViewModel.MCPSessionTarget,
+        targetWindow: WindowState,
+        expectedWorkspaceID: UUID
     ) async throws -> RepositoryContext {
+        guard let expectedWorkspace = targetWindow.workspaceManager.workspace(withID: expectedWorkspaceID) else {
+            throw MCPError.invalidParams("The captured workspace is no longer available for \(operationName) worktree binding.")
+        }
         let store = targetWindow.promptManager.workspaceFileContextStore
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        try targetWindow.agentModeViewModel.requireCurrentMCPWorkspaceTarget(
+            target,
+            expectedWorkspaceID: expectedWorkspaceID
+        )
         let discoveryRoots = Self.repositoryDiscoveryRoots(
-            primaryRoot: targetWindow.workspaceManager.activeWorkspace?.repoPaths.first,
+            primaryRoot: expectedWorkspace.repoPaths.first,
             visibleRoots: visibleRoots
         )
         var candidates: [RepositoryCandidate] = []
@@ -473,8 +594,12 @@ struct AgentMCPStartWorktreeCoordinator {
         )
     }
 
-    private func validateRuntimeRoot(_ logicalRoot: WorkspaceRootRef, targetWindow: WindowState) throws {
-        guard let primaryRoot = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first else {
+    private func validateRuntimeRoot(
+        _ logicalRoot: WorkspaceRootRef,
+        targetWindow: WindowState,
+        expectedWorkspaceID: UUID
+    ) throws {
+        guard let primaryRoot = targetWindow.workspaceManager.workspace(withID: expectedWorkspaceID)?.repoPaths.first else {
             return
         }
         let primary = standardizedPath((primaryRoot as NSString).expandingTildeInPath)
@@ -576,7 +701,7 @@ struct AgentMCPStartWorktreeCoordinator {
         }
         let result: GitWorktreeCreateResult
         #if DEBUG
-            result = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
+            result = try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(benchmarkMetricTag) {
                 try await vcsService.createGitWorktreeWithResult(
                     request: plan.createRequest,
                     at: context.repo.rootURL,
@@ -665,6 +790,8 @@ struct AgentMCPStartWorktreeCoordinator {
             logicalRootName: logicalRoot.name,
             worktreeID: worktree.worktreeID,
             worktreeRootPath: physicalRootPath,
+            commonGitDir: worktree.repository.commonGitDir,
+            isMainWorktree: worktree.isMain,
             worktreeName: worktree.name,
             branch: worktree.branch,
             head: worktree.head,

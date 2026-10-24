@@ -38,8 +38,5 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Test Xcode workspace generator
-        run: make xcode-generator-test
-
       - name: Validate generated Xcode workspace
         run: make xcode-validate

@@ -31,16 +31,25 @@ enum AgentModeMCPToolPolicy {
         .grantedCapabilities
     static let cursorGrantedTools = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
+    static let grokBuildGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeGrokBuildEngineer)
+        .grantedCapabilities
+    static let grokBuildGrantedTools = MCPToolCapabilities.toolNames(for: grokBuildGrantedCapabilities)
+
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {
         case .codexExec:
             codexNativeGrantedTools
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             claudeNativeGrantedTools
-        case .openCode:
+        case .openCode, .antigravity:
             openCodeGrantedTools
         case .cursor:
             cursorGrantedTools
+        case .grokBuild:
+            grokBuildGrantedTools
+        case .devin:
+            grantedTools
         }
     }
 }

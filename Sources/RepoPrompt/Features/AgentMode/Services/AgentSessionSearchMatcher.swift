@@ -7,21 +7,52 @@ import Foundation
 /// search backend reusable without coupling it to SwiftUI row types or actors.
 struct AgentSessionSearchQuery: Equatable {
     let rawValue: String
+    /// Free-text tokens. Facet tokens (`is:pinned`, `group:<name>`) are parsed out of here.
     let tokens: [String]
     let normalizedTokens: [String]
+    /// `is:pinned`: only pinned sessions match.
+    var requiresPinned = false
+    /// `group:<name>` (quote names with spaces: `group:"My lanes"`), normalized.
+    var groupFacets: [String] = []
 
     var isEmpty: Bool {
-        normalizedTokens.isEmpty
+        normalizedTokens.isEmpty && !hasFacets
+    }
+
+    var hasFacets: Bool {
+        requiresPinned || !groupFacets.isEmpty
     }
 
     static func parse(_ rawValue: String?) -> AgentSessionSearchQuery {
         let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let tokens = Self.tokenize(trimmed)
-        return AgentSessionSearchQuery(
+        var textTokens: [String] = []
+        var requiresPinned = false
+        var groupFacets: [String] = []
+        var pendingGroup = false
+        for token in Self.tokenize(trimmed) {
+            let lowered = token.lowercased()
+            if pendingGroup {
+                pendingGroup = false
+                groupFacets.append(AgentSessionSearchNormalizer.normalize(token))
+            } else if lowered == "is:pinned" {
+                requiresPinned = true
+            } else if lowered == "group:" {
+                // `group:"Two words"` tokenizes as `group:` followed by the quoted name.
+                pendingGroup = true
+            } else if lowered.hasPrefix("group:") {
+                groupFacets.append(AgentSessionSearchNormalizer.normalize(String(token.dropFirst("group:".count))))
+            } else {
+                textTokens.append(token)
+            }
+        }
+        var query = AgentSessionSearchQuery(
             rawValue: trimmed,
-            tokens: tokens,
-            normalizedTokens: tokens.map(AgentSessionSearchNormalizer.normalize)
+            tokens: textTokens,
+            normalizedTokens: textTokens.map(AgentSessionSearchNormalizer.normalize)
         )
+        query.requiresPinned = requiresPinned
+        query.groupFacets = groupFacets
+        return query
     }
 
     static func tokenize(_ query: String) -> [String] {
@@ -98,6 +129,17 @@ struct AgentSessionSearchFields: Equatable {
     static let empty = AgentSessionSearchFields(fields: [])
 
     let fields: [AgentSessionSearchField]
+    /// Facet: the row is pinned (`is:pinned`).
+    private(set) var isPinned = false
+    /// Facet: normalized sidebar group (`group:<name>`).
+    private(set) var normalizedGroup: String?
+
+    func withFacets(isPinned: Bool, group: String?) -> AgentSessionSearchFields {
+        var copy = self
+        copy.isPinned = isPinned
+        copy.normalizedGroup = group.map(AgentSessionSearchNormalizer.normalize)
+        return copy
+    }
 
     init(fields: [AgentSessionSearchField]) {
         self.fields = fields.filter { !$0.isEmpty }
@@ -126,6 +168,59 @@ struct AgentSessionSearchFields: Equatable {
     }
 }
 
+/// Raw, un-normalized inputs required to materialize `AgentSessionSearchFields`
+/// for one sidebar row.
+///
+/// Sidebar rows capture this source instead of the normalized fields because
+/// `AgentSessionSearchNormalizer.normalize(_:)` performs ICU case/diacritic/width
+/// folding per field, and a row carries ~25-40 fields. Materializing during every
+/// projection rebuild spent that cost on values no consumer reads while the
+/// sidebar search box is empty (see `filteredSidebarSessions`, which only touches
+/// search fields on the non-empty-query branch).
+///
+/// Constructing a source is allocation-free: every stored property is a retain of
+/// a value the row builder already computed.
+///
+/// Equality is intentionally *stricter* than the normalized output it replaces,
+/// not identical to it. Normalization is lossy in two ways: `searchFields(source:)`
+/// reads only some members of the worktree/merge summaries it is given (a summary
+/// whose `updatedAt`, `status`, or `conflictFileCount` changed produces byte-identical
+/// fields), and `AgentSessionSearchFields.init` drops fields that normalize to
+/// empty (so `nil` and `""` inputs collapse together). Comparing sources therefore
+/// reports "changed" in a few cases where comparing normalized fields reported
+/// "unchanged".
+///
+/// That direction is the safe one: a row can be considered unequal when its
+/// rendered content is in fact identical, which costs at most a redundant view
+/// diff or search-field re-materialization. It can never report a row as equal
+/// after its search-relevant inputs changed, so search results and row identity
+/// cannot go stale.
+struct AgentSessionSearchFieldSource: Equatable {
+    static let empty = AgentSessionSearchFieldSource()
+
+    var title: String = ""
+    var runState: AgentSessionRunState?
+    var isMCPControlled: Bool = false
+    var worktree: AgentWorktreeIndicator?
+    var mergeAttention: AgentWorktreeMergeAttention?
+    var sessionID: UUID?
+    var tabID: UUID?
+    var entryID: UUID?
+    var entryParentSessionID: UUID?
+    var lastRunStateRaw: String?
+    var agentKindRaw: String?
+    var agentModelRaw: String?
+    var agentReasoningEffortRaw: String?
+    var autoEditEnabled: Bool = false
+    var hasUnknownConversationContent: Bool = false
+    var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = []
+    var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
+    /// Facets for `is:pinned` / `group:`, and the sidebar's group sections.
+    var isPinned: Bool = false
+    var sidebarGroup: String?
+    var sidebarGroupOrder: Int?
+}
+
 struct AgentSessionSearchScore: Comparable, Equatable {
     let value: Int
 
@@ -152,6 +247,11 @@ extension AgentSessionRunState {
 enum AgentSessionSearchMatcher {
     static func score(query: AgentSessionSearchQuery, fields: AgentSessionSearchFields) -> AgentSessionSearchScore? {
         guard !query.isEmpty else { return AgentSessionSearchScore(value: 0) }
+        if query.requiresPinned, !fields.isPinned { return nil }
+        for group in query.groupFacets where fields.normalizedGroup != group {
+            return nil
+        }
+        guard !query.normalizedTokens.isEmpty else { return AgentSessionSearchScore(value: 0) }
         guard !fields.fields.isEmpty else { return nil }
 
         var total = 0

@@ -21,10 +21,16 @@ package enum EditFlowPerf {
         package let requestIdentity: MCPRequestTimelineIdentity?
     }
 
-    @TaskLocal
-    package static var currentLifecycleCorrelation: LifecycleCorrelation?
-    @TaskLocal
-    package static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
+    // Boxed: `LifecycleCorrelation` carries a `UUID` (#1039).
+    package static let currentLifecycleCorrelationTaskLocal = BoxedTaskLocal<LifecycleCorrelation?>(nil)
+    package static var currentLifecycleCorrelation: LifecycleCorrelation? {
+        currentLifecycleCorrelationTaskLocal.get()
+    }
+
+    package static let currentFileSystemPublicationCorrelationTaskLocal = BoxedTaskLocal<LifecycleCorrelation?>(nil)
+    package static var currentFileSystemPublicationCorrelation: LifecycleCorrelation? {
+        currentFileSystemPublicationCorrelationTaskLocal.get()
+    }
 
     #if DEBUG || EDIT_FLOW_PERF
         package struct IntervalState {
@@ -614,11 +620,7 @@ package enum EditFlowPerf {
             package static let folderResolution: StaticString = "EditFlow.ReadFile.FolderResolution"
             package static let externalFolderGuard: StaticString = "EditFlow.ReadFile.ExternalFolderGuard"
             package static let readableServiceResolution: StaticString = "EditFlow.ReadFile.ReadableServiceResolution"
-            package static let exactCatalogLookupAwait: StaticString = "EditFlow.ReadFile.ExactCatalogLookupAwait"
             package static let exactCatalogLookupActorBody: StaticString = "EditFlow.ReadFile.ExactCatalogLookupActorBody"
-            package static let explicitMaterialization: StaticString = "EditFlow.ReadFile.ExplicitMaterialization"
-            package static let generalLookupFallback: StaticString = "EditFlow.ReadFile.GeneralLookupFallback"
-            package static let externalFileFallback: StaticString = "EditFlow.ReadFile.ExternalFileFallback"
             package static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
             package static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
             package static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"
@@ -795,9 +797,15 @@ package enum EditFlowPerf {
             package static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
             package static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
             package static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
+            package static let contentLoadBegan: StaticString = "ReadFile.ContentLoadBegan"
+            package static let contentLoadEnded: StaticString = "ReadFile.ContentLoadEnded"
             package static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
             package static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
             package static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
+        }
+
+        package enum WorkspaceExactResolution {
+            package static let checkpoint: StaticString = "WorkspaceExactResolution.Checkpoint"
         }
 
         package enum Bootstrap {

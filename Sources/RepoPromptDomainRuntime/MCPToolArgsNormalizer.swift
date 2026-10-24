@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
 // Generic MCP tool-call argument normalization.
 // Handles JSON-string payloads, tool-name wrappers, hidden routing fields, and
@@ -8,6 +9,12 @@ import MCP
 // MARK: - Argument Normalization
 
 /// Result of normalizing MCP tool call arguments
+package enum MCPToolCallDeadlineEnvelopeState: Sendable, Equatable {
+    case absent
+    case valid(MCPToolCallDeadlineEnvelope)
+    case invalid
+}
+
 package struct NormalizedArgs {
     /// Cleaned argument payload with hidden routing fields removed.
     package var payload: [String: Value]
@@ -19,10 +26,48 @@ package struct NormalizedArgs {
     package var contextID: UUID?
     /// Extracted working directories if present (bind_context-only selector)
     package var workingDirs: [String]
+    /// Authoritative direct call envelope state, removed before domain arguments are observed.
+    package var executionEnvelopeState: MCPToolCallDeadlineEnvelopeState
     /// Whether caller requested raw JSON output (skip markdown formatting)
     package var rawJSON: Bool = false
     /// Warnings generated during normalization (e.g., unwrapped tool-name wrapper)
     package var warnings: [String]
+}
+
+package enum MCPToolCallDeadlineEnvelopeValueCodec {
+    package static func encode(_ envelope: MCPToolCallDeadlineEnvelope) -> Value {
+        var object: [String: Value] = [
+            "kind": .string(envelope.kind.rawValue),
+            "timeout_mode": .string(envelope.timeoutMode.rawValue)
+        ]
+        if let expiresAtUnixMilliseconds = envelope.expiresAtUnixMilliseconds {
+            object["expires_at_unix_milliseconds"] = .int(Int(expiresAtUnixMilliseconds))
+        }
+        return .object(object)
+    }
+
+    package static func decode(_ value: Value) -> MCPToolCallDeadlineEnvelope? {
+        guard let object = value.objectValue,
+              let rawKind = object["kind"]?.stringValue,
+              let kind = MCPToolCallDeadlineEnvelope.Kind(rawValue: rawKind)
+        else { return nil }
+        let timeoutMode: MCPToolCallDeadlineEnvelope.TimeoutMode
+        if let rawTimeoutMode = object["timeout_mode"]?.stringValue {
+            guard let decodedMode = MCPToolCallDeadlineEnvelope.TimeoutMode(rawValue: rawTimeoutMode) else {
+                return nil
+            }
+            timeoutMode = decodedMode
+        } else {
+            timeoutMode = .ordinaryDefault
+        }
+        let expiresAt = object["expires_at_unix_milliseconds"]?.intValue.map(Int64.init)
+        guard timeoutMode != .ordinaryDefault || expiresAt != nil else { return nil }
+        return MCPToolCallDeadlineEnvelope(
+            kind: kind,
+            expiresAtUnixMilliseconds: expiresAt,
+            timeoutMode: timeoutMode
+        )
+    }
 }
 
 /// Pure, stateless helpers for argument sanitization
@@ -39,10 +84,30 @@ package enum MCPToolArgsNormalizer {
         canonicalToolName: String
     ) -> NormalizedArgs {
         guard var raw = params else {
-            return NormalizedArgs(payload: [:], tabID: nil, windowID: nil, contextID: nil, workingDirs: [], rawJSON: false, warnings: [])
+            return NormalizedArgs(
+                payload: [:],
+                tabID: nil,
+                windowID: nil,
+                contextID: nil,
+                workingDirs: [],
+                executionEnvelopeState: .absent,
+                rawJSON: false,
+                warnings: []
+            )
         }
 
         var warnings: [String] = []
+        let executionEnvelopeState: MCPToolCallDeadlineEnvelopeState = if let directValue = raw.removeValue(
+            forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey
+        ) {
+            if let envelope = MCPToolCallDeadlineEnvelopeValueCodec.decode(directValue) {
+                .valid(envelope)
+            } else {
+                .invalid
+            }
+        } else {
+            .absent
+        }
 
         // Case 1: Entire arguments payload is a single JSON string → treat it as the object
         if raw.count == 1, let (_, onlyVal) = raw.first, case let .string(s) = onlyVal,
@@ -118,6 +183,9 @@ package enum MCPToolArgsNormalizer {
             }
         }
 
+        // Wrappers cannot extend or disable a transport-level execution contract.
+        raw.removeValue(forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey)
+
         // Case 6: Strip supported hidden routing fields and extract supported ones
         let shouldExtractWorkingDirs = canonicalToolName == "bind_context"
         var extractedTabID: UUID?
@@ -136,6 +204,10 @@ package enum MCPToolArgsNormalizer {
             }
 
             if var nestedArgs {
+                nestedArgs.removeValue(
+                    forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey
+                )
+
                 // Extract _tabID if present in nested payload
                 if let tabIDValue = nestedArgs["_tabID"],
                    let tabIDString = tabIDValue.stringValue,
@@ -225,6 +297,7 @@ package enum MCPToolArgsNormalizer {
             windowID: extractedWindowID,
             contextID: extractedContextID,
             workingDirs: extractedWorkingDirs,
+            executionEnvelopeState: executionEnvelopeState,
             rawJSON: extractedRawJSON,
             warnings: warnings
         )
@@ -313,7 +386,10 @@ package enum MCPToolArgsNormalizer {
     }
 
     private static func allowedSiblingKeys(for tool: String) -> Set<String> {
-        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args", "operation_id"]
+        let common: Set = [
+            "_tabID", "_windowID", "_rawJSON", MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey,
+            "context_id", "path", "verbose", "args", "operation_id"
+        ]
         switch tool {
         case "bind_context":
             return common.union(["op", "window_id", "working_dirs", "create_if_missing", "tab_name"])

@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+
 //
 //  AppearanceSettingsView.swift
 //  RepoPrompt

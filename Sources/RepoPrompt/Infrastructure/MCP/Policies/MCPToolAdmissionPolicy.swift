@@ -4,6 +4,9 @@ import RepoPromptDomainRuntime
 
 typealias MCPToolAdmissionClass = RepoPromptDomainRuntime.MCPToolAdmissionClass
 typealias MCPToolOperationIdentity = RepoPromptDomainRuntime.MCPDomainToolOperationIdentity
+// These are the domain owners' values, not a second admission or terminal-settlement model.
+typealias MCPToolAdmissionDecision = RepoPromptDomainRuntime.MCPDomainPreAdmissionDecision
+typealias MCPToolSettlementResult = RepoPromptDomainRuntime.MCPToolExecutionSettlement
 
 extension MCPToolAdmissionClass {
     var connectionLane: MCPConnectionCallLane {
@@ -25,6 +28,34 @@ extension MCPToolAdmissionClass {
 }
 
 enum MCPToolAdmissionPolicy {
+    static func clientPolicySnapshot(
+        restricted: Set<String>,
+        additional: Set<String>,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool,
+        hasExactAgentSessionLinkGrant: Bool = false,
+        canBecomeOverseer: Bool = false,
+        hasActivatedOverseer: Bool = false
+    ) -> MCPDomainClientPolicySnapshot {
+        let role: MCPClientTaskRole = switch taskLabelKind {
+        case .explore:
+            .explore
+        case .engineer, .pair, .design:
+            .engineer
+        case nil:
+            .direct
+        }
+        return MCPDomainClientPolicySnapshot(
+            restrictedToolNames: restricted,
+            additionalToolNames: additional,
+            role: role,
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant,
+            canBecomeOverseer: canBecomeOverseer,
+            hasActivatedOverseer: hasActivatedOverseer
+        )
+    }
+
     /// Keep app-host admission aligned with the package-level domain limits.
     static let exclusiveConnectionLimit = MCPDomainToolAdmissionLimits.exclusiveConnection
     static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection

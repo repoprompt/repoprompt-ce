@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  PromptOrderingSettingsMenu.swift
 //  RepoPrompt

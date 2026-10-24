@@ -1,78 +1,7 @@
 import Foundation
+import RepoPromptPersistence
 
 #if DEBUG
-    /// Stable, privacy-safe payload model for the attachable `codemap_graph_status` DEBUG MCP operation.
-    struct CodemapGraphStatusStoreEventSnapshot: Equatable {
-        let ordinal: UInt64
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let kind: String
-        let launchPhase: String
-        let uptimeNanoseconds: UInt64
-    }
-
-    struct CodemapGraphStatusStoreEventPage: Equatable {
-        let firstOrdinal: UInt64
-        let lastOrdinal: UInt64
-        let nextOrdinal: UInt64?
-        let events: [CodemapGraphStatusStoreEventSnapshot]
-    }
-
-    struct CodemapGraphStatusRetrySnapshot: Equatable {
-        let attempt: Int
-        let deadlineUptimeNanoseconds: UInt64
-    }
-
-    struct CodemapGraphStatusRetryExhaustionSnapshot: Equatable {
-        let attempt: Int
-        let uptimeNanoseconds: UInt64
-    }
-
-    struct CodemapGraphStatusLaunchSnapshot: Equatable {
-        let id: UUID
-        let phase: WorkspaceCodemapGraphIndexLaunchPhase
-        let retryAttempt: Int
-        let taskPresent: Bool
-        let createdUptimeNanoseconds: UInt64
-        let phaseEnteredUptimeNanoseconds: UInt64
-        let retry: CodemapGraphStatusRetrySnapshot?
-        let retryExhaustion: CodemapGraphStatusRetryExhaustionSnapshot?
-    }
-
-    struct CodemapGraphStatusAdmissionSnapshot: Equatable {
-        let metrics: [String: UInt64]
-        let queueWaitMilliseconds: [UInt64]
-    }
-
-    struct CodemapGraphStatusManifestSnapshot: Equatable {
-        let failureCounts: [WorkspaceCodemapManifestFailureReason: UInt64]
-        let lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
-        let measurements: WorkspaceCodemapManifestMeasurementSnapshot
-    }
-
-    struct CodemapGraphStatusRootSnapshot: Equatable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let catalogGeneration: UInt64
-        let ingressGeneration: UInt64
-        let rootKind: WorkspaceRootKind
-        let eligibilityFlightPresent: Bool
-        let launch: CodemapGraphStatusLaunchSnapshot?
-        let job: WorkspaceCodemapBindingEngineGraphIndexRootAccounting?
-        let admission: CodemapGraphStatusAdmissionSnapshot?
-        let manifest: CodemapGraphStatusManifestSnapshot?
-        let milestones: [CodemapGraphStatusStoreEventSnapshot]
-        let engineEvents: WorkspaceCodemapGraphIndexDebugEventPage?
-    }
-
-    struct CodemapGraphStatusSnapshot: Equatable {
-        let sampledUptimeNanoseconds: UInt64
-        let roots: [CodemapGraphStatusRootSnapshot]
-        let storeEvents: CodemapGraphStatusStoreEventPage?
-        let graphIndexJobCount: Int
-        let queuedGraphIndexBatchCount: Int
-        let activeGraphIndexBatchCount: Int
-        let drainingGraphIndexTaskCount: Int
-    }
-
     enum CodemapGraphStatusDebugSupport {
         static func payload(
             snapshot: CodemapGraphStatusSnapshot,
@@ -304,7 +233,55 @@ import Foundation
                 } ?? NSNull(),
                 "measurements": Dictionary(uniqueKeysWithValues: snapshot.measurements.byOrigin.map {
                     ($0.key.rawValue, manifestMeasurementPayload($0.value))
-                })
+                }),
+                "writers": snapshot.writerActivity.map(manifestWriterActivityPayload) ?? NSNull()
+            ]
+        }
+
+        private static func manifestWriterActivityPayload(_ snapshot: CodemapManifestWriterActivitySnapshot) -> [String: Any] {
+            func age(_ start: UInt64) -> UInt64 {
+                (snapshot.sampledUptimeNanoseconds >= start ? snapshot.sampledUptimeNanoseconds - start : 0) / 1_000_000
+            }
+            let tasks: [[String: Any]] = snapshot.tasks.map { task in
+                [
+                    "writer_id": task.writerID.uuidString, "namespace_digest": task.namespaceDigest,
+                    "root_id": task.rootEpoch?.rootID.uuidString ?? NSNull(),
+                    "root_lifetime_id": task.rootEpoch?.rootLifetimeID.uuidString ?? NSNull(),
+                    "batch_id": task.batchID?.uuidString ?? NSNull(), "origin": task.origin ?? NSNull(),
+                    "phase": task.phase, "task_started_uptime_ns": task.taskStartedUptimeNanoseconds,
+                    "task_age_ms": age(task.taskStartedUptimeNanoseconds),
+                    "batch_started_uptime_ns": task.batchStartedUptimeNanoseconds ?? NSNull(),
+                    "batch_age_ms": task.batchStartedUptimeNanoseconds.map(age) ?? NSNull(),
+                    "phase_started_uptime_ns": task.phaseStartedUptimeNanoseconds,
+                    "phase_age_ms": age(task.phaseStartedUptimeNanoseconds)
+                ]
+            }
+            let queues: [[String: Any]] = snapshot.namespaces.map { queue in
+                [
+                    "namespace_digest": queue.namespaceDigest, "queued_item_count": queue.queuedItemCount,
+                    "deferred_tail_item_count": queue.deferredTailItemCount,
+                    "deferred_head_waiting_item_count": queue.deferredHeadWaitingItemCount,
+                    "in_flight_item_count": queue.inFlightItemCount, "retry_pending": queue.retryPending
+                ]
+            }
+            return [
+                "scope": "manifest_writer_tasks", "engine_instance_id": snapshot.engineInstanceID.uuidString,
+                "sampled_uptime_ns": snapshot.sampledUptimeNanoseconds,
+                "root": [
+                    "scope": "root_epoch", "root_id": snapshot.rootEpoch.rootID.uuidString,
+                    "root_lifetime_id": snapshot.rootEpoch.rootLifetimeID.uuidString,
+                    "queue_item_count": NSNull(), "queue_counts_complete": false,
+                    "quiescence_confirmed": snapshot.quiescenceConfirmed ? (true as Any) : NSNull()
+                ],
+                "engine": [
+                    "scope": "engine_all_root_epochs", "live_task_count": snapshot.liveTaskCount,
+                    "namespace_count": snapshot.namespaceCount, "accounting_complete": snapshot.accountingComplete,
+                    "quiescence_confirmed": snapshot.quiescenceConfirmed,
+                    "omitted_live_task_count": snapshot.omittedLiveTaskCount,
+                    "omitted_namespace_count": snapshot.omittedNamespaceCount,
+                    "queue_counts_complete": snapshot.omittedNamespaceCount == 0,
+                    "tasks": tasks, "namespaces": queues
+                ]
             ]
         }
 

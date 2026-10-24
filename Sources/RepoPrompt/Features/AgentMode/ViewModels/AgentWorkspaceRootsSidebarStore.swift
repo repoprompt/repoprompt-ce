@@ -1,5 +1,8 @@
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 struct AgentWorkspaceCodemapPresentation: Equatable {
     enum State: Equatable {
@@ -133,7 +136,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case .paused:
             "Paused for this loaded root. Resume to allow Code Map indexing."
         case .recoveryExhausted:
-            "Code Map indexing stopped after repeated worker recovery attempts. Retry to resume from its checkpoint."
+            "Code Map indexing stopped after repeated recovery attempts. Retry to resume indexing."
         case .unavailable:
             "Code Maps are unavailable for this root."
         case .revoked:
@@ -146,7 +149,8 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         let state: State = if snapshot.isGenerationSuspended {
             .paused
         } else if snapshot.availability == .unavailable,
-                  snapshot.unavailableReason == .workerRecoveryExhausted
+                  snapshot.unavailableReason == .workerRecoveryExhausted ||
+                  snapshot.unavailableReason == .retryExhausted
         {
             .recoveryExhausted
         } else {
