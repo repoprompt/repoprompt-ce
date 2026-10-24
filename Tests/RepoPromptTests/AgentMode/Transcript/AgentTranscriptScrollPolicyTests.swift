@@ -598,7 +598,30 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         let adjustment = model.layoutDidChange(from: old, to: shrunk, clipOriginY: 1500)
 
         XCTAssertEqual(adjustment, .setClipOrigin(shrunk.maxClipOriginY))
-        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b7", offsetFromViewportTop: -100))
+        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b7", offsetFromViewportTop: 200))
+
+        // Appending below the anchor must not recover the old, now-unreachable offset.
+        let appended = layout(Array(baseSpecs.prefix(9)))
+        XCTAssertEqual(model.didAppend(from: shrunk, to: appended, clipOriginY: shrunk.maxClipOriginY), .none)
+        XCTAssertFalse(model.isFollowing)
+    }
+
+    func testClampedFallbackAnchorKeepsItsActualOffsetWhenContentAppends() {
+        let old = layout(baseSpecs)
+        var model = TranscriptScrollAnchorModel()
+        model.userDidScroll(clipOriginY: 1500, layout: old) // inside b7, turn B
+
+        // The lost anchor falls back to b6, but its former viewport offset cannot be kept.
+        let shrunk = layout(Array(baseSpecs.prefix(7)))
+        XCTAssertEqual(
+            model.layoutDidChange(from: old, to: shrunk, clipOriginY: 1500),
+            .setClipOrigin(shrunk.maxClipOriginY)
+        )
+        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b6", offsetFromViewportTop: 200))
+
+        let appended = layout(Array(baseSpecs.prefix(7)) + [("new", turnB, 200)])
+        XCTAssertEqual(model.didAppend(from: shrunk, to: appended, clipOriginY: shrunk.maxClipOriginY), .none)
+        XCTAssertFalse(model.isFollowing)
     }
 
     func testFoldAndUnfoldAboveAnchorRoundTripsToTheOriginalClipOrigin() {
@@ -632,6 +655,13 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         // b2 was 250pt above the viewport top and stays exactly there.
         XCTAssertEqual(model.mode, .reading(anchorBlockID: "b2", offsetFromViewportTop: -250))
         XCTAssertEqual(adjustment, .none)
+
+        // The fallback row is entirely above the viewport (height 100, offset -250), so
+        // width reflow must preserve its offset in points rather than scale a fraction.
+        var reflowedSpecs = specs.filter { $0.0 != "b3" }
+        reflowedSpecs[2].2 = 200
+        XCTAssertEqual(model.widthDidChange(from: new, to: layout(reflowedSpecs), clipOriginY: 650), .none)
+        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b2", offsetFromViewportTop: -250))
     }
 
     func testRemovedTurnKeepsViewportAndReadsFromNewTopVisibleRow() {
@@ -769,6 +799,27 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
             tracker.refreshAnchor(frames: shifted, context: userScrolling)
             XCTAssertEqual(tracker.anchorBlockID, "b")
             XCTAssertEqual(tracker.anchorMinY, -50)
+        }
+
+        @MainActor
+        func testProbeWindowTransitionBreaksFrameSequenceWithoutDiscardingSamples() throws {
+            let sampler = AgentChatStressFrameIntervalSampler()
+            let probe = AgentChatStressFrameProbeNSView(sampler: sampler)
+            sampler.setCollecting(true)
+            sampler.recordDisplayFrame(timestamp: 1)
+            sampler.recordDisplayFrame(timestamp: 1.016)
+            let referenceDate = Date(timeIntervalSince1970: 100)
+            XCTAssertEqual(sampler.currentSummary(now: referenceDate)?.sampleCount, 1)
+
+            // Exercise the window lifecycle hook without opening a window. Collection stays on,
+            // but the first frame after the probe's hiatus establishes a fresh baseline.
+            probe.viewDidMoveToWindow()
+            sampler.recordDisplayFrame(timestamp: 31)
+            sampler.recordDisplayFrame(timestamp: 31.016)
+            let summary = try XCTUnwrap(sampler.currentSummary(now: referenceDate.addingTimeInterval(1)))
+            XCTAssertTrue(sampler.isCollecting)
+            XCTAssertEqual(summary.sampleCount, 2)
+            XCTAssertEqual(summary.p99MS, 16, accuracy: 0.001)
         }
 
         func testFrameIntervalPercentilesUseNearestRankOverTheRingBuffer() throws {

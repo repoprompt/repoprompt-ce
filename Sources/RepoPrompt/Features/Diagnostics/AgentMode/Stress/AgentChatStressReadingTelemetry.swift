@@ -224,6 +224,12 @@
             recorder.recordFrame(at: timestamp)
         }
 
+        /// A probe may leave/rejoin a window while collection remains enabled. Preserve samples,
+        /// but never interpret the interval without a display link as a streaming frame stall.
+        func breakSequence() {
+            recorder.breakSequence()
+        }
+
         /// Percentile summary, recomputed at most every `summaryRefreshInterval`.
         func currentSummary(now: Date = Date()) -> AgentChatStressFrameIntervalRecorder.Summary? {
             if let cachedSummaryAt, now.timeIntervalSince(cachedSummaryAt) < Self.summaryRefreshInterval {
@@ -286,6 +292,7 @@
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            sampler.breakSequence()
             displayLink?.invalidate()
             displayLink = nil
             guard window != nil else { return }

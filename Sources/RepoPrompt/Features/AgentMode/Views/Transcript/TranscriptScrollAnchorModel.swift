@@ -141,7 +141,11 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
             return adjustment(to: newLayout.maxClipOriginY, from: clipOriginY)
         case let .reading(anchorBlockID, offset):
             if let anchorRow = newLayout.row(for: anchorBlockID) {
-                return adjustment(to: newLayout.clampedClipOriginY(anchorRow.minY - offset), from: clipOriginY)
+                let target = newLayout.clampedClipOriginY(anchorRow.minY - offset)
+                // Clamping changes the row's actual viewport offset. Keep that position on the
+                // next layout event instead of recovering an unreachable pre-shrink offset.
+                mode = .reading(anchorBlockID: anchorBlockID, offsetFromViewportTop: anchorRow.minY - target)
+                return adjustment(to: target, from: clipOriginY)
             }
             return fallbackAdjustment(
                 lostAnchorBlockID: anchorBlockID,
@@ -182,7 +186,8 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
            offset < 0,
            let oldRow = oldLayout.row(for: anchorBlockID),
            let newRow = newLayout.row(for: anchorBlockID),
-           oldRow.height > 0
+           oldRow.height > 0,
+           -offset < oldRow.height
         {
             let scaledOffset = offset * (newRow.height / oldRow.height)
             mode = .reading(anchorBlockID: anchorBlockID, offsetFromViewportTop: scaledOffset)
@@ -256,8 +261,9 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
             return reanchorInPlace(newLayout: newLayout, clipOriginY: clipOriginY)
         }
         let offset = nearestOldRow.minY - clipOriginY
-        mode = .reading(anchorBlockID: nearestNewRow.blockID, offsetFromViewportTop: offset)
-        return adjustment(to: newLayout.clampedClipOriginY(nearestNewRow.minY - offset), from: clipOriginY)
+        let target = newLayout.clampedClipOriginY(nearestNewRow.minY - offset)
+        mode = .reading(anchorBlockID: nearestNewRow.blockID, offsetFromViewportTop: nearestNewRow.minY - target)
+        return adjustment(to: target, from: clipOriginY)
     }
 
     /// Keeps the viewport where it is (clamped to the new content) and reads from the row now at
