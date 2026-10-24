@@ -582,6 +582,7 @@ class WindowState: ObservableObject {
         detachTitlebarAccessoryControllers(from: nsWindow)
         clearTitlebarAccessoryRequestsForClose()
         if !isPreparedSessionOwner { apiSettingsViewModel.prepareForWindowClose() }
+        promptManager.cancelInitialModelRefreshForWindowClose()
         contextBuilderAgentViewModel.prepareForWindowClose()
         workspaceManager.prepareForWindowClose()
         promptManager.gitViewModel.prepareForWindowClose()
@@ -595,20 +596,22 @@ class WindowState: ObservableObject {
 
     // MARK: - Initialization
 
-    convenience init() {
+    convenience init(automaticProviderModelDiscoveryEnabled: Bool = true) {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             domainRuntimeOverride: nil
         )
     }
 
-    convenience init(domainRuntime: MCPDomainRuntime) {
+    convenience init(domainRuntime: MCPDomainRuntime, automaticProviderModelDiscoveryEnabled: Bool = true) {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             domainRuntimeOverride: domainRuntime
         )
     }
@@ -633,12 +636,14 @@ class WindowState: ObservableObject {
             domainRuntime: MCPDomainRuntime,
             keyManager: KeyManager,
             codexModelPollingService: CodexModelPollingService,
-            loadStoredAPISettingsDataOnInit: Bool
+            loadStoredAPISettingsDataOnInit: Bool,
+            automaticProviderModelDiscoveryEnabled: Bool = true
         ) {
             self.init(
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
                 codexModelPollingService: codexModelPollingService,
+                automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
                 domainRuntimeOverride: domainRuntime,
                 keyManager: keyManager
             )
@@ -756,6 +761,7 @@ class WindowState: ObservableObject {
         codexModelPollingService: CodexModelPollingService,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
+        automaticProviderModelDiscoveryEnabled: Bool = true,
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
@@ -787,6 +793,7 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory,
             sessionRuntimeWorkspace: sessionRuntimeWorkspace,
@@ -2877,6 +2884,7 @@ class WindowState: ObservableObject {
         beginClose()
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
+        await promptManager.awaitInitialModelRefreshCompletion()
         // Finish this window's own saves (including the final `onDisappear` capture) before any
         // teardown step can stop the presentation that owns them (#1089).
         await workspaceManager.awaitOwnSavesForWindowClose()
