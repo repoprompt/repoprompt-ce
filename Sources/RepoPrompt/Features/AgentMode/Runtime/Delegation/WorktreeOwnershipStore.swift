@@ -49,7 +49,7 @@ final class WorktreeOwnershipStore {
     static let filename = "delegationWorktreeOwnership.json"
     enum LoadState: Equatable { case unloaded, ready, blocked(String) }
     private(set) var records: [String: WorktreeOwnershipRecord] = [:]
-    private(set) var loadState: LoadState = .ready
+    private(set) var loadState: LoadState = .unloaded
     private(set) var saveState = "not_persisted"
     private(set) var persistenceDiagnostic: String?
     private var repository: OverseerContinuityRepository?
@@ -73,7 +73,12 @@ final class WorktreeOwnershipStore {
     }
 
     func bootstrapProduction(mode: AgentSessionOversightPersistenceMode) async {
-        guard mode.performsProductionFileIO else { return }
+        guard mode.performsProductionFileIO else {
+            // Suppressed launches explicitly use only current-process ownership. Do not let a
+            // later suppressed call turn an already-open, blocked durable source into readiness.
+            if repository == nil { loadState = .ready }
+            return
+        }
         let locations = OverseerContinuityRepository.production()
         await bootstrap(
             fileURL: locations.legacyDirectory.appendingPathComponent(Self.filename),

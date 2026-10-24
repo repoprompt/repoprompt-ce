@@ -190,12 +190,16 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     /// Worktrees created by any of the given sessions under a scope and not yet released
     /// (`WorktreeOwnershipStore`). Counted toward `maxWorktrees` even while unbound.
     var ownedUnreleasedWorktreeIDs: @MainActor (_ createdBy: Set<UUID>) -> Set<String> = { _ in [] }
+    /// Standalone projectors model known in-memory ownership. Production supplies the durable
+    /// store's live readiness; unavailable ownership is unknown usage, never an empty set.
+    var ownershipAccountingReady: @MainActor () -> Bool = { true }
     /// Optional operation-count witness; not retained in an authority proof.
     var onAncestryLookup: ((UUID) -> Void)?
 
     func withSynchronousCensus<Result>(_ body: (any DelegationMembershipProjector) -> Result) -> Result {
         var projector = Self(source: census(), onAncestryLookup: onAncestryLookup)
         projector.ownedUnreleasedWorktreeIDs = ownedUnreleasedWorktreeIDs
+        projector.ownershipAccountingReady = ownershipAccountingReady
         return body(projector)
     }
 
@@ -203,6 +207,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         let points = TargetSource(source: source, targets: targets)
         var projector = Self(source: points, onAncestryLookup: onAncestryLookup)
         projector.ownedUnreleasedWorktreeIDs = ownedUnreleasedWorktreeIDs
+        projector.ownershipAccountingReady = ownershipAccountingReady
         return body(projector)
     }
 
@@ -319,6 +324,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     }
 
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
+        guard ownershipAccountingReady() else { return nil }
         let census = census()
         guard census.snapshot.hasCompletePlacement(for: scope) else { return nil }
         return Self(source: census, ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs, onAncestryLookup: onAncestryLookup)
