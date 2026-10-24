@@ -21,6 +21,8 @@ protocol NativeAgentRuntimeControlling: Actor {
         systemPromptOverride: String?
     ) async throws -> NativeAgentRuntimeSessionRef
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef
+    /// Cached command metadata from this runtime's initialize response; never starts a process.
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand]
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws
     /// Unlike the legacy live-update helper, this proves the complete requested configuration.
     func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication
@@ -40,6 +42,10 @@ protocol NativeAgentRuntimeControlling: Actor {
 }
 
 extension NativeAgentRuntimeControlling {
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
+        []
+    }
+
     /// Fail closed for runtimes that have not implemented application proof. In particular,
     /// an old no-op fake must not accidentally certify provider application.
     func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
@@ -80,6 +86,7 @@ typealias NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event
 typealias NativeAgentRuntimeSessionRef = ClaudeNativeProcessSessionController.SessionRef
 typealias NativeAgentRuntimeTurnStatus = ClaudeNativeProcessSessionController.TurnStatus
 typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionController.RuntimeInitStatus
+typealias NativeAgentRuntimeSlashCommand = ClaudeNativeProcessSessionController.RuntimeInitStatus.InitializeResponseSnapshot.Command
 typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
 typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
 typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel

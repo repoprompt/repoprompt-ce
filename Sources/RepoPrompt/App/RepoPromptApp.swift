@@ -6,6 +6,7 @@ import RepoPromptFileSystem
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import Sparkle
 import SwiftUI
 
@@ -71,6 +72,9 @@ struct RepoPromptSwiftUIApp: App {
             #endif
             return handler
         }
+        // Do not initialize the settings-backed property before the state boundary
+        // check (stored-property default initializers run before this init body).
+        _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -137,7 +141,7 @@ struct RepoPromptSwiftUIApp: App {
     }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
-    @StateObject private var fontScale = FontScaleManager.shared
+    @StateObject private var fontScale: FontScaleManager
 
     // MARK: - Body
 
@@ -204,8 +208,45 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
+    /// Each attempt re-runs the full bootstrap: exclusive profile lease, running-app guard,
+    /// verified publication, and debug preferences replaced only after a successful publish.
+    /// The existing debug profile is never silently reused while release may be writing.
+    private static func checkDebugStateBoundary() {
+        var startEmpty = false
+        while true {
+            do {
+                try DebugStateBootstrap.runIfNeeded(forceCleanSlate: startEmpty)
+                return
+            } catch {
+                let cleanRequested = startEmpty || ProcessInfo.processInfo.arguments.contains(DebugStateBootstrap.cleanSlateArgument)
+                let offerStartEmpty = !cleanRequested && DebugStateBootstrap.startEmptyCanRecover(from: error)
+                let alert = NSAlert()
+                alert.messageText = "Debug state snapshot could not be prepared"
+                var details = "\(error.localizedDescription)\nProduction and prior debug state were preserved."
+                if offerStartEmpty {
+                    details += "\n\nRetry attempts another capture. If production changed during capture, a retry may succeed once its writes pause briefly."
+                        + "\n\nStart Empty opens this launch with an isolated, empty debug profile. The current debug profile and"
+                        + " its preferences are archived, not deleted, under “RepoPrompt CE Debug Recovery”. Production state is"
+                        + " never modified, and the next normal launch captures production again."
+                }
+                alert.informativeText = details
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Retry")
+                if offerStartEmpty { alert.addButton(withTitle: "Start Empty") }
+                switch alert.runModal() {
+                case .alertSecondButtonReturn: continue
+                case .alertThirdButtonReturn where offerStartEmpty: startEmpty = true
+                default: exit(EXIT_FAILURE)
+                }
+            }
+        }
+    }
+
     public static func main() {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        // Before defaults migration, provider launch snapshots, property wrappers,
+        // or any settings/session singleton can observe or normalize this profile.
+        Self.checkDebugStateBoundary()
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()

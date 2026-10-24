@@ -41,7 +41,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             inputSchema: .object(
                 properties: [
                     "op": .string(description: "Required operation: context or compact.", enum: ["context", "compact"]),
-                    "note": .string(description: "[compact] Verbatim continuation note, at most 8,192 UTF-8 bytes."),
+                    "note": .string(description: "[compact] Required verbatim note: 10% of window tokens × 4 UTF-8 bytes; 65,536 if unknown."),
                     "idempotency_key": .string(description: "[compact] Required identical-retry key, at most 200 UTF-8 bytes.")
                 ],
                 required: ["op"]

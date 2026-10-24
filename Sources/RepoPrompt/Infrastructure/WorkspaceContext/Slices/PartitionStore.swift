@@ -3,12 +3,9 @@ import Foundation
 import RepoPromptFoundation
 import RepoPromptShared
 
+/// Compatibility seam for app/MCP consumers; build selection has one authority.
 enum WorkspaceContextFilesystemIdentity {
-    #if DEBUG
-        static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
-    #else
-        static let identity = MCPFilesystemIdentity.repoPromptCE(.release)
-    #endif
+    static let identity = MCPFilesystemIdentity.current
 }
 
 public enum SliceMutationMode: Sendable {
@@ -60,10 +57,9 @@ actor PartitionStore {
         return try body()
     }
 
-    /// <AppSupport>/RepoPrompt CE/Partitions
-    private static func partitionsBaseURL() -> URL {
-        WorkspaceContextFilesystemIdentity.identity.applicationSupportRootURL()
-            .appendingPathComponent("Partitions", isDirectory: true)
+    /// Persisted slice selections, not a rebuildable shared resource cache.
+    private static func partitionsBaseURL(locations: AppProfileLocations) -> URL {
+        locations.applicationSupportRoot.appendingPathComponent("Partitions", isDirectory: true)
     }
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
@@ -150,6 +146,7 @@ actor PartitionStore {
     }
 
     private let baseURL: URL
+    private let profileLocations: AppProfileLocations
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let dateFormatter = ISO8601DateFormatter()
@@ -167,8 +164,9 @@ actor PartitionStore {
         }
     #endif
 
-    init(baseURL: URL? = nil) {
-        self.baseURL = baseURL ?? Self.partitionsBaseURL()
+    init(baseURL: URL? = nil, profileLocations: AppProfileLocations = .current) {
+        self.profileLocations = profileLocations
+        self.baseURL = baseURL ?? Self.partitionsBaseURL(locations: profileLocations)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         self.encoder = encoder
@@ -203,6 +201,7 @@ actor PartitionStore {
     ) throws {
         try Task.checkCancellation()
         let url = partitionURL(forRoot: rootPath, scope: scope)
+        try profileLocations.validateMetadataFile(url)
 
         // Ensure directories exist: .../Application Support/RepoPrompt CE/Partitions/<repoKey>/
         let dirURL = url.deletingLastPathComponent()

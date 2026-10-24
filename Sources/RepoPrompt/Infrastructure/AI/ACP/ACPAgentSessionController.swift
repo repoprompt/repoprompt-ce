@@ -3674,7 +3674,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func messageStopResult(
+    func messageStopResult(
         from response: [String: Any],
         sessionID: String,
         stopReason: String?
@@ -3688,9 +3688,37 @@ actor ACPAgentSessionController {
         let cachedReadTokens = intValue(usage?["cachedReadTokens"])
         let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
         let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
-        let contextUsedTokens = hasContextBreakdown
-            ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
-            : nil
+        let contextUsedTokens: Int?
+        let modelContextWindow: Int?
+        if provider.providerID == .grokBuild {
+            let meta = response["_meta"] as? [String: Any]
+            // Grok's totalTokens tracks current conversation state, including a reseed
+            // after compaction. inputTokens can still describe the pre-compaction call.
+            // Only older responses without totalTokens may use last-call input instead;
+            // zero/invalid current-state claims must not resurrect that stale prompt.
+            let contextCount = meta?["totalTokens"] ?? meta?["inputTokens"]
+            if let number = contextCount as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID(),
+               let count = number as? Int, count > 0
+            {
+                contextUsedTokens = count
+            } else {
+                contextUsedTokens = nil
+            }
+            // Grok reports an API routing slug here, which may differ from the catalog
+            // key (including per-effort routing). Prefer a direct match, then THIS
+            // session's confirmed catalog selection, never a global/default guess.
+            let modelOption = discoveredSessionModels?.option(matching: meta?["modelId"] as? String)
+                ?? discoveredSessionModels?.option(matching: discoveredSessionModels?.currentModelRaw)
+            // Zero explicitly withdraws an unresolved capacity. Nil would make no new
+            // window claim and let the estimator retain a different model's old bound.
+            modelContextWindow = modelOption?.contextWindowTokens ?? 0
+        } else {
+            modelContextWindow = nil
+            contextUsedTokens = hasContextBreakdown
+                ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
+                : nil
+        }
         let providerSessionID = providerSessionIdentity.loadSessionID ?? sessionID
         return AIStreamResult(
             type: "message_stop",
@@ -3699,6 +3727,7 @@ actor ACPAgentSessionController {
             completionTokens: outputTokens,
             providerSessionID: providerSessionID,
             stopReason: stopReason,
+            modelContextWindow: modelContextWindow,
             contextUsedTokens: contextUsedTokens
         )
     }

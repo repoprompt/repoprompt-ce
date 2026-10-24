@@ -19,6 +19,7 @@ struct CodexDynamicModelRecord: Codable, Hashable {
     let isDefault: Bool
     let supportedReasoningEfforts: [CodexDynamicReasoningRecord]
     let defaultReasoningEffort: String?
+    let serviceTiers: [CodexModelServiceTier]
 
     init(
         id: String,
@@ -27,7 +28,8 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         description: String,
         isDefault: Bool,
         supportedReasoningEfforts: [CodexDynamicReasoningRecord] = [],
-        defaultReasoningEffort: String? = nil
+        defaultReasoningEffort: String? = nil,
+        serviceTiers: [CodexModelServiceTier] = []
     ) {
         self.id = id
         self.model = model
@@ -36,6 +38,7 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         self.isDefault = isDefault
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
+        self.serviceTiers = serviceTiers
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -46,6 +49,7 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         case isDefault
         case supportedReasoningEfforts
         case defaultReasoningEffort
+        case serviceTiers
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +61,7 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         isDefault = try container.decode(Bool.self, forKey: .isDefault)
         supportedReasoningEfforts = try container.decodeIfPresent([CodexDynamicReasoningRecord].self, forKey: .supportedReasoningEfforts) ?? []
         defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        serviceTiers = try container.decodeIfPresent([CodexModelServiceTier].self, forKey: .serviceTiers) ?? []
     }
 }
 
@@ -67,6 +72,31 @@ struct CodexDynamicModelOption: Hashable {
     let isDefault: Bool
     let baseID: String
     let reasoningEffort: CodexReasoningEffort?
+    let supportedReasoningEffortRawValues: [String]
+    let defaultReasoningEffortRawValue: String?
+    let defaultReasoningEffort: CodexReasoningEffort?
+
+    init(
+        id: String,
+        displayName: String,
+        description: String,
+        isDefault: Bool,
+        baseID: String,
+        reasoningEffort: CodexReasoningEffort?,
+        supportedReasoningEffortRawValues: [String] = [],
+        defaultReasoningEffortRawValue: String? = nil,
+        defaultReasoningEffort: CodexReasoningEffort? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.description = description
+        self.isDefault = isDefault
+        self.baseID = baseID
+        self.reasoningEffort = reasoningEffort
+        self.supportedReasoningEffortRawValues = supportedReasoningEffortRawValues
+        self.defaultReasoningEffortRawValue = defaultReasoningEffortRawValue
+        self.defaultReasoningEffort = defaultReasoningEffort
+    }
 }
 
 enum CodexDynamicModelMapper {
@@ -87,7 +117,8 @@ enum CodexDynamicModelMapper {
                 supportedReasoningEfforts: model.supportedReasoningEfforts.map {
                     CodexDynamicReasoningRecord(reasoningEffort: $0.reasoningEffort, description: $0.description)
                 },
-                defaultReasoningEffort: model.defaultReasoningEffort
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                serviceTiers: model.serviceTiers
             )
         }
         return options(from: records)
@@ -98,7 +129,27 @@ enum CodexDynamicModelMapper {
         var seen = Set<String>()
         let advertisedIDs = Set(records.map { CodexModelIdentity.key($0.id) }.filter { !$0.isEmpty })
 
-        for record in records {
+        // Capability changes participate in the registry signature and are persisted.
+        // A future model can gain Ultrafast on refresh without a model-version allowlist.
+        let speedRecords = records.compactMap { record -> CodexDynamicModelRecord? in
+            guard !normalizeID(record.id).isEmpty,
+                  CodexModelSpecifier(raw: record.id).serviceTier == nil,
+                  let tier = record.serviceTiers.first(where: {
+                      $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                          == CodexServiceTierVariantCatalog.ultrafastServiceTier
+                  }) else { return nil }
+            let id = "\(normalizeID(record.id))-\(CodexServiceTierVariantCatalog.ultrafastServiceTier)"
+            guard !advertisedIDs.contains(CodexModelIdentity.key(id)) else { return nil }
+            let name = tier.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let label = name.isEmpty ? "Ultrafast" : name
+            return CodexDynamicModelRecord(
+                id: id, model: record.model, displayName: "\(record.displayName) \(label)",
+                description: [record.description, tier.description].filter { !$0.isEmpty }.joined(separator: " "),
+                isDefault: false, supportedReasoningEfforts: record.supportedReasoningEfforts,
+                defaultReasoningEffort: record.defaultReasoningEffort
+            )
+        }
+        for record in records + speedRecords {
             let baseID = normalizeID(record.id)
             guard !baseID.isEmpty else { continue }
 
@@ -108,6 +159,8 @@ enum CodexDynamicModelMapper {
                 fallbackID: baseID
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
+                + [record.defaultReasoningEffort].compactMap(\.self)
             // Extended effort parsing preserves exact model identities. Do not offer a
             // synthetic option that would resolve to another advertised model instead.
             let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription).filter { entry in
@@ -123,7 +176,10 @@ enum CodexDynamicModelMapper {
                         description: baseDescription,
                         isDefault: record.isDefault,
                         baseID: baseID,
-                        reasoningEffort: nil
+                        reasoningEffort: nil,
+                        supportedReasoningEffortRawValues: rawEfforts,
+                        defaultReasoningEffortRawValue: record.defaultReasoningEffort,
+                        defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort)
                     ),
                     seen: &seen,
                     into: &options
@@ -141,7 +197,10 @@ enum CodexDynamicModelMapper {
                         description: optionDescription,
                         isDefault: record.isDefault && effortEntry.isDefault,
                         baseID: baseID,
-                        reasoningEffort: effortEntry.effort
+                        reasoningEffort: effortEntry.effort,
+                        supportedReasoningEffortRawValues: rawEfforts,
+                        defaultReasoningEffortRawValue: record.defaultReasoningEffort,
+                        defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort)
                     ),
                     seen: &seen,
                     into: &options
@@ -390,10 +449,13 @@ enum CodexDynamicModelStore {
         let canonicalModel = model.model.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = model.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = model.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        let defaultReasoningEffort = CodexReasoningEffort.parse(model.defaultReasoningEffort)?.rawValue
-        var reasoningDescriptionsByEffort: [CodexReasoningEffort: String] = [:]
+        let defaultReasoningEffort = model.defaultReasoningEffort.flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+        var reasoningDescriptionsByEffort: [String: String] = [:]
         for entry in model.supportedReasoningEfforts {
-            guard let effort = CodexReasoningEffort.parse(entry.reasoningEffort) else { continue }
+            let effort = entry.reasoningEffort
+            guard !effort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             let effortDescription = entry.description.trimmingCharacters(in: .whitespacesAndNewlines)
             if let existing = reasoningDescriptionsByEffort[effort] {
                 if effortDescription.localizedCaseInsensitiveCompare(existing) == .orderedAscending {
@@ -403,18 +465,20 @@ enum CodexDynamicModelStore {
                 reasoningDescriptionsByEffort[effort] = effortDescription
             }
         }
-        if let defaultReasoningEffort,
-           let defaultEffort = CodexReasoningEffort(rawValue: defaultReasoningEffort),
-           reasoningDescriptionsByEffort[defaultEffort] == nil
-        {
-            reasoningDescriptionsByEffort[defaultEffort] = description
+        if let defaultReasoningEffort, reasoningDescriptionsByEffort[defaultReasoningEffort] == nil {
+            reasoningDescriptionsByEffort[defaultReasoningEffort] = description
         }
-        let reasoningEfforts: [CodexDynamicReasoningRecord] = CodexReasoningEffort.displayOrder.compactMap {
-            effort -> CodexDynamicReasoningRecord? in
-            guard let effortDescription = reasoningDescriptionsByEffort[effort] else { return nil }
-            return CodexDynamicReasoningRecord(
-                reasoningEffort: effort.rawValue,
-                description: effortDescription
+        let knownOrder = Dictionary(uniqueKeysWithValues: CodexReasoningEffort.displayOrder.enumerated().map {
+            ($0.element.rawValue, $0.offset)
+        })
+        let reasoningEfforts = reasoningDescriptionsByEffort.keys.sorted { left, right in
+            let leftOrder = knownOrder[left] ?? Int.max
+            let rightOrder = knownOrder[right] ?? Int.max
+            return leftOrder == rightOrder ? left < right : leftOrder < rightOrder
+        }.map { effort in
+            CodexDynamicReasoningRecord(
+                reasoningEffort: effort,
+                description: reasoningDescriptionsByEffort[effort]!
             )
         }
 
@@ -425,7 +489,12 @@ enum CodexDynamicModelStore {
             description: description,
             isDefault: model.isDefault,
             supportedReasoningEfforts: reasoningEfforts,
-            defaultReasoningEffort: defaultReasoningEffort
+            defaultReasoningEffort: defaultReasoningEffort,
+            serviceTiers: model.serviceTiers.sorted {
+                if $0.id != $1.id { return $0.id < $1.id }
+                if $0.name != $1.name { return $0.name < $1.name }
+                return $0.description < $1.description
+            }
         )
     }
 

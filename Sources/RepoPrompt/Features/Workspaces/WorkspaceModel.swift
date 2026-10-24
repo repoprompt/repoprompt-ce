@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
 
@@ -208,6 +209,10 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
     var isPinned: Bool
     /// Explicit order among pinned Agent sessions. nil preserves legacy activity sorting.
     var pinnedOrder: Int?
+    /// Optional sidebar group label for this tab's Agent session. nil means ungrouped.
+    var sidebarGroup: String?
+    /// Order of `sidebarGroup` among the workspace's groups, mirrored on every tab in the group.
+    var sidebarGroupOrder: Int?
     var activeChatSessionID: UUID?
     var activeAgentSessionID: UUID?
 
@@ -237,6 +242,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         lastModified: Date = Date(),
         isPinned: Bool = false,
         pinnedOrder: Int? = nil,
+        sidebarGroup: String? = nil,
+        sidebarGroupOrder: Int? = nil,
         activeChatSessionID: UUID? = nil,
         activeAgentSessionID: UUID? = nil,
         selection: StoredSelection = .init(),
@@ -252,6 +259,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         self.lastModified = lastModified
         self.isPinned = isPinned
         self.pinnedOrder = pinnedOrder
+        self.sidebarGroup = sidebarGroup
+        self.sidebarGroupOrder = sidebarGroupOrder
         self.activeChatSessionID = activeChatSessionID
         self.activeAgentSessionID = activeAgentSessionID
         self.selection = selection
@@ -270,6 +279,11 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         lastModified = try c.decodeIfPresent(Date.self, forKey: .lastModified) ?? WorkspaceDecodeSynthesis.mark(Date())
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         pinnedOrder = try? c.decode(Int.self, forKey: .pinnedOrder)
+        // Additive and optional like `pinnedOrder`: absent, malformed, or invalid names (empty,
+        // multi-line, over-long) decode as ungrouped; valid names are trimmed like the ops write them.
+        sidebarGroup = (try? c.decode(String.self, forKey: .sidebarGroup))
+            .flatMap(DomainAgentSessionSidebarGroup.normalizedName)
+        sidebarGroupOrder = sidebarGroup == nil ? nil : try? c.decode(Int.self, forKey: .sidebarGroupOrder)
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)
         selection = (try? c.decodeIfPresent(StoredSelection.self, forKey: .selection)) ?? .init()
@@ -288,6 +302,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         try c.encode(lastModified, forKey: .lastModified)
         try c.encode(isPinned, forKey: .isPinned)
         try c.encodeIfPresent(pinnedOrder, forKey: .pinnedOrder)
+        try c.encodeIfPresent(sidebarGroup, forKey: .sidebarGroup)
+        try c.encodeIfPresent(sidebarGroupOrder, forKey: .sidebarGroupOrder)
         try c.encodeIfPresent(activeChatSessionID, forKey: .activeChatSessionID)
         try c.encodeIfPresent(activeAgentSessionID, forKey: .activeAgentSessionID)
         try c.encode(selection, forKey: .selection)
@@ -305,6 +321,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         case lastModified
         case isPinned
         case pinnedOrder
+        case sidebarGroup
+        case sidebarGroupOrder
         case activeChatSessionID
         case activeAgentSessionID
         case selection

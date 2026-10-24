@@ -60,7 +60,12 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Stop owns cancellation, not creation. Start this fixture at an explicitly restored binding.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID, sessionID: sessionID, tabName: "Stop target", isWindowClosing: false
         ))
@@ -315,6 +320,9 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.installPersistentSessionBinding(
             AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: fixture.candidate.sessionID)
         )
+        XCTAssertFalse(fixture.session.permitsBoundOperationAndSave, "The old binding's hydration must not transfer to its successor")
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(fixture.session.permitsBoundOperationAndSave, "Stop targets the explicitly restored successor")
         let reboundCandidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
             tabID: fixture.tabID, sessionID: fixture.candidate.sessionID,
             tabName: "Stop target", isWindowClosing: false
@@ -884,6 +892,32 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetLoading))
         snapshot.endpointMatchesGrant = false
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.endpointInvalidated))
+    }
+
+    func testManagedStopRequiresAuthoritativeRestorationEvenForAnActiveRun() throws {
+        var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+        snapshot.runStateIsActive = true
+        let token = try XCTUnwrap(snapshot.restorationReadiness.bindingToken)
+        let states: [(AgentSessionRestorationReadiness, AgentSessionLinkSendFailure)] = [
+            (.pending(token), .targetLoading),
+            (.creating(token, .init(workspaceID: UUID(), ownerID: UUID(), phase: .preparing)), .targetCreationIncomplete),
+            (
+                .creating(token, .init(
+                    workspaceID: UUID(), ownerID: UUID(),
+                    phase: .readyToPersist(configurationStamp: Data("configured payload".utf8))
+                )),
+                .targetCreationIncomplete
+            ),
+            (.terminal(token, .missingPayload), .targetRestoreUnavailable),
+            (.terminal(token, .loadFailed), .targetRestoreUnavailable)
+        ]
+        for (readiness, failure) in states {
+            snapshot.restorationReadiness = readiness
+            XCTAssertTrue(snapshot.hasLoadedPersistedState)
+            XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(failure))
+        }
+        snapshot.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .activeRun)
     }
 
     func testInteractionIsNotABlockerAndUnsentDraftIsNotInSnapshot() {

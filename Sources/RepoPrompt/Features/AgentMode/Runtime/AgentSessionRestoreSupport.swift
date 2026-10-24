@@ -359,6 +359,8 @@ enum AgentSessionRestoreSupport {
             periodicIdleWakeIntervalSeconds: session.periodicIdleWakeIntervalSeconds,
             parentSessionID: session.parentSessionID,
             createdByOverseerSessionID: session.createdByOverseerSessionID,
+            organizationalParentID: session.organizationalParentID,
+            delegationScopeID: session.delegationScopeID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

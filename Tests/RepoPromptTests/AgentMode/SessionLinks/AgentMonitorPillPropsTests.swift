@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// Monitor pill rendering contract: directional row labels, accessibility text, status mapping, and
@@ -35,6 +36,68 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             autoWakeSnooze: autoWakeSnooze,
             isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected
         )
+    }
+
+    func testOverseerEnableRebindRetiresOldFailureAndBusyState() throws {
+        let original = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID)
+        let rebound = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID, transitionGeneration: 2)
+        XCTAssertNotEqual(original, rebound, "same session ID can have a new exact incarnation")
+        var state = AgentMonitorOverseerEnableState()
+        let request = try XCTUnwrap(state.begin(for: original))
+        XCTAssertTrue(state.isBusy(for: original))
+        XCTAssertNil(state.begin(for: original), "duplicate requests remain disabled")
+        XCTAssertFalse(state.isBusy(for: rebound), "rendering hides retired state even before onChange")
+
+        state.rebind(to: rebound)
+        XCTAssertNil(state.request)
+        state.complete(request, enabled: false)
+        XCTAssertEqual(state.endpoint, rebound)
+        XCTAssertNil(state.request)
+        XCTAssertFalse(state.isBusy(for: rebound))
+        XCTAssertNil(state.failure(for: rebound))
+        XCTAssertNil(state.failureMessage, "old failure cannot stamp the rebound presentation owner")
+    }
+
+    func testOverseerEnableOldCompletionCannotClearNewerRequest() throws {
+        let original = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID)
+        let other = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetID)
+        for oldEnabled in [false, true] {
+            var state = AgentMonitorOverseerEnableState()
+            let retired = try XCTUnwrap(state.begin(for: original))
+            state.rebind(to: other)
+            state.rebind(to: original)
+            let current = try XCTUnwrap(state.begin(for: original))
+            XCTAssertNotEqual(retired.token, current.token)
+            let busy = state
+            state.complete(retired, enabled: oldEnabled)
+            XCTAssertEqual(state, busy, "endpoint equality alone cannot retire an older request")
+            XCTAssertTrue(state.isBusy(for: original))
+            state.complete(current, enabled: false)
+            XCTAssertFalse(state.isBusy(for: original))
+            XCTAssertTrue(try XCTUnwrap(state.failure(for: original)).contains("agent_session_link"))
+            let failed = state
+            state.complete(retired, enabled: true)
+            XCTAssertEqual(state, failed, "old success cannot clear newer feedback")
+        }
+    }
+
+    func testOverseerEnableCurrentCompletionAndRebindResetFeedback() throws {
+        let endpoint = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID)
+        var state = AgentMonitorOverseerEnableState()
+        let failed = try XCTUnwrap(state.begin(for: endpoint))
+        state.complete(failed, enabled: false)
+        XCTAssertNotNil(state.failure(for: endpoint))
+        let retry = try XCTUnwrap(state.begin(for: endpoint))
+        XCTAssertNil(state.failure(for: endpoint))
+        state.complete(retry, enabled: true)
+        XCTAssertFalse(state.isBusy(for: endpoint))
+        XCTAssertNil(state.failure(for: endpoint))
+        let next = try XCTUnwrap(state.begin(for: endpoint))
+        state.complete(next, enabled: false)
+        state.rebind(to: nil)
+        XCTAssertNil(state.endpoint)
+        XCTAssertNil(state.request)
+        XCTAssertNil(state.failureMessage)
     }
 
     // MARK: - Fixed reference clock
@@ -622,8 +685,72 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             roleAllowsOutboundMonitoring: true
         )
         XCTAssertEqual(fresh.sessionID, observerID)
+        XCTAssertNil(fresh.endpoint)
         XCTAssertTrue(fresh.outbound.isEmpty)
         XCTAssertEqual(fresh.canAddReason, "Load this thread before adding sessions to oversee.")
+    }
+
+    func testReadyLinklessFallbackPreservesCurrentEndpointWithoutGrantingOversight() {
+        let endpoint = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID)
+        let props = AgentModeViewModel.monitorPillProps(
+            sessionID: observerID,
+            published: nil,
+            currentEndpoint: endpoint,
+            eligibility: eligibility(),
+            roleAllowsOutboundMonitoring: true
+        )
+        XCTAssertEqual(props.endpoint, endpoint)
+        XCTAssertTrue(props.canAdd)
+        XCTAssertTrue(props.outbound.isEmpty)
+        XCTAssertTrue(props.inbound.isEmpty)
+        XCTAssertTrue(props.recentNotices.isEmpty)
+        XCTAssertFalse(props.isOverseer)
+    }
+
+    @MainActor
+    func testCurrentLinklessPropsRetainEndpointAndRejectCapturedEndpointAfterRebind() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 27199,
+            testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("No provider dispatch expected") }
+        )
+        let tabID = UUID()
+        let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "First oversight link"
+        )
+        defer { withExtendedLifetime(workspace) {} }
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        // This presentation test starts with restored content, not an unfinished first-save claim.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        // Capture the props an open popover would retain, before any link publication exists.
+        let captured = viewModel.currentMonitorPillProps()
+        XCTAssertEqual(captured.endpoint, endpoint)
+        XCTAssertTrue(captured.canAdd)
+        XCTAssertTrue(captured.outbound.isEmpty)
+        XCTAssertTrue(captured.inbound.isEmpty)
+        XCTAssertFalse(captured.isOverseer)
+
+        session.beginPersistentBindingTransition()
+        let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        XCTAssertNotEqual(endpoint, rebound)
+        XCTAssertEqual(viewModel.currentMonitorPillProps().endpoint, rebound)
+        let originalAutoWake = session.oversight.autoWakeOnUpdates
+        XCTAssertFalse(try viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+            !originalAutoWake, for: XCTUnwrap(captured.endpoint)
+        ))
+        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
+        // The current incarnation is still addressable: stale rejection is not a blanket refusal.
+        XCTAssertTrue(viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(originalAutoWake, for: rebound))
+        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
     }
 
     func testWithCanAddReasonIsIdentityPreservingWhenUnchanged() {

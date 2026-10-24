@@ -2,6 +2,7 @@
 @testable import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
@@ -25,6 +26,7 @@ import XCTest
                 .appendingPathComponent("WorkspaceRegistryRestartResolutionTests-\(UUID().uuidString)", isDirectory: true)
             repoRoot = temporaryRoot
                 .appendingPathComponent("WorkspaceRegistryRestartResolutionRepos-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")

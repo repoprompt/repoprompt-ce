@@ -141,6 +141,7 @@ public enum MCPTimeoutPolicy {
     /// Long-running tools whose provider/run cancellation contract is authoritative.
     public static let cliDefaultUnboundedToolNames: Set<String> = [
         "ask_oracle",
+        "oracle_send",
         "context_builder"
     ]
     /// Extra time after a caller-requested server-side wait for response encoding

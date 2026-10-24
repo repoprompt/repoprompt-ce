@@ -12,6 +12,7 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     /// Variant provenance for synthesized effort options. Optional so records persisted
     /// before effort support decode unchanged.
     var effortVariant: AgentModelEffortVariant? = nil
+    var contextWindowTokens: Int? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
@@ -200,7 +201,10 @@ enum ACPDynamicModelStore {
         guard !rawValue.isEmpty else { return nil }
         let displayName = option.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = normalizedOptionalString(option.description)
-        let supportedReasoningEfforts = normalizedReasoningEffortRaws(option.supportedReasoningEfforts)
+        let supportedReasoningEfforts = normalizedRawEffortValues(
+            option.supportedReasoningEffortRawValues
+                + normalizedReasoningEffortRaws(option.supportedReasoningEfforts)
+        )
         return ACPDynamicModelRecord(
             rawValue: rawValue,
             displayName: displayName.isEmpty ? rawValue : displayName,
@@ -208,8 +212,9 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: option.isPlaceholderDefault,
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
-            effortVariant: option.effortVariant
+            defaultReasoningEffort: option.defaultReasoningEffortRawValue ?? option.defaultReasoningEffort?.rawValue,
+            effortVariant: option.effortVariant,
+            contextWindowTokens: option.contextWindowTokens
         )
     }
 
@@ -226,8 +231,13 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: record.isPlaceholderDefault,
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
+            supportedReasoningEffortRawValues: normalizedRawEffortValues(
+                record.supportedReasoningEfforts + [record.defaultReasoningEffort].compactMap(\.self)
+            ),
             defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
-            effortVariant: record.effortVariant
+            defaultReasoningEffortRawValue: record.defaultReasoningEffort,
+            effortVariant: record.effortVariant,
+            contextWindowTokens: record.contextWindowTokens
         )
     }
 
@@ -268,9 +278,9 @@ enum ACPDynamicModelStore {
     ) -> ACPDynamicModelRecord {
         let metadataRecord = preferredMetadataRecord(existing, candidate)
         let fallbackRecord = metadataRecord == existing ? candidate : existing
-        let supportedReasoningEfforts = normalizedReasoningEfforts(
+        let supportedReasoningEfforts = normalizedRawEffortValues(
             existing.supportedReasoningEfforts + candidate.supportedReasoningEfforts
-        ).map(\.rawValue)
+        )
         return ACPDynamicModelRecord(
             rawValue: preferredRawValue(existing.rawValue, candidate.rawValue),
             displayName: metadataRecord.displayName,
@@ -281,7 +291,8 @@ enum ACPDynamicModelStore {
             defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
             // Variant provenance is semantic identity, not metadata: keep it only when both
             // records agree, so a real base (nil) never inherits stale variant provenance.
-            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil,
+            contextWindowTokens: metadataRecord.contextWindowTokens ?? fallbackRecord.contextWindowTokens
         )
     }
 
@@ -339,6 +350,13 @@ enum ACPDynamicModelStore {
             return matched.rawValue
         }
         return trimmed
+    }
+
+    private static func normalizedRawEffortValues(_ efforts: [String]) -> [String] {
+        var seen: Set<String> = []
+        return efforts.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && seen.insert($0).inserted
+        }
     }
 
     private static func normalizedReasoningEffortRaws(_ efforts: [CodexReasoningEffort]) -> [String] {

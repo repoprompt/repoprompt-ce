@@ -29,10 +29,12 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "self_compact"))
         let serialized = try String(decoding: JSONEncoder().encode(definition), as: UTF8.self)
         XCTAssertLessThanOrEqual(serialized.count, 1000, "Complete minified definition, not description alone")
+        let noteDescription = definition.inputSchema.objectValue?["properties"]?.objectValue?["note"]?.objectValue?["description"]?.stringValue
+        XCTAssertEqual(noteDescription, "[compact] Required verbatim note: 10% of window tokens × 4 UTF-8 bytes; 65,536 if unknown.")
         let description = definition.description
         for required in [
             "Agent Mode session", "no target selector", "`context`", "load", "status",
-            "`compact`", "nonempty `note`", "8,192 UTF-8 bytes", "`idempotency_key`",
+            "`compact`", "nonempty `note`", "~10% of context window in UTF-8 bytes; 65,536 if unknown", "`idempotency_key`",
             "200 UTF-8 bytes", "same note", "New `scheduled`", "finish this turn normally",
             "no new authority"
         ] {

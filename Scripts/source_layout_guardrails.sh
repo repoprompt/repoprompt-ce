@@ -396,7 +396,12 @@ if [[ -d "$workspace_core_source_dir" ]]; then
     printf '%s\n' "$unexpected_workspace_core_files" >&2
   fi
 
-  if ! workspace_core_imports="$(xcrun swiftc -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
+  # Keep Xcode's selected toolchain on macOS; the same compiler check also runs headlessly on Linux.
+  workspace_core_compiler=(swiftc)
+  if command -v xcrun >/dev/null 2>&1; then
+    workspace_core_compiler=(xcrun swiftc)
+  fi
+  if ! workspace_core_imports="$("${workspace_core_compiler[@]}" -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
     fail "Swift compiler could not inspect RepoPromptWorkspaceCore imports"
     printf '%s\n' "$workspace_core_imports" >&2
   elif [[ "$workspace_core_imports" != "Foundation" ]]; then
@@ -799,6 +804,7 @@ allowed_tracked_docs=(
   "docs/architecture/agent-orchestration-guidance.md"
   "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
+  "docs/architecture/ci-reliability-2026-10-23.md"
   "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
@@ -808,6 +814,7 @@ allowed_tracked_docs=(
   "docs/architecture/modules.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
+  "docs/architecture/routing-profile-publication.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/self-compact-native-note-delivery.md"
   "docs/architecture/source-layout.md"
@@ -822,8 +829,11 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
+  "docs/plans/agent-mode-reprompter-2026-10-20.md"
+  "docs/plans/openai-decisions-contract-2026-10-07.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
+  "docs/reviews/model-router-auto-effort-openai-decisions-verification.md"
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"

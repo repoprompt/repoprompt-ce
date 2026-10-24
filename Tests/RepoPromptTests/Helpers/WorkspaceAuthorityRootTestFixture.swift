@@ -4,6 +4,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptVCS
 import XCTest
 
@@ -104,7 +105,9 @@ import XCTest
         private init(sandbox: URL, rootNames: [String]) {
             let base = sandbox.appendingPathComponent("root-fixture-\(UUID().uuidString)", isDirectory: true)
             self.base = base
-            storage = base.appendingPathComponent("Workspaces", isDirectory: true)
+            storage = AppProfileLocations.current.customWorkspaceDirectory(
+                selectedDirectory: base.appendingPathComponent("Workspaces", isDirectory: true)
+            )
             rootPaths = rootNames.map { base.appendingPathComponent($0).path }
         }
 
