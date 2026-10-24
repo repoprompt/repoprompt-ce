@@ -13,10 +13,12 @@ included:
   - Sources/RepoPromptVCS
   - Sources/RepoPromptPersistence
   - Sources/RepoPromptSettingsCore
+  - Sources/RepoPromptProviderQuota
   - Tests/RepoPromptFileSystemTests
   - Tests/RepoPromptVCSTests
   - Tests/RepoPromptPersistenceTests
   - Tests/RepoPromptSettingsCoreTests
+  - Tests/RepoPromptProviderQuotaTests
   - Tests/RepoPromptTests
   - Tests/RepoPromptMCPCoreTests
   - Tests/RepoPromptTestSupport

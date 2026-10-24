@@ -46,21 +46,48 @@ extension AgentModeViewModel {
         modelID: String,
         liveness: @escaping AgentSessionLinkSendLivenessProbe,
         availability: @MainActor () -> AgentModelCatalog.AvailabilityContext,
+        roleSelectionProvider: AgentMCPSelectionResolver.RoleSelectionProvider? = nil,
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome {
         guard let session = agentSessionLinkModelSession(matching: candidate),
               liveness().permitsDelivery, !Task.isCancelled else { return .blocked(.endpointInvalidated) }
         if let failure = agentSessionLinkModelReadiness(session) { return .blocked(failure) }
         let admittedAvailability = availability()
-        if let id = AgentModelSelectionID.parse(modelID), id.rawValue == modelID,
+        let admittedModelID: String
+        func invalid(_ detail: String, code: String = "model_catalog_admission_failed") -> AgentSessionLinkModelOutcome {
+            let alternatives = AgentAdvertisedModelCatalog.shared.modelIDs(
+                for: session.selectedAgent, availability: availability()
+            )
+            return .refused(
+                code: code,
+                detail: detail + " Usable same-agent model_ids: [" + alternatives.joined(separator: ", ")
+                    + "]. Next: agent_manage {op: list_agents, roles_only: false} in the destination workspace.",
+                alternatives: alternatives
+            )
+        }
+        if AgentModelCatalog.TaskLabelKind(rawValue: modelID.lowercased()) != nil {
+            do {
+                // Same workspace-aware role defaults as agent_run. Capture the concrete ID once;
+                // the final lease hop cannot substitute a different role default or warm catalogue.
+                let resolved = try AgentMCPSelectionResolver.resolve(
+                    modelID: modelID, availability: admittedAvailability, workspaceID: candidate.workspaceID,
+                    roleSelectionProvider: roleSelectionProvider
+                )
+                guard let agent = resolved.agentRaw, let raw = resolved.modelRaw else {
+                    return invalid("No available model for the requested role.", code: "model_role_unavailable")
+                }
+                admittedModelID = AgentModelSelectionID(agentRaw: agent, modelRaw: raw).rawValue
+            } catch { return invalid("Role resolution failed: " + error.localizedDescription, code: "model_role_unavailable") }
+        } else { admittedModelID = modelID }
+        if let id = AgentModelSelectionID.parse(admittedModelID), id.rawValue == admittedModelID,
            let agent = AgentProviderKind(rawValue: id.agentRaw), agent != session.selectedAgent
         {
-            return .invalid("set_model cannot change agent kind (current: \(session.selectedAgent.rawValue)). Use agent_manage.list_agents for a same-agent model_id.")
+            return invalid("set_model cannot change agent kind (current: \(session.selectedAgent.rawValue)). Use agent_manage.list_agents for a same-agent model_id.", code: "model_agent_mismatch")
         }
         do {
-            _ = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: admittedAvailability)
-        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return .invalid(error.message) }
-        catch { return .invalid("Model catalogue admission failed.") }
+            _ = try AgentAdvertisedModelCatalog.shared.selection(admittedModelID, availability: admittedAvailability)
+        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
+        catch { return invalid("Model catalogue admission failed.") }
 
         let commit = await reauthorize()
         guard commit == .committed else { return .blocked(commit.refusal) }
@@ -74,18 +101,18 @@ extension AgentModeViewModel {
         }
         if let failure = agentSessionLinkModelReadiness(session) { return .blocked(failure) }
         guard availability() == admittedAvailability else {
-            return .invalid("Destination model availability changed. Refresh agent_manage.list_agents and retry.")
+            return invalid("Destination model availability changed. Refresh agent_manage.list_agents and retry.", code: "model_availability_changed")
         }
-        if let id = AgentModelSelectionID.parse(modelID), id.rawValue == modelID,
+        if let id = AgentModelSelectionID.parse(admittedModelID), id.rawValue == admittedModelID,
            let agent = AgentProviderKind(rawValue: id.agentRaw), agent != session.selectedAgent
         {
-            return .invalid("The target agent changed. Refresh agent_manage.list_agents and choose a same-agent model_id.")
+            return invalid("The target agent changed. Refresh agent_manage.list_agents and choose a same-agent model_id.", code: "model_agent_changed")
         }
         do {
-            let selection = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: admittedAvailability)
+            let selection = try AgentAdvertisedModelCatalog.shared.selection(admittedModelID, availability: admittedAvailability)
             return .accepted(agentSessionLinkCommitModel(selection, to: session))
-        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return .invalid(error.message) }
-        catch { return .invalid("Model catalogue admission failed.") }
+        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
+        catch { return invalid("Model catalogue admission failed.") }
     }
 
     private func agentSessionLinkModelReadiness(_ session: TabSession) -> AgentSessionLinkSendFailure? {

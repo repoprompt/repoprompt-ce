@@ -93,12 +93,16 @@ public enum GitDiffMachineRecords {
         while !fields.isAtEnd {
             try Task.checkCancellation()
             let status = try utf8(fields.next())
-            guard let first = status.utf8.first, Array("ACDMRTUXB".utf8).contains(first),
-                  status.utf8.dropFirst().allSatisfy({ (48 ... 57).contains($0) })
+            let statusLetters = Array("ACDMRTUXB".utf8)
+            // Combined diffs report one status per parent and a single destination path,
+            // even when a parent status is R or C. Scored ordinary renames/copies use two paths.
+            let combined = status.utf8.count > 1 && status.utf8.allSatisfy { statusLetters.contains($0) }
+            guard let first = status.utf8.first, statusLetters.contains(first),
+                  combined || status.utf8.dropFirst().allSatisfy({ (48 ... 57).contains($0) })
             else { throw GitDiffRecordError.malformed("name-status code") }
-            let renamed = first == 82 || first == 67
+            let renamed = !combined && (first == 82 || first == 67)
             let scoreBytes = Data(status.utf8.dropFirst())
-            if renamed || !scoreBytes.isEmpty {
+            if !combined, renamed || !scoreBytes.isEmpty {
                 guard renamed || first == 77,
                       !scoreBytes.isEmpty,
                       let score = try Int(utf8(scoreBytes)), (0 ... 100).contains(score)

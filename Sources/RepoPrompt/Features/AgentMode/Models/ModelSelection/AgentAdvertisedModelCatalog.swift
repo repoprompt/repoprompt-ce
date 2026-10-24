@@ -74,6 +74,16 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
         return Selection(id: id, agent: agent, option: entry.option, reasoningEffortRaw: entry.reasoningEffortRaw)
     }
 
+    /// Bounded memory-only recovery hints; never discover or warm a provider catalogue on refusal.
+    func modelIDs(for agent: AgentProviderKind, availability: AgentModelCatalog.AvailabilityContext) -> [String] {
+        guard AgentModelCatalog.isAgentAvailable(agent, availability: availability) else { return [] }
+        return lock.withLock {
+            (optionsByAgent[agent]?.keys.sorted() ?? []).prefix(8).map {
+                AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: $0).rawValue
+            }
+        }
+    }
+
     struct Selection {
         let id: AgentModelSelectionID
         let agent: AgentProviderKind
@@ -90,6 +100,15 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
 
     enum AdmissionError: Error, Equatable {
         case invalidID, unavailable, catalogueUnavailable, unadvertised
+
+        var diagnosticCode: String {
+            switch self {
+            case .invalidID: "model_id_invalid"
+            case .unavailable: "model_agent_unavailable"
+            case .catalogueUnavailable: "model_catalog_unavailable"
+            case .unadvertised: "model_not_advertised"
+            }
+        }
 
         var message: String {
             switch self {

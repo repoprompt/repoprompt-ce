@@ -43,7 +43,8 @@ enum ACPAgentProviderFactory {
                     // effective profile (including .mcpSafeDefaults overrides), so this
                     // config must not OR the global preference back in.
                     alwaysApproveTools: false,
-                    apiKey: grokAPIKeyProvider()
+                    apiKey: grokAPIKeyProvider(),
+                    backgroundFeatureEnvironment: GrokBuildAgentConfig.managedBackgroundFeatureEnvironment
                 )
             )
         case .antigravity:

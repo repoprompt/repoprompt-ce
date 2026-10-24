@@ -218,6 +218,29 @@ package enum DomainExactRootSelection: Equatable {
     case changed
 }
 
+/// Exact registered-workspace routing facts, independent of session/delegation authority.
+package enum DomainWorkspaceReadSelector: Equatable, Sendable {
+    case id(UUID)
+    case exactName(String)
+}
+
+package struct DomainWorkspaceReadLocation: Equatable, Sendable {
+    package let runtimeID: UUID
+    package let lifecycleGeneration: UInt64
+    package let locationGeneration: UInt64
+    package let workspaceID: UUID
+    package let name: String
+    package let directory: URL
+}
+
+package enum DomainWorkspaceLocationSelection: Equatable, Sendable {
+    case matched(DomainWorkspaceReadLocation)
+    case ambiguous
+    case unavailable
+    case notReady
+    case notRegistered
+}
+
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool
@@ -225,6 +248,9 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let catalogRevision: UInt64
     package let health: DomainAuthorityHealth
     package let workspaces: [DomainWorkspaceSnapshot]
+    /// Known, nondeleted catalog members the authority cannot currently supply a record for.
+    /// Transient: completeness is separate from aggregate `health`, which may remain writable.
+    package let unavailableWorkspaceIDs: Set<UUID>
 
     package init(
         runtimeIdentity: DomainRuntimeIdentity,
@@ -232,7 +258,8 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         publicationSequence: UInt64,
         catalogRevision: UInt64,
         health: DomainAuthorityHealth,
-        workspaces: [DomainWorkspaceSnapshot]
+        workspaces: [DomainWorkspaceSnapshot],
+        unavailableWorkspaceIDs: Set<UUID> = []
     ) {
         self.runtimeIdentity = runtimeIdentity
         self.isBootstrapped = isBootstrapped
@@ -240,6 +267,7 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         self.catalogRevision = catalogRevision
         self.health = health
         self.workspaces = workspaces
+        self.unavailableWorkspaceIDs = unavailableWorkspaceIDs
     }
 }
 

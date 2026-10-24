@@ -19,7 +19,8 @@ extension AgentModeViewModel {
             executionLocation: executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
             activeRunID: activeSession?.runID,
-            monitor: currentMonitorPillProps()
+            monitor: currentMonitorPillProps(),
+            reprompt: repromptPillProps()
         )
     }
 
@@ -28,6 +29,8 @@ extension AgentModeViewModel {
     }
 
     /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
+    /// The link-projection publisher calls this on every mutation, and most mutations leave the
+    /// pills untouched.
     func syncStatusPillsUIStateIfMonitorStale() {
         let published = ui.statusPills.snapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
@@ -55,7 +58,7 @@ extension AgentModeViewModel {
                 isEnabled: !busy,
                 isOperationInProgress: busy,
                 requiresActiveRunConfirmation: false,
-                disabledReason: busy ? "Preparing the selected worktree…" : nil
+                disabledReason: session?.pendingHandoff.executionLocationFailure ?? (busy ? "Preparing the selected worktree…" : nil)
             )
         }
 
@@ -127,6 +130,9 @@ extension AgentModeViewModel {
     }
 
     private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {
+        if let failure = session.pendingHandoff.executionLocationFailure {
+            return failure
+        }
         if !session.hasLoadedPersistedState {
             return "Load this thread before changing its execution location."
         }

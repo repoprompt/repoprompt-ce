@@ -36,6 +36,15 @@ final class GitDiffMachineRecordsTests: XCTestCase {
         }
     }
 
+    func testCombinedStatusesUseOnePathEvenForRenameAndCopyParents() throws {
+        for code in ["MM", "RM", "CM", "MD", "MMM"] {
+            let records = try GitDiffMachineRecords.nameStatus(Data("\(code)\0 merged\tfile\0M\0next\0".utf8))
+            XCTAssertEqual(records.map(\.status), [code, "M"])
+            XCTAssertEqual(records.map(\.path.bytes), [Data(" merged\tfile".utf8), Data("next".utf8)])
+            XCTAssertTrue(records.allSatisfy { $0.originalPath == nil })
+        }
+    }
+
     func testInvalidUTF8IsRetainedUntilExportAndCannotBecomeEmptySuccess() throws {
         let raw = Data([0xFF, 0xFE])
         var numstat = Data("1\t0\t".utf8)
@@ -52,7 +61,7 @@ final class GitDiffMachineRecordsTests: XCTestCase {
         for raw in ["1\t0\tname", "1\t0\t\0old\0", "x\t0\tname\0", "1\t0\t\0\0new\0", "1\t0\tgood\0broken\0"] {
             XCTAssertThrowsError(try GitDiffMachineRecords.numstat(Data(raw.utf8)), raw)
         }
-        for raw in ["M\0name", "R100\0old\0", "Z\0name\0", "\0name\0", "M\0\0", "R\0old\0new\0", "R101\0old\0new\0", "A1\0name\0", "M101\0name\0"] {
+        for raw in ["M\0name", "R100\0old\0", "Z\0name\0", "\0name\0", "M\0\0", "R\0old\0new\0", "R101\0old\0new\0", "A1\0name\0", "M101\0name\0", "M1M\0name\0", "R9M\0name\0"] {
             XCTAssertThrowsError(try GitDiffMachineRecords.nameStatus(Data(raw.utf8)), raw)
         }
         var cursor = GitDiffNULCursor(Data("1234\0".utf8), maximumFieldBytes: 3)

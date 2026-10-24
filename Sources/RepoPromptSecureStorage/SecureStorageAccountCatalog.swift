@@ -28,6 +28,7 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
 
     /// Model-router backend accounts.
     case jevRouterAPIKey
+    case openAIDecisionsRouterAPIKey
 
     // Agent permission document accounts.
     case agentPermissionSubagentDocument
@@ -79,6 +80,8 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
             "ClaudeCompatibleBackend.custom.apiKey"
         case .jevRouterAPIKey:
             "JevRouterAPIKey"
+        case .openAIDecisionsRouterAPIKey:
+            "OpenAIDecisionsRouterAPIKey"
         case .agentPermissionSubagentDocument:
             Self.decode([
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
@@ -148,6 +151,7 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .claudeCompatibleKimiAPIKey: "Kimi compatible API key"
         case .claudeCompatibleCustomAPIKey: "Custom Claude-compatible API key"
         case .jevRouterAPIKey: "Jev model router API key"
+        case .openAIDecisionsRouterAPIKey: "OpenAI Decisions model router API key"
         case .agentPermissionSubagentDocument: "Subagent permissions"
         case .agentPermissionCodexDocument: "Codex permissions"
         case .agentPermissionClaudeDocument: "Claude permissions"

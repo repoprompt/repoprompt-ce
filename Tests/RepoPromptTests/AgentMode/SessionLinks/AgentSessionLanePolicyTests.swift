@@ -293,30 +293,88 @@ final class AgentSessionLanePolicyTests: XCTestCase {
 
     @MainActor
     func testEveryRoleUsesItsEffectiveRoleDefaultAndMappedEffort() throws {
-        let workspaceID = UUID()
-        let overrides = Dictionary(
-            uniqueKeysWithValues: AgentModelCatalog.TaskLabelKind.allCases.map {
-                ($0.rawValue, "codexExec:gpt-5.4-high")
-            }
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .devin)
+        registry.test_reset(providerID: .cursor)
+        defer {
+            registry.test_reset(providerID: .devin)
+            registry.test_reset(providerID: .cursor)
+        }
+        let devinModel = AgentModelOption(
+            rawValue: "test-devin-pinned", displayName: "Pinned Devin", description: nil, isDefault: false
         )
-        let settings = AgentModelsProfileRoleDefaultsStore(overrides: overrides)
-        let availability = AgentModelCatalog.AvailabilityContext()
-        for role in AgentModelCatalog.TaskLabelKind.allCases {
-            let selected = try AgentSessionLanePolicy.resolveRole(
-                role.rawValue,
-                availability: availability,
-                workspaceID: workspaceID,
-                settingsStore: settings
-            )
-            XCTAssertEqual(selected.role, role)
-            XCTAssertEqual(selected.agentRaw, AgentProviderKind.codexExec.rawValue)
-            XCTAssertEqual(selected.modelRaw, "gpt-5.4-high")
-            XCTAssertEqual(selected.reasoningEffortRaw, "high")
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            .init(options: [devinModel], currentModelRaw: devinModel.rawValue), for: .devin
+        ))
+        let workspaceID = UUID()
+        var scenarios: [(
+            name: String, role: AgentModelCatalog.TaskLabelKind, agent: AgentProviderKind,
+            model: String, effort: String?, availability: AgentModelCatalog.AvailabilityContext, admitted: Bool
+        )] = AgentModelCatalog.TaskLabelKind.allCases.map {
+            ("\($0.rawValue) Codex pin", $0, .codexExec, "gpt-5.4-high", "high", .init(), true)
+        }
+        scenarios.append(contentsOf: [
+            (
+                "Devin-only pin",
+                .pair,
+                .devin,
+                devinModel.rawValue,
+                nil,
+                .init(claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false, devinAvailable: true),
+                true
+            ),
+            (
+                "Cursor-only Auto pin",
+                .pair,
+                .cursor,
+                AgentModel.cursorAuto.rawValue,
+                nil,
+                .init(claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false, cursorAvailable: true),
+                true
+            ),
+            ("disconnected Devin pin", .pair, .devin, devinModel.rawValue, nil, .none, false)
+        ])
+        for scenario in scenarios {
+            let settings = AgentModelsProfileRoleDefaultsStore(overrides: [scenario.role.rawValue: AgentModelSelectionID(
+                agentRaw: scenario.agent.rawValue, modelRaw: scenario.model
+            ).rawValue])
+            if scenario.agent != .codexExec {
+                XCTAssertNil(MCPAgentRoleDefaultsService.effectiveSelection(
+                    for: scenario.role, availability: scenario.availability,
+                    workspaceID: workspaceID, settingsStore: settings
+                ), "\(scenario.name): no recommendation row should be synthesized")
+            }
+            if !scenario.admitted {
+                XCTAssertThrowsError(try AgentSessionLanePolicy.resolveRole(
+                    scenario.role.rawValue, availability: scenario.availability,
+                    workspaceID: workspaceID, settingsStore: settings
+                ), scenario.name) { error in
+                    XCTAssertEqual(error as? AgentSessionLanePolicy.RoleResolutionError, .roleUnavailable, scenario.name)
+                }
+                continue
+            }
+            let selected: AgentSessionLanePolicy.RoleSelection
+            do {
+                selected = try AgentSessionLanePolicy.resolveRole(
+                    scenario.role.rawValue,
+                    availability: scenario.availability,
+                    workspaceID: workspaceID,
+                    settingsStore: settings
+                )
+            } catch {
+                XCTFail("\(scenario.name): an executable destination pin must resolve, got \(error)")
+                continue
+            }
+            XCTAssertEqual(selected.role, scenario.role, scenario.name)
+            XCTAssertEqual(selected.agentRaw, scenario.agent.rawValue, scenario.name)
+            XCTAssertEqual(selected.modelRaw, scenario.model, scenario.name)
+            XCTAssertEqual(selected.reasoningEffortRaw, scenario.effort, scenario.name)
+            XCTAssertTrue(selected.modelParameterSelections.isEmpty, scenario.name)
         }
     }
 
     @MainActor
-    func testFreshHandoffDestinationDoesNotInheritCreatorProvenance() {
+    func testFreshHandoffDestinationDoesNotInheritCreatorProvenance() throws {
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
@@ -326,7 +384,14 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }
         )
-        let destination = viewModel.session(for: UUID())
+        let tabID = UUID()
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Fresh handoff provenance"
+        )
+        defer { withExtendedLifetime(manager) {} }
+        let destination = viewModel.session(for: tabID)
+        _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(destination))
+        XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
         destination.createdByOverseerSessionID = UUID()
         viewModel.markSessionAsFreshlyCreated(destination)
         XCTAssertNil(destination.createdByOverseerSessionID)
@@ -359,24 +424,40 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             )
             let sourceTabID = UUID()
             let sourceSessionID = UUID()
+            let sourceCreatorID = UUID()
             let sourceTab = ComposeTabState(id: sourceTabID, name: "Source", activeAgentSessionID: sourceSessionID)
             let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex {
                 $0.id == workspace.id
             })
+            window.workspaceManager.workspaces[workspaceIndex].customStoragePath = root.appendingPathComponent("sessions", isDirectory: true)
+            // Hydration must establish the source's readiness and creator provenance before Handoff.
+            let persistedSource = AgentSession(
+                id: sourceSessionID,
+                workspaceID: workspace.id,
+                composeTabID: sourceTabID,
+                name: "Source",
+                items: [
+                    AgentChatItemPersist(from: .user("Source user", sequenceIndex: 0)),
+                    AgentChatItemPersist(from: .assistant("Source assistant", sequenceIndex: 1))
+                ],
+                autoEditEnabled: false,
+                createdByOverseerSessionID: sourceCreatorID
+            )
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                persistedSource, for: window.workspaceManager.workspaces[workspaceIndex]
+            )
             window.workspaceManager.workspaces[workspaceIndex].composeTabs = [sourceTab]
             window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = sourceTabID
             window.promptManager.loadComposeTabsFromWorkspace(
                 window.workspaceManager.workspaces[workspaceIndex], syncPromptText: true
             )
             let viewModel = window.agentModeViewModel
-            let source = viewModel.session(for: sourceTabID)
-            source.hasLoadedPersistedState = true
-            source.createdByOverseerSessionID = UUID()
-            source.setItemsSilently([
-                .user("Source user", sequenceIndex: 0),
-                .assistant("Source assistant", sequenceIndex: 1)
-            ], reason: .testOverride)
-            viewModel.refreshDerivedTranscriptState(for: source)
+            let source = await viewModel.ensureSessionReady(tabID: sourceTabID)
+            XCTAssertEqual(source.activeAgentSessionID, sourceSessionID)
+            let sourceToken = try XCTUnwrap(source.currentRestorationBindingToken)
+            XCTAssertEqual(source.qualifiedRestorationReadiness, .authoritative(sourceToken, .persistedPayloadApplied))
+            XCTAssertEqual(source.createdByOverseerSessionID, sourceCreatorID)
+            XCTAssertEqual(source.items.count, 2)
             viewModel.setAgentModeActive(true)
             var savedCreator: UUID?
             var saveWasCalled = false
@@ -395,6 +476,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
             XCTAssertTrue(saveWasCalled)
             XCTAssertNil(savedCreator)
             XCTAssertNil(viewModel.sessions[destinationTabID]?.createdByOverseerSessionID)
+            XCTAssertEqual(source.createdByOverseerSessionID, sourceCreatorID)
         } catch {
             await cleanup()
             throw error

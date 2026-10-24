@@ -233,7 +233,55 @@ import RepoPromptPersistence
                 } ?? NSNull(),
                 "measurements": Dictionary(uniqueKeysWithValues: snapshot.measurements.byOrigin.map {
                     ($0.key.rawValue, manifestMeasurementPayload($0.value))
-                })
+                }),
+                "writers": snapshot.writerActivity.map(manifestWriterActivityPayload) ?? NSNull()
+            ]
+        }
+
+        private static func manifestWriterActivityPayload(_ snapshot: CodemapManifestWriterActivitySnapshot) -> [String: Any] {
+            func age(_ start: UInt64) -> UInt64 {
+                (snapshot.sampledUptimeNanoseconds >= start ? snapshot.sampledUptimeNanoseconds - start : 0) / 1_000_000
+            }
+            let tasks: [[String: Any]] = snapshot.tasks.map { task in
+                [
+                    "writer_id": task.writerID.uuidString, "namespace_digest": task.namespaceDigest,
+                    "root_id": task.rootEpoch?.rootID.uuidString ?? NSNull(),
+                    "root_lifetime_id": task.rootEpoch?.rootLifetimeID.uuidString ?? NSNull(),
+                    "batch_id": task.batchID?.uuidString ?? NSNull(), "origin": task.origin ?? NSNull(),
+                    "phase": task.phase, "task_started_uptime_ns": task.taskStartedUptimeNanoseconds,
+                    "task_age_ms": age(task.taskStartedUptimeNanoseconds),
+                    "batch_started_uptime_ns": task.batchStartedUptimeNanoseconds ?? NSNull(),
+                    "batch_age_ms": task.batchStartedUptimeNanoseconds.map(age) ?? NSNull(),
+                    "phase_started_uptime_ns": task.phaseStartedUptimeNanoseconds,
+                    "phase_age_ms": age(task.phaseStartedUptimeNanoseconds)
+                ]
+            }
+            let queues: [[String: Any]] = snapshot.namespaces.map { queue in
+                [
+                    "namespace_digest": queue.namespaceDigest, "queued_item_count": queue.queuedItemCount,
+                    "deferred_tail_item_count": queue.deferredTailItemCount,
+                    "deferred_head_waiting_item_count": queue.deferredHeadWaitingItemCount,
+                    "in_flight_item_count": queue.inFlightItemCount, "retry_pending": queue.retryPending
+                ]
+            }
+            return [
+                "scope": "manifest_writer_tasks", "engine_instance_id": snapshot.engineInstanceID.uuidString,
+                "sampled_uptime_ns": snapshot.sampledUptimeNanoseconds,
+                "root": [
+                    "scope": "root_epoch", "root_id": snapshot.rootEpoch.rootID.uuidString,
+                    "root_lifetime_id": snapshot.rootEpoch.rootLifetimeID.uuidString,
+                    "queue_item_count": NSNull(), "queue_counts_complete": false,
+                    "quiescence_confirmed": snapshot.quiescenceConfirmed ? (true as Any) : NSNull()
+                ],
+                "engine": [
+                    "scope": "engine_all_root_epochs", "live_task_count": snapshot.liveTaskCount,
+                    "namespace_count": snapshot.namespaceCount, "accounting_complete": snapshot.accountingComplete,
+                    "quiescence_confirmed": snapshot.quiescenceConfirmed,
+                    "omitted_live_task_count": snapshot.omittedLiveTaskCount,
+                    "omitted_namespace_count": snapshot.omittedNamespaceCount,
+                    "queue_counts_complete": snapshot.omittedNamespaceCount == 0,
+                    "tasks": tasks, "namespaces": queues
+                ]
             ]
         }
 

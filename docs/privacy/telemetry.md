@@ -33,6 +33,105 @@ production builds, release-candidate ad-hoc builds, UI-test launches, and stress
 Local DEBUG builds may use `REPOPROMPT_SENTRY_DSN` only for integration testing; official release
 telemetry uses the signed bundle's `RepoPromptSentryDSN` instead.
 
+## Account usage limits (separate from diagnostic telemetry)
+
+The optional usage-limit display is controlled by **Settings → Agent Mode → Overview →
+Show usage limits when available**. This presentation preference does not authorize credential
+access or change model selection. Codex usage must be enabled separately; it uses a dedicated
+Codex app-server account read and account notifications without creating a conversation.
+
+Claude usage requires explicit **Connect Claude usage** consent in CLI Providers for one Claude
+Code config-folder profile. Prior OAuth consent does not authorize this changed method. A short-lived,
+hidden terminal process runs the user's unmodified Claude Code, opens its built-in `/usage`, and
+consumes its documented status-line JSON. RepoPrompt does not read Claude login tokens or call
+account endpoints itself. Claude Code owns authentication, including any refresh it performs, and
+may update its own ordinary session bookkeeping. RepoPrompt writes only per-run settings in a
+private app-owned directory, never user/project Claude settings. User/project setting sources are
+excluded, explicit hooks are empty, and tools/MCP servers are disabled; managed policy is not
+bypassed. `disableAllHooks` is deliberately omitted because Claude also uses it to suppress the
+status-line collector. No model prompt is submitted and no trust or login prompt is approved
+automatically. If CLI setup prevents startup, the read fails closed.
+The first **Connect and open setup** confirmation opens Terminal for the user to approve the
+helper folder or sign in themselves. A clearly styled **Finish Claude setup…** action is also
+available beside unavailable readings, with another setup action under Details. Each uses that
+same isolated folder/configuration, sends no model message, and opens Terminal only after an
+explicit user confirmation. The first Connect defers collection until the user chooses
+**Check usage after setup**. Pending setup remains visible after a restart and is not reported as
+completed collection. Preparing setup requires profile-scoped consent, not completed setup;
+background collection still requires both. If Terminal cannot open the prepared helper, the
+setup sheet shows the concrete error and a selectable, copyable manual command with trust/sign-in
+and completion instructions. Setup completion starts a new generation so a pre-setup failure
+cannot consume the ordinary Refresh cooldown. Normal refreshes remain hidden.
+
+Claude checks once when usage is first demanded after launch/enable, plus manual Refresh with a
+60-second minimum gap. There is no periodic Claude polling or permanent helper. Hidden surfaces or
+the master preference being off cancel active collection. The local statistics cache is loaded before
+the startup refresh and retains the original observation date; expired/aged values remain stale.
+Only percentages, reset times and non-secret cache/profile metadata are persisted in private files.
+Account identity is unknown, so these readings cannot supply routing eligibility or account-balancing
+signals. Disconnect removes the statistics cache. Codex snapshots remain in memory in this change.
+
+The Claude-only opt-in disclosure explains this method and that Anthropic has not explicitly approved
+automated usage monitoring; using documented CLI features is not a compliance guarantee. Account
+identities, credentials and raw terminal output are not logged or sent to diagnostic telemetry. Legacy
+Claude run-event telemetry remains separate and cannot authorize usage collection.
+
+## Agent Mode Re-prompt (model requests, not telemetry)
+
+Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
+sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
+relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Default resolution
+prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
+when possible, then the other subscription, then configured fast API tiers (Sonnet 5.5,
+GPT-6.1 Sol Low, Gemini 3 Flash), then none. No arbitrary catalog-first or primary Oracle fallback
+is used. Other configured models require an explicit choice. The UI names the concrete model or
+shows Choose a model when unavailable. Losing an already resolved default does not silently switch
+billing routes. Explicit models never fall back. A call freezes its billing route; failure/retry cannot switch it. The provider's retention
+and billing terms apply; do not send secrets you do not want that recipient to receive.
+
+**Include recent chat context** is on by default and persisted in the selected Agent Models
+profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
+the last up to three prior user bubble texts (the rewritten text when applicable) and each turn's
+final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized
+excerpt budget is 8 KiB; oldest turns are dropped first. Only post-compaction turns qualify.
+Tool calls/results, thinking, diffs, attachment payloads and system/workflow envelopes are excluded.
+The strip says **with chat context** when excerpts are actually used. Fixed, non-editable framing
+makes history background for vocabulary/intent only: the current message always wins, assistant
+claims are unverified, and corrections/redirections must abandon rather than perpetuate failed
+approaches. Turn history never creates new requirements unless the current message restates them.
+
+Calls are stateless and tool-less: **no Oracle consults, Context Builder, repository file contents,
+git review packaging or selection mutations**. Composer attachments/tagged files are preserved
+locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
+provider-history rows. Substantive answers may cause one refinement from original text plus answers;
+skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
+chat exposure.
+
+The brief streams into the existing composer, read-only during preparation. **Review before
+sending** is the default: successful preparation unlocks editing and Return dispatches the current
+draft without rewriting it again. The opt-in, profile-scoped **Send automatically** mode dispatches
+a successful rewrite through ordinary fresh-claim admission on completion; any clarification questions
+force Review for that turn, even if skipped. Slash-leading generated or edited text also forces
+Review, with a warning that the provider may interpret it as a command; only a deliberate subsequent
+Send can dispatch it. Cmd+Return always prepares for Review (including a
+one-shot when the pill is off), using current edited text or the first original when unchanged.
+The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
+the edited rewrite stays available through undo/recovery. After five seconds, Send original is an explicit second Send action through
+fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
+recovery banner. Invalidation (tab/target/settings changes or Stop) also restores the original when
+the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
+rewrite choices, rather than silently starting another rewrite from generated output. Truncated output
+is recoverable but cannot be sent as a successful preparation.
+Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.
+
+Enabled Auto Effort can judge the rewriter's effort using its existing masked decision service.
+Router/implementing-turn Auto Effort speculation starts only after a complete brief, never partial
+tokens, and is discarded on edits or stale policy. These opted-in services may have received the
+complete draft even if it is later undone. Composer edits are never sent back to the rewrite model.
+No implementing turn is sent speculatively. Minimal local automation audits store outcomes and
+reuse/fallback flags, not message text, guidance, excerpts, answers, paths or generated briefs.
+These model calls are independent of **Share crash reports and diagnostics**.
+
 ## What is collected
 
 When active, RepoPrompt can send:

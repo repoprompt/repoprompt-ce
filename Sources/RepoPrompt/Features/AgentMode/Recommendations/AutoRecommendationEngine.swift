@@ -351,8 +351,8 @@ final class AutoRecommendationEngine {
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restores a usable saved Context Builder agent, using its catalog default when the saved model is absent or blank.
+    /// Invalid nonempty models or unavailable agents fall back through the same recommendation ranking as the wizard.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
@@ -360,19 +360,27 @@ final class AutoRecommendationEngine {
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
-           !modelRaw.isEmpty,
            AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
-           AgentModelCatalog.isAgentAvailable(agent, availability: availability),
-           isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
+           AgentModelCatalog.isAgentAvailable(agent, availability: availability)
         {
-            return AgentModelCatalog.normalizeSelection(
-                agentRaw: agent.rawValue,
-                modelRaw: modelRaw,
-                availability: availability,
-                surface: .headless
-            )
+            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if modelRaw.isEmpty {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: nil,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
+            if isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability) {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: modelRaw,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
         }
 
         let status = ProviderStatusSnapshot(
@@ -462,14 +470,20 @@ final class AutoRecommendationEngine {
 
     // MARK: - MCP Agent Defaults Recommendation
 
-    /// Build a connection-aware availability context from provider status.
-    private func mcpAgentAvailabilityContext(from status: ProviderStatusSnapshot) -> AgentModelCatalog.AvailabilityContext {
+    /// Keep CLI readiness/filtering separate from providers whose availability is runtime-owned.
+    func mcpAgentAvailabilityContext(
+        from status: ProviderStatusSnapshot,
+        runtimeAvailability: AgentModelCatalog.AvailabilityContext
+    ) -> AgentModelCatalog.AvailabilityContext {
         let backendStore = ClaudeCodeCompatibleBackendStore.shared
         return AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: status.claudeCodeCLI == .ready,
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
+            grokBuildAvailable: status.grokBuildCLI == .ready,
+            antigravityAvailable: runtimeAvailability.antigravityAvailable,
+            devinAvailable: runtimeAvailability.devinAvailable,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid
@@ -481,8 +495,9 @@ final class AutoRecommendationEngine {
         actualStatus: ProviderStatusSnapshot,
         recommendedStatus: ProviderStatusSnapshot
     ) -> MCPAgentDefaultsRecommendation? {
-        let availability = mcpAgentAvailabilityContext(from: actualStatus)
-        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus)
+        let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
+        let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
+        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
         let profileStore = AgentModelsProfileRoleDefaultsStore(
             overrides: profile(for: scope).mcpAgentRoleOverrides
         )

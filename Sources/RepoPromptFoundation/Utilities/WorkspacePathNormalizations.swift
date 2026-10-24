@@ -121,7 +121,7 @@ package enum GitDiffPathNormalization {
         from paths: [String],
         repoRootPath: String
     ) -> [NormalizedGitPathspec] {
-        guard let root = try? WorkspaceAbsolutePath.nativeText(repoRootPath) else { return [] }
+        guard let root = try? WorkspaceAbsolutePath.nativeText(removingCurrentDirectoryComponents(repoRootPath)) else { return [] }
         var results: [NormalizedGitPathspec] = []
         results.reserveCapacity(paths.count)
 
@@ -131,7 +131,7 @@ package enum GitDiffPathNormalization {
                 results.append(NormalizedGitPathspec(plain: rawPath, requiresLiteralMagic: false))
                 continue
             }
-            guard let path = try? WorkspaceAbsolutePath.nativeText(rawPath), path.isLexicallyWithin(root) else {
+            guard let path = try? WorkspaceAbsolutePath.nativeText(removingCurrentDirectoryComponents(rawPath)), path.isLexicallyWithin(root) else {
                 continue
             }
             if path.directoryKey == root.directoryKey {
@@ -142,6 +142,14 @@ package enum GitDiffPathNormalization {
             results.append(NormalizedGitPathspec(plain: pathspec, requiresLiteralMagic: true))
         }
         return results
+    }
+
+    /// Git projection may ignore standalone '.' components, including before the root prefix.
+    /// Do not collapse '..': crossing a symlink can give parent traversal a different meaning.
+    private static func removingCurrentDirectoryComponents(_ path: String) -> String {
+        let projected = path.split(separator: "/", omittingEmptySubsequences: false)
+            .filter { $0 != "." }.joined(separator: "/")
+        return path.hasSuffix("/.") ? projected + "/" : projected
     }
 
     package static func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {

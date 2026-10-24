@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 import RepoPromptSecureStorage
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -360,7 +362,16 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Provider dispatch exercises an existing restored session, not first-save preparation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let inventory = MonitorInventoryPublisher(
             viewModel: viewModel,
             observerSessionID: sessionID,
@@ -461,7 +472,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         return wakeID
     }
 
-    func testManualCatalogReadinessTimeoutRestoresExactOptimisticSubmission() async throws {
+    func testManualMissingRouteRestoresExactOptimisticSubmission() async throws {
         #if DEBUG
             let fixture = try makeFixture()
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
@@ -518,6 +529,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 hasAgentSessionLink: nil
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
 
             let existing = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
             fixture.session.appendItem(existing)
@@ -533,7 +545,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             )
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
-            try await AsyncTestWait.waitUntil("manual readiness timeout rollback") {
+            try await AsyncTestWait.waitUntil("manual route refusal rollback") {
                 await MainActor.run {
                     fixture.viewModel.draftRestorationEvent?.text == rawDraft
                 }
@@ -541,7 +553,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), [existing.id])
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness timed out") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was unavailable") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
@@ -552,7 +564,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testManualParkedCatalogWaiterSupersessionRestoresExactOptimisticSubmission() async throws {
+    func testManualRouteQualificationSupersessionRestoresExactOptimisticSubmission() async throws {
         #if DEBUG
             let fixture = try makeFixture()
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
@@ -644,12 +656,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             await authorityGate.waitUntilEntered()
-            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
+            // Rebind the process run while qualification is suspended. No catalog event is needed.
+            fixture.session.installRunID(UUID())
             await authorityGate.open()
-            try await AsyncTestWait.waitUntil("catalog waiter to park") {
-                await manager.debugHasRunCatalogState(for: runID)
-            }
-            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
 
             try await AsyncTestWait.waitUntil("manual readiness supersession rollback") {
                 await MainActor.run {
@@ -663,12 +672,13 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
             XCTAssertEqual(fixture.viewModel.selectedWorkflow, workflow)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness was superseded") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was superseded") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
             XCTAssertTrue(fixture.startedTurns.isEmpty)
             XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
             XCTAssertNil(fixture.session.codexPendingAuthRetryTurn)
+            await manager.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
@@ -725,12 +735,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 routeIsCurrent && candidate == expectedRouteToken && requestedTabID == fixture.tabID
             }
             let afterReadinessGate = CatalogAuthorityGate()
-            fixture.viewModel.test_agentSessionLinkAfterProviderInputCatalogReadiness = {
+            fixture.viewModel.test_agentSessionLinkAfterProviderInputRouteReadiness = {
                 _ = await afterReadinessGate.requirement()
             }
             addTeardownBlock { @MainActor in
                 await afterReadinessGate.open()
-                fixture.viewModel.test_agentSessionLinkAfterProviderInputCatalogReadiness = nil
+                fixture.viewModel.test_agentSessionLinkAfterProviderInputRouteReadiness = nil
             }
 
             let existing = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
@@ -759,7 +769,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), [existing.id])
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog route changed") == true,
+                fixture.viewModel.draftRestorationEvent?.message.contains("MCP route changed") == true,
                 "unexpected restoration message: \(fixture.viewModel.draftRestorationEvent?.message ?? "nil")"
             )
             XCTAssertTrue(fixture.startedTurns.isEmpty)
@@ -827,7 +837,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         let note = "resume βeta\nwithout edits"
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "codex-native-note", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "codex-native-note", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .dispatchingNote
         state.active?.compactProviderConversation = fixture.session.codexConversationID
         let dispatchID = try AgentSelfCompactionDispatchID(
@@ -874,6 +884,226 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
         XCTAssertEqual(fixture.session.pendingImageAttachments, [attachment])
         XCTAssertFalse(fixture.startedTurns.contains { $0.contains("keep staged handoff") })
+    }
+
+    func testLocalInputCodexLateReadRefusalKeepsBaselineAndStopOrCancellationPreventsHandoff() async throws {
+        for mode in ["revoked", "stop", "cancel", "computerUse"] {
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            fixture.session.beginRunAttempt(source: "test.codex.localInput.\(mode)")
+            let gate = TestReleaseFence(name: "Codex final optional Read \(mode)")
+            var baseline: String?
+            fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+                baseline = rendered.fragment
+                return .init(fragment: rendered.fragment + "\n<user_input>must not escape</user_input>", markupDeltaBytes: 49, requirements: [])
+            }
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+                await gate.enterAndWait()
+                return false
+            }
+            let send = Task { @MainActor in
+                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing task", attachments: [])
+            }
+            defer { gate.release()
+                send.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            XCTAssertTrue(fixture.startedTurns.isEmpty, "Read proof precedes physical input")
+            if mode == "stop" { fixture.session.stopState.invalidateScheduledStarts() }
+            if mode == "cancel" { send.cancel() }
+            let featureState = fixture.session.codexControllerFeatureState
+            if mode == "computerUse" {
+                fixture.session.codexControllerFeatureState?.computerUseEnabled = true
+                XCTAssertEqual(fixture.session.codexControllerFeatureState?.computerUseEnabled, true)
+            }
+            gate.release()
+            _ = await send.value
+            fixture.session.codexControllerFeatureState = featureState
+            if mode == "revoked" {
+                let text = try XCTUnwrap(fixture.startedTurns.first)
+                XCTAssertEqual(fixture.startedTurns.count, 1)
+                XCTAssertEqual(text, try AgentSessionLinkPromptComposer.decorated("existing task", fragment: XCTUnwrap(baseline)))
+                XCTAssertFalse(text.contains("must not escape"))
+            } else {
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "existing final Stop/task/Computer Use fence wins during proof")
+            }
+        }
+    }
+
+    func testLocalInputCodexReadCancellationKeepsParkedNoteAndDisclosureForLaterStartAndSteer() async throws {
+        for steer in [false, true] {
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            fixture.session.beginRunAttempt(source: "test.localInput.parked.prime")
+            _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+            if steer {
+                fixture.controller.markActiveTurn(id: "turn-1")
+                await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+            } else {
+                fixture.session.runState = .idle
+                fixture.session.beginRunAttempt(source: "test.localInput.parked.start")
+            }
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("PARKED-READ-CORRECTION")
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            let owner = try AgentSelfCompactOwner(
+                windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+                sessionID: endpoint.sessionID, persistentBindingGeneration: XCTUnwrap(endpoint.persistentBindingGeneration),
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+                runID: XCTUnwrap(fixture.session.runID), runAttemptID: UUID()
+            )
+            var state = AgentSelfCompactState()
+            _ = state.reserve(note: "preserve parked continuation", idempotencyKey: "parked-read-cancellation", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
+            state.active?.compactTurnSucceeded = true
+            state.active?.phase = .parked
+            fixture.session.selfCompactState = state
+            let parked = try XCTUnwrap(state.parkedNote)
+            let startsBefore = fixture.startedTurns.count
+            let steersBefore = fixture.controller.steeredTurns.count
+            let gate = TestReleaseFence(name: "parked Codex optional Read cancellation")
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+                await gate.enterAndWait()
+                return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+            }
+            let send = Task { @MainActor in
+                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary task", attachments: [])
+            }
+            defer { gate.release()
+                send.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            send.cancel()
+            gate.release()
+            _ = await send.value
+            XCTAssertEqual(fixture.startedTurns.count, startsBefore)
+            XCTAssertEqual(fixture.controller.steeredTurns.count, steersBefore)
+            XCTAssertEqual(fixture.session.selfCompactState.parkedNote?.dispatchID, parked.dispatchID)
+            XCTAssertEqual(fixture.session.selfCompactState.active?.noteDispatchStarted, false)
+            XCTAssertNil(fixture.session.selfCompactState.latest)
+            let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+            let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+            let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+            XCTAssertNotNil(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = nil
+            if !steer {
+                fixture.session.runState = .idle
+                fixture.session.beginRunAttempt(source: "test.localInput.parked.retryStart")
+            }
+            let retried = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later valid task", attachments: [])
+            XCTAssertEqual(retried, .sent)
+            let text = try XCTUnwrap(steer ? fixture.controller.steeredTurns.last : fixture.startedTurns.last)
+            XCTAssertTrue(text.hasPrefix(parked.frame + "\n\n"))
+            XCTAssertEqual(text.components(separatedBy: parked.frame).count - 1, 1)
+            XCTAssertTrue(text.contains("PARKED-READ-CORRECTION"))
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .noteAccepted)
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .prepended)
+            XCTAssertNil(fixture.session.selfCompactState.parkedNote)
+            try input.assertConsumed()
+        }
+    }
+
+    func testLocalInputRealAuthorityCodexStartAndSteerPhysicalTransports() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        await input.correction("CODEX-START-CORRECTION")
+        fixture.session.beginRunAttempt(source: "test.localInput.codex.start")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing task", attachments: [])
+        XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.last).contains("CODEX-START-CORRECTION"))
+        try input.assertConsumed()
+        fixture.controller.markActiveTurn(id: "turn-1")
+        await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+        await input.correction("CODEX-STEER-CORRECTION")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing steering", attachments: [])
+        let steered = try XCTUnwrap(fixture.controller.steeredTurns.last)
+        XCTAssertTrue(steered.contains("<user_input at="))
+        XCTAssertTrue(steered.contains("CODEX-STEER-CORRECTION"))
+        XCTAssertFalse(steered.contains("CODEX-START-CORRECTION"))
+        try input.assertConsumed()
+        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+    }
+
+    func testLocalInputCodexExpectedTurnRetryUsesBaselineWithoutHarvestingNewCorrection() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        fixture.session.beginRunAttempt(source: "test.codex.mismatch.prime")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+        fixture.controller.markActiveTurn(id: "turn-1")
+        await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        await input.correction("FIRST-HANDOFF-CORRECTION")
+        var proofCalls = 0
+        var baselineFragment: String?
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+            baselineFragment = rendered.fragment
+            let inventory = input.host.publishedPromptInventories[input.observer.sessionID]!
+            return input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: rendered)
+        }
+        var attempts: [String] = []
+        fixture.controller.steerHandler = { @MainActor text, expectedTurnID in
+            attempts.append(text)
+            if attempts.count == 1 {
+                await input.correction("NEW-DURING-RETRY-CORRECTION")
+                throw CodexTurnSteerError.expectedTurnMismatch(
+                    expectedTurnID: expectedTurnID, actualTurnID: "turn-2",
+                    failure: .init(method: "turn/steer", code: nil, message: "expected turn mismatch", data: nil)
+                )
+            }
+            return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+        }
+        let outcome = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing steering", attachments: [])
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertTrue(try XCTUnwrap(attempts.first).contains("FIRST-HANDOFF-CORRECTION"))
+        let retry = try XCTUnwrap(attempts.last)
+        XCTAssertEqual(Array(retry.utf8), try Array(AgentSessionLinkPromptComposer.decorated("existing steering", fragment: XCTUnwrap(baselineFragment)).utf8))
+        XCTAssertFalse(retry.contains("<user_input"))
+        XCTAssertFalse(retry.contains("NEW-DURING-RETRY-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1)
+        fixture.controller.steerHandler = nil
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = nil
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.codex.mismatch.fresh")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertTrue(fresh.contains("NEW-DURING-RETRY-CORRECTION"))
+        XCTAssertFalse(fresh.contains("FIRST-HANDOFF-CORRECTION"))
+        XCTAssertEqual(proofCalls, 2)
+        try input.assertConsumed()
+    }
+
+    func testLocalInputRealAuthorityCodexFallbackHarvestsOnlyAtPhysicalDrain() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        fixture.session.beginRunAttempt(source: "test.localInput.codex.fallback")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed task", attachments: [])
+        await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+        fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
+        fixture.controller.steerFailure = .noActiveTurn(.init(method: "turn/steer", code: nil, message: "no active turn", data: nil))
+        let queued = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "queued existing task", attachments: [])
+        guard case .queuedFallback = queued else { return XCTFail("expected fallback queue") }
+        await input.correction("CODEX-DRAIN-CORRECTION")
+        fixture.controller.steerFailure = nil
+        fixture.controller.threadRuntimeStatus = .idle
+        try await AsyncTestWait.waitUntil("positive Read fallback transport", timeout: 5) {
+            await MainActor.run { fixture.startedTurns.contains { $0.hasPrefix("queued existing task") } }
+        }
+        let drained = try XCTUnwrap(fixture.startedTurns.last { $0.hasPrefix("queued existing task") })
+        XCTAssertTrue(drained.contains("<user_input at="))
+        XCTAssertTrue(drained.contains("CODEX-DRAIN-CORRECTION"))
+        try input.assertConsumed()
+        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
     func testInitialStartCarriesExactlyOneSupplementThenGoesQuiet() async throws {
@@ -1054,6 +1284,18 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.controller.steerFailure = nil
         await fixture.inventory.publishCodex(revision: 2, targetCount: 3)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let catalog = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: catalog.runID,
+                routeToken: catalog.routeToken,
+                projectionRevision: catalog.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ),
+            to: endpoint
+        )
         // Only now may the head drain, so "drain time" provably means "after revision 2".
         fixture.controller.threadRuntimeStatus = .idle
 
@@ -1084,7 +1326,42 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             dispatched.contains("count=\"3\""),
             "a queued entry must render membership at drain time, not at enqueue time"
         )
+        XCTAssertEqual(fixture.startedTurns.count(where: { $0.hasPrefix("queued instruction") }), 1)
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+    }
+
+    func testQueuedFallbackMissingRouteRefusesWithoutStartingAnotherTurn() async throws {
+        #if DEBUG
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            fixture.session.beginRunAttempt(source: "test.codex.fallback.route-refusal")
+            _ = await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "seed turn", attachments: []
+            )
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller
+            )
+            fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
+            fixture.controller.steerFailure = .noActiveTurn(
+                CodexAppServerClient.RequestFailure(method: "turn/steer", code: nil, message: "no active turn", data: nil)
+            )
+            let outcome = await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session, text: "queued route refusal", attachments: []
+            )
+            guard case .queuedFallback = outcome else { return XCTFail("expected fallback, got \(outcome)") }
+            fixture.controller.steerFailure = nil
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
+            fixture.controller.threadRuntimeStatus = .idle
+            try await AsyncTestWait.waitUntil("the fallback route refusal to settle") {
+                await MainActor.run {
+                    fixture.session.codexFallbackQueue.isEmpty && fixture.session.codexFallbackDispatchInFlight == nil
+                }
+            }
+            XCTAssertEqual(fixture.startedTurns.count, 1, "only the seed physically dispatched")
+            XCTAssertFalse(fixture.startedTurns.contains { $0.hasPrefix("queued route refusal") })
+        #else
+            throw XCTSkip("Route authority seam requires DEBUG helpers.")
+        #endif
     }
 
     // MARK: Auto-wake dispatch identity
@@ -1280,10 +1557,121 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
+    func testAuthRecoveryAcceptedBaselineReplayLeavesNewCorrectionOwedForFreshTurn() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        fixture.session.beginRunAttempt(source: "test.auth.acceptedBaseline")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "BASELINE-ONLY", attachments: [])
+        let original = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertFalse(original.contains("<user_input"))
+        XCTAssertNil(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim?.localInput)
+        let acceptedProofCalls = proofCalls
+
+        // This is new retained composer input AFTER acceptance, not the already-consumed offer.
+        await input.correction("FRESH-OWED-CORRECTION")
+        let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+        let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+        let owed = try XCTUnwrap(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+        let range = try XCTUnwrap(owed.requirements.first?.offer.range)
+        XCTAssertEqual(range.capturedFrontier, 0)
+        XCTAssertEqual(range.throughOrdinal, 1)
+
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(Array(replay.utf8), Array(original.utf8), "accepted replay must use the original baseline bytes")
+        XCTAssertFalse(replay.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls, "accepted replay must not perform another Read proof")
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_pendingClaimCount(observerSessionID: fixture.sessionID), 0, "accepted replay must not mint a fresh claim")
+        let stillOwed = input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline)
+        XCTAssertEqual(stillOwed?.requirements.first?.offer.range, range, "accepted replay must not advance the disclosure frontier")
+        let replayFrontier = stillOwed?.requirements.first?.offer.range.capturedFrontier
+        print("OVERSIGHT_ACCEPTED_REPLAY baselineBytes=\(original.utf8.count) replayBytes=\(replay.utf8.count) readProofs=\(acceptedProofCalls)->\(proofCalls) frontier=\(range.capturedFrontier)->\(String(describing: replayFrontier)) through=\(range.throughOrdinal)")
+
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.auth.independentFreshTurn")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertTrue(fresh.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
+        try input.assertConsumed()
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.auth.afterFreshTurn")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later permitted turn", attachments: [])
+        XCTAssertFalse(try XCTUnwrap(fixture.startedTurns.last).contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
+    }
+
+    func testAuthRecoveryReplayDoesNotUpgradeFreshOwedLocalInput() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            proofCalls += 1
+            return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+        }
+        await input.correction("ORIGINAL-ACCEPTED-CORRECTION")
+        fixture.session.beginRunAttempt(source: "test.codex.auth.freshLocalInput")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "auth turn", attachments: [])
+        let original = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(fixture.startedTurns.count, 1)
+        XCTAssertTrue(original.contains("ORIGINAL-ACCEPTED-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1)
+        let accepted = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim)
+        XCTAssertNil(accepted.localInput)
+        let baseline = AgentSessionLinkPromptComposer.decorated("auth turn", with: accepted)
+        try input.assertConsumed()
+        await input.correction("FRESH-OWED-CORRECTION")
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(
+                message: "stream error: unexpected status 401 Unauthorized from api.openai.com/v1/responses",
+                willRetry: false,
+                threadID: nil,
+                turnID: nil,
+                itemID: nil
+            )),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        let didRefresh = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(didRefresh)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        try assertReplayUsedFreshController(fixture)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
+        XCTAssertEqual(replay, baseline, "accepted auth replay must retain its exact baseline only")
+        XCTAssertEqual(Array(replay.utf8), Array(baseline.utf8))
+        XCTAssertFalse(replay.contains("ORIGINAL-ACCEPTED-CORRECTION"))
+        XCTAssertFalse(replay.contains("FRESH-OWED-CORRECTION"))
+        XCTAssertEqual(proofCalls, 1, "accepted replay must not prove or upgrade a fresh optional offer")
+        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
+        print("OVERSIGHT_VERA_REPLAY originalBytes=\(original.utf8.count) acceptedBaselineBytes=\(baseline.utf8.count) replayBytes=\(replay.utf8.count) readProofs=1->\(proofCalls)")
+    }
+
     func testAuthRecoveryReplayPreservesTheAlreadyAcknowledgedSupplement() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth")
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+            .init(fragment: rendered.fragment + "\n<user_input>withheld optional text</user_input>", markupDeltaBytes: 49, requirements: [])
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+            proofCalls += 1
+            return false
+        }
         _ = await fixture.coordinator.sendCodexNativeMessage(
             session: fixture.session,
             text: "auth turn",
@@ -1291,6 +1679,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         let original = try XCTUnwrap(fixture.startedTurns.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(original, userContent: "auth turn")
+        XCTAssertEqual(proofCalls, 1)
+        XCTAssertFalse(original.contains("withheld optional text"))
+        XCTAssertNil(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim?.localInput)
 
         // The provider accepted the dispatch, then failed it with an auth-classified error. Managed
         // recovery replays the same turn; without the acknowledged claim it would ship bare text and
@@ -1313,6 +1704,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         try assertReplayUsedFreshController(fixture)
         let replay = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertEqual(replay, original, "the replay must be byte-identical to the accepted dispatch")
+        XCTAssertEqual(proofCalls, 1, "accepted baseline replay never proves or upgrades optional data")
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(replay, userContent: "auth turn")
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
@@ -1409,7 +1801,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
-    func testAuthRecoveryReplayShipsCurrentMembershipWhenLinksChangedMidRecovery() async throws {
+    func testAuthRecoveryReplayLeavesChangedMembershipOwedForFreshTurn() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth.churn")
@@ -1437,10 +1829,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(fixture.startedTurns.count, 2)
         try assertReplayUsedFreshController(fixture)
         let replay = try XCTUnwrap(fixture.startedTurns.last)
-        MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(replay, userContent: "churn turn")
-        XCTAssertTrue(replay.contains("count=\"3\""), "the replay must ship the current membership")
+        XCTAssertEqual(replay, "churn turn", "changed authority must not resurrect the accepted fragment or mint a fresh claim")
+        MonitorSupplementAssertions.assertCarriesNoSupplement(replay)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_pendingClaimCount(observerSessionID: fixture.sessionID), 0)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaimStore.test_lastAcceptedRevision(observerSessionID: fixture.sessionID), 1)
 
-        // Revision 2 is now acknowledged, so an ordinary later turn is quiet.
+        // Recovery cannot acknowledge a new revision; a separately permitted fresh turn owns it.
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.auth.after")
         _ = await fixture.coordinator.sendCodexNativeMessage(
@@ -1448,9 +1842,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             text: "later turn",
             attachments: []
         )
-        try MonitorSupplementAssertions.assertCarriesNoSupplement(
-            XCTUnwrap(fixture.startedTurns.last)
-        )
+        let fresh = try XCTUnwrap(fixture.startedTurns.last)
+        MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(fresh, userContent: "later turn")
+        XCTAssertTrue(fresh.contains("count=\"3\""))
     }
 
     /// Regression: managed-auth replay classifies by reserved dispatch-ID *family*, never by a parsed
@@ -1458,8 +1852,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     ///
     /// `lane.autowake:<UUID>:<epoch>` is the historical spelling: reserved family, no parseable wake.
     /// If this branch asked `autoWakeID != nil` instead of `isAutoWakeFamily`, that value would read
-    /// as an ordinary dispatch and fall into the ordinary replay — the one branch that may mint a
-    /// fresh lane claim or ship raw stored text. A settled wake is already spent; the only thing it
+    /// as an ordinary dispatch and fall into the ordinary replay branch that may ship raw stored text.
+    /// A settled wake is already spent; the only thing it
     /// may ever replay is the exact fragment that was accepted, and an identity that cannot be matched
     /// to that fragment must refuse instead of composing a new turn.
     ///
@@ -1562,11 +1956,14 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let inventory: MonitorInventoryPublisher
         /// Retained: the view model holds its workspace manager weakly.
         let workspaceManager: WorkspaceManagerViewModel
+        let mcpServer: MCPServerViewModel?
     }
 
     private func makeFixture(
         agent: AgentProviderKind,
-        claudeController: MonitorFakeNativeController? = nil
+        claudeController: MonitorFakeNativeController? = nil,
+        codexController: MonitorFakeCodexController? = nil,
+        withMCPServer: Bool = false
     ) throws -> Fixture {
         let tabID = UUID()
         // A real run resolves its workspace before it reaches a provider, so the runner-level suites
@@ -1575,8 +1972,9 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
@@ -1601,11 +1999,39 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
 
+        let mcpServer: MCPServerViewModel? = if withMCPServer {
+            MCPServerViewModel(
+                service: MCPService(
+                    hostBootstrapOperation: {},
+                    controllerStartOperation: {},
+                    controllerFullShutdownOperation: {}
+                ),
+                promptVM: prompt,
+                oracleVM: OracleViewModel(
+                    aiQueriesService: aiQueriesService,
+                    promptViewModel: prompt,
+                    workspaceManager: manager,
+                    chatData: ChatDataService()
+                ),
+                workspaceManager: manager,
+                windowID: 1,
+                workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                    throw MCPError.internalError("search is not used by route removal tests")
+                },
+                ensureGitDataRootLoaded: { _, _ in
+                    throw MCPError.internalError("Git-data loading is not used by route removal tests")
+                }
+            )
+        } else {
+            nil
+        }
+
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
-                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                if let codexController { return codexController }
+                return LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
             // A session may recycle a pre-seeded fake when its launch metadata is absent.
             // Never let that replacement fall through to the real provider factory.
@@ -1613,7 +2039,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 claudeController ?? MonitorFakeNativeController()
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testMCPServer: mcpServer
         )
         retained.append(viewModel)
         viewModel.workspaceManager = manager
@@ -1625,7 +2052,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Provider dispatch exercises an existing restored session, not first-save preparation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         return Fixture(
             viewModel: viewModel,
             session: session,
@@ -1636,7 +2072,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 observerSessionID: sessionID,
                 tabID: tabID
             ),
-            workspaceManager: manager
+            workspaceManager: manager,
+            mcpServer: mcpServer
         )
     }
 
@@ -1661,6 +2098,410 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     }
 
     // MARK: Claude native
+
+    func testLocalInputClaudeLateReadRefusalKeepsBaselineAndSupersessionOrCancellationPreventsHandoff() async throws {
+        for mode in ["revoked", "superseded", "cancel"] {
+            let controller = MonitorFakeNativeController()
+            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+            fixture.inventory.publish(revision: 1, targetCount: 1)
+            let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.localInput.\(mode)")
+            let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: fixture.session, intent: intent)
+            XCTAssertEqual(startup, .ready)
+            let gate = TestReleaseFence(name: "Claude final optional Read \(mode)")
+            var baseline: String?
+            fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+                baseline = rendered.fragment
+                return .init(fragment: rendered.fragment + "\n<user_input>must not escape</user_input>", markupDeltaBytes: 49, requirements: [])
+            }
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+                await gate.enterAndWait()
+                return false
+            }
+            let send = Task { @MainActor in
+                await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                    session: fixture.session, text: "existing task", attachments: [], intent: intent,
+                    allowsCatalogRouteControllerRecovery: false
+                )
+            }
+            defer { gate.release()
+                send.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            let before = await controller.sentMessages
+            XCTAssertTrue(before.isEmpty)
+            if mode == "superseded" { fixture.session.beginRunAttempt(source: "test.claude.successor") }
+            if mode == "cancel" { send.cancel() }
+            gate.release()
+            _ = await send.value
+            let sent = await controller.sentMessages
+            if mode == "revoked" {
+                let text = try XCTUnwrap(sent.first)
+                XCTAssertEqual(sent.count, 1)
+                XCTAssertTrue(try text.hasSuffix(XCTUnwrap(baseline)), "exact baseline survives failed optional Read")
+                XCTAssertTrue(text.contains("existing task"))
+                XCTAssertFalse(text.contains("must not escape"))
+            } else {
+                XCTAssertTrue(sent.isEmpty, "existing intent/task fence wins during proof")
+            }
+        }
+    }
+
+    func testLocalInputClaudeNativeAcceptanceAndRetainedSendFailureSettleProducerOnce() async throws {
+        for fails in [false, true] {
+            let controller = MonitorFakeNativeController()
+            await controller.setFailSendAfterRecord(fails)
+            await controller.setFinishEventsAfterSend(true)
+            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+            let session = fixture.session
+            session.installLocalInputSeed(.init())
+            let item = AgentChatItem.user("Retained native composer input", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(item)
+            let token = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
+            )
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            await runner.startRun(
+                tabID: fixture.tabID, session: session, initialUserMessage: item.text,
+                initialMessageForRun: item.text, attachments: [],
+                makeLease: { runID in harness.makeLease(runID: runID, tabID: fixture.tabID) },
+                localComposerCandidate: token
+            )
+            await session.agentTask?.value
+            let sent = await controller.sentMessages
+            XCTAssertEqual(sent.count, 1)
+            XCTAssertEqual(session.items.first(where: { $0.id == item.id })?.userInputOrigin, .localComposer)
+            XCTAssertEqual(session.localInputIndex.producedThrough, 1)
+            XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0)
+            XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: .retained))
+        }
+    }
+
+    func testLocalComposerCodexTargetRetentionCompactionReachesClaudeCodeObserverOnce() async throws {
+        let controller = MonitorFakeNativeController()
+        let observer = try makeFixture(agent: .claudeCode, claudeController: controller)
+        observer.session.oversight.autoWakeOnUpdates = false
+        observer.inventory.publish(revision: 1, targetCount: 1)
+        let intent = try claudeRunIntent(for: observer.session, source: "test.retention.claude.observer")
+        let startup = await observer.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: observer.session, intent: intent)
+        XCTAssertEqual(startup, .ready)
+
+        let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
+        let target = try makeFixture(agent: .codexExec, codexController: codex)
+        target.session.oversight.autoWakeOnUpdates = false
+        // A real long transcript, not a large independent retained-input index. Hydration is over
+        // before the grant baseline; validated composer refresh prunes the suffix during ingress.
+        let history = (0 ..< 500).flatMap { turn in
+            [
+                AgentChatItem.user("Historical request \(turn)", sequenceIndex: turn * 2),
+                AgentChatItem.assistant("Historical answer \(turn)", sequenceIndex: turn * 2 + 1)
+            ]
+        }
+        XCTAssertGreaterThanOrEqual(history.count, 900)
+        target.session.replaceItems(history)
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        XCTAssertEqual(target.session.transcript.turns.count, 500)
+        XCTAssertLessThan(target.session.items.count, history.count, "actual initial working-suffix pruning")
+        let targetEndpoint = try XCTUnwrap(target.viewModel.agentSessionLinkObserverEndpoint(tabID: target.tabID))
+        let observerEndpoint = try XCTUnwrap(observer.viewModel.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
+        let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) -> AgentSessionLinkEndpointCandidate {
+            let readiness: AgentSessionRestorationReadiness
+            if let generation = endpoint.persistentBindingGeneration {
+                let token = AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
+                    ),
+                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                )
+                readiness = .authoritative(token, .persistedPayloadApplied)
+            } else {
+                readiness = .unbound
+            }
+            return .init(
+                windowID: endpoint.windowID,
+                workspaceID: endpoint.workspaceID,
+                tabID: endpoint.tabID,
+                sessionID: endpoint.sessionID,
+                persistentBindingGeneration: endpoint.persistentBindingGeneration,
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: provider,
+                providerDisplayName: provider,
+                locationLabel: nil,
+                restorationReadiness: readiness
+            )
+        }
+        host.candidates = [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
+        host.promptViewModel = observer.viewModel
+        host.localInputSnapshotOverride = { endpoint, includeRecords in
+            guard endpoint == targetEndpoint else { return nil }
+            return target.viewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
+        }
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        addTeardownBlock { @MainActor in
+            let links = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observerEndpoint.sessionID)
+            for link in links.items {
+                await bridge.revokeLink(linkID: link.linkID, generation: link.generation)
+            }
+            target.session.agentTask?.cancel()
+            target.session.codexEventTask?.cancel()
+            await codex.shutdown()
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            await bridge.test_settleProjections()
+        }
+        var tick: TimeInterval = 1000
+        func status(_ value: DomainAgentSessionLinkStatus) async {
+            tick += 1
+            host.snapshotOverrides[target.sessionID] = .init(
+                sessionID: target.sessionID, displayName: "Codex target", providerDisplayName: "Codex CLI",
+                status: value, board: .empty, idleForSend: value == .idle, pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: "Completed.", visibleRowCount: Int(tick), lastActivityAt: Date(timeIntervalSince1970: tick)
+            )
+            host.fireObservation(for: target.sessionID)
+            await bridge.test_settleProjections()
+        }
+        guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString)
+        else { return XCTFail("exact Read grant must precede local input") }
+        await status(.running)
+        let initialSnapshot = try XCTUnwrap(target.viewModel.agentSessionLinkLocalInputSnapshot(for: targetEndpoint, includeRecords: true))
+        XCTAssertEqual(initialSnapshot.producedThrough, 0)
+
+        let workingBefore = Set(target.session.items.map(\.id))
+        let marker = "LOCAL-COMPOSER-RETENTION-CORRECTION"
+        let submitTarget = try XCTUnwrap(target.viewModel.makeComposerSubmitTarget(tabID: target.tabID, session: target.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: submitTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: marker)
+        guard case let .claimed(claim) = target.viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false)
+        else { return XCTFail("validated local composer must own ingress") }
+        let submitted = await target.viewModel.executeComposerSubmitAttempt(text: marker, claim: claim, createAndActivateSessionTab: { nil })
+        XCTAssertEqual(submitted, .submitted)
+        try await AsyncTestWait.waitUntil("authentic Codex producer retained origin", timeout: 5) {
+            target.session.items.contains { $0.text == marker && $0.userInputOrigin == .localComposer }
+        }
+        XCTAssertEqual(codex.startedTurns.count, 1, "actual native Codex physical start")
+        let row = try XCTUnwrap(target.session.items.first { $0.text == marker })
+        XCTAssertEqual(row.userInputOrigin, .localComposer)
+        let after = try XCTUnwrap(target.viewModel.agentSessionLinkLocalInputSnapshot(for: targetEndpoint, includeRecords: true))
+        let record = try XCTUnwrap(after.records.first { $0.itemID == row.id })
+        XCTAssertEqual(record.ordinal, 1)
+        let workingAfter = Set(target.session.items.map(\.id))
+        let pruned = workingBefore.subtracting(workingAfter)
+        XCTAssertFalse(pruned.isEmpty, "validated composer refresh must actually prune old mutable rows")
+        // Working-source pruning is not canonical deletion: the previous request survives, too.
+        let requests = target.session.transcript.turns.compactMap(\.request)
+        XCTAssertTrue(requests.contains { pruned.contains($0.id) })
+        let retained = try XCTUnwrap(requests.first { $0.id == row.id })
+        XCTAssertEqual(retained.userInputOrigin, .localComposer)
+        XCTAssertEqual(retained.text, marker)
+        XCTAssertEqual(after.epoch, initialSnapshot.epoch, "ordinary retention must preserve the grant's index incarnation")
+        XCTAssertEqual(after.producedThrough, initialSnapshot.producedThrough + 1)
+        await status(.idle)
+        let inventory = try XCTUnwrap(host.publishedPromptInventories[observer.sessionID])
+        let passive = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observerEndpoint])
+        let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: passive))
+        let offered = bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: baseline)
+        // Do not unwrap here: the known-bad retention reset loses the offer, but the regression
+        // must continue all the way through the actual Claude Code physical-send boundary.
+        XCTAssertEqual(offered?.requirements.first?.offer.range.indexEpoch, initialSnapshot.epoch)
+        XCTAssertEqual(offered?.requirements.first?.offer.range.capturedFrontier, 0)
+        XCTAssertEqual(offered?.requirements.first?.offer.range.throughOrdinal, 1)
+        XCTAssertEqual(offered?.requirements.first?.renderedRecords.first?.contentVersion, record.contentVersion)
+        print("LOCAL_INPUT_RETENTION history_rows=\(history.count) pruned_rows=\(pruned.count) canonical_origin=\(retained.userInputOrigin?.rawValue ?? "nil") epoch_preserved=\(after.epoch == initialSnapshot.epoch) produced_before=\(initialSnapshot.producedThrough) produced_after=\(after.producedThrough) offered_after=\(offered?.requirements.count ?? 0)")
+
+        var readCalls = 0
+        observer.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+            readCalls += 1
+            return await bridge.proveLocalInputRead(decoration, observer: observerEndpoint)
+        }
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "existing observer task", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let messages = await controller.sentMessages
+        XCTAssertEqual(messages.count, 1)
+        let sent = try XCTUnwrap(messages.first)
+        XCTAssertTrue(sent.contains("<user_input at="))
+        XCTAssertTrue(sent.contains(marker))
+        XCTAssertFalse(sent.contains("user_inputs_omitted="))
+        XCTAssertEqual(readCalls, 1, "real exact Read proof at physical Claude Code boundary")
+        XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: baseline), "frozen owed range consumed, not vacuous receipt removal")
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "next independent observer task", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let later = await controller.sentMessages
+        XCTAssertEqual(later.count, 2)
+        XCTAssertFalse(try XCTUnwrap(later.last).contains(marker))
+        XCTAssertEqual(readCalls, 1)
+        MonitorSupplementAssertions.assertNotPersisted(in: observer.session)
+        print("LOCAL_INPUT_RETENTION_TRANSPORT sends=\(later.count) read_proofs=\(readCalls) first_contains_input=\(sent.contains(marker)) second_contains_input=\(later.last?.contains(marker) ?? false)")
+
+        // Genuine history replacement remains a new incarnation: a typed retained copy is not
+        // a new composer event and cannot be caught up through the still-live Read grant.
+        target.session.replaceItems([retained.toItem()])
+        target.viewModel.refreshDerivedTranscriptState(for: target.session, publishActivePresentation: false)
+        XCTAssertNotEqual(target.session.localInputIndex.epoch, after.epoch)
+        await status(.running)
+        await status(.idle)
+        let replacementPassive = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observerEndpoint])
+        let replacementBaseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: replacementPassive))
+        XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: replacementBaseline))
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "after genuine history replacement", attachments: [], intent: intent,
+            allowsCatalogRouteControllerRecovery: false
+        )
+        let replacementMessages = await controller.sentMessages
+        XCTAssertEqual(replacementMessages.count, 3)
+        XCTAssertFalse(try XCTUnwrap(replacementMessages.last).contains(marker))
+        XCTAssertEqual(readCalls, 1)
+    }
+
+    func testRetentionPreservesCanonicalOnlyRecordsAndExactPendingProducerTokens() throws {
+        let fixture = try makeFixture(agent: .codexExec)
+        let session = fixture.session
+        session.installLocalInputSeed(.init())
+        let history = (0 ..< 500).flatMap { turn in
+            [
+                AgentChatItem.user("Older request \(turn)", sequenceIndex: turn * 2),
+                AgentChatItem.assistant("Older answer \(turn)", sequenceIndex: turn * 2 + 1)
+            ]
+        }
+        let a = AgentChatItem.user("canonical retained A", sequenceIndex: 1000)
+        let b = AgentChatItem.user("pending retained B", sequenceIndex: 1001)
+        session.appendItem(a)
+        let tokenA = session.registerLocalComposerCandidate(itemID: a.id, at: 0)
+        XCTAssertTrue(session.settleLocalComposerOrigin(tokenA, disposition: .retained))
+        session.appendItem(b)
+        let tokenB = session.registerLocalComposerCandidate(itemID: b.id, at: 1)
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: .empty, workingItems: history + session.items, terminalState: .idle,
+            nextSequenceIndex: session.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+        )
+        var seed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: [a.id])
+        for request in session.transcript.turns.compactMap(\.request) {
+            seed.append(request.toItem())
+        }
+        session.installLocalInputSeed(seed)
+        let before = try XCTUnwrap(session.localInputIndex.snapshot)
+        let original = try XCTUnwrap(before.records.first)
+        session.setItemsSilentlyForRetentionCompaction([])
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(Set(session.transcript.turns.compactMap(\.request).map(\.id)).isSuperset(of: [a.id, b.id]))
+        let after = try XCTUnwrap(session.localInputIndex.snapshot)
+        XCTAssertEqual(after.epoch, before.epoch)
+        XCTAssertEqual(after.producedThrough, before.producedThrough)
+        XCTAssertEqual(after.records.first?.ordinal, original.ordinal)
+        XCTAssertEqual(after.records.first?.contentVersion, original.contentVersion)
+        XCTAssertEqual(after.records.first?.content, original.content)
+        XCTAssertNil(after.records.first?.sourcePosition)
+        XCTAssertTrue(session.settleLocalComposerOrigin(tokenB, disposition: .retained))
+        XCTAssertEqual(session.transcript.turns.first { $0.request?.id == b.id }?.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 2)
+        XCTAssertEqual(session.localInputIndex.records.map(\.itemID), [a.id, b.id])
+        let settled = try XCTUnwrap(session.localInputIndex.snapshot)
+        // Follow the production structural notification through an actual canonical refresh:
+        // a genuinely compacted request must retain provenance and its original event identity.
+        fixture.viewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        let compacted = try XCTUnwrap(session.transcript.turns.first { $0.request?.id == a.id })
+        XCTAssertNotEqual(compacted.retentionTier, .full)
+        XCTAssertEqual(compacted.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.transcript.turns.first { $0.request?.id == b.id }?.request?.userInputOrigin, .localComposer)
+        XCTAssertEqual(session.localInputIndex.epoch, settled.epoch)
+        XCTAssertEqual(session.localInputIndex.producedThrough, settled.producedThrough)
+        XCTAssertEqual(session.localInputIndex.records.map(\.ordinal), settled.records.map(\.ordinal))
+        XCTAssertEqual(session.localInputIndex.records.map(\.contentVersion), settled.records.map(\.contentVersion))
+        XCTAssertFalse(session.settleLocalComposerOrigin(tokenB, disposition: .retained))
+        XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0)
+    }
+
+    func testCanonicalOnlyProducerRefusalsRetireTokenWithoutProducingInput() {
+        for mode in ["pending", "missing", "rolledBack"] {
+            let session = AgentTabSession(tabID: UUID())
+            let item = AgentChatItem.user("exact pending producer", sequenceIndex: 0)
+            session.appendItem(item)
+            let token = session.registerLocalComposerCandidate(itemID: item.id, at: 0)
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: .empty, workingItems: session.items, terminalState: .idle,
+                nextSequenceIndex: session.nextSequenceIndex,
+                policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+            )
+            session.installLocalInputSeed(.init())
+            session.setItemsSilentlyForRetentionCompaction([])
+            if mode == "pending" {
+                session.transcript.turns[0].request?.text = "uncommitted canonical edit"
+            } else if mode == "missing" {
+                session.transcript.turns.removeAll()
+                session.installLocalInputSeed(.init())
+            }
+            XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: mode == "rolledBack" ? .rolledBack : .retained), mode)
+            XCTAssertEqual(session.localInputIndex.producedThrough, 0, mode)
+            XCTAssertTrue(session.localInputIndex.records.isEmpty, mode)
+            XCTAssertNil(session.transcript.turns.first?.request?.userInputOrigin, mode)
+            session.installLocalInputSeed(.init())
+            XCTAssertFalse(session.settleLocalComposerOrigin(token, disposition: .retained), "refusal retires token: \(mode)")
+            XCTAssertEqual(session.test_unsettledLocalComposerCandidateCount, 0, mode)
+        }
+    }
+
+    func testCanonicalDeleteAndEditInvalidateRetainedContentWhileHydrationRetiresTokens() throws {
+        let session = AgentTabSession(tabID: UUID())
+        let a = AgentChatItem.user("delete A", sequenceIndex: 0)
+        let b = AgentChatItem.user("survive B", sequenceIndex: 1)
+        for item in [a, b] {
+            session.appendItem(item)
+            let token = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+            XCTAssertTrue(session.settleLocalComposerOrigin(token, disposition: .retained))
+        }
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: .empty, workingItems: session.items, terminalState: .idle,
+            nextSequenceIndex: session.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: false), protection: .none
+        )
+        func installCanonicalSeed() {
+            var seed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: Set(session.localInputIndex.records.map(\.itemID)))
+            for request in session.transcript.turns.compactMap(\.request) {
+                seed.append(request.toItem())
+            }
+            session.installLocalInputSeed(seed)
+        }
+        installCanonicalSeed()
+        let before = try XCTUnwrap(session.localInputIndex.snapshot)
+        let survivor = try XCTUnwrap(before.records.first { $0.itemID == b.id })
+        session.setItemsSilentlyForRetentionCompaction([])
+        session.transcript.turns.removeAll { $0.request?.id == a.id }
+        installCanonicalSeed()
+        XCTAssertEqual(session.localInputIndex.epoch, before.epoch)
+        XCTAssertEqual(session.localInputIndex.producedThrough, 2)
+        XCTAssertNil(session.localInputIndex.records.first { $0.itemID == a.id }?.content, "only actual canonical absence invalidates retained disclosure")
+        XCTAssertEqual(session.localInputIndex.records.first { $0.itemID == b.id }?.contentVersion, survivor.contentVersion)
+        session.transcript.turns[0].request?.text = "edited B"
+        installCanonicalSeed()
+        let edited = try XCTUnwrap(session.localInputIndex.records.first { $0.itemID == b.id })
+        XCTAssertEqual(edited.ordinal, survivor.ordinal)
+        XCTAssertNotEqual(edited.contentVersion, survivor.contentVersion, "frozen content proof cannot release an edited row")
+        XCTAssertEqual(edited.content?.text, "edited B")
+        let c = AgentChatItem.user("pending before hydration", sequenceIndex: 2)
+        session.appendItem(c)
+        let stale = session.registerLocalComposerCandidate(itemID: c.id, at: 0)
+        session.setItemsSilently([c], reason: .persistedSessionHydration)
+        XCTAssertNotEqual(session.localInputIndex.epoch, before.epoch)
+        XCTAssertNil(session.localInputIndex.snapshot)
+        XCTAssertFalse(session.settleLocalComposerOrigin(stale, disposition: .retained))
+        XCTAssertNil(session.items[0].userInputOrigin)
+    }
 
     func testClaudeNativeSendCarriesExactlyOneSupplementThenGoesQuiet() async throws {
         let controller = MonitorFakeNativeController()
@@ -1702,6 +2543,242 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         )
         let after = await controller.sentMessages
         try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(after.last))
+    }
+
+    func testClaudeNativeStaleCatalogSendsOnceWithoutRecyclingController() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.stale-catalog")
+        // Establish ordinary launch settings before measuring catalog-triggered recycling.
+        let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: fixture.session, text: "seed", attachments: [],
+            intent: intent, allowsCatalogRouteControllerRecovery: false
+        )
+        XCTAssertEqual(seed, .sent)
+        let initialShutdownCount = await controller.shutdownCount
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let projection = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: projection.runID,
+                routeToken: projection.routeToken,
+                projectionRevision: projection.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ),
+            to: endpoint
+        )
+        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: fixture.session, text: "oversight despite stale tools", attachments: [],
+            intent: intent, allowsCatalogRouteControllerRecovery: true
+        )
+        XCTAssertEqual(outcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent.count, 2)
+        try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
+            XCTUnwrap(sent.last), userContent: "oversight despite stale tools"
+        )
+        let shutdownCount = await controller.shutdownCount
+        XCTAssertEqual(shutdownCount, initialShutdownCount)
+        XCTAssertTrue(fixture.session.claudeController === controller)
+        let next = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "next turn", session: fixture.session,
+            dispatchID: .claudeNativeSend(projection.runID)
+        )
+        MonitorSupplementAssertions.assertCarriesNoSupplement(next.text)
+    }
+
+    func testClaudeConnectionRemovalDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: false)
+    }
+
+    func testClaudeTerminalConnectionDuringConfigurationRefusesAndPreservesMessage() async throws {
+        try await assertClaudeClosedConnectionDuringConfiguration(pauseTermination: true)
+    }
+
+    private func assertClaudeClosedConnectionDuringConfiguration(pauseTermination: Bool) async throws {
+        #if DEBUG
+            let controller = MonitorFakeNativeController()
+            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller, withMCPServer: true)
+            let server = try XCTUnwrap(fixture.mcpServer)
+            fixture.inventory.publish(revision: 0, targetCount: 0)
+            fixture.session.installRunID(UUID())
+            fixture.session.claudeController = controller
+            let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.removing-route")
+            let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "seed", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+            XCTAssertEqual(seed, .sent)
+            fixture.inventory.publish(revision: 1, targetCount: 1)
+            let runID = try XCTUnwrap(fixture.session.runID)
+            let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+            let connectionID = UUID()
+            let manager = ServerNetworkManager.shared
+            let transportBaseline = await manager.debugTransportState()
+            // Direct admission starts the shared manager even without a listener. Removing
+            // only the connection leaves that owner active for later routed-runtime tests.
+            // Register first so the gate/connection teardown below runs before restoration.
+            addTeardownBlock {
+                if !transportBaseline.isRunning { await manager.stop() }
+                await manager.setEnabled(transportBaseline.isEnabled)
+                let restored = await manager.debugTransportState()
+                XCTAssertEqual(restored, transportBaseline, "Fixture must restore its shared transport ownership")
+            }
+            let removalGate = CatalogAuthorityGate()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: connectionID,
+                connection: MonitorRemovalConnection(gate: removalGate, pauseTermination: pauseTermination)
+            )
+            let state = await manager.debugDirectAdmissionStateForTesting(connectionID: connectionID)
+            let token = try AgentSessionLinkRunCatalogRouteToken(
+                runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
+                routingAuthorityGeneration: 1,
+                connectionLifecycleGeneration: XCTUnwrap(state.connectionLifecycleGeneration)
+            )
+            try server.bindTabForConnection(
+                connectionID: connectionID, clientName: nil, tabID: fixture.tabID,
+                workspaceID: XCTUnwrap(fixture.workspaceManager.activeWorkspaceID),
+                windowID: endpoint.windowID, runID: runID
+            )
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+            // Exercise the production final fence, not a simulated route-current boolean.
+            fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+                server.hasCurrentRunCatalogRouteToken(candidate, expectedTabID: tabID)
+            }
+            XCTAssertTrue(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            let configurationGate = CatalogAuthorityGate()
+            await controller.setConfigurationGate(configurationGate)
+            addTeardownBlock { @MainActor in
+                await configurationGate.open()
+                await removalGate.open()
+                await manager.debugRemoveConnection(connectionID)
+            }
+            let confirmed = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
+            fixture.session.appendItem(confirmed)
+            let rawDraft = "preserve removing-route input"
+            fixture.viewModel.storeDraftText(for: fixture.tabID, rawDraft)
+            XCTAssertEqual(
+                fixture.viewModel.submitUserTurn(
+                    text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                    tabID: fixture.tabID, rawDraftText: rawDraft
+                ),
+                .submitted
+            )
+            fixture.viewModel.storeDraftText(for: fixture.tabID, "")
+            await configurationGate.waitUntilEntered()
+            let removal = Task {
+                if pauseTermination {
+                    await manager.terminateConnection(connectionID, reason: .runCompleted)
+                } else {
+                    await manager.removeConnection(connectionID)
+                }
+            }
+            // Hold either terminal commitment BEFORE removal, or removal BEFORE mapping cleanup.
+            await removalGate.waitUntilEntered()
+            let removalHasBegun = await manager.debugHasConnectionRemovalOperation(for: connectionID)
+            XCTAssertEqual(removalHasBegun, !pauseTermination)
+            XCTAssertTrue(server.hasCurrentRunRouteMapping(
+                runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
+            ), "retained mappings must reproduce the unsafe cleanup interval")
+            XCTAssertFalse(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            await configurationGate.open()
+            try await AsyncTestWait.waitUntil("removing-route refusal or physical send") {
+                let refused = await MainActor.run {
+                    fixture.session.items.contains {
+                        $0.kind == .error && $0.text.contains("[route:configuration-fence]")
+                    }
+                }
+                if refused { return true }
+                return await controller.sentCount > 1
+            }
+            let sent = await controller.sentMessages
+            XCTAssertEqual(sent, ["seed"], "removal must cause definite no-call, not an uncertain write")
+            XCTAssertEqual(
+                fixture.session.items.filter { $0.kind == .user }.map(\.text),
+                [confirmed.text, rawDraft],
+                "native refusal preserves the unsent message in the transcript for retry"
+            )
+            XCTAssertTrue(fixture.session.items.contains {
+                $0.kind == .error && $0.text.contains("No provider message was sent")
+            })
+            XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.test_lastAcceptedRevision(
+                observerSessionID: fixture.sessionID
+            ))
+            await removalGate.open()
+            await removal.value
+        #else
+            throw XCTSkip("Connection lifecycle diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testClaudeFirstLinkDuringConfigurationRequiresCurrentRoute() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.late-link")
+        let gate = CatalogAuthorityGate()
+        await controller.setConfigurationGate(gate)
+        addTeardownBlock { await gate.open() }
+        let send = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "late first link", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await gate.waitUntilEntered()
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
+        await gate.open()
+        let outcome = await send.value
+        guard case .failed = outcome else { return XCTFail("Expected a real route refusal") }
+        let sent = await controller.sentMessages
+        XCTAssertTrue(sent.isEmpty, "a stale link-less qualification cannot send a new supplement")
+    }
+
+    func testClaudeFirstLinkDuringConfigurationRequalifiesWithoutCatalogRefresh() async throws {
+        let controller = MonitorFakeNativeController()
+        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        fixture.inventory.publish(revision: 0, targetCount: 0)
+        fixture.session.installRunID(UUID())
+        fixture.session.claudeController = controller
+        let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.late-link.valid")
+        let gate = CatalogAuthorityGate()
+        await controller.setConfigurationGate(gate)
+        addTeardownBlock { await gate.open() }
+        let send = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "late linked turn", attachments: [],
+                intent: intent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await gate.waitUntilEntered()
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        let projection = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+            .init(
+                runID: projection.runID,
+                routeToken: projection.routeToken,
+                projectionRevision: projection.projectionRevision + 1,
+                hasAgentSessionLink: false,
+                hasAnyActiveLink: true
+            ), to: endpoint
+        )
+        await gate.open()
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .sent)
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent.count, 1)
+        try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
+            XCTUnwrap(sent.first), userContent: "late linked turn"
+        )
     }
 
     func testClaudeNativeRevocationDeliversOneClosingNotice() async throws {
@@ -1748,6 +2825,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         session.installRunID(UUID())
         session.claudeController = fake
         let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
@@ -1766,21 +2848,21 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         await session.claudeController?.shutdown()
     }
 
-    func testClaudeNativeLostCatalogRouteRecyclesControllerBeforeDispatch() async throws {
-        try await assertClaudeNativeLostCatalogRouteRecovery(
-            readiness: [.timedOut, .ready],
+    func testClaudeNativeMissingRouteRecoversBeforeDispatch() async throws {
+        try await assertClaudeNativeLostRouteRecovery(
+            readiness: [false, true],
             finalRoutePresence: [true]
         )
     }
 
-    func testClaudeNativeFinalCatalogFenceLossRecyclesControllerBeforeDispatch() async throws {
-        try await assertClaudeNativeLostCatalogRouteRecovery(
-            readiness: [.ready, .ready],
+    func testClaudeNativeFinalRouteFenceLossRecoversBeforeDispatch() async throws {
+        try await assertClaudeNativeLostRouteRecovery(
+            readiness: [true, true],
             finalRoutePresence: [false, true]
         )
     }
 
-    func testClaudeNativeActiveSteeringFailsClosedWithoutRecyclingOwnedEventStream() async {
+    func testClaudeNativeActiveSteeringFailsClosedWithoutRecyclingOwnedEventStream() async throws {
         let controller = MonitorFakeNativeController()
         var factoryCalls = 0
         let coordinator = ClaudeAgentModeCoordinator(
@@ -1795,6 +2877,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -1812,8 +2899,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .timedOut },
-                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in false },
+                qualifyAgentSessionLinkProviderInputRoute: { _ in .unavailable },
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
                 },
@@ -1853,8 +2940,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertTrue(session.claudeController === controller)
     }
 
-    private func assertClaudeNativeLostCatalogRouteRecovery(
-        readiness: [AgentModeViewModel.ProviderInputCatalogReadiness],
+    private func assertClaudeNativeLostRouteRecovery(
+        readiness: [Bool],
         finalRoutePresence: [Bool]
     ) async throws {
         let firstController = MonitorFakeNativeController()
@@ -1872,11 +2959,25 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.claude.catalog-route-recovery")
 
+        let endpoint = try DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1, workspaceID: UUID(), tabID: session.tabID,
+            sessionID: XCTUnwrap(session.activeAgentSessionID),
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 0
+        )
+        let routeToken = AgentSessionLinkRunCatalogRouteToken(
+            runID: runID, observerEndpoint: endpoint, connectionID: UUID(),
+            routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
+        )
         var pendingReadiness = readiness
         var pendingFinalRoutePresence = finalRoutePresence
         var physicalDispatchNotAttemptedCount = 0
@@ -1887,10 +2988,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                ensureAgentSessionLinkProviderInputCatalogReady: { _ in
-                    pendingReadiness.removeFirst()
+                qualifyAgentSessionLinkProviderInputRoute: { _ in
+                    pendingReadiness.removeFirst() ? .ready(routeToken) : .unavailable
                 },
-                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in
                     // Route state persists through the additional post-configuration proof fence.
                     pendingFinalRoutePresence.isEmpty ? finalRoutePresence.last == true : pendingFinalRoutePresence.removeFirst()
                 },
@@ -1927,7 +3028,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertEqual(firstSentCount, 0)
         XCTAssertEqual(firstShutdownCount, 1)
         XCTAssertEqual(firstResumeIDs.count, 1)
-        XCTAssertNil(firstResumeIDs[0])
+        let firstResumeID = try XCTUnwrap(firstResumeIDs.first)
+        XCTAssertNil(firstResumeID)
         XCTAssertEqual(replacementResumeIDs, ["monitor-native-session"])
         XCTAssertEqual(replacementMessages, ["continue oversight"])
         XCTAssertEqual(session.runID, runID, "route recovery preserves the logical process run")
@@ -1975,10 +3077,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 to: endpoint
             )
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             XCTAssertTrue(
-                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: fixture.session, qualification: readiness)
             )
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -1994,7 +3096,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             )
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in false }
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
             XCTAssertEqual(readiness, .notRequired)
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -2032,10 +3134,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 to: endpoint
             )
 
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             XCTAssertFalse(
-                fixture.viewModel.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: fixture.session)
+                fixture.viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: fixture.session, qualification: readiness)
             )
         #else
             throw XCTSkip("Catalog route seams require DEBUG helpers.")
@@ -2089,7 +3191,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
 
             let readiness = Task { @MainActor in
-                await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
+                await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
             }
             let readyProjection = AgentSessionLinkRunCatalogProjection(
                 runID: runID,
@@ -2116,7 +3218,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testCodexContinuationCatalogTimeoutRestoresInstructionWithoutResumingProvider() async throws {
+    func testCodexContinuationMissingRouteRestoresInstructionWithoutResumingProvider() async throws {
         #if DEBUG
             let fixture = try makeFixture(agent: .codexExec)
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
@@ -2138,6 +3240,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 hasAgentSessionLink: nil
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(unready, to: endpoint)
+            fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
 
             let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
             fixture.session.codexController = controller
@@ -2164,7 +3267,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             try await AsyncTestWait.waitUntil(
-                "continuation readiness timeout rollback",
+                "continuation route refusal rollback",
                 timeout: 15
             ) {
                 await MainActor.run { fixture.viewModel.draftRestorationEvent?.text == rawDraft }
@@ -2175,7 +3278,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             XCTAssertTrue(fixture.session.items.allSatisfy { $0.kind != .user })
             XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), rawDraft)
             XCTAssertTrue(
-                fixture.viewModel.draftRestorationEvent?.message.contains("catalog readiness timed out") == true
+                fixture.viewModel.draftRestorationEvent?.message.contains("route qualification was unavailable") == true
             )
 
             cancelWaitingInstructionForTest(fixture.session)
@@ -2249,19 +3352,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
             await authorityGate.open()
-            let readyProjection = AgentSessionLinkRunCatalogProjection(
-                runID: runID,
-                routeToken: routeToken,
-                projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true,
-                hasAnyActiveLink: true
-            )
-            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
-            _ = await manager.debugPublishRunCatalogObservation(
-                routeToken: routeToken,
-                hasAgentSessionLink: true
-            )
-
+            // Both submissions raced under an unknown catalog; do not heal it to resume.
             let response = try await waiting.value
             XCTAssertTrue(try XCTUnwrap(response.text).contains("first instruction"))
             try await AsyncTestWait.waitUntil("the queued second instruction to restore") {
@@ -2280,7 +3371,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #endif
     }
 
-    func testCodexResumedContinuationWaitsForServerObservedCatalogReadiness() async throws {
+    func testCodexResumedContinuationProceedsWithoutCatalogRefresh() async throws {
         #if DEBUG
             let fixture = try makeFixture(agent: .codexExec)
             let authorityGate = CatalogAuthorityGate()
@@ -2333,36 +3424,24 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             await authorityGate.waitUntilEntered()
             XCTAssertNotNil(
                 fixture.session.instructionContinuation,
-                "active-link input must remain suspended while the exact catalog is unready"
+                "active-link input remains suspended until exact route qualification finishes"
             )
             XCTAssertEqual(fixture.session.instructionWaitID, expectedWaitID)
             XCTAssertEqual(fixture.session.codexController.map(ObjectIdentifier.init), expectedControllerID)
             await authorityGate.open()
 
-            let expectedReady = AgentSessionLinkRunCatalogProjection(
-                runID: runID,
-                routeToken: routeToken,
-                projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true,
-                hasAnyActiveLink: true
-            )
-            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(expectedReady, to: endpoint)
-            let ready = await manager.debugPublishRunCatalogObservation(
-                routeToken: routeToken,
-                hasAgentSessionLink: true
-            )
-            XCTAssertEqual(ready, expectedReady)
-            let readiness = await fixture.viewModel.ensureProviderInputCatalogReady(for: fixture.session)
-            XCTAssertEqual(readiness, .ready)
+            // Never publish a ready catalog: the route, not tools/list, admits this continuation.
+            let readiness = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+            XCTAssertEqual(readiness, .ready(routeToken))
             try? await AsyncTestWait.waitUntil(
-                "exact readiness to resume the continuation"
+                "exact route qualification to resume the continuation"
             ) {
                 await MainActor.run { fixture.session.instructionContinuation == nil }
             }
             guard fixture.session.instructionContinuation == nil else {
                 cancelWaitingInstructionForTest(fixture.session)
                 _ = try? await waiting.value
-                return XCTFail("exact readiness did not resume the waiting continuation")
+                return XCTFail("exact route qualification did not resume the waiting continuation")
             }
             let response = try await waiting.value
             try MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(
@@ -2374,6 +3453,75 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
+    }
+
+    func testLocalInputDequeuedInstructionDuringReadProofRecoversQueueOrStoppedDraftExactlyOnce() async throws {
+        for stopped in [false, true] {
+            let fixture = try makeFixture(agent: .claudeCode)
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("QUEUE-RECOVERY-CORRECTION")
+            let queued = AgentTabSession.PendingInstruction(providerText: "provider queued input", localDraftText: "distinct local draft")
+            fixture.session.pendingInstructions = [queued]
+            let gate = TestReleaseFence(name: "dequeued instruction optional Read cancellation")
+            fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
+                await gate.enterAndWait()
+                return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+            }
+            let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+            defer { gate.release()
+                waiting.cancel()
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+            if stopped { fixture.session.stopState.invalidateScheduledStarts() }
+            waiting.cancel()
+            gate.release()
+            do {
+                _ = try await waiting.value
+                XCTFail("cancelled queued input must never return to the provider")
+            } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+            if stopped {
+                XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+                XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "distinct local draft")
+            } else {
+                XCTAssertEqual(fixture.session.pendingInstructions, [queued])
+                XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "")
+            }
+            let snapshot = try XCTUnwrap(input.host.publishedPassiveNoticesByEndpoint[input.observer])
+            let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+            let baseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: snapshot))
+            XCTAssertNotNil(input.bridge.localInputDecoration(observer: input.observer, inventory: inventory, baseline: baseline))
+            if !stopped {
+                fixture.viewModel.test_agentSessionLinkLocalInputReadProof = nil
+                let response = try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID)
+                let acceptedText = try XCTUnwrap(response.text)
+                XCTAssertTrue(acceptedText.contains("provider queued input"))
+                XCTAssertTrue(acceptedText.contains("QUEUE-RECOVERY-CORRECTION"))
+                try input.assertConsumed()
+                XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+            }
+        }
+    }
+
+    func testLocalInputRealAuthorityWaitingContinuationPhysicalResume() async throws {
+        let fixture = try makeFixture(agent: .claudeCode)
+        fixture.inventory.publish(revision: 1, targetCount: 1)
+        let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
+        addTeardownBlock { @MainActor in await input.cleanup() }
+        await input.correction("WAITING-AUTHORITY-CORRECTION")
+        let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        try await AsyncTestWait.waitUntil("positive Read waiting continuation") {
+            await MainActor.run { fixture.session.instructionContinuation != nil }
+        }
+        _ = fixture.viewModel.submitUserTurn(text: "existing resumed instruction")
+        let response = try await waiting.value
+        let text = try XCTUnwrap(response.text)
+        XCTAssertTrue(text.contains("<user_input at="))
+        XCTAssertTrue(text.contains("WAITING-AUTHORITY-CORRECTION"))
+        try input.assertConsumed()
+        MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
     func testResumedContinuationCarriesExactlyOneSupplementAndConsumesItOnce() async throws {
@@ -2407,14 +3555,82 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
 // MARK: - Non-Codex fakes
 
+private actor MonitorRemovalConnection: MCPServerConnection {
+    let gate: CatalogAuthorityGate
+    let pauseTermination: Bool
+
+    init(gate: CatalogAuthorityGate, pauseTermination: Bool) {
+        self.gate = gate
+        self.pauseTermination = pauseTermination
+    }
+
+    nonisolated var isFilesystemBacked: Bool {
+        false
+    }
+
+    nonisolated var connectionFolderURL: URL? {
+        nil
+    }
+
+    nonisolated var capabilityToken: String? {
+        nil
+    }
+
+    func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+    func stop() async {}
+    func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
+    func notifyToolListChanged() async {}
+    func connectionState() -> ConnectionStateSnapshot {
+        .ready
+    }
+
+    func isViableForRetention() -> Bool {
+        true
+    }
+
+    func secondsSinceLastActivity() async -> TimeInterval {
+        0
+    }
+
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+        nil
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        if !pauseTermination { _ = await gate.requirement() }
+        return nil
+    }
+
+    func terminate(reason _: TerminationReason, message _: String?) async {
+        if pauseTermination { _ = await gate.requirement() }
+    }
+
+    func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+}
+
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
+    private var lastSentTurnID: UUID?
+
+    func completeLastTurn(text: String? = nil, status: NativeAgentRuntimeTurnStatus = .completed) {
+        guard let lastSentTurnID else { return }
+        _ = events // Buffer an immediate reply even if the real runner has not subscribed yet.
+        if let text { continuation?.yield(.stream(.init(type: "content", text: text))) }
+        continuation?.yield(.turnCompleted(turnID: lastSentTurnID, status: status))
+        self.lastSentTurnID = nil
+    }
+
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var rejectResume = false
     private var turnInFlight = false
     private var failSendAfterRecord = false
+    private var finishEventsAfterSend = false
+
+    func setFinishEventsAfterSend(_ value: Bool) {
+        finishEventsAfterSend = value
+    }
 
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
@@ -2477,21 +3693,42 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         _ = configuration.apply()
     }
 
+    private var configurationGate: CatalogAuthorityGate?
+
+    fileprivate func setConfigurationGate(_ gate: CatalogAuthorityGate?) {
+        configurationGate = gate
+    }
+
     func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
-        configuration.apply()
+        if let configurationGate {
+            _ = await configurationGate.requirement()
+        }
+        return configuration.apply()
     }
 
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
         sentMessages.append(text)
         if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
-        return UUID()
+        let turnID = UUID()
+        lastSentTurnID = turnID
+        if finishEventsAfterSend {
+            _ = events
+            continuation?.finish()
+        }
+        return turnID
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
         if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
-        return UUID()
+        let turnID = UUID()
+        lastSentTurnID = turnID
+        if finishEventsAfterSend {
+            _ = events
+            continuation?.finish()
+        }
+        return turnID
     }
 
     func interruptTurn(reason _: String) async -> NativeAgentRuntimeInterruptOutcome {
@@ -2537,6 +3774,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     /// When set, `steerUserTurn` throws it instead of accepting, which is how the runtime lands in
     /// the queued-fallback path.
     var steerFailure: CodexTurnSteerError?
+    /// Intercepts each physical steer attempt to drive the actual bounded transport retry.
+    var steerHandler: (@MainActor @Sendable (String, String) async throws -> CodexTurnSteerReceipt)?
     /// Runtime status the queued-fallback pump reads. Idle unless a test deliberately holds it.
     var threadRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus {
         get { lock.withLock { runtimeStatus } }
@@ -2632,6 +3871,9 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         images _: [AgentImageAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
+        if let steerHandler {
+            return try await steerHandler(text, expectedTurnID)
+        }
         if let steerFailure {
             throw steerFailure
         }

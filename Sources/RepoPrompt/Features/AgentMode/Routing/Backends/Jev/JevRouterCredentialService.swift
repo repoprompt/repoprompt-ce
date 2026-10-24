@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptSecureStorage
 
-actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
+actor JevRouterCredentialService: DecisionServiceConfigurationController {
     enum ValidationResult: Equatable {
         case saved(generation: UInt64, supportedModel: String)
         case missingKey
@@ -20,7 +20,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     private var hasValidatedKey = false
     private var isValidating = false
     private var startupValidatedGeneration: UInt64?
-    private var readinessContinuations: [UUID: AsyncStream<AgentTaskRouterBackendReadiness>.Continuation] = [:]
+    private var readinessContinuations: [UUID: AsyncStream<DecisionReadiness>.Continuation] = [:]
 
     init(
         secureKeys: SecureKeysService = SecureKeysService(),
@@ -30,15 +30,15 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
         self.client = client
     }
 
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+    func readinessSnapshot() -> DecisionReadiness {
         if isValidating { return .validating(generation: generation) }
         guard hasValidatedKey else {
-            return .needsConfiguration(generation: generation, reason: "Validate a TypeSafe API key.")
+            return .needsConfiguration(generation: generation, reason: "Validate a Jev TypeSafe API key first.")
         }
         return .ready(generation: generation, policyVersion: Self.routingPolicyVersion)
     }
 
-    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
+    func readinessUpdates() -> AsyncStream<DecisionReadiness> {
         let observationID = UUID()
         return AsyncStream { continuation in
             readinessContinuations[observationID] = continuation
@@ -180,8 +180,8 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     func perform(
-        _ action: AgentTaskRouterBackendSettingsAction
-    ) async -> AgentTaskRouterBackendSettingsActionResult {
+        _ action: DecisionServiceSettingsAction
+    ) async -> DecisionServiceSettingsActionResult {
         switch action {
         case let .validateAndSaveSecret(secret):
             return await Self.actionResult(from: validateAndSave(secret, operationID: UUID()))
@@ -252,7 +252,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
         readinessContinuations.removeValue(forKey: id)
     }
 
-    private static func actionResult(from result: ValidationResult) -> AgentTaskRouterBackendSettingsActionResult {
+    private static func actionResult(from result: ValidationResult) -> DecisionServiceSettingsActionResult {
         switch result {
         case let .saved(_, supportedModel):
             .succeeded("Key verified. \(supportedModel) is available and routing is ready.")

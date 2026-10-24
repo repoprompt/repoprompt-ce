@@ -46,9 +46,21 @@ enum SparkleUpdaterStartDecision: Equatable {
 final class SparkleUpdaterManager: ObservableObject {
     /// Singleton instance - set by AppDelegate on launch
     static var shared: SparkleUpdaterManager!
+    /// AppDelegate owns history; consumers borrow its composed store without
+    /// making the updater retain a store whose context closures reference it.
+    weak var tipHistoryStore: TipHistoryStore?
     private nonisolated static let stableFeedURL = SecurityObfuscation.decode(SecurityObfuscation.stableFeedURLEncoded)
     private nonisolated static let tipFeedURL = SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
     private nonisolated static let expectedPublicEdKey = SecurityObfuscation.decode(SecurityObfuscation.expectedPublicEdKeyEncoded)
+    nonisolated static var pinnedPublicEdKey: String {
+        expectedPublicEdKey
+    }
+
+    nonisolated static func isTrustedTipDownloadURL(_ url: URL, tag: String, name: String) -> Bool {
+        updateChannel(forAppcastItemURL: url) == .tip &&
+            UpdateChannel.tip.historyRepository?.trustsDownload(url, tag: tag, name: name) == true
+    }
+
     nonisolated static let stableRecoveryDownloadsURL = URL(
         string: "https://github.com/repoprompt/repoprompt-ce-updates/releases"
     )

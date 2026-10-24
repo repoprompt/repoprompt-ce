@@ -7,18 +7,31 @@ final class GrokBuildDirectEffortWireState: @unchecked Sendable {
         case unavailable
     }
 
+    private struct Advertisement {
+        let wireValues: [CodexReasoningEffort: String]
+        let effortsByID: [String: CodexReasoningEffort]
+    }
+
     private let lock = NSLock()
     private var hasParsedSnapshot = false
-    private var valuesBySessionID: [String: [String: [CodexReasoningEffort: String]]] = [:]
+    private var advertisementsBySessionID: [String: [String: Advertisement]] = [:]
 
     func replace(
         sessionID: String?,
-        valuesByModelRaw: [String: [CodexReasoningEffort: String]]
+        valuesByModelRaw: [String: [CodexReasoningEffort: String]],
+        effortsByIDByModelRaw: [String: [String: CodexReasoningEffort]]
     ) {
         lock.withLock {
             hasParsedSnapshot = true
             guard let sessionID else { return }
-            valuesBySessionID[sessionID] = valuesByModelRaw
+            var advertisements: [String: Advertisement] = [:]
+            for (modelRaw, wireValues) in valuesByModelRaw {
+                advertisements[modelRaw] = Advertisement(
+                    wireValues: wireValues,
+                    effortsByID: effortsByIDByModelRaw[modelRaw] ?? [:]
+                )
+            }
+            advertisementsBySessionID[sessionID] = advertisements
         }
     }
 
@@ -26,8 +39,16 @@ final class GrokBuildDirectEffortWireState: @unchecked Sendable {
         lock.withLock {
             hasParsedSnapshot = true
             if let sessionID {
-                valuesBySessionID.removeValue(forKey: sessionID)
+                advertisementsBySessionID.removeValue(forKey: sessionID)
             }
+        }
+    }
+
+    func reportedEffort(sessionID: String, baseModelRaw: String, idRaw: String?) -> CodexReasoningEffort? {
+        lock.withLock {
+            guard let idRaw else { return nil }
+            return advertisementsBySessionID[sessionID]?[baseModelRaw.lowercased()]?
+                .effortsByID[idRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
         }
     }
 
@@ -38,7 +59,7 @@ final class GrokBuildDirectEffortWireState: @unchecked Sendable {
     ) -> Lookup {
         lock.withLock {
             guard hasParsedSnapshot else { return .uninitialized }
-            guard let value = valuesBySessionID[sessionID]?[baseModelRaw.lowercased()]?[effort] else {
+            guard let value = advertisementsBySessionID[sessionID]?[baseModelRaw.lowercased()]?.wireValues[effort] else {
                 return .unavailable
             }
             return .exact(value)

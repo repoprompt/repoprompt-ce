@@ -350,7 +350,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     let metricTag = startupContext.flatMap {
                         WorktreeStartupInstrumentation.benchmarkMetricTag(correlationID: $0.correlationID)
                     }
-                    _ = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(metricTag) {
+                    _ = try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(metricTag) {
                         try await agentModeVM.transitionWorktreeBindings(
                             desiredBindings,
                             forSessionID: targetSessionID,
@@ -701,7 +701,7 @@ struct AgentMCPStartWorktreeCoordinator {
         }
         let result: GitWorktreeCreateResult
         #if DEBUG
-            result = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
+            result = try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(benchmarkMetricTag) {
                 try await vcsService.createGitWorktreeWithResult(
                     request: plan.createRequest,
                     at: context.repo.rootURL,

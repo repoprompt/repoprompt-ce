@@ -156,7 +156,7 @@ final class AgentSessionLinkObservationSignalTests: XCTestCase {
         XCTAssertEqual(count(), 2)
     }
 
-    func testBindingTransitionAndHydrationWake() {
+    func testBindingTransitionAndHydrationWake() throws {
         let (session, count, cancellable) = makeSession()
         defer { cancellable.cancel() }
         session.hasLoadedPersistedState = true
@@ -166,10 +166,30 @@ final class AgentSessionLinkObservationSignalTests: XCTestCase {
         XCTAssertTrue(session.bindingTransitionInProgress)
         XCTAssertEqual(count(), 2)
 
+        var installationReadiness: [AgentSessionRestorationReadiness] = []
+        var installationTransitions: [Bool] = []
+        let installationObserver = session.monitorObservationSignal.sink { _ in
+            installationReadiness.append(session.restorationReadiness)
+            installationTransitions.append(session.bindingTransitionInProgress)
+        }
+        defer { installationObserver.cancel() }
         session.installPersistentSessionBinding(
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
         )
+        let bindingToken = try XCTUnwrap(session.currentRestorationBindingToken)
         XCTAssertFalse(session.bindingTransitionInProgress)
-        XCTAssertEqual(count(), 3)
+        // Installation settles the transition and then publishes the new binding's pending proof.
+        XCTAssertEqual(installationTransitions, [false, false])
+        XCTAssertEqual(installationReadiness, [.unbound, .pending(bindingToken)])
+        XCTAssertEqual(count(), 4)
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        installationObserver.cancel()
+
+        // Actual restoration wakes observers even though the legacy load latch already reads true.
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        XCTAssertEqual(count(), 5)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertEqual(count(), 5, "An unchanged restoration proof must not publish another wake")
     }
 }

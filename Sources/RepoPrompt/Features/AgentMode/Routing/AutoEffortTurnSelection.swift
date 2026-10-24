@@ -6,21 +6,25 @@ struct AutoEffortTurnSelection: Equatable {
     let selectedModelRaw: String
     let manualEffortRaw: String?
     let effortRaw: String
+    let backendID: DecisionServiceID
+    let autoEffortRevision: UInt64
 
     func isCurrent(
         provider currentProvider: AgentProviderKind,
         selectedModelRaw currentModelRaw: String,
         manualEffortRaw currentManualEffortRaw: String?,
-        enabled: Bool
+        configuration: AutoEffortConfiguration
     ) -> Bool {
-        enabled
+        configuration.enabled
+            && configuration.revision == autoEffortRevision
+            && configuration.selectedBackendID == backendID
             && provider == currentProvider
             && selectedModelRaw == currentModelRaw
             && manualEffortRaw == currentManualEffortRaw
     }
 }
 
-/// UI-only record of a Jev choice for a submitted user turn. It is not persisted and does not
+/// UI-only record of a decision-service choice for a submitted user turn. It is not persisted and does not
 /// claim that the provider cached or completed the turn.
 struct AutoEffortTurnFeedback: Equatable {
     enum Direction: Equatable {
@@ -40,7 +44,7 @@ struct AutoEffortTurnFeedback: Equatable {
             $0.provider == selection.provider && $0.selectedModelRaw == selection.selectedModelRaw
                 ? $0.effortRaw : nil
         } ?? selection.manualEffortRaw
-        let order = ["low", "medium", "high", "xhigh", "max"]
+        let order = ["low", "medium", "high", "xhigh", "max", "ultra"]
         if let before = previousEffort.flatMap({ order.firstIndex(of: $0) }),
            let after = order.firstIndex(of: selection.effortRaw)
         {

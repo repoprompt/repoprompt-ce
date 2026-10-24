@@ -1,5 +1,7 @@
 import Foundation
 import RepoPromptClaudeCompatibleProvider
+import RepoPromptDomainRuntime
+import RepoPromptProviderQuota
 
 typealias ClaudeCompatiblePluginID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderPluginID
 typealias ClaudeCompatiblePluginBackendID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendID
@@ -14,6 +16,7 @@ typealias ClaudeCompatiblePluginLaunchEnvironment = RepoPromptClaudeCompatiblePr
 typealias ClaudeCompatiblePluginAvailability = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderAvailability
 typealias ClaudeCompatiblePluginModelOption = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelOption
 typealias ClaudeCompatiblePluginModelCatalogSnapshot = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelCatalogSnapshot
+typealias ClaudeCompatiblePluginRateLimitInfo = RepoPromptClaudeCompatibleProvider.ClaudeProviderRateLimitInfo
 typealias ClaudeCompatiblePluginStreamResult = RepoPromptClaudeCompatibleProvider.ClaudeProviderStreamResult
 typealias ClaudeCompatiblePluginRuntimeVariant = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeVariant
 typealias ClaudeCompatiblePluginProviderError = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderError
@@ -26,6 +29,15 @@ typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.C
 /// helpers. This keeps lower-level Claude provider code from depending upward on
 /// Agent Mode's feature bridge while preserving a single package import point.
 enum ClaudeCompatibleProviderRuntimeBridge {
+    static func quotaObservation(from info: ClaudeCompatiblePluginRateLimitInfo) -> ClaudeProviderQuotaObservation {
+        let status: ClaudeProviderQuotaObservation.Status = switch info.status {
+        case .allowed: .allowed
+        case .allowedWarning: .allowedWarning
+        case .rejected: .rejected
+        }
+        return ClaudeProviderQuotaObservation(status: status, resetsAt: info.resetsAt, rateLimitType: info.rateLimitType, utilization: info.utilization)
+    }
+
     static func pluginRuntimeVariant(for runtimeVariant: ClaudeCodeRuntimeVariant) -> ClaudeCompatiblePluginRuntimeVariant {
         switch runtimeVariant {
         case .standard:
@@ -82,7 +94,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             displayName: normalized.normalizedDisplayName,
             baseURL: normalized.normalizedBaseURL ?? normalized.baseURL,
             auth: pluginAuth(from: normalized.auth),
-            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior)
+            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior),
+            httpCredentialConsentEndpoint: normalized.httpCredentialConsentEndpoint
         )
     }
 
@@ -175,8 +188,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String,
         selectedBackendModelID: String? = nil
-    ) -> [String: String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
+    ) throws -> [String: String] {
+        try RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: pluginBackendConfig(from: config),
             apiKey: apiKey,
             selectedBackendModelID: selectedBackendModelID

@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
@@ -27,9 +28,35 @@ enum AgentSessionLinkModelOutcome {
     case accepted(AgentSessionLinkModelReceipt)
     case blocked(AgentSessionLinkSendFailure)
     case invalid(String)
+    case refused(code: String, detail: String, alternatives: [String])
 }
 
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        nil
+    }
+
+    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? {
+        nil
+    }
+
+    func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
+        nil
+    }
+
+    func agentSessionLinkBootstrapRefusal(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionOverseerBootstrapRefusal? {
+        guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
+        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: false)
+    }
+
+    func agentSessionLinkActivateOverseer(
+        for _: DomainAgentSessionLinkEndpointIdentity, expected _: AgentSessionOverseerBootstrapState
+    ) -> Bool {
+        false
+    }
+
     func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
         .none
     }
@@ -120,9 +147,41 @@ struct AgentSessionLinkForkInheritanceSummary: Equatable {
 /// Every method must be side-effect free with respect to focus: resolving, snapshotting, and
 /// observing a target must never switch, activate, or focus its window.
 @MainActor
+protocol PreparedAgentSessionRuntimeRegistry: AnyObject {
+    func addingPreparedRuntimeCarriers(to snapshot: AgentSessionCarrierResolver.Snapshot, sessionIDs: Set<UUID>?, windowIDs: Set<Int>) -> AgentSessionCarrierResolver.Snapshot
+    func hasPreparedRuntime(_ sessionID: UUID) -> Bool
+    func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool
+    func finishPreparedRuntimeVisit(_ sessionID: UUID)
+    func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void)
+    func beginPreparedOversightPreparation(_ id: UUID)
+    func endPreparedOversightPreparation(_ id: UUID)
+    func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool
+}
+
+@MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
+
+    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? { get }
     /// All live compose-tab/session bindings across every non-closing window.
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate]
+    func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate]
+
+    /// The `NSWindow` hosting a logical window ID, for alerts that should present as a sheet.
+    /// Lets Feature-layer UI reach a concrete window without touching App-layer types directly.
+    /// Default `nil` — hosts that do not own real windows present app-modally instead.
+    func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow?
+
+    /// Fresh MainActor reads, without hydration, focus changes, or full candidate discovery.
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate?
+
+    /// Retains every live incarnation and includes an empty array for each known-absent UUID.
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]]
 
     func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext
 
@@ -137,6 +196,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         liveness: @escaping AgentSessionLinkSendLivenessProbe,
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome
+
+    /// Exact session-incarnation opt-in; default hosts fail closed. Neither method creates grants.
+    func agentSessionLinkBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState?
+    /// nil when bootstrap would admit the endpoint now; otherwise a classified, actionable refusal.
+    func agentSessionLinkBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal?
+    func agentSessionLinkActivateOverseer(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
+    ) -> Bool
 
     /// Count independent compose-tab bindings without hydration.
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int
@@ -153,12 +220,17 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         selection: AgentSessionLanePolicy.RoleSelection
     ) async throws -> AgentSessionLaneHostCreationOutcome
 
-    /// `commit: false` is an inactivity preflight; `true` stashes under the supplied CAS fence.
+    /// `commit: false` runs the full non-mutating retirement preflight (required flush, stash
+    /// cascade claims, save admission); `true` stashes under the supplied CAS fence.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
         isStillRetirable: @escaping @MainActor () -> Bool
     ) async -> Bool
+
+    /// The synchronous slice of retirement readiness run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and save admission.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool
 
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
@@ -171,6 +243,10 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// Active descendants across all workspace scopes; uncertain disk state blocks retirement.
     func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool
 
+    /// Publishes settled UI names, independently of exact endpoint props and authority events.
+    func agentSessionLinkPublishCreatorNames(_ names: [UUID: String])
+
+    /// Non-enumerating owner-valid local-index/compact-ID fallback only.
     func agentSessionLinkLaneCreatorLabel(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> String?
@@ -331,6 +407,9 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     )
+
+    /// Waits for an already-retiring controller without revoking local Computer Use consent.
+    func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async
 
     /// Fences one incarnation's published inventory, so nothing can be claimed against a membership
     /// snapshot that is about to stop being true, and returns the fence's token.
@@ -502,6 +581,13 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
+
+    /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
+    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        agentSessionLinkCandidates(includeLocation: true)
+    }
+
     func agentSessionLinkClaimLaneRetirement(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
         nil
     }
@@ -519,6 +605,10 @@ extension AgentSessionLinkEndpointHost {
         endpoint _: DomainAgentSessionLinkEndpointIdentity, commit _: Bool,
         isStillRetirable _: @escaping @MainActor () -> Bool
     ) async -> Bool {
+        false
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         false
     }
 
@@ -540,9 +630,15 @@ extension AgentSessionLinkEndpointHost {
         true
     }
 
+    func agentSessionLinkPublishCreatorNames(_: [UUID: String]) {}
+
     func agentSessionLinkLaneCreatorLabel(
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> String? {
+        nil
+    }
+
+    func agentSessionLinkSheetWindow(windowID _: Int) -> NSWindow? {
         nil
     }
 
@@ -778,6 +874,9 @@ enum AgentSessionLinkLocationInvalidationSink {
 @MainActor
 enum AgentSessionLinkInvalidationSink {
     static var invalidateBinding: ((Int, UUID, DomainAgentSessionLinkRevocationReason) -> Void)?
+    /// Advertisement only — never revocation or a grant. Carries the retired session UUID captured
+    /// at the clear, so an in-place replacement cannot redirect it.
+    static var overseerActivationRetired: ((UUID) -> Void)?
 
     /// Revokes only the endpoint incarnations of one exact `(window, tab)` that are no longer live.
     static func bindingEnded(
@@ -786,6 +885,47 @@ enum AgentSessionLinkInvalidationSink {
         reason: DomainAgentSessionLinkRevocationReason
     ) {
         invalidateBinding?(windowID, tabID, reason)
+    }
+}
+
+// MARK: - Delegated Add authority
+
+/// The live delegated-scope authority behind one `session_admin link` Add.
+///
+/// A caller-side check before `addMonitorLink` cannot cover the Add's own suspensions (persistence
+/// admission, the pair lanes, the durable insert, reservation, activation), so the predicate travels
+/// with the transaction and is re-proved synchronously at each commit point, after the preceding hop:
+/// before the durable insert, before and after reservation, immediately before `activateLink`, after
+/// activation, and in the caller-side completion fence. A failed proof fails closed through the
+/// transaction's existing rollback: an unactivated reservation is abandoned, only this transaction's
+/// own grant reference is revoked, and only a durable row this transaction freshly inserted is
+/// compensated (expected token and assertion generation). A pre-existing or concurrently reasserted
+/// row or grant is never removed. Ordinary user Add and launch restoration never carry one.
+///
+/// Compared by identity so a delegated Add never joins another caller's establishment.
+@MainActor
+final class AgentSessionLinkDelegatedAddAuthorization: Hashable {
+    let sourceScopeID: UUID?
+    private let isCurrentPredicate: @MainActor () -> Bool
+
+    init(sourceScopeID: UUID? = nil, isCurrent: @escaping @MainActor () -> Bool) {
+        self.sourceScopeID = sourceScopeID
+        isCurrentPredicate = isCurrent
+    }
+
+    var isCurrent: Bool {
+        isCurrentPredicate()
+    }
+
+    nonisolated static func == (
+        lhs: AgentSessionLinkDelegatedAddAuthorization,
+        rhs: AgentSessionLinkDelegatedAddAuthorization
+    ) -> Bool {
+        lhs === rhs
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
     }
 }
 
@@ -807,6 +947,10 @@ final class AgentSessionLinkRuntimeBridge {
     static let shared = AgentSessionLinkRuntimeBridge(
         authority: AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
     )
+
+    /// Explicit UI-only opt-in, exact-incarnation scoped and intentionally not persisted.
+    private var readOnlyApprovalTokens: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+    private var readOnlyApprovalTasks: Set<DomainAgentSessionLinkEndpointIdentity> = []
 
     private var restorePerfRecorder: any WorkspaceRestorePerfRecording
 
@@ -880,6 +1024,18 @@ final class AgentSessionLinkRuntimeBridge {
     /// Pasted-ID Add and launch restoration pass no constraints and retain their existing UUID
     /// resolution semantics. Exact callers supply both endpoints so duplicate UUID incarnations do
     /// not introduce ambiguity and a stale presentation can never mint against a replacement.
+    /// Only the creator can construct this proof, after the exact new lane's durable first save.
+    private struct LaneCreationActivationBasis: Hashable {
+        let activation: AgentSessionOverseerActivation
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let bindingToken: AgentSessionRestorationBindingToken
+    }
+
+    private enum LaneCreationCallerBasis {
+        case linked
+        case activated(AgentSessionOverseerActivation)
+    }
+
     private struct AddEndpointExpectations: Equatable, Hashable {
         let observer: DomainAgentSessionLinkEndpointIdentity?
         let target: DomainAgentSessionLinkEndpointIdentity?
@@ -888,21 +1044,35 @@ final class AgentSessionLinkRuntimeBridge {
         let requiresExistingOutboundLink: Bool
         /// Only lane creation needs an exact direct relationship, in either direction.
         let requiresExistingDirectLink: Bool
+        let laneCreationActivation: LaneCreationActivationBasis?
+        /// Delegated (`session_admin`) Adds carry the caller's live scope authority through the
+        /// transaction; see `AgentSessionLinkDelegatedAddAuthorization`.
+        let delegatedAuthorization: AgentSessionLinkDelegatedAddAuthorization?
 
         init(
             observer: DomainAgentSessionLinkEndpointIdentity?,
             target: DomainAgentSessionLinkEndpointIdentity?,
             requiresExistingOutboundLink: Bool = false,
-            requiresExistingDirectLink: Bool = false
+            requiresExistingDirectLink: Bool = false,
+            laneCreationActivation: LaneCreationActivationBasis? = nil,
+            delegatedAuthorization: AgentSessionLinkDelegatedAddAuthorization? = nil
         ) {
             self.observer = observer
             self.target = target
             self.requiresExistingOutboundLink = requiresExistingOutboundLink
             self.requiresExistingDirectLink = requiresExistingDirectLink
+            self.laneCreationActivation = laneCreationActivation
+            self.delegatedAuthorization = delegatedAuthorization
         }
 
         var isEmpty: Bool {
             observer == nil && target == nil
+        }
+
+        /// Caller authority that can end while the transaction is suspended, and so is re-proved at
+        /// the durable insert, around reservation, and around activation — not only up front.
+        var requiresLiveRecheck: Bool {
+            laneCreationActivation != nil || delegatedAuthorization != nil
         }
 
         func matches(
@@ -944,13 +1114,14 @@ final class AgentSessionLinkRuntimeBridge {
         /// token that is still current and delete the intent the user reasserted in the meantime.
         /// The generation is what makes that owner compare out.
         let assertionGeneration: UInt64?
+        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     }
 
-    private enum IntentPersistenceAdmission {
+    private enum IntentContinuityLookup {
         /// No durable layer is installed in this process.
         case noDurableLayer
         case available(AgentSessionOversightIntentStore)
-        case refused(String)
     }
 
     /// What one fresh establishment attempt produced.
@@ -1008,29 +1179,132 @@ final class AgentSessionLinkRuntimeBridge {
         let task: Task<Void, Never>
     }
 
-    /// One-shot gate shared by a shutdown phase and the total deadline that bounds it.
+    /// One-shot gate shared by transaction settlement and its cancellation/deadline branch.
     ///
     /// MainActor-confined, so the single-resume guarantee is a plain flag rather than a lock, and the
     /// losing branch is abandoned rather than awaited.
     @MainActor
-    private final class ShutdownPhaseGate {
+    private final class TransactionSettlementGate {
         private var continuation: CheckedContinuation<Bool, Never>?
+        private var result: Bool?
 
-        init(_ continuation: CheckedContinuation<Bool, Never>) {
+        init(_ continuation: CheckedContinuation<Bool, Never>? = nil) {
             self.continuation = continuation
         }
 
-        func finish(_ completed: Bool) {
-            guard let continuation else { return }
-            self.continuation = nil
-            continuation.resume(returning: completed)
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                }
+            }
         }
+
+        func finish(_ completed: Bool) {
+            guard result == nil else { return }
+            result = completed
+            let continuation = continuation
+            self.continuation = nil
+            continuation?.resume(returning: completed)
+        }
+    }
+
+    /// `NSWindow` for a logical window ID through the installed host — nil when absent or no host.
+    func agentSessionLinkSheetWindow(windowID: Int?) -> NSWindow? {
+        guard let windowID else { return nil }
+        return host?.agentSessionLinkSheetWindow(windowID: windowID)
     }
 
     private let authority: DomainAgentSessionLinkAuthority
     private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
     private var localInputReleaseTasks: [DomainAgentSessionLinkEndpointIdentity: Task<Void, Never>] = [:]
     private weak var host: AgentSessionLinkEndpointHost?
+    private var creatorNames = AgentSessionCreatorNames()
+
+    /// Settles UI-only name changes at the source owner; no authority or candidate sweep on rename.
+    func noteCreatorNameSourceChanged(windowID: Int, sources: [UUID: AgentSessionCreatorNames.Source]) {
+        guard !isFrozenForTermination else { return }
+        let previous = creatorNames.snapshot
+        creatorNames.update(windowID: windowID, sources: sources)
+        guard previous != creatorNames.snapshot else { return }
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+        // Every live target menu can include this name among linked/available peers. Repaint from
+        // cached membership in the existing coalesced UI-only lane, never the authoritative lane.
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: creatorNames.liveEndpoints.intersection(menuCatalog?.endpoints ?? []))
+        notifyCandidateAvailabilityChanged()
+    }
+
+    private func settleCreatorNames(_ candidates: [AgentSessionLinkEndpointCandidate]) {
+        creatorNames.replaceLive(candidates.filter {
+            !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0.sessionID)
+        })
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+    }
+
+    /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
+    /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
+    let delegationScopes: DelegationScopeRuntime
+    private var scopedLinkConsentInstalled = false
+
+    func ensureScopedLinkConsent() async -> Bool {
+        if !scopedLinkConsentInstalled {
+            scopedLinkConsentInstalled = true
+            delegationScopes.liveScopesDidChange = { [weak self] in self?.noteTopologyMayHaveChanged() }
+            delegationScopes.scopesDidInvalidate = { [weak self] ids in
+                Task { @MainActor [weak self] in
+                    guard let self, !isFrozenForTermination else { return }
+                    let captured = bookkeepingByReference
+                    let notices = await authority.revokeLinks(sourceScopeIDs: ids)
+                    await reconcile(after: notices, capturedBookkeeping: captured)
+                }
+            }
+        }
+        await authority.installCapabilityElevation(delegationScopes.authorization.linkCapabilityElevation)
+        return await authority.installScopeConsent(delegationScopes.linkConsent)
+    }
+
+    /// Durable worktree ownership for delegated worktree creation/release; installed at launch.
+    let worktreeOwnership = WorktreeOwnershipStore()
+    /// The single shared administration service behind `session_admin` and future UI dispatchers.
+    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore.makeProduction(
+        scopes: delegationScopes,
+        worktreeOwnership: worktreeOwnership
+    )
+    /// `session_admin`'s entry point: filters, preview, idempotency, undo, and apply-on-approval over
+    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops
+    /// and the structure/lifecycle/worktree ops.
+    private(set) lazy var sessionAdministrationFrontDoor: AgentSessionAdministrationFrontDoor = {
+        let frontDoor = AgentSessionAdministrationFrontDoor.production(
+            core: sessionAdministration,
+            scopes: delegationScopes,
+            workspaceLocations: HistoryWorkspaceLocationResolver(workspaceStore: {
+                AppDomainRuntimeComposition.shared.runtime.workspaceStore
+            })
+        )
+        frontDoor.registerStructureHandlers(
+            scopes: delegationScopes, worktreeOwnership: worktreeOwnership,
+            structureHost: SessionAdminWindowsStructureHost(bridge: { [unowned self] in self })
+        )
+        return frontDoor
+    }()
+
+    /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
+    /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
+    /// `stopMonitorLink`, so the link authority stays the sole owner of link lifecycle.
+    func oversightInventory(includeLocation: Bool = true) async -> (
+        live: [DomainAgentSessionLinkInventoryItem],
+        persisted: [AgentSessionOversightIntent]
+    ) {
+        // Every live link's observer is a tracked observer endpoint or a current candidate.
+        let observers = Set(knownObserverEndpoints.map(\.sessionID))
+            .union(host?.agentSessionLinkCandidates(includeLocation: includeLocation).map(\.sessionID) ?? [])
+        let live = await authority.linkItems(forObservers: observers)
+        let persisted = await intentStore?.allIntents() ?? []
+        return (live, persisted)
+    }
+
     /// Durable oversight intent, installed by app composition.
     ///
     /// Deliberately not constructed here. The bridge is a process singleton, so a self-bootstrapping
@@ -1040,6 +1314,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// Bounded automatic reauthorization of the launch snapshot. Created lazily so a bridge with no
     /// durable layer never allocates one.
     private var launchCoordinator: AgentSessionOversightLaunchCoordinator?
+    private var launchPreparedTargetIDs: Set<UUID> = []
+    private weak var launchPreparationWindowHost: (any PreparedAgentSessionRuntimeRegistry)?
+    var overseeWatchNow: @MainActor () -> Date = Date.init
+    #if DEBUG
+        var test_activeOverseeWatches = 0
+    #endif
     /// The single process-wide durable-oversight level every window renders.
     private var persistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     /// Termination freeze. Set synchronously, before any async shutdown work, and never cleared:
@@ -1072,6 +1352,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// Creator-scoped admission tickets. A settled target is the same slot as its active grant.
     private enum LaneCreationReservation { case pending, session(UUID) }
     private var laneCreationCapReservations: [UUID: [UUID: LaneCreationReservation]] = [:]
+    /// Versions reservations and exact activation-backed task membership, including outer compensation gaps.
     private var laneCreationCapGeneration: [UUID: UInt64] = [:]
     private var retiringTargets: Set<DomainAgentSessionLinkEndpointIdentity> = []
     /// One retirement lane per pair. Every durable removal for a pair — user Stop, launch
@@ -1095,6 +1376,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// of resuming a backlog its previous incarnation collected under authority it no longer holds.
     private var passiveNoticesByObserver:
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPassiveStatusNotices] = [:]
+    /// Read-only exact-incarnation count. No reducer, publication or receipt is created by a read.
+    func pendingAttentionOccurrenceCount(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Int {
+        passiveNoticesByObserver[endpoint]?.pendingAttentionOccurrenceCount ?? 0
+    }
+
     private var chains: [UUID: TargetPublicationChain] = [:]
     /// Never reset per target record. A re-installed chain therefore continues above any high-water
     /// mark a previous incarnation left behind, so its first publication is never rejected as stale.
@@ -1133,6 +1419,25 @@ final class AgentSessionLinkRuntimeBridge {
     private var changeFeedTask: Task<Void, Never>?
     private var inboundAdvertisementCountByTargetSession: [UUID: Int] = [:]
     private var refreshTask: Task<Void, Never>?
+    /// Derived UI inputs only. The coalesced authoritative refresh lane is the sole installer.
+    private var menuCatalog: DomainAgentSessionLinkPresentationSnapshot?
+    /// UI-only observer census shared by closed rows, never consulted by authority or Add.
+    /// Invalidation contract: every eligibility OR existence input must synchronously emit a
+    /// candidate-readiness change after mutation, or advance the authority revision. This includes
+    /// durable binding/incarnation, hydration, parentage, MCP control/origin, role policy, binding
+    /// transitions, deletion, closing windows and live-session removal. An async teardown hop or
+    /// a pre-mutation notification cannot substitute for the post-mutation presentation fence.
+    private struct SidebarObserverIndex {
+        let authorityRevision: UInt64
+        let eligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+        let eligibleCountBySession: [UUID: Int]
+    }
+
+    private var sidebarObserverIndex: SidebarObserverIndex?
+    private var projectedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+    private var candidateAvailabilityNotificationPending = false
+    /// Collapses readiness bursts into one queued settle.
+    private var candidatePresentationRefreshPending = false
     private var pendingRefreshScope: ProjectionRefreshScope?
     /// Exact target incarnations whose effective location label changed and whose observers still
     /// have to be repainted. Coalesced: a burst of worktree/branch/workspace edits costs one pass.
@@ -1142,8 +1447,45 @@ final class AgentSessionLinkRuntimeBridge {
     private var pendingMonitorObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     private var monitorProjectionRefreshTask: Task<Void, Never>?
     private var bindingChangeCancellable: AnyCancellable?
+    private var continuityChangeCancellable: AnyCancellable?
 
     #if DEBUG
+        var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
+        var test_afterMonitorProjection: (@MainActor () async -> Void)?
+        /// Fault injection for native tracking tests: hide coherent UI inputs without installing
+        /// another catalog or blocking AppKit's nested run loop on an async authority turn.
+        var test_menuCatalogUnavailable = false
+
+        /// True while any candidate-presentation work is queued or a sibling task (monitor
+        /// repaint, availability notification) is still outstanding.
+        private var test_presentationRefreshUnsettled: Bool {
+            candidatePresentationRefreshPending
+                || monitorProjectionRefreshTask != nil || candidateAvailabilityNotificationPending
+        }
+
+        /// Polls until presentation work is quiescent; returns false once `maxYields` polls are
+        /// spent. Polls also elapse while the monitor lane awaits the authority actor, so a bounded
+        /// call measures scheduling opportunities, not progress — keep budgets generous.
+        private func test_drainPresentationPipelines(maxYields: Int) async -> Bool {
+            var remainingYields = maxYields
+            while test_presentationRefreshUnsettled {
+                guard remainingYields > 0 else { return false }
+                remainingYields -= 1
+                await Task.yield()
+            }
+            return true
+        }
+
+        @discardableResult
+        func test_settleCandidateAvailabilityNotifications(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
+        }
+
+        func test_enqueueProjectionRefresh(sessionIDs: Set<UUID>) {
+            let scope = ProjectionRefreshScope.sessions(sessionIDs)
+            pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
+        }
+
         /// Runs after the terminal survivor authority hop, before release to the observer.
         var test_afterTerminalWaitSurvivorAuthorityValidation: (@MainActor () -> Void)?
         /// Parks managed prompt projection after authority validation and before release.
@@ -1153,6 +1495,9 @@ final class AgentSessionLinkRuntimeBridge {
         var test_beforeSynchronousSeed: (@MainActor () -> Void)?
 
         var test_beforeDurableIntentSettlement: (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        var test_beforeLaunchAuditRevocation: (@MainActor () async -> Void)?
+        var test_afterDurableIntentRemoval: (@MainActor () async -> Void)?
+        var test_afterStopAdmission: (@MainActor () async -> Void)?
         /// Deterministic interleaving seam after activation is live and bookkeeping is installed, but
         /// before the post-activation deletion/token fence.
         var test_afterActivationBeforeDeletionFence: (@MainActor (AgentSessionOversightIntent) async -> Void)?
@@ -1166,8 +1511,26 @@ final class AgentSessionLinkRuntimeBridge {
         var test_afterRetireAuthorizationBeforeFence: (@MainActor () async -> Void)?
         /// Holds a claimed key before its first admission hop; replays must join this task.
         var test_afterLaneCreationClaim: (@MainActor () async -> Void)?
+        /// Parks bootstrap after route success, before its terminal no-link authority sample.
+        var test_afterBootstrapRouteValidation: (@MainActor () async -> Void)?
+        var test_afterTargetedLink: (@MainActor () async -> Void)?
+        var test_afterTargetedDelivery: (@MainActor () async -> Void)?
+        var test_beforeIntentBootstrap: (@MainActor () -> Void)?
+        /// Signals a linked-basis creation waiting for an exact bootstrap establishment to settle.
+        var test_beforeLaneCreationBootstrapSettlement: (@MainActor () -> Void)?
+        /// Emulates scheduling delay before the independent-grant actor hop and before its returned
+        /// value is consumed. Tests retain the real authority sample; neither seam replaces it.
+        var test_beforeLaneCreationIndependentGrantSample: (@MainActor (Set<DomainAgentSessionLinkEndpointIdentity>) async -> Void)?
+        var test_afterLaneCreationIndependentGrantSample: (@MainActor (DomainAgentSessionLinkGrant?) async -> Void)?
         var test_afterLaneCapInventoryBeforeRevision: (@MainActor () async -> Void)?
+        /// Emulates scheduling delay at the final cap-admission caller authorization hop.
+        var test_beforeLaneCapCallerValidation: (@MainActor () async -> Void)?
         var test_afterAddInsertionBeforeEstablishment: (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        /// Deterministic interleaving seam inside the pair retirement lane, after persistence admission
+        /// and the Add's own precondition hops, immediately before the final pre-insert fence.
+        var test_beforeDurableAddInsert: (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        /// Parks the exact entry owner after its mutation, before outer compensation/cap release.
+        var test_afterActivationBackedEstablishmentMutation: (@MainActor (AgentSessionOversightIntent, Bool) async -> Void)?
         /// Signals that an Add is waiting behind another complete establishment for the same
         /// semantic UUID pair. Tests use it instead of timing assumptions.
         var test_beforePairEstablishmentWait:
@@ -1187,23 +1550,58 @@ final class AgentSessionLinkRuntimeBridge {
             await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID)
         },
         now: @escaping @Sendable () -> Date = { Date() },
-        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+        delegationScopes: DelegationScopeRuntime? = nil
     ) {
+        self.delegationScopes = delegationScopes ?? DelegationScopeRuntime(
+            persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
+        )
         self.restorePerfRecorder = restorePerfRecorder
         self.authority = authority
         self.host = host
         self.toolAdvertisementInvalidator = toolAdvertisementInvalidator
         self.now = now
+        continuityChangeCancellable = NotificationCenter.default.publisher(for: .agentOverseerContinuityDidChange)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.refreshContinuityDiagnostics() }
+            }
+    }
+
+    /// Continuity notifications repaint diagnostics only; they can neither grant nor revoke live
+    /// authority, re-establish a link, deliver a message, or admit a wake.
+    private func refreshContinuityDiagnostics() async {
+        guard let intentStore, !isFrozenForTermination else { return }
+        let state = await intentStore.saveState
+        let detail = await intentStore.diagnostic
+        if state == "saved" {
+            persistencePresentation.availability = await intentStore.persistenceMode == .enabled ? .ready : .dormant
+            persistencePresentation.dismissWarnings(ids: ["oversight.continuity.save"])
+            if let detail { persistencePresentation.appendWarning(id: "oversight.continuity.recovery", message: detail) }
+        } else if state == "pending" {
+            persistencePresentation.availability = .saving
+        } else if state == "not_persisted" {
+            persistencePresentation.availability = .suppressed
+        } else {
+            persistencePresentation.availability = .blocked(detail ?? "Live links apply now; continuity saving is \(state), not durable or shared.")
+        }
+        publishPersistencePresentation()
     }
 
     // MARK: - Attachment
 
     func attach(host: AgentSessionLinkEndpointHost) {
+        if self.host !== host { invalidateMenuCatalog() }
         self.host = host
         AgentSessionLinkInvalidationSink.invalidateBinding = { [weak self] windowID, tabID, reason in
             guard let self else { return }
             Task { @MainActor in
                 await self.invalidateBinding(windowID: windowID, tabID: tabID, reason: reason)
+            }
+        }
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { [weak self] sessionID in
+            Task { @MainActor in
+                guard let self, !self.isFrozenForTermination else { return }
+                await self.invalidateToolAdvertisement(forObserverSession: sessionID)
             }
         }
         AgentSessionLinkCandidateReadinessSignal.onChange = { [weak self] in
@@ -1214,6 +1612,14 @@ final class AgentSessionLinkRuntimeBridge {
         }
         AgentSessionLinkLocationInvalidationSink.refreshObservedTargets = { [weak self] workspaceID in
             self?.requestMonitorLocationRefreshForObservedTargets(inWorkspace: workspaceID)
+        }
+        // Session removal cannot race unopened/restoring/blocked scope persistence. Before the
+        // first attach the production registry is closed; this predicate follows the existing scope
+        // runtime rather than duplicating its readiness state. Explicit ephemeral test bridges own
+        // no saved authority and must not leave a dead weak predicate in the process-global fixture.
+        // Suppressed production still has a requiresStore owner and remains fenced.
+        if delegationScopes.persistenceMode == .requiresStore {
+            AgentSessionDeletionRegistry.shared.installScopePersistenceAdmission(for: delegationScopes)
         }
         // Awaited by the registry rather than spawned: the deleting caller must not proceed to
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
@@ -1233,6 +1639,16 @@ final class AgentSessionLinkRuntimeBridge {
         // late window from losing all three; attach itself still restores nothing.
         host.agentSessionLinkPublishPersistencePresentation(persistencePresentation)
         noteTopologyMayHaveChanged()
+        Task { @MainActor [weak self] in
+            await self?.requestProjectionRefresh()
+        }
+    }
+
+    /// Qualifies passive row preparation without inventing an endpoint or accepting duplicate claims.
+    func canPrepareSidebarSession(_ descriptor: AgentSessionLinkComposeTabDescriptor) -> Bool {
+        guard !isFrozenForTermination, let host else { return false }
+        let claims = host.agentSessionLinkComposeTabDescriptors().filter { $0.sessionID == descriptor.sessionID }
+        return claims == [descriptor]
     }
 
     /// Subscribes to the authoritative persistent-binding seam.
@@ -1290,10 +1706,9 @@ final class AgentSessionLinkRuntimeBridge {
             let observers = await authority.links(forTarget: targetSessionID).items.map(\.observerSessionID)
             return .sessions(Set(observers))
         case .activated, .revoked:
-            // Every target menu intersects live candidates with the authority-wide set of exact
-            // endpoints holding outbound grants. A membership change can cross an observer's 0↔1
-            // boundary and therefore change availability in otherwise unrelated target rows.
-            return .full
+            // Unlinked rows derive choices at opening. Only this pair needs authoritative writes;
+            // catalog-key removals (including unrelated notice eviction) are reconciled by the pass.
+            return .sessions(Set([event.observerSessionID, event.targetSessionID].compactMap(\.self)))
         case .draining, .shutdown:
             return .full
         }
@@ -1355,6 +1770,24 @@ final class AgentSessionLinkRuntimeBridge {
             await requestProjectionRefresh()
         }
 
+        func test_settleTargetPublications() async {
+            for chain in Array(chains.values) {
+                await chain.tail?.value
+            }
+        }
+
+        func test_refreshStatus(sessionIDs: Set<UUID>) async {
+            await requestProjectionRefresh(.sessions(sessionIDs))
+        }
+
+        func test_reinstallObservation(for candidate: AgentSessionLinkEndpointCandidate) {
+            installObservation(for: candidate, initialActivity: nil)
+        }
+
+        func test_sourcePublicationSequence(for sessionID: UUID) -> UInt64? {
+            nextSourcePublicationSequenceBySession[sessionID]
+        }
+
         /// Test seam: starts the authority change feed alone.
         ///
         /// `attach(host:)` also installs the process-wide invalidation sink and a Combine binding
@@ -1384,7 +1817,18 @@ final class AgentSessionLinkRuntimeBridge {
     /// Deliberately independent of window-session restore. The manifest is loaded even when
     /// auto-restore is off — dormant intent must survive, not be silently discarded because the user
     /// turned window restoration off for one launch.
+    /// Restore consent continuity before any derived intent can attempt establishment.
+    func bootstrapContinuity(scopeStore: DelegationScopeStore, intentStore: AgentSessionOversightIntentStore) async {
+        await delegationScopes.bootstrap(store: scopeStore)
+        await bootstrapIntentStore(intentStore)
+    }
+
     func bootstrapIntentStore(_ store: AgentSessionOversightIntentStore) async {
+        guard !isFrozenForTermination else { return }
+        #if DEBUG
+            test_beforeIntentBootstrap?()
+        #endif
+        _ = await ensureScopedLinkConsent()
         guard !isFrozenForTermination else { return }
         intentStore = store
         let mode = await store.persistenceMode
@@ -1473,7 +1917,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// Called on attach, window registration/unregistration, restore-gate transitions, and discovery
     /// completion. The event never carries state; the coordinator always rereads the level snapshot.
     func noteTopologyMayHaveChanged() {
-        guard !isFrozenForTermination, let launchCoordinator else { return }
+        guard !isFrozenForTermination else { return }
+        requestCandidatePresentationRefresh()
+        guard let launchCoordinator else { return }
         if let host {
             launchCoordinator.updateTopologyState(host.agentSessionLinkRestoreTopologyState())
         }
@@ -1504,9 +1950,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// exists to keep.
     private func auditObserverEligibility() async {
         guard !isFrozenForTermination, let host else { return }
-        let live = host.agentSessionLinkCandidates()
         for endpoint in knownObserverEndpoints {
-            guard let candidate = live.first(where: { $0.domainEndpoint == endpoint }) else { continue }
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { continue }
             guard AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                 candidate.eligibilityInput,
                 roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
@@ -1536,6 +1981,10 @@ final class AgentSessionLinkRuntimeBridge {
             launchCoordinator?.reservationStartCount ?? 0
         }
 
+        func test_launchRefusedEstablishmentCount(for pair: AgentSessionOversightIntent) -> Int {
+            launchCoordinator?.refusedEstablishmentCount(for: pair) ?? 0
+        }
+
         /// Test seam: runs the eager observer-eligibility audit synchronously.
         ///
         /// `noteCandidateReadinessChanged()` fires it from a detached task because its callers are
@@ -1545,20 +1994,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
     #endif
 
-    /// Classifies whether persistence currently admits a mutation.
-    ///
-    /// `loadForLaunch()` is idempotent and reports the settled classification, so Add and Stop both
-    /// observe exactly what the launch load decided rather than re-reading the file.
-    private func intentPersistenceAdmission() async -> IntentPersistenceAdmission {
+    /// Live admission never opens or awaits the continuity database. Bootstrap/background save
+    /// notifications own diagnostics; a stalled file cannot delay a real user-approved task.
+    private func intentContinuityLookup() -> IntentContinuityLookup {
         guard let intentStore else { return .noDurableLayer }
-        switch await intentStore.loadForLaunch() {
-        case .ready:
-            return .available(intentStore)
-        case .suppressed:
-            return .refused(AgentSessionOversightPersistenceCopy.suppressedLaunch)
-        case let .blocked(reason):
-            return .refused(AgentSessionOversightPersistenceCopy.message(for: reason))
-        }
+        return .available(intentStore)
     }
 
     /// Whether this establishment's durable token is still the current one for its pair.
@@ -1618,11 +2058,22 @@ final class AgentSessionLinkRuntimeBridge {
     func freezeForTermination() {
         guard !isFrozenForTermination else { return }
         isFrozenForTermination = true
+        // The deletion registry owns reported per-session removals. Closing its admission and
+        // checking both disk attempts and commit callbacks in this same MainActor turn proves that
+        // no later reported removal can invalidate a clean scope seal. If anything is pending, leave the
+        // scope document open and require fresh approval next launch. Ephemeral fixtures have no
+        // scope document to seal and must not freeze the process-global deletion fixture.
+        let mayRestoreScopes = delegationScopes.availability == .ready
+            && AgentSessionDeletionRegistry.shared.freezeNewDeletionAdmissionForTermination()
+        delegationScopes.freezeForTermination(allowRestoration: mayRestoreScopes)
         // Presentation-only work is dropped rather than drained: a queued projection repaint has no
         // durable or agent-visible consequence, so nothing about quitting has to wait for it.
         pendingMonitorTargetEndpoints.removeAll()
         pendingMonitorObserverEndpoints.removeAll()
         monitorSeenByReference.removeAll()
+        menuCatalog = nil
+        sidebarObserverIndex = nil
+        projectedEndpoints.removeAll()
         // Queued sends die with the process by design. They are pre-authorization for a delivery the
         // user is not present for, and quitting ends the turn that authorized them; nothing about a
         // queued message is expected back next launch.
@@ -1651,7 +2102,7 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// The deadline is total and the losing branch is never awaited: a transaction stuck behind a
     /// hung filesystem must not hold up quit. Anything unsettled is logged as a count and abandoned;
-    /// the write-through store means every *reported* Add or Stop is already durable.
+    /// live action results and continuity-save acknowledgement are reported separately.
     func settleIntentTransactions(
         deadlineSeconds: TimeInterval = AgentSessionLinkRuntimeBridge.defaultIntentSettlementSeconds
     ) async {
@@ -1676,8 +2127,8 @@ final class AgentSessionLinkRuntimeBridge {
             reachedDeadline = !cleanupSettled
         }
         if !reachedDeadline {
-            // Write-through, so this is a linearization point rather than a flush: it only confirms
-            // that every operation registered before it crossed the store actor.
+            // Await the current outbox attempt. A failed save remains observable and is not
+            // represented as durable; do not hold quit open for an unbounded retry loop.
             let barrierSettled = await withinDeadline(deadline) { [weak self] in
                 await self?.intentStore?.serializationBarrier()
             }
@@ -1725,8 +2176,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// Runs one shutdown phase, abandoning it when the total deadline elapses first.
     ///
     /// The losing branch is never awaited and never structurally joined: a phase stuck behind a hung
-    /// filesystem must not hold up quit, and the write-through store means everything already
-    /// reported to the user is already durable.
+    /// filesystem must not hold up quit. Only acknowledged row commits are durable; a successful
+    /// live decision by itself is not a continuity-save acknowledgement.
     ///
     /// - Returns: `false` when the deadline elapsed before the phase completed.
     private func withinDeadline(
@@ -1737,7 +2188,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard remaining > 0 else { return false }
         var timeout: Task<Void, Never>?
         let completed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let gate = ShutdownPhaseGate(continuation)
+            let gate = TransactionSettlementGate(continuation)
             timeout = Task { @MainActor in
                 do {
                     try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
@@ -1781,7 +2232,7 @@ final class AgentSessionLinkRuntimeBridge {
     enum DurableIntentPolicy: Equatable {
         /// Quitting. The relationship is expected back next launch.
         case preserveIntent
-        /// Any ordinary lifecycle end. v1 creates no invisible dormant subscriptions.
+        /// Default lifecycle cleanup; exact captured close ownership may override settlement.
         case removeIntent
     }
 
@@ -1833,8 +2284,10 @@ final class AgentSessionLinkRuntimeBridge {
             // bookkeeping in that window — leaving this owner to either skip its own removal or act
             // on a mapping newer work installed.
             let bookkeeping = capturedBookkeeping[reference]
-            if let bookkeeping, bookkeepingByReference[reference] == bookkeeping {
-                bookkeepingByReference.removeValue(forKey: reference)
+            defer {
+                if let bookkeeping, bookkeepingByReference[reference] == bookkeeping {
+                    bookkeepingByReference.removeValue(forKey: reference)
+                }
             }
             guard let bookkeeping else { continue }
             guard Self.durableIntentPolicy(for: notice.reason) == .removeIntent else { continue }
@@ -1856,13 +2309,25 @@ final class AgentSessionLinkRuntimeBridge {
             // The authority hop happened before this method. Entering the same pair lane Add holds
             // prevents a later reassertion from interleaving with the write; the assertion generation
             // compares out a reassertion that already completed during that authority hop.
-            let receipt = await withPairRetirementLane(bookkeeping.pair) {
-                await intentStore.remove(
+            let receipt: AgentSessionOversightIntentMutationReceipt? = await withPairRetirementLane(bookkeeping.pair) {
+                guard !self.preservesClose(reference, bookkeeping: bookkeeping, reason: notice.reason) else { return nil }
+                // Submitted removal cannot be retracted: end close-capture eligibility before the hop.
+                if self.bookkeepingByReference[reference] == bookkeeping {
+                    self.bookkeepingByReference.removeValue(forKey: reference)
+                }
+                let receipt = await intentStore.remove(
                     bookkeeping.pair,
                     ifCurrent: token,
                     assertedAt: bookkeeping.assertionGeneration
                 )
+                #if DEBUG
+                    await self.test_afterDurableIntentRemoval?()
+                #endif
+                return receipt
             }
+            guard let receipt,
+                  !preservesClose(reference, bookkeeping: bookkeeping, reason: notice.reason)
+            else { continue }
             switch receipt.outcome {
             case .applied, .unchanged, .absent:
                 launchCoordinator?.noteRevocation(
@@ -1877,22 +2342,47 @@ final class AgentSessionLinkRuntimeBridge {
             case .writeFailed, .blocked:
                 // Authority stays revoked. The saved row survives and may be restored next launch, so
                 // the user is told rather than left with a silent inconsistency.
-                launchCoordinator?.noteRevocation(
-                    pair: bookkeeping.pair,
-                    assertedAt: bookkeeping.assertionGeneration,
-                    preservesIntent: false
-                )
-                launchCoordinatorIfNeeded().noteCleanupPending(
-                    pair: bookkeeping.pair,
-                    token: token,
-                    assertedAt: bookkeeping.assertionGeneration
-                )
-                reportPersistenceWarning(
-                    id: AgentSessionOversightWarningID.cleanupFailed,
-                    message: AgentSessionOversightPersistenceCopy.automaticCleanupFailed
-                )
+                queueFailedIntentCleanup(bookkeeping)
             }
         }
+    }
+
+    private func queueFailedIntentCleanup(_ bookkeeping: ReferenceBookkeeping) {
+        guard let token = bookkeeping.token else { return }
+        launchCoordinatorIfNeeded().noteCleanupPending(
+            pair: bookkeeping.pair, token: token, assertedAt: bookkeeping.assertionGeneration
+        )
+        reportPersistenceWarning(
+            id: AgentSessionOversightWarningID.cleanupFailed,
+            message: AgentSessionOversightPersistenceCopy.automaticCleanupFailed
+        )
+    }
+
+    func noteOversightWindowClosing(windowID: Int) {
+        guard !isFrozenForTermination else { return }
+        for (reference, bookkeeping) in bookkeepingByReference {
+            let closing = [bookkeeping.observerEndpoint, bookkeeping.targetEndpoint]
+                .filter { $0.windowID == windowID }
+            guard !closing.isEmpty, let token = bookkeeping.token,
+                  let generation = bookkeeping.assertionGeneration
+            else { continue }
+            launchCoordinatorIfNeeded().noteWindowClose(
+                pair: bookkeeping.pair, token: token, assertedAt: generation,
+                reference: reference
+            )
+        }
+    }
+
+    private func preservesClose(
+        _ reference: DomainAgentSessionLinkReference,
+        bookkeeping: ReferenceBookkeeping,
+        reason: DomainAgentSessionLinkRevocationReason
+    ) -> Bool {
+        reason != .userRequested && reason != .sessionDeleted
+            && launchCoordinator?.preservesClosedReference(
+                reference, pair: bookkeeping.pair, token: bookkeeping.token,
+                assertedAt: bookkeeping.assertionGeneration
+            ) == true
     }
 
     // MARK: - Durable deletion fence
@@ -1904,6 +2394,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// removed, and a disk failure there is recorded as a warning rather than pretending the deletion
     /// rolled back.
     private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
+        creatorNames.remove(sessionID)
+        host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
+        // Revoke synchronously before the first suspension. The deletion registry retains its
+        // commit task through this callback, so an overlapping quit cannot seal stale scope intent.
+        delegationScopes.revokeAll(involving: sessionID)
         await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
@@ -2090,11 +2585,15 @@ final class AgentSessionLinkRuntimeBridge {
             )
             // Same-token explicit assertions join one establishment. Adopt the newer assertion only
             // after the older task finished writing its bookkeeping, so it cannot overwrite us.
-            if result.outcome.failureMessage == nil, let reference = result.reference {
+            if result.outcome.failureMessage == nil, let reference = result.reference,
+               let observerEndpoint = result.observerEndpoint, let targetEndpoint = result.targetEndpoint
+            {
                 bookkeepingByReference[reference] = ReferenceBookkeeping(
                     pair: pair,
                     token: token,
-                    assertionGeneration: generation
+                    assertionGeneration: generation,
+                    observerEndpoint: observerEndpoint,
+                    targetEndpoint: targetEndpoint
                 )
             }
             return result
@@ -2112,7 +2611,15 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         establishmentTasks[key] = task
+        // Membership must advance the sample witness before any suspension, independently of
+        // the earlier cap admission/target assignment and the later outer compensation/defer.
+        if expectedEndpoints.laneCreationActivation != nil {
+            laneCreationCapGeneration[pair.observerSessionID, default: 0] &+= 1
+        }
         #if DEBUG
+            if expectedEndpoints.laneCreationActivation != nil {
+                await test_afterActivationBackedEstablishmentMutation?(pair, true)
+            }
             logPairLane(pair: pair, outcome: "inserted")
         #endif
         let outcome = await validateCompletedEstablishment(
@@ -2125,6 +2632,14 @@ final class AgentSessionLinkRuntimeBridge {
         )
         if establishmentTasks[key] == task {
             establishmentTasks.removeValue(forKey: key)
+            if expectedEndpoints.laneCreationActivation != nil {
+                laneCreationCapGeneration[pair.observerSessionID, default: 0] &+= 1
+            }
+            #if DEBUG
+                if expectedEndpoints.laneCreationActivation != nil {
+                    await test_afterActivationBackedEstablishmentMutation?(pair, false)
+                }
+            #endif
         }
         return outcome
     }
@@ -2293,6 +2808,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// least one outbound link. The same authority that projects the menu enforces the precondition
     /// again at reservation and activation, closing a stale-menu race without preventing other
     /// surfaces from creating an observer's first link.
+    ///
+    /// For "Link overseer" menu picks — that list only offers active observers.
     func addSidebarMonitorLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -2305,6 +2822,32 @@ final class AgentSessionLinkRuntimeBridge {
             expectedObserverEndpoint: observerEndpoint,
             expectedTargetEndpoint: targetEndpoint,
             requiresExistingOutboundLink: true
+        )
+    }
+
+    /// Exact endpoint Add on behalf of a delegated `session_admin link`.
+    ///
+    /// Same shared durable core as every other Add; the delegated authority is re-proved at each of
+    /// its commit points (see `AgentSessionLinkDelegatedAddAuthorization`), so a scope revoked or a
+    /// membership lost while the transaction is suspended fails closed instead of leaving a durable
+    /// managed link behind.
+    func addDelegatedMonitorLink(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        authorization: AgentSessionLinkDelegatedAddAuthorization
+    ) async -> AgentMonitorAddOutcome {
+        await addMonitorLink(
+            pair: AgentSessionOversightIntent(
+                observerSessionID: observerEndpoint.sessionID,
+                targetSessionID: targetEndpoint.sessionID,
+                sourceScopeID: authorization.sourceScopeID
+            ),
+            expectedEndpoints: AddEndpointExpectations(
+                observer: observerEndpoint,
+                target: targetEndpoint,
+                delegatedAuthorization: authorization
+            ),
+            proof: nil
         )
     }
 
@@ -2327,7 +2870,15 @@ final class AgentSessionLinkRuntimeBridge {
             requiresExistingOutboundLink: requiresExistingOutboundLink,
             requiresExistingDirectLink: requiresExistingDirectLink
         )
-        return await withPairEstablishmentLane(pair) { [weak self] in
+        return await addMonitorLink(pair: pair, expectedEndpoints: expectedEndpoints, proof: proof)
+    }
+
+    private func addMonitorLink(
+        pair: AgentSessionOversightIntent,
+        expectedEndpoints: AddEndpointExpectations,
+        proof: AgentSessionOversightRestorationProof?
+    ) async -> AgentMonitorAddOutcome {
+        await withPairEstablishmentLane(pair) { [weak self] in
             guard let self else {
                 return .rejected(message: Self.unavailableMessage)
             }
@@ -2344,11 +2895,15 @@ final class AgentSessionLinkRuntimeBridge {
         expectedEndpoints: AddEndpointExpectations,
         proof: AgentSessionOversightRestorationProof?
     ) async -> AgentMonitorAddOutcome {
+        var pair = pair
         guard host != nil else { return .rejected(message: Self.unavailableMessage) }
         guard !isFrozenForTermination else {
             return .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
         }
         guard pair.observerSessionID != pair.targetSessionID else { return .failed(.selfMonitor) }
+        if pair.sourceScopeID != nil, await !ensureScopedLinkConsent() {
+            return .rejected(message: "source_scope_unavailable: The exact-target decision owner is unavailable. Call session_admin scope_status; nothing was linked.")
+        }
         if isRetiringEndpoint(in: pair) { return .failed(.closing) }
         // A deleted transcript is not an oversight endpoint, however live its tab still looks: the
         // view-model teardown that removes it from the candidate sweep runs several awaits after the
@@ -2357,17 +2912,21 @@ final class AgentSessionLinkRuntimeBridge {
 
         let transaction = registerTransaction()
         defer { finishTransaction(transaction) }
+        let active = await authority.links(forObserver: pair.observerSessionID)
+        let matching = active.items.filter { $0.targetSessionID == pair.targetSessionID }
+        if matching.count == 1, let existing = matching.first {
+            // Reassertion never changes an already-active grant's consent provenance.
+            pair = AgentSessionOversightIntent(
+                observerSessionID: pair.observerSessionID, targetSessionID: pair.targetSessionID,
+                sourceScopeID: existing.sourceScopeID
+            )
+        }
 
-        let store: AgentSessionOversightIntentStore?
-        switch await intentPersistenceAdmission() {
+        let store: AgentSessionOversightIntentStore? = switch intentContinuityLookup() {
         case .noDurableLayer:
-            store = nil
+            nil
         case let .available(value):
-            store = value
-        case let .refused(message):
-            // Persistence failure blocks the action outright: a session-only link that silently
-            // disappears on the next launch is worse than a refusal the user can act on.
-            return .rejected(message: message)
+            value
         }
 
         // Token B may not reserve until token A's removal and establishment have settled, and the
@@ -2412,6 +2971,13 @@ final class AgentSessionLinkRuntimeBridge {
                       await authority.hasActiveLink(endpoint: observerEndpoint)
                 else { return .refused(.failed(.closing)) }
             }
+            #if DEBUG
+                await test_beforeDurableAddInsert?(pair)
+            #endif
+            // Last fence before anything durable is written; no suspension follows it before the insert.
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return .refused(.failed(.rebinding))
+            }
             guard let store else {
                 return .inserted(
                     token: nil,
@@ -2420,6 +2986,12 @@ final class AgentSessionLinkRuntimeBridge {
                 )
             }
             let receipt = await store.insert(pair)
+            if !receipt.isDurable {
+                persistencePresentation.availability = receipt.saveState == "pending" ? .saving
+                    : receipt.saveState == "not_persisted" ? .suppressed
+                    : .blocked(receipt.saveError ?? "Live link applied; continuity saving failed. It is not durable or shared.")
+                publishPersistencePresentation()
+            }
             switch receipt.outcome {
             case .applied, .unchanged:
                 // Idempotent: an existing pair reuses its token rather than superseding it, so an
@@ -2432,18 +3004,29 @@ final class AgentSessionLinkRuntimeBridge {
                 #if DEBUG
                     if receipt.outcome == .unchanged { logPairLane(pair: pair, outcome: "reused") }
                 #endif
+                // A delegated Add reasserting a row that still owes a cleanup (the user stopped it but
+                // the removal failed to write) only counts as a reassertion once it is established:
+                // its scope authority can still end, and retiring the cleanup now would keep the row
+                // the user stopped. The bumped assertion generation already fences Retry out of this
+                // row until the outcome is settled below.
+                let defersCleanupReassertion = expectedEndpoints.delegatedAuthorization != nil
+                    && receipt.outcome == .unchanged
+                    && launchCoordinator?.pendingCleanupToken(for: pair) == token
                 // Retires any failed automatic cleanup for this pair, still holding the lane: the
                 // user has reasserted it, so neither a queued **Retry saving** nor a launch
                 // retirement may delete what they just recreated.
-                launchCoordinator?.noteInteractiveTokenChange(
-                    pair: pair,
-                    token: token,
-                    assertedAt: assertionGeneration
-                )
+                if !defersCleanupReassertion {
+                    launchCoordinator?.noteInteractiveTokenChange(
+                        pair: pair,
+                        token: token,
+                        assertedAt: assertionGeneration
+                    )
+                }
                 return .inserted(
                     token: token,
                     assertionGeneration: assertionGeneration,
-                    insertedDurableIntent: receipt.outcome == .applied
+                    insertedDurableIntent: receipt.outcome == .applied,
+                    defersCleanupReassertion: defersCleanupReassertion
                 )
             case .writeFailed:
                 return .refused(.rejected(message: AgentSessionOversightPersistenceCopy.addWriteFailed))
@@ -2454,13 +3037,15 @@ final class AgentSessionLinkRuntimeBridge {
         let token: AgentSessionOversightIntentToken?
         let assertionGeneration: UInt64?
         let insertedDurableIntent: Bool
+        let defersCleanupReassertion: Bool
         switch insertion {
         case let .refused(refusal):
             return refusal
-        case let .inserted(value, generation, inserted):
+        case let .inserted(value, generation, inserted, defers):
             token = value
             assertionGeneration = generation
             insertedDurableIntent = inserted
+            defersCleanupReassertion = defers
         }
 
         // The insert is committed. A freeze that lands now preserves the token for the next launch
@@ -2482,6 +3067,17 @@ final class AgentSessionLinkRuntimeBridge {
             expectedEndpoints: expectedEndpoints
         )
         let outcome = establishment.outcome
+        // Settles a deferred delegated reassertion: an established link retires the pending cleanup
+        // exactly as an interactive Add does; a failed one moves that cleanup onto the generation this
+        // insert asserted, so **Retry saving** still removes the row the user stopped.
+        if defersCleanupReassertion, let token {
+            if outcome.failureMessage == nil {
+                launchCoordinator?.noteInteractiveTokenChange(pair: pair, token: token, assertedAt: assertionGeneration)
+            } else {
+                launchCoordinator?.noteCleanupPending(pair: pair, token: token, assertedAt: assertionGeneration)
+            }
+            publishPersistencePresentation()
+        }
         guard !establishment.preservesDurableIntentOnFailure else { return outcome }
         // An idempotent `.unchanged` insertion reasserted a row that predates this attempt. A later
         // transient resolution failure must never compensate that existing durable relationship away.
@@ -2602,9 +3198,9 @@ final class AgentSessionLinkRuntimeBridge {
                 endpoint: childEndpoint,
                 candidates: candidates
             ) != nil,
-                case let .success(target) = AgentSessionLinkEndpointResolver.resolve(
-                    sessionID: frozen.sessionID,
-                    candidates: candidates
+                case let .success(target) = resolveAddCandidate(
+                    sessionID: frozen.sessionID, expectedEndpoint: nil,
+                    candidates: candidates, observerSessionID: childEndpoint.sessionID
                 ),
                 target.domainEndpoint == expectedTargetEndpoint
             else {
@@ -2658,7 +3254,8 @@ final class AgentSessionLinkRuntimeBridge {
         case inserted(
             token: AgentSessionOversightIntentToken?,
             assertionGeneration: UInt64?,
-            insertedDurableIntent: Bool
+            insertedDurableIntent: Bool,
+            defersCleanupReassertion: Bool = false
         )
         case refused(AgentMonitorAddOutcome)
     }
@@ -2690,25 +3287,42 @@ final class AgentSessionLinkRuntimeBridge {
     /// callers may select one presented incarnation from that ambiguous set, but only when the full
     /// endpoint identity still exists exactly once and remains target-eligible. A same-UUID
     /// replacement therefore reports rebinding instead of being silently adopted.
+    /// Re-sampled at each endpoint/commit fence, including after full access is switched off.
+    /// This is eligibility only; the ordinary scope/link authority still authorizes every effect.
+    func targetResolveFailure(
+        for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID?
+    ) -> AgentSessionLinkResolveFailure? {
+        guard let observerSessionID else {
+            return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
+        }
+        let approved = delegationScopes.authorization.permitsChildLinkTarget(
+            observerSessionID: observerSessionID, targetSessionID: candidate.sessionID
+        )
+        return AgentSessionLinkEndpointEligibility.targetResolveFailure(
+            for: candidate, observerSessionID: observerSessionID, permitsChildTarget: approved
+        )
+    }
+
     private func resolveAddCandidate(
         sessionID: UUID,
         expectedEndpoint: DomainAgentSessionLinkEndpointIdentity?,
-        candidates: [AgentSessionLinkEndpointCandidate]
+        candidates: [AgentSessionLinkEndpointCandidate],
+        observerSessionID: UUID? = nil
     ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
-        guard let expectedEndpoint else {
-            return AgentSessionLinkEndpointResolver.resolve(
-                sessionID: sessionID,
-                candidates: candidates
-            )
+        let matches = candidates.filter { $0.sessionID == sessionID }
+        guard !matches.isEmpty else { return .failure(.notFound) }
+        let match: AgentSessionLinkEndpointCandidate
+        if let expectedEndpoint {
+            guard expectedEndpoint.sessionID == sessionID else { return .failure(.rebinding) }
+            let exact = matches.filter { $0.domainEndpoint == expectedEndpoint }
+            guard !exact.isEmpty else { return .failure(.rebinding) }
+            guard exact.count == 1 else { return .failure(.ambiguous) }
+            match = exact[0]
+        } else {
+            guard matches.count == 1 else { return .failure(.ambiguous) }
+            match = matches[0]
         }
-        guard expectedEndpoint.sessionID == sessionID else { return .failure(.rebinding) }
-        let sessionMatches = candidates.filter { $0.sessionID == sessionID }
-        guard !sessionMatches.isEmpty else { return .failure(.notFound) }
-        let exactMatches = sessionMatches.filter { $0.domainEndpoint == expectedEndpoint }
-        guard !exactMatches.isEmpty else { return .failure(.rebinding) }
-        guard exactMatches.count == 1 else { return .failure(.ambiguous) }
-        let match = exactMatches[0]
-        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: match) {
+        if let failure = targetResolveFailure(for: match, observerSessionID: observerSessionID) {
             return .failure(failure)
         }
         return .success(match)
@@ -2743,17 +3357,15 @@ final class AgentSessionLinkRuntimeBridge {
         switch resolveAddCandidate(
             sessionID: pair.targetSessionID,
             expectedEndpoint: expectedEndpoints.target,
-            candidates: candidates
+            candidates: candidates,
+            observerSessionID: pair.observerSessionID
         ) {
         case let .success(resolved):
             target = resolved
         case let .failure(failure):
             return .failed(failure)
         }
-        guard expectedEndpoints.matches(
-            observer: observer.domainEndpoint,
-            target: target.domainEndpoint
-        ) else {
+        guard liveCandidatesMatch(expectedEndpoints, pair: pair, candidates: [observer, target]) else {
             return .failed(.rebinding)
         }
         return nil
@@ -2778,10 +3390,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// link is ever visible in an uninitialized state.
     /// - Parameter proof: the exact incarnations and binding-qualified hydration outcomes an
     ///   automatic restoration was classified against, or `nil` for a manual Add. Restoration adds
-    ///   this precondition on top of the shared path rather than beside it: the resolver deliberately
-    ///   gates on the legacy `hasLoadedPersistedState` latch, which is also true for a missing
-    ///   payload, a superseded revision, and a thrown load error, so re-deriving readiness here would
-    ///   authorize exactly the state the proof exists to exclude.
+    ///   this precondition on top of the shared path rather than beside it. Compare a unique raw
+    ///   candidate pair before eligibility so a superseded hydration proof retains its typed drift
+    ///   outcome instead of being relabeled as a generic loading refusal.
     private func performFreshEstablishment(
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken?,
@@ -2806,7 +3417,20 @@ final class AgentSessionLinkRuntimeBridge {
         let observerSessionID = pair.observerSessionID
         let targetSessionID = pair.targetSessionID
 
-        let candidates = host.agentSessionLinkCandidates()
+        let candidates = host.agentSessionLinkCandidates(
+            forSessionIDs: [observerSessionID, targetSessionID], includeLocation: true
+        ).values.flatMap(\.self)
+        if let proof, proof.requireObserverAuthoritative {
+            let observers = candidates.filter { $0.sessionID == observerSessionID }
+            let targets = candidates.filter { $0.sessionID == targetSessionID }
+            if observers.count == 1, targets.count == 1,
+               !proof.matches(observer: observers[0], target: targets[0])
+            {
+                // Preserve the restoration drift classification before readiness-aware resolution
+                // rejects either endpoint. Missing and duplicate candidates keep resolver semantics.
+                return EstablishmentResult(outcome: .failed(.rebinding))
+            }
+        }
         let observer: AgentSessionLinkEndpointCandidate
         switch resolveAddCandidate(
             sessionID: observerSessionID,
@@ -2832,7 +3456,8 @@ final class AgentSessionLinkRuntimeBridge {
         switch resolveAddCandidate(
             sessionID: targetSessionID,
             expectedEndpoint: expectedEndpoints.target,
-            candidates: candidates
+            candidates: candidates,
+            observerSessionID: observerSessionID
         ) {
         case let .success(resolved):
             target = resolved
@@ -2869,7 +3494,7 @@ final class AgentSessionLinkRuntimeBridge {
         let observerEndpoint = observer.domainEndpoint
         let targetEndpoint = target.domainEndpoint
         // Exact callers add one more incarnation fence immediately before reservation. Ordinary
-        // Add/restoration pass no expectations and retain their existing candidate-read count.
+        // Add/restoration retain the UUID-unique initial resolution above.
         if !expectedEndpoints.isEmpty,
            !liveCandidatesStillMatch(expectedEndpoints, pair: pair)
         {
@@ -2882,7 +3507,8 @@ final class AgentSessionLinkRuntimeBridge {
             observer: observerEndpoint,
             target: targetEndpoint,
             requiresExistingOutboundLink: expectedEndpoints.requiresExistingOutboundLink,
-            requiresExistingDirectLink: expectedEndpoints.requiresExistingDirectLink
+            requiresExistingDirectLink: expectedEndpoints.requiresExistingDirectLink,
+            sourceScopeID: pair.sourceScopeID
         ) {
         case let .reserved(pending, collateral):
             reservation = pending
@@ -2893,7 +3519,9 @@ final class AgentSessionLinkRuntimeBridge {
             bookkeepingByReference[Self.reference(for: pending)] = ReferenceBookkeeping(
                 pair: pair,
                 token: token,
-                assertionGeneration: assertionGeneration
+                assertionGeneration: assertionGeneration,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: targetEndpoint
             )
             #if DEBUG
                 await test_afterReservationBeforeActivation?(pair)
@@ -2902,6 +3530,11 @@ final class AgentSessionLinkRuntimeBridge {
                 await authority.abandonReservation(pending)
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.closing))
+            }
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                await authority.abandonReservation(pending)
+                bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
+                return EstablishmentResult(outcome: .failed(.rebinding))
             }
             guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
                 await authority.abandonReservation(pending)
@@ -2952,12 +3585,18 @@ final class AgentSessionLinkRuntimeBridge {
             if let proof, !liveCandidatesStillMatch(proof) {
                 return EstablishmentResult(outcome: .failed(.rebinding))
             }
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
+            }
             bookkeepingByReference[reference] = ReferenceBookkeeping(
                 pair: pair,
                 token: token,
-                assertionGeneration: assertionGeneration
+                assertionGeneration: assertionGeneration,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: targetEndpoint
             )
-            await requestProjectionRefresh()
+            await sweepKnownEndpointsForMembershipRefresh()
+            await requestProjectionRefresh(.sessions([observerEndpoint.sessionID, targetEndpoint.sessionID]))
             guard await tokenIsCurrent(token) else {
                 await revoke(reference: reference, settlesDurableIntent: false)
                 return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
@@ -2976,6 +3615,9 @@ final class AgentSessionLinkRuntimeBridge {
                 return EstablishmentResult(
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
+            }
+            guard !expectedEndpoints.requiresLiveRecheck || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
             }
             return EstablishmentResult(
                 outcome: .alreadyLinked(linkID: grant.id, targetSessionID: grant.target.sessionID),
@@ -3005,6 +3647,9 @@ final class AgentSessionLinkRuntimeBridge {
             return EstablishmentResult(outcome: .failed(.closing))
         }
 
+        await host.agentSessionLinkWillActivate(observerEndpoint)
+        await host.agentSessionLinkWillActivate(targetEndpoint)
+
         // Second token fence: the reservation authorizes nothing, so a Stop that committed during
         // the reserve hop is settled by abandoning here rather than by revoking a grant that this
         // task would otherwise be about to create.
@@ -3028,14 +3673,10 @@ final class AgentSessionLinkRuntimeBridge {
         #endif
         // Synchronous seed: revalidate both live identities on MainActor, then build the initial
         // sanitized snapshot before the link can become visible to any operation.
-        let liveCandidates = host.agentSessionLinkCandidates()
-        guard !isFrozenForTermination, let liveTarget = liveCandidates.first(where: { $0.domainEndpoint == targetEndpoint }),
-              liveCandidates.contains(where: { $0.domainEndpoint == observerEndpoint }),
-              expectedEndpoints.isEmpty || liveCandidatesMatch(
-                  expectedEndpoints,
-                  pair: pair,
-                  candidates: liveCandidates
-              )
+        guard !isFrozenForTermination,
+              let liveObserver = host.agentSessionLinkCandidate(for: observerEndpoint, includeLocation: true),
+              let liveTarget = host.agentSessionLinkCandidate(for: targetEndpoint, includeLocation: true),
+              expectedEndpoints.isEmpty || liveCandidatesStillMatch(expectedEndpoints, pair: pair)
         else {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
@@ -3045,7 +3686,7 @@ final class AgentSessionLinkRuntimeBridge {
         // that rebound during the reserve hop can present the same endpoint identity with a fresh
         // pending proof, and reauthorizing that would grant against a transcript this process has
         // not proved it read.
-        if let proof, !proof.matches(liveCandidates: liveCandidates) {
+        if let proof, !proof.matches(observer: liveObserver, target: liveTarget) {
             await authority.abandonReservation(reservation)
             bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
             return EstablishmentResult(outcome: .failed(.rebinding))
@@ -3075,14 +3716,33 @@ final class AgentSessionLinkRuntimeBridge {
             initialSnapshot: seed,
             sourcePublicationSequence: seedSequence
         )
+        /// The new first-lane exception, and a delegated Add whose scope authority ended during the
+        /// activation hop, must not publish inventory for a consumed activation. Rollback remains in
+        /// this transaction owner: it revokes only this activation's own grant and compensates only
+        /// its own fresh durable insert.
+        func settleStaleLaneActivation(_ value: DomainAgentSessionLinkActivation) async -> EstablishmentResult? {
+            guard expectedEndpoints.requiresLiveRecheck,
+                  !liveCandidatesStillMatch(expectedEndpoints, pair: pair) else { return nil }
+            host.agentSessionLinkReleasePromptInventoryHold(hold, for: observerEndpoint, publishing: nil)
+            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
+            let reference = Self.reference(for: value.grant)
+            bookkeepingByReference[reference] = ReferenceBookkeeping(
+                pair: pair, token: token, assertionGeneration: assertionGeneration,
+                observerEndpoint: value.grant.observer, targetEndpoint: value.grant.target
+            )
+            await revoke(reference: reference, settlesDurableIntent: false)
+            return EstablishmentResult(outcome: .failed(.rebinding))
+        }
         let activation: DomainAgentSessionLinkActivation
         switch disposition {
         case let .activated(value):
             activation = value
+            if let refusal = await settleStaleLaneActivation(value) { return refusal }
             // The manager-owned catalog projection must become unready before active inventory is
             // published. Awaiting the existing invalidation path keeps the prompt hold across both
             // authority activation and projection application.
             await invalidateToolAdvertisement(forObserverSession: observerEndpoint.sessionID)
+            if let refusal = await settleStaleLaneActivation(value) { return refusal }
             host.agentSessionLinkReleasePromptInventoryHold(
                 hold,
                 for: observerEndpoint,
@@ -3114,7 +3774,9 @@ final class AgentSessionLinkRuntimeBridge {
         bookkeepingByReference[grantReference] = ReferenceBookkeeping(
             pair: pair,
             token: token,
-            assertionGeneration: assertionGeneration
+            assertionGeneration: assertionGeneration,
+            observerEndpoint: activation.grant.observer,
+            targetEndpoint: activation.grant.target
         )
 
         #if DEBUG
@@ -3142,11 +3804,10 @@ final class AgentSessionLinkRuntimeBridge {
             await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        // Third restoration fence, for the same reason the token has one: the grant is live from the
-        // instant activation committed, so a proof that stopped holding across that hop has to be
-        // revoked rather than left for a sweep that only looks at identity.
+        // Recheck proof after activation: revoke stale runtime authority immediately;
+        // the qualified coordinator retains durable retirement ownership.
         if let proof, !liveCandidatesStillMatch(proof) {
-            await revoke(reference: grantReference)
+            await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.rebinding))
         }
         if !expectedEndpoints.isEmpty,
@@ -3191,7 +3852,8 @@ final class AgentSessionLinkRuntimeBridge {
         // Otherwise this activation joined a record whose live chain already owns the dedupe state;
         // overwriting it would discard that chain's next publication.
 
-        await requestProjectionRefresh()
+        await sweepKnownEndpointsForMembershipRefresh()
+        await requestProjectionRefresh(.sessions([observerEndpoint.sessionID, targetEndpoint.sessionID]))
         if activation.installsTargetObservation {
             let targetHoldsOutboundLink = await authority.hasActiveOutboundLink(
                 observerEndpoint: targetEndpoint
@@ -3214,11 +3876,10 @@ final class AgentSessionLinkRuntimeBridge {
             )
             return EstablishmentResult(outcome: .failed(.closing))
         }
-        // The projection refresh, authority lookup, and advertisement invalidation above all
-        // suspend. Exact Add must not report success if either selected incarnation rebound, closed,
-        // or lost eligibility during that tail work. Restoration proofs get the same final fence.
+        // Recheck incarnations after projection/authority/advertisement hops. Runtime proof
+        // rollback leaves durable cleanup with the qualified coordinator.
         if let proof, !liveCandidatesStillMatch(proof) {
-            await revoke(reference: grantReference)
+            await revoke(reference: grantReference, settlesDurableIntent: false)
             return EstablishmentResult(outcome: .failed(.rebinding))
         }
         if !expectedEndpoints.isEmpty,
@@ -3241,8 +3902,11 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Whether both proved incarnations are still live with the same authoritative hydration proof.
     private func liveCandidatesStillMatch(_ proof: AgentSessionOversightRestorationProof) -> Bool {
-        guard let host else { return false }
-        return proof.matches(liveCandidates: host.agentSessionLinkCandidates())
+        guard let host,
+              let observer = host.agentSessionLinkCandidate(for: proof.observerEndpoint, includeLocation: true),
+              let target = host.agentSessionLinkCandidate(for: proof.targetEndpoint, includeLocation: true)
+        else { return false }
+        return proof.matches(observer: observer, target: target)
     }
 
     private func liveCandidatesStillMatch(
@@ -3250,11 +3914,19 @@ final class AgentSessionLinkRuntimeBridge {
         pair: AgentSessionOversightIntent
     ) -> Bool {
         guard let host else { return false }
-        return liveCandidatesMatch(
-            expectations,
-            pair: pair,
-            candidates: host.agentSessionLinkCandidates()
-        )
+        // Exact expectations address their presented incarnation. An unspecified endpoint keeps
+        // the pasted-UUID resolver's ambiguity policy, with only that UUID's fresh census.
+        var requestedIDs = Set<UUID>()
+        if expectations.observer == nil { requestedIDs.insert(pair.observerSessionID) }
+        if expectations.target == nil { requestedIDs.insert(pair.targetSessionID) }
+        var candidates = requestedIDs.isEmpty ? [] : host.agentSessionLinkCandidates(
+            forSessionIDs: requestedIDs, includeLocation: true
+        ).values.flatMap(\.self)
+        for endpoint in [expectations.observer, expectations.target].compactMap(\.self) {
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true) else { return false }
+            candidates.append(candidate)
+        }
+        return liveCandidatesMatch(expectations, pair: pair, candidates: candidates)
     }
 
     private func liveCandidatesMatch(
@@ -3262,6 +3934,9 @@ final class AgentSessionLinkRuntimeBridge {
         pair: AgentSessionOversightIntent,
         candidates: [AgentSessionLinkEndpointCandidate]
     ) -> Bool {
+        // Evaluated synchronously with the endpoint proof, so every commit point that re-proves the
+        // exact incarnations also re-proves the delegated scope authority behind the Add.
+        if let delegated = expectations.delegatedAuthorization, !delegated.isCurrent { return false }
         guard case let .success(observer) = resolveAddCandidate(
             sessionID: pair.observerSessionID,
             expectedEndpoint: expectations.observer,
@@ -3270,7 +3945,8 @@ final class AgentSessionLinkRuntimeBridge {
             case let .success(target) = resolveAddCandidate(
                 sessionID: pair.targetSessionID,
                 expectedEndpoint: expectations.target,
-                candidates: candidates
+                candidates: candidates,
+                observerSessionID: pair.observerSessionID
             ),
             AgentSessionLinkEndpointEligibility.addDisabledReason(
                 observer.eligibilityInput,
@@ -3278,6 +3954,13 @@ final class AgentSessionLinkRuntimeBridge {
             ) == nil
         else {
             return false
+        }
+        if let basis = expectations.laneCreationActivation {
+            guard host?.agentSessionLinkBootstrapState(for: observer.domainEndpoint)?.activation == basis.activation,
+                  basis.activation.endpoint == observer.domainEndpoint,
+                  basis.target == target.domainEndpoint,
+                  target.restorationReadiness == .authoritative(basis.bindingToken, .freshBindingDurablyCreated),
+                  host?.agentSessionLinkLaneProvenance(for: target.domainEndpoint) == observer.sessionID else { return false }
         }
         return expectations.matches(
             observer: observer.domainEndpoint,
@@ -3289,40 +3972,63 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static let staleRelationshipMessage = "That oversight relationship is no longer active."
 
-    /// Legacy UUID-addressed adapter. Authority supplies the exact endpoints, then the exact Stop
-    /// core below performs every validation and mutation.
+    /// Legacy adapter: grant or pre-suspension admission supplies exact endpoints to the Stop core.
     func stopMonitorLink(
         observerSessionID: UUID,
         targetSessionID: UUID,
         linkID: UUID,
-        generation: UInt64
+        generation: UInt64,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
         guard !isFrozenForTermination else {
             return .failed(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
         }
         let reference = DomainAgentSessionLinkReference(linkID: linkID, generation: generation)
-        guard let grant = await authority.activeGrant(for: reference) else { return .alreadyStopped }
-        guard grant.observer.sessionID == observerSessionID,
-              grant.target.sessionID == targetSessionID
+        let admitted = admittedRetirement(for: reference)
+        let grant = await authority.activeGrant(for: reference)
+        guard let observerEndpoint = grant?.observer ?? admitted?.observerEndpoint,
+              let targetEndpoint = grant?.target ?? admitted?.targetEndpoint
+        else { return .alreadyStopped }
+        guard observerEndpoint.sessionID == observerSessionID,
+              targetEndpoint.sessionID == targetSessionID
         else {
             return .failed(message: Self.staleRelationshipMessage)
         }
-        return await stopMonitorLink(
-            observerEndpoint: grant.observer,
-            targetEndpoint: grant.target,
-            expectedReference: reference
+        return await performStop(
+            observerEndpoint: observerEndpoint, targetEndpoint: targetEndpoint,
+            expectedReference: reference, admitted: admitted, isStillAuthorized: isStillAuthorized
         )
     }
 
-    /// Authority-first durable Stop for one exact observer-target relationship.
-    ///
-    /// The authority grant is the proof. Neither endpoint has to remain in the live candidate list,
-    /// which lets a target unlink an observer whose window already disappeared. Durable removal
-    /// still commits before revocation, and both operations are generation and pair qualified.
+    /// Commits durable removal before revoking the exact relationship. After close, only ownership
+    /// captured at invocation may retire its parked token; no successor can substitute.
     func stopMonitorLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         expectedReference: DomainAgentSessionLinkReference
+    ) async -> AgentMonitorStopOutcome {
+        await performStop(
+            observerEndpoint: observerEndpoint, targetEndpoint: targetEndpoint,
+            expectedReference: expectedReference, admitted: admittedRetirement(for: expectedReference)
+        )
+    }
+
+    private func admittedRetirement(for reference: DomainAgentSessionLinkReference) -> ReferenceBookkeeping? {
+        guard let mapped = bookkeepingByReference[reference], mapped.token != nil,
+              mapped.assertionGeneration != nil,
+              launchCoordinator?.preservesClosedReference(
+                  reference, pair: mapped.pair, token: mapped.token, assertedAt: mapped.assertionGeneration
+              ) != true
+        else { return nil }
+        return mapped
+    }
+
+    private func performStop(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference,
+        admitted: ReferenceBookkeeping?,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
         let pair = AgentSessionOversightIntent(
             observerSessionID: observerEndpoint.sessionID,
@@ -3333,6 +4039,9 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let transaction = registerTransaction()
         defer { finishTransaction(transaction) }
+        #if DEBUG
+            await test_afterStopAdmission?()
+        #endif
         // The lane is installed *before* the removal is awaited, so an Add racing this Stop blocks
         // on it instead of reserving against a token that is being retired.
         let outcome = await withPairRetirementLane(pair) { [weak self] () -> AgentMonitorStopOutcome in
@@ -3340,18 +4049,29 @@ final class AgentSessionLinkRuntimeBridge {
             guard !isFrozenForTermination else {
                 return .failed(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
             }
-            guard let grant = await authority.activeGrant(for: expectedReference) else {
-                // Never infer a replacement from the UUID pair. A retired generation is simply
-                // already stopped, even if this pair has since been re-added.
-                return .alreadyStopped
-            }
+            let grant = await authority.activeGrant(for: expectedReference)
             guard !isFrozenForTermination else {
                 return .failed(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
             }
+            if let admitted, admitted.pair == pair,
+               admitted.observerEndpoint == observerEndpoint, admitted.targetEndpoint == targetEndpoint,
+               launchCoordinator?.permitsCloseRetirement(
+                   expectedReference, pair: pair, token: admitted.token, assertedAt: admitted.assertionGeneration
+               ) == true
+            {
+                return await performPairRetirement(
+                    pair: pair, reference: expectedReference, admittedClose: admitted,
+                    isStillAuthorized: isStillAuthorized
+                )
+            }
+            guard let grant else { return .alreadyStopped }
             guard grant.observer == observerEndpoint, grant.target == targetEndpoint else {
                 return .failed(message: Self.staleRelationshipMessage)
             }
-            return await performPairRetirement(pair: pair, reference: expectedReference)
+            if let admitted, bookkeepingByReference[expectedReference] != admitted { return .alreadyStopped }
+            return await performPairRetirement(
+                pair: pair, reference: expectedReference, isStillAuthorized: isStillAuthorized
+            )
         }
         #if DEBUG
             logPairLane(pair: pair, outcome: "retired")
@@ -3375,20 +4095,30 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func performPairRetirement(
         pair: AgentSessionOversightIntent,
-        reference: DomainAgentSessionLinkReference
+        reference: DomainAgentSessionLinkReference,
+        admittedClose: ReferenceBookkeeping? = nil,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
-        let mapped = bookkeepingByReference[reference]
+        guard isStillAuthorized?() ?? true else {
+            return .failed(message: "Delegated authority ended before the unlink.")
+        }
+        if let admittedClose {
+            guard launchCoordinator?.permitsCloseRetirement(
+                reference, pair: pair, token: admittedClose.token,
+                assertedAt: admittedClose.assertionGeneration
+            ) == true,
+                bookkeepingByReference[reference].map({ $0 == admittedClose }) ?? true
+            else { return .alreadyStopped }
+        }
+        let mapped = admittedClose ?? bookkeepingByReference[reference]
         if let mapped, mapped.pair != pair {
             // The authority endpoints matched before entry, so a different bookkeeping pair is an
             // internal stale-owner mismatch. Neither the durable row nor the grant may be guessed at.
             return .failed(message: Self.staleRelationshipMessage)
         }
 
-        // Never derived from the pair alone. A stale row for reference A can arrive long after the
-        // pair was stopped and re-added under token B; looking the pair up would find B, remove it,
-        // settle B's establishment, and revoke B's grants — a stale UI action terminating a newer
-        // explicit re-add. A missing mapping is an invariant failure, so persistence fails closed and
-        // only the exact runtime reference may be considered.
+        // Never infer ownership from UUIDs: a stale reference must not retire a newer re-add.
+        // Require live bookkeeping or an admitted, still-parked close reference.
         guard let intentStore else {
             #if DEBUG
                 if mapped == nil { logPairLane(pair: pair, outcome: "unmapped_reference") }
@@ -3413,6 +4143,8 @@ final class AgentSessionLinkRuntimeBridge {
             ifCurrent: token,
             assertedAt: mapped.assertionGeneration
         )
+        // A retired close reference cannot retry against a newer assertion, even of the same token.
+        if admittedClose != nil, receipt.outcome == .tokenMismatch { return .alreadyStopped }
         var compensationAttempts = 0
         while receipt.outcome == .tokenMismatch,
               receipt.token(for: pair) == token,
@@ -3424,6 +4156,9 @@ final class AgentSessionLinkRuntimeBridge {
             // mapping and must keep its durable row.
             await settleEstablishment(pair: pair, token: token)
             guard bookkeepingByReference[reference] == mapped, !isFrozenForTermination else { break }
+            guard isStillAuthorized?() ?? true else {
+                return .failed(message: "Delegated authority ended before the unlink.")
+            }
             compensationAttempts += 1
             receipt = await intentStore.remove(pair, ifCurrent: token, assertedAt: nil)
         }
@@ -3435,12 +4170,15 @@ final class AgentSessionLinkRuntimeBridge {
         }
         switch receipt.outcome {
         case .writeFailed:
-            // The grant and the token both stay valid. Reporting success here would tell the user
-            // oversight ended while it is still live and still saved.
+            // Intent stays saved. A captured close may already have revoked authority, but a failed
+            // durable write still cannot report that the user's saved relationship was forgotten.
             return .failed(message: AgentSessionOversightPersistenceCopy.stopWriteFailed)
         case .blocked:
             return .failed(message: AgentSessionOversightPersistenceCopy.unreadable)
         case .absent, .tokenMismatch:
+            if admittedClose != nil, receipt.outcome == .absent {
+                launchCoordinator?.noteRevocation(pair: pair, assertedAt: mapped.assertionGeneration, preservesIntent: false)
+            }
             // A newer token is current, or the pair was already removed. Settle only this stale
             // token's work and revoke only the authority-validated expected reference; never remove
             // the newer token or infer a replacement reference from the UUID pair.
@@ -3462,6 +4200,7 @@ final class AgentSessionLinkRuntimeBridge {
             break
         }
 
+        launchCoordinator?.noteRevocation(pair: pair, assertedAt: mapped.assertionGeneration, preservesIntent: false)
         // Token A is gone from disk. Settle its establishment first so an in-flight activation
         // cannot leave its grant behind the removal, then retire only the expected reference.
         await settleEstablishment(pair: pair, token: token)
@@ -3476,7 +4215,26 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Either endpoint may revoke. Both windows update from the same authority transition.
     func revokeLink(linkID: UUID, generation: UInt64) async {
-        await revoke(reference: DomainAgentSessionLinkReference(linkID: linkID, generation: generation))
+        let transaction = registerTransaction()
+        defer { finishTransaction(transaction) }
+        let reference = DomainAgentSessionLinkReference(linkID: linkID, generation: generation)
+        let admitted = admittedRetirement(for: reference)
+        #if DEBUG
+            await test_afterStopAdmission?()
+        #endif
+        // Keep authority-first revocation and its existing best-effort persistence semantics.
+        if let admitted, let current = bookkeepingByReference[reference], current != admitted { return }
+        let revoked = await revoke(reference: reference)
+        guard !revoked, let admitted else { return }
+        await withPairRetirementLane(admitted.pair) { [self] in
+            let outcome = await performPairRetirement(pair: admitted.pair, reference: reference, admittedClose: admitted)
+            // After the write hop, only its still-current parked owner may queue cleanup.
+            if case .failed = outcome, launchCoordinator?.permitsCloseRetirement(
+                reference, pair: admitted.pair, token: admitted.token, assertedAt: admitted.assertionGeneration
+            ) == true {
+                queueFailedIntentCleanup(admitted)
+            }
+        }
     }
 
     @discardableResult
@@ -3621,6 +4379,15 @@ final class AgentSessionLinkRuntimeBridge {
         await requestProjectionRefresh()
     }
 
+    /// Membership used to refresh full topology, which also settled disappeared grants/input
+    /// owners. Retain that lifecycle fence without discovering or projecting unrelated chats.
+    private func sweepKnownEndpointsForMembershipRefresh() async {
+        guard let host else { return }
+        let endpoints = knownObserverEndpoints.union(knownTargetEndpoints).union(localInputGenerations.keys)
+        let live = endpoints.compactMap { host.agentSessionLinkCandidate(for: $0, includeLocation: false) }
+        await sweepStaleEndpoints(liveCandidates: live)
+    }
+
     /// Revokes every known endpoint incarnation that is no longer live.
     ///
     /// Runs inline inside a refresh pass and therefore must never call `requestProjectionRefresh`:
@@ -3678,6 +4445,11 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            // Retire only the disclosure lease before durable settlement can suspend. A proof
+            // completed just before this known revocation must not survive its disk-write hop.
+            if let observer = notice.observerEndpoint {
+                passiveNoticesByObserver[observer]?.localInputFrontiers.removeValue(forKey: reference)
+            }
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
         // queued message must never outlive the exact grant that admitted it.
@@ -3691,7 +4463,8 @@ final class AgentSessionLinkRuntimeBridge {
         await reconcile(afterTargetSessions: Set(notices.map(\.targetSessionID)))
         await pruneKnownEndpoints(sessionIDs: touched)
         if refreshingProjections {
-            await requestProjectionRefresh()
+            await sweepKnownEndpointsForMembershipRefresh()
+            await requestProjectionRefresh(.sessions(touched))
         }
         // Every revocation path — manual Stop, lifecycle invalidation, stale-endpoint sweep — funnels
         // through here, so this is the one place that covers losing a link the way the add path covers
@@ -3751,8 +4524,9 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
         chains[endpoint.sessionID] = chain
-        chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self] in
-            self?.publishTargetSnapshot(forTargetSession: endpoint.sessionID)
+        chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
+            guard let chain else { return }
+            self?.publishTargetSnapshot(endpoint: endpoint, originatingChain: chain)
         }
         guard chain.token != nil else {
             // The endpoint disappeared between activation and observation install. Fail closed.
@@ -3782,26 +4556,39 @@ final class AgentSessionLinkRuntimeBridge {
         chain.tail = nil
     }
 
+    private enum CandidateLookup {
+        case unqueried
+        /// nil is authoritative absence, not permission to rediscover candidates.
+        case resolved(AgentSessionLinkEndpointCandidate?)
+    }
+
     /// Builds the sanitized snapshot on MainActor, allocates its source publication sequence
     /// synchronously, then appends the publish to this target's retained serial chain.
     ///
     /// Sequence allocation happens before the actor hop, so ordering is decided by MainActor order
     /// rather than by task scheduling; the authority's high-water rule is the second line of defence.
+    private func publishTargetSnapshot(forTargetSession sessionID: UUID) {
+        guard let chain = chains[sessionID] else { return }
+        publishTargetSnapshot(endpoint: chain.endpoint, originatingChain: chain)
+    }
+
     private func publishTargetSnapshot(
-        forTargetSession sessionID: UUID,
-        validatedCandidate: AgentSessionLinkEndpointCandidate? = nil
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        originatingChain chain: TargetPublicationChain,
+        lookup: CandidateLookup = .unqueried
     ) {
-        guard let chain = chains[sessionID], let host else { return }
-        let endpoint = chain.endpoint
-        // Resolved by exact incarnation, never by session UUID. A UUID lookup that demands a unique
-        // match reports "ambiguous" the moment a second live incarnation of this UUID opens, which
-        // would revoke this still-valid grant as `.targetIdentityDrift`; a lookup that tolerated
-        // ambiguity would publish some other incarnation's state under this grant.
-        guard let candidate = validatedCandidate ?? host.agentSessionLinkCandidates()
-            .first(where: { $0.domainEndpoint == endpoint }),
-            candidate.domainEndpoint == endpoint
-        else {
-            // Identity drift: revoke rather than publish state for a different incarnation.
+        let sessionID = endpoint.sessionID
+        // Ownership precedes lookup, sampling, sequence allocation AND cleanup. Endpoint equality
+        // alone cannot distinguish reinstalling an observation on the same exact incarnation.
+        guard !isFrozenForTermination, chains[sessionID] === chain,
+              chain.endpoint == endpoint, let host else { return }
+        let current: AgentSessionLinkEndpointCandidate? = switch lookup {
+        case .unqueried:
+            host.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
+        case let .resolved(candidate):
+            candidate
+        }
+        guard let candidate = current, candidate.domainEndpoint == endpoint else {
             removeChain(forTargetSession: sessionID, matching: endpoint)
             Task { [weak self] in
                 await self?.invalidate(endpoint: endpoint, reason: .targetIdentityDrift)
@@ -3863,61 +4650,222 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     private func performProjectionRefresh(_ scope: ProjectionRefreshScope) async {
-        guard let host else { return }
-        var candidates = host.agentSessionLinkCandidates()
+        guard !isFrozenForTermination, let host else { return }
+        var fullCandidates: [AgentSessionLinkEndpointCandidate] = []
         if scope.isFull {
-            // Only a full pass sweeps: status churn cannot invalidate an endpoint, and lifecycle
-            // seams (window/workspace/binding/session) all request a full refresh.
-            await sweepStaleEndpoints(liveCandidates: candidates)
-            // Re-read after the sweep so a projection is never built from a candidate the sweep just
-            // proved stale.
-            candidates = host.agentSessionLinkCandidates()
+            await sweepStaleEndpoints(liveCandidates: host.agentSessionLinkCandidates(includeLocation: false))
+            guard !isFrozenForTermination, self.host === host else { return }
+            fullCandidates = host.agentSessionLinkCandidates(includeLocation: false)
         }
-        // Keyed by exact incarnation. A `[sessionID: candidate]` map with first-wins uniquing picks
-        // an arbitrary incarnation when one session UUID is live in two windows, which would source
-        // outbound status/provider/location and inbound names from the wrong one.
-        let byEndpoint = Dictionary(
-            candidates.map { ($0.domainEndpoint, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let rebuilt: [AgentSessionLinkEndpointCandidate] = switch scope {
+        let previousCatalog = menuCatalog
+        let previousKeys = previousCatalog?.endpoints ?? []
+        let retained = previousKeys.union(projectedEndpoints).union(passiveNoticesByObserver.keys)
+        let snapshot = await authority.presentationSnapshot(additionalEndpoints: retained)
+        #if DEBUG
+            await test_afterPresentationSnapshot?()
+        #endif
+        guard !isFrozenForTermination, self.host === host,
+              snapshot.authorityRevision >= (menuCatalog?.authorityRevision ?? 0)
+        else { return }
+        // Equal revisions are intentionally installable: dismissal changes notices, not revision.
+        // No other lane installs, so equal-revision snapshots follow transaction order.
+        let availabilityChanged = menuCatalog == nil
+            || menuCatalog?.activeOutboundObserverEndpoints != snapshot.activeOutboundObserverEndpoints
+        // Notice eviction/dismissal can change an owner that still has links and is outside scope.
+        // Compare actual old/new inputs, not only key removal or authority revisions.
+        let changedNoticeOwners = previousKeys.union(snapshot.endpoints).filter {
+            (previousCatalog?.inputs[$0]?.notices ?? []) != (snapshot.inputs[$0]?.notices ?? [])
+        }
+        menuCatalog = snapshot
+        let removed = previousKeys.subtracting(snapshot.endpoints)
+        var endpoints: Set<DomainAgentSessionLinkEndpointIdentity> = switch scope {
         case .full:
-            candidates
+            snapshot.endpoints.union(retained)
         case let .sessions(sessionIDs):
-            candidates.filter { sessionIDs.contains($0.sessionID) }
+            snapshot.endpoints.union(retained).filter { sessionIDs.contains($0.sessionID) }
         }
-        for candidate in rebuilt {
-            let projection = await makeProjection(
-                for: candidate,
-                candidates: candidates,
-                candidatesByEndpoint: byEndpoint
-            )
-            host.agentSessionLinkPublishProjection(projection.props, to: candidate.domainEndpoint)
-            // Both projections are built from one authority read, but only the pill is published
-            // unconditionally. The prompt inventory here was read before this line — possibly several
-            // hops ago, since each candidate costs its own `projectionInputs` — and a membership
-            // write may have fenced this endpoint in between. The host refuses the write in that
-            // case; the write's own release publishes the post-mutation inventory instead, and the
-            // refresh this method is called from again afterwards reconciles the pill.
-            host.agentSessionLinkPublishPromptInventory(
-                projection.promptInventory,
-                to: candidate.domainEndpoint
-            )
-            // Published after the inventory it will later be joined to, and only for an observer
-            // holding a queue. A fenced endpoint refuses the inventory above while accepting this,
-            // which is exactly the state the revision match is for: the snapshot simply stays
-            // undeliverable until the pass after the membership write republishes both.
-            if let passiveNotices = projection.passiveNotices {
-                host.agentSessionLinkPublishPassiveStatusNotices(
-                    passiveNotices,
-                    to: candidate.domainEndpoint
-                )
+        endpoints.formUnion(removed)
+        endpoints.formUnion(changedNoticeOwners)
+        endpoints.formUnion(Set(passiveNoticesByObserver.keys).subtracting(snapshot.endpoints))
+        var fullMap: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] = [:]
+        if scope.isFull {
+            // Discovery proves topology without resolving N execution locations. Only exact peers
+            // recorded by this authority snapshot contribute display fields to linked/notice rows.
+            var peers: Set<DomainAgentSessionLinkEndpointIdentity> = []
+            for inputs in snapshot.inputs.values {
+                peers.formUnion(inputs.outboundTargetEndpoints.values)
+                peers.formUnion(inputs.inboundObserverEndpoints.values)
+                for notice in inputs.notices {
+                    if let observer = notice.observerEndpoint { peers.insert(observer) }
+                    if let target = notice.targetEndpoint { peers.insert(target) }
+                }
+            }
+            for peer in peers {
+                if let current = host.agentSessionLinkCandidate(for: peer, includeLocation: true) {
+                    fullMap[peer] = current
+                }
             }
         }
+        for endpoint in endpoints {
+            guard !isFrozenForTermination, self.host === host else { return }
+            // Re-read exact ownership after the authority hop; a displaced endpoint cannot clear
+            // or label its successor. UI empty defaults never enter this publication path.
+            guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true),
+                  let inputs = snapshot.inputs[endpoint]
+            else {
+                projectedEndpoints.remove(endpoint)
+                continue
+            }
+            guard let projection = await makeProjection(
+                for: candidate,
+                inputs: inputs,
+                candidatesByEndpoint: scope.isFull ? fullMap : presentationCandidates(for: endpoint, inputs: inputs)
+            ) else { return }
+            guard !isFrozenForTermination, self.host === host else { return }
+            guard host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { continue }
+            host.agentSessionLinkPublishProjection(projection.props, to: endpoint)
+            // Membership holds and inventory revisions remain the publication fence.
+            host.agentSessionLinkPublishPromptInventory(projection.promptInventory, to: endpoint)
+            if let passiveNotices = projection.passiveNotices {
+                host.agentSessionLinkPublishPassiveStatusNotices(passiveNotices, to: endpoint)
+            }
+            if snapshot.endpoints.contains(endpoint) {
+                projectedEndpoints.insert(endpoint)
+            } else {
+                projectedEndpoints.remove(endpoint)
+            }
+        }
+        if availabilityChanged { notifyCandidateAvailabilityChanged() }
+        // A missing observer cannot reconcile its last-link projection. Retire that exact queue
+        // even during sparse refreshes, looking up only existing reducer owners through the host index.
+        let livePassiveOwners = Set(passiveNoticesByObserver.keys.filter {
+            host.agentSessionLinkCandidate(for: $0, includeLocation: false) != nil
+        })
+        prunePassiveNotices(liveEndpoints: livePassiveOwners)
         if scope.isFull {
-            prunePassiveNotices(liveEndpoints: Set(candidates.map(\.domainEndpoint)))
+            let live = Set(fullCandidates.map(\.domainEndpoint))
+            projectedEndpoints.formIntersection(live)
             await reconcilePendingSends()
         }
+    }
+
+    private func invalidateMenuCatalog() {
+        guard menuCatalog != nil else { return }
+        menuCatalog = nil
+        sidebarObserverIndex = nil
+        notifyCandidateAvailabilityChanged()
+    }
+
+    /// Payload-free shared availability invalidation, always after catalog storage. It is not a
+    /// status event and never runs for ordinary target snapshots.
+    private func notifyCandidateAvailabilityChanged() {
+        // Invalidate synchronously even when the repaint notification is already coalesced.
+        // Hydration, rebind, role and MCP eligibility can change without an authority revision.
+        sidebarObserverIndex = nil
+        guard !candidateAvailabilityNotificationPending, !isFrozenForTermination else { return }
+        candidateAvailabilityNotificationPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            candidateAvailabilityNotificationPending = false
+            guard !isFrozenForTermination else { return }
+            NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
+        }
+    }
+
+    /// UI-only empty inputs require a coherent catalog and fresh exact ownership. They are never
+    /// published as agent inventories or consumed by authorization.
+    private func menuInputs(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkEndpointProjectionInputs? {
+        #if DEBUG
+            guard !test_menuCatalogUnavailable else { return nil }
+        #endif
+        guard !isFrozenForTermination, let catalog = menuCatalog,
+              host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
+        else { return nil }
+        if catalog.endpoints.contains(endpoint) { return catalog.inputs[endpoint] }
+        return DomainAgentSessionLinkEndpointProjectionInputs(
+            outbound: DomainAgentSessionLinkInventory(sessionID: endpoint.sessionID, linkSetRevision: 0, authorityRevision: catalog.authorityRevision, items: []),
+            inbound: DomainAgentSessionLinkInventory(sessionID: endpoint.sessionID, linkSetRevision: 0, authorityRevision: catalog.authorityRevision, items: []),
+            outboundTargetEndpoints: [:], inboundObserverEndpoints: [:],
+            activeOutboundObserverEndpoints: catalog.activeOutboundObserverEndpoints, notices: []
+        )
+    }
+
+    /// Fresh single-row choice construction at a menu tracking boundary, never during row rendering.
+    func sidebarOversightMenu(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightMenuProps? {
+        guard let host, let inputs = menuInputs(for: endpoint),
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: true)
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        let creatorID = host.agentSessionLinkLaneProvenance(for: endpoint)
+        let creatorFallback = creatorID.flatMap { id -> String? in
+            // The unchanged builder resolves live names itself. Fallback only for a known,
+            // non-live creator, exactly as the former eager projection did.
+            if candidates.contains(where: { $0.sessionID == id }) { return nil }
+            return creatorNames.snapshot[id] ?? host.agentSessionLinkLaneCreatorLabel(for: endpoint)
+        }
+        return AgentSidebarOversightMenuProjection.make(
+            target: candidate, inputs: inputs, candidates: candidates,
+            createdByLabel: creatorFallback, creatorSessionID: creatorID
+        )
+    }
+
+    private func sidebarObservers(in catalog: DomainAgentSessionLinkPresentationSnapshot) -> SidebarObserverIndex {
+        if let index = sidebarObserverIndex, index.authorityRevision == catalog.authorityRevision {
+            return index
+        }
+        var eligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        var eligibleCountBySession: [UUID: Int] = [:]
+        if let host {
+            for endpoint in catalog.activeOutboundObserverEndpoints {
+                guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+                      AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring) == nil
+                else { continue }
+                eligibleEndpoints.insert(endpoint)
+                eligibleCountBySession[endpoint.sessionID, default: 0] += 1
+            }
+        }
+        let index = SidebarObserverIndex(
+            authorityRevision: catalog.authorityRevision,
+            eligibleEndpoints: eligibleEndpoints,
+            eligibleCountBySession: eligibleCountBySession
+        )
+        sidebarObserverIndex = index
+        return index
+    }
+
+    /// Closed-row summary: O(exact linked peers), with the observer census built once per revision.
+    /// Candidate-local invalidation also retires the census; actions still resolve live candidates.
+    func sidebarOversightSummary(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightSummary? {
+        guard let host, let inputs = menuInputs(for: endpoint),
+              let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
+        else { return nil }
+        let linked = Set(inputs.inboundObserverEndpoints.values)
+        let targetReason = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)?.uiMessage
+        var available = 0
+        if targetReason == nil, let catalog = menuCatalog {
+            let observers = sidebarObservers(in: catalog)
+            available = observers.eligibleEndpoints.count - observers.eligibleCountBySession[endpoint.sessionID, default: 0]
+            for peer in linked where peer.sessionID != endpoint.sessionID && observers.eligibleEndpoints.contains(peer) {
+                available -= 1
+            }
+        }
+        let creatorID = host.agentSessionLinkLaneProvenance(for: endpoint)
+        let peerIDs = Set(inputs.inbound.items.map(\.observerSessionID)).union(inputs.outbound.items.map(\.targetSessionID)).union(creatorID.map { [$0] } ?? [])
+        let peers = host.agentSessionLinkCandidates(forSessionIDs: peerIDs, includeLocation: false).compactMapValues { $0.first }
+        func name(_ exact: DomainAgentSessionLinkEndpointIdentity?, id: UUID, fallback: String?) -> String {
+            exact.flatMap { host.agentSessionLinkCandidate(for: $0, includeLocation: false)?.resolvedDisplayName }
+                ?? peers[id]?.resolvedDisplayName ?? fallback ?? AgentMonitorSessionIDFormatter.short(id)
+        }
+        return AgentSidebarOversightSummary(
+            linkedObserverCount: linked.count, availableObserverCount: available,
+            inboundObserverNames: inputs.inbound.items.map { name(inputs.inboundObserverEndpoints[$0.linkID], id: $0.observerSessionID, fallback: $0.displayName) },
+            inboundObserverSessionIDs: inputs.inbound.items.map(\.observerSessionID),
+            outboundTargetNames: inputs.outbound.items.map { name(inputs.outboundTargetEndpoints[$0.linkID], id: $0.targetSessionID, fallback: $0.displayName) },
+            createdByLabel: creatorID.flatMap { peers[$0]?.resolvedDisplayName ?? creatorNames.snapshot[$0] ?? host.agentSessionLinkLaneCreatorLabel(for: endpoint) },
+            creatorSessionID: creatorID,
+            targetIneligibleReason: targetReason,
+            observerIneligibleReason: AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring)
+        )
     }
 
     /// One endpoint's refreshed projections: the Oversee rows the user sees and the inventory the
@@ -3933,43 +4881,95 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func makeProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
-        candidates: [AgentSessionLinkEndpointCandidate],
+        inputs: DomainAgentSessionLinkEndpointProjectionInputs,
         candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
-    ) async -> EndpointProjection {
-        // Endpoint-scoped on every axis, read in one authority turn: a second live incarnation of
-        // this session UUID owns neither these outbound grants nor these inbound observers nor these
-        // notices, and must not render or be told about them.
-        let inputs = await authority.projectionInputs(forEndpoint: candidate.domainEndpoint)
+    ) async -> EndpointProjection? {
+        guard !isFrozenForTermination, let host else { return nil }
         let monitor = await makeMonitorProjection(
-            for: candidate,
-            inputs: inputs,
-            candidates: candidates,
-            candidatesByEndpoint: candidatesByEndpoint,
+            for: candidate, inputs: inputs, candidatesByEndpoint: candidatesByEndpoint,
             collectsStatusSamples: true
         )
+        #if DEBUG
+            await test_afterMonitorProjection?()
+        #endif
+        guard !isFrozenForTermination, self.host === host else { return nil }
         // Reconciled here rather than inside the row builder, because this is the only pass that is
         // authoritative about membership *and* status at once.
+        // One post-await snapshot serves both eligibility and app-wide UUID uniqueness. Empty,
+        // unrelated chats need neither. Do not share this freshness-sensitive snapshot across hops.
+        let needsFreshCandidates = passiveNoticesByObserver[candidate.domainEndpoint] != nil
+            || !monitor.statusSamples.isEmpty || !inputs.outbound.items.isEmpty
+        let freshCandidates = needsFreshCandidates ? host.agentSessionLinkCandidates(
+            forSessionIDs: Set(inputs.outbound.items.map(\.targetSessionID)), includeLocation: false
+        ).values.flatMap(\.self) : []
+        let currentCandidate = needsFreshCandidates
+            ? host.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
+        scheduleReadOnlyApprovals(observer: candidate.domainEndpoint, targetIDs: inputs.outbound.items.map(\.targetSessionID))
         let passiveNotices = reconcilePassiveNotices(
             for: candidate,
             samples: monitor.statusSamples,
-            linkSetRevision: inputs.outbound.linkSetRevision
+            linkSetRevision: inputs.outbound.linkSetRevision,
+            currentCandidate: currentCandidate,
+            localInputSources: inputs.outbound.items.compactMap { item in
+                guard item.capabilities.contains(.read),
+                      let target = inputs.outboundTargetEndpoints[item.linkID] else { return nil }
+                return AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                    reference: .init(linkID: item.linkID, generation: item.generation), target: target,
+                    snapshot: host.agentSessionLinkLocalInputSnapshot(for: target, includeRecords: false)
+                )
+            }
         )
         return EndpointProjection(
             props: monitor.props,
             // Built from the authority inventory, not from the UI rows: those substitute a live
             // candidate's name and status when the grant carries none, and neither substitution may
             // leak into agent-facing prompt text.
-            promptInventory: laneAnnotatedPromptInventory(inputs.outbound),
+            promptInventory: laneAnnotatedPromptInventory(inputs.outbound, freshCandidates: freshCandidates),
             passiveNotices: passiveNotices
         )
+    }
+
+    /// Only authority-recorded exact peers can contribute to these linked rows/inbound choices.
+    private func presentationCandidates(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        inputs: DomainAgentSessionLinkEndpointProjectionInputs
+    ) -> [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] {
+        var endpoints: Set<DomainAgentSessionLinkEndpointIdentity> = [endpoint]
+        endpoints.formUnion(inputs.outboundTargetEndpoints.values)
+        endpoints.formUnion(inputs.inboundObserverEndpoints.values)
+        for notice in inputs.notices {
+            if let observer = notice.observerEndpoint {
+                endpoints.insert(observer)
+            }
+            if let target = notice.targetEndpoint {
+                endpoints.insert(target)
+            }
+        }
+        // Fork linked summaries retain app-wide UUID name fallback, including a moved incarnation.
+        // This bounded census does not build the complete outbound menu choices.
+        var sessionIDs = Set(endpoints.map(\.sessionID))
+        if let creator = host?.agentSessionLinkLaneProvenance(for: endpoint) { sessionIDs.insert(creator) }
+        let candidates = host?.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: true).values.flatMap(\.self) ?? []
+        return Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Annotate only uniquely resolved live targets; an ambiguous session UUID grants no provenance.
     func laneAnnotatedPromptInventory(
         _ inventory: DomainAgentSessionLinkInventory
     ) -> AgentSessionLinkPromptInventory {
-        let candidates = host?.agentSessionLinkCandidates() ?? []
-        let bySessionID = Dictionary(grouping: candidates, by: \.sessionID)
+        guard !inventory.items.isEmpty else { return AgentSessionLinkPromptInventory(inventory) }
+        return laneAnnotatedPromptInventory(inventory, freshCandidates: host?.agentSessionLinkCandidates(
+            forSessionIDs: Set(inventory.items.map(\.targetSessionID)), includeLocation: false
+        ).values.flatMap(\.self) ?? [])
+    }
+
+    /// Called synchronously with a snapshot read after this endpoint's final authority hop.
+    private func laneAnnotatedPromptInventory(
+        _ inventory: DomainAgentSessionLinkInventory,
+        freshCandidates: [AgentSessionLinkEndpointCandidate]
+    ) -> AgentSessionLinkPromptInventory {
+        guard !inventory.items.isEmpty else { return AgentSessionLinkPromptInventory(inventory) }
+        let bySessionID = Dictionary(grouping: freshCandidates, by: \.sessionID)
         return AgentSessionLinkPromptInventory(inventory) { targetID in
             guard let matches = bySessionID[targetID], matches.count == 1 else { return false }
             return host?.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint)
@@ -3994,12 +4994,16 @@ final class AgentSessionLinkRuntimeBridge {
     private func makeMonitorProjection(
         for candidate: AgentSessionLinkEndpointCandidate,
         inputs: DomainAgentSessionLinkEndpointProjectionInputs,
-        candidates: [AgentSessionLinkEndpointCandidate],
         candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate],
         collectsStatusSamples: Bool = false
     ) async -> MonitorProjection {
         let sessionID = candidate.sessionID
         let endpoint = candidate.domainEndpoint
+        // Display names resolve app-wide by session ID: a linked peer whose exact endpoint
+        // incarnation moved (rebind or another window) still names itself, and the compact ID
+        // only shows for a truly unknown session.
+        let peerIDs = Set(inputs.outbound.items.map(\.targetSessionID)).union(inputs.inbound.items.map(\.observerSessionID))
+        let candidatesBySessionID = host?.agentSessionLinkCandidates(forSessionIDs: peerIDs, includeLocation: true).compactMapValues { $0.first } ?? [:]
 
         var outbound: [AgentMonitorPillProps.Outbound] = []
         var statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
@@ -4054,7 +5058,9 @@ final class AgentSessionLinkRuntimeBridge {
                 generation: item.generation,
                 targetSessionID: item.targetSessionID,
                 targetEndpoint: targetEndpoint,
+                linkCreatedAt: item.createdAt,
                 displayName: item.displayName ?? target?.resolvedDisplayName
+                    ?? candidatesBySessionID[item.targetSessionID]?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.targetSessionID),
                 providerDisplayName: target?.providerDisplayName,
                 locationLabel: target?.locationLabel,
@@ -4065,7 +5071,7 @@ final class AgentSessionLinkRuntimeBridge {
             ))
         }
 
-        let inbound: [AgentMonitorPillProps.Inbound] = inputs.inbound.items.compactMap { item in
+        let inbound: [AgentMonitorPillProps.Inbound] = inputs.inbound.items.compactMap { item -> AgentMonitorPillProps.Inbound? in
             guard let observerEndpoint = inputs.inboundObserverEndpoints[item.linkID] else {
                 assertionFailure("Active inbound oversight link is missing its exact observer endpoint.")
                 return nil
@@ -4076,7 +5082,9 @@ final class AgentSessionLinkRuntimeBridge {
                 generation: item.generation,
                 observerSessionID: item.observerSessionID,
                 observerEndpoint: observerEndpoint,
+                linkCreatedAt: item.createdAt,
                 displayName: observer?.resolvedDisplayName
+                    ?? candidatesBySessionID[item.observerSessionID]?.resolvedDisplayName
                     ?? AgentMonitorSessionIDFormatter.short(item.observerSessionID),
                 // UI only, exactly as on the outbound rows: the observing session's window is what
                 // the user needs to identify here, and it never reaches an agent-facing payload.
@@ -4090,15 +5098,9 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
 
-        let props = AgentMonitorPillProps(
+        var props = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: AgentSidebarOversightMenuProjection.make(
-                target: candidate,
-                inputs: inputs,
-                candidates: candidates,
-                createdByLabel: host?.agentSessionLinkLaneCreatorLabel(for: endpoint)
-            ),
             outbound: outbound,
             inbound: inbound,
             recentNotices: inputs.notices.map { notice in
@@ -4134,6 +5136,7 @@ final class AgentSessionLinkRuntimeBridge {
                 isFrozenForTermination: isFrozenForTermination
             )
         )
+        props.readOnlyAutoApprovalEnabled = readOnlyApprovalTokens[endpoint] != nil
         return MonitorProjection(props: props, statusSamples: statusSamples)
     }
 
@@ -4359,10 +5362,27 @@ final class AgentSessionLinkRuntimeBridge {
     /// uses the presentation-only lane so the repaint cannot publish prompt inventory, consume its
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
-        guard let host else { return }
-        requestMonitorProjectionRefresh(
-            forExactObserverEndpoints: Set(host.agentSessionLinkCandidates().map(\.domainEndpoint))
-        )
+        // Retire the census at emission time, before the coalesced hop: eligibility and existence
+        // inputs can change without an authority revision, and a queued settle cannot stand in for
+        // the synchronous presentation fence the census contract requires.
+        sidebarObserverIndex = nil
+        guard !isFrozenForTermination, host != nil, !candidatePresentationRefreshPending else { return }
+        // Queued, not inline: the settle's own publish re-signals readiness, which would nest a
+        // full candidate pass on the caller's stack.
+        candidatePresentationRefreshPending = true
+        Task { @MainActor [weak self] in
+            self?.performCandidatePresentationRefresh()
+        }
+    }
+
+    /// Must stay synchronous: coalescing relies on each settle being atomic.
+    private func performCandidatePresentationRefresh() {
+        candidatePresentationRefreshPending = false
+        guard !isFrozenForTermination, let host else { return }
+        // Keep creator-name publication with its existing owner; it is not menu materialization.
+        settleCreatorNames(host.agentSessionLinkCandidates())
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: menuCatalog?.endpoints ?? [])
+        notifyCandidateAvailabilityChanged()
     }
 
     private func scheduleMonitorProjectionRefresh() {
@@ -4390,27 +5410,20 @@ final class AgentSessionLinkRuntimeBridge {
         forExactObserverEndpoints endpoints: Set<DomainAgentSessionLinkEndpointIdentity>
     ) async {
         for observer in endpoints {
-            guard !isFrozenForTermination, monitorProjectionEndpointIsLive(observer) else { continue }
-            let inputs = await authority.projectionInputs(forEndpoint: observer)
-            guard !isFrozenForTermination, let host else { return }
-            // One candidate read after the hop backs both the observer's own revalidation and the
-            // peer lookup, so the rows cannot mix two window snapshots.
-            let candidates = host.agentSessionLinkCandidates()
-            guard let candidate = candidates.first(where: { $0.domainEndpoint == observer }) else {
-                continue
-            }
-            let byEndpoint = Dictionary(
-                candidates.map { ($0.domainEndpoint, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
+            guard !isFrozenForTermination else { continue }
+            guard let inputs = menuCatalog?.inputs[observer],
+                  menuCatalog?.endpoints.contains(observer) == true,
+                  let host,
+                  let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: true)
+            else { continue }
+            let candidates = presentationCandidates(for: observer, inputs: inputs)
             // Rows only: `statusSamples` are deliberately dropped here. Location, Seen, settings,
             // sidebar-menu, and observer-role repaints are not authoritative status observations;
             // presentation work cannot queue a notice or trigger Auto-wake.
             let monitor = await makeMonitorProjection(
                 for: candidate,
                 inputs: inputs,
-                candidates: candidates,
-                candidatesByEndpoint: byEndpoint
+                candidatesByEndpoint: candidates
             )
             host.agentSessionLinkPublishProjection(monitor.props, to: observer)
         }
@@ -4419,22 +5432,22 @@ final class AgentSessionLinkRuntimeBridge {
     private func monitorProjectionEndpointIsLive(
         _ endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        host?.agentSessionLinkCandidates().contains { $0.domainEndpoint == endpoint } ?? false
+        host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil
     }
 
     #if DEBUG
         /// Test seam: drains queued presentation-only projection refreshes, including work a drain
-        /// enqueues, so assertions observe settled rows.
-        func test_settleMonitorProjectionRefresh() async {
-            while let task = monitorProjectionRefreshTask {
-                await task.value
-            }
+        /// enqueues, so assertions observe settled rows. Tests that must fail rather than hang on
+        /// non-convergence pass `maxYields`; the drain then reports false instead of looping.
+        @discardableResult
+        func test_settleMonitorProjectionRefresh(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
         }
     #endif
 
     func dismissNotices(forEndpoint endpoint: DomainAgentSessionLinkEndpointIdentity) async {
         await authority.clearRecentRevocationNotices(forEndpoint: endpoint)
-        await requestProjectionRefresh()
+        await requestProjectionRefresh(.sessions([endpoint.sessionID]))
     }
 
     // MARK: - Unread acknowledgement
@@ -4699,7 +5712,7 @@ final class AgentSessionLinkRuntimeBridge {
             observer.eligibilityInput,
             roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
         ) == .eligible
-            && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+            && targetResolveFailure(for: target, observerSessionID: observerEndpoint.sessionID) == nil
     }
 
     /// Rebuild terminal-wait survivors without releasing a row or successor cursor through a
@@ -4735,7 +5748,7 @@ final class AgentSessionLinkRuntimeBridge {
                       roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
                   ) == .eligible,
                   let target = candidates.first(where: { $0.domainEndpoint == lease.target }),
-                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+                  targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil
             else { return nil }
             return state
         }
@@ -4775,7 +5788,7 @@ final class AgentSessionLinkRuntimeBridge {
         var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
         for lease in leases {
             guard let candidate = candidates.first(where: { $0.domainEndpoint == lease.target }),
-                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate) == nil,
+                  targetResolveFailure(for: candidate, observerSessionID: lease.observer.sessionID) == nil,
                   let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
                   AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                       observer.eligibilityInput,
@@ -4807,15 +5820,17 @@ final class AgentSessionLinkRuntimeBridge {
             return (inspections, Set(leases.map(\.target.sessionID)))
         }
         guard leases.count > 1, !isFrozenForTermination else { return nil }
-        var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
-        var surviving: Set<UUID> = []
+        var surviving: [DomainAgentSessionLinkLease] = []
         for lease in leases {
-            guard let own = await pendingInteractionsForObservation(leases: [lease]) else { continue }
-            inspections.merge(own) { _, fenced in fenced }
-            surviving.insert(lease.target.sessionID)
+            guard await pendingInteractionsForObservation(leases: [lease]) != nil else { continue }
+            surviving.append(lease)
         }
-        guard !surviving.isEmpty, !isFrozenForTermination else { return nil }
-        return (inspections, surviving)
+        // A later sibling's authority hop can invalidate an earlier survivor. Release only a fresh
+        // projection of the final whole-survivor batch, never the provisional per-target prompts.
+        guard !surviving.isEmpty,
+              let inspections = await pendingInteractionsForObservation(leases: surviving)
+        else { return nil }
+        return (inspections, Set(surviving.map(\.target.sessionID)))
     }
 
     /// Submits one explicit observer answer to the target's exact current interaction.
@@ -4826,7 +5841,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// withdrawn management, or endpoint replacement that lands mid-call applies nothing.
     func respondToInteraction(
         target: AuthorizedTarget,
-        request: AgentSessionLinkInteractionResponseRequest
+        request: AgentSessionLinkInteractionResponseRequest,
+        readOnlyApprovalToken: UUID? = nil
     ) async -> AgentSessionLinkInteractionDisposition {
         guard !isFrozenForTermination else { return .shuttingDown }
         guard let host else { return .denied }
@@ -4836,7 +5852,12 @@ final class AgentSessionLinkRuntimeBridge {
             request: request,
             authorize: { [weak self] in
                 guard let self else { return false }
-                return await managementLeaseIsStillAuthorized(lease)
+                guard await managementLeaseIsStillAuthorized(lease) else { return false }
+                if request.readOnlyAutoApproval {
+                    guard let readOnlyApprovalToken,
+                          readOnlyApprovalTokens[lease.observer] == readOnlyApprovalToken else { return false }
+                }
+                return true
             }
         )
         return .responded(outcome)
@@ -4866,6 +5887,48 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         return true
+    }
+
+    /// User consent only: this method has no MCP surface and changes no grant or wake setting.
+    @discardableResult
+    func setReadOnlyAutoApproval(_ enabled: Bool, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination,
+              host?.agentSessionLinkCandidate(for: observer, includeLocation: false) != nil else { return false }
+        if enabled {
+            if readOnlyApprovalTokens[observer] == nil { readOnlyApprovalTokens[observer] = UUID() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let links = await authority.links(forObserver: observer.sessionID)
+                scheduleReadOnlyApprovals(observer: observer, targetIDs: links.items.map(\.targetSessionID))
+            }
+        } else {
+            readOnlyApprovalTokens.removeValue(forKey: observer)
+        }
+        requestObserverLocalPolicyRepaint(for: observer)
+        return true
+    }
+
+    private func scheduleReadOnlyApprovals(observer: DomainAgentSessionLinkEndpointIdentity, targetIDs: [UUID]) {
+        guard let token = readOnlyApprovalTokens[observer], !readOnlyApprovalTasks.contains(observer) else { return }
+        readOnlyApprovalTasks.insert(observer)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { readOnlyApprovalTasks.remove(observer) }
+            for targetID in targetIDs {
+                guard readOnlyApprovalTokens[observer] == token, !isFrozenForTermination else { return }
+                guard case let .success(target) = await authorizeTarget(
+                    operation: .monitorRespond, observerEndpoint: observer, targetSessionID: targetID
+                ), readOnlyApprovalTokens[observer] == token,
+                let interaction = host?.agentSessionLinkPendingInteraction(for: target.candidate).interaction,
+                interaction.kind == .approval else { continue }
+                var request = AgentSessionLinkInteractionResponseRequest(
+                    interactionID: interaction.id,
+                    payload: .init(text: nil, skip: false, responseArgument: .scalar("accept"), amendment: nil, answersByQuestionID: [:])
+                )
+                request.readOnlyAutoApproval = true
+                _ = await respondToInteraction(target: target, request: request, readOnlyApprovalToken: token)
+            }
+        }
     }
 
     // MARK: Routine wake interval and Wake now routing
@@ -5041,12 +6104,67 @@ final class AgentSessionLinkRuntimeBridge {
         return .success(host)
     }
 
-    /// Applies one accepted provider receipt to the exact observer's queue.
-    ///
-    /// Synchronous because it runs at the provider's acceptance signal, on the same MainActor pass as
-    /// the dispatch it acknowledges. The reducer enforces epoch scoping, monotonicity, and
-    /// idempotence; the immediate republish is what stops a second natural dispatch from reclaiming a
-    /// batch that was already physically delivered.
+    /// Claim-time pull over baseline-selected status entries only. No transcript/global census.
+    func localInputDecoration(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        inventory: AgentSessionLinkPromptInventory,
+        baseline: AgentSessionLinkPromptRenderResult
+    ) -> AgentSessionLinkLocalInputDecoration? {
+        guard !isFrozenForTermination, let host,
+              let observerCandidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: observerCandidate),
+              var notices = passiveNoticesByObserver[observer],
+              let entries = baseline.passiveBatch?.entries else { return nil }
+        var offers: [AgentSessionLinkPassiveStatusNotices.LocalInputOffer] = []
+        for entry in entries {
+            guard inventory.items.contains(where: {
+                $0.reference == entry.reference && $0.targetSessionID == entry.targetSessionID && $0.capabilityNames.contains("read")
+            }) else { continue }
+            let source = AgentSessionLinkPassiveStatusNotices.LocalInputSource(
+                reference: entry.reference, target: entry.targetEndpoint,
+                snapshot: host.agentSessionLinkLocalInputSnapshot(for: entry.targetEndpoint, includeRecords: true)
+            )
+            if let offer = notices.localInputOffer(for: source) { offers.append(offer) }
+        }
+        passiveNoticesByObserver[observer] = notices
+        return AgentSessionLinkPrompts.decorateLocalInputs(baseline, offers: offers)
+    }
+
+    /// Exact endpoints, content and captured frontier. Safe both before and after authority await.
+    func localInputContentIsCurrent(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: candidate),
+              let notices = passiveNoticesByObserver[observer],
+              notices.canConsumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        return decoration.requirements.allSatisfy { requirement in
+            let range = requirement.offer.range
+            guard let snapshot = host.agentSessionLinkLocalInputSnapshot(for: range.target, includeRecords: true),
+                  snapshot.epoch == range.indexEpoch, snapshot.producedThrough >= range.throughOrdinal else { return false }
+            return requirement.renderedRecords.allSatisfy { frozen in
+                snapshot.records.contains(where: {
+                    $0.itemID == frozen.itemID && $0.ordinal == frozen.ordinal && $0.contentVersion == frozen.contentVersion && $0.content == frozen.content
+                })
+            }
+        }
+    }
+
+    func proveLocalInputRead(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer) else { return false }
+        let requirements = decoration.requirements.map {
+            DomainAgentSessionReadDisclosureRequirement(observer: observer, target: $0.offer.range.target, reference: $0.offer.range.reference)
+        }
+        return await authority.validateReadDisclosures(requirements)
+    }
+
+    /// Synchronous final handoff consumption; no publication, acceptance or wake state mutation.
+    func consumeLocalInputHandoff(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard localInputContentIsCurrent(decoration, observer: observer), var notices = passiveNoticesByObserver[observer],
+              notices.consumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
+        passiveNoticesByObserver[observer] = notices
+        return true
+    }
+
     func applyPassiveMonitorNoticeReceipt(
         _ receipt: AgentSessionLinkPassiveStatusNotices.Receipt,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -5068,7 +6186,9 @@ final class AgentSessionLinkRuntimeBridge {
     private func reconcilePassiveNotices(
         for candidate: AgentSessionLinkEndpointCandidate,
         samples: [AgentSessionLinkPassiveStatusNotices.Sample],
-        linkSetRevision: UInt64
+        linkSetRevision: UInt64,
+        currentCandidate current: AgentSessionLinkEndpointCandidate?,
+        localInputSources: [AgentSessionLinkPassiveStatusNotices.LocalInputSource]
     ) -> AgentSessionLinkPassiveStatusNotices.Snapshot? {
         let endpoint = candidate.domainEndpoint
         let existing = passiveNoticesByObserver[endpoint]
@@ -5078,8 +6198,8 @@ final class AgentSessionLinkRuntimeBridge {
         // a suppression that landed during the hop has nothing else to catch it — and an observer that
         // cannot be told anything must stop accumulating rather than keep a backlog. Fails closed: an
         // endpoint that vanished during the hop is not deliverable.
-        let current = host?.agentSessionLinkCandidates()
-            .first { $0.domainEndpoint == endpoint }
+        // The caller supplies the fresh post-hop exact candidate; nil is an authoritative absence,
+        // never a request to reconstruct candidates or reuse the pre-hop presentation snapshot.
         let deliverable = current.map(Self.passiveDeliveryIsPermitted) ?? false
         var notices = existing
             ?? AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
@@ -5107,6 +6227,7 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         notices.setAutoWakeLanes(autoWakeLanes)
+        notices.reconcileLocalInputSources(localInputSources)
         let snapshot = notices.snapshot
         if samples.isEmpty {
             // The last direct link went away. Publish one terminal empty snapshot so the view model
@@ -5392,15 +6513,33 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
-        let leaseResult = await authority.authorize(
+        // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
+        delegationScopes.reconcileGlobalAutoApprove()
+        var leaseResult = await authority.authorize(
             operation: operation,
             observerEndpoint: observerEndpoint,
             targetSessionID: targetSessionID
         )
+        // Full access: a stored link capability is not a ceiling (`linkCapabilityCeiling`). Ensuring the
+        // observer's full-access grant elevates its links in the authority; the stored link is unchanged.
+        if case .failure(.capabilityDenied) = leaseResult,
+           delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: observerEndpoint.sessionID)
+        {
+            _ = await ensureScopedLinkConsent()
+            leaseResult = await authority.authorize(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            )
+        }
         let lease: DomainAgentSessionLinkLease
         switch leaseResult {
         case let .success(value):
             lease = value
+        case .failure(.noActiveLink):
+            // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
+            guard let established = await establishFullAccessLink(
+                operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+            ) else { return .failure(.denied) }
+            lease = established
         case let .failure(error):
             if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
                 if operation == .monitorSetModel {
@@ -5425,6 +6564,45 @@ final class AgentSessionLinkRuntimeBridge {
             return .failure(.denied)
         }
         return .success(AuthorizedTarget(lease: lease, candidate: candidate))
+    }
+
+    /// Full access (`OverseerAuthorizationEngine.fullAccessLinkSource`): a missing link is not a
+    /// permission barrier. Establishes the ordinary managed link through the delegated durable Add, with
+    /// the full-access grant as its source scope (turning full access off revokes the grant and, with it,
+    /// this link), then authorizes the operation normally. Transport integrity still applies: exactly one
+    /// live target endpoint, a live observer endpoint, no self-link, and every Add commit fence.
+    private func establishFullAccessLink(
+        operation: DomainAgentSessionTargetOperation,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) async -> DomainAgentSessionLinkLease? {
+        let engine = delegationScopes.authorization
+        guard let host, targetSessionID != observerEndpoint.sessionID,
+              let source = engine.fullAccessLinkSource(observerSessionID: observerEndpoint.sessionID)
+        else { return nil }
+        let candidates = host.agentSessionLinkCandidates()
+        let targets = candidates.filter { $0.sessionID == targetSessionID }
+        guard targets.count == 1, let target = targets.first,
+              candidates.contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return nil }
+        let sourceScopeID = source.id
+        switch await addDelegatedMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(
+                sourceScopeID: sourceScopeID,
+                isCurrent: { engine.isFullAccessLinkSourceCurrent(sourceScopeID) }
+            )
+        ) {
+        case .added, .alreadyLinked:
+            break
+        default:
+            return nil
+        }
+        guard case let .success(lease) = await authority.authorize(
+            operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID
+        ) else { return nil }
+        return lease
     }
 
     /// Tells "linked, but management was not granted" apart from "not linked" for one management
@@ -5517,8 +6695,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard let liveTarget, let liveObserver else { return nil }
 
-        guard await revalidateObserverCapability(liveObserver) else { return nil }
-        return liveTarget
+        guard await revalidateObserverCapability(liveObserver), self.host === host,
+              let current = host.agentSessionLinkCandidate(for: liveTarget.domainEndpoint, includeLocation: false),
+              targetResolveFailure(for: current, observerSessionID: lease.observer.sessionID) == nil
+        else { return nil }
+        return current
     }
 
     /// Re-checks one live observer's capability, revoking its outbound grants on permanent loss.
@@ -5576,7 +6757,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// `list` presents no per-target proof, so without this it would remain callable by an observer
     /// that had already lost the capability. The lookup is by exact endpoint rather than by session
     /// UUID: a duplicate live incarnation must not satisfy the check on the granted one's behalf.
-    private func revalidateObserver(
+    func revalidateObserver(
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         guard let host else { return false }
@@ -5597,16 +6778,28 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Authoritative outbound inventory for a targetless `list`.
     ///
-    /// `list` names no target, so it is authorized against the caller's own grant set and exists only
-    /// while at least one outbound link remains.
+    /// Linked observers list their own grant set. An explicitly activated eligible caller may also
+    /// inspect its own empty set; activation never supplies authority over a target.
     func inventory(
         forObserverEndpoint observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Result<DomainAgentSessionLinkInventory, AuthorizationFailure> {
         guard await revalidateObserver(endpoint: observerEndpoint) else {
             return .failure(.denied)
         }
-        return await authority.authorizeInventory(observerEndpoint: observerEndpoint)
-            .mapError(AuthorizationFailure.init)
+        let result = await authority.authorizeInventory(observerEndpoint: observerEndpoint)
+        if case .failure(.noActiveLink) = result,
+           let activation = overseerBootstrapState(for: observerEndpoint)?.activation,
+           activation.endpoint == observerEndpoint
+        {
+            // Activation admits discovery of the caller's own empty set, never any target action.
+            // Keep the domain's link-only authorization unchanged for unactivated inbound callers.
+            let inventory = await authority.links(forObserverEndpoint: observerEndpoint)
+            guard await revalidateObserver(endpoint: observerEndpoint),
+                  overseerBootstrapState(for: observerEndpoint)?.activation == activation,
+                  !isFrozenForTermination else { return .failure(.denied) }
+            return .success(inventory)
+        }
+        return result.mapError(AuthorizationFailure.init)
     }
 
     func setWaitingOn(
@@ -5641,25 +6834,27 @@ final class AgentSessionLinkRuntimeBridge {
               grant.target == lease.target
         else { return false }
         return grant.capabilities.contains(.manage)
+            || delegationScopes.authorization.elevatesLinkCapabilities(observerSessionID: lease.observer.sessionID, issue: false)
     }
 
     /// Loads durable child metadata once for the batch, then publishes the resulting target
-    /// snapshots before a poll or wait reads the authority. One live-candidate map serves all rows.
+    /// snapshots before a poll or wait reads the authority. Each captured owner gets one exact read.
     func refreshLaneBoardCensus(for targets: [AuthorizedTarget]) async {
         guard let host, !targets.isEmpty else { return }
-        await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
-        let candidatesByEndpoint = Dictionary(
-            host.agentSessionLinkCandidates().map { ($0.domainEndpoint, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        for target in targets {
-            publishTargetSnapshot(
-                forTargetSession: target.lease.target.sessionID,
-                validatedCandidate: candidatesByEndpoint[target.candidate.domainEndpoint]
-            )
+        let owners = targets.compactMap { target -> TargetPublicationChain? in
+            guard let chain = chains[target.lease.target.sessionID],
+                  chain.endpoint == target.lease.target else { return nil }
+            return chain
         }
-        for target in targets {
-            await chains[target.lease.target.sessionID]?.tail?.value
+        await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
+        for chain in owners {
+            guard chains[chain.endpoint.sessionID] === chain else { continue }
+            let candidate = host.agentSessionLinkCandidate(for: chain.endpoint, includeLocation: false)
+            // No suspension between the exact host read and ownership-guarded sampling.
+            publishTargetSnapshot(endpoint: chain.endpoint, originatingChain: chain, lookup: .resolved(candidate))
+        }
+        for chain in owners {
+            await chain.tail?.value
         }
     }
 
@@ -5705,6 +6900,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         localInputReleaseTasks[endpoint] = task
         return task
+    }
+
+    func resolveWaitCursorTargets(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        cursors: [String]
+    ) async -> Result<[UUID], DomainAgentSessionLinkError> {
+        await authority.resolveWaitCursorTargets(observerEndpoint: observerEndpoint, cursors: cursors)
     }
 
     /// Bounded, event-driven wait. The authority owns one-waiter admission and atomic multi-target
@@ -5756,6 +6958,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// paths above, and `request_attention` continues to authorize through its exact inverse proof.
     func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
         await authority.hasActiveLink(endpoint: endpoint)
+    }
+
+    /// Exact-pair active link for delegation-scope `link` (report as-is, never upgrade) and `unlink`
+    /// (reference for the ordinary Stop). Bookkeeping only: the scope authority already authorized
+    /// the operation, and Add/Stop below remain the only mutation paths.
+    func delegationActiveLink(observerSessionID: UUID, targetSessionID: UUID) async -> DomainAgentSessionLinkInventoryItem? {
+        await authority.links(forObserver: observerSessionID).items.first { $0.targetSessionID == targetSessionID }
     }
 
     // MARK: - Sanitized read
@@ -5928,6 +7137,10 @@ final class AgentSessionLinkRuntimeBridge {
             return .rejected(.denied)
         }
 
+        // Managed task assignment includes idle sends and create_lane's first task, not just
+        // steer. Sample exact management authority and require it again at the final dispatch fence.
+        let managedTargets = await authority.managedObservationTargetsIfValid(leases: [target.lease])
+        let requiresManagement = delivery == .managedSteer || managedTargets?.contains(target.candidate.sessionID) == true
         let disposition = await authority.beginSend(
             lease: target.lease,
             idempotencyKey: idempotencyKey,
@@ -5993,7 +7206,7 @@ final class AgentSessionLinkRuntimeBridge {
             observerDisplayName: observer.resolvedDisplayName,
             message: message,
             workflow: workflow,
-            framing: delivery == .managedSteer ? .management : .coordination
+            framing: requiresManagement ? .management : .coordination
         )
         request.startStopFence = startStopFence
         // Keep the host that supplied this exact candidate through the send transaction. The
@@ -6005,7 +7218,6 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         let authority = authority
-        let requiresManagement = delivery == .managedSteer
         let commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome = {
             // A queued drain's cancellation cutoff, taken synchronously on the bridge's main
             // actor immediately before the authority hop. Refusing here is indistinguishable
@@ -6090,6 +7302,7 @@ final class AgentSessionLinkRuntimeBridge {
               let target = host.agentSessionLinkModelCandidate(for: lease.target),
               observer.domainEndpoint == lease.observer, target.domainEndpoint == lease.target,
               !observer.isClosing, !target.isClosing,
+              targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil,
               !observer.isDeletionInProgress, !target.isDeletionInProgress,
               AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                   observer.eligibilityInput,
@@ -6729,7 +7942,7 @@ final class AgentSessionLinkRuntimeBridge {
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
-            case .persistenceFailed, .persistenceIndeterminate:
+            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
@@ -6963,26 +8176,205 @@ final class AgentSessionLinkRuntimeBridge {
         laneCreationCapGeneration[creatorSessionID, default: 0] &+= 1
     }
 
-    /// Early service gate so workspace resolution cannot disclose destinations to an unlinked caller.
+    /// Memory-only catalog fact, qualified by the current eligible session object and binding.
+    func overseerBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
+        guard !isFrozenForTermination else { return nil }
+        return host?.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    /// Catalog listing and refusal text only; never admits activation.
+    func overseerBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal? {
+        guard !isFrozenForTermination else { return .terminating }
+        guard let host else { return .notLoaded }
+        return host.agentSessionLinkBootstrapRefusal(for: endpoint)
+    }
+
+    /// Direct user consent from the dashboard, not an Agent/MCP invocation. Capture the displayed
+    /// incarnation and compare it synchronously at commit; the tool's route-proof path stays separate.
+    /// Intentionally gates on agent_session_link only: direct user consent is not the become_overseer
+    /// MCP tool. MCP bootstrap additionally requires become_overseer availability and its route proof.
+    func enableOverseerFromToolbar(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        expected: AgentSessionOverseerBootstrapState,
+        isEnabled: @MainActor () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) }
+    ) async -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
+              host.agentSessionLinkBootstrapState(for: endpoint) == expected,
+              await !(authority.hasActiveLink(endpoint: endpoint))
+        else { return false }
+        // Like tool bootstrap, consent linearizes at the no-link authority sample. Any relationship
+        // committed after that sample is independently ordered; re-fence the captured incarnation.
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
+              host.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
+        else { return false }
+        // Consent is already committed. Catalog publication neither grants links nor starts a turn.
+        await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+        return true
+    }
+
+    func becomeOverseer(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        isEnabled: @escaping @MainActor () -> Bool,
+        revalidateRoute: @MainActor () async -> Bool,
+        commitIfCurrent: @MainActor (_ commit: () -> Bool) -> Bool,
+        continuingTargetedRequest: Bool = false
+    ) async -> AgentProviderKind? {
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
+              let initial = host.agentSessionLinkBootstrapState(for: endpoint),
+              continuingTargetedRequest || initial.activation == nil
+        else { return nil }
+        if !continuingTargetedRequest, await authority.hasActiveLink(endpoint: endpoint) { return nil }
+        guard await revalidateRoute() else { return nil }
+        #if DEBUG
+            await test_afterBootstrapRouteValidation?()
+        #endif
+        // Bootstrap may linearize at this no-link sample while the route proof is valid. A grant
+        // committed after the sample is an independently ordered inbound/outbound relationship;
+        // activation plus inbound is supported. This is not physical cross-actor atomicity.
+        if !continuingTargetedRequest, await authority.hasActiveLink(endpoint: endpoint) { return nil }
+        guard commitIfCurrent({
+            guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
+                  host.agentSessionLinkBootstrapState(for: endpoint) == initial
+            else { return false }
+            return initial.activation != nil || host.agentSessionLinkActivateOverseer(for: endpoint, expected: initial)
+        }) else { return nil }
+        await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+        return initial.provider
+    }
+
+    private func laneCreationCallerIsCurrent(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        basis: LaneCreationCallerBasis
+    ) async -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
+        // Global Overseer full access: an eligible caller creates lanes without activation or a link.
+        if case .linked = basis, delegationScopes.authorization.laneCreatorRequiresActiveLink {
+            guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
+        }
+        return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)
+    }
+
+    /// Synchronous incarnation/eligibility fence after the last authority suspension.
+    private func laneCreationCallerEndpointIsCurrent(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        basis: LaneCreationCallerBasis
+    ) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, let host else { return false }
+        if case let .activated(activation) = basis {
+            guard host.agentSessionLinkBootstrapState(for: endpoint)?.activation == activation else { return false }
+        }
+        guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return false }
+        return AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) == nil
+    }
+
+    private func laneCreationCallerBasis(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> LaneCreationCallerBasis {
+        if let activation = host?.agentSessionLinkBootstrapState(for: endpoint)?.activation { return .activated(activation) }
+        return .linked
+    }
+
+    /// An activation-backed establishment exposes its indexed grant before final validation. A caller
+    /// without its own activation must not promote that provisional grant into an unrelated linked
+    /// creation. An independently indexed exact grant bypasses the wait. Otherwise wait for the
+    /// existing pair owner (including validation and compensation), not just the inner authority
+    /// task. These are exact-endpoint dependencies, never a creator-wide lock.
+    /// Called only before allocating this creation's target, so it cannot wait on itself or a child.
+    private func settledLaneCreationCallerBasis(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        initialBasis: LaneCreationCallerBasis
+    ) async -> LaneCreationCallerBasis? {
+        if case .activated = initialBasis { return initialBasis }
+        // Match the existing cap-admission stability budget. Churn cannot keep this gate retrying
+        // forever, and the generation survives removal of the last reservation/task entry.
+        for _ in 0 ..< 32 {
+            guard !isFrozenForTermination, !Task.isCancelled else { return nil }
+            let generation = laneCreationCapGeneration[endpoint.sessionID, default: 0]
+            let basis = laneCreationCallerBasis(for: endpoint)
+            if case .activated = basis { return basis }
+            let pending = laneCreationBootstrapEstablishments(for: endpoint)
+            guard !pending.isEmpty else { return basis }
+            #if DEBUG
+                await test_beforeLaneCreationIndependentGrantSample?(Set(pending.compactMap(\.expectedEndpoints.target)))
+            #endif
+            let independent = await authority.activeDirectGrant(
+                endpoint: endpoint,
+                excludingOutboundTargets: Set(pending.compactMap(\.expectedEndpoints.target))
+            )
+            #if DEBUG
+                await test_afterLaneCreationIndependentGrantSample?(independent)
+            #endif
+            guard !isFrozenForTermination, !Task.isCancelled else { return nil }
+            // A provisional generation may have entered and fully rolled back during the actor
+            // hop. Its absence from today's task table is not proof of independent authority.
+            guard generation == laneCreationCapGeneration[endpoint.sessionID, default: 0] else { continue }
+            let current = laneCreationBootstrapEstablishments(for: endpoint)
+            if let independent,
+               independent.target == endpoint || !current.contains(where: { $0.expectedEndpoints.target == independent.target })
+            {
+                return laneCreationCallerBasis(for: endpoint)
+            }
+            let pairs = Set(current.map(\.pair))
+            let owners = pairs.compactMap { pairEstablishmentBarriers[$0]?.task }
+            guard owners.count == pairs.count else { return nil }
+            guard !owners.isEmpty else { return laneCreationCallerBasis(for: endpoint) }
+            #if DEBUG
+                test_beforeLaneCreationBootstrapSettlement?()
+            #endif
+            guard await awaitLaneCreationBootstrapSettlement(owners) else { return nil }
+            // A new exact bootstrap establishment may have entered while the previous owner settled.
+            // Re-read only the bounded in-flight task table; no host census or catalog mutation.
+        }
+        return nil
+    }
+
+    /// Cancellation abandons only this wait, never the independently owned first-lane transaction.
+    /// As with shutdown settlement, the losing completion branch has no side effects after release.
+    private func awaitLaneCreationBootstrapSettlement(_ owners: [Task<Void, Never>]) async -> Bool {
+        let gate = TransactionSettlementGate()
+        Task { @MainActor in
+            for owner in owners {
+                await owner.value
+            }
+            gate.finish(true)
+        }
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { gate.finish(false) }
+            return await gate.wait()
+        } onCancel: {
+            Task { @MainActor in gate.finish(false) }
+        }
+    }
+
+    private func laneCreationBootstrapEstablishments(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> [EstablishmentKey] {
+        establishmentTasks.keys.filter {
+            $0.expectedEndpoints.observer == endpoint && $0.expectedEndpoints.laneCreationActivation != nil
+        }
+    }
+
+    /// Early service gate so workspace resolution cannot disclose destinations to an unauthorized caller.
     func laneCreationCallerPreflight(
-        _ endpoint: DomainAgentSessionLinkEndpointIdentity
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        idempotencyKey: String? = nil
     ) async -> AgentSessionLaneCreateReceipt.Reason? {
         guard !isFrozenForTermination else { return .shuttingDown }
-        guard let candidate = host?.agentSessionLinkCandidates().first(where: {
-            $0.domainEndpoint == endpoint
-        }),
-            AgentSessionLinkEndpointEligibility.addDisabledReason(
-                candidate.eligibilityInput,
-                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-            ) == nil
-        else { return .denied }
-        return await authority.hasActiveLink(endpoint: endpoint) ? nil : .denied
+        // This exact endpoint already owns the claim. The normal parser/digest check and createLane
+        // join remain authoritative; a replay cannot start a new transaction or resolve a new basis.
+        if let idempotencyKey,
+           laneCreationTasks[LaneCreationKey(endpoint: endpoint, idempotencyKey: idempotencyKey)] != nil
+        { return nil }
+        guard let basis = await settledLaneCreationCallerBasis(
+            for: endpoint, initialBasis: laneCreationCallerBasis(for: endpoint)
+        ) else { return .denied }
+        return await laneCreationCallerIsCurrent(endpoint, basis: basis) ? nil : .denied
     }
 
     func createLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
+        resolveDestination: @escaping @MainActor () -> AgentSessionLaneDestinationResolution
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination else { return .refused(.shuttingDown) }
         let key = LaneCreationKey(endpoint: observerEndpoint, idempotencyKey: request.idempotencyKey)
@@ -7007,7 +8399,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let endpointReceiptCount = laneCreationReceipts.keys.count(where: { $0.endpoint == observerEndpoint })
             + laneCreationTombstones.keys.count(where: { $0.endpoint == observerEndpoint })
-        // Global in-flight pressure and per-creator lane capacity happen to share the value eight.
+        // Global in-flight creation pressure remains capped at eight, independently of per-creator lane capacity.
         guard endpointReceiptCount + laneCreationTasks.keys.count(where: { $0.endpoint == observerEndpoint }) < 256,
               laneCreationTasks.count < 8
         else {
@@ -7016,6 +8408,7 @@ final class AgentSessionLinkRuntimeBridge {
         // The claim is MainActor-local and happens before the first suspension. Replays join this
         // exact task even while authorization, persistence, or destination discovery is suspended.
         let claimID = UUID()
+        let callerBasis = laneCreationCallerBasis(for: observerEndpoint)
         let task = Task { @MainActor [weak self] in
             guard let self else { return AgentSessionLaneCreateReceipt.refused(.denied) }
             #if DEBUG
@@ -7023,8 +8416,14 @@ final class AgentSessionLinkRuntimeBridge {
             #endif
             let transaction = registerTransaction()
             defer { finishTransaction(transaction) }
+            guard let settledBasis = await settledLaneCreationCallerBasis(
+                for: observerEndpoint, initialBasis: callerBasis
+            ) else {
+                return .refused(isFrozenForTermination || Task.isCancelled ? .shuttingDown : .denied)
+            }
             return await performClaimedLaneCreation(
                 observerEndpoint: observerEndpoint,
+                callerBasis: settledBasis,
                 request: request,
                 resolveDestination: resolveDestination
             )
@@ -7046,26 +8445,24 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func performClaimedLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        callerBasis: LaneCreationCallerBasis,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
+        resolveDestination: @escaping @MainActor () -> AgentSessionLaneDestinationResolution
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard let host,
-              let observer = host.agentSessionLinkCandidates().first(where: {
-                  $0.domainEndpoint == observerEndpoint
-              }),
-              AgentSessionLinkEndpointEligibility.addDisabledReason(
-                  observer.eligibilityInput,
-                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-              ) == nil,
-              await authority.hasActiveLink(endpoint: observerEndpoint)
+        guard let host, await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis)
         else { return .refused(.denied) }
-        guard case .available = await intentPersistenceAdmission() else {
-            return .refused(.persistenceUnavailable)
-        }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard let destination = resolveDestination()
-        else { return .refused(.destinationUnavailable) }
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
+        let destination: AgentSessionLaneDestination
+        switch resolveDestination() {
+        case let .available(value): destination = value
+        case let .unavailable(failure):
+            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            receipt.destinationFailure = failure
+            receipt.refusalStage = "destination_resolution"
+            return receipt
+        }
         let selection: AgentSessionLanePolicy.RoleSelection
         do {
             if let modelID = request.modelID {
@@ -7074,16 +8471,19 @@ final class AgentSessionLinkRuntimeBridge {
                     modelID, availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID)
                 )
             } else {
-                // Preserve the existing role/default behavior. Explicit selections never warm.
+                // Role/default selections retain persisted-catalog warming. Explicit selections never warm.
                 await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
                 selection = try AgentSessionLanePolicy.resolveRole(
-                    request.role, availability: .current, workspaceID: destination.workspaceID
+                    request.role,
+                    availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID),
+                    workspaceID: destination.workspaceID
                 )
             }
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
-        guard await authority.hasActiveLink(endpoint: observerEndpoint) else { return .refused(.denied) }
-        // No suspension between this count and the reservation: admission is creator-scoped and
-        // counts both active lanes and the pending allocations that have not linked yet.
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
+        // Admission is creator-scoped and counts active lanes plus pending allocations. The final
+        // authorization must be inside the stability fence: it can suspend while a competing
+        // reservation becomes a linked lane and is released.
         let creatorID = observerEndpoint.sessionID
         var linkedIDs: Set<UUID>
         var stabilityAttempts = 0
@@ -7096,8 +8496,14 @@ final class AgentSessionLinkRuntimeBridge {
             #if DEBUG
                 await test_afterLaneCapInventoryBeforeRevision?()
             #endif
+            #if DEBUG
+                await test_beforeLaneCapCallerValidation?()
+            #endif
+            guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
             let currentRevision = await authority.snapshot().authorityRevision
             guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard laneCreationCallerEndpointIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
             if generation == laneCreationCapGeneration[creatorID, default: 0],
                snapshot.revision == currentRevision
             {
@@ -7105,12 +8511,10 @@ final class AgentSessionLinkRuntimeBridge {
                 break
             }
         }
+        // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
-        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
-        else { return .refused(.denied) }
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-        guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        guard delegationScopes.authorization.admitsAdditionalLane(admittedLaneCount: admittedCount)
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
@@ -7122,7 +8526,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         return await performLaneCreation(
-            observerEndpoint: observerEndpoint, request: request, selection: selection,
+            observerEndpoint: observerEndpoint, callerBasis: callerBasis, request: request, selection: selection,
             destinationWindowID: destination.windowID, workspaceID: destination.workspaceID,
             workspaceName: destination.workspaceName, reservationTicket: ticket
         )
@@ -7130,6 +8534,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func performLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        callerBasis: LaneCreationCallerBasis,
         request: AgentSessionLaneCreateRequest,
         selection: AgentSessionLanePolicy.RoleSelection,
         destinationWindowID: Int,
@@ -7140,13 +8545,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
             return .refused(.shuttingDown)
         }
-        guard host.agentSessionLinkCandidates().contains(where: {
-            $0.domainEndpoint == observerEndpoint
-                && AgentSessionLinkEndpointEligibility.addDisabledReason(
-                    $0.eligibilityInput,
-                    roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
-                ) == nil
-        }), await authority.hasActiveLink(endpoint: observerEndpoint) else {
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else {
             return .refused(.denied)
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
@@ -7168,7 +8567,47 @@ final class AgentSessionLinkRuntimeBridge {
             )
         } catch is AgentSessionLaneHostUnavailable {
             return .refused(.hostUnavailable)
-        } catch { return .refused(.destinationUnavailable) }
+        } catch let failure as AgentSessionLaneSpawnAdmissionFailure {
+            var receipt = AgentSessionLaneCreateReceipt.refused(.scopeDenied)
+            receipt.refusalDetail = failure.detail
+            receipt.admissionSubreason = failure.subreason
+            receipt.refusalStage = "scope_admission"
+            return receipt
+        } catch let failure as AgentSessionLaneDestinationFailure {
+            let reason: AgentSessionLaneCreateReceipt.Reason = if case .admissionRejected = failure {
+                .workspaceAdmissionRejected
+            } else { .destinationUnavailable }
+            var receipt: AgentSessionLaneCreateReceipt
+            if case let .admissionRejected(admission) = failure, let retained = admission.retainedAdmission {
+                // Recovery has not proved removal of this exact provisional identity. Retain the
+                // request in the existing incomplete ledger, including when admission was cancelled.
+                receipt = await AgentSessionLaneCreateReceipt(
+                    result: .creationIncomplete, sessionID: retained.identity.sessionID,
+                    sessionName: request.sessionName, linked: false, reason: reason, firstTask: .none,
+                    laneCount: linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
+                )
+                receipt.workspaceName = workspaceName
+            } else {
+                receipt = .refused(reason)
+            }
+            receipt.destinationFailure = failure
+            receipt.refusalStage = "host_allocation"
+            if case let .creationRejected(detail) = failure { receipt.refusalDetail = detail }
+            if case let .admissionRejected(admission) = failure {
+                receipt.refusalDetail = admission.detail
+                receipt.refusalStage = "workspace_admission"
+            }
+            return receipt
+        } catch {
+            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            let type = String(describing: Swift.type(of: error)).filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." }
+            receipt.destinationFailure = .hostError(String(type.prefix(120)))
+            receipt.refusalStage = "host_allocation"
+            // The type alone is not actionable. Only agent-facing invalid-params text is
+            // forwarded; internal error text stays private.
+            receipt.refusalDetail = Self.laneHostAgentFacingDetail(error)
+            return receipt
+        }
         let sessionID: UUID
         let tabID: UUID
         let bindingToken: AgentSessionRestorationBindingToken?
@@ -7206,6 +8645,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, !Task.isCancelled else {
             return await receipt(false, .shuttingDown)
         }
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return await receipt(false, .denied) }
         let matches = host.agentSessionLinkCandidates().filter { $0.sessionID == sessionID }
         guard matches.count == 1, matches[0].tabID == tabID,
               let bindingToken,
@@ -7222,13 +8662,21 @@ final class AgentSessionLinkRuntimeBridge {
                 observer: observer, target: matches[0], requireObserverAuthoritative: false
             )
         else { return await receipt(false, .addFailed) }
+        let activationBasis: LaneCreationActivationBasis? = switch callerBasis {
+        case .linked: nil
+        case let .activated(activation):
+            LaneCreationActivationBasis(activation: activation, target: laneEndpoint, bindingToken: bindingToken)
+        }
         let add = await addMonitorLink(
             pair: AgentSessionOversightIntent(
                 observerSessionID: observerEndpoint.sessionID, targetSessionID: sessionID
             ),
-            expectedObserverEndpoint: observerEndpoint,
-            expectedTargetEndpoint: laneEndpoint,
-            requiresExistingDirectLink: true,
+            expectedEndpoints: AddEndpointExpectations(
+                observer: observerEndpoint,
+                target: laneEndpoint,
+                requiresExistingDirectLink: activationBasis == nil,
+                laneCreationActivation: activationBasis
+            ),
             proof: proof
         )
         switch add {
@@ -7270,6 +8718,23 @@ final class AgentSessionLinkRuntimeBridge {
         case .workflowUnavailable: (.failed, "workflow")
         }
         return await receipt(true, nil, firstTask, firstTaskReason)
+    }
+
+    /// Exact-inventory proof that the granted link is still the target's only live relationship and
+    /// no send is in flight on it. Runs before preflight and again immediately before unlinking.
+    private func retireRelationshipFence(
+        targetSessionID: UUID,
+        lease: DomainAgentSessionLinkLease
+    ) async -> AgentSessionLaneRetireOutcome.Reason? {
+        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
+        guard relationships.inbound.items.count == 1 else { return .laneInUseInboundCount }
+        guard relationships.inbound.items[0].linkID == lease.linkID else { return .laneInUseInboundLink }
+        guard relationships.inbound.items[0].generation == lease.linkGeneration else {
+            return .laneInUseInboundGeneration
+        }
+        guard relationships.outbound.items.isEmpty else { return .laneInUseOutbound }
+        guard pendingSendsByReference[lease.reference] == nil else { return .laneInUsePending }
+        return nil
     }
 
     func retireLane(
@@ -7329,21 +8794,8 @@ final class AgentSessionLinkRuntimeBridge {
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
-        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard relationships.inbound.items.count == 1 else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundCount)
-        }
-        guard relationships.inbound.items[0].linkID == target.lease.linkID else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundLink)
-        }
-        guard relationships.inbound.items[0].generation == target.lease.linkGeneration else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundGeneration)
-        }
-        guard relationships.outbound.items.isEmpty else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseOutbound)
-        }
-        guard pendingSendsByReference[target.lease.reference] == nil else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUsePending)
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
         #if DEBUG
             await test_afterRetireRelationshipPrecheck?()
@@ -7363,9 +8815,31 @@ final class AgentSessionLinkRuntimeBridge {
             let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
+        // Preflight performs the required-session flush, the stash cascade's claim checks, and the
+        // workspace-save admission probe without mutating anything; a refusal leaves link and tab.
         guard await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: false, isStillRetirable: stillRetirable
         ) else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
+        // The flush may have settled a stale persisted child header; rescan before unlinking.
+        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
+        // Preflight's awaits kept the grant live: re-run the cheap fence immediately before unlink.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable() else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneBusy)
+        }
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
+        }
+        // The fence's awaits kept the grant live, so revalidate synchronously before unlinking.
+        // The residual window inside stopMonitorLink stays covered by post-unlink revalidation.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable(), host.agentSessionLinkRetirementReadiness(endpoint: endpoint)
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // Stop owns the pair-retirement lane. Wrapping it here would wait on our own barrier.
         let stop = await stopMonitorLink(
             observerEndpoint: observerEndpoint,
@@ -7391,13 +8865,13 @@ final class AgentSessionLinkRuntimeBridge {
 
     // MARK: - Resolution preview
 
-    /// Builds the pre-authorization preview. Resolution never focuses, activates, or switches the
-    /// target window, and knowing a UUID still grants nothing.
-    func resolvePreview(
+    /// Resolves a pasted target UUID to its exact live candidate. Resolution never focuses,
+    /// activates, or switches the target window, and knowing a UUID still grants nothing.
+    func resolveTargetCandidate(
         observerSessionID: UUID?,
         rawTargetSessionID: String,
         existingOutboundTargetIDs: Set<UUID>
-    ) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure> {
+    ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
         guard let host else { return .failure(.notFound) }
         guard let targetSessionID = AgentSessionLinkEndpointResolver.parseSessionID(rawTargetSessionID) else {
             return .failure(.malformedIdentifier)
@@ -7408,9 +8882,23 @@ final class AgentSessionLinkRuntimeBridge {
         if existingOutboundTargetIDs.contains(targetSessionID) {
             return .failure(.alreadyMonitoring)
         }
-        return AgentSessionLinkEndpointResolver.resolve(
-            sessionID: targetSessionID,
-            candidates: host.agentSessionLinkCandidates()
+        return resolveAddCandidate(
+            sessionID: targetSessionID, expectedEndpoint: nil,
+            candidates: host.agentSessionLinkCandidates(), observerSessionID: observerSessionID
+        )
+    }
+
+    /// Builds the pre-authorization preview. Resolution never focuses, activates, or switches the
+    /// target window, and knowing a UUID still grants nothing.
+    func resolvePreview(
+        observerSessionID: UUID?,
+        rawTargetSessionID: String,
+        existingOutboundTargetIDs: Set<UUID>
+    ) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure> {
+        resolveTargetCandidate(
+            observerSessionID: observerSessionID,
+            rawTargetSessionID: rawTargetSessionID,
+            existingOutboundTargetIDs: existingOutboundTargetIDs
         ).map { candidate in
             AgentMonitorResolvedPreview(
                 sessionID: candidate.sessionID,
@@ -7423,6 +8911,69 @@ final class AgentSessionLinkRuntimeBridge {
                 ).status
             )
         }
+    }
+
+    /// Resolves a pasted Session ID for the *inbound* direction: the pasted session is the
+    /// prospective overseer of the row's target. Unlike the "Link overseer" menu list — which only
+    /// offers sessions that already hold an outbound link — the pasted-ID path accepts any
+    /// eligible session, so a session can be linked as overseer before it holds its first link.
+    /// Returns user-facing message text on failure.
+    ///
+    /// New links require observer eligibility via `addDisabledReason` (child/MCP-controlled/
+    /// MCP-originated sessions, and a role policy that denies outbound monitoring, can never
+    /// observe); an existing exact link resolves as `.alreadyLinked` before that check.
+    func resolveSidebarOverseerCandidate(
+        rawSessionID: String,
+        excludingTargetSessionID: UUID
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
+        guard let host else {
+            return .failure(AgentOversightResolutionMessage(message: Self.unavailableMessage))
+        }
+        guard let sessionID = AgentSessionLinkEndpointResolver.parseSessionID(rawSessionID) else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.malformedIdentifier.uiMessage
+            ))
+        }
+        guard sessionID != excludingTargetSessionID else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.selfMonitor.uiMessage
+            ))
+        }
+        let matches = host.agentSessionLinkCandidates().filter { $0.sessionID == sessionID }
+        guard !matches.isEmpty else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.notFound.uiMessage
+            ))
+        }
+        guard matches.count == 1 else {
+            return .failure(AgentOversightResolutionMessage(
+                message: AgentSessionLinkResolveFailure.ambiguous.uiMessage
+            ))
+        }
+        let candidate = matches[0]
+        // An already-linked pair resolves as done before eligibility is even consulted: the sheet
+        // closes silently rather than showing confirm-then-no-op or a transient eligibility error.
+        let inventory = await authority.links(forObserverEndpoint: candidate.domainEndpoint)
+        if inventory.items.contains(where: { $0.targetSessionID == excludingTargetSessionID }) {
+            return .success(.alreadyLinked)
+        }
+        if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput,
+            roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) {
+            return .failure(AgentOversightResolutionMessage(message: reason))
+        }
+        return .success(.candidate(candidate))
+    }
+
+    /// UI-only display name for one exact live endpoint, used by the link-confirmation dialog so it
+    /// can name the observer without routing through a session UUID.
+    func liveCandidateDisplayName(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> String? {
+        host?.agentSessionLinkCandidates()
+            .first(where: { $0.domainEndpoint == endpoint })?
+            .resolvedDisplayName
     }
 
     // MARK: - References
@@ -7473,6 +9024,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static func message(for rejection: DomainAgentSessionLinkReservationRejection) -> String {
         switch rejection {
+        case .sourceScopeUnavailable:
+            "source_scope_unavailable: Exact-target consent is revoked, expired, or not restored. Call session_admin scope_status; nothing was linked."
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .selfMonitor:
@@ -7490,6 +9043,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static func message(for rejection: DomainAgentSessionLinkActivationRejection) -> String {
         switch rejection {
+        case .sourceScopeUnavailable:
+            "source_scope_unavailable: Exact-target consent ended before activation. Call session_admin scope_status; nothing was linked."
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .unknownReservation:
@@ -7512,12 +9067,60 @@ final class AgentSessionLinkRuntimeBridge {
 /// handles — is what guarantees automatic restoration cannot bypass the shared establishment path,
 /// the pair retirement barrier, or expected-token removal.
 extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
+        targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
+    }
+
     var launchCoordinatorHost: AgentSessionLinkEndpointHost? {
         host
     }
 
     var launchCoordinatorIsFrozen: Bool {
         isFrozenForTermination
+    }
+
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID> {
+        guard let host, let windows = host.preparedSessionRuntimes, let intentStore, !isFrozenForTermination else { return [] }
+        launchPreparationWindowHost = windows
+        var uncertain: Set<UUID> = []
+        for pair in pairs {
+            guard !isFrozenForTermination,
+                  host.agentSessionLinkCandidates(forSessionIDs: [pair.targetSessionID], includeLocation: false)[pair.targetSessionID]?.isEmpty != false,
+                  host.agentSessionLinkCandidates(forSessionIDs: [pair.observerSessionID], includeLocation: false)[pair.observerSessionID]?.count == 1,
+                  let token = await intentStore.token(for: pair),
+                  let scopeID = token.pair.sourceScopeID,
+                  delegationScopes.record(id: scopeID)?.grant.kind == .session(targetSessionID: pair.targetSessionID) else { continue }
+            let currentPair = token.pair
+            let consent = delegationScopes.linkConsent
+            let stillPermitted: @MainActor () -> Bool = { [weak self] in
+                guard self?.isFrozenForTermination == false else { return false }
+                guard let scopeID = currentPair.sourceScopeID else { return true }
+                return consent.permits(scopeID: scopeID, observer: currentPair.observerSessionID, target: currentPair.targetSessionID, at: Date())
+            }
+            guard stillPermitted() else { continue }
+            if launchPreparedTargetIDs.insert(pair.targetSessionID).inserted {
+                windows.beginPreparedOversightPreparation(pair.targetSessionID)
+            }
+            let prepared = await windows.prepareScopedSavedTarget(pair.targetSessionID, isStillAuthorized: stillPermitted)
+            // Keep this owner alive across the actor hops that establish the restored link. Cleanup
+            // must not retire an unlinked prepared runtime in the prepare-to-establish interval.
+            // Preparation grants nothing. Establishment below still rechecks the current token,
+            // consent provenance, exact endpoint, ambiguity, deletion and restoration proof.
+            if !prepared {
+                uncertain.insert(pair.targetSessionID)
+            }
+        }
+        return uncertain
+    }
+
+    func launchCoordinatorFinishSavedTargetPreparation() {
+        let ids = launchPreparedTargetIDs
+        launchPreparedTargetIDs.removeAll()
+        let windows = launchPreparationWindowHost
+        launchPreparationWindowHost = nil
+        for id in ids {
+            windows?.endPreparedOversightPreparation(id)
+        }
     }
 
     func launchCoordinatorEstablish(
@@ -7548,10 +9151,26 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
                     outcome: .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
                 )
             }
+            if let generation, let intentStore,
+               await intentStore.assertionGeneration(for: pair) != generation
+            {
+                return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
+            }
+            // Coordinator dictionary keys identify the pair, not its mutable consent provenance.
+            // Re-read the current row inside its lane; never establish from a first-seen stale key.
+            var currentPair = pair
+            var currentToken = token
+            if let intentStore {
+                guard let saved = await intentStore.token(for: pair), saved == token else {
+                    return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
+                }
+                currentPair = saved.pair
+                currentToken = saved
+            }
             // Still inside the pair lane, so a concurrent Add or Stop cannot interleave with restore.
             return await establish(
-                pair: pair,
-                token: token,
+                pair: currentPair,
+                token: currentToken,
                 assertedAt: generation,
                 proof: proof
             )
@@ -7575,17 +9194,36 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
         // The same lane a user Stop and a user Add take. Launch retirement and **Retry saving** are
         // durable removals like any other, and running them outside the lane is what would let a
         // cleanup already suspended on the store actor delete a token an explicit Add just reused.
-        return await withPairRetirementLane(pair) { [intentStore, pair, token, generation] in
-            await intentStore.remove(pair, ifCurrent: token, assertedAt: generation)
+        return await withPairRetirementLane(pair) { [self, intentStore, pair, token, generation] in
+            guard launchCoordinator?.permitsRemoval(pair: pair, token: token) == true else {
+                return AgentSessionOversightIntentMutationReceipt(
+                    outcome: .tokenMismatch, storeRevisionBefore: 0, storeRevisionAfter: 0,
+                    transitions: [], wroteFile: false
+                )
+            }
+            for (reference, bookkeeping) in bookkeepingByReference
+                where bookkeeping.pair == pair && bookkeeping.token == token
+                && bookkeeping.assertionGeneration == generation
+            {
+                bookkeepingByReference.removeValue(forKey: reference)
+            }
+            return await intentStore.remove(pair, ifCurrent: token, assertedAt: generation)
         }
     }
 
     func launchCoordinatorRevoke(reference: DomainAgentSessionLinkReference) async {
-        await revoke(reference: reference)
+        #if DEBUG
+            await test_beforeLaunchAuditRevocation?()
+        #endif
+        await revoke(reference: reference, settlesDurableIntent: false)
     }
 
     func launchCoordinatorReportWarning(id: String, message: String) {
         reportPersistenceWarning(id: id, message: message)
+    }
+
+    func launchCoordinatorClearWarning(id: String) {
+        dismissPersistenceWarnings(ids: [id])
     }
 
     func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>) {

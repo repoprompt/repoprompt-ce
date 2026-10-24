@@ -47,6 +47,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     @Published package private(set) var codeMapsGloballyDisabled: Bool = false
     @Published package private(set) var nonGitCodeMapsEnabled: Bool = false
     @Published package private(set) var modelRouterSettingsRevision: UInt64 = 0
+    @Published package private(set) var autoEffortSettingsRevision: UInt64 = 0
+    private var routerDemandObservers: [UUID: AsyncStream<RoutingSettingsSnapshot>.Continuation] = [:]
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published package private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
@@ -227,6 +229,11 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         AgentModelsSettingsProfile(
             planningModelRaw: scalarPreferences.modelSelection?.planningModel,
             additionalOracleModelRaws: scalarPreferences.modelSelection?.additionalOracleModels ?? [],
+            oracleReconciliationGuidance: scalarPreferences.modelSelection?.oracleReconciliationGuidance,
+            agentRepromptGuidance: scalarPreferences.modelSelection?.agentRepromptGuidance,
+            agentRepromptModelRaw: scalarPreferences.modelSelection?.agentRepromptModelRaw,
+            agentRepromptMode: scalarPreferences.modelSelection?.agentRepromptMode,
+            agentRepromptIncludesRecentChat: scalarPreferences.modelSelection?.agentRepromptIncludesRecentChat,
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
@@ -249,6 +256,11 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         modelSelection.additionalOracleModels = normalized.additionalOracleModelRaws.isEmpty
             ? nil
             : normalized.additionalOracleModelRaws
+        modelSelection.oracleReconciliationGuidance = normalized.oracleReconciliationGuidance
+        modelSelection.agentRepromptGuidance = normalized.agentRepromptGuidance
+        modelSelection.agentRepromptModelRaw = normalized.agentRepromptModelRaw
+        modelSelection.agentRepromptMode = normalized.agentRepromptMode
+        modelSelection.agentRepromptIncludesRecentChat = normalized.agentRepromptIncludesRecentChat
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
@@ -1036,15 +1048,56 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     }
 
     /// Independent of Model Router. Missing settings retain the manual-effort path.
+    package func routingSettingsSnapshot() -> RoutingSettingsSnapshot {
+        .init(
+            routerEnabled: scalarPreferences.modelRouter?.enabled == true,
+            selectedBackendRawValue: scalarPreferences.modelRouter?.selectedBackendRawValue,
+            autoEffortEnabled: autoEffortEnabled(),
+            routerRevision: modelRouterSettingsRevision,
+            autoEffortBackendRawValue: scalarPreferences.agentMode?.autoEffortBackendRawValue,
+            autoEffortRevision: autoEffortSettingsRevision
+        )
+    }
+
+    package func routingSettingsUpdates() -> AsyncStream<RoutingSettingsSnapshot> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            routerDemandObservers[id] = continuation
+            continuation.yield(routingSettingsSnapshot())
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.routerDemandObservers.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    private func publishRouterDemand() {
+        let snapshot = routingSettingsSnapshot()
+        for continuation in routerDemandObservers.values {
+            continuation.yield(snapshot)
+        }
+    }
+
+    package func setAutoEffortBackendRaw(_ raw: String, commit: Bool = true) {
+        guard scalarPreferences.agentMode?.autoEffortBackendRawValue != raw else { return }
+        updateAgentModeScalar(commit: false) { $0.autoEffortBackendRawValue = raw }
+        autoEffortSettingsRevision &+= 1
+        publishRouterDemand()
+        if commit { save() }
+    }
+
     package func autoEffortEnabled() -> Bool {
         scalarPreferences.agentMode?.autoEffortEnabled == true
     }
 
     package func setAutoEffortEnabled(_ enabled: Bool, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
+        guard autoEffortEnabled() != enabled else { return }
+        updateAgentModeScalar(commit: false) { settings in
             // Clearing returns to the baseline scalar shape for older CE builds.
             settings.autoEffortEnabled = enabled ? true : nil
         }
+        autoEffortSettingsRevision &+= 1
+        publishRouterDemand()
+        if commit { save() }
     }
 
     package func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
@@ -1075,6 +1128,81 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: commit) { settings in
             settings.codexToolSuggestionsEnabled = enabled
         }
+    }
+
+    package func codexUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexUsageQuotaEnabled ?? false
+    }
+
+    package func setCodexUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.codexUsageQuotaEnabled = enabled }
+    }
+
+    package func claudeUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.claudeUsageQuotaEnabled ?? false
+    }
+
+    package func setClaudeUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeUsageQuotaEnabled = enabled }
+    }
+
+    /// Master presentation switch. An explicit choice wins; otherwise users who opted into
+    /// either legacy per-provider surface keep seeing usage. This is a pure read: it neither
+    /// persists the derived value nor authorizes any acquisition source.
+    package func usageLimitsDisplayEnabled() -> Bool {
+        Self.resolvedUsageLimitsDisplayEnabled(scalarPreferences.agentMode)
+    }
+
+    package nonisolated static func resolvedUsageLimitsDisplayEnabled(
+        _ settings: GlobalScalarPreferences.AgentModeSettings?
+    ) -> Bool {
+        if let explicit = settings?.usageLimitsDisplayEnabled { return explicit }
+        return settings?.codexUsageQuotaEnabled == true || settings?.claudeUsageQuotaEnabled == true
+    }
+
+    package func setUsageLimitsDisplayEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.usageLimitsDisplayEnabled = enabled }
+    }
+
+    /// UI-only consent record. Deliberately has no MCP writer.
+    package func claudeCLIUsageGrant() -> ClaudeCLIUsageGrant? {
+        scalarPreferences.agentMode?.claudeCLIUsageGrant
+    }
+
+    package func setClaudeCLIUsageGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeCLIUsageGrant = grant }
+    }
+
+    /// The Claude usage display the user already set up: usage display on, and a ready CLI
+    /// usage grant for this credential profile. This is the consent that lets passive run
+    /// telemetry refresh the *displayed* Claude usage.
+    package func claudeUsageDisplayConsented(profileID: String) -> Bool {
+        guard usageLimitsDisplayEnabled(), let grant = claudeCLIUsageGrant() else { return false }
+        return grant.isReady && grant.applies(toProfileID: profileID)
+    }
+
+    /// Whether first-party Claude runs record their own SDK `rate_limit_event` stream output.
+    ///
+    /// Either the diagnostics toggle (`claudeUsageQuotaEnabled`, unchanged meaning) or the
+    /// connected Claude usage display is sufficient. The events are part of the run's own
+    /// output: recording them starts no read, process, or request and touches no credential,
+    /// so the display connection the user already granted covers showing them. They remain
+    /// display-only; routing and balancing never consume SDK telemetry.
+    package func claudeRunTelemetryRecordingEnabled(profileID: String) -> Bool {
+        claudeUsageQuotaEnabled() || claudeUsageDisplayConsented(profileID: profileID)
+    }
+
+    /// UI-only, separately disclosed background acquisition consent. Not routing policy.
+    package func setClaudeBalancingRefreshGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeBalancingRefreshGrant = grant }
+    }
+
+    package func claudeAccountUsageGrant() -> ClaudeAccountUsageGrant? {
+        scalarPreferences.agentMode?.claudeAccountUsageGrant
+    }
+
+    package func setClaudeAccountUsageGrant(_ grant: ClaudeAccountUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeAccountUsageGrant = grant }
     }
 
     package func globalCodexHookApprovalStrictModeEnabled() -> Bool {
@@ -1124,6 +1252,54 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             overrides[workspaceID.uuidString] = override
             settings.codexHookApprovalStrictModeWorkspaceOverrides = overrides.isEmpty ? nil : overrides
         }
+    }
+
+    package func providerEnvironmentWithheldNames() -> [String] {
+        scalarPreferences.agentMode?.providerEnvironmentWithheldNames ?? []
+    }
+
+    package func providerEnvironmentPassthroughNames(for provider: String) -> [String] {
+        scalarPreferences.agentMode?.providerEnvironmentPassthroughNames?[provider] ?? []
+    }
+
+    @discardableResult
+    package func setProviderEnvironmentWithheldNames(_ names: [String], commit: Bool = true) -> Bool {
+        guard let normalized = ProviderEnvironmentNames.normalized(names) else { return false }
+        updateAgentModeScalar(commit: commit) {
+            $0.providerEnvironmentWithheldNames = normalized.isEmpty ? nil : normalized
+        }
+        return true
+    }
+
+    @discardableResult
+    package func setProviderEnvironmentPassthroughNames(_ names: [String], for provider: String, commit: Bool = true) -> Bool {
+        guard !provider.isEmpty, let normalized = ProviderEnvironmentNames.normalized(names) else { return false }
+        updateAgentModeScalar(commit: commit) {
+            var providers = $0.providerEnvironmentPassthroughNames ?? [:]
+            providers[provider] = normalized.isEmpty ? nil : normalized
+            $0.providerEnvironmentPassthroughNames = providers.isEmpty ? nil : providers
+        }
+        return true
+    }
+
+    /// One in-memory mutation and one raw-preserving write for the UI's paired controls.
+    @discardableResult
+    package func setProviderEnvironmentFiltering(withheldNames: [String], passthroughNames: [String], for provider: String) -> Bool {
+        guard !provider.isEmpty,
+              let withheld = ProviderEnvironmentNames.normalized(withheldNames),
+              let passthrough = ProviderEnvironmentNames.normalized(passthroughNames)
+        else { return false }
+        updateAgentModeScalar(commit: false) {
+            $0.providerEnvironmentWithheldNames = withheld.isEmpty ? nil : withheld
+            var providers = $0.providerEnvironmentPassthroughNames ?? [:]
+            providers[provider] = passthrough.isEmpty ? nil : passthrough
+            $0.providerEnvironmentPassthroughNames = providers.isEmpty ? nil : providers
+        }
+        return save()
+    }
+
+    package func providerEnvironmentRemovedNames(for provider: String) -> Set<String> {
+        Set(providerEnvironmentWithheldNames()).subtracting(providerEnvironmentPassthroughNames(for: provider))
     }
 
     package func subagentDefaultWaitSeconds() -> Int {
@@ -1379,6 +1555,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
         if before != scalarPreferences.modelRouter {
             modelRouterSettingsRevision &+= 1
+            publishRouterDemand()
         }
         if commit {
             save()
@@ -1793,6 +1970,11 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         var normalized = AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
             additionalOracleModelRaws: profile.additionalOracleModelRaws,
+            oracleReconciliationGuidance: profile.oracleReconciliationGuidance,
+            agentRepromptGuidance: profile.agentRepromptGuidance,
+            agentRepromptModelRaw: profile.agentRepromptModelRaw,
+            agentRepromptMode: profile.agentRepromptMode,
+            agentRepromptIncludesRecentChat: profile.agentRepromptIncludesRecentChat,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
@@ -1877,6 +2059,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     // MARK: - Persistence
 
     private func load(notifyAgentModelsChanges: Bool = false) {
+        let oldRouterSettings = scalarPreferences.modelRouter
+        let oldEnabled = autoEffortEnabled()
+        let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
+        defer {
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
+            if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
+                autoEffortSettingsRevision &+= 1
+            }
+            publishRouterDemand()
+        }
+
         let oldGlobalProfile = globalAgentModelsProfile()
         let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
         let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
@@ -1993,6 +2186,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     @discardableResult
     package func reloadFromDisk() -> Bool {
+        let oldRouterSettings = scalarPreferences.modelRouter
+        let oldEnabled = autoEffortEnabled()
+        let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
+        defer {
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
+            if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
+                autoEffortSettingsRevision &+= 1
+            }
+            publishRouterDemand()
+        }
+
         do {
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID

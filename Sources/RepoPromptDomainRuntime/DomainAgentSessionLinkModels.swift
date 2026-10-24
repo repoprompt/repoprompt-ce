@@ -62,6 +62,8 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
 }
 
 package struct DomainAgentSessionLinkGrant: Identifiable, Hashable, Sendable {
+    /// Exact-target consent that owns this derived link, when present. Ordinary explicit links stay independent.
+    package let sourceScopeID: UUID?
     package let id: UUID
     package let generation: UInt64
     package let observer: DomainAgentSessionLinkEndpointIdentity
@@ -75,8 +77,10 @@ package struct DomainAgentSessionLinkGrant: Identifiable, Hashable, Sendable {
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
         createdAt: Date,
-        capabilities: Set<DomainAgentSessionLinkCapability>
+        capabilities: Set<DomainAgentSessionLinkCapability>,
+        sourceScopeID: UUID? = nil
     ) {
+        self.sourceScopeID = sourceScopeID
         self.id = id
         self.generation = generation
         self.observer = observer
@@ -94,6 +98,19 @@ package struct DomainAgentSessionLinkReference: Hashable, Sendable {
     package init(linkID: UUID, generation: UInt64) {
         self.linkID = linkID
         self.generation = generation
+    }
+}
+
+/// Internal final-handoff proof. No transcript data or public cursor is carried or created.
+package struct DomainAgentSessionReadDisclosureRequirement: Hashable, Sendable {
+    package let observer: DomainAgentSessionLinkEndpointIdentity
+    package let target: DomainAgentSessionLinkEndpointIdentity
+    package let reference: DomainAgentSessionLinkReference
+
+    package init(observer: DomainAgentSessionLinkEndpointIdentity, target: DomainAgentSessionLinkEndpointIdentity, reference: DomainAgentSessionLinkReference) {
+        self.observer = observer
+        self.target = target
+        self.reference = reference
     }
 }
 
@@ -234,6 +251,7 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
+        case resumeHistoryTooLarge = "resume_history_too_large"
         case cancelled
     }
 
@@ -359,12 +377,16 @@ package struct DomainAgentSessionLinkTargetState: Hashable, Sendable {
 // MARK: - Inventory
 
 package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
+    package let sourceScopeID: UUID?
     package let linkID: UUID
     package let generation: UInt64
     package let observerSessionID: UUID
     package let targetSessionID: UUID
     package let displayName: String?
     package let capabilities: Set<DomainAgentSessionLinkCapability>
+    /// Grant creation time — host-side ordering input only (e.g. "first overseer by link
+    /// creation"); inventories keep their deterministic UUID ordering regardless.
+    package let createdAt: Date
 
     package init(
         linkID: UUID,
@@ -372,8 +394,11 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
         observerSessionID: UUID,
         targetSessionID: UUID,
         displayName: String?,
-        capabilities: Set<DomainAgentSessionLinkCapability>
+        capabilities: Set<DomainAgentSessionLinkCapability>,
+        createdAt: Date,
+        sourceScopeID: UUID? = nil
     ) {
+        self.sourceScopeID = sourceScopeID
         self.linkID = linkID
         self.generation = generation
         self.observerSessionID = observerSessionID
@@ -383,6 +408,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.capabilities = capabilities
+        self.createdAt = createdAt
     }
 
     package var capabilityNames: [String] {
@@ -526,6 +552,15 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendab
     }
 }
 
+/// A single authority turn for sparse presentation and authoritative final clears.
+/// `endpoints` names retained link/notice keys, not the additional empty clear inputs.
+package struct DomainAgentSessionLinkPresentationSnapshot: Sendable {
+    package let authorityRevision: UInt64
+    package let endpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let inputs: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionLinkEndpointProjectionInputs]
+}
+
 // MARK: - Errors
 
 package enum DomainAgentSessionLinkError: String, Error, Equatable, Sendable {
@@ -548,6 +583,7 @@ package enum DomainAgentSessionLinkError: String, Error, Equatable, Sendable {
 /// A reserved-but-not-yet-active link. The app bridge must seed an initial snapshot before the link
 /// becomes visible to any tool operation, so `poll` can never race an uninitialized active link.
 package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
+    package let sourceScopeID: UUID?
     package let linkID: UUID
     package let generation: UInt64
     package let observer: DomainAgentSessionLinkEndpointIdentity
@@ -583,8 +619,10 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         requiresExistingOutboundLink: Bool,
         requiresExistingDirectLink: Bool = false,
         provisionallyInstallsTargetObservation: Bool,
-        reservedAtAuthorityRevision: UInt64
+        reservedAtAuthorityRevision: UInt64,
+        sourceScopeID: UUID? = nil
     ) {
+        self.sourceScopeID = sourceScopeID
         self.linkID = linkID
         self.generation = generation
         self.observer = observer
@@ -643,6 +681,7 @@ package enum DomainAgentSessionLinkReservationDisposition: Equatable, Sendable {
 }
 
 package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Sendable {
+    case sourceScopeUnavailable = "source_scope_unavailable"
     case shuttingDown = "shutting_down"
     case selfMonitor = "self_monitor"
     case observerBindingUnresolved = "observer_binding_unresolved"
@@ -668,6 +707,7 @@ package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
 }
 
 package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Sendable {
+    case sourceScopeUnavailable = "source_scope_unavailable"
     case shuttingDown = "shutting_down"
     case unknownReservation = "unknown_reservation"
     case endpointDrift = "endpoint_drift"
@@ -700,6 +740,7 @@ package enum DomainAgentSessionLinkTargetChangeDisposition: Equatable, Sendable 
 /// A lease is not durable authority: the caller must still revalidate both live endpoint identities
 /// before it reads or mutates target state.
 package struct DomainAgentSessionLinkLease: Hashable, Sendable {
+    package let sourceScopeID: UUID?
     package let leaseID: UUID
     package let runtimeID: UUID
     package let runtimeGeneration: UInt64
@@ -719,8 +760,10 @@ package struct DomainAgentSessionLinkLease: Hashable, Sendable {
         capability: DomainAgentSessionLinkCapability,
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
-        issuedAt: Date
+        issuedAt: Date,
+        sourceScopeID: UUID? = nil
     ) {
+        self.sourceScopeID = sourceScopeID
         self.leaseID = leaseID
         self.runtimeID = runtimeID
         self.runtimeGeneration = runtimeGeneration

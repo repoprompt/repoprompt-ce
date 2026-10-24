@@ -7,6 +7,135 @@ import XCTest
 
 @MainActor
 final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
+    private let quotaSettingKey = "agent_mode.codex_usage_quota_enabled"
+
+    private func makeQuotaService() throws -> (AppSettingsMCPService, GlobalSettingsStore, () -> Void) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexUsageQuotaAppSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let suiteName = "CodexUsageQuotaAppSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        let cleanup = {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        return (AppSettingsMCPService(store: store), store, cleanup)
+    }
+
+    /// Quota opt-in writes must apply immediately, not merely persist until Settings closes.
+    func testWriteAppliesTheRuntimeTransitionInBothDirections() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = CodexUsageQuotaRuntimeBridge.applyEnabled
+        defer { CodexUsageQuotaRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        CodexUsageQuotaRuntimeBridge.applyEnabled = { transitions.append($0) }
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "production default is off")
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(quotaSettingKey), "value": .bool(true)
+        ])
+        XCTAssertTrue(store.codexUsageQuotaEnabled(), "the flag persists")
+        XCTAssertEqual(transitions, [true], "and is applied immediately")
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(quotaSettingKey), "value": .bool(false)
+        ])
+        XCTAssertFalse(store.codexUsageQuotaEnabled())
+        XCTAssertEqual(transitions, [true, false], "disabling tears down without waiting for the pane to close")
+    }
+
+    func testClaudeSettingDefaultsOffAndAppliesBothTransitions() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = ClaudeUsageQuotaRuntimeBridge.applyEnabled
+        defer { ClaudeUsageQuotaRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        ClaudeUsageQuotaRuntimeBridge.applyEnabled = { transitions.append($0) }
+        XCTAssertFalse(store.claudeUsageQuotaEnabled())
+        for enabled in [true, false] {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string("agent_mode.claude_usage_quota_enabled"), "value": .bool(enabled)
+            ])
+            XCTAssertEqual(store.claudeUsageQuotaEnabled(), enabled)
+        }
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "provider opt-ins are independent")
+    }
+
+    func testUsageLimitsDisplayIsPresentationOnlyAndAppliesBothTransitions() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = UsageLimitsDisplayRuntimeBridge.applyEnabled
+        defer { UsageLimitsDisplayRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        UsageLimitsDisplayRuntimeBridge.applyEnabled = { transitions.append($0) }
+        let key = "agent_mode.usage_limits_display_enabled"
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let entry = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(entry.objectValue?["type"]?.stringValue, "boolean")
+        XCTAssertEqual(entry.objectValue?["value"]?.boolValue, false, "no legacy opt-in means hidden")
+
+        for enabled in [true, false] {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string(key), "value": .bool(enabled)
+            ])
+            XCTAssertEqual(store.usageLimitsDisplayEnabled(), enabled)
+        }
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "presentation never enables a source")
+        XCTAssertNil(store.claudeAccountUsageGrant(), "presentation never grants account consent")
+    }
+
+    func testLegacyClaudeOptInNeverCreatesAccountConsentAndNoGrantKeyExists() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = ClaudeUsageQuotaRuntimeBridge.applyEnabled
+        defer { ClaudeUsageQuotaRuntimeBridge.applyEnabled = original }
+        ClaudeUsageQuotaRuntimeBridge.applyEnabled = { _ in }
+
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string("agent_mode.claude_usage_quota_enabled"), "value": .bool(true)
+        ])
+        XCTAssertNil(store.claudeAccountUsageGrant())
+        XCTAssertTrue(store.usageLimitsDisplayEnabled(), "legacy opt-in users keep a visible surface")
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let keys = settings.compactMap { $0.objectValue?["key"]?.stringValue }
+        XCTAssertFalse(keys.contains { $0.localizedCaseInsensitiveContains("grant") || $0.localizedCaseInsensitiveContains("account_usage") })
+        let claudeEntry = try XCTUnwrap(settings.first {
+            $0.objectValue?["key"]?.stringValue == "agent_mode.claude_usage_quota_enabled"
+        })
+        let description = try XCTUnwrap(claudeEntry.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(description.contains("does NOT authorize Claude account usage reads"), description)
+    }
+
+    func testSettingIsReadableAndDefaultsOffInTheCatalog() async throws {
+        let (service, _, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = CodexUsageQuotaRuntimeBridge.applyEnabled
+        defer { CodexUsageQuotaRuntimeBridge.applyEnabled = original }
+        CodexUsageQuotaRuntimeBridge.applyEnabled = { _ in }
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let entry = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == quotaSettingKey })
+        XCTAssertEqual(entry.objectValue?["type"]?.stringValue, "boolean")
+        XCTAssertEqual(entry.objectValue?["value"]?.boolValue, false, "observe-only feature ships off")
+        let description = try XCTUnwrap(entry.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(description.contains("observe-only"))
+    }
+
     func testOracleRosterSettingIsOrderedValidatedAndPersistedAsSchemaV7() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceOracleRosterTests-\(UUID().uuidString)", isDirectory: true)
@@ -556,25 +685,85 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 ("unknown-context-builder-agent", "unknown-remembered-model"),
                 (AgentProviderKind.antigravity.rawValue, "antigravity-remembered-model")
             ] {
-                store.setGlobalAgentModelsProfile(
-                    AgentModelsSettingsProfile(
-                        contextBuilderAgentRaw: agentRaw,
-                        contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
-                    ),
-                    contextBuilderWriteIntent: .userInitiated
-                )
+                for requestedModel in ["sonnet", "haiku"] {
+                    let scenario = "\(agentRaw), requested=\(requestedModel)"
+                    store.setGlobalAgentModelsProfile(
+                        AgentModelsSettingsProfile(
+                            contextBuilderAgentRaw: agentRaw,
+                            contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
+                        ),
+                        contextBuilderWriteIntent: .userInitiated
+                    )
 
-                _ = try await service.handleForTesting([
-                    "op": .string("set"),
-                    "key": .string("context_builder.model"),
-                    "value": .string("sonnet")
-                ])
+                    _ = try await service.handleForTesting([
+                        "op": .string("set"),
+                        "key": .string("context_builder.model"),
+                        "value": .string(requestedModel)
+                    ])
 
-                let profile = store.globalAgentModelsProfile()
-                XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, agentRaw)
-                XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], "sonnet", agentRaw)
-                XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, agentRaw)
+                    let profile = store.globalAgentModelsProfile()
+                    XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, scenario)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], requestedModel, scenario)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, scenario)
+                }
             }
+        }
+    }
+
+    /// Reads disclose an unusable saved ID without projecting a fallback model. Clearing that
+    /// model is a no-op; an explicit valid agent choice replaces the ID durably.
+    func testContextBuilderAgentSetOfDisplayedFallbackReplacesUnknownStoredAgent() async throws {
+        try await withContextBuilderSettings { store, service, defaults, fileURL in
+            let claudeRaw = AgentProviderKind.claudeCode.rawValue
+            let unknownRaw = "unknown-context-builder-agent"
+            let rememberedModels = [unknownRaw: "unknown-remembered-model", claudeRaw: "haiku"]
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: unknownRaw,
+                    contextBuilderModelsByAgent: rememberedModels
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+            let get = try await service.handleForTesting([
+                "op": .string("get"),
+                "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+            ])
+            let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+            XCTAssertEqual(values["context_builder.agent"]?.stringValue, unknownRaw)
+            XCTAssertEqual(values["context_builder.model"], .null)
+
+            let clear = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.model"),
+                "value": .null
+            ])
+            XCTAssertEqual(clear.objectValue?["changed"]?.boolValue, false)
+            XCTAssertEqual(clear.objectValue?["applied"]?.boolValue, false)
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, unknownRaw)
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent, rememberedModels)
+
+            let options = try await service.handleForTesting([
+                "op": .string("options"),
+                "key": .string("context_builder.model")
+            ])
+            XCTAssertEqual(
+                options.objectValue?["filters"]?.objectValue?["agent"]?.stringValue,
+                "claudeCode",
+                "implicit options target the model writer's agent"
+            )
+
+            let set = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.agent"),
+                "value": .string(claudeRaw)
+            ])
+            XCTAssertEqual(set.objectValue?["changed"]?.boolValue, true)
+            XCTAssertEqual(set.objectValue?["applied"]?.boolValue, true)
+            XCTAssertNil(set.objectValue?["persistence_blocked"])
+            let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw)
+            XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw)
+            XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderModelsByAgent, rememberedModels)
         }
     }
 

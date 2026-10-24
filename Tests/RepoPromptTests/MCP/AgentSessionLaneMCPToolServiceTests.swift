@@ -22,19 +22,19 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(payload?["result"]?.stringValue, "created")
         XCTAssertEqual(payload?["session_id"]?.stringValue, sessionID.uuidString)
         XCTAssertEqual(payload?["first_task"]?.stringValue, "queued")
-        XCTAssertEqual(payload?["lanes"]?.stringValue, "3/8")
+        XCTAssertEqual(payload?["lanes"]?.stringValue, "3/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)")
         XCTAssertEqual(payload?["duplicate"], .bool(true))
         XCTAssertNil(payload?["link_reason"])
         XCTAssertEqual(payload?["workspace"]?.stringValue, "Café \"QA\"")
 
         let refused = AgentSessionLaneMCPToolService.render(
-            AgentSessionLaneCreateReceipt.refused(.laneLimitReached, laneCount: 8)
+            AgentSessionLaneCreateReceipt.refused(.laneLimitReached, laneCount: AgentSessionLanePolicy.agentSessionLaneMaximumCount)
         ).objectValue
         XCTAssertEqual(refused?["result"]?.stringValue, "lane_limit_reached")
-        XCTAssertEqual(refused?["lanes"]?.stringValue, "8/8")
+        XCTAssertEqual(refused?["lanes"]?.stringValue, "\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)")
         XCTAssertNil(refused?["session_id"])
         for reason in [AgentSessionLaneCreateReceipt.Reason.denied, .modelUnavailable, .laneLimitReached] {
-            var receipt = AgentSessionLaneCreateReceipt.refused(reason, laneCount: 8)
+            var receipt = AgentSessionLaneCreateReceipt.refused(reason, laneCount: AgentSessionLanePolicy.agentSessionLaneMaximumCount)
             receipt.workspaceName = "Must not leak"
             XCTAssertNil(AgentSessionLaneMCPToolService.render(receipt).objectValue?["workspace"])
         }
@@ -66,7 +66,8 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
                 observerSessionID: observerID,
                 targetSessionID: targetID,
                 displayName: "Lane",
-                capabilities: DomainAgentSessionLinkCapability.version1
+                capabilities: DomainAgentSessionLinkCapability.version1,
+                createdAt: Date(timeIntervalSince1970: 0)
             )]
         )
         let annotated = AgentSessionLinkPromptInventory(inventory) { $0 == targetID }

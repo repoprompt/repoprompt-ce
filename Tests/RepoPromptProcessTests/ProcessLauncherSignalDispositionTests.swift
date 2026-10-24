@@ -4,6 +4,24 @@ import Foundation
 import XCTest
 
 final class ProcessLauncherSignalDispositionTests: XCTestCase {
+    func testPTYKeepsLaunchPolicyAndTerminalDescriptorsAndBoundedCleanup() async throws {
+        XCTAssertThrowsError(try ProcessLauncher.spawnPTY(command: "/bin/true", arguments: [], environment: [:], workingDirectory: "/tmp"))
+        let child = try ProcessLauncher.spawnPTY(command: "/bin/sh", arguments: ["-c", "test -t 0 && test -t 1 && test -t 2 && printf RPCE_PTY_OK; sleep 10"],
+            environment: ["PATH": "/usr/bin:/bin"], workingDirectory: "/tmp", allowsProviderProcessLaunchForTesting: true)
+        XCTAssertEqual(child.processGroupID, child.pid)
+        var bytes = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        for _ in 0 ..< 50 {
+            let count = Darwin.read(child.master, &buffer, buffer.count)
+            if count > 0 { bytes.append(contentsOf: buffer.prefix(count)) }
+            if String(decoding: bytes, as: UTF8.self).contains("RPCE_PTY_OK") { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        close(child.master)
+        _ = await ProcessTermination.terminateAndReap(pid: child.pid, processGroupID: child.processGroupID, sigtermGrace: 0.2, sigkillGrace: 0.2)
+        XCTAssertTrue(String(decoding: bytes, as: UTF8.self).contains("RPCE_PTY_OK"))
+    }
+
     private enum HelperEnvironment {
         static let isHelper = "REPOPROMPT_PROCESS_LAUNCHER_SIGTERM_HELPER"
         static let markerPath = "REPOPROMPT_PROCESS_LAUNCHER_SIGTERM_MARKER"

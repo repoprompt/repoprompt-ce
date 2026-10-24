@@ -182,6 +182,36 @@ final class DirectHeadlessFileSearchFilterTests: XCTestCase {
         }
     }
 
+    func testReadFileRejectsOversizedFileEvenForOneLine() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        try Data(repeating: 65, count: 10_000_001).write(to: fixture.file)
+        do {
+            _ = try await Self.service(roots: [fixture.root]).readFile(Self.request([
+                "path": .string(fixture.file.path), "start_line": .int(1), "limit": .int(1)
+            ]))
+            XCTFail("An oversized file must not bypass the byte bound through line slicing")
+        } catch {
+            XCTAssertEqual(error as? MCPDomainHeadlessFileReader.ReadError, .tooLarge)
+        }
+    }
+
+    func testReadFileHonorsAlreadyCancelledCaller() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let service = Self.service(roots: [fixture.root])
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await service.readFile(Self.request(["path": .string(fixture.file.path)]))
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled reads must not return content")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     private static func service(roots: [URL]) -> MCPDomainCanonicalWorkspaceService {
         let identity = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
         let snapshot: @Sendable () -> DomainCanonicalWorkspaceSnapshot = {
@@ -194,7 +224,7 @@ final class DirectHeadlessFileSearchFilterTests: XCTestCase {
             resolvePath: { rawPath, roots, allowMissingLeaf in
                 try DirectHeadlessDomainContext.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
             }
-        ))
+        ), fileReadSlotDirectory: roots[0].deletingLastPathComponent().appendingPathComponent("read-slots"))
     }
 
     private static func request(_ arguments: [String: Value]) throws -> DomainPhysicalReadRequest {

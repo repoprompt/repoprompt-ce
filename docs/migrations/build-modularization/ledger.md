@@ -37,6 +37,8 @@ Local tooling-half validation on 2026-09-30: `make conductor-selftest` passed; `
 - **Tracked, not gated:** `app_target_swift_lines` (visible advisory above baseline plus the unchanged 2,000-line headroom), `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, lexical `app_wrong_way_file_edges`, lexical `app_largest_cycle_components`, and `tests_sleep_calls`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations.
 - Lower a baseline with `update` in the slice that improves it. Raising one requires `update --allow-regression` plus a justification entry here.
 
+**2026-10-11 #1286 overseer-scope test-import alignment.** The maintainer explicitly authorizes only `tests_testable_import_app_files` 331 → 332 for `Tests/RepoPromptTests/MCP/SessionAdminScopeLifecycleTests.swift`, the one App-importing test file the delegation-scope stack (#1286, with #1288/#1290 adding none) introduces. It necessarily imports App: it exercises `BatchConfirmationCoordinator`, `DelegationScopeRuntime` and `AgentSessionAdministrationCore`, which live in the App target, and it carries the regression witnesses for batch-card tab/session binding, supplied-confirmation validation below the threshold, and applying-card retention. When #1286 was first published `main` had slack; merging `main` at `b279947533a8bae418582c9a800e5f3e1a890459` (four new App-importing test files, baseline still 331) brought the merged tree to 332. No consolidation into unrelated suites, suppression or SPI exposure. `update --allow-regression` was run and its output narrowed to this single metric: the description, app-line baseline and headroom, every tracked metric and every other gated baseline are unchanged. Counts above 332 still fail.
+
 **2026-10-03 PR 4 maintainer policy decision.** The user explicitly makes the App-line reference advisory, superseding the earlier hard-ceiling and proposed +177 allowance decisions. No numeric baseline is raised: `app_target_swift_lines` remains 649,794, headroom 2,000, advisory reference 651,794. Pinned main `a877f1ea` has 651,988 App lines (+194); the pending PR 4 merge has 651,971 (+177), a PR 4 contribution of −17. Excess remains visible even when another mandatory ratchet fails. All four non-increasing metrics, dependency/security/test gates and baseline/configuration failures remain mandatory; `update` still refuses unapproved baseline increases. The earlier actual guardrail exit1 is retained as historical failure, not retrospectively passed. Policy regression checks and final commit/push preflights must execute before publication; optional current-main full-suite/package/live checks remain pending, including incomplete ticket `51d89061-0945-4554-b73b-12d601485397` (zero executed tests).
 
 **2026-10-03 PR 4/#1148 test-import alignment.** The maintainer explicitly authorizes only `tests_testable_import_app_files` 332 → 333 for the already-merged #1148 coverage at `274fd59d12585e26d53a8457dbd5c5b5014b7441`. Its new `MCPStateSubscriptionTests.swift` necessarily imports App: all six unchanged tests exercise real `MCPService` subscriber fan-out, seed/unsubscribe/approval state and `MCPServerViewModel` lifetime/window presentation with App dependencies and DEBUG hooks. Preserve the complete upstream file and assertions; no consolidation, deletion, Shared substitute, public/SPI exposure or suppression. CI run `37109785395`, job `111165298080`, checked synthetic merge `10d61881d4feb4b8300b4001c2cfd4878d343f4d` and failed the genuine 333 > 332 ratchet before compilation; that failure remains historical, not passed. This is a one-file structural-baseline alignment, not a relaxed check: counts above 333 still fail. App baseline 649,794/headroom 2,000/advisory reference 651,794, every other baseline/list and all dependency/security/test/configuration gates remain unchanged. Exact merged-head guardrails, eight focused methods, style and later commit/push preflights remain pending validator execution.
@@ -44,6 +46,10 @@ Local tooling-half validation on 2026-09-30: `make conductor-selftest` passed; `
 **2026-10-01 PR 2/main reconciliation.** Merging current `origin/main` (#1134–#1136) into PR 2 put the app target at 649,172 Swift lines, 242 above the earlier 648,930 ceiling. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the recorded app-line baseline is now 649,172 with the same fixed 2,000-line headroom. The non-increasing gate counts remain unchanged; tracked-only counts reflect the merged source. This is a baseline reconciliation for existing feature work and PR 2, not a change to the guardrail policy.
 
 **2026-10-01 PR 2/#1137 reconciliation.** Merging `origin/main` at `773a0f2e` added three tests with an exact `@testable import RepoPromptApp` line. The new Devin catalog, Context Builder prompt, and MCP policy tests exercise app-owned types; the fourth new Devin test uses an SPI-prefixed import and is not counted by this lexical metric. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the test-import baseline is 332 rather than 329. The app-line baseline and tracked metrics were also refreshed for the new Devin catalog. This reconciles upstream app-level test coverage without weakening the non-increasing rule for later changes.
+
+**2026-10-01 #1143 reconciliation.** Merging `origin/main` at `7d9cecd2` into the #1128 new-window chooser fix adds one test file with an exact `@testable import RepoPromptApp` line: `NewWindowInitialSelectionTests`. It is a composition suite. It drives `WindowState`, `DomainWorkspacePresentationBridge`, `ContentViewModel`, and `WorkspaceManagerViewModel` together against a real `MCPDomainRuntime`, so it cannot move to a module test target. The PR's projection-observer test support was folded into the existing `WorkspaceAuthorityRootTestFixture.swift` rather than adding a second file. Regenerated `ratchets.json` with `update --allow-regression` against the merged tree: the test-import baseline is 333 rather than 332. The app-line baseline was refreshed to include the fix's source (+628 lines). The non-increasing rule for later changes is unchanged.
+
+**2026-10-08 #1143 simplification follow-up.** Applied the four static-equivalence cuts from the review of `493d6205`: remove unused route/startup test surface, consolidate the identical pending/dispatch restore payload, and remove one-shot startup replacement checks. App source falls from 650,635 to 650,611 Swift lines (24 fewer); execution/protection separation, route scheduling, startup joins, and cancellation checks remain unchanged. Regenerated measurements show 650,611 app lines and 749,091 first-party lines. The recorded baseline of 650,498 predates the 137-line restore-lifetime addition at the reviewed head; it remains unchanged because the measured total is within the existing 2,000-line allowance and this deletion-only follow-up should not raise the baseline. Non-increasing gate counts are unchanged. The projection generation counter is intentionally retained pending separate zero-sequence, same-sequence, and stop/restart equivalence validation.
 
 ## Baseline — 2026-09-28 (`589cecc5`)
 
@@ -1042,6 +1048,25 @@ This in-place C1/C2 slice removes WorkspaceContext, Search, and CodeMap's outbou
 Compiler-index readiness baseline on 101 files: 55 outbound target files, 168 outbound file edges, 1,040 symbols. The final index and validation tickets are recorded in `/tmp/rpce-pr-reviews/pr3-impl.md` for this worktree. FileSystem/VCS and other Infrastructure remain for subsequent milestones.
 
 
+## #1112 restoration-presentation test ownership exception — 2026-10-02
+
+Atila approved one increase of `tests_testable_import_app_files`, from 333 to
+334, for exactly
+`Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift`.
+It owns the classifier, persisted-restoration lifecycle, and snapshot-publication
+suites for one cohesive restoration-presentation contract. The nearest existing
+transcript-policy tests own repaint/remount behavior; appending the new contract
+there solely to satisfy the file count would harm ownership and navigation.
+Existing title and sidebar suites remain in their owning test files.
+
+This exception does not raise the app-source line baseline or its 2,000-line
+headroom, change other ratchets, or authorize wider production visibility.
+The approval was relayed by Atila's delegated #1112 overseer during implementation.
+Guardrails must still pass on the integrated change.
+
+2026-10-09: Atila reaffirmed the same single-file exception for `Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift` against main’s lowered baseline (327→328); the exception was not widened.
+
+
 ## PR 4 MCP server prep — bounded source handoff (2026-10-02)
 
 Base/current fetched origin/main at start: `61ab8b285fa5a9281587ec9712404bfe7b5c528f`;
@@ -1284,3 +1309,6 @@ supplied by these owning writer or neutral container suites. The historical
 final-materialization and graph authority failures remain unattributed; subsequent
 GREEN execution is not causal explanation. No typed-path claimed source or
 separately owned reliability source was modified.
+
+
+**2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.

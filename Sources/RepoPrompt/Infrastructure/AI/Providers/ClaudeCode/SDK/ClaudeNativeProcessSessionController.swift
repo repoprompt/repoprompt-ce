@@ -23,6 +23,14 @@ final actor ClaudeNativeProcessSessionController {
                 let name: String
                 let description: String
                 let argumentHint: String
+                let builtin: Bool
+
+                init(name: String, description: String, argumentHint: String, builtin: Bool = false) {
+                    self.name = name
+                    self.description = description
+                    self.argumentHint = argumentHint
+                    self.builtin = builtin
+                }
             }
 
             struct Agent: Equatable {
@@ -71,6 +79,7 @@ final actor ClaudeNativeProcessSessionController {
 
     enum Event {
         case stream(AIStreamResult)
+        case rateLimit(ClaudeCompatiblePluginRateLimitInfo)
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
@@ -456,6 +465,11 @@ final actor ClaudeNativeProcessSessionController {
         SessionRef(sessionID: sessionID)
     }
 
+    func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
+        guard hasActiveSession, !isShuttingDown else { return [] }
+        return initializeResponseSnapshot?.commands ?? []
+    }
+
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         do {
             guard try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil) == .applied else {
@@ -750,10 +764,17 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
-        let arguments = buildArguments(
+        var arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil
         )
+        #if DEBUG
+            arguments += ClaudeStatusLineCompatibilityProbe.claimSettingsArguments(
+                launchArguments: ProcessInfo.processInfo.arguments,
+                isFirstParty: launchEnvironment.backend == .defaultClaude,
+                providerArguments: arguments
+            )
+        #endif
 
         let workingDirectory = resolvedWorkingDirectory()
         let spawned = try ProcessLauncher.spawn(
@@ -1493,6 +1514,13 @@ final actor ClaudeNativeProcessSessionController {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return
         }
+        // Preserve quota telemetry separately from transcript events, including routine
+        // "allowed" events that the transcript translator intentionally suppresses.
+        if payload["type"] as? String == "rate_limit_event",
+           let rateLimit = ClaudeCompatiblePluginRateLimitInfo.decodeEvent(data)
+        {
+            emit(.rateLimit(rateLimit))
+        }
         let streamResults = translator.parseNDJSONLine(data)
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
@@ -1738,7 +1766,8 @@ final actor ClaudeNativeProcessSessionController {
                 return .init(
                     name: name,
                     description: (cmd["description"] as? String) ?? "",
-                    argumentHint: (cmd["argumentHint"] as? String) ?? ""
+                    argumentHint: (cmd["argumentHint"] as? String) ?? "",
+                    builtin: (cmd["builtin"] as? Bool) == true
                 )
             }
         } else {
@@ -2464,8 +2493,12 @@ final actor ClaudeNativeProcessSessionController {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
+        let filtered = await ProviderEnvironmentFiltering.filter(
+            result.environment,
+            for: config.runtimeVariant.agentKind
+        )
         return effectiveLaunchEnvironment(
-            base: result.environment,
+            base: filtered,
             resolverOverrides: resolverOverrides,
             resolverRemovedKeys: resolverRemovedKeys
         )

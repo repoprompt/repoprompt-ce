@@ -27,7 +27,15 @@ extension AgentModeViewModel {
         let acpRunLocksModelControls = session?.runState.isActive == true
             && (selectedAgent == .cursor || !acpControls.isEmpty)
         let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
+        let selectedRouterServiceID = routerControlsFreshTask
+            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
+        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        let autoEffortServiceName = autoEffortConfiguration.enabled
+            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
+            : nil
         return AgentComposerProps(
+            computerUse: computerUseComposerProps(session: session),
             currentTabID: tabID,
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
@@ -48,6 +56,8 @@ extension AgentModeViewModel {
             canSendWithCurrentProvider: canSendWithCurrentProvider,
             isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
             isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
+            automaticRouterServiceName: automaticRouterServiceName,
+            autoEffortServiceName: autoEffortServiceName,
             unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
@@ -62,6 +72,18 @@ extension AgentModeViewModel {
             stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
             draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
+        )
+    }
+
+    /// Pure presentation: no companion lookup, configuration IO, or permission probing.
+    func computerUseComposerProps(session: AgentTabSession?) -> AgentComputerUseComposerProps {
+        guard let session, session.selectedAgent == .codexExec, session.parentSessionID == nil,
+              sessions[session.tabID] === session,
+              !session.bindingTransitionInProgress else { return .hidden }
+        return .init(
+            isVisible: true,
+            isOn: session.isCodexComputerUseArmed,
+            isBusy: session.codexComputerUseArmingRequestID != nil || !session.codexComputerUseOwnershipTransitionHolds.isEmpty
         )
     }
 
@@ -115,12 +137,21 @@ extension AgentModeViewModel {
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
-        let resolvedSession = session ?? self.session(for: tabID)
+        let resolvedSession: TabSession
+        if let heldSession = session ?? sessions[tabID] {
+            resolvedSession = heldSession
+        } else {
+            // Saved-session activation owns materialization. Repainting a composer during
+            // recovery must not recreate a detached runtime from its still-visible carrier.
+            guard explicitActiveSessionID(for: tabID) == nil else { return nil }
+            resolvedSession = self.session(for: tabID)
+        }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil
         }
-        guard !resolvedSession.isComposerSubmissionInFlight,
+        guard resolvedSession.restorationAdmissionFailureMessage == nil,
+              !resolvedSession.isComposerSubmissionInFlight,
               !resolvedSession.isPreparingInitialWorktree,
               !resolvedSession.isChangingExecutionLocation
         else { return nil }
@@ -159,6 +190,7 @@ extension AgentModeViewModel {
     }
 
     func syncComposerUIState(tabID: UUID? = nil) {
+        invalidateRepromptIfNeeded()
         #if DEBUG
             test_syncComposerCallCount += 1
         #endif

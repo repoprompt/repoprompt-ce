@@ -82,7 +82,8 @@ package class DiffGenerationUtility {
         searchStartLine: Int = 0,
         mcpAmbiguityCheck: Bool = false,
         replaceAll: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> [DiffChunk] {
         switch action {
         case .create:
@@ -107,7 +108,8 @@ package class DiffGenerationUtility {
                     searchStartLine: searchStartLine,
                     mcpAmbiguityCheck: mcpAmbiguityCheck,
                     replaceAll: replaceAll,
-                    tabPromotionEnabled: tabPromotionEnabled
+                    tabPromotionEnabled: tabPromotionEnabled,
+                    requireWholeLineMatch: requireWholeLineMatch
                 )
             } else if isStartSelectorEmpty, isEndSelectorEmpty {
                 return generateRewriteDiff(fileContent: fileContent, newContent: newContent)
@@ -277,6 +279,10 @@ package class DiffGenerationUtility {
      */
 
     /// 🚩 Offset-aware search-block diff
+    ///
+    /// Matched file lines are replaced wholesale. When `requireWholeLineMatch` is set,
+    /// a candidate is only accepted if every matched line passes `isWholeLineMatch`, so
+    /// capped-key or fuzzy-probe candidates cannot drop text the search did not cover.
     package static func generateDiffWithSearchBlock(
         fileContent: [String],
         searchBlock: [String],
@@ -287,7 +293,8 @@ package class DiffGenerationUtility {
         searchStartLine: Int = 0,
         mcpAmbiguityCheck: Bool = false,
         replaceAll: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> [DiffChunk] {
         guard !fileContent.isEmpty else { throw DiffGenerationError.emptyContent }
         guard !searchBlock.isEmpty else { throw DiffGenerationError.invalidSelector }
@@ -344,6 +351,12 @@ package class DiffGenerationUtility {
 
                 // ➌ Produce diff for this match (same as single-match logic)
                 let oldBlock = Array(fileContent[globalMatch ..< globalEnd])
+                if requireWholeLineMatch,
+                   !isWholeLineMatch(fileLines: oldBlock, searchLines: sanitizedSearch)
+                {
+                    currentStartLine = globalMatch + 1
+                    continue
+                }
                 let correctedNew = IndentCorrectionUtility.reIndentUsingSearchBlock(
                     oldBlock: oldBlock,
                     searchBlock: sanitizedSearch,
@@ -409,6 +422,11 @@ package class DiffGenerationUtility {
 
         // ➌ Produce diff
         let oldBlock = Array(fileContent[globalMatch ..< globalEnd])
+        if requireWholeLineMatch,
+           !isWholeLineMatch(fileLines: oldBlock, searchLines: sanitizedSearch)
+        {
+            throw DiffGenerationError.noMatchFound
+        }
         let correctedNew = IndentCorrectionUtility.reIndentUsingSearchBlock(
             oldBlock: oldBlock,
             searchBlock: sanitizedSearch,
@@ -896,8 +914,10 @@ package class DiffGenerationUtility {
     }
 
     /// Internal normalisation pipeline – **all** string surgery happens here.
+    /// `wholeLine` (the `isWholeLineMatch` key) stops after step 4: no length cap and
+    /// no trailing-delimiter strip, so a line never equals one that lacks its last token.
     @inline(__always)
-    private static func normalized(_ raw: String) -> String {
+    private static func normalized(_ raw: String, wholeLine: Bool = false) -> String {
         // 1. Decode HTML entities & lowercase.
         var s = raw.decodingHTMLEntities().lowercased()
 
@@ -925,6 +945,8 @@ package class DiffGenerationUtility {
         // 4. Collapse separator runs.
         s = collapseSeparatorRuns(s)
 
+        if wholeLine { return s }
+
         // 5. Cap to 150 chars to bound fuzzy-match CPU.
         if s.count > 150 { s = String(s.prefix(150)) }
 
@@ -944,6 +966,23 @@ package class DiffGenerationUtility {
     package static func canonicalKey(_ raw: String) -> String? {
         let key = normalized(raw)
         return key.isEmpty ? nil : key
+    }
+
+    /// True when each matched file line equals its search line under the matcher's own
+    /// normalisation (indentation, whitespace, case, …) but **without** the 150-char
+    /// key cap or the trailing-delimiter strip. Rejects candidates admitted only by capped
+    /// keys, unverified middle lines, the fuzzy probe, or a missing trailing `=`/`:`/`->`
+    /// token, all of which would replace text the search did not cover.
+    package static func isWholeLineMatch(fileLines: [String], searchLines: [String]) -> Bool {
+        guard fileLines.count == searchLines.count else { return false }
+        return zip(fileLines, searchLines).allSatisfy { fileLine, searchLine in
+            wholeLineKey(fileLine) == wholeLineKey(searchLine)
+        }
+    }
+
+    @inline(__always)
+    private static func wholeLineKey(_ raw: String) -> String {
+        String.removeIndentationTag(normalized(raw, wholeLine: true))
     }
 
     /// Returns the strict & loose hash keys plus the cleaned text for a line.

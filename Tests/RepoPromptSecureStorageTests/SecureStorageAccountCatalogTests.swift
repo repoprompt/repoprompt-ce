@@ -27,6 +27,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "ClaudeCompatibleBackend.kimi.apiKey",
                 "ClaudeCompatibleBackend.custom.apiKey",
                 "JevRouterAPIKey",
+                "OpenAIDecisionsRouterAPIKey",
                 "rp.agent.permissions.subagent.v1",
                 "rp.agent.permissions.codex.v1",
                 "rp.agent.permissions.claude.v1",
@@ -37,7 +38,18 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.devin.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 27)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 28)
+    }
+
+    func testDecisionsAccountIsIsolatedAndIncludedInRepairInventory() {
+        let account = SecureStorageAccount.openAIDecisionsRouterAPIKey
+        XCTAssertEqual(account.identifier, "OpenAIDecisionsRouterAPIKey")
+        XCTAssertEqual(SecureStorageAccountCatalog.allAccounts.count(where: { $0 == account }), 1)
+        XCTAssertFalse(SecureStorageAccountCatalog.providerAndCLIAccounts.contains(account))
+        XCTAssertFalse(SecureStorageAccountCatalog.claudeCompatibleAccounts.contains(account))
+        XCTAssertFalse(SecureStorageAccountCatalog.agentPermissionAccounts.contains(account))
+        XCTAssertFalse(SecureStorageAccountCatalog.identityMigrationV2Accounts.contains(account))
+        XCTAssertEqual(SecureStorageAccountCatalog.identityMigrationV2Accounts.count, 24)
     }
 
     func testIdentityMigrationV2CatalogRemainsFrozen() {

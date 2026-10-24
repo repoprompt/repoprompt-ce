@@ -60,6 +60,15 @@ extension AgentModeViewModel {
             return .manualOnly(manualOnlyReason)
         }
 
+        if request.readOnlyAutoApproval {
+            guard let approval = session.pendingApproval, approval.id == interaction.id,
+                  AgentSessionLinkReadOnlyApprovalPolicy.allows(approval),
+                  request.payload.responseArgument == .scalar("accept")
+            else {
+                return .invalid("This command is outside the read-only auto-approval allowlist; manual approval is required.")
+            }
+        }
+
         let resolution: PendingInteractionResolution
         do {
             resolution = try mcpPendingInteractionResolution(
@@ -102,6 +111,10 @@ extension AgentModeViewModel {
         guard let current = mcpPendingInteraction(for: session) else { return .noPendingInteraction }
         guard current.id == request.interactionID else {
             return .interactionMismatch(currentInteractionID: current.id)
+        }
+        if request.readOnlyAutoApproval {
+            guard let approval = session.pendingApproval, approval.id == current.id,
+                  AgentSessionLinkReadOnlyApprovalPolicy.allows(approval) else { return .unavailable }
         }
         do {
             try applyPendingInteractionResolution(resolution, to: session)

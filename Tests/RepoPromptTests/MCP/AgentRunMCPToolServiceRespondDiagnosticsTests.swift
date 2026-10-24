@@ -1,5 +1,8 @@
+import AppKit
+import Combine
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -338,5 +341,131 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             )
             return GitWorktreeMergePreview(operationID: "merge", inspection: inspection, artifacts: nil)
         }
+    }
+}
+
+/// Workspace answers must belong to the displayed request and its presenting window.
+@MainActor
+final class WorkspaceApprovalResponseBindingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        _ = NSApplication.shared
+    }
+
+    func testDelayedActionCannotResolveOrRememberApprovalForTheNextRequest() async throws {
+        for sameWindow in [false, true] {
+            let manager = WorkspaceApprovalManager.shared
+            let windowA = makeWindow()
+            let windowB = sameWindow ? windowA : makeWindow()
+            let requestA = WorkspaceApprovalRequest(
+                clientID: "scope-a-\(UUID())", operation: .addFolder, windowID: windowA.windowID
+            )
+            let requestB = WorkspaceApprovalRequest(
+                clientID: "scope-b-\(UUID())", operation: .removeFolder, windowID: windowB.windowID
+            )
+            defer {
+                manager.cancelPending(requestID: requestA.id)
+                manager.cancelPending(requestID: requestB.id)
+                manager.removeAllAutoApprovals(for: requestA.clientID)
+                manager.removeAllAutoApprovals(for: requestB.clientID)
+                WindowStatesManager.shared.unregisterWindowState(windowA)
+                if !sameWindow { WindowStatesManager.shared.unregisterWindowState(windowB) }
+            }
+            let pendingA = Task { await manager.requestApproval(for: requestA) }
+            try await waitUntilPresented(manager, requestID: requestA.id)
+            XCTAssertEqual(manager.presentedTargetWindowID, windowA.windowID)
+            // Capture exactly the action A's overlay submits, but hold it until B is active.
+            let delayedAction = {
+                manager.resolveApproval(
+                    requestID: requestA.id, respondingWindowID: windowA.windowID,
+                    allow: true, alwaysAllow: true
+                )
+            }
+            let pendingB = Task { await manager.requestApproval(for: requestB) }
+            manager.cancelPending(requestID: requestA.id)
+            let resultA = await pendingA.value
+            XCTAssertFalse(resultA.isApproved)
+            try await waitUntilPresented(manager, requestID: requestB.id)
+            XCTAssertEqual(manager.presentedTargetWindowID, windowB.windowID)
+            delayedAction()
+            XCTAssertEqual(manager.pendingRequest?.id, requestB.id, "A stale action must leave B unanswered")
+            XCTAssertNil(manager.settings.clientPolicies[requestB.clientID], "A's toggle must not grant B a policy")
+            XCTAssertNil(manager.settings.clientPolicies[requestA.clientID])
+            manager.resolveApproval(
+                requestID: requestB.id, respondingWindowID: windowB.windowID, allow: false
+            )
+            let resultB = await pendingB.value
+            XCTAssertFalse(resultB.isApproved)
+        }
+    }
+
+    func testWrongWindowAndDuplicateActionsCannotRememberApproval() async throws {
+        let manager = WorkspaceApprovalManager.shared
+        let window = makeWindow()
+        let request = WorkspaceApprovalRequest(
+            clientID: "scope-window-\(UUID())", operation: .addFolder, windowID: window.windowID
+        )
+        defer {
+            manager.cancelPending(requestID: request.id)
+            manager.removeAllAutoApprovals(for: request.clientID)
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+        let pending = Task { await manager.requestApproval(for: request) }
+        try await waitUntilPresented(manager, requestID: request.id)
+        manager.resolveApproval(
+            requestID: request.id, respondingWindowID: window.windowID + 1, allow: true, alwaysAllow: true
+        )
+        XCTAssertEqual(manager.pendingRequest?.id, request.id)
+        XCTAssertNil(manager.settings.clientPolicies[request.clientID])
+        manager.resolveApproval(requestID: request.id, respondingWindowID: window.windowID, allow: false)
+        manager.resolveApproval(
+            requestID: request.id, respondingWindowID: window.windowID, allow: true, alwaysAllow: true
+        )
+        let result = await pending.value
+        XCTAssertFalse(result.isApproved)
+        XCTAssertNil(manager.settings.clientPolicies[request.clientID])
+    }
+
+    func testMatchingWindowCanRememberOnlyTheDisplayedClientsOperation() async throws {
+        let manager = WorkspaceApprovalManager.shared
+        let window = makeWindow()
+        let request = WorkspaceApprovalRequest(
+            clientID: "scope-remember-\(UUID())", operation: .addFolder, windowID: window.windowID
+        )
+        defer {
+            manager.cancelPending(requestID: request.id)
+            manager.removeAllAutoApprovals(for: request.clientID)
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+        let pending = Task { await manager.requestApproval(for: request) }
+        try await waitUntilPresented(manager, requestID: request.id)
+        manager.resolveApproval(
+            requestID: request.id, respondingWindowID: window.windowID, allow: true, alwaysAllow: true
+        )
+        let result = await pending.value
+        guard case .approved(alwaysAllow: true) = result else {
+            return XCTFail("Expected the explicit remembered approval")
+        }
+        XCTAssertEqual(manager.settings.clientPolicies[request.clientID]?.allowedOperations, [.addFolder])
+    }
+
+    private func makeWindow() -> WindowState {
+        let settings = GlobalSettingsStore.shared
+        let previous = settings.mcpAutoStart()
+        settings.setMCPAutoStart(false, commit: false)
+        defer { settings.setMCPAutoStart(previous, commit: false) }
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        return window
+    }
+
+    private func waitUntilPresented(_ manager: WorkspaceApprovalManager, requestID: UUID) async throws {
+        let presented = expectation(description: "Request presented")
+        let observation = manager.$pendingRequest
+            .first { $0?.id == requestID }
+            .sink { _ in presented.fulfill() }
+        defer { observation.cancel() }
+        await fulfillment(of: [presented], timeout: 5)
+        XCTAssertEqual(manager.pendingRequest?.id, requestID)
     }
 }

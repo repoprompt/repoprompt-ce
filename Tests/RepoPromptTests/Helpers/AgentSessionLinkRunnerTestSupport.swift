@@ -73,6 +73,8 @@ final class AgentSessionLinkRunnerHarness {
     /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
     /// provider boundary without duplicating runner logic.
     var forcedAutoWakeID: UUID?
+    var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
+    private var workspaces: [WorkspaceManagerViewModel] = []
 
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
@@ -95,7 +97,9 @@ final class AgentSessionLinkRunnerHarness {
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             // No MCP infrastructure in these suites: signal routing immediately so the bootstrap lease
             // resolves instead of waiting for a connection that will never arrive.
-            if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
@@ -184,7 +188,7 @@ final class AgentSessionLinkRunnerHarness {
                         )
                     }
                 },
-                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
@@ -192,7 +196,7 @@ final class AgentSessionLinkRunnerHarness {
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
-                        if let sessionLinkHost {
+                        if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                             return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
@@ -227,11 +231,29 @@ final class AgentSessionLinkRunnerHarness {
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        sessionLinkHost?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
                     }
+                },
+                proveAgentSessionLinkProviderInput: { session, claim in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                    }
+                    return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+                },
+                handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                    }
+                    return AgentSessionLinkProviderInputRelease.handoff(
+                        original: claim,
+                        proof: proof,
+                        current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed },
+                        isPending: { _ in true },
+                        consume: { _ in false }
+                    )
                 }
             ),
             interactions: .init(
@@ -315,6 +337,19 @@ final class AgentSessionLinkRunnerHarness {
         )
     }
 
+    func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
+        let tabID = UUID()
+        workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+        let session = host.session(for: tabID)
+        session.selectedAgent = agent
+        session.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        return session
+    }
+
     func makeSession(agent: AgentProviderKind) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = agent
@@ -380,6 +415,14 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         lock.lock()
         defer { lock.unlock() }
         return captured
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        providerID == .devin
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        providerID == .devin && input.category == "thought_level" ? .thinking : nil
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
@@ -464,7 +507,9 @@ final class AgentSessionLinkACPResponseGate {
     }
 
     deinit {
-        if !released { try? handle.write(contentsOf: Data([1])) }
+        if !released {
+            try? handle.write(contentsOf: Data([1]))
+        }
         try? handle.close()
     }
 }
@@ -479,6 +524,8 @@ enum AgentSessionLinkACPServerScript {
     ///   `session/new`; `__malformed__` sends a non-list `availableCommands`.
     /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
     /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
+    /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
+    /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
     /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
     /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
     /// - `ACP_UNMATCHED_RESPONSE_ON_PROMPT`: a response with an unknown id during each prompt (a protocol
@@ -496,20 +543,28 @@ enum AgentSessionLinkACPServerScript {
 
         fail_marker = os.environ.get("ACP_FAIL_PROMPTS_CONTAINING")
         prompt_log = os.environ.get("ACP_PROMPT_LOG")
-        current_model = "model-a"
+        devin_fixture = os.environ.get("ACP_DEVIN_FIXTURE") == "1"
+        current_model = "swe-2-high" if devin_fixture else "model-a"
+        current_thinking = "high"
         current_mode = "ask"
+
+        def trace(direction, payload):
+            path = os.environ.get("ACP_RPC_LOG")
+            if path:
+                with open(path, "a") as log:
+                    log.write(json.dumps({"direction": direction, "payload": payload}) + "\n")
 
         def config_options():
             # The controller refuses to run against a runtime that does not advertise a modern
             # session-mode select, so both selects are required here.
-            return [
+            options = [
                 {
                     "id": "model",
                     "name": "Model",
                     "category": "model",
                     "type": "select",
                     "currentValue": current_model,
-                    "options": [{"value": "model-a", "name": "Model A"}]
+                    "options": [{"value": "swe-2-high", "name": "SWE-2"}] if devin_fixture else [{"value": "model-a", "name": "Model A"}]
                 },
                 {
                     "id": "mode",
@@ -525,6 +580,13 @@ enum AgentSessionLinkACPServerScript {
                     ]
                 }
             ]
+            if devin_fixture:
+                options.append({
+                    "id": "thought_level", "name": "Thinking", "category": "thought_level",
+                    "type": "select", "currentValue": current_thinking,
+                    "options": [{"value": value, "name": value} for value in ["medium", "high", "max"]]
+                })
+            return options
 
         def notify_update(session_id, update):
             print(json.dumps({
@@ -547,7 +609,9 @@ enum AgentSessionLinkACPServerScript {
             })
 
         def respond(request_id, result=None):
-            print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
+            response = {"jsonrpc": "2.0", "id": request_id, "result": result or {}}
+            trace("response", response)
+            print(json.dumps(response), flush=True)
 
         def respond_error(request_id, message):
             print(json.dumps({
@@ -561,6 +625,7 @@ enum AgentSessionLinkACPServerScript {
                 request = json.loads(line)
             except Exception:
                 continue
+            trace("request", request)
             method = request.get("method")
             params = request.get("params") or {}
             if method == os.environ.get("ACP_HOLD_METHOD"):
@@ -591,6 +656,8 @@ enum AgentSessionLinkACPServerScript {
                     current_model = params.get("value")
                 elif params.get("configId") == "mode":
                     current_mode = params.get("value")
+                elif params.get("configId") == "thought_level":
+                    current_thinking = params.get("value")
                 respond(request.get("id"), {"configOptions": config_options()})
             elif method == "session/prompt":
                 if prompt_log:

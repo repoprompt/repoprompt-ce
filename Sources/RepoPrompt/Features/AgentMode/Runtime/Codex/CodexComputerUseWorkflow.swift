@@ -1,8 +1,10 @@
 import Foundation
+import OSLog
 import RepoPromptSettingsCore
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
+    static let codexComputerUseDidChange = Notification.Name("RepoPrompt.codexComputerUseDidChange")
 }
 
 private enum CodexNativeFeatureGate: Hashable {
@@ -130,10 +132,33 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Codex computer-use is currently disabled in RepoPrompt because it requires additional computer permissions/accessibility setup."
+    static let disabledMessage = "Computer Use is turned off. Enable Computer Use in Codex Direct Agent permissions, then submit /computer-use. macOS permissions must be granted manually."
+    static let unavailableMessage = "Computer Use requires the installed SkyComputerUseClient companion from Codex or ChatGPT. No companion is available; this turn cannot use computer-use tools."
+    static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
+    static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
 
+    @MainActor
     static var isEnabled: Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: false)
+        GlobalSettingsStore.shared.codexComputerUseEnabled()
+    }
+
+    static func isEnabled(defaults: UserDefaults) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(defaults: defaults)
+    }
+
+    static func isEnabled(persistedValue: Bool?) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue)
+    }
+
+    static func setEnabled(_ value: Bool, defaults: UserDefaults = .standard) {
+        let oldValue = isEnabled(defaults: defaults)
+        CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults)
+        postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))
+    }
+
+    static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
+        guard currentValue != previousValue else { return }
+        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
     }
 
     #if DEBUG
@@ -142,14 +167,43 @@ enum CodexComputerUseWorkflow {
         }
     #endif
 
+    private static let approvalLogger = Logger(subsystem: "com.repoprompt.agents", category: "CodexComputerUse")
+
+    enum ApprovalDecisionPath: String {
+        case mcpElicitation
+        case permissions
+        case approval
+        case requestUserInput
+        case other
+    }
+
+    static func logApprovalDecision(path: ApprovalDecisionPath, server: String?, armed: Bool, approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy, sandboxMode: CodexAgentToolPreferences.SandboxMode, outcome: String) {
+        guard armed else { return }
+        let server = server ?? "unspecified"
+        let mode = approvalPolicy.persistedValue + "/" + sandboxMode.persistedValue
+        approvalLogger.notice("Computer Use approval path=\(path.rawValue, privacy: .public) server=\(server, privacy: .private) armed=true mode=\(mode, privacy: .public) outcome=\(outcome, privacy: .public)")
+    }
+
+    static func automaticallyApprovesCompanion(
+        armed: Bool,
+        approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy,
+        sandboxMode: CodexAgentToolPreferences.SandboxMode
+    ) -> Bool {
+        armed && approvalPolicy == .never && sandboxMode == .dangerFullAccess
+    }
+
+    static func isOffCommand(argumentsText: String) -> Bool {
+        argumentsText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "off"
+    }
+
     static func bubbleWorkflowDefinition() -> AgentWorkflowDefinition {
         AgentWorkflowDefinition(
             customID: UUID(),
             displayName: "/\(commandName)",
-            iconName: "display",
+            iconName: "cursorarrow",
             accentColorHex: "#0EA5E9",
             tooltipText: "Guide Codex through a computer-use workflow",
-            descriptionText: "Enables Codex computer-use capabilities for this explicit workflow turn.",
+            descriptionText: "Arms Computer Use for this chat until /computer-use off or the session ends.",
             template: nil
         )
     }
@@ -162,9 +216,9 @@ enum CodexComputerUseWorkflow {
 
         return """
         <computer_use_workflow>
-        The user explicitly requested a Codex computer-use workflow in RepoPrompt Agent Mode.
+        The user explicitly armed Computer Use for this chat in RepoPrompt Agent Mode. It remains available for later turns in this chat until /computer-use off or the session ends.
 
-        Use Codex's computer-use, tool-search, plugin, and MCP tools only when they are available in this session. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
+        Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
 
         Safety requirements:
         - Clarify missing target app/site/account, destination, credentials, or intended action before operating.

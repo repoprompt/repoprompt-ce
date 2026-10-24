@@ -2,6 +2,48 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
+/// Persisted, non-secret record that the user explicitly connected Claude account usage for one
+/// Claude config profile. It holds no token, account identifier, or token-derived value. A grant
+/// for a different profile than the active one is inert; it is only ever written from the UI.
+package struct ClaudeAccountUsageGrant: Codable, Equatable {
+    /// Canonical Claude config-directory identity (e.g. resolved `CLAUDE_CONFIG_DIR` path).
+    package let credentialProfileID: String
+    package let grantedAt: Date
+
+    package init(credentialProfileID: String, grantedAt: Date) {
+        self.credentialProfileID = credentialProfileID
+        self.grantedAt = grantedAt
+    }
+
+    package func applies(toProfileID profileID: String) -> Bool {
+        !credentialProfileID.isEmpty && credentialProfileID == profileID
+    }
+}
+
+/// Explicit consent for the CLI-owned usage collector; legacy OAuth grants never authorize it.
+package struct ClaudeCLIUsageGrant: Codable, Equatable {
+    package let credentialProfileID: String
+    package let grantedAt: Date
+    package let consentVersion: Int
+    /// Older connected grants remain readable; a new deferred setup explicitly stores false.
+    package var setupCompleted: Bool?
+
+    package init(credentialProfileID: String, grantedAt: Date, consentVersion: Int = 1, setupCompleted: Bool = true) {
+        self.credentialProfileID = credentialProfileID
+        self.grantedAt = grantedAt
+        self.consentVersion = consentVersion
+        self.setupCompleted = setupCompleted
+    }
+
+    package var isReady: Bool {
+        setupCompleted != false
+    }
+
+    package func applies(toProfileID profileID: String) -> Bool {
+        consentVersion == 1 && !credentialProfileID.isEmpty && credentialProfileID == profileID
+    }
+}
+
 private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
     OracleRosterContract.sanitizedAdditionalModelIDs(raws)
 }
@@ -28,7 +70,10 @@ private func strictAdditionalOracleModelRaws(_ raws: [String], codingPath: [Codi
 /// behavior group from pre-Context-Builder typed writers. Schema v7 adds the Oracle
 /// roster. Schema v8 adds OpenCode-style ACP parameter pins to Agent Models profiles.
 /// Schema v9 adds the optional app-global model-router policy group. Schema v10
-/// adds global primary/subagent scope policy and custom router guidance.
+/// adds global primary/subagent scope policy and custom router guidance. Schema v11
+/// fences optional Oracle reconciliation guidance from older typed writers. Schema v12
+/// adds an explicit independent Auto Effort decision-service selection and retains
+/// deprecated routing-profile update fields for rollback compatibility.
 /// Scalar fields stay optional so missing JSON fields fall back through the
 /// typed GlobalSettingsStore accessors without losing current default behavior.
 package struct GlobalSettingsDocument: Codable {
@@ -48,7 +93,11 @@ package struct GlobalSettingsDocument: Codable {
     package static let modelRouterSchemaVersion = 9
     package static let scopedModelRouterSchemaVersion = 10
     package static let rejectedExperimentalSchemaVersions = 6 ... 6
-    package static let currentSchemaVersion = 10
+    package static let oracleReconciliationGuidanceSchemaVersion = 11
+    package static let autoEffortServiceSchemaVersion = 12
+    package static let routingProfileUpdatePreferenceSchemaVersion = 12
+    package static let agentRepromptGuidanceSchemaVersion = 13
+    package static let currentSchemaVersion = 13
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -122,6 +171,31 @@ package struct GlobalSettingsDocument: Codable {
         if hasGlobalOracleRoster || hasWorkspaceOracleRoster {
             requiredVersion = max(requiredVersion, Self.oracleRosterSchemaVersion)
         }
+        let hasGlobalGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
+            scalarPreferences?.modelSelection?.oracleReconciliationGuidance
+        ) != nil
+        // Retained profiles need protection even while the workspace inherits global settings.
+        let hasWorkspaceGuidance = agentModelsSettings.values.contains { settings in
+            OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
+                settings.profile?.oracleReconciliationGuidance
+            ) != nil
+        }
+        if hasGlobalGuidance || hasWorkspaceGuidance {
+            requiredVersion = max(requiredVersion, Self.oracleReconciliationGuidanceSchemaVersion)
+        }
+        let hasGlobalReprompt = AgentRepromptGuidance.normalizedOverride(scalarPreferences?.modelSelection?.agentRepromptGuidance) != nil
+            || AgentRepromptModelPreference.normalizedRaw(scalarPreferences?.modelSelection?.agentRepromptModelRaw) != nil
+            || scalarPreferences?.modelSelection?.agentRepromptMode != nil
+            || scalarPreferences?.modelSelection?.agentRepromptIncludesRecentChat != nil
+        let hasWorkspaceReprompt = agentModelsSettings.values.contains {
+            AgentRepromptGuidance.normalizedOverride($0.profile?.agentRepromptGuidance) != nil
+                || AgentRepromptModelPreference.normalizedRaw($0.profile?.agentRepromptModelRaw) != nil
+                || $0.profile?.agentRepromptMode != nil
+                || $0.profile?.agentRepromptIncludesRecentChat != nil
+        }
+        if hasGlobalReprompt || hasWorkspaceReprompt {
+            requiredVersion = max(requiredVersion, Self.agentRepromptGuidanceSchemaVersion)
+        }
         let hasGlobalParameterPins = globalDefaults.mcpAgentRoleModelParameters?.isEmpty == false
             || globalDefaults.contextBuilderModelParametersByAgent?.isEmpty == false
         let hasWorkspaceParameterPins = agentModelsSettings.values.contains { settings in
@@ -130,6 +204,14 @@ package struct GlobalSettingsDocument: Codable {
         }
         if hasGlobalParameterPins || hasWorkspaceParameterPins {
             requiredVersion = max(requiredVersion, Self.agentModelParameterPinsSchemaVersion)
+        }
+        if scalarPreferences?.agentMode?.autoEffortBackendRawValue != nil {
+            requiredVersion = max(requiredVersion, Self.autoEffortServiceSchemaVersion)
+        }
+        if scalarPreferences?.modelRoutingProfiles?.remoteUpdatesDisabled != nil
+            || scalarPreferences?.modelRoutingProfiles?.lastCheckAt != nil
+        {
+            requiredVersion = max(requiredVersion, Self.routingProfileUpdatePreferenceSchemaVersion)
         }
         if let router = scalarPreferences?.modelRouter {
             requiredVersion = max(requiredVersion, Self.modelRouterSchemaVersion)
@@ -238,6 +320,12 @@ package enum ContextBuilderSettingsWriteIntent {
 package struct AgentModelsSettingsProfile: Codable, Equatable {
     package var planningModelRaw: String?
     package var additionalOracleModelRaws: [String]
+    /// Nil uses the delivery contract's built-in guidance, not a per-field global inheritance.
+    package var oracleReconciliationGuidance: String?
+    package var agentRepromptGuidance: String?
+    package var agentRepromptModelRaw: String?
+    package var agentRepromptMode: AgentRepromptMode?
+    package var agentRepromptIncludesRecentChat: Bool?
     package var preferredComposeModelRaw: String?
     package var syncChatModelWithOracle: Bool
     package var contextBuilderAgentRaw: String?
@@ -255,6 +343,11 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
     package init(
         planningModelRaw: String? = nil,
         additionalOracleModelRaws: [String] = [],
+        oracleReconciliationGuidance: String? = nil,
+        agentRepromptGuidance: String? = nil,
+        agentRepromptModelRaw: String? = nil,
+        agentRepromptMode: AgentRepromptMode? = nil,
+        agentRepromptIncludesRecentChat: Bool? = nil,
         preferredComposeModelRaw: String? = nil,
         syncChatModelWithOracle: Bool = false,
         contextBuilderAgentRaw: String? = nil,
@@ -266,6 +359,11 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
         self.additionalOracleModelRaws = sanitizedAdditionalOracleModelRaws(additionalOracleModelRaws)
+        self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
+        self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
+        self.agentRepromptModelRaw = AgentRepromptModelPreference.normalizedRaw(agentRepromptModelRaw)
+        self.agentRepromptMode = agentRepromptMode
+        self.agentRepromptIncludesRecentChat = agentRepromptIncludesRecentChat
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
@@ -287,6 +385,11 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case planningModelRaw
         case additionalOracleModelRaws
+        case oracleReconciliationGuidance
+        case agentRepromptGuidance
+        case agentRepromptModelRaw
+        case agentRepromptMode
+        case agentRepromptIncludesRecentChat
         case preferredComposeModelRaw
         case syncChatModelWithOracle
         case contextBuilderAgentRaw
@@ -307,6 +410,13 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
             container.decodeIfPresent(String.self, forKey: .planningModelRaw)
         )
         additionalOracleModelRaws = additional
+        oracleReconciliationGuidance = try OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
+            container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
+        )
+        agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
+        agentRepromptModelRaw = try AgentRepromptModelPreference.normalizedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw))
+        agentRepromptMode = try container.decodeIfPresent(AgentRepromptMode.self, forKey: .agentRepromptMode)
+        agentRepromptIncludesRecentChat = try container.decodeIfPresent(Bool.self, forKey: .agentRepromptIncludesRecentChat)
         preferredComposeModelRaw = try Self.normalizedChatModelRaw(
             container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw)
         )
@@ -654,6 +764,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
     package var telemetry: TelemetrySettings?
     package var modelOverrides: ModelOverrideSettingsData?
     package var modelRouter: ModelRouterSettings?
+    package var modelRoutingProfiles: ModelRoutingProfileSettings?
     /// Additive, schema-neutral group: every field is optional and typed readers fall back to
     /// `NotificationPreferences.defaults`. Older typed readers ignore the unknown key, and the
     /// raw-preserving save path keeps it, so it deliberately does not raise `requiredSchemaVersion`.
@@ -670,6 +781,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         telemetry: TelemetrySettings? = nil,
         modelOverrides: ModelOverrideSettingsData? = nil,
         modelRouter: ModelRouterSettings? = nil,
+        modelRoutingProfiles: ModelRoutingProfileSettings? = nil,
         notifications: NotificationSettings? = nil
     ) {
         self.ui = ui
@@ -682,6 +794,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
         self.modelRouter = modelRouter
+        self.modelRoutingProfiles = modelRoutingProfiles
         self.notifications = notifications
     }
 
@@ -708,6 +821,16 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         // Resolves stored overrides over the product defaults.
     }
 
+    /// Inert schema-v12 fields retained for rollback compatibility.
+    package struct ModelRoutingProfileSettings: Codable, Equatable {
+        package var remoteUpdatesDisabled: Bool?
+        package var lastCheckAt: Date?
+        package init(remoteUpdatesDisabled: Bool? = nil, lastCheckAt: Date? = nil) {
+            self.remoteUpdatesDisabled = remoteUpdatesDisabled
+            self.lastCheckAt = lastCheckAt
+        }
+    }
+
     package struct ModelRouterSettings: Codable, Equatable {
         package var enabled: Bool?
         package var selectedBackendRawValue: String?
@@ -716,6 +839,11 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var primaryProviderRawValue: String?
         package var subagentProviderRawValue: String?
         package var customInstructions: String?
+        package var usageBalancingEnabled: Bool?
+        package var usageBalancingPreset: String?
+        package var usageBalancingOverride: Bool?
+        package var usageLargerPlan: String? // Legacy value retained for lossless settings round trips; no longer used.
+        package var allowPaidFastRouting: Bool?
 
         package init(
             enabled: Bool? = nil,
@@ -811,17 +939,32 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var preferredComposeModel: String?
         package var planningModel: String?
         package var additionalOracleModels: [String]?
+        package var oracleReconciliationGuidance: String?
+        package var agentRepromptGuidance: String?
+        package var agentRepromptModelRaw: String?
+        package var agentRepromptMode: AgentRepromptMode?
+        package var agentRepromptIncludesRecentChat: Bool?
         package var syncChatModelWithOracle: Bool?
 
         package init(
             preferredComposeModel: String? = nil,
             planningModel: String? = nil,
             additionalOracleModels: [String]? = nil,
+            oracleReconciliationGuidance: String? = nil,
+            agentRepromptGuidance: String? = nil,
+            agentRepromptModelRaw: String? = nil,
+            agentRepromptMode: AgentRepromptMode? = nil,
+            agentRepromptIncludesRecentChat: Bool? = nil,
             syncChatModelWithOracle: Bool? = nil
         ) {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
             self.additionalOracleModels = additionalOracleModels
+            self.oracleReconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidance)
+            self.agentRepromptGuidance = AgentRepromptGuidance.normalizedOverride(agentRepromptGuidance)
+            self.agentRepromptModelRaw = AgentRepromptModelPreference.normalizedRaw(agentRepromptModelRaw)
+            self.agentRepromptMode = agentRepromptMode
+            self.agentRepromptIncludesRecentChat = agentRepromptIncludesRecentChat
             self.syncChatModelWithOracle = syncChatModelWithOracle
         }
 
@@ -829,6 +972,11 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             case preferredComposeModel
             case planningModel
             case additionalOracleModels
+            case oracleReconciliationGuidance
+            case agentRepromptGuidance
+            case agentRepromptModelRaw
+            case agentRepromptMode
+            case agentRepromptIncludesRecentChat
             case syncChatModelWithOracle
         }
 
@@ -836,6 +984,13 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             preferredComposeModel = try container.decodeIfPresent(String.self, forKey: .preferredComposeModel)
             planningModel = try container.decodeIfPresent(String.self, forKey: .planningModel)
+            oracleReconciliationGuidance = try OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(
+                container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
+            )
+            agentRepromptGuidance = try AgentRepromptGuidance.normalizedOverride(container.decodeIfPresent(String.self, forKey: .agentRepromptGuidance))
+            agentRepromptModelRaw = try AgentRepromptModelPreference.normalizedRaw(container.decodeIfPresent(String.self, forKey: .agentRepromptModelRaw))
+            agentRepromptMode = try container.decodeIfPresent(AgentRepromptMode.self, forKey: .agentRepromptMode)
+            agentRepromptIncludesRecentChat = try container.decodeIfPresent(Bool.self, forKey: .agentRepromptIncludesRecentChat)
             if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {
                 additionalOracleModels = try strictAdditionalOracleModelRaws(
                     values,
@@ -965,8 +1120,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var maxBackgroundAgentComposeTabs: Int?
         package var showBuiltInWorkflowCleanupGuidance: Bool?
         package var codexGoalSupportEnabled: Bool?
+        package var codexComputerUseEnabled: Bool?
         package var codexReasoningSummariesEnabled: Bool?
         package var autoEffortEnabled: Bool?
+        package var autoEffortBackendRawValue: String?
         package var codexMemoriesEnabled: Bool?
         package var codexAppsEnabled: Bool?
         package var codexPluginsEnabled: Bool?
@@ -974,10 +1131,29 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var codexToolSuggestionsEnabled: Bool?
         package var codexHookApprovalStrictModeEnabled: Bool?
         package var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
+        /// Default-off opt-in flags only; quota readings themselves are never persisted.
+        /// `codexUsageQuotaEnabled` authorizes the Codex app-server quota source.
+        package var codexUsageQuotaEnabled: Bool?
+        /// Legacy name. Gates passive Claude run rate-limit telemetry only; it never authorizes
+        /// an account usage read and is never migrated into `claudeAccountUsageGrant`.
+        package var claudeUsageQuotaEnabled: Bool?
+        /// Master presentation switch ("Show usage limits when available"). `nil` means
+        /// "never chosen"; the store derives it from the legacy per-provider flags.
+        /// Presentation only: it never authorizes acquisition by itself.
+        package var usageLimitsDisplayEnabled: Bool?
+        /// Explicit, UI-only consent to read Claude account usage for one config profile.
+        package var claudeAccountUsageGrant: ClaudeAccountUsageGrant?
+        package var claudeCLIUsageGrant: ClaudeCLIUsageGrant?
+        package var claudeBalancingRefreshGrant: ClaudeCLIUsageGrant?
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
         package var subagentDefaultWaitSeconds: Int?
+        /// App-global UI preference; skips only the confirmation dialog, never authority.
+        package var suppressOversightLinkConfirmation: Bool?
+        /// Opt-in exact environment-variable names; nil retains existing launch behavior.
+        package var providerEnvironmentWithheldNames: [String]?
+        package var providerEnvironmentPassthroughNames: [String: [String]]?
 
         package init(
             proEditAgentMode: Bool? = nil,
@@ -988,8 +1164,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             maxBackgroundAgentComposeTabs: Int? = nil,
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
+            codexComputerUseEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             autoEffortEnabled: Bool? = nil,
+            autoEffortBackendRawValue: String? = nil,
             codexMemoriesEnabled: Bool? = nil,
             codexAppsEnabled: Bool? = nil,
             codexPluginsEnabled: Bool? = nil,
@@ -997,10 +1175,18 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             codexToolSuggestionsEnabled: Bool? = nil,
             codexHookApprovalStrictModeEnabled: Bool? = nil,
             codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
+            codexUsageQuotaEnabled: Bool? = nil,
+            claudeUsageQuotaEnabled: Bool? = nil,
+            usageLimitsDisplayEnabled: Bool? = nil,
+            claudeAccountUsageGrant: ClaudeAccountUsageGrant? = nil,
+            claudeCLIUsageGrant: ClaudeCLIUsageGrant? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
-            subagentDefaultWaitSeconds: Int? = nil
+            subagentDefaultWaitSeconds: Int? = nil,
+            suppressOversightLinkConfirmation: Bool? = nil,
+            providerEnvironmentWithheldNames: [String]? = nil,
+            providerEnvironmentPassthroughNames: [String: [String]]? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
             self.proEditAgentKind = proEditAgentKind
@@ -1010,8 +1196,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.maxBackgroundAgentComposeTabs = maxBackgroundAgentComposeTabs
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
+            self.codexComputerUseEnabled = codexComputerUseEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.autoEffortEnabled = autoEffortEnabled
+            self.autoEffortBackendRawValue = autoEffortBackendRawValue
             self.codexMemoriesEnabled = codexMemoriesEnabled
             self.codexAppsEnabled = codexAppsEnabled
             self.codexPluginsEnabled = codexPluginsEnabled
@@ -1019,10 +1207,18 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.codexToolSuggestionsEnabled = codexToolSuggestionsEnabled
             self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
             self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
+            self.codexUsageQuotaEnabled = codexUsageQuotaEnabled
+            self.claudeUsageQuotaEnabled = claudeUsageQuotaEnabled
+            self.usageLimitsDisplayEnabled = usageLimitsDisplayEnabled
+            self.claudeAccountUsageGrant = claudeAccountUsageGrant
+            self.claudeCLIUsageGrant = claudeCLIUsageGrant
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
             self.subagentDefaultWaitSeconds = subagentDefaultWaitSeconds
+            self.suppressOversightLinkConfirmation = suppressOversightLinkConfirmation
+            self.providerEnvironmentWithheldNames = providerEnvironmentWithheldNames
+            self.providerEnvironmentPassthroughNames = providerEnvironmentPassthroughNames
         }
     }
 }

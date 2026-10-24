@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -10,27 +11,6 @@ import RepoPromptDomainRuntime
 // Invariants: props are an exact-endpoint projection, never a session-UUID lookup, so a rebind
 // cannot inherit a predecessor's role or rows; and nothing here reads the passive queue or wake
 // state directly — snooze and selection arrive already projected.
-
-// MARK: - Identifier formatting
-
-/// Short display form for an Agent session ID.
-///
-/// The full canonical UUID remains available through the row's tooltip, accessibility value, and
-/// Copy Session ID actions. The compact form is retained for fallback task names, previews, inbound
-/// labels, notices, and attribution.
-enum AgentMonitorSessionIDFormatter {
-    private static let baseTokenLength = 4
-
-    static func short(_ sessionID: UUID) -> String {
-        token(sessionID, endLength: baseTokenLength)
-    }
-
-    private static func token(_ sessionID: UUID, endLength: Int) -> String {
-        let raw = sessionID.uuidString
-        guard raw.count > endLength * 2 else { return raw }
-        return "\(raw.prefix(endLength))…\(raw.suffix(endLength))"
-    }
-}
 
 // MARK: - Status
 
@@ -260,7 +240,7 @@ enum AgentMonitorAutoWakeCopy {
     routine status and overflow remains governed by selection and snooze. To stop those routine wakes, \
     switch off and deselect or snooze the lane. To prevent purposeful attention from that link, \
     unlink it; revocation and all other safety and admission gates still apply. The setting applies \
-    to this session rather than to individual links. Off by default, and saved with this session even \
+    to this session rather than to individual links. On by default, and saved with this session even \
     when it oversees nothing.
     """
     static let accessibilityLabel = "Auto-wake on all updates"
@@ -976,12 +956,17 @@ enum AgentMonitorAccessibilityLocationPhrase {
 /// Workspace/worktree labels here are **UI only**; they are never placed in agent-facing snapshots,
 /// inventories, or prompts.
 struct AgentMonitorPillProps: Equatable {
+    /// Explicit, revocable, process-local user policy; independent of management grants.
+    var readOnlyAutoApprovalEnabled = false
     struct Outbound: Equatable, Identifiable {
         let linkID: UUID
         let generation: UInt64
         let targetSessionID: UUID
         /// Exact target incarnation recorded by the authority for this generation-qualified row.
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+        /// Grant creation time — drives "first overseer by link creation" ordering for the
+        /// sidebar marks and the palette slot allocator. Never reaches agent-facing payloads.
+        let linkCreatedAt: Date?
         let displayName: String
         let providerDisplayName: String?
         let locationLabel: String?
@@ -1010,6 +995,7 @@ struct AgentMonitorPillProps: Equatable {
             generation: UInt64,
             targetSessionID: UUID,
             targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            linkCreatedAt: Date? = nil,
             displayName: String,
             providerDisplayName: String?,
             locationLabel: String?,
@@ -1024,6 +1010,7 @@ struct AgentMonitorPillProps: Equatable {
             self.generation = generation
             self.targetSessionID = targetSessionID
             self.targetEndpoint = targetEndpoint
+            self.linkCreatedAt = linkCreatedAt
             self.displayName = displayName
             self.providerDisplayName = providerDisplayName
             self.locationLabel = locationLabel
@@ -1054,6 +1041,7 @@ struct AgentMonitorPillProps: Equatable {
                 generation: generation,
                 targetSessionID: targetSessionID,
                 targetEndpoint: targetEndpoint,
+                linkCreatedAt: linkCreatedAt,
                 displayName: displayName,
                 providerDisplayName: providerDisplayName,
                 locationLabel: locationLabel,
@@ -1226,8 +1214,29 @@ struct AgentMonitorPillProps: Equatable {
         let observerSessionID: UUID
         /// Exact observer incarnation recorded by the authority for this generation-qualified row.
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        /// Grant creation time — orders a row's overseers by link creation so the mark always
+        /// wears the first overseer's group colour. Never reaches agent-facing payloads.
+        let linkCreatedAt: Date?
         let displayName: String
         let providerDisplayName: String?
+
+        init(
+            linkID: UUID,
+            generation: UInt64,
+            observerSessionID: UUID,
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            linkCreatedAt: Date? = nil,
+            displayName: String,
+            providerDisplayName: String?
+        ) {
+            self.linkID = linkID
+            self.generation = generation
+            self.observerSessionID = observerSessionID
+            self.observerEndpoint = observerEndpoint
+            self.linkCreatedAt = linkCreatedAt
+            self.displayName = displayName
+            self.providerDisplayName = providerDisplayName
+        }
 
         var id: UUID {
             linkID
@@ -1316,18 +1325,12 @@ struct AgentMonitorPillProps: Equatable {
     /// The observing session this projection belongs to, or `nil` while the tab has no durable
     /// top-level binding.
     let sessionID: UUID?
-    /// The exact incarnation this projection was published to, or `nil` for a locally synthesized
-    /// placeholder that carries no authority state.
+    /// The exact current incarnation, including eligibility-only props for a session with no links.
+    /// `nil` means no current incarnation could be resolved. An endpoint is an address, not authority.
     ///
     /// Notices are recorded per incarnation, so dismissing them needs the identity rather than the
     /// session UUID: a duplicate live incarnation of the same UUID must not clear another's notices.
     var endpoint: DomainAgentSessionLinkEndpointIdentity?
-    /// Target-centric relationship choices for this exact endpoint.
-    ///
-    /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
-    /// placeholder). A non-nil empty value means there is neither an eligible observer to add nor an
-    /// existing relationship to unlink, so the sidebar renders no management surface.
-    let sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
     let recentNotices: [Notice]
@@ -1369,6 +1372,8 @@ struct AgentMonitorPillProps: Equatable {
     /// transitions that move no link, so baking it into stored props would repaint the sidebar and
     /// window title for presentation-only churn.
     var pendingUpdates: AgentMonitorPendingUpdates?
+    /// UI-only exact-incarnation consent state, overlaid by the current tab. Not link authority.
+    var overseerBootstrapState: AgentSessionOverseerBootstrapState?
     /// Process-wide durable-oversight state, overlaid by the owning window rather than published by
     /// the bridge's per-endpoint projection.
     ///
@@ -1380,7 +1385,6 @@ struct AgentMonitorPillProps: Equatable {
     init(
         sessionID: UUID?,
         endpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
-        sidebarOversightMenu: AgentSidebarOversightMenuProps?,
         outbound: [Outbound],
         inbound: [Inbound],
         recentNotices: [Notice],
@@ -1393,11 +1397,11 @@ struct AgentMonitorPillProps: Equatable {
         periodicIdleWakeEnabled: Bool = false,
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         pendingUpdates: AgentMonitorPendingUpdates? = nil,
+        overseerBootstrapState: AgentSessionOverseerBootstrapState? = nil,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
         self.sessionID = sessionID
         self.endpoint = endpoint
-        self.sidebarOversightMenu = sidebarOversightMenu
         self.outbound = outbound
         self.inbound = inbound
         self.recentNotices = recentNotices
@@ -1410,12 +1414,12 @@ struct AgentMonitorPillProps: Equatable {
         self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
         self.periodicIdleWakeIntervalSeconds = periodicIdleWakeIntervalSeconds
         self.pendingUpdates = pendingUpdates
+        self.overseerBootstrapState = overseerBootstrapState
         self.persistence = persistence
     }
 
     static let empty = AgentMonitorPillProps(
         sessionID: nil,
-        sidebarOversightMenu: nil,
         outbound: [],
         inbound: [],
         recentNotices: [],
@@ -1432,7 +1436,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1445,6 +1448,7 @@ struct AgentMonitorPillProps: Equatable {
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             pendingUpdates: pendingUpdates,
+            overseerBootstrapState: overseerBootstrapState,
             persistence: persistence
         )
     }
@@ -1463,7 +1467,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1476,6 +1479,7 @@ struct AgentMonitorPillProps: Equatable {
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             pendingUpdates: pendingUpdates,
+            overseerBootstrapState: overseerBootstrapState,
             persistence: presentation
         )
     }
@@ -1578,7 +1582,97 @@ enum AgentMonitorNoticeFormatter {
     }
 }
 
+// MARK: - Overseer opt-in presentation
+
+/// Popover-local feedback, never activation authority. Every completion belongs to one request on
+/// one endpoint; a rebind retires it even if the async operation itself has already committed.
+struct AgentMonitorOverseerEnableState: Equatable {
+    struct Request: Equatable {
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let token: UUID
+    }
+
+    private(set) var endpoint: DomainAgentSessionLinkEndpointIdentity?
+    private(set) var request: Request?
+    private(set) var failureMessage: String?
+
+    func isBusy(for endpoint: DomainAgentSessionLinkEndpointIdentity?) -> Bool {
+        self.endpoint == endpoint && request != nil
+    }
+
+    func failure(for endpoint: DomainAgentSessionLinkEndpointIdentity?) -> String? {
+        self.endpoint == endpoint ? failureMessage : nil
+    }
+
+    mutating func rebind(to endpoint: DomainAgentSessionLinkEndpointIdentity?) {
+        guard self.endpoint != endpoint else { return }
+        self.endpoint = endpoint
+        request = nil
+        failureMessage = nil
+    }
+
+    mutating func begin(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Request? {
+        rebind(to: endpoint)
+        guard request == nil else { return nil }
+        let request = Request(endpoint: endpoint, token: UUID())
+        self.request = request
+        failureMessage = nil
+        return request
+    }
+
+    mutating func complete(_ request: Request, enabled: Bool) {
+        // Qualify all completion writes, including clearing busy state, against the live owner.
+        guard endpoint == request.endpoint, self.request == request else { return }
+        self.request = nil
+        failureMessage = enabled ? nil : "Could not enable overseer mode. The session changed or agent_session_link is disabled; reopen this dashboard and try again."
+    }
+}
+
 // MARK: - Resolved preview
+
+/// Presentation only: readiness and explicit retry re-resolve unchanged input; Add still authorizes.
+@MainActor
+final class AgentMonitorSessionIDEditor: ObservableObject {
+    @Published var identifierText = ""
+    @Published var preview: AgentMonitorResolvedPreview?
+    @Published var validationMessage: String?
+    private var resolve: ((String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>)?
+    private var readinessSubscription: AnyCancellable?
+
+    init(readinessChanges: AnyPublisher<Void, Never>) {
+        readinessSubscription = readinessChanges.receive(on: DispatchQueue.main).sink { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func updateIdentifier(_ text: String) {
+        identifierText = text
+        refresh()
+    }
+
+    func refresh(using resolve: @escaping (String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>) {
+        self.resolve = resolve
+        refresh()
+    }
+
+    func refresh() {
+        let trimmed = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            preview = nil
+            validationMessage = nil
+            return
+        }
+        guard let resolve else { return }
+        switch resolve(trimmed) {
+        case let .success(resolved):
+            preview = resolved
+            validationMessage = nil
+        case let .failure(failure):
+            preview = nil
+            validationMessage = failure.uiMessage
+        }
+    }
+}
 
 /// Preview shown after a UUID resolves but before the user authorizes the link.
 ///
@@ -1629,13 +1723,15 @@ enum AgentSessionOversightPersistenceCopy {
     static let loading = "Saved oversight links are still loading."
     static let suppressedLaunch = "Saved oversight links are unavailable in this launch mode."
     static let autoRestoreDisabled = "Saved oversight links will remain dormant while window restoration is turned off."
-    static let futureSchema = "Saved oversight links were created by a newer RepoPrompt version. The file was preserved, so oversight can’t be changed in this version."
-    static let unreadable = "RepoPrompt couldn’t read or back up saved oversight links. The file was preserved, so oversight can’t be changed."
-    static let quarantined = "RepoPrompt couldn’t read saved oversight links. It backed up the file and started with no saved links."
-    static let terminalRestorationSummary = "Some saved oversight links couldn’t be restored and were removed."
-    static let addWriteFailed = "Oversight couldn’t be saved, so it wasn’t started. Check disk space and Application Support permissions, then try again."
+    static let futureSchema = "Saved continuity uses a newer format and was preserved. Current approved links still work; use a compatible version to recover those saved records."
+    static let unreadable = "Saved link continuity could not open. Existing data is preserved and current approved links still work. Check local storage permissions and disk space, then retry saving."
+    static let quarantined = "Legacy link data could not be decoded and remains preserved for recovery; no unknown authority was activated."
+    static let terminalRestorationSummary = "Some saved oversight links couldn’t be restored. They were kept for a later launch."
+    static let deletedRestorationSummary = "Saved oversight links for deleted sessions were removed."
+    static let duplicateWaiting = "Some saved oversight links are waiting because a session is open in more than one window. Close the extra window to let RepoPrompt reconsider restoration."
+    static let addWriteFailed = "Live oversight and continuity saving have separate results. This change is not saved; check disk space and storage permissions, then retry saving."
     static let addCompensationFailed = "Oversight didn’t start, and RepoPrompt couldn’t clear its saved request. It won’t retry again this launch; check disk space and permissions before relaunching."
-    static let stopWriteFailed = "Oversight couldn’t be removed from saved state, so the link is still active. Check disk space and Application Support permissions, then try again."
+    static let stopWriteFailed = "Saved link removal is pending or failed. The live unlink result is separate; check disk space and storage permissions, then retry saving."
     static let automaticCleanupFailed = "Oversight ended, but RepoPrompt couldn’t update saved oversight links. It may be restored after relaunch."
     static let shutdownBeforeInsert = "RepoPrompt is shutting down, so oversight wasn’t changed."
     static let shutdownAfterInsert = "RepoPrompt is shutting down. Oversight wasn’t started, but its saved request can be reconsidered next launch."
@@ -1680,7 +1776,9 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
         case dormant
         /// Deterministic or persistence-suppressed launch: no production file I/O at all.
         case suppressed
-        /// The file was preserved and mutation is refused. Carries the exact user-facing reason.
+        /// Live changes are usable while their continuity transactions are queued.
+        case saving
+        /// Continuity failed; live user decisions remain usable.
         case blocked(String)
     }
 
@@ -1713,25 +1811,21 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
 
     /// Why Add must stay disabled for persistence reasons, or `nil`.
     ///
-    /// Composed ahead of live endpoint eligibility: a session that is perfectly eligible still cannot
-    /// be granted oversight while the durable record cannot be written.
+    /// Continuity diagnostics never override actual caller/endpoint eligibility.
     var addBlockerMessage: String? {
-        switch availability {
-        case .loading:
-            AgentSessionOversightPersistenceCopy.loading
-        case .ready, .dormant:
-            nil
-        case .suppressed:
-            AgentSessionOversightPersistenceCopy.suppressedLaunch
-        case let .blocked(message):
-            message
-        }
+        nil // Continuity cannot veto an explicit current-session user decision.
     }
 
     /// Informational line rendered even when Add is permitted.
     var noticeMessage: String? {
-        guard case .dormant = availability else { return nil }
-        return AgentSessionOversightPersistenceCopy.autoRestoreDisabled
+        switch availability {
+        case .loading: "Saved link continuity is opening; new explicit live links remain usable."
+        case .ready: nil
+        case .dormant: AgentSessionOversightPersistenceCopy.autoRestoreDisabled
+        case .suppressed: "Continuity saving is disabled for this launch; live links are process-local."
+        case .saving: "Live changes apply now; continuity saving is pending."
+        case let .blocked(message): message + " New explicit live links remain usable; saving will retry."
+        }
     }
 
     /// Appends a warning under the cap, collapsing an existing entry with the same identity.
@@ -1764,6 +1858,8 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
 enum AgentSessionOversightWarningID {
     static let quarantined = "oversight.persistence.quarantined"
     static let terminalRestoration = "oversight.persistence.terminalRestoration"
+    static let deletedRestoration = "oversight.persistence.deletedRestoration"
+    static let duplicateWaiting = "oversight.persistence.duplicateWaiting"
     static let cleanupFailed = "oversight.persistence.cleanupFailed"
     static let compensationFailed = "oversight.persistence.compensationFailed"
 }
@@ -1836,5 +1932,34 @@ enum AgentMonitorAddOutcome: Equatable {
         case let .rejected(message):
             message
         }
+    }
+}
+
+/// Closed-row summary only: bounded linked names and counts, never available-choice arrays.
+struct AgentSidebarOversightSummary: Equatable {
+    let linkedObserverCount: Int
+    let availableObserverCount: Int
+    let inboundObserverNames: [String]
+    let inboundObserverSessionIDs: [UUID]
+    let outboundTargetNames: [String]
+    let createdByLabel: String?
+    let creatorSessionID: UUID?
+    let targetIneligibleReason: String?
+    var observerIneligibleReason: String?
+
+    var creatorIsOverseer: Bool {
+        creatorSessionID.map { inboundObserverSessionIDs.contains($0) } ?? false
+    }
+
+    var creatorIsSoleOverseer: Bool {
+        creatorIsOverseer && linkedObserverCount == 1
+    }
+
+    var showsCreatedBySection: Bool {
+        createdByLabel != nil && creatorSessionID != nil && !creatorIsOverseer
+    }
+
+    var accessibilityValue: String {
+        AgentOversightUICopy.overseeByMenuAccessibilityValue(overseenByCount: linkedObserverCount, availableCount: availableObserverCount)
     }
 }

@@ -441,6 +441,90 @@ import XCTest
             }
         }
 
+        func testAbsoluteDotComponentsKeepGitMatchedSnapshotFiles() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: ["file*.swift": "let literal = 1\n", "file1.swift": "let peer = 1\n", "sub/keep.txt": "keep\n"]
+            )
+            try fixture.write("let literal = 2\n", to: "file*.swift", at: repo)
+            try fixture.write("let peer = 2\n", to: "file1.swift", at: repo)
+            let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+            // Construct raw strings: URL path projection can remove the dot components.
+            let requests = [
+                repo.path + "/./file*.swift",
+                repo.path + "/sub/../file*.swift",
+                repo.deletingLastPathComponent().path + "/./" + repo.lastPathComponent + "/file*.swift"
+            ]
+            for spelling in requests {
+                let result = try await engine.buildSnapshotInputs(
+                    compare: .uncommitted(base: "HEAD"),
+                    pathspecs: [spelling],
+                    repoURL: repo,
+                    contextLines: 3,
+                    detectRenames: false,
+                    generateDiffText: true
+                )
+                XCTAssertEqual(result.changedFiles.map(\.path), ["file*.swift"], spelling)
+                XCTAssertEqual(result.summary.files, 1, spelling)
+                let diff = try XCTUnwrap(result.diffText)
+                XCTAssertTrue(diff.contains("+let literal = 2"), spelling)
+                XCTAssertFalse(diff.contains("+let peer = 2"), spelling)
+                XCTAssertEqual(try Set(XCTUnwrap(result.perFile).keys), ["file*.swift"], spelling)
+            }
+        }
+
+        func testRejectedPathspecsKeepSnapshotEmpty() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try makeModifiedRepository(using: fixture)
+            let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+            for request in ["", "/outside-the-repository/file.swift", "bad\0path"] {
+                let result = try await engine.buildSnapshotInputs(
+                    compare: .uncommitted(base: "HEAD"),
+                    pathspecs: [request],
+                    repoURL: repo,
+                    contextLines: 3,
+                    detectRenames: false,
+                    generateDiffText: true
+                )
+                XCTAssertTrue(result.changedFiles.isEmpty)
+                XCTAssertEqual(result.summary.files, 0)
+                XCTAssertNil(result.diffText)
+            }
+        }
+
+        func testMergeCommitInspectionAcceptsCombinedStatusRecords() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "base\n"])
+            try fixture.runGit(["checkout", "-b", "side"], at: repo)
+            try fixture.write("side\n", to: "file.txt", at: repo)
+            try fixture.stage("file.txt", at: repo)
+            try fixture.commit("Side", at: repo)
+            try fixture.runGit(["checkout", "main"], at: repo)
+            try fixture.write("main\n", to: "file.txt", at: repo)
+            try fixture.stage("file.txt", at: repo)
+            try fixture.commit("Main", at: repo)
+            XCTAssertThrowsError(try fixture.runGit(["merge", "--no-ff", "--no-commit", "side"], at: repo))
+            try fixture.write("resolved\n", to: "file.txt", at: repo)
+            try fixture.stage("file.txt", at: repo)
+            try fixture.commit("Merge resolution", at: repo)
+            XCTAssertEqual(try fixture.runGit(["diff", "--name-status", "-z", "HEAD^!"], at: repo), "MM\0file.txt\0")
+
+            let records = try await GitService().getChangedFilesStats(
+                compare: .revspec("HEAD^!"),
+                includeUntrackedWhenApplicable: false,
+                detectRenames: true,
+                paths: nil,
+                at: repo
+            )
+            let record = try XCTUnwrap(records.first)
+            XCTAssertEqual(records.count, 1)
+            XCTAssertEqual(record.path, "file.txt")
+            XCTAssertEqual(record.status, "M")
+            XCTAssertEqual(record.additions, 1)
+            XCTAssertEqual(record.deletions, 1)
+        }
+
         func testGitChangedFileStatsPreserveMachineRecordNamesAndRenames() async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let names = [" leading.txt ", "line\nbreak.txt", "tab\tname.txt", "literal => arrow.txt", "dir/{old => new}/file.txt", "caf\u{e9}.txt"]

@@ -1,3 +1,4 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Content Root Shell
@@ -8,12 +9,26 @@ struct ContentRootShellView: View {
     @Binding var showWorkspaceSwitchOverlay: Bool
     @StateObject private var agentNavigationHUD = AgentNavigationHUDViewModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var lastAgentNavigationHUDCommand: (mode: AgentNavigationHUDMode, at: Date)?
+    @State private var agentNavigationHUDCommands = AgentNavigationHUDCommandDeduplicator()
+
+    /// A workspace approval is only this window's business when it targets this
+    /// window (or targets none). The manager is a process-wide singleton, so every
+    /// consumer of its pending request must apply this same scope.
+    private var presentedWorkspaceApprovalRequest: WorkspaceApprovalRequest? {
+        guard let request = workspaceApprovalManager.pendingRequest,
+              workspaceApprovalManager.isApprovalOverlayVisible,
+              WorkspaceApprovalPresentationPolicy.shouldPresent(
+                  targetWindowID: workspaceApprovalManager.presentedTargetWindowID,
+                  inWindowID: viewModel.state.windowID
+              )
+        else { return nil }
+        return request
+    }
 
     private var isBlockingOverlayVisible: Bool {
         showWorkspaceSwitchOverlay
             || (viewModel.state.mcpServer.pendingClientID != nil && viewModel.state.mcpServer.isApprovalOverlayVisible)
-            || (workspaceApprovalManager.pendingRequest != nil && workspaceApprovalManager.isApprovalOverlayVisible)
+            || presentedWorkspaceApprovalRequest != nil
     }
 
     var body: some View {
@@ -47,22 +62,28 @@ struct ContentRootShellView: View {
 
             // MCP Client Approval Overlay
             if let clientID = viewModel.state.mcpServer.pendingClientID,
+               let generation = viewModel.state.mcpServer.pendingApprovalGeneration,
                viewModel.state.mcpServer.isApprovalOverlayVisible
             {
-                MCPApprovalOverlayView(clientID: clientID)
-                    .environmentObject(viewModel.state.mcpServer)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    .zIndex(1000)
+                MCPApprovalOverlayView(
+                    clientID: clientID,
+                    generation: generation,
+                    executablePath: viewModel.state.mcpServer.pendingApprovalExecutablePath
+                )
+                .id(generation)
+                .environmentObject(viewModel.state.mcpServer)
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                .zIndex(1000)
             }
 
             // Workspace Operation Approval Overlay
-            if let request = workspaceApprovalManager.pendingRequest,
-               workspaceApprovalManager.isApprovalOverlayVisible
-            {
+            if let request = presentedWorkspaceApprovalRequest {
                 WorkspaceApprovalOverlayView(
                     approvalManager: workspaceApprovalManager,
-                    request: request
+                    request: request,
+                    respondingWindowID: viewModel.state.windowID
                 )
+                .id(request.id)
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
             }
@@ -70,20 +91,39 @@ struct ContentRootShellView: View {
         .animation(hudAnimation, value: agentNavigationHUD.isPresented)
         .onReceive(NotificationCenter.default.publisher(for: .showAgentNavigationHUD)) { note in
             guard noteTargetsCurrentWindow(note) else { return }
+            #if DEBUG
+                let startMS = viewModel.state.agentModeViewModel.perfRecorder.timestampMSIfEnabled()
+                defer { viewModel.state.agentModeViewModel.perfRecorder.durationEvent("hud.command.shell", startMS: startMS) }
+            #endif
             guard !isBlockingOverlayVisible else {
+                recordHUDCommandIgnored("blockingOverlay")
                 animateHUD { agentNavigationHUD.dismiss() }
                 return
             }
             let rawMode = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.mode] as? String
             let mode = rawMode.flatMap(AgentNavigationHUDMode.init(rawValue:)) ?? .currentWindow
-            guard !isDuplicateAgentNavigationHUDCommand(mode) else { return }
+            guard !agentNavigationHUDCommands.isDuplicate(
+                mode: mode,
+                eventTimestamp: note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.eventTimestamp] as? TimeInterval
+            ) else {
+                recordHUDCommandIgnored("duplicateEvent")
+                return
+            }
             guard viewModel.rootRoute != .workspaceEntry || mode == .allAgents else {
+                recordHUDCommandIgnored("workspaceEntry")
                 animateHUD { agentNavigationHUD.dismiss() }
                 return
             }
             animateHUD {
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange)) { note in
+            guard agentNavigationHUD.isPresented,
+                  let owner = note.object as? AgentModeViewModel,
+                  agentNavigationHUD.snapshot.mode == .allAgents || owner === viewModel.state.agentModeViewModel
+            else { return }
+            agentNavigationHUD.refreshOversightRoles(from: owner)
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
             guard noteTargetsCurrentWindow(note), agentNavigationHUD.isPresented else { return }
@@ -95,11 +135,13 @@ struct ContentRootShellView: View {
         }
         .onChange(of: isBlockingOverlayVisible) { _, isVisible in
             if isVisible {
+                recordHUDCommandIgnored("overlayBecameVisible")
                 animateHUD { agentNavigationHUD.dismiss() }
             }
         }
         .onChange(of: viewModel.state.promptManager.activeComposeTabID) { _, _ in
             if agentNavigationHUD.isPresented, !agentNavigationHUD.isRouting {
+                recordHUDCommandIgnored("activeTabChanged")
                 animateHUD { agentNavigationHUD.dismiss() }
             }
         }
@@ -119,17 +161,10 @@ struct ContentRootShellView: View {
         }
     }
 
-    /// SwiftUI menu commands and the app-focus-gated KeyboardShortcuts handler
-    /// can both see the same physical ⌘K event. Coalesce same-mode repeats from
-    /// a single keypress so the VM's deliberate toggle semantics don't open and
-    /// immediately close the switcher.
-    private func isDuplicateAgentNavigationHUDCommand(_ mode: AgentNavigationHUDMode) -> Bool {
-        let now = Date()
-        defer { lastAgentNavigationHUDCommand = (mode, now) }
-        guard let lastAgentNavigationHUDCommand,
-              lastAgentNavigationHUDCommand.mode == mode
-        else { return false }
-        return now.timeIntervalSince(lastAgentNavigationHUDCommand.at) < 0.20
+    private func recordHUDCommandIgnored(_ reason: String) {
+        #if DEBUG
+            viewModel.state.agentModeViewModel.perfRecorder.event("hud.command.ignored", fields: ["reason": reason])
+        #endif
     }
 
     private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {

@@ -43,7 +43,7 @@ struct WorkspaceLandingView: View {
         .padding(.horizontal, horizontalPadding)
     }
 
-    // MARK: - Compact Layout (unchanged)
+    // MARK: - Compact Layout
 
     private var compactContent: some View {
         VStack(spacing: 16) {
@@ -105,31 +105,11 @@ struct WorkspaceLandingView: View {
             }
 
             ScrollView {
-                LazyVStack(spacing: 6) {
-                    ForEach(filteredWorkspaces) { workspace in
-                        workspaceCard(workspace)
-                            .contextMenu {
-                                if !workspace.isEphemeral {
-                                    Button(workspace.isTemporaryWorkspace ? "Keep in Saved Workspaces" : "Move to Temporary Workspaces") {
-                                        Task {
-                                            await workspaceManager.setWorkspaceLibraryMembership(workspace, saved: workspace.isTemporaryWorkspace)
-                                        }
-                                    }
-                                }
-                            }
-                    }
-                    if filteredWorkspaces.isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: searchText.isEmpty ? "folder" : "magnifyingglass")
-                                .font(.title)
-                            Text(searchText.isEmpty ? "No \(showTemporaryWorkspaces ? "temporary" : "saved") workspaces" : "No matching workspaces")
-                            Text(searchText.isEmpty ? "Open a folder to get started." : "Try another name or folder path.")
-                                .font(.callout)
-                        }
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, minHeight: 180)
-                    }
-                }
+                WorkspaceChooserResultsView(
+                    workspaceManager: workspaceManager,
+                    query: .expanded(collection: showTemporaryWorkspaces ? .temporary : .saved, searchText: searchText),
+                    onOpenWorkspace: onOpenWorkspace
+                )
             }
             .frame(minHeight: 180, idealHeight: 350, maxHeight: 440)
 
@@ -150,33 +130,8 @@ struct WorkspaceLandingView: View {
         .frame(maxWidth: maxWidth)
     }
 
-    private var filteredWorkspaces: [WorkspaceModel] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return workspaceManager.workspacesForMenu(.init(includeTemporary: true)).filter {
-            $0.isTemporaryWorkspace == showTemporaryWorkspaces
-                && (
-                    query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)
-                        || $0.repoPaths.contains { $0.localizedCaseInsensitiveContains(query) }
-                )
-        }
-    }
-
-    private func workspaceCard(_ ws: WorkspaceModel) -> some View {
-        WorkspaceCardButton(ws: ws, abbreviatePath: abbreviatePath) {
-            onOpenWorkspace(ws)
-        }
-    }
-
     private var effectiveGreetingText: String {
         greetingText ?? "Welcome back"
-    }
-
-    private func abbreviatePath(_ path: String) -> String {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        if path.hasPrefix(homeDir) {
-            return "~" + path.dropFirst(homeDir.count)
-        }
-        return path
     }
 
     // MARK: - Legacy Helpers (for compact mode)
@@ -212,25 +167,9 @@ struct WorkspaceLandingView: View {
 
     @ViewBuilder
     private var recentWorkspacesSection: some View {
-        if userWorkspaces.isEmpty {
-            Text("No existing workspaces")
-                .font(fontPreset.font)
-                .foregroundColor(.secondary)
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Recent workspaces")
-                    .font(fontPreset.subheadlineFont)
-                    .foregroundColor(.secondary)
-
-                ForEach(userWorkspaces.prefix(maxRecent)) { ws in
-                    Button(action: { onOpenWorkspace(ws) }) {
-                        Text(ws.name)
-                            .font(fontPreset.font)
-                    }
-                    .buttonStyle(LinkButtonStyle())
-                }
-            }
-        }
+        WorkspaceChooserResultsView(
+            workspaceManager: workspaceManager, query: .compact(maxRecent: maxRecent), onOpenWorkspace: onOpenWorkspace
+        )
 
         Divider()
             .padding(.vertical, 6)
@@ -248,9 +187,146 @@ struct WorkspaceLandingView: View {
         .hoverEffect()
         .hoverTooltip("Edit, rename, or delete workspaces", .top)
     }
+}
 
-    private var userWorkspaces: [WorkspaceModel] {
-        workspaceManager.workspacesForMenu()
+/// Both Landing layouts consume one captured presentation and one production query.
+struct WorkspaceChooserResultsView: View {
+    @ObservedObject var workspaceManager: WorkspaceManagerViewModel
+    @ObservedObject private var fontScale = FontScaleManager.shared
+    let query: WorkspaceChooserQuery
+    let onOpenWorkspace: (WorkspaceModel) -> Void
+
+    var body: some View {
+        let captured = workspaceManager.workspaceChooserPresentation
+        let presentation = query.applying(to: captured)
+        switch presentation {
+        case .loading:
+            let _ = report(kind: .loading, rows: [], source: nil, failure: nil)
+            HStack {
+                ProgressView().controlSize(.small)
+                Text("Loading workspaces…")
+            }
+            .foregroundStyle(.secondary)
+        case let .failed(failure):
+            let _ = report(kind: .failed, rows: [], source: nil, failure: failure)
+            VStack(spacing: 8) {
+                Text("Unable to load workspaces.")
+                Text("Try again, or open a folder.").foregroundStyle(.secondary)
+                retryButton(failure)
+            }
+        case let .ready(catalog, refresh):
+            let failure = presentation.failure
+            let _ = report(kind: .ready, rows: catalog.workspaces, source: catalog.source, failure: failure)
+            VStack(alignment: .leading, spacing: 8) {
+                if case let .failed(failure) = refresh {
+                    HStack {
+                        Text(warning(for: catalog.source)).font(.callout).foregroundStyle(.secondary)
+                        retryButton(failure)
+                    }
+                }
+                if catalog.workspaces.isEmpty {
+                    emptyResults(source: catalog.source, hasFailure: failure != nil)
+                } else {
+                    switch query {
+                    case .compact:
+                        Text("Recent workspaces")
+                            .font(fontScale.preset.subheadlineFont)
+                            .foregroundStyle(.secondary)
+                        ForEach(catalog.workspaces) { workspace in
+                            Button(action: { onOpenWorkspace(workspace) }) {
+                                Text(workspace.name).font(fontScale.preset.font)
+                            }
+                            .buttonStyle(LinkButtonStyle())
+                        }
+                    case .expanded:
+                        LazyVStack(spacing: 6) {
+                            ForEach(catalog.workspaces) { workspace in
+                                WorkspaceCardButton(ws: workspace, abbreviatePath: abbreviatePath) {
+                                    onOpenWorkspace(workspace)
+                                }
+                                .contextMenu {
+                                    if !workspace.isEphemeral {
+                                        Button(workspace.isTemporaryWorkspace ? "Keep in Saved Workspaces" : "Move to Temporary Workspaces") {
+                                            Task {
+                                                await workspaceManager.setWorkspaceLibraryMembership(workspace, saved: workspace.isTemporaryWorkspace)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func retryButton(_ failure: WorkspaceChooserFailure) -> some View {
+        Button(action: workspaceManager.retryWorkspaceChooser) {
+            HStack {
+                if failure.recovery.isRetrying { ProgressView().controlSize(.small) }
+                Text(failure.recovery.isRetrying ? "Retrying…" : "Retry")
+            }
+        }
+        .disabled(failure.recovery.isRetrying)
+    }
+
+    private func warning(for source: WorkspaceChooserCatalog.Source) -> String {
+        if case let .authority(stamp) = source, !stamp.isComplete {
+            return "Some workspaces are unavailable. Showing available workspaces."
+        }
+        return "Workspaces couldn’t be refreshed. Showing the last available list."
+    }
+
+    @ViewBuilder
+    private func emptyResults(source: WorkspaceChooserCatalog.Source, hasFailure: Bool) -> some View {
+        switch query {
+        case .compact:
+            let unavailableText = if case let .authority(stamp) = source, !stamp.isComplete {
+                "No workspaces available in this incomplete list"
+            } else {
+                "No workspaces available in the last loaded list"
+            }
+            Text(hasFailure ? unavailableText : "No existing workspaces")
+                .font(fontScale.preset.font)
+                .foregroundStyle(.secondary)
+        case .expanded:
+            let searching = !query.rawSearchText.isEmpty
+            let collection = query.collection == .temporary ? "temporary" : "saved"
+            VStack(spacing: 8) {
+                Image(systemName: searching ? "magnifyingglass" : "folder").font(.title)
+                Text(
+                    searching
+                        ? (hasFailure ? "No available matching workspaces" : "No matching workspaces")
+                        : (hasFailure ? "No available \(collection) workspaces" : "No \(collection) workspaces")
+                )
+                Text(searching ? "Try another name or folder path." : "Open a folder to get started.").font(.callout)
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: 180)
+        }
+    }
+
+    private func abbreviatePath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+
+    private enum BranchKind { case loading, failed, ready }
+
+    private func report(
+        kind: BranchKind, rows: [WorkspaceModel], source: WorkspaceChooserCatalog.Source?, failure: WorkspaceChooserFailure?
+    ) {
+        #if DEBUG
+            let observedKind: WorkspaceChooserConsumption.Kind = switch kind {
+            case .loading: .loading
+            case .failed: .failed
+            case .ready: .ready
+            }
+            workspaceManager.didConsumeWorkspaceChooserForTesting(.init(
+                kind: observedKind, orderedIDs: rows.map(\.id), query: query, source: source, failure: failure
+            ))
+        #endif
     }
 }
 

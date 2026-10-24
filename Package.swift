@@ -53,6 +53,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptVCS",
     "RepoPromptPersistence",
     "RepoPromptSettingsCore",
+    "RepoPromptProviderQuota",
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
@@ -92,6 +93,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptVCS",
     "RepoPromptPersistence",
     "RepoPromptSettingsCore",
+    "RepoPromptProviderQuota",
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptMCPCore",
@@ -135,6 +137,18 @@ let package = Package(
             name: "RepoPrompt",
             dependencies: ["RepoPromptApp"],
             path: "Sources/RepoPromptExecutable"
+        ),
+        .target(
+            name: "RepoPromptProviderQuota",
+            dependencies: [],
+            path: "Sources/RepoPromptProviderQuota",
+            swiftSettings: swift6LanguageMode
+        ),
+        .testTarget(
+            name: "RepoPromptProviderQuotaTests",
+            dependencies: ["RepoPromptProviderQuota"],
+            path: "Tests/RepoPromptProviderQuotaTests",
+            swiftSettings: swift6LanguageMode
         ),
         .target(
             name: "RepoPromptDomainRuntime",
@@ -202,19 +216,19 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptPersistence",
-            dependencies: ["RepoPromptCodeMapCore", "RepoPromptFileSystem", "RepoPromptVCS", "RepoPromptShared"],
+            dependencies: ["RepoPromptCodeMapCore", "RepoPromptFileSystem", "RepoPromptVCS", "RepoPromptShared", "RepoPromptC"],
             path: "Sources/RepoPromptPersistence",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .testTarget(
             name: "RepoPromptSettingsCoreTests",
-            dependencies: ["RepoPromptSettingsCore"],
+            dependencies: ["RepoPromptSettingsCore", "RepoPromptProviderQuota"],
             path: "Tests/RepoPromptSettingsCoreTests",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(
             name: "RepoPromptSettingsCore",
-            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptShared"],
+            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
             path: "Sources/RepoPromptSettingsCore",
             swiftSettings: repoPromptSettingsCoreSwiftSettings
         ),
@@ -294,7 +308,7 @@ let package = Package(
             ]
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
-        .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
+        .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")], linkerSettings: [.linkedLibrary("sqlite3")]),
         // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
         // FileManager source probe evaluates false in this root package graph.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),

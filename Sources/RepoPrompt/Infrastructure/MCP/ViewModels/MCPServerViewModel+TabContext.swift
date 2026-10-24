@@ -828,11 +828,11 @@ extension MCPServerViewModel {
             && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
     }
 
-    /// Final synchronous fence for a catalog-qualified provider dispatch.
+    /// Final synchronous mapping fence for an actor-qualified provider dispatch.
     ///
-    /// The server actor already qualified the token's policy and connection lifecycle. This
-    /// MainActor check closes the remaining handover interval by requiring that the exact
-    /// connection observed by `tools/list` still owns the bidirectional route at composition time.
+    /// Recheck the actor's live lifecycle/removal state synchronously as well as both mapping
+    /// directions: cleanup can suspend after removal starts but before mappings are retracted.
+    /// Neither this fence nor its lifecycle read depends on catalog/tool-list freshness.
     @MainActor
     func hasCurrentRunCatalogRouteToken(
         _ token: AgentSessionLinkRunCatalogRouteToken,
@@ -844,6 +844,7 @@ extension MCPServerViewModel {
                 connectionID: token.connectionID,
                 expectedTabID: expectedTabID
             )
+            && ServerNetworkManager.shared.hasLiveProviderInputConnection(token)
     }
 
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
@@ -4059,7 +4060,8 @@ extension MCPServerViewModel {
     func cleanupRunIDMapping(
         runID: UUID,
         connectionID: UUID,
-        signalRoutingFailure: Bool = true
+        signalRoutingFailure: Bool = true,
+        routingWaitGeneration: UUID? = nil
     ) {
         readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         if connectionIDByRunID[runID] == connectionID {
@@ -4073,7 +4075,7 @@ extension MCPServerViewModel {
 
         // A stale generation must not fail routing for a newer replacement connection.
         if signalRoutingFailure, liveConnectionID(forRunID: runID) == nil {
-            MCPRoutingWaiter.signalFailed(runID)
+            MCPRoutingWaiter.signalFailed(runID, generation: routingWaitGeneration)
         }
     }
 
@@ -4310,7 +4312,8 @@ extension MCPServerViewModel {
         _ token: PendingPolicyRunIDMappingToken,
         clientName: String?,
         windowID: Int?,
-        signalRoutingFailure: Bool
+        signalRoutingFailure: Bool,
+        routingWaitGeneration: UUID? = nil
     ) -> PendingPolicyRunIDMappingRollbackResult {
         guard isCurrentPendingPolicyRunIDMapping(token) else {
             let supersededBySameConnection = connectionIDByRunID[token.runID] == token.connectionID
@@ -4324,7 +4327,7 @@ extension MCPServerViewModel {
                 )
             }
             if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
-                MCPRoutingWaiter.signalFailed(token.runID)
+                MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
             }
             return supersededBySameConnection
                 ? .supersededBySameConnection
@@ -4411,7 +4414,7 @@ extension MCPServerViewModel {
         }
 
         if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
-            MCPRoutingWaiter.signalFailed(token.runID)
+            MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
         }
         return .restored
     }

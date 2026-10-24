@@ -2,6 +2,7 @@ import RepoPromptSettingsCore
 
 // MARK: - Connection Management Components
 
+import Combine
 import CryptoKit
 import Darwin
 import Dispatch
@@ -460,6 +461,158 @@ struct MCPBootstrapLifecycleTiming {
     )
 }
 
+/// A single bootstrap invocation's revocable commit fence, never a grant or provisional activation.
+/// The network owner qualifies/arms it and revokes it before authority writes. Only the final,
+/// synchronous MainActor incarnation CAS may run under its per-request lock; no async settlement.
+final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
+    let routeToken: AgentSessionLinkRunCatalogRouteToken
+    private let invocationID: UUID
+    private let connectionIdentity: ObjectIdentifier
+    private let windowIdentity: MCPWindowToolDispatchIdentity
+    private let lock = NSLock()
+    private var valid = true
+    private var armed = false
+    /// Installed synchronously on MainActor before network qualification starts. Sinks only revoke.
+    private var familyObservers: [AnyCancellable] = []
+
+    private init(
+        invocationID: UUID,
+        routeToken: AgentSessionLinkRunCatalogRouteToken,
+        authorization: MCPToolDispatchAuthorization,
+        windowIdentity: MCPWindowToolDispatchIdentity
+    ) {
+        self.invocationID = invocationID
+        self.routeToken = routeToken
+        connectionIdentity = authorization.connectionIdentity
+        self.windowIdentity = windowIdentity
+    }
+
+    /// Captures immutable ingress identity and starts family revocation without any actor hop.
+    /// This is not qualification or admission: the network issuer must independently verify it.
+    @MainActor
+    static func prepareObservingFamily(
+        invocation: ToolInvocationContext,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> MCPBecomeOverseerActivationProof? {
+        guard !Task.isCancelled,
+              case .network = invocation.origin,
+              invocation.toolName == MCPWindowToolName.becomeOverseer,
+              invocation.metadata.invocationID == invocation.invocationID,
+              let authorization = invocation.dispatchAuthorization,
+              invocation.connectionID == authorization.connectionID,
+              let windowIdentity = authorization.windowIdentity,
+              windowIdentity.windowID == endpoint.windowID,
+              invocation.metadata.windowID == endpoint.windowID,
+              let token = windowIdentity.modelRouteToken,
+              token.observerEndpoint == endpoint,
+              token.connectionID == authorization.connectionID,
+              token.connectionLifecycleGeneration == authorization.lifecycleGeneration
+        else { return nil }
+        let proof = MCPBecomeOverseerActivationProof(
+            invocationID: invocation.invocationID, routeToken: token,
+            authorization: authorization, windowIdentity: windowIdentity
+        )
+        proof.observeFamilyAvailability()
+        return proof
+    }
+
+    /// Called only after the issuer's independent current invocation/route checks, before registry
+    /// insertion in the same unsuspended network actor segment. An observed proof is never reusable.
+    fileprivate func matchesUnarmed(
+        invocationID: UUID,
+        routeToken: AgentSessionLinkRunCatalogRouteToken,
+        authorization: MCPToolDispatchAuthorization,
+        windowIdentity: MCPWindowToolDispatchIdentity
+    ) -> Bool {
+        lock.withLock {
+            valid && !armed
+                && self.invocationID == invocationID
+                && self.routeToken == routeToken
+                && connectionIdentity == authorization.connectionIdentity
+                && authorization.connectionID == routeToken.connectionID
+                && authorization.lifecycleGeneration == routeToken.connectionLifecycleGeneration
+                && self.windowIdentity.windowID == windowIdentity.windowID
+                && self.windowIdentity.modelRouteToken == windowIdentity.modelRouteToken
+                && self.windowIdentity.windowStateIdentity == windowIdentity.windowStateIdentity
+                && self.windowIdentity.serverViewModelIdentity == windowIdentity.serverViewModelIdentity
+                && self.windowIdentity.catalogRegistrationHandle == windowIdentity.catalogRegistrationHandle
+        }
+    }
+
+    /// Also used by request cancellation/cleanup. Revocation and commit have one linearization point.
+    func invalidate() {
+        lock.withLock { valid = false }
+    }
+
+    fileprivate func arm() -> Bool {
+        lock.withLock {
+            guard valid, !armed else { return false }
+            armed = true
+            return true
+        }
+    }
+
+    @MainActor
+    fileprivate func observeFamilyAvailability() {
+        let store = ToolAvailabilityStore.shared
+        let revokeIfDisabled: (Set<String>) -> Void = { [weak self] names in
+            if names.contains(MCPWindowToolName.agentSessionLink) || names.contains(MCPWindowToolName.becomeOverseer) {
+                self?.invalidate()
+            }
+        }
+        // @Published emits the proposed value synchronously, before assignment. A disable/enable
+        // ABA during network qualification or the no-link await therefore revokes before any broadcast.
+        familyObservers = [
+            store.$disabledTools.sink(receiveValue: revokeIfDisabled),
+            store.$globallySuppressedTools.sink(receiveValue: revokeIfDisabled)
+        ]
+    }
+
+    /// Single use. `commit` must only recheck session-local incarnation/eligibility and perform its
+    /// synchronous activation CAS. It must not call back into network authority or mutate policy.
+    @MainActor
+    func commitIfCurrent(
+        invocation: ToolInvocationContext,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        _ commit: () -> Bool
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard valid, armed, !Task.isCancelled,
+              case .network = invocation.origin,
+              invocation.toolName == MCPWindowToolName.becomeOverseer,
+              invocation.invocationID == invocationID,
+              invocation.metadata.invocationID == invocationID,
+              invocation.connectionID == routeToken.connectionID,
+              endpoint == routeToken.observerEndpoint,
+              invocation.metadata.windowID == endpoint.windowID,
+              let authorization = invocation.dispatchAuthorization,
+              authorization.connectionID == routeToken.connectionID,
+              authorization.connectionIdentity == connectionIdentity,
+              authorization.lifecycleGeneration == routeToken.connectionLifecycleGeneration,
+              authorization.windowIdentity?.windowID == endpoint.windowID,
+              authorization.windowIdentity?.modelRouteToken == routeToken,
+              authorization.windowIdentity?.windowStateIdentity == windowIdentity.windowStateIdentity,
+              authorization.windowIdentity?.serverViewModelIdentity == windowIdentity.serverViewModelIdentity,
+              authorization.windowIdentity?.catalogRegistrationHandle == windowIdentity.catalogRegistrationHandle,
+              ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
+              ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.becomeOverseer),
+              let window = WindowStatesManager.shared.modelRoutingWindow(withID: endpoint.windowID),
+              ObjectIdentifier(window) == windowIdentity.windowStateIdentity,
+              ObjectIdentifier(window.mcpServer) == windowIdentity.serverViewModelIdentity,
+              window.mcpServer.hasCurrentRunRouteMapping(
+                  runID: routeToken.runID, connectionID: routeToken.connectionID, expectedTabID: endpoint.tabID
+              ),
+              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+        else {
+            valid = false
+            return false
+        }
+        valid = false
+        return commit()
+    }
+}
+
 /// Manages all MCP connections using the bootstrap UNIX-domain socket.
 /// TCP/Bonjour transport has been removed.
 actor ServerNetworkManager {
@@ -743,9 +896,94 @@ actor ServerNetworkManager {
         return defaultDomainHost
     }
 
-    private var isRunningState: Bool = false
-    private var lifecycleGeneration: UInt64 = 0
-    private var isEnabledState: Bool = true
+    /// The actor remains the sole writer. A synchronous reader at provider composition must see
+    /// removal/Stop immediately, before their async cleanup can retract MainActor route mappings.
+    private final class ConnectionLifecycleState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running = false
+        private var generation: UInt64 = 0
+        private var generationsByID: [UUID: UInt64] = [:]
+        private var removingIDs: Set<UUID> = []
+        private var watchdogTerminalIDs: Set<UUID> = []
+        private var transportTerminalIDs: Set<UUID> = []
+
+        var isRunning: Bool {
+            get { lock.withLock { running } }
+            set { lock.withLock { running = newValue } }
+        }
+
+        var lifecycleGeneration: UInt64 {
+            get { lock.withLock { generation } }
+            set { lock.withLock { generation = newValue } }
+        }
+
+        var connectionGenerations: [UUID: UInt64] {
+            get { lock.withLock { generationsByID } }
+            _modify {
+                lock.lock()
+                defer { lock.unlock() }
+                yield &generationsByID
+            }
+        }
+
+        var removingConnections: Set<UUID> {
+            get { lock.withLock { removingIDs } }
+            _modify {
+                lock.lock()
+                defer { lock.unlock() }
+                yield &removingIDs
+            }
+        }
+
+        var watchdogTerminalConnections: Set<UUID> {
+            get { lock.withLock { watchdogTerminalIDs } }
+            _modify {
+                lock.lock()
+                defer { lock.unlock() }
+                yield &watchdogTerminalIDs
+            }
+        }
+
+        var transportTerminalConnections: Set<UUID> {
+            get { lock.withLock { transportTerminalIDs } }
+            _modify {
+                lock.lock()
+                defer { lock.unlock() }
+                yield &transportTerminalIDs
+            }
+        }
+
+        func isLive(connectionID: UUID, generation expectedGeneration: UInt64) -> Bool {
+            lock.withLock {
+                running && generation == expectedGeneration
+                    && generationsByID[connectionID] == expectedGeneration
+                    && !removingIDs.contains(connectionID)
+                    && !watchdogTerminalIDs.contains(connectionID)
+                    && !transportTerminalIDs.contains(connectionID)
+            }
+        }
+    }
+
+    private nonisolated let connectionLifecycleState = ConnectionLifecycleState()
+    private var isRunningState: Bool {
+        get { connectionLifecycleState.isRunning }
+        set {
+            revokeBecomeOverseerActivationProofs()
+            connectionLifecycleState.isRunning = newValue
+        }
+    }
+
+    private var lifecycleGeneration: UInt64 {
+        get { connectionLifecycleState.lifecycleGeneration }
+        set {
+            revokeBecomeOverseerActivationProofs()
+            connectionLifecycleState.lifecycleGeneration = newValue
+        }
+    }
+
+    private var isEnabledState: Bool = true {
+        willSet { revokeBecomeOverseerActivationProofs() }
+    }
 
     init(
         bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
@@ -1026,14 +1264,110 @@ actor ServerNetworkManager {
         private var debugTerminalRecordDirectoryURLForTesting: URL?
     #endif
 
-    private var connections: [UUID: any MCPServerConnection] = [:]
-    private var connectionsBeingRemoved: Set<UUID> = []
-    private var executionWatchdogTerminalConnections: Set<UUID> = []
-    private var transportTerminalConnections: Set<UUID> = []
+    private var connections: [UUID: any MCPServerConnection] = [:] {
+        willSet {
+            revokeBecomeOverseerActivationProofs { route in
+                let id = route.connectionID
+                return connections[id].map { ObjectIdentifier($0 as AnyObject) }
+                    != newValue[id].map { ObjectIdentifier($0 as AnyObject) }
+            }
+        }
+    }
+
+    private var connectionsBeingRemoved: Set<UUID> {
+        get { connectionLifecycleState.removingConnections }
+        _modify {
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.removingConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.removingConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.removingConnections = newValue
+            }
+            yield &newValue
+        }
+    }
+
+    private var executionWatchdogTerminalConnections: Set<UUID> {
+        get { connectionLifecycleState.watchdogTerminalConnections }
+        _modify {
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.watchdogTerminalConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.watchdogTerminalConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.watchdogTerminalConnections = newValue
+            }
+            yield &newValue
+        }
+    }
+
+    private var transportTerminalConnections: Set<UUID> {
+        get { connectionLifecycleState.transportTerminalConnections }
+        _modify {
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.transportTerminalConnections
+                return
+            }
+            let oldValue = connectionLifecycleState.transportTerminalConnections
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
+                }
+                connectionLifecycleState.transportTerminalConnections = newValue
+            }
+            yield &newValue
+        }
+    }
+
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
-    private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
+    private var connectionLifecycleGenerationByID: [UUID: UInt64] {
+        get { connectionLifecycleState.connectionGenerations }
+        _modify {
+            guard !becomeOverseerActivationProofs.isEmpty else {
+                yield &connectionLifecycleState.connectionGenerations
+                return
+            }
+            let oldValue = connectionLifecycleState.connectionGenerations
+            var newValue = oldValue
+            defer {
+                revokeBecomeOverseerActivationProofs {
+                    oldValue[$0.connectionID] != newValue[$0.connectionID]
+                }
+                connectionLifecycleState.connectionGenerations = newValue
+            }
+            yield &newValue
+        }
+    }
+
     private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
     private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
+
+    private struct AutomaticAgentAdmission {
+        enum Source {
+            case pendingPolicy(key: String, id: UUID)
+            case liveToken(String)
+        }
+
+        let runID: UUID
+        let authorityGeneration: UInt64
+        let observedHelperPID: Int
+        let source: Source
+    }
+
+    /// One initialize handoff only; never a standing connection/name grant.
+    private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
     private let terminalRecordClaimsByConnectionID = MCPDomainTerminalClaimRegistry<MCPTerminalRecord>()
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -1363,12 +1697,27 @@ actor ServerNetworkManager {
         private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
     #endif
 
-    // Per-connection restriction + routing state
-    private var restrictedToolsByConnection: [UUID: Set<String>] = [:]
-    private var additionalToolsByConnection: [UUID: Set<String>] = [:]
-    private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:]
+    /// Invalidates queued internal-management admission only for this connection.
+    /// Installed run renewals also carry their existing run-routing generation.
+    private var policyGenerationByConnectionID: [UUID: UInt64] = [:]
+
+    /// Per-connection restriction + routing state
+    private var restrictedToolsByConnection: [UUID: Set<String>] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { restrictedToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+    }
+
+    private var additionalToolsByConnection: [UUID: Set<String>] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { additionalToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+    }
+
+    private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { runPurposeByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+    }
+
     private var resolvedPresentationWindowByConnection: [UUID: Int] = [:]
-    private var preassignedConnections: Set<UUID> = []
+    private var preassignedConnections: Set<UUID> = [] {
+        willSet { revokeBecomeOverseerActivationProofs { preassignedConnections.contains($0.connectionID) != newValue.contains($0.connectionID) } }
+    }
 
     /// Tracks the window count at the time each connection was established.
     /// Connections established during single-window mode are auto-bound to that window
@@ -1412,7 +1761,7 @@ actor ServerNetworkManager {
 
     /// Run-scoped policy state captured when the first connection for a run is admitted.
     /// Used to rehydrate later handover/reconnect connections from server-maintained run mapping.
-    private struct RunConnectionPolicyState {
+    private struct RunConnectionPolicyState: Equatable {
         let windowID: Int
         let workspaceID: UUID?
         let tabID: UUID?
@@ -1422,6 +1771,17 @@ actor ServerNetworkManager {
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
         let allowsAgentExternalControlTools: Bool
         let updatedAt: Date
+        /// Rehydration timestamps are not policy changes. This identity changes only
+        /// when semantic policy changes, including rollback or removal/reseeding.
+        var admissionRevision = UUID()
+
+        func hasSameAdmissionPolicy(as other: Self) -> Bool {
+            windowID == other.windowID && workspaceID == other.workspaceID && tabID == other.tabID
+                && restrictedTools == other.restrictedTools
+                && (additionalTools ?? []) == (other.additionalTools ?? [])
+                && purpose == other.purpose && taskLabelKind == other.taskLabelKind
+                && allowsAgentExternalControlTools == other.allowsAgentExternalControlTools
+        }
     }
 
     /// Same-process live reconnect affinity keyed by MCP client name + capability token.
@@ -1484,13 +1844,33 @@ actor ServerNetworkManager {
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
-    private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:]
-    private var admittedPolicyRunIDs: Set<UUID> = []
-    private var presentationWindowByRun: [UUID: Int] = [:]
-    private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:]
-    private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:]
-    private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:]
-    private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:]
+    private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { runPolicyStateByRunID[$0.runID] != newValue[$0.runID] } }
+    }
+
+    private var admittedPolicyRunIDs: Set<UUID> = [] {
+        willSet { revokeBecomeOverseerActivationProofs { admittedPolicyRunIDs.contains($0.runID) != newValue.contains($0.runID) } }
+    }
+
+    private var presentationWindowByRun: [UUID: Int] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByRun[$0.runID] != newValue[$0.runID] } }
+    }
+
+    private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
+    }
+
+    private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByRunID[$0.runID] != newValue[$0.runID] } }
+    }
+
+    private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { runRoutingAuthorityGenerationByRunID[$0.runID] != newValue[$0.runID] } }
+    }
+
+    private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { revocationFenceGenerationByRunID[$0.runID] != newValue[$0.runID] } }
+    }
 
     private struct RunCatalogObservation: Equatable {
         let runID: UUID
@@ -1501,6 +1881,8 @@ actor ServerNetworkManager {
         let hasAgentSessionLink: Bool?
         let hasAnyActiveLink: Bool?
         let hasActiveOutboundLink: Bool?
+        let expectedSurface: Data?
+        let returnedSurface: Data?
         let projectionRevision: UInt64
 
         var routeToken: AgentSessionLinkRunCatalogRouteToken? {
@@ -1525,7 +1907,9 @@ actor ServerNetworkManager {
                 projectionRevision: projectionRevision,
                 hasAgentSessionLink: hasAgentSessionLink,
                 hasAnyActiveLink: hasAnyActiveLink,
-                hasActiveOutboundLink: hasActiveOutboundLink
+                hasActiveOutboundLink: hasActiveOutboundLink,
+                expectedSurface: expectedSurface,
+                returnedSurface: returnedSurface
             )
         }
     }
@@ -1541,10 +1925,15 @@ actor ServerNetworkManager {
     private var runCatalogProjectionRevision: UInt64 = 0
     private var runCatalogWaitersByRunID: [UUID: [UUID: RunCatalogWaiter]] = [:]
 
-    // 🆕 Per-connection → windowID routing map
-    private var presentationWindowByConnection: [UUID: Int] = [:]
+    /// 🆕 Per-connection → windowID routing map
+    private var presentationWindowByConnection: [UUID: Int] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+    }
+
     private var windowBindingTransactions: [UUID: (mutex: AsyncMutex, users: Int)] = [:]
-    private var runIDByConnectionID: [UUID: UUID] = [:]
+    private var runIDByConnectionID: [UUID: UUID] = [:] {
+        willSet { revokeBecomeOverseerActivationProofs { runIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
+    }
 
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
 
@@ -1821,6 +2210,7 @@ actor ServerNetworkManager {
     private struct ToolSchemaCacheKey: Hashable {
         let name: String
         let purpose: MCPRunPurpose
+        let agentSessionLinkSurface: AgentSessionLinkToolSurface
     }
 
     private var toolSchemaCache: [ToolSchemaCacheKey: Value] = [:]
@@ -2210,17 +2600,32 @@ actor ServerNetworkManager {
         return (UserDefaults.standard.object(forKey: "mcp.preserveOnePerClient") as? Bool) ?? true
     }
 
-    /// 🆕 Task-local keys to expose current routing hints inside tool calls
-    @TaskLocal
-    static var currentConnectionID: UUID?
-    @TaskLocal
-    static var currentProgressState: MCPRequestProgressContext?
-    @TaskLocal
-    static var currentTabContextHint: MCPServerViewModel.TabContextHint?
-    @TaskLocal
-    static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
-    @TaskLocal
-    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+    /// 🆕 Task-local keys to expose current routing hints inside tool calls.
+    /// Boxed so macOS 14 never runs the miscompiled back-deployed `withValue` fallback (#1039).
+    static let currentConnectionIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    static var currentConnectionID: UUID? {
+        currentConnectionIDTaskLocal.get()
+    }
+
+    static let currentProgressStateTaskLocal = BoxedTaskLocal<MCPRequestProgressContext?>(nil)
+    static var currentProgressState: MCPRequestProgressContext? {
+        currentProgressStateTaskLocal.get()
+    }
+
+    static let currentTabContextHintTaskLocal = BoxedTaskLocal<MCPServerViewModel.TabContextHint?>(nil)
+    static var currentTabContextHint: MCPServerViewModel.TabContextHint? {
+        currentTabContextHintTaskLocal.get()
+    }
+
+    static let currentToolDispatchAuthorizationTaskLocal = BoxedTaskLocal<ToolDispatchAuthorization?>(nil)
+    static var currentToolDispatchAuthorization: ToolDispatchAuthorization? {
+        currentToolDispatchAuthorizationTaskLocal.get()
+    }
+
+    static let currentExplicitWindowRoutingHintTaskLocal = BoxedTaskLocal<MCPExplicitWindowRoutingHint?>(nil)
+    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint? {
+        currentExplicitWindowRoutingHintTaskLocal.get()
+    }
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -2517,6 +2922,7 @@ actor ServerNetworkManager {
               let connection = connections[authorization.connectionID]
         else { return false }
         return ObjectIdentifier(connection as AnyObject) == authorization.connectionIdentity
+            && isCurrentToolPolicyAdmission(authorization.policyAdmissionToken)
     }
 
     /// Run `op` while recording this exact active-tool scope for `windowID`.
@@ -2711,7 +3117,104 @@ actor ServerNetworkManager {
         saveRoutingState()
     }
 
-    private func effectivePolicyState(for connectionID: UUID) -> (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
+    private func setConnectionRestrictedTools(_ tools: Set<String>?, for connectionID: UUID) {
+        if (restrictedToolsByConnection[connectionID] ?? []) != (tools ?? []) {
+            policyGenerationByConnectionID[connectionID, default: 0] &+= 1
+        }
+        restrictedToolsByConnection[connectionID] = tools
+    }
+
+    private func setConnectionAdditionalTools(_ tools: Set<String>?, for connectionID: UUID) {
+        if (additionalToolsByConnection[connectionID] ?? []) != (tools ?? []) {
+            policyGenerationByConnectionID[connectionID, default: 0] &+= 1
+        }
+        additionalToolsByConnection[connectionID] = tools
+    }
+
+    private func setConnectionRunPurpose(_ purpose: MCPRunPurpose?, for connectionID: UUID) {
+        if (runPurposeByConnection[connectionID] ?? .unknown) != (purpose ?? .unknown) {
+            policyGenerationByConnectionID[connectionID, default: 0] &+= 1
+        }
+        runPurposeByConnection[connectionID] = purpose
+    }
+
+    private func setConnectionRunID(_ runID: UUID?, for connectionID: UUID) {
+        if runIDByConnectionID[connectionID] != runID {
+            policyGenerationByConnectionID[connectionID, default: 0] &+= 1
+        }
+        runIDByConnectionID[connectionID] = runID
+    }
+
+    private func setConnectionPreassigned(_ preassigned: Bool, for connectionID: UUID) {
+        if preassignedConnections.contains(connectionID) != preassigned {
+            policyGenerationByConnectionID[connectionID, default: 0] &+= 1
+        }
+        if preassigned { preassignedConnections.insert(connectionID) }
+        else { preassignedConnections.remove(connectionID) }
+    }
+
+    private typealias EffectiveConnectionPolicy = (
+        restricted: Set<String>, additional: Set<String>, preassigned: Bool,
+        purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool
+    )
+
+    private struct ToolPolicyAdmissionSnapshot {
+        let policy: EffectiveConnectionPolicy
+        let token: MCPToolPolicyAdmissionToken?
+    }
+
+    /// Capture policy and its fence in one actor turn, before either live-grant lookup.
+    /// This fence covers internal management; ordinary file/export calls keep their own
+    /// publication contracts. It never grants Domain scope or session-link authority.
+    private func toolPolicyAdmissionSnapshot(
+        connectionID: UUID,
+        toolName: String
+    ) -> ToolPolicyAdmissionSnapshot? {
+        let policy = effectivePolicyState(for: connectionID)
+        let requiresPolicyFence = switch MCPDomainToolCatalog.entry(named: toolName)?.capability {
+        case .agentSessionAdmin, .agentExternalControl, .agentExploreControl,
+             .agentSessionLinkControl, .worktreeManage:
+            true
+        default:
+            false
+        }
+        guard requiresPolicyFence else { return ToolPolicyAdmissionSnapshot(policy: policy, token: nil) }
+        guard let resolution = connectionCallLimiterResolution(for: connectionID),
+              isCurrentConnectionCallLimiterResolution(resolution, connectionID: connectionID)
+        else { return nil }
+        let runID = runIDByConnectionID[connectionID]
+        return ToolPolicyAdmissionSnapshot(
+            policy: policy,
+            token: MCPToolPolicyAdmissionToken(
+                connectionID: connectionID,
+                connectionIdentity: resolution.connectionIdentity,
+                lifecycleGeneration: resolution.lifecycleGeneration,
+                policyGeneration: policyGenerationByConnectionID[connectionID, default: 0],
+                runID: runID,
+                runRoutingAuthorityGeneration: runID.flatMap { runRoutingAuthorityGenerationByRunID[$0] },
+                runPolicyRevision: runID.flatMap { runPolicyStateByRunID[$0]?.admissionRevision }
+            )
+        )
+    }
+
+    private func isCurrentToolPolicyAdmission(_ token: MCPToolPolicyAdmissionToken?) -> Bool {
+        guard let token else { return true }
+        guard !connectionsBeingRemoved.contains(token.connectionID),
+              !executionWatchdogTerminalConnections.contains(token.connectionID),
+              isCurrentLifecycle(token.lifecycleGeneration),
+              connectionLifecycleGenerationByID[token.connectionID] == token.lifecycleGeneration,
+              let connection = connections[token.connectionID],
+              ObjectIdentifier(connection as AnyObject) == token.connectionIdentity,
+              policyGenerationByConnectionID[token.connectionID, default: 0] == token.policyGeneration,
+              runIDByConnectionID[token.connectionID] == token.runID
+        else { return false }
+        return token.runID.flatMap { runRoutingAuthorityGenerationByRunID[$0] }
+            == token.runRoutingAuthorityGeneration
+            && token.runID.flatMap { runPolicyStateByRunID[$0]?.admissionRevision } == token.runPolicyRevision
+    }
+
+    private func effectivePolicyState(for connectionID: UUID) -> EffectiveConnectionPolicy {
         let restricted = restrictedToolsByConnection[connectionID] ?? []
         let additional = additionalToolsByConnection[connectionID] ?? []
         let preassigned = preassignedConnections.contains(connectionID)
@@ -2749,13 +3252,43 @@ actor ServerNetworkManager {
         let hasAnyActiveLink: Bool
         /// Kept separate for observer prompt/catalog readiness and outbound operations.
         let hasActiveOutboundLink: Bool
+        /// Catalog reachability only; every scope operation re-authorizes at execution.
+        var isSessionAdminEligible = false
+        /// Activation admission: the session is eligible to activate right now.
+        let canBecomeOverseer: Bool
+        /// Catalog listing and early call admission. Wider than `canBecomeOverseer`: a session
+        /// that is only transiently ineligible keeps the tool so a call returns an actionable
+        /// reason instead of the agent silently lacking the tool. Never admits activation.
+        var canListBecomeOverseer = false
+        let hasActivatedOverseer: Bool
 
         var additionalGrants: Set<String> {
-            hasAnyActiveLink ? [MCPWindowToolName.agentSessionLink] : []
+            var grants: Set<String> = []
+            if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
+            if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
+            if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
+            return grants
+        }
+
+        var toolSurface: AgentSessionLinkToolSurface {
+            hasActivatedOverseer ? .full : AgentSessionLinkToolSurface(
+                hasAnyActiveLink: hasAnyActiveLink,
+                hasActiveOutboundLink: hasActiveOutboundLink
+            )
         }
     }
 
     private func liveSessionLinkGrantSnapshot(connectionID: UUID, modelOnly: Bool = false) async -> LiveSessionLinkGrantSnapshot? {
+        #if DEBUG
+            return await AgentSessionLinkCatalogReadScope.isRoleLookupTaskLocal.withValue(true) {
+                await readLiveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: modelOnly)
+            }
+        #else
+            return await readLiveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: modelOnly)
+        #endif
+    }
+
+    private func readLiveSessionLinkGrantSnapshot(connectionID: UUID, modelOnly: Bool) async -> LiveSessionLinkGrantSnapshot? {
         guard let runID = runIDByConnectionID[connectionID],
               let runState = runPolicyStateByRunID[runID],
               runState.purpose == .agentModeRun,
@@ -2794,35 +3327,235 @@ actor ServerNetworkManager {
                 observerEndpoint: routeToken.observerEndpoint
             )
         #endif
+        let bootstrapState = await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint)
+        // One main-actor read, before route revalidation: no new suspension after the fences below.
+        let (oversightEnabled, globalOverseer) = await MainActor.run {
+            (
+                ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
+                OverseerAuthorizationEngine.current.listsFullOversightSurface
+            )
+        }
         guard let revalidatedRouteToken = await (
             modelOnly
                 ? cachedModelCatalogRouteToken(connectionID: connectionID)
                 : authoritativeRunCatalogRouteToken(runID: routeToken.runID, windowID: runState.windowID, tabID: tabID)
-        ), revalidatedRouteToken == routeToken else {
+        ), revalidatedRouteToken == routeToken,
+        await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
             return nil
         }
-        return LiveSessionLinkGrantSnapshot(
+        // Scopes bind durable session identity; routing still binds the exact run endpoint.
+        let callerSessionID = routeToken.observerEndpoint.sessionID
+        let holdsLiveScope = await MainActor.run {
+            AgentSessionLinkRuntimeBridge.shared.delegationScopes.hasLiveScopeForCatalog(grantedTo: callerSessionID)
+        }
+        // Scope lookup suspends too: a tab rebind must not publish the old run's grants.
+        guard let scopeRevalidatedRouteToken = await (
+            modelOnly
+                ? cachedModelCatalogRouteToken(connectionID: connectionID)
+                : authoritativeRunCatalogRouteToken(runID: routeToken.runID, windowID: runState.windowID, tabID: tabID)
+        ), scopeRevalidatedRouteToken == routeToken,
+        await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
+            return nil
+        }
+        // Global Overseer full access (read above) lists the full oversight surface for every eligible
+        // session from its first turn, as if activated; each operation still authorizes when it runs.
+        let eligible = runState.taskLabelKind != .explore && bootstrapState != nil
+        let transientlyIneligible: Bool = if runState.taskLabelKind != .explore, bootstrapState == nil {
+            await AgentSessionLinkRuntimeBridge.shared
+                .overseerBootstrapRefusal(for: routeToken.observerEndpoint)?.isPermanent == false
+        } else {
+            false
+        }
+        let activated = eligible && (bootstrapState?.activation != nil || (globalOverseer && oversightEnabled))
+        var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,
-            hasActiveOutboundLink: hasActiveOutboundLink
+            hasActiveOutboundLink: hasActiveOutboundLink,
+            // The targeted bootstrap remains reachable for another exact-target request. It
+            // requests consent; activation and existing links never grant scope authority.
+            canBecomeOverseer: isEnabledState && oversightEnabled && eligible,
+            hasActivatedOverseer: activated
         )
+        // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
+        // authority. Keep durable scope eligibility independent of activation retirement.
+        snapshot.canListBecomeOverseer = isEnabledState && oversightEnabled && (eligible || transientlyIneligible)
+        // Every session that can become an overseer also sees session_admin from its first turn,
+        // so it can request a scope without waiting for a catalog refresh some providers (Codex)
+        // never perform mid-thread. Listing grants nothing: each op re-authorizes at execution.
+        snapshot.isSessionAdminEligible = snapshot.canListBecomeOverseer
+            || holdsLiveScope
+            || runState.allowsAgentExternalControlTools
+            || hasActiveOutboundLink
+            || (activated && oversightEnabled)
+        return snapshot
+    }
+
+    func isBecomeOverseerAvailable(connectionID: UUID, endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        guard let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: true) else { return false }
+        return snapshot.routeToken.observerEndpoint == endpoint && snapshot.canBecomeOverseer
+    }
+
+    private struct WeakBecomeOverseerActivationProof {
+        weak var value: MCPBecomeOverseerActivationProof?
+    }
+
+    /// Request lifetimes only, not a route/role index. Weak references never retain an invocation.
+    private var becomeOverseerActivationProofs: [UUID: WeakBecomeOverseerActivationProof] = [:]
+
+    /// Revoke before publishing an affected connection/run write. Lifecycle _modify stages its
+    /// proposed value until this fence runs; comparing after a backing-state write would be too late.
+    /// Revocation is sticky across ABA. Only global lifecycle/enablement writers use the default.
+    /// No ordinary catalog path walks this request-only registry; an empty registry is a no-op.
+    private func revokeBecomeOverseerActivationProofs(
+        where isAffected: (AgentSessionLinkRunCatalogRouteToken) -> Bool = { _ in true }
+    ) {
+        guard !becomeOverseerActivationProofs.isEmpty else { return }
+        let proofs = becomeOverseerActivationProofs
+        for (invocationID, entry) in proofs {
+            guard let proof = entry.value else {
+                becomeOverseerActivationProofs.removeValue(forKey: invocationID)
+                continue
+            }
+            if isAffected(proof.routeToken) {
+                proof.invalidate()
+                becomeOverseerActivationProofs.removeValue(forKey: invocationID)
+            }
+        }
+    }
+
+    /// The same unarmed proof must already observe family withdrawal before this first network check.
+    /// Verify its complete ingress identity independently and register without suspension, then sample
+    /// current authority before arming. No activation is published here or during async qualification.
+    func issueBecomeOverseerActivationProof(
+        invocation: ToolInvocationContext,
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        observedProof proof: MCPBecomeOverseerActivationProof
+    ) async -> MCPBecomeOverseerActivationProof? {
+        var issued = false
+        defer {
+            if !issued {
+                proof.invalidate()
+                if becomeOverseerActivationProofs[invocation.invocationID]?.value === proof {
+                    becomeOverseerActivationProofs.removeValue(forKey: invocation.invocationID)
+                }
+            }
+        }
+        guard !Task.isCancelled, isEnabledState,
+              case .network = invocation.origin,
+              invocation.toolName == MCPWindowToolName.becomeOverseer,
+              invocation.metadata.invocationID == invocation.invocationID,
+              let authorization = invocation.dispatchAuthorization,
+              invocation.connectionID == authorization.connectionID,
+              isCurrentToolDispatchAuthorization(authorization),
+              let windowIdentity = authorization.windowIdentity,
+              windowIdentity.windowID == endpoint.windowID,
+              invocation.metadata.windowID == endpoint.windowID,
+              let route = cachedModelRunRoute(connectionID: authorization.connectionID),
+              route.windowID == endpoint.windowID, route.tabID == endpoint.tabID,
+              route.connectionLifecycleGeneration == authorization.lifecycleGeneration
+        else { return nil }
+        becomeOverseerActivationProofs = becomeOverseerActivationProofs.filter { $0.value.value != nil }
+        guard becomeOverseerActivationProofs[invocation.invocationID]?.value == nil else { return nil }
+        let token = AgentSessionLinkRunCatalogRouteToken(
+            runID: route.runID, observerEndpoint: endpoint, connectionID: authorization.connectionID,
+            routingAuthorityGeneration: route.routingAuthorityGeneration,
+            connectionLifecycleGeneration: route.connectionLifecycleGeneration
+        )
+        guard windowIdentity.modelRouteToken == token,
+              proof.matchesUnarmed(
+                  invocationID: invocation.invocationID, routeToken: token,
+                  authorization: authorization, windowIdentity: windowIdentity
+              )
+        else { return nil }
+        becomeOverseerActivationProofs[invocation.invocationID] = .init(value: proof)
+        #if DEBUG
+            await debugAfterBecomeOverseerProofRegistrationForTesting?(invocation.invocationID, endpoint)
+        #endif
+        let snapshot = await MCPInvocationContextBridge.withInvocation(invocation) {
+            await liveSessionLinkGrantSnapshot(connectionID: authorization.connectionID, modelOnly: true)
+        }
+        guard !Task.isCancelled, isEnabledState,
+              snapshot?.routeToken == token, snapshot?.canBecomeOverseer == true,
+              isCurrentToolDispatchAuthorization(authorization),
+              isCurrentCatalogRouteToken(token),
+              effectivePolicyState(for: authorization.connectionID).taskLabelKind != .explore,
+              proof.arm()
+        else { return nil }
+        issued = true
+        return proof
+    }
+
+    /// Uses the same immutable domain advertisement and client shaping as tools/list. No route
+    /// discovery, persistence, provider lookup, or session census is performed here.
+    private func expectedSessionLinkCatalogSurface(
+        connectionID: UUID,
+        snapshot: LiveSessionLinkGrantSnapshot?
+    ) async -> Data? {
+        guard let snapshot else { return nil }
+        let policy = effectivePolicyState(for: connectionID)
+        let disabled = await MainActor.run { ToolAvailabilityStore.shared.effectiveDisabledTools }
+        let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
+            restricted: policy.restricted,
+            additional: policy.additional.union(snapshot.additionalGrants),
+            taskLabelKind: policy.taskLabelKind,
+            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+            hasExactAgentSessionLinkGrant: snapshot.hasAnyActiveLink,
+            canBecomeOverseer: snapshot.canListBecomeOverseer,
+            hasActivatedOverseer: snapshot.hasActivatedOverseer
+        )
+        let catalog = await domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: isEnabledState,
+            disabledToolNames: disabled,
+            policy: domainPolicy,
+            agentSessionLinkSurface: snapshot.toolSurface
+        ))
+        var tools: [MCP.Tool] = []
+        for definition in catalog.definitions where AgentSessionLinkCatalogSurface.toolNames.contains(definition.name) {
+            guard let schema = try? await cachedSchema(
+                for: definition.name, schema: definition.inputSchema,
+                purpose: policy.purpose, agentSessionLinkSurface: snapshot.toolSurface
+            ) else { return nil }
+            tools.append(.init(
+                name: definition.name,
+                description: advertisedToolDescription(for: definition.name, baseDescription: definition.description, purpose: policy.purpose),
+                inputSchema: schema,
+                annotations: CodexMCPToolAnnotationProjection.project(definition.annotations.mcpAnnotations, clientIdentifier: clientIdentifier(forConnection: connectionID))
+            ))
+        }
+        return try? AgentSessionLinkCatalogSurface.fingerprint(tools)
     }
 
     private func completeRunCatalogObservation(
         connectionID: UUID,
         initialRouteToken: AgentSessionLinkRunCatalogRouteToken?,
-        returnedSessionLinkPresence: Bool
+        returnedSessionLinkPresence: Bool,
+        returnedSurface: Data? = nil
     ) async {
         let runID = initialRouteToken?.runID ?? runIDByConnectionID[connectionID]
         guard let runID else { return }
 
+        let initialRevision = runCatalogObservationByRunID[runID]?.projectionRevision ?? 0
         let finalSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+        let computedSurface = await expectedSessionLinkCatalogSurface(connectionID: connectionID, snapshot: finalSnapshot)
+        #if DEBUG
+            await debugAfterExpectedCatalogSurfaceForTesting?()
+        #endif
+        let currentObservation = runCatalogObservationByRunID[runID]
+        let hasNewerObservation = (currentObservation?.projectionRevision ?? 0) > initialRevision
         let routeTokensAgree = finalSnapshot?.routeToken == initialRouteToken
-        let routeIsCurrent = routeTokensAgree && finalSnapshot != nil
-        let liveCatalogPresence = finalSnapshot?.hasAnyActiveLink ?? false
-        let liveOutboundPresence = finalSnapshot?.hasActiveOutboundLink ?? false
-        let membershipAgrees = liveCatalogPresence == returnedSessionLinkPresence
-        let currentRouteToken = runCatalogObservationByRunID[runID]?.routeToken
+        // Expected-definition computation crosses actors. Preserve a newer same-route expectation
+        // and its membership facts while merging this list's actual returned evidence. Shaping can
+        // change without a role snapshot change (for example, disabling MCP or the tool family).
+        // A newer unknown/successor route must not be overwritten by this old completion either.
+        let routeIsCurrent = routeTokensAgree && isCurrentCatalogRouteToken(finalSnapshot?.routeToken)
+            && (!hasNewerObservation || currentObservation?.routeToken == finalSnapshot?.routeToken)
+        let expectedSurface = hasNewerObservation ? currentObservation?.expectedSurface : computedSurface
+        let liveAnyLinkPresence = hasNewerObservation ? currentObservation?.hasAnyActiveLink : finalSnapshot?.hasAnyActiveLink
+        let liveOutboundPresence = hasNewerObservation ? currentObservation?.hasActiveOutboundLink : finalSnapshot?.hasActiveOutboundLink
+        let liveCatalogPresence = liveAnyLinkPresence == true || finalSnapshot?.hasActivatedOverseer == true
+        let membershipAgrees = returnedSurface.map { $0 == expectedSurface }
+            ?? (liveCatalogPresence == returnedSessionLinkPresence)
+        let currentRouteToken = currentObservation?.routeToken
         // The currently authoritative successor may replace a preserved unready predecessor.
         // A late predecessor completion still fails `routeIsCurrent` and cannot overwrite a
         // successor observation it does not own.
@@ -2832,18 +3565,35 @@ actor ServerNetworkManager {
                 runID: runID,
                 routeToken: routeIsCurrent ? finalSnapshot?.routeToken : nil,
                 hasAgentSessionLink: routeIsCurrent ? returnedSessionLinkPresence : nil,
-                hasAnyActiveLink: routeIsCurrent ? liveCatalogPresence : nil,
+                hasAnyActiveLink: routeIsCurrent ? liveAnyLinkPresence : nil,
                 hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
+                expectedSurface: routeIsCurrent ? expectedSurface : nil,
+                returnedSurface: routeIsCurrent ? returnedSurface : nil,
                 supersedesWaiters: false
             )
         }
 
-        guard !routeTokensAgree || !membershipAgrees else { return }
-        if routeTokensAgree, let authoritativeConnectionID = finalSnapshot?.routeToken.connectionID {
+        guard !routeIsCurrent || !membershipAgrees else { return }
+        if routeIsCurrent, let authoritativeConnectionID = finalSnapshot?.routeToken.connectionID {
             await notifyToolListChanged(connectionID: authoritativeConnectionID)
         } else if let authoritativeRouteToken = await authoritativeRunCatalogRouteToken(for: runID) {
             await notifyToolListChanged(connectionID: authoritativeRouteToken.connectionID)
         }
+    }
+
+    /// Final actor-local generation fence after expected-definition actor hops.
+    private func isCurrentCatalogRouteToken(_ token: AgentSessionLinkRunCatalogRouteToken?) -> Bool {
+        guard let token,
+              let route = authoritativeRunRouteActorSnapshot(
+                  runID: token.runID,
+                  connectionID: token.connectionID,
+                  windowID: token.observerEndpoint.windowID,
+                  tabID: token.observerEndpoint.tabID
+              ),
+              route.connectionLifecycleGeneration == token.connectionLifecycleGeneration,
+              runRoutingAuthorityGenerationByRunID[token.runID] == token.routingAuthorityGeneration
+        else { return false }
+        return true
     }
 
     private func authoritativeRunCatalogRouteToken(
@@ -2866,6 +3616,8 @@ actor ServerNetworkManager {
         hasAgentSessionLink: Bool?,
         hasAnyActiveLink: Bool?,
         hasActiveOutboundLink: Bool?,
+        expectedSurface: Data? = nil,
+        returnedSurface: Data? = nil,
         supersedesWaiters: Bool
     ) async -> AgentSessionLinkRunCatalogProjection {
         runCatalogProjectionRevision &+= 1
@@ -2878,6 +3630,8 @@ actor ServerNetworkManager {
             hasAgentSessionLink: hasAgentSessionLink,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink,
+            expectedSurface: expectedSurface,
+            returnedSurface: returnedSurface,
             projectionRevision: runCatalogProjectionRevision
         )
         runCatalogObservationByRunID[runID] = observation
@@ -3107,7 +3861,10 @@ actor ServerNetworkManager {
     /// at session UUID scope because one UUID can own several live runs, but every candidate connection
     /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
     /// incarnation therefore receives no catalog grant from the incarnation the user linked.
-    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+    ///
+    /// - Parameter forceRelist: relist even when every link fact is unchanged. Delegation-scope
+    ///   changes alter `session_admin` eligibility without touching any link fact.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID, forceRelist: Bool = false) async {
         let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
             guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
             return (runID, state.windowID, tabID)
@@ -3127,13 +3884,26 @@ actor ServerNetworkManager {
         for (connectionID, runID) in runIDByConnectionID
             where matchingRunIDs.contains(runID) && !connectionsBeingRemoved.contains(connectionID)
         {
+            let initialRevision = runCatalogObservationByRunID[runID]?.projectionRevision ?? 0
             let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
-            let observation = runCatalogObservationByRunID[runID]
             let routeToken = snapshot?.routeToken
+            let computedSurface = await expectedSessionLinkCatalogSurface(connectionID: connectionID, snapshot: snapshot)
+            if routeToken != nil, !isCurrentCatalogRouteToken(routeToken) { continue }
+            let observation = runCatalogObservationByRunID[runID]
+            if (observation?.projectionRevision ?? 0) > initialRevision {
+                // A newer owner already published during shaping. Its expected fingerprint covers
+                // configuration/client shaping as well as membership; role equality cannot make
+                // this older computation authoritative again.
+                await notifyToolListChanged(connectionID: connectionID)
+                continue
+            }
+            let expectedSurface = computedSurface
             let hasAnyActiveLink = snapshot?.hasAnyActiveLink
             let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
-            if observation?.routeToken == routeToken,
-               observation?.hasAgentSessionLink == hasAnyActiveLink,
+            if !forceRelist,
+               observation?.routeToken == routeToken,
+               observation?.expectedSurface == expectedSurface,
+               observation?.returnedSurface == expectedSurface,
                observation?.hasAnyActiveLink == hasAnyActiveLink,
                observation?.hasActiveOutboundLink == hasActiveOutboundLink
             {
@@ -3156,6 +3926,8 @@ actor ServerNetworkManager {
                 hasAgentSessionLink: returnedPresence,
                 hasAnyActiveLink: hasAnyActiveLink,
                 hasActiveOutboundLink: hasActiveOutboundLink,
+                expectedSurface: expectedSurface,
+                returnedSurface: observation?.routeToken == routeToken ? observation?.returnedSurface : nil,
                 supersedesWaiters: false
             )
             await notifyToolListChanged(connectionID: connectionID)
@@ -3211,7 +3983,7 @@ actor ServerNetworkManager {
         for cid in toClear {
             presentationWindowByConnection[cid] = nil
             resolvedPresentationWindowByConnection[cid] = nil // Keep both maps consistent
-            runIDByConnectionID[cid] = nil
+            setConnectionRunID(nil, for: cid)
         }
 
         // Window close authoritatively removes this bucket; deferred exact-ID completions are no-ops.
@@ -3231,7 +4003,7 @@ actor ServerNetworkManager {
                 staleRunIDSet.contains(runID) ? connectionID : nil
             }
             for connectionID in staleConnections {
-                runIDByConnectionID.removeValue(forKey: connectionID)
+                setConnectionRunID(nil, for: connectionID)
             }
         }
         dashboardDidChangeHook?()
@@ -3431,17 +4203,17 @@ actor ServerNetworkManager {
         // supplies a new one for a new top-level request.
         let effectiveProgressState = progressContext
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
-        return try await $currentProgressState.withValue(effectiveProgressState) {
+        return try await currentProgressStateTaskLocal.withValue(effectiveProgressState) {
             #if DEBUG || EDIT_FLOW_PERF
                 let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
                 guard let effectiveLifecycleCorrelation else {
-                    return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                    return try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
                 }
-                return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
-                    try await $currentConnectionID.withValue(connectionID, operation: operation)
+                return try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(effectiveLifecycleCorrelation) {
+                    try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
                 }
             #else
-                return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                return try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
             #endif
         }
     }
@@ -3462,7 +4234,7 @@ actor ServerNetworkManager {
     }
 
     func setRunPurpose(_ purpose: MCPRunPurpose, for connectionID: UUID) {
-        runPurposeByConnection[connectionID] = purpose
+        setConnectionRunPurpose(purpose, for: connectionID)
     }
 
     func hasCachedRunPolicyState(for runID: UUID) -> Bool {
@@ -3561,7 +4333,7 @@ actor ServerNetworkManager {
             return nil
         }
 
-        runIDByConnectionID[connectionID] = resolved.runID
+        setConnectionRunID(resolved.runID, for: connectionID)
         presentationWindowByRun[resolved.runID] = resolved.windowID
         return resolved.runID
     }
@@ -3624,7 +4396,16 @@ actor ServerNetworkManager {
         return true
     }
 
-    /// Returns the exact route/policy/connection token used to qualify a server-observed catalog.
+    /// Final synchronous lifecycle fence for a previously actor-qualified provider route.
+    /// Reads the same removal/generation state as the actor, not a delayed catalog projection.
+    nonisolated func hasLiveProviderInputConnection(_ token: AgentSessionLinkRunCatalogRouteToken) -> Bool {
+        connectionLifecycleState.isLive(
+            connectionID: token.connectionID,
+            generation: token.connectionLifecycleGeneration
+        )
+    }
+
+    /// Returns exact actor-owned route/policy/connection proof, independently of catalog discovery.
     func authoritativeRunCatalogRouteToken(
         runID: UUID,
         windowID: Int,
@@ -3843,8 +4624,10 @@ actor ServerNetworkManager {
     }
 
     nonisolated static func isMemoryOnlyModelCall(toolName: String, arguments: [String: Value]) -> Bool {
-        toolName == MCPWindowToolName.agentSessionLink
-            && AgentMCPToolHelpers.normalizedString(arguments["op"])?.lowercased() == "set_model"
+        toolName == MCPWindowToolName.becomeOverseer || (
+            toolName == MCPWindowToolName.agentSessionLink
+                && AgentMCPToolHelpers.normalizedString(arguments["op"])?.lowercased() == "set_model"
+        )
     }
 
     nonisolated static let modelRouteUnavailableMessage =
@@ -4048,7 +4831,7 @@ actor ServerNetworkManager {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
             }
             if persistWindowBinding {
-                runIDByConnectionID[connectionID] = runID
+                setConnectionRunID(runID, for: connectionID)
             }
             presentationWindowByRun[runID] = windowID
             return true
@@ -4086,7 +4869,7 @@ actor ServerNetworkManager {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            setConnectionRunID(runID, for: connectionID)
         }
         presentationWindowByRun[runID] = windowID
         updateLiveRunAffinity(
@@ -4132,7 +4915,7 @@ actor ServerNetworkManager {
         if presentationWindowByConnection[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
-        runIDByConnectionID[connectionID] = runID
+        setConnectionRunID(runID, for: connectionID)
         presentationWindowByRun[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
@@ -4147,6 +4930,18 @@ actor ServerNetworkManager {
             persistWindowBinding: true
         )
         return token
+    }
+
+    /// Keep the semantic fence with the existing run-policy owner. A restored
+    /// snapshot cannot restore its old admission revision and reopen an ABA window.
+    private func setRunPolicyState(_ state: RunConnectionPolicyState, for runID: UUID) {
+        var next = state
+        if let current = runPolicyStateByRunID[runID], current.hasSameAdmissionPolicy(as: state) {
+            next.admissionRevision = current.admissionRevision
+        } else {
+            next.admissionRevision = UUID()
+        }
+        runPolicyStateByRunID[runID] = next
     }
 
     private func seedRunPolicyState(
@@ -4164,7 +4959,7 @@ actor ServerNetworkManager {
         if let existing = runPolicyStateByRunID[runID], existing.updatedAt >= updatedAt {
             return
         }
-        runPolicyStateByRunID[runID] = RunConnectionPolicyState(
+        setRunPolicyState(RunConnectionPolicyState(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
@@ -4174,7 +4969,7 @@ actor ServerNetworkManager {
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             updatedAt: updatedAt
-        )
+        ), for: runID)
         presentationWindowByRun[runID] = windowID
     }
 
@@ -4407,16 +5202,16 @@ actor ServerNetworkManager {
     ) async {
         guard let cached = runPolicyStateByRunID[runID] else { return }
 
-        restrictedToolsByConnection[connectionID] = cached.restrictedTools
+        setConnectionRestrictedTools(cached.restrictedTools, for: connectionID)
         if let additional = cached.additionalTools {
-            additionalToolsByConnection[connectionID] = additional
+            setConnectionAdditionalTools(additional, for: connectionID)
         } else {
-            additionalToolsByConnection.removeValue(forKey: connectionID)
+            setConnectionAdditionalTools(nil, for: connectionID)
         }
-        runPurposeByConnection[connectionID] = cached.purpose
-        preassignedConnections.insert(connectionID)
+        setConnectionRunPurpose(cached.purpose, for: connectionID)
+        setConnectionPreassigned(true, for: connectionID)
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            setConnectionRunID(runID, for: connectionID)
         }
 
         if persistWindowBinding, presentationWindowByConnection[connectionID] != cached.windowID {
@@ -4525,6 +5320,13 @@ actor ServerNetworkManager {
     /// Use this at true end-of-scope boundaries (session deletion, tab/window close),
     /// not for normal observer lifecycle teardown.
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
+        // Retiring a route also retires its unconsumed/reserved bootstrap intent.
+        // Do this before the first actor hop: a late peer must not reinstall a terminal run.
+        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
+        for key in Array(pendingPoliciesByClient.keys) {
+            pendingPoliciesByClient[key]?.removeAll { $0.runID == runID }
+            if pendingPoliciesByClient[key]?.isEmpty == true { pendingPoliciesByClient.removeValue(forKey: key) }
+        }
         await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
@@ -4537,7 +5339,7 @@ actor ServerNetworkManager {
             mappedRunID == runID ? connectionID : nil
         }
         for connectionID in connectionIDsForRun {
-            runIDByConnectionID.removeValue(forKey: connectionID)
+            setConnectionRunID(nil, for: connectionID)
         }
 
         await MainActor.run {
@@ -6613,6 +7415,7 @@ actor ServerNetworkManager {
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
             bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+            automaticAgentAdmissions.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -6712,6 +7515,7 @@ actor ServerNetworkManager {
         runPurposeByConnection.removeAll()
         windowCountAtConnectionTime.removeAll()
         preassignedConnections.removeAll()
+        policyGenerationByConnectionID.removeAll()
         pendingPoliciesByClient.removeAll()
         expectedAgentPIDsByClient.removeAll()
         expectedAgentPIDsByRunID.removeAll()
@@ -7564,13 +8368,14 @@ actor ServerNetworkManager {
             )
         #endif
 
-        restrictedToolsByConnection.removeValue(forKey: id)
-        additionalToolsByConnection.removeValue(forKey: id)
-        runPurposeByConnection.removeValue(forKey: id)
-        runIDByConnectionID.removeValue(forKey: id)
+        setConnectionRestrictedTools(nil, for: id)
+        setConnectionAdditionalTools(nil, for: id)
+        setConnectionRunPurpose(nil, for: id)
+        setConnectionRunID(nil, for: id)
         pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
         resolvedPresentationWindowByConnection.removeValue(forKey: id)
-        preassignedConnections.remove(id)
+        setConnectionPreassigned(false, for: id)
+        policyGenerationByConnectionID.removeValue(forKey: id)
         windowCountAtConnectionTime.removeValue(forKey: id)
         identityContextByConnection.removeValue(forKey: id)
 
@@ -7630,6 +8435,7 @@ actor ServerNetworkManager {
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
         bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+        automaticAgentAdmissions.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -7823,8 +8629,17 @@ actor ServerNetworkManager {
         )
     }
 
-    private func cachedSchema(for name: String, schema: Value, purpose: MCPRunPurpose) async throws -> Value {
-        let cacheKey = ToolSchemaCacheKey(name: name, purpose: purpose)
+    private func cachedSchema(
+        for name: String,
+        schema: Value,
+        purpose: MCPRunPurpose,
+        agentSessionLinkSurface: AgentSessionLinkToolSurface = .full
+    ) async throws -> Value {
+        let cacheKey = ToolSchemaCacheKey(
+            name: name,
+            purpose: purpose,
+            agentSessionLinkSurface: name == MCPWindowToolName.agentSessionLink ? agentSessionLinkSurface : .full
+        )
         if let cached = toolSchemaCache[cacheKey] {
             return cached
         }
@@ -7955,6 +8770,124 @@ actor ServerNetworkManager {
         return mutableArgs
     }
 
+    /// Admission-only exception for app-launched providers. The controller verifies the helper
+    /// executable; this actor rechecks the same observed peer against current run-owned evidence.
+    /// Claimed PIDs, names alone, and expected ancestry without a policy/token never authorize it.
+    /// The one-initialize proof must survive normal policy consumption; fallback cannot widen it.
+    func authorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) async -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        let deadline = Date().addingTimeInterval(2)
+        // Launchers register the parent PID just after Process.run(). The helper may win
+        // that race. Wait only while a PID-gated policy exists, using observed identity
+        // throughout; absence of proof never becomes approval when the bound expires.
+        repeat {
+            guard !Task.isCancelled,
+                  isCurrentConnection(connectionID, lifecycleGeneration: generation),
+                  bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+            else { return false }
+            if tryAuthorizeAutomaticAppManagedAgentAdmission(
+                connectionID: connectionID, clientName: clientName,
+                verifiedBundledHelperPID: verifiedBundledHelperPID
+            ) { return true }
+            guard hasPIDGatedPendingPolicy(for: clientName), Date() < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while true
+    }
+
+    private func tryAuthorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID],
+              isCurrentConnection(connectionID, lifecycleGeneration: generation),
+              verifiedBundledHelperPID > 1,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+        else { return false }
+
+        func ownsLiveRun(_ runID: UUID) -> Bool {
+            guard runPolicyStateByRunID[runID] != nil,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  revocationFenceGenerationByRunID[runID] != authorityGeneration
+            else { return false }
+            let expectedPIDs = expectedAgentPIDs(for: clientName)
+                .intersection(expectedAgentPIDs(for: clientName, runID: runID))
+            return !expectedPIDs.isEmpty && isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(verifiedBundledHelperPID))
+        }
+
+        if let entry = oldestPendingPolicyEntry(for: clientName, where: { policy in
+            guard policy.requiresExpectedAgentPID,
+                  policy.reservationConnectionID == nil,
+                  let runID = policy.runID
+            else { return false }
+            return ownsLiveRun(runID)
+        }) {
+            // Do not let an old connection's token or mapping borrow a successor run's policy.
+            let boundRunID = runIDByConnectionID[connectionID]
+            let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+            let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+            guard let runID = entry.policy.runID,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  boundRunID == nil || boundRunID == runID,
+                  affinity == nil || affinity?.runID == runID
+            else { return false }
+            automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+                runID: runID, authorityGeneration: authorityGeneration,
+                observedHelperPID: verifiedBundledHelperPID,
+                source: .pendingPolicy(key: entry.key, id: entry.policy.id)
+            )
+            return true
+        }
+
+        // Reconnects require the exact live capability token as well as current ancestry.
+        // An expected process alone cannot join an established run under a new token.
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        guard let sessionKey,
+              let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
+              admittedPolicyRunIDs.contains(affinity.runID),
+              ownsLiveRun(affinity.runID),
+              let authorityGeneration = runRoutingAuthorityGenerationByRunID[affinity.runID],
+              runIDByConnectionID[connectionID].map({ $0 == affinity.runID }) ?? true
+        else { return false }
+        automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+            runID: affinity.runID, authorityGeneration: authorityGeneration,
+            observedHelperPID: verifiedBundledHelperPID, source: .liveToken(sessionKey)
+        )
+        return true
+    }
+
+    private func isCurrentAutomaticAgentAdmission(
+        _ proof: AutomaticAgentAdmission,
+        connectionID: UUID,
+        clientName: String,
+        requiresPendingPolicy: Bool
+    ) -> Bool {
+        guard runPolicyStateByRunID[proof.runID] != nil,
+              runRoutingAuthorityGenerationByRunID[proof.runID] == proof.authorityGeneration,
+              revocationFenceGenerationByRunID[proof.runID] != proof.authorityGeneration,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == proof.observedHelperPID,
+              isExpectedAgentDescendant(clientName: clientName, clientPid: proof.observedHelperPID, runID: proof.runID) == true
+        else { return false }
+        switch proof.source {
+        case let .pendingPolicy(key, id):
+            guard requiresPendingPolicy else { return true }
+            pruneExpiredPolicies(for: clientName)
+            return pendingPoliciesByClient[key]?.contains {
+                $0.id == id && $0.runID == proof.runID && $0.reservationConnectionID == nil
+            } == true
+        case let .liveToken(token):
+            return (connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]) == token
+                && preferredLiveRunAffinity(for: clientName, sessionKey: token)?.runID == proof.runID
+                && admittedPolicyRunIDs.contains(proof.runID)
+        }
+    }
+
     /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
     private func completeApprovedAgentInitialization(
         clientName: String,
@@ -7964,6 +8897,10 @@ actor ServerNetworkManager {
         clientPid: Int,
         expectedLifecycleGeneration: UInt64
     ) async -> Bool {
+        let automaticAdmission = automaticAgentAdmissions.removeValue(forKey: connectionID)
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let readiness = await awaitAgentPolicyAdmissionIfNeeded(
             clientName: clientName,
             bootstrapClientName: bootstrapClientName,
@@ -7977,6 +8914,9 @@ actor ServerNetworkManager {
             return false
         }
 
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let policyOutcome = await applyPendingPolicyIfAvailable(
             clientName: clientName,
             connectionID: connectionID,
@@ -7991,6 +8931,14 @@ actor ServerNetworkManager {
             )
             pendingConnections.removeValue(forKey: connectionID)
             return false
+        }
+        if let automaticAdmission {
+            guard isCurrentAutomaticAgentAdmission(
+                automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+            ),
+                runIDByConnectionID[connectionID] == automaticAdmission.runID,
+                admittedPolicyRunIDs.contains(automaticAdmission.runID)
+            else { return false }
         }
         notifyConnectionWaiters(
             connectionID: connectionID,
@@ -8396,12 +9344,25 @@ actor ServerNetworkManager {
             "Installing connection policy for client \(clientName) window=\(windowID) grants=\(grantDescription) restricted=\(restrictedDescription) oneShot=\(oneShot) ttl=\(ttl) reason=\(reason ?? "-") role=\(taskLabelKind?.rawValue ?? "-")"
         )
         if let runID {
+            // A new attempt can reuse the already-admitted provider connection without
+            // another tools/list. Retain only that exact live route's workspace; a cold,
+            // revoked, pending or differently addressed route still requires admission.
+            let committedWorkspaceID: UUID? = if purpose == .agentModeRun,
+                                                 let connectionID = lateCommittedRunRouteCandidate(
+                                                     runID: runID, windowID: windowID, tabID: tabID
+                                                 ),
+                                                 let route = cachedModelRunRoute(connectionID: connectionID)
+            {
+                route.workspaceID
+            } else {
+                nil
+            }
             runRoutingAuthorityGenerationByRunID[runID, default: 0] &+= 1
             revocationFenceGenerationByRunID.removeValue(forKey: runID)
             seedRunPolicyState(
                 runID: runID,
                 windowID: windowID,
-                workspaceID: nil,
+                workspaceID: committedWorkspaceID,
                 tabID: tabID,
                 restrictedTools: sanitizedRestricted,
                 additionalTools: additionalTools,
@@ -8880,9 +9841,9 @@ actor ServerNetworkManager {
             purpose: MCPRunPurpose = .unknown,
             windowID: Int? = nil
         ) {
-            runIDByConnectionID[connectionID] = runID
+            setConnectionRunID(runID, for: connectionID)
             if purpose != .unknown || runPurposeByConnection[connectionID] == nil {
-                runPurposeByConnection[connectionID] = purpose
+                setConnectionRunPurpose(purpose, for: connectionID)
             }
             if let windowID {
                 presentationWindowByConnection[connectionID] = windowID
@@ -9246,7 +10207,9 @@ actor ServerNetworkManager {
                         } else {
                             workspace?.name ?? NSNull()
                         }
-                        let workspaceInstanceNumber: Any = window.workspaceInstanceNumber ?? NSNull()
+                        let workspaceInstanceNumber: Any = workspace.flatMap {
+                            window.workspaceInstanceNumber(for: $0.id)
+                        } ?? NSNull()
                         let activeContextID: Any = activeTabID?.uuidString ?? NSNull()
                         let activeContextName: Any = activeTabID.flatMap { window.workspaceManager.composeTabName(with: $0) } ?? NSNull()
                         let repoPaths: [String] = workspace.map { WorkspaceManagerViewModel.loadableRepoPaths(for: $0) } ?? []
@@ -10809,9 +11772,9 @@ actor ServerNetworkManager {
 
         func debugSetAdditionalTools(for connectionID: UUID, additionalTools: Set<String>?) async {
             if let additionalTools {
-                additionalToolsByConnection[connectionID] = additionalTools
+                setConnectionAdditionalTools(additionalTools, for: connectionID)
             } else {
-                additionalToolsByConnection.removeValue(forKey: connectionID)
+                setConnectionAdditionalTools(nil, for: connectionID)
             }
             if connections[connectionID] != nil {
                 await notifyToolListChanged(connectionID: connectionID)
@@ -10850,22 +11813,41 @@ actor ServerNetworkManager {
                 ),
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
-                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
+                hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             let advertisement = await domainHost.advertisedCatalog(
                 MCPDomainCatalogAdvertisementRequest(
                     isGloballyEnabled: isEnabledState,
                     disabledToolNames: disabled,
-                    policy: domainPolicy
+                    policy: domainPolicy,
+                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full
                 )
             )
             let names = advertisement.definitions.map(\.name).sorted()
             await completeRunCatalogObservation(
                 connectionID: connectionID,
                 initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
-                returnedSessionLinkPresence: names.contains(MCPWindowToolName.agentSessionLink)
+                returnedSessionLinkPresence: names.contains(MCPWindowToolName.agentSessionLink),
+                returnedSurface: expectedSessionLinkCatalogSurface(connectionID: connectionID, snapshot: sessionLinkGrantSnapshot)
             )
             return names
+        }
+
+        /// Exercises the production cache without starting a transport or contacting a provider.
+        func debugCachedToolSchema(
+            definition: MCPDomainToolDefinition,
+            purpose: MCPRunPurpose,
+            surface: AgentSessionLinkToolSurface
+        ) async throws -> Value {
+            let projected = surface.project(definition)
+            return try await cachedSchema(
+                for: projected.name,
+                schema: projected.inputSchema,
+                purpose: purpose,
+                agentSessionLinkSurface: surface
+            )
         }
 
         /// Compatibility helper for tests whose linked endpoints are all outbound observers.
@@ -11074,7 +12056,7 @@ actor ServerNetworkManager {
 
     func setRestrictedTools(for connectionID: UUID, tools: Set<String>) async {
         let sanitized = Self.sanitizedRoutingRestrictedTools(tools)
-        restrictedToolsByConnection[connectionID] = sanitized
+        setConnectionRestrictedTools(sanitized, for: connectionID)
         if connections[connectionID] != nil {
             await notifyToolListChanged(connectionID: connectionID)
         }
@@ -11085,16 +12067,16 @@ actor ServerNetworkManager {
         guard !sanitized.isEmpty else { return }
         var existing = restrictedToolsByConnection[connectionID] ?? []
         existing.formUnion(sanitized)
-        restrictedToolsByConnection[connectionID] = existing
+        setConnectionRestrictedTools(existing, for: connectionID)
         if connections[connectionID] != nil {
             await notifyToolListChanged(connectionID: connectionID)
         }
     }
 
     func clearRestrictedTools(for connectionID: UUID) async {
-        if restrictedToolsByConnection.removeValue(forKey: connectionID) != nil,
-           connections[connectionID] != nil
-        {
+        let hadRestrictions = restrictedToolsByConnection[connectionID] != nil
+        setConnectionRestrictedTools(nil, for: connectionID)
+        if hadRestrictions, connections[connectionID] != nil {
             await notifyToolListChanged(connectionID: connectionID)
         }
     }
@@ -11174,6 +12156,24 @@ actor ServerNetworkManager {
         }
     }
 
+    #if DEBUG
+        private(set) var debugCatalogHydrationWorkCount = 0
+        private var debugAfterExpectedCatalogSurfaceForTesting: (@Sendable () async -> Void)?
+        private var debugAfterBecomeOverseerProofRegistrationForTesting: (
+            @Sendable (UUID, DomainAgentSessionLinkEndpointIdentity) async -> Void
+        )?
+
+        func debugSetAfterBecomeOverseerProofRegistrationForTesting(
+            _ hook: (@Sendable (UUID, DomainAgentSessionLinkEndpointIdentity) async -> Void)?
+        ) {
+            debugAfterBecomeOverseerProofRegistrationForTesting = hook
+        }
+
+        func debugSetAfterExpectedCatalogSurfaceForTesting(_ hook: (@Sendable () async -> Void)?) {
+            debugAfterExpectedCatalogSurfaceForTesting = hook
+        }
+    #endif
+
     @discardableResult
     private func hydratePersistedAgentModePolicyForConnectionIfNeeded(
         connectionID: UUID,
@@ -11186,6 +12186,9 @@ actor ServerNetworkManager {
             return false
         }
 
+        #if DEBUG
+            debugCatalogHydrationWorkCount += 1
+        #endif
         guard let clientName = clientIdentifier(forConnection: connectionID) else { return false }
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
         if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
@@ -11364,9 +12367,14 @@ actor ServerNetworkManager {
         requireRunRouting: Bool = true,
         expectedLifecycleGeneration: UInt64? = nil
     ) async -> PendingPolicyApplicationOutcome {
-        if let reservedEntry = oldestReservedPendingPolicyEntry(for: clientName),
-           canConsumePendingPolicy(reservedEntry.policy, clientName: clientName, clientPid: clientPid)
-        {
+        let initialSessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let initialRunID = runIDByConnectionID[connectionID]
+            ?? preferredLiveRunAffinity(for: clientName, sessionKey: initialSessionKey)?.runID
+        if let reservedEntry = oldestPendingPolicyEntry(for: clientName, where: {
+            $0.reservationConnectionID != nil
+                && (initialRunID == nil || $0.runID == initialRunID)
+                && canConsumePendingPolicy($0, clientName: clientName, clientPid: clientPid)
+        }) {
             mcpPolicyLog(
                 "pending policy route installation already reserved client=\(clientName) connection=\(connectionID) reservedConnection=\(reservedEntry.policy.reservationConnectionID?.uuidString ?? "nil") runID=\(reservedEntry.policy.runID?.uuidString ?? "nil")"
             )
@@ -11485,16 +12493,44 @@ actor ServerNetworkManager {
             #endif
         }
 
-        let hasPIDGatedPolicy = hasPIDGatedPendingPolicy(for: clientName)
-        let matchedQueueEntry = if hasPIDGatedPolicy {
-            oldestPIDGatedPendingPolicyEntry(for: clientName, matching: clientPid ?? -1)
-        } else {
-            oldestPendingPolicyEntry(for: clientName) { policy in
-                policy.reservationConnectionID == nil
-                    && canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
-            }
+        // A PID proves ancestry, not which run a shared provider process is serving.
+        // Prefer the exact connection/token binding before selecting a pending policy;
+        // never assign an unbound peer to an arbitrary run by FIFO.
+        let boundRunID = await runIDForConnection(connectionID)
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+        if let boundRunID, let liveAffinity, boundRunID != liveAffinity.runID {
+            return .rejected(runID: boundRunID, reason: "session_token_bound_to_other_run")
         }
+        let exactRunID = boundRunID ?? liveAffinity?.runID
+        let hasPIDGatedPolicy = hasPIDGatedPendingPolicy(for: clientName)
+        let eligible: (ClientConnectionPolicy) -> Bool = { policy in
+            policy.reservationConnectionID == nil
+                && (!hasPIDGatedPolicy || policy.requiresExpectedAgentPID)
+                && self.canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
+                && (exactRunID == nil || policy.runID == exactRunID)
+        }
+        if exactRunID == nil,
+           let first = oldestPendingPolicyEntry(for: clientName, where: eligible),
+           first.policy.purpose == .agentModeRun, let firstRunID = first.policy.runID,
+           oldestPendingPolicyEntry(for: clientName, where: {
+               eligible($0) && $0.runID != nil && $0.runID != firstRunID
+           }) != nil || admittedPolicyRunIDs.contains(where: { otherRunID in
+               otherRunID != firstRunID
+                   && runPolicyStateByRunID[otherRunID]?.purpose == .agentModeRun
+                   && clientPid.map {
+                       isExpectedAgentDescendant(clientName: clientName, clientPid: $0, runID: otherRunID) == true
+                   } == true
+           })
+        {
+            return .rejected(runID: nil, reason: "ambiguous_run_policy")
+        }
+        let matchedQueueEntry = oldestPendingPolicyEntry(for: clientName, where: eligible)
         guard let matchedQueueEntry else {
+            if liveAffinity != nil {
+                await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
+                return .fallback
+            }
             #if DEBUG
                 debugPolicyDiagnostic("pendingPolicyMiss", connectionID: connectionID, extra: [
                     "clientName": clientName,
@@ -11519,8 +12555,6 @@ actor ServerNetworkManager {
             await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
             return .fallback
         }
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
         var queue = pendingPoliciesByClient[matchedQueueEntry.key] ?? []
         mcpRoutingLog("Applying FIFO policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connectionID=\(connectionID) queueLength=\(queue.count) policyWindow=\(matchedQueueEntry.policy.windowID)")
         let policy: ClientConnectionPolicy
@@ -11593,15 +12627,47 @@ actor ServerNetworkManager {
             return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
         }
 
+        let pendingPolicyApplicationID = UUID()
+        let routingAuthorityGeneration = policy.runID.map {
+            runRoutingAuthorityGenerationByRunID[$0, default: 0]
+        }
+        pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
+        if let runID = policy.runID {
+            pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
+        }
+
+        // Capture readiness ownership before any application await. A restarted process may
+        // acquire a new waiter for this same run while this application's tail is suspended.
+        let routingWaitGeneration: UUID? = if requireRunRouting, let runID = policy.runID {
+            await MCPRoutingWaiter.generation(runID: runID)
+        } else {
+            nil
+        }
+
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ) else {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                )
+            }
+            finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
+
         // This is the authoritative child-observation boundary: the connection has
         // matched and reserved the exact run-owned name/PID policy and passed existing
         // run-affinity checks, but run-route installation has not started. Observation
         // remains sticky if a later route installation is rolled back.
-        if requireRunRouting, let runID = policy.runID {
+        if requireRunRouting, let runID = policy.runID, let routingWaitGeneration {
             #if DEBUG
                 await debugSuspendPendingPolicyObservationIfNeeded()
             #endif
-            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID, generation: routingWaitGeneration)
             #if DEBUG
                 if wasFirstObservation {
                     debugRecordRunRoutingEvent(
@@ -11618,6 +12684,21 @@ actor ServerNetworkManager {
             #endif
         }
 
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ) else {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                )
+            }
+            finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
+
         let restorePoint = PendingPolicyRestorePoint(
             restrictedTools: restrictedToolsByConnection[connectionID],
             additionalTools: additionalToolsByConnection[connectionID],
@@ -11630,30 +12711,21 @@ actor ServerNetworkManager {
             runPolicyState: policy.runID.flatMap { runPolicyStateByRunID[$0] },
             runWindowID: policy.runID.flatMap { presentationWindowByRun[$0] }
         )
-        let pendingPolicyApplicationID = UUID()
-        let routingAuthorityGeneration = policy.runID.map {
-            runRoutingAuthorityGenerationByRunID[$0, default: 0]
-        }
-        pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
-        if let runID = policy.runID {
-            pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
-        }
-
         // Stage the complete policy before registering the run mapping. The mapping
         // signals MCPRoutingWaiter, so restrictions and run identity must already be
         // visible before the bootstrap gate can be released.
-        restrictedToolsByConnection[connectionID] = policy.restrictedTools
-        preassignedConnections.insert(connectionID)
-        runPurposeByConnection[connectionID] = policy.purpose
+        setConnectionRestrictedTools(policy.restrictedTools, for: connectionID)
+        setConnectionPreassigned(true, for: connectionID)
+        setConnectionRunPurpose(policy.purpose, for: connectionID)
         cacheRunPolicyStateIfNeeded(policy)
         if let runID = policy.runID {
             admittedPolicyRunIDs.insert(runID)
-            runIDByConnectionID[connectionID] = runID
+            setConnectionRunID(runID, for: connectionID)
         }
         if let additional = policy.additionalTools {
-            additionalToolsByConnection[connectionID] = additional
+            setConnectionAdditionalTools(additional, for: connectionID)
         } else {
-            additionalToolsByConnection.removeValue(forKey: connectionID)
+            setConnectionAdditionalTools(nil, for: connectionID)
         }
         presentationWindowByConnection[connectionID] = policy.windowID
         resolvedPresentationWindowByConnection[connectionID] = policy.windowID
@@ -11687,6 +12759,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
                 signalRoutingFailure: false
             )
             return .rejected(runID: policy.runID, reason: "stale_connection")
@@ -11740,6 +12813,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
                 )
                 return .rejected(
@@ -11787,6 +12861,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                     signalRoutingFailure: false
                 )
@@ -11807,6 +12882,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
             )
             return .rejected(runID: policy.runID, reason: "policy_removed")
@@ -11817,6 +12893,33 @@ actor ServerNetworkManager {
                 runID: runID,
                 successorConnectionID: connectionID
             )
+        }
+
+        // Catalog publication crosses actors after one-shot consumption. Revocation or a
+        // successor install during that await must also fence this completion tail.
+        guard isPendingPolicyApplicationOwner(
+            pendingPolicyApplicationID,
+            connectionID: connectionID,
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
+        ),
+            isPendingPolicyApplicationCurrent(
+                connectionID: connectionID,
+                clientName: clientName,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
+            )
+        else {
+            await rollbackPendingPolicyApplication(
+                policy,
+                clientName: clientName,
+                connectionID: connectionID,
+                restorePoint: restorePoint,
+                applicationID: pendingPolicyApplicationID,
+                routingWaitGeneration: routingWaitGeneration,
+                pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
+                signalRoutingFailure: false
+            )
+            return .rejected(runID: policy.runID, reason: "stale_connection")
         }
 
         finishPendingPolicyApplication(
@@ -11830,8 +12933,8 @@ actor ServerNetworkManager {
                 windowID: policy.windowID
             )
         }
-        if requireRunRouting, let runID = policy.runID {
-            await MCPRoutingWaiter.notifyRouted(runID: runID)
+        if requireRunRouting, let runID = policy.runID, let routingWaitGeneration {
+            await MCPRoutingWaiter.notifyRouted(runID: runID, generation: routingWaitGeneration)
         }
 
         let grantDescription = Self.describeGrantedTools(restricted: policy.restrictedTools)
@@ -11931,6 +13034,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         restorePoint: PendingPolicyRestorePoint,
         applicationID: UUID,
+        routingWaitGeneration: UUID? = nil,
         pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken? = nil,
         signalRoutingFailure: Bool = true
     ) async {
@@ -11943,7 +13047,8 @@ actor ServerNetworkManager {
                         pendingPolicyRunIDMappingToken,
                         clientName: clientName,
                         windowID: policy.windowID,
-                        signalRoutingFailure: signalRoutingFailure
+                        signalRoutingFailure: signalRoutingFailure && routingWaitGeneration != nil,
+                        routingWaitGeneration: routingWaitGeneration
                     )
                 }
                 window.mcpServer.removeTabContext(
@@ -11955,7 +13060,8 @@ actor ServerNetworkManager {
                 window.mcpServer.cleanupRunIDMapping(
                     runID: runID,
                     connectionID: connectionID,
-                    signalRoutingFailure: signalRoutingFailure
+                    signalRoutingFailure: signalRoutingFailure && routingWaitGeneration != nil,
+                    routingWaitGeneration: routingWaitGeneration
                 )
                 return .restored
             }
@@ -12008,19 +13114,19 @@ actor ServerNetworkManager {
     ) {
         if restoreConnectionScopedState {
             if let restrictedTools = restorePoint.restrictedTools {
-                restrictedToolsByConnection[connectionID] = restrictedTools
+                setConnectionRestrictedTools(restrictedTools, for: connectionID)
             } else {
-                restrictedToolsByConnection.removeValue(forKey: connectionID)
+                setConnectionRestrictedTools(nil, for: connectionID)
             }
             if let additionalTools = restorePoint.additionalTools {
-                additionalToolsByConnection[connectionID] = additionalTools
+                setConnectionAdditionalTools(additionalTools, for: connectionID)
             } else {
-                additionalToolsByConnection.removeValue(forKey: connectionID)
+                setConnectionAdditionalTools(nil, for: connectionID)
             }
             if let runPurpose = restorePoint.runPurpose {
-                runPurposeByConnection[connectionID] = runPurpose
+                setConnectionRunPurpose(runPurpose, for: connectionID)
             } else {
-                runPurposeByConnection.removeValue(forKey: connectionID)
+                setConnectionRunPurpose(nil, for: connectionID)
             }
             if let windowID = restorePoint.windowID {
                 presentationWindowByConnection[connectionID] = windowID
@@ -12033,14 +13139,14 @@ actor ServerNetworkManager {
                 resolvedPresentationWindowByConnection.removeValue(forKey: connectionID)
             }
             if let runID = restorePoint.runID {
-                runIDByConnectionID[connectionID] = runID
+                setConnectionRunID(runID, for: connectionID)
             } else {
-                runIDByConnectionID.removeValue(forKey: connectionID)
+                setConnectionRunID(nil, for: connectionID)
             }
             if restorePoint.wasPreassigned {
-                preassignedConnections.insert(connectionID)
+                setConnectionPreassigned(true, for: connectionID)
             } else {
-                preassignedConnections.remove(connectionID)
+                setConnectionPreassigned(false, for: connectionID)
             }
         }
 
@@ -12051,7 +13157,7 @@ actor ServerNetworkManager {
             admittedPolicyRunIDs.remove(policyRunID)
         }
         if let runPolicyState = restorePoint.runPolicyState {
-            runPolicyStateByRunID[policyRunID] = runPolicyState
+            setRunPolicyState(runPolicyState, for: policyRunID)
         } else {
             runPolicyStateByRunID.removeValue(forKey: policyRunID)
         }
@@ -12306,7 +13412,9 @@ actor ServerNetworkManager {
                 ),
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
-                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
+                hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             // The domain host owns canonical filtering; this app shell retains only
             // purpose-specific schema/description and client annotation projection.
@@ -12314,7 +13422,8 @@ actor ServerNetworkManager {
                 MCPDomainCatalogAdvertisementRequest(
                     isGloballyEnabled: isEnabledState,
                     disabledToolNames: disabled,
-                    policy: domainPolicy
+                    policy: domainPolicy,
+                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full
                 )
             )
             #if DEBUG
@@ -12333,7 +13442,8 @@ actor ServerNetworkManager {
                 let schemaValue = try await cachedSchema(
                     for: definition.name,
                     schema: definition.inputSchema,
-                    purpose: policy.purpose
+                    purpose: policy.purpose,
+                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full
                 )
                 let description = advertisedToolDescription(
                     for: definition.name,
@@ -12362,10 +13472,11 @@ actor ServerNetworkManager {
                 ])
             #endif
             let returnedSessionLinkPresence = tools.contains { $0.name == MCPWindowToolName.agentSessionLink }
-            await completeRunCatalogObservation(
+            try await completeRunCatalogObservation(
                 connectionID: connectionID,
                 initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
-                returnedSessionLinkPresence: returnedSessionLinkPresence
+                returnedSessionLinkPresence: returnedSessionLinkPresence,
+                returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools)
             )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
             return ListTools.Result(tools: tools)
@@ -12684,6 +13795,8 @@ actor ServerNetworkManager {
             // while the call is waiting for a response.
 
             let isMemoryOnlyModelCall = Self.isMemoryOnlyModelCall(toolName: toolName, arguments: cleanedArguments)
+            let memoryRouteUnavailableMessage = toolName == MCPWindowToolName.becomeOverseer
+                ? "Tool 'become_overseer' is not available for this session." : Self.modelRouteUnavailableMessage
             let modelRouteToken = isMemoryOnlyModelCall
                 ? await cachedModelCatalogRouteToken(connectionID: connectionID) : nil
             if isMemoryOnlyModelCall {
@@ -12692,7 +13805,7 @@ actor ServerNetworkManager {
                       extractedContextID.map({ $0 == endpoint.tabID }) ?? true,
                       extractedTabID.map({ $0 == endpoint.tabID }) ?? true
                 else {
-                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: Self.modelRouteUnavailableMessage)
+                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: memoryRouteUnavailableMessage)
                 }
             }
             var dispatchTabContextHint: MCPServerViewModel.TabContextHint? = modelRouteToken.map {
@@ -12758,6 +13871,29 @@ actor ServerNetworkManager {
                 return admissionTimeout
             }
 
+            let policyAdmission = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.MCPToolCall.effectivePolicySnapshot,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            ) {
+                await self.toolPolicyAdmissionSnapshot(connectionID: connectionID, toolName: toolName)
+            }
+            guard let policyAdmission else {
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: "tool_execution_connection_terminal",
+                    message: "The MCP connection is closing."
+                )
+            }
+            let initialPolicy = policyAdmission.policy
+            let policyAdmissionToken = policyAdmission.token
+            @Sendable func policyChangedResult() -> CallTool.Result {
+                Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: "tool_execution_policy_changed",
+                    message: "Tool '\(toolName)' was not started because this connection's policy changed. Retry under the current policy."
+                )
+            }
+
             do {
                 let policyState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.policyGating,
@@ -12768,14 +13904,19 @@ actor ServerNetworkManager {
                 // tools/list already performs any needed persisted routing hydration.
                 // Avoid repeating that work while a tool call is in-flight.
 
-                let effectivePolicy = await effectivePolicyState(for: connectionID)
+                let effectivePolicy = initialPolicy
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                // must never decide execution. Scoped to the only tool whose grant is live link
-                // state, so no other tool call pays for the lookup or its actor hop.
-                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
+                guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
+                    return policyChangedResult()
+                }
                 let liveAdditional = effectivePolicy.additional.union(
                     liveSessionLinkGrant?.additionalGrants ?? []
                 )
@@ -12784,15 +13925,22 @@ actor ServerNetworkManager {
                     additional: liveAdditional,
                     taskLabelKind: effectivePolicy.taskLabelKind,
                     allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools,
-                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
+                    hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 do {
                     try await domainHost.evaluateEarlyCallPolicy(
                         toolName: toolName,
                         policy: domainPolicy
                     )
+                    guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
+                        return policyChangedResult()
+                    }
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
                     where toolName == MCPWindowToolName.agentSessionLink
+                    || toolName == MCPWindowToolName.becomeOverseer
+                    || toolName == MCPWindowToolName.sessionAdmin
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -12850,14 +13998,13 @@ actor ServerNetworkManager {
                 argsForFormatter["_rawJSON"] = .bool(true)
             }
 
-            connectionLog("tools/call \(toolName): computing effective policy")
-            let policy = await EditFlowPerf.measure(
-                EditFlowPerf.Stage.MCPToolCall.effectivePolicySnapshot,
-                EditFlowPerf.Dimensions(toolName: toolName)
-            ) {
-                await self.effectivePolicyState(for: connectionID)
+            connectionLog("tools/call \(toolName): validating admitted policy")
+            // Unfenced ordinary calls retain their existing fresh second policy read.
+            let policy = if policyAdmissionToken != nil {
+                initialPolicy
+            } else {
+                await effectivePolicyState(for: connectionID)
             }
-            connectionLog("tools/call \(toolName): policy ready")
             let preAdmissionDecision: MCPToolAdmissionDecision
             do {
                 let policyState = EditFlowPerf.begin(
@@ -12868,9 +14015,16 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
+                guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
+                    return policyChangedResult()
+                }
                 let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                     restricted: policy.restricted,
                     additional: policy.additional.union(
@@ -12878,15 +14032,23 @@ actor ServerNetworkManager {
                     ),
                     taskLabelKind: policy.taskLabelKind,
                     allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
-                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
+                    hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(
                     toolName: toolName,
                     policy: domainPolicy
                 )
+                guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
+                    return policyChangedResult()
+                }
             } catch MCPDomainCallPolicyDenial.restricted {
                 log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
                 return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+            } catch MCPDomainCallPolicyDenial.roleUnavailable where toolName == MCPWindowToolName.sessionAdmin {
+                // Same uniform text as an ungranted call, so the role gate reveals nothing more.
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is not available for this session.")
             } catch MCPDomainCallPolicyDenial.roleUnavailable {
                 return Self.toolErrorResult(
                     rawJSON: capturedRawJSON,
@@ -13128,6 +14290,9 @@ actor ServerNetworkManager {
                             message: "The MCP connection was closed after an earlier tool failed to stop."
                         )
                     }
+                    guard await self.isCurrentToolPolicyAdmission(policyAdmissionToken) else {
+                        return policyChangedResult()
+                    }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired,
                         correlation: lifecycleCorrelation,
@@ -13143,7 +14308,7 @@ actor ServerNetworkManager {
                             lifecycleCorrelation: lifecycleCorrelation,
                             progressHandle: capturedProgressState
                         ) {
-                            await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
+                            await Self.currentTabContextHintTaskLocal.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
                                     EditFlowPerf.Dimensions(toolName: toolName)
@@ -13189,7 +14354,7 @@ actor ServerNetworkManager {
                                     if isMemoryOnlyModelCall,
                                        await self.cachedModelCatalogRouteToken(connectionID: connectionID) != modelRouteToken
                                     {
-                                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: Self.modelRouteUnavailableMessage)
+                                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: memoryRouteUnavailableMessage)
                                     }
                                     let bypassWindowRouting = isMemoryOnlyModelCall || Self.shouldBypassWindowRouting(for: toolName)
                                     let existingMapping = bypassWindowRouting ? nil : await self.presentationWindowByConnection[connectionID]
@@ -14575,7 +15740,7 @@ actor ServerNetworkManager {
                                         guard let context = try? await self.modelInvocationSecurityContext(
                                             connectionID: connectionID, invocationID: invocationID, expectedRoute: modelRouteToken
                                         ) else {
-                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: Self.modelRouteUnavailableMessage)
+                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: memoryRouteUnavailableMessage)
                                         }
                                         invocationSecurityContext = context
                                     } else {
@@ -14667,7 +15832,8 @@ actor ServerNetworkManager {
                                         let dispatchAuthorization = await self.toolDispatchAuthorization(
                                             connectionID: connectionID,
                                             resolution: limiterResolution,
-                                            windowIdentity: windowDispatchIdentity
+                                            windowIdentity: windowDispatchIdentity,
+                                            policyAdmissionToken: policyAdmissionToken
                                         )
                                         promptExportPublicationAuthorityObservation?.bind(dispatchAuthorization)
                                         let explicitWindowRoutingHint = Self.explicitWindowRoutingHint(
@@ -14689,8 +15855,8 @@ actor ServerNetworkManager {
                                                 windowIdentity: windowDispatchIdentity,
                                                 recordScope: shouldTrackToolOwnership
                                             ) {
-                                                try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
-                                                    let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                try await Self.currentToolDispatchAuthorizationTaskLocal.withValue(dispatchAuthorization) {
+                                                    let value = try await Self.currentExplicitWindowRoutingHintTaskLocal.withValue(explicitWindowRoutingHint) {
                                                         try await EditFlowPerf.measure(
                                                             EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                             EditFlowPerf.Dimensions(toolName: toolName)
@@ -15413,6 +16579,13 @@ actor ServerNetworkManager {
         return (fingerprint, nil)
     }
 
+    /// Liveness fence for queued approval UI; process identity may be unavailable
+    /// even for a live connection, so a missing peer PID is not a close signal.
+    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
+    }
+
     /// Returns the verified peer PID for a bootstrap socket connection, if available.
     func peerPID(for connectionID: UUID) async -> Int? {
         guard let connection = connections[connectionID] else { return nil }
@@ -15668,11 +16841,12 @@ actor ServerNetworkManager {
             }
         #endif
         return await MainActor.run {
-            WindowStatesManager.shared.allWindows.map {
-                MCPRoutingWindowSnapshot(
-                    workspaceID: $0.workspaceManager.activeWorkspace?.id,
-                    instanceNumber: $0.workspaceInstanceNumber,
-                    windowID: $0.windowID
+            WindowStatesManager.shared.allWindows.map { window in
+                let workspaceID = window.workspaceManager.activeWorkspace?.id
+                return MCPRoutingWindowSnapshot(
+                    workspaceID: workspaceID,
+                    instanceNumber: workspaceID.flatMap { window.workspaceInstanceNumber(for: $0) },
+                    windowID: window.windowID
                 )
             }
         }
@@ -15877,7 +17051,9 @@ actor ServerNetworkManager {
                 let windowID,
                 let win = WindowStatesManager.shared.window(withID: windowID)
             else { return (nil, nil) }
-            return (win.workspaceManager.activeWorkspace?.id, win.workspaceInstanceNumber)
+            // Pair the number with the same workspace ID; a pending assignment records nil.
+            let workspaceID = win.workspaceManager.activeWorkspace?.id
+            return (workspaceID, workspaceID.flatMap { win.workspaceInstanceNumber(for: $0) })
         }
 
         await pruneRoutingRecords()
@@ -16104,13 +17280,15 @@ actor ServerNetworkManager {
     private func toolDispatchAuthorization(
         connectionID: UUID,
         resolution: ConnectionCallLimiterResolution,
-        windowIdentity: WindowToolDispatchIdentity? = nil
+        windowIdentity: WindowToolDispatchIdentity? = nil,
+        policyAdmissionToken: MCPToolPolicyAdmissionToken?
     ) -> ToolDispatchAuthorization {
         ToolDispatchAuthorization(
             connectionID: connectionID,
             connectionIdentity: resolution.connectionIdentity,
             lifecycleGeneration: resolution.lifecycleGeneration,
-            windowIdentity: windowIdentity
+            windowIdentity: windowIdentity,
+            policyAdmissionToken: policyAdmissionToken
         )
     }
 

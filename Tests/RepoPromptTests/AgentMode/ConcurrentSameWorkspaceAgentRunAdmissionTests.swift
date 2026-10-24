@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
@@ -355,6 +356,120 @@ import XCTest
             XCTAssertEqual(Set([firstPair, secondPair]).count, 2)
         }
 
+        func testUnchangedCodemapPublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let files = fixture.window.workspaceFilesViewModel
+            XCTAssertTrue(files.autoCodemapFiles.isEmpty)
+            var preparations = 0
+            fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor _, _, _ in
+                preparations += 1
+                // The root/selection reconciler can republish an unchanged empty list
+                // while off-main document preparation is suspended. Exercise the real
+                // Combine subscriber and drain its scheduled dirty-state callback.
+                files.setAutoCodemapFilesForTesting([])
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("unchanged selection must not veto admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let count = await recorder.count()
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(preparations, 1, "No real workspace mutation occurred; the two-attempt retry budget must remain unused")
+        }
+
+        func testUnchangedGitModePublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: false)
+        }
+
+        func testChangedGitModePublicationStillInvalidatesAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: true)
+        }
+
+        private func assertGitModePublicationDuringAdmissionSave(
+            changesMode: Bool,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            let gitViewModel = fixture.window.promptManager.gitViewModel
+            let initialMode = gitViewModel.gitDiffInclusionMode
+            trackCleanup {
+                gitViewModel.gitDiffInclusionMode = initialMode
+                await fixture.cleanup()
+            }
+            let manager = fixture.window.workspaceManager
+            let initialTabs = try XCTUnwrap(manager.activeWorkspace, file: file, line: line).composeTabs
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                // Settings sync can republish the same mode while document preparation
+                // is suspended. The control changes it once, then republishes that value
+                // on the retry; only the real transition may invalidate the capture.
+                let currentMode = gitViewModel.gitDiffInclusionMode
+                let publishedMode: GitDiffInclusionMode = changesMode && preparations == 1
+                    ? (currentMode == .all ? .none : .all)
+                    : currentMode
+                gitViewModel.gitDiffInclusionMode = publishedMode
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("Git mode publication during admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let observations = await recorder.observations()
+            XCTAssertEqual(observations.count, 1, file: file, line: line)
+            XCTAssertEqual(
+                preparations,
+                changesMode ? 2 : 1,
+                "Only a changed Git mode may consume the one allowed save retry",
+                file: file,
+                line: line
+            )
+            let observation = try XCTUnwrap(observations.first, file: file, line: line)
+            let pair = AdmissionIdentityPair(tabID: observation.tabID, sessionID: observation.sessionID)
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let canonical = try XCTUnwrap(snapshot, file: file, line: line)
+            let canonicalWorkspace = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: canonical.document.documentBytes
+            )
+            let savedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            assertExactAdmissionState(
+                in: canonicalWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+            assertExactAdmissionState(
+                in: savedWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+        }
+
         func testCanonicalAdmissionRefreshReResolvesWorkspaceAfterReorder() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -582,10 +697,21 @@ import XCTest
             if canonical.activeComposeTabID == moved.id {
                 canonical.activeComposeTabID = canonical.composeTabs.first?.id
             }
-            let stashedSnapshot = try WorkspaceManagerViewModel.replacingWorkspaceProjectionForTesting(
+            // The refreshed identity must come from a committed authority revision. Replacing
+            // only snapshot bytes leaves a fictitious digest that the next durable save rejects.
+            let stashSave = try await DomainWorkspaceAuthorityClient(
+                store: fixture.runtime.workspaceStore,
+                windowID: fixture.window.windowID
+            ).saveFailClosed(
                 canonical,
-                in: canonicalSnapshot
+                fileURL: fixture.workspaceFileURL,
+                expectedWorkspaceRevision: canonicalSnapshot.revisions.workingRevision,
+                expectedContentDigest: canonicalSnapshot.document.contentDigest
             )
+            XCTAssertEqual(stashSave.saved?.disposition, .applied)
+            let stashedValue = await fixture.runtime.workspaceStore
+                .canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let stashedSnapshot = try XCTUnwrap(stashedValue)
             let peerIndex = try XCTUnwrap(peer.workspaceManager.workspaces.firstIndex {
                 $0.id == fixture.workspaceID
             })
@@ -677,7 +803,8 @@ import XCTest
                 try await manager.withAgentSessionAdmission(
                     workspaceID: workspace.id,
                     admissionID: UUID(),
-                    refreshCanonicalState: true
+                    refreshCanonicalState: true,
+                    kind: .freshTab
                 ) {
                     operationRan = true
                 }
@@ -1133,6 +1260,84 @@ import XCTest
             )
             XCTAssertFalse(savedWorkspace.composeTabs.containsIdentity(rejectedPair))
 
+            // A rejected attempt may only detach its own rolled-back runtime. Exercise the
+            // same early boundary with a retained tab, rotated binding, and replacement owner.
+            enum SurvivingOwner: CaseIterable { case stashed, rebound, replacement }
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let viewModel = fixture.window.agentModeViewModel
+            for survivingOwner in SurvivingOwner.allCases {
+                var survivor: AgentTabSession?
+                var survivorSessionID: UUID?
+                var attempt: AgentProvisionalAdmissionIdentity?
+                prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting { identity, receipt in
+                    XCTAssertEqual(receipt.outcome.normalizedFailureCategory, .authorityRevisionConflict)
+                    guard let runtime = viewModel.session(for: identity.tabID, createIfNeeded: false),
+                          let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                          let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: {
+                              $0.id == identity.tabID
+                          })
+                    else { return XCTFail("Rejected creation must expose its captured runtime before rollback") }
+                    XCTAssertTrue(runtime.qualifiedRestorationReadiness.isCreating)
+                    attempt = identity
+                    let tab = manager.workspaces[workspaceIndex].composeTabs.remove(at: tabIndex)
+                    switch survivingOwner {
+                    case .stashed:
+                        manager.workspaces[workspaceIndex].stashedTabs.append(StashedTab(tab: tab))
+                        survivor = runtime
+                        survivorSessionID = identity.sessionID
+                    case .rebound:
+                        let successorID = UUID()
+                        _ = viewModel.test_installPersistentSessionBinding(sessionID: successorID, on: runtime)
+                        survivor = runtime
+                        survivorSessionID = successorID
+                    case .replacement:
+                        viewModel.test_removeSession(tabID: identity.tabID)
+                        let replacement = viewModel.session(for: identity.tabID)
+                        _ = viewModel.test_installPersistentSessionBinding(sessionID: identity.sessionID, on: replacement)
+                        survivor = replacement
+                        survivorSessionID = identity.sessionID
+                    }
+                    prompt.loadComposeTabsFromWorkspace(manager.workspaces[workspaceIndex])
+                }
+                defer {
+                    prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil)
+                    if let attempt {
+                        viewModel.test_removeSession(tabID: attempt.tabID)
+                        if let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                            manager.workspaces[workspaceIndex].stashedTabs.removeAll { $0.tab.id == attempt.tabID }
+                            prompt.loadComposeTabsFromWorkspace(manager.workspaces[workspaceIndex])
+                        }
+                    }
+                }
+                do {
+                    _ = try await service.execute(args: [
+                        "op": .string("start"),
+                        "message": .string("reject while preserving \(survivingOwner)"),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                    XCTFail("Typed rejection must still refuse provider dispatch for \(survivingOwner)")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("workspace binding was not durably accepted"))
+                }
+                let retained = try XCTUnwrap(survivor)
+                XCTAssertTrue(viewModel.session(for: retained.tabID, createIfNeeded: false) === retained)
+                XCTAssertEqual(retained.activeAgentSessionID, survivorSessionID)
+                XCTAssertNotNil(retained.operationAdmissionFailureMessage)
+                let attemptedProviderCount = await providerRecorder.count()
+                XCTAssertEqual(attemptedProviderCount, 0)
+                if survivingOwner == .stashed {
+                    XCTAssertTrue(manager.workspace(withID: workspaceID)?.stashedTabs.contains {
+                        $0.tab.id == retained.tabID && $0.tab.activeAgentSessionID == survivorSessionID
+                    } == true)
+                } else {
+                    XCTAssertFalse(manager.workspace(withID: workspaceID)?.composeTabs.contains {
+                        $0.id == retained.tabID
+                    } == true)
+                }
+            }
+
             fixture.window.workspaceManager.removeBeforeSaveListener(beforeSaveToken)
             fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
             await fixture.closeWindowAndRuntime()
@@ -1552,18 +1757,76 @@ import XCTest
             let coordinator = WorkspaceAgentAdmissionCoordinator()
             let fixture = makeManagerFixture(coordinator: coordinator)
             defer { fixture.manager.prepareForWindowClose() }
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: {
+                XCTAssertEqual(coordinator.snapshot().activeAdmissionCount, 0, "Emit only after lease release")
+                reports.append($0)
+            })
 
             do {
                 _ = try await fixture.manager.withAgentSessionAdmission(
                     workspaceID: UUID(),
-                    admissionID: UUID()
+                    admissionID: UUID(),
+                    kind: .freshTab,
+                    timing: timing
                 ) {
+                    timing.begin(.save)
+                    defer { timing.end() }
+                    now += .seconds(44)
                     throw AdmissionTestError.expected
                 }
                 XCTFail("The controlled operation must throw.")
             } catch AdmissionTestError.expected {}
 
             XCTAssertEqual(coordinator.snapshot().trackedWorkspaceCount, 0)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(reports.first?.slowestPhase, .save)
+            XCTAssertEqual(reports.first?.totalMilliseconds, 44000)
+            XCTAssertEqual(reports.first?.holdMilliseconds, 44000)
+            XCTAssertEqual(reports.first?.outcome, .threw)
+        }
+
+        func testAdmissionTimingReportsKindOutcomeAndReleasedLeaseOnEveryExit() async throws {
+            let coordinator = WorkspaceAgentAdmissionCoordinator()
+            let fixture = makeManagerFixture(coordinator: coordinator)
+            defer { fixture.manager.prepareForWindowClose() }
+            let cases: [(WorkspaceAgentAdmissionTiming.Kind, WorkspaceAgentAdmissionTiming.Outcome)] = [
+                (.freshTab, .committed), (.existingTab, .rejected), (.recovery, .cancelled), (.discard, .threw)
+            ]
+            for (kind, outcome) in cases {
+                var now = Duration.zero
+                var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+                let workspaceID = UUID()
+                let admissionID = UUID()
+                let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: {
+                    XCTAssertEqual(coordinator.snapshot().activeAdmissionCount, 0)
+                    reports.append($0)
+                })
+                do {
+                    _ = try await fixture.manager.withAgentSessionAdmission(
+                        workspaceID: workspaceID, admissionID: admissionID, kind: kind,
+                        classifyOutcome: { (accepted: Bool) in accepted ? .committed : .rejected }, timing: timing
+                    ) {
+                        now += .seconds(6)
+                        if outcome == .cancelled { throw CancellationError() }
+                        if outcome == .threw { throw AdmissionTestError.expected }
+                        return outcome == .committed
+                    }
+                    XCTAssertTrue(outcome == .committed || outcome == .rejected)
+                } catch is CancellationError {
+                    XCTAssertEqual(outcome, .cancelled)
+                } catch AdmissionTestError.expected {
+                    XCTAssertEqual(outcome, .threw)
+                }
+                let report = try XCTUnwrap(reports.first)
+                XCTAssertEqual(reports.count, 1)
+                XCTAssertEqual(report.outcome, outcome)
+                XCTAssertEqual(report.context.kind, kind)
+                XCTAssertEqual(report.context.workspaceKey, WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID))
+                XCTAssertEqual(report.context.correlationKey, WorkspaceAgentAdmissionCoordinator.redactedID(admissionID))
+                XCTAssertTrue(report.logMessage.contains("kind=\(kind.rawValue) outcome=\(outcome.rawValue)"))
+            }
         }
 
         func testAgentAdmissionSaveRetriesOnceThenPersistsNewestState() async throws {
@@ -1730,6 +1993,18 @@ import XCTest
                     let sessionID = try XCTUnwrap(target.sessionID)
                     let pair = AdmissionIdentityPair(tabID: target.tabID, sessionID: sessionID)
                     try await validateBeforeProviderDispatch?(pair)
+                    // Keep the production configured-first-save boundary even though provider
+                    // execution is recorded here. A peer may restore this accepted session.
+                    try await agentModeVM.mcpConfigureSession(
+                        tabID: target.tabID,
+                        agentRaw: agentRaw,
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: reasoningEffortRaw,
+                        creationHandle: target.creationHandle
+                    )
+                    let committed = await agentModeVM.commitConfiguredSessionCreation(target: target)
+                    _ = try XCTUnwrap(committed ? target.sessionID : nil, "Configured session must save before provider dispatch")
+                    XCTAssertNil(agentModeVM.session(for: target.tabID).operationAdmissionFailureMessage)
                     try await recorder.recordAndWait(
                         .init(
                             tabID: target.tabID,
@@ -1847,7 +2122,7 @@ import XCTest
             let workspace = WorkspaceModel(
                 name: "Admission",
                 repoPaths: [],
-                customStoragePath: root,
+                customStoragePath: AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: root),
                 composeTabs: [tab],
                 activeComposeTabID: tab.id
             )
@@ -1927,6 +2202,25 @@ import XCTest
         let workspaceFileURL: URL
     }
 
+    /// Creation and bridge projection are independent now that canonical decoding suspends.
+    /// Admission tests begin only after the real bridge accepted this durable document; a
+    /// synthetic local append cannot establish the full-document write baseline saves require.
+    @MainActor
+    private func awaitDurableAdmissionCatalog(
+        window: WindowState, runtime: MCPDomainRuntime, workspaceID: UUID
+    ) async throws {
+        let catalog = await runtime.workspaceStore.snapshot()
+        guard let record = catalog.workspaces.first(where: { $0.document.workspaceID == workspaceID }),
+              let bridge = window.domainWorkspacePresentationBridgeForTesting
+        else { throw AdmissionTestError.fixtureSetup("durable admission catalog unavailable") }
+        let checkpoint = await DomainWorkspaceProjectionObserver(bridge: bridge).waitForProjection(
+            afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+        )
+        guard checkpoint != nil,
+              window.workspaceManager.qualifiedDomainWorkspaceDescendant(record) != nil
+        else { throw AdmissionTestError.fixtureSetup("durable admission catalog has no accepted full-document baseline") }
+    }
+
     @MainActor
     private final class DistinctDurableAdmissionFixture {
         let first: DurableAdmissionWindow
@@ -1975,6 +2269,11 @@ import XCTest
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let firstWindow = WindowState(domainRuntime: firstRuntime)
             let secondWindow = WindowState(domainRuntime: secondRuntime)
+            for (label, window) in [("A", firstWindow), ("B", secondWindow)] {
+                window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                    print("WORKSPACE_SAVE_CONFLICT distinct-\(label) \(fields.sorted { $0.key < $1.key })")
+                }
+            }
             WindowStatesManager.shared.registerWindowState(firstWindow)
             WindowStatesManager.shared.registerWindowState(secondWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -2086,11 +2385,7 @@ import XCTest
                 throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
             }
             await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-            // A sibling window can publish a catalog projection while this synthetic workspace is
-            // being created, so establish the local projection from the workspace just committed.
-            if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
-                window.workspaceManager.workspaces.append(workspace)
-            }
+            try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
             let storedWorkspace = try XCTUnwrap(
                 window.workspaceManager.workspaces.first { $0.id == workspace.id }
             )
@@ -2180,6 +2475,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState(domainRuntime: runtime)
+            window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             do {
@@ -2200,11 +2498,7 @@ import XCTest
                     throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
                 }
                 await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-                // Catalog projection and fixture creation are independent publications; the test
-                // window must expose the workspace that the authority has already committed.
-                if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
-                    window.workspaceManager.workspaces.append(workspace)
-                }
+                try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
                 let storedWorkspace = try XCTUnwrap(
                     window.workspaceManager.workspaces.first { $0.id == workspace.id }
                 )
@@ -2262,6 +2556,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let peer = WindowState(domainRuntime: runtime)
+            peer.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(peer)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             peerWindows.append(peer)
@@ -2574,3 +2871,74 @@ import XCTest
         }
     }
 #endif
+
+@MainActor
+final class WorkspaceAgentAdmissionTimingTests: XCTestCase {
+    func testFortyFourSecondStallIsAttributedToEachExclusivePhase() throws {
+        for slowPhase in WorkspaceAgentAdmissionTiming.Phase.allCases {
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
+            let workspaceID = UUID()
+            let admissionID = UUID()
+            timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: .freshTab)
+            now += slowPhase == .queueWait ? .seconds(44) : .seconds(1)
+            timing.acquired()
+            timing.begin(.refresh)
+            now += slowPhase == .refresh ? .seconds(44) : .seconds(1)
+            timing.begin(.catalogRefresh)
+            now += slowPhase == .catalogRefresh ? .seconds(44) : .seconds(1)
+            timing.end()
+            // Baseline adoption can refresh again, with save work nested inside that refresh.
+            timing.begin(.refresh)
+            timing.begin(.save)
+            now += slowPhase == .save ? .seconds(44) : .seconds(1)
+            timing.end()
+            timing.end()
+            timing.end()
+            now += slowPhase == .other ? .seconds(44) : .seconds(1)
+            timing.recordSaveAttempt()
+            timing.recordSaveAttempt()
+            timing.finish(outcome: .committed)
+
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(report.slowestPhase, slowPhase)
+            XCTAssertEqual(report.milliseconds[slowPhase.rawValue], 44000)
+            XCTAssertEqual(report.totalMilliseconds, 48000)
+            XCTAssertEqual(report.holdMilliseconds, slowPhase == .queueWait ? 4000 : 47000)
+            XCTAssertEqual(report.counts, [1, 1, 1, 1, 1])
+            XCTAssertEqual(report.saveAttempts, 2)
+            XCTAssertEqual(report.context.workspaceKey, WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID))
+            XCTAssertEqual(report.context.correlationKey, WorkspaceAgentAdmissionCoordinator.redactedID(admissionID))
+            XCTAssertFalse(report.logMessage.contains(workspaceID.uuidString))
+            XCTAssertFalse(report.logMessage.contains(admissionID.uuidString))
+            XCTAssertTrue(report.logMessage.contains("slowest=\(slowPhase.name)"))
+        }
+    }
+
+    func testThresholdBoundaryAndRepeatedFinishEmitAtMostOneReport() {
+        for elapsed in [Duration.milliseconds(4999), .seconds(5)] {
+            var now = Duration.zero
+            var messages: [String] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { messages.append($0.logMessage) })
+            let workspaceID = UUID()
+            let admissionID = UUID()
+            timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: .discard)
+            now = elapsed
+            timing.finish(outcome: .cancelled) // Includes cancellation before acquiring a lease.
+            timing.finish(outcome: .threw)
+            timing.acquired()
+            timing.begin(.save)
+            timing.end()
+            timing.finish(outcome: .committed)
+            if elapsed < .seconds(5) {
+                XCTAssertEqual(messages, [])
+            } else {
+                XCTAssertEqual(messages, [
+                    "event=agentAdmission.slow workspace=\(WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID)) correlation=\(WorkspaceAgentAdmissionCoordinator.redactedID(admissionID)) kind=discard outcome=cancelled totalMS=5000.000 holdMS=0.000 slowest=queue_wait saveAttempts=0 queue_waitMS=5000.000 queue_waitCount=1 refreshMS=0.000 refreshCount=0 catalog_refreshMS=0.000 catalog_refreshCount=0 saveMS=0.000 saveCount=0 otherMS=0.000 otherCount=0"
+                ])
+            }
+        }
+    }
+}

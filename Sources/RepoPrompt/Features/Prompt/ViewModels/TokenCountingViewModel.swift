@@ -460,7 +460,7 @@ class TokenCountingViewModel: ObservableObject {
     #endif
 
     @MainActor
-    func forceImmediateRecount() async {
+    func forceImmediateRecount(windowOrdinal: Int? = nil) async {
         #if DEBUG
             let forceStartMS = PromptTokenRecountDiagnostics.start()
             let replacedDebounceTask = tokenUpdateDebounceTask != nil
@@ -489,7 +489,9 @@ class TokenCountingViewModel: ObservableObject {
         updateTokenCountTask = nil
         pendingDirty = []
         isImmediateRecountInProgress = true
+        let immediateRecountSpan = StartupPhaseLog.begin(.immediateRecount, window: windowOrdinal)
         await performTokenCountOffMainThread()
+        immediateRecountSpan.end()
         isImmediateRecountInProgress = false
         scheduleTokenCountUpdateIfNeeded()
         #if DEBUG

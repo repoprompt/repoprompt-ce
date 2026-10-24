@@ -197,7 +197,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     agentSessionID: $0
                 )
             }
-            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag
+            return try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal
                 .withValue(tag, operation: operation)
         #else
             return try await operation()

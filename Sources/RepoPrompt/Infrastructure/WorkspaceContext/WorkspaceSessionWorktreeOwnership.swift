@@ -114,7 +114,7 @@ enum WorkspaceSessionWorktreeOwnershipError: LocalizedError, Equatable {
         case let .unavailableRoot(path):
             "The Agent session worktree root is unavailable: \(path)"
         case let .invalidRootKind(path):
-            "The requested Agent worktree path is already loaded with incompatible ownership: \(path)"
+            "The requested Agent worktree path is already loaded as a workspace folder with incompatible ownership: \(path). Remove that folder from this workspace before binding, or use a separate workspace. The existing folder ownership was not changed."
         }
     }
 }

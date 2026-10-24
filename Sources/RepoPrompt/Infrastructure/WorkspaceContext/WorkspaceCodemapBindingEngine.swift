@@ -4,6 +4,7 @@ import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptPersistence
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
@@ -358,7 +359,12 @@ actor WorkspaceCodemapBindingEngine {
             let mutationByteCount: UInt64
         }
 
-        @TaskLocal private static var debugManifestStoreAttemptContext: DebugManifestStoreAttemptContext?
+        // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+        private nonisolated static let debugManifestStoreAttemptContextTaskLocal =
+            BoxedTaskLocal<DebugManifestStoreAttemptContext?>(nil)
+        private nonisolated static var debugManifestStoreAttemptContext: DebugManifestStoreAttemptContext? {
+            debugManifestStoreAttemptContextTaskLocal.get()
+        }
     #endif
 
     private enum ManifestMutationSubmissionResult {
@@ -714,10 +720,10 @@ actor WorkspaceCodemapBindingEngine {
     private var graphIndexAdmissionQueue: [GraphIndexAdmissionWaiter] = []
     private var activeGraphIndexJobIDs: Set<UUID> = []
     private var graphIndexWatchdogTasks: [UUID: Task<Void, Never>] = [:]
-    private var graphIndexWorkerRecoveryContinuations: [
+    private var graphIndexExecutionContinuations: [
         UUID: (
             rootEpoch: WorkspaceCodemapRootEpoch,
-            continuation: AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState>.Continuation
+            continuation: AsyncStream<WorkspaceCodemapGraphIndexExecutionState>.Continuation
         )
     ] = [:]
     private var prioritizedGraphIndexRootEpoch: WorkspaceCodemapRootEpoch?
@@ -780,6 +786,10 @@ actor WorkspaceCodemapBindingEngine {
         private var debugLastManifestFailureByRootEpoch: [
             WorkspaceCodemapRootEpoch: WorkspaceCodemapManifestFailureDiagnostic
         ] = [:]
+        private let debugManifestWriterEngineID = UUID()
+        private var debugManifestWriterLiveTaskCount = 0
+        private var debugManifestWriterAccountingComplete = true
+        private var debugManifestWriterTasks: [UUID: CodemapManifestWriterTaskSnapshot] = [:]
         private var debugManifestMeasurementsByRootEpoch: [
             WorkspaceCodemapRootEpoch: [
                 WorkspaceCodemapManifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementAggregate
@@ -1521,7 +1531,7 @@ actor WorkspaceCodemapBindingEngine {
         job.retryAttempt = 0
         job.retry = nil
         graphIndexJobs[rootEpoch] = job
-        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         #if DEBUG
             recordGraphIndexDebugEvent(
                 kind: .graphIndexRunScheduled,
@@ -2007,34 +2017,38 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    func graphIndexWorkerRecoveryUpdates(
+    func graphIndexExecutionUpdates(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState> {
+    ) -> AsyncStream<WorkspaceCodemapGraphIndexExecutionState> {
         let id = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            graphIndexWorkerRecoveryContinuations[id] = (rootEpoch, continuation)
-            continuation.yield(graphIndexWorkerRecoveryState(rootEpoch: rootEpoch))
+            graphIndexExecutionContinuations[id] = (rootEpoch, continuation)
+            continuation.yield(graphIndexExecutionState(rootEpoch: rootEpoch))
             continuation.onTermination = { _ in
-                Task { await self.removeGraphIndexWorkerRecoveryContinuation(id) }
+                Task { await self.removeGraphIndexExecutionContinuation(id) }
             }
         }
     }
 
-    private func graphIndexWorkerRecoveryState(
+    private func graphIndexExecutionState(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapGraphIndexWorkerRecoveryState {
-        graphIndexJobs[rootEpoch]?.workerRecoveryExhausted == true ? .exhausted : .available
+    ) -> WorkspaceCodemapGraphIndexExecutionState {
+        guard let job = graphIndexJobs[rootEpoch] else { return .available }
+        if job.phase == .budgetLimited, let budget = job.budget {
+            return .budgetLimited(budget)
+        }
+        return job.workerRecoveryExhausted ? .exhausted : .available
     }
 
-    private func publishGraphIndexWorkerRecoveryState(rootEpoch: WorkspaceCodemapRootEpoch) {
-        let state = graphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
-        for entry in graphIndexWorkerRecoveryContinuations.values where entry.rootEpoch == rootEpoch {
+    private func publishGraphIndexExecutionState(rootEpoch: WorkspaceCodemapRootEpoch) {
+        let state = graphIndexExecutionState(rootEpoch: rootEpoch)
+        for entry in graphIndexExecutionContinuations.values where entry.rootEpoch == rootEpoch {
             entry.continuation.yield(state)
         }
     }
 
-    private func removeGraphIndexWorkerRecoveryContinuation(_ id: UUID) {
-        graphIndexWorkerRecoveryContinuations.removeValue(forKey: id)
+    private func removeGraphIndexExecutionContinuation(_ id: UUID) {
+        graphIndexExecutionContinuations.removeValue(forKey: id)
     }
 
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
@@ -2430,6 +2444,81 @@ actor WorkspaceCodemapBindingEngine {
             (
                 debugManifestFailureCountsByRootEpoch[rootEpoch] ?? [:],
                 debugLastManifestFailureByRootEpoch[rootEpoch]
+            )
+        }
+
+        /// Metadata stays independent of manifestWriters until the exact task returns.
+        private func debugManifestWriterStarted(writerID: UUID, namespace: CodeMapRootManifestNamespace) {
+            let (next, overflow) = debugManifestWriterLiveTaskCount.addingReportingOverflow(1)
+            debugManifestWriterAccountingComplete = debugManifestWriterAccountingComplete && !overflow
+            debugManifestWriterLiveTaskCount = overflow ? .max : next
+            guard debugManifestWriterTasks.count < 64 else { return }
+            let now = uptimeNanoseconds()
+            debugManifestWriterTasks[writerID] = CodemapManifestWriterTaskSnapshot(
+                writerID: writerID, namespaceDigest: namespace.storageDigestHex,
+                rootEpoch: nil, batchID: nil, origin: nil, phase: "scheduled",
+                taskStartedUptimeNanoseconds: now, batchStartedUptimeNanoseconds: nil,
+                phaseStartedUptimeNanoseconds: now
+            )
+        }
+
+        private func debugManifestWriterEnded(writerID: UUID) {
+            if debugManifestWriterLiveTaskCount > 0 {
+                debugManifestWriterLiveTaskCount -= 1
+            } else {
+                debugManifestWriterAccountingComplete = false
+            }
+            debugManifestWriterTasks.removeValue(forKey: writerID)
+        }
+
+        private func debugManifestWriterPhase(
+            writerID: UUID, phase: String, batch: ManifestMutationBatch? = nil
+        ) {
+            guard var task = debugManifestWriterTasks[writerID] else { return }
+            let now = uptimeNanoseconds()
+            task.phase = phase
+            task.phaseStartedUptimeNanoseconds = now
+            if let batch {
+                task.rootEpoch = batch.workKey.scope.rootEpoch
+                task.batchID = batch.id
+                task.batchStartedUptimeNanoseconds = now
+                switch batch.proof {
+                case .session: task.origin = "session"
+                case .graphIndex(_, _, .pageCheckpoint): task.origin = "graph_page"
+                case .graphIndex(_, _, .enumerationSeal): task.origin = "graph_seal"
+                }
+            } else if phase == "checking_enabled" {
+                task.rootEpoch = nil
+                task.batchID = nil
+                task.origin = nil
+                task.batchStartedUptimeNanoseconds = nil
+            }
+            debugManifestWriterTasks[writerID] = task
+        }
+
+        func debugManifestWriterActivity(rootEpoch: WorkspaceCodemapRootEpoch) -> CodemapManifestWriterActivitySnapshot {
+            // Read at most 32 namespace states, never queued items or the blocked manifest store.
+            let queues = manifestWriters.prefix(32).map { namespace, writer in
+                CodemapManifestWriterQueueSnapshot(
+                    namespaceDigest: namespace.storageDigestHex,
+                    queuedItemCount: writer.queuedWork.count,
+                    deferredTailItemCount: writer.deferredWork.count,
+                    deferredHeadWaitingItemCount: writer.deferredHeadBatch?.id != writer.inFlightBatch?.id
+                        ? writer.deferredHeadBatch?.items.count ?? 0 : 0,
+                    inFlightItemCount: writer.inFlightBatch?.items.count ?? 0,
+                    retryPending: writer.retryTask != nil
+                )
+            }
+            let complete = debugManifestWriterAccountingComplete &&
+                debugManifestWriterTasks.count <= debugManifestWriterLiveTaskCount
+            return CodemapManifestWriterActivitySnapshot(
+                engineInstanceID: debugManifestWriterEngineID, rootEpoch: rootEpoch,
+                sampledUptimeNanoseconds: uptimeNanoseconds(), liveTaskCount: debugManifestWriterLiveTaskCount,
+                namespaceCount: manifestWriters.count, accountingComplete: complete,
+                quiescenceConfirmed: complete && debugManifestWriterLiveTaskCount == 0 && manifestWriters.isEmpty,
+                omittedLiveTaskCount: max(0, debugManifestWriterLiveTaskCount - debugManifestWriterTasks.count),
+                tasks: Array(debugManifestWriterTasks.values), namespaces: queues,
+                omittedNamespaceCount: manifestWriters.count - queues.count
             )
         }
 
@@ -5510,6 +5599,7 @@ actor WorkspaceCodemapBindingEngine {
         job.budget = budget
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         emit(
             .graphIndexBudget,
             rootEpoch: rootEpoch,
@@ -5600,7 +5690,7 @@ actor WorkspaceCodemapBindingEngine {
             job.workerRestartRequestedReason = nil
             let task = job.task
             graphIndexJobs[rootEpoch] = job
-            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+            publishGraphIndexExecutionState(rootEpoch: rootEpoch)
             graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
             // A cancellation-ignoring worker may still own mutation/publication work for an admitted batch.
             // Keep its admission and resources quarantined until finishGraphIndexWorker releases them.
@@ -5716,7 +5806,7 @@ actor WorkspaceCodemapBindingEngine {
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
         if terminalCompletionReconciledRecovery {
-            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+            publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         }
         #if DEBUG
             recordGraphIndexDebugEvent(
@@ -5807,7 +5897,7 @@ actor WorkspaceCodemapBindingEngine {
         cancelRunning: Bool = false
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
-        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         discardGraphIndexManifestStages(&job)
         graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
         if prioritizedGraphIndexRootEpoch == rootEpoch {
@@ -8524,6 +8614,9 @@ actor WorkspaceCodemapBindingEngine {
         guard !manifestPublicationDisabled, !isShuttingDown else { return }
         let writerID = UUID()
         state.writerID = writerID
+        #if DEBUG
+            debugManifestWriterStarted(writerID: writerID, namespace: namespace)
+        #endif
         state.task = Task {
             await self.runManifestWriter(namespace: namespace, writerID: writerID)
         }
@@ -8609,7 +8702,13 @@ actor WorkspaceCodemapBindingEngine {
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
     ) async {
+        #if DEBUG
+            defer { debugManifestWriterEnded(writerID: writerID) }
+        #endif
         while !Task.isCancelled {
+            #if DEBUG
+                debugManifestWriterPhase(writerID: writerID, phase: "checking_enabled")
+            #endif
             guard await manifestPublicationIsEnabled() else {
                 // The setting read suspends. A cancelled predecessor must not tear down an
                 // OFF-era replacement that now owns this namespace.
@@ -8642,6 +8741,9 @@ actor WorkspaceCodemapBindingEngine {
                     debugDeferredRetry = dequeued.isDeferredRetry
                 #endif
                 writer.inFlightBatch = batch
+                #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "validating", batch: batch)
+                #endif
                 manifestWriters[namespace] = writer
                 if dequeued.isDeferredRetry {
                     incrementCounter(\.manifestWriteRetries)
@@ -8760,6 +8862,9 @@ actor WorkspaceCodemapBindingEngine {
                     discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                     continue
                 }
+                #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "claiming_authority")
+                #endif
                 let claimedWriterAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
                     namespace: namespace,
                     authority: gitPipeline.authority,
@@ -8791,13 +8896,14 @@ actor WorkspaceCodemapBindingEngine {
                     await hooks.beforeManifestStoreWrite(scope.rootEpoch)
                 #endif
                 #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "awaiting_publication")
                     let debugContext = DebugManifestStoreAttemptContext(
                         rootEpoch: scope.rootEpoch,
                         proof: batch.proof,
                         deferredRetry: debugDeferredRetry,
                         mutationByteCount: debugMutationByteCount
                     )
-                    let result = try await Self.$debugManifestStoreAttemptContext.withValue(
+                    let result = try await Self.debugManifestStoreAttemptContextTaskLocal.withValue(
                         debugContext
                     ) {
                         try await mergeManifestChanges(
@@ -8820,6 +8926,7 @@ actor WorkspaceCodemapBindingEngine {
                     )
                 #endif
                 #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "completing")
                     manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
                     if case let .graphIndex(_, _, origin) = batch.proof {
                         switch origin {

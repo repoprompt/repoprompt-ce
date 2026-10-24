@@ -67,16 +67,35 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
     // MARK: - Repair
 
+    func testSurfaceEvidenceHandlesSameNameDowngradeWithdrawalAndUnknownWithoutPhantomReadiness() throws {
+        let fixture = try makeFixture()
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        let route = AgentSessionLinkRunCatalogRouteToken(runID: runID, observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
+        let full = Data("full definition".utf8)
+        let reduced = Data("reduced definition".utf8)
+        let absent = Data("[]".utf8)
+        for (expected, returned) in [(reduced, full), (absent, full), (full, absent)] {
+            let mismatch = AgentSessionLinkRunCatalogProjection(runID: runID, routeToken: route, projectionRevision: 2, hasAgentSessionLink: true, hasAnyActiveLink: false, hasActiveOutboundLink: false, expectedSurface: expected, returnedSurface: returned)
+            XCTAssertTrue(AgentSessionLinkCodexCatalogRepair.isStuckProjection(mismatch))
+            XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(mismatch))
+            XCTAssertFalse(mismatch.isReady)
+        }
+        let unknown = AgentSessionLinkRunCatalogProjection(runID: runID, routeToken: route, projectionRevision: 3, hasAgentSessionLink: true, hasAnyActiveLink: false, hasActiveOutboundLink: false, expectedSurface: full, returnedSurface: nil)
+        XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.isStuckProjection(unknown))
+        XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(unknown))
+    }
+
     /// The whole contract in one pass: an idle Codex observer behind a false/live-outbound catalog
-    /// cannot admit a wake, and one exact projection both retires the stale run and re-drives the
-    /// unchanged passive snapshot into the cold-bootstrap exception.
+    /// admits its wake independently of discovery; one exact projection still retires the idle
+    /// stale client while preserving the unchanged passive snapshot for a cold restart.
     func testExactFalseLiveOutboundProjectionRepairsIdleCodexAndColdBootstrapsSamePassiveSnapshot() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture)
         try publishLane(fixture, queueRevision: 7)
-        XCTAssertNil(
-            fixture.session.oversight.pendingAutoWake,
-            "an established run behind a false catalog must not be able to admit a wake"
+        XCTAssertEqual(
+            fixture.session.oversight.pendingAutoWake?.queueRevision, 7,
+            "catalog freshness does not gate wake admission"
         )
 
         let sourceGeneration = fixture.session.codexControllerGeneration
@@ -190,7 +209,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: false)
         XCTAssertEqual(fixture.session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
-        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.queueRevision, 9)
 
         // The one field that matters here: `clearCodexControllerInstanceState` nils `codexController`,
         // and with `preserveRunID: true` the run identity survives. The rest of that teardown

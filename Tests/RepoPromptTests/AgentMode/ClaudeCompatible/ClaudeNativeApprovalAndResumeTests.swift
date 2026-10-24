@@ -1,8 +1,261 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
+    func testCLIUsageConfigurationDoesNotDisableItsOwnStatusLine() throws {
+        let data = try ClaudeCLIUsageSource.collectionSettings(collector: "/fixture/collector --private-output")
+        let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(settings["disableAllHooks"], "This flag suppresses the status-line collector too; managed policy must not be overridden with false")
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        XCTAssertTrue(hooks.isEmpty)
+        let statusLine = try XCTUnwrap(settings["statusLine"] as? [String: String])
+        XCTAssertEqual(statusLine["type"], "command")
+        XCTAssertEqual(statusLine["command"], "/fixture/collector --private-output")
+    }
+
+    func testCLIUsageSetupIsExplicitAndDoesNotPinDefaultCredentialsOrSendInput() {
+        let root = URL(fileURLWithPath: "/fixture/helper's folder")
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/.claude"), isDefault: true)
+        let script = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: profile, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(script.contains("helper'\\''s folder"), "shell-quote paths containing apostrophes")
+        XCTAssertTrue(script.contains("'-u' 'CLAUDE_CONFIG_DIR'"))
+        XCTAssertFalse(script.contains("CLAUDE_CONFIG_DIR="), "default profile must retain Claude's normal Keychain/config identity")
+        XCTAssertTrue(script.contains("'--setting-sources' ''"))
+        XCTAssertTrue(script.contains("'--tools' ''"))
+        XCTAssertTrue(script.contains("'--strict-mcp-config'"))
+        XCTAssertFalse(script.contains("--dangerously-skip-permissions"))
+        XCTAssertFalse(script.contains("--print"))
+        XCTAssertTrue(script.contains("/exit or Ctrl-C twice"))
+        XCTAssertTrue(script.contains("Check usage after setup"))
+        XCTAssertFalse(script.contains("osascript"))
+        let custom = ClaudeUsageCredentialProfile(directory: root, isDefault: false)
+        let customScript = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: custom, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(customScript.contains("CLAUDE_CONFIG_DIR=/fixture/helper'\\''s folder"))
+    }
+
+    func testCLIUsageCommandAdmissionRequiresReadinessAndKeepsDeadlineAndFreshReceipt() throws {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let ready = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data("{}".utf8), now: date))
+        let reading = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date.addingTimeInterval(1)))
+        var state = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(state.next(record: nil, elapsed: 5, now: date), .wait, "never type into trust/login setup")
+        XCTAssertEqual(state.next(record: ready, elapsed: 6, now: date), .usage)
+        XCTAssertEqual(state.next(record: ready, elapsed: 7, now: date), .wait, "do not submit /usage twice")
+        XCTAssertEqual(state.next(record: ready, elapsed: 15, now: date), .wait, "slow usage fetch is not dismissed at 3 seconds")
+        XCTAssertEqual(state.next(record: ready, elapsed: 16, now: date), .escape)
+        XCTAssertEqual(state.next(record: ready, elapsed: 17, now: date), .wait, "escape is one-shot")
+        XCTAssertEqual(state.next(record: reading, elapsed: 18, now: date), .complete(reading))
+        var startup = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(startup.next(record: nil, elapsed: 30, now: date), .failed(.cliUnavailable))
+        var empty = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(empty.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(empty.next(record: ready, elapsed: 30, now: date), .failed(.invalidResponse))
+        var early = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(early.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(early.next(record: reading, elapsed: 1, now: date), .complete(reading), "accept JSON before Escape if CLI already reported it")
+        var stale = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(stale.next(record: reading, elapsed: 0, now: date.addingTimeInterval(2)), .usage)
+        XCTAssertEqual(stale.next(record: reading, elapsed: 1, now: date.addingTimeInterval(3)), .wait, "startup retained JSON is not a refreshed reading")
+    }
+
+    func testOnlyFirstPartyAgentsHaveAUsageTarget() {
+        XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .codexExec), .codex)
+        XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .claudeCode), .claude)
+        for agent in AgentProviderKind.allCases where agent != .codexExec && agent != .claudeCode {
+            XCTAssertNil(ProviderQuotaSettingsTarget(agent: agent), agent.rawValue)
+        }
+    }
+
+    func testCLIUsageRequiresConsentBeforeCollection() async {
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let source = ClaudeCLIUsageSource(profileProvider: { profile }, collect: { _, _ in
+            XCTFail("Collection without consent")
+            throw ProviderQuotaReadError.transport
+        }, consentProvider: { nil })
+        do {
+            _ = try await source.read(.init(userInitiated: true))
+            XCTFail("Read without consent")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+    }
+
+    func testCLIUsageWhitelistsStatisticsAndKeepsPercentUnitsAndUnknownAccount() throws {
+        let payload = Data(#"{"session_id":"secret-session","token":"secret-token","rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1900000300},"seven_day":{"used_percentage":23},"unexpected":{"used_percentage":99}}}"#.utf8)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload))
+        XCTAssertEqual(record.windows["five_hour"]?.used, 1)
+        XCTAssertEqual(record.windows.count, 2)
+        let encoded = try JSONEncoder().encode(record)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("secret"))
+        let snapshot = record.snapshot(profileID: "profile")
+        XCTAssertFalse(snapshot.accountKey.isIdentified)
+        XCTAssertEqual(snapshot.source, .claudeCLIUsage)
+        XCTAssertEqual(snapshot.coverage, .accountWideAggregateOnly)
+        XCTAssertNil(snapshot.buckets.first?.planType)
+    }
+
+    private func cliPlanUsageSnapshot(observedAt date: Date) throws -> ProviderQuotaSnapshot {
+        let payload = Data(#"{"rate_limits":{"five_hour":{"used_percentage":6,"resets_at":1900010000},"seven_day":{"used_percentage":5,"resets_at":1900300000}}}"#.utf8)
+        return try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload, now: date)).snapshot(profileID: "profile")
+    }
+
+    func testCLIUsageSnapshotDeclaresPlanWindowDurationsAndFriendlyTitles() throws {
+        let snapshot = try cliPlanUsageSnapshot(observedAt: Date(timeIntervalSince1970: 1_900_000_000))
+        let windows = try XCTUnwrap(snapshot.buckets.first?.windows)
+        XCTAssertEqual(windows.map(\.nativeRole), ["five_hour", "seven_day"])
+        XCTAssertEqual(windows.map(\.windowDuration), [18000, 604_800])
+        XCTAssertEqual(windows.map(ProviderQuotaPresenter.windowTitle(for:)), ["5-hour limit", "Weekly limit"], "raw role names must not leak into Settings rows")
+    }
+
+    func testCLIUsageIndicatorStaysVisibleBeyondDefaultStaleHorizon() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let hourOld = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(60 * 60)), "an hour-old 5-hour reading is within 25% of its window")
+        XCTAssertEqual(hourOld.usedPercent, 5, "the weekly window remains the primary figure")
+        XCTAssertEqual(hourOld.shortWindowPercent, 6, "the hour-old 5-hour reading remains visible as the secondary figure")
+        let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
+        XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
+        XCTAssertEqual(pastFiveHourHorizon.freshness, .fresh)
+        let everythingAged = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(43 * 3600)), "aged readings stay visible")
+        XCTAssertEqual(everythingAged.usedPercent, 5, "the aged weekly reading stays primary")
+        XCTAssertEqual(everythingAged.shortWindowPercent, 6, "the aged 5-hour reading also stays visible")
+        XCTAssertEqual(everythingAged.freshness, .resetPassed, "the 5-hour reset has passed with nothing newer")
+    }
+
+    func testCLIUsageWeeklyReadingInformsBalancingWithinSixHours() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let recent = ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(40 * 60))
+        XCTAssertTrue(recent.known)
+        XCTAssertNotNil(recent.weeklySparePace)
+        XCTAssertEqual(recent.weeklyHeadroom, 95)
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(6 * 3600 + 1)).known, "weekly routing evidence is capped at six hours")
+    }
+
+    func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {
+        for raw in [
+            #"{"rate_limits":{"five_hour":{"used_percentage":true}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":-1}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":101}}}"#,
+            #"{"rate_limits":{"five_hour":{"resets_at":1900000300}}}"#
+        ] {
+            XCTAssertTrue(try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(raw.utf8))).windows.isEmpty)
+        }
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data(repeating: 32, count: 65537)))
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data("invalid".utf8)))
+    }
+
+    func testCLIUsageCacheIsPrivateProfileScopedAndRetainsObservationDate() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = ClaudeCLIUsageCache(root: root)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date))
+        try cache.save(record, profileID: "profile-a")
+        XCTAssertEqual(cache.load(profileID: "profile-a")?.receivedAt, date)
+        XCTAssertNil(cache.load(profileID: "profile-b"))
+        let mode = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("cache.json").path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: root.appendingPathComponent("cache.json").path)
+        XCTAssertNil(cache.load(profileID: "profile-a"))
+    }
+
+    func testCLIUsageProfileChangeOrCancellationNeverCachesReading() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile-a"), isDefault: false)
+        let profiles = UsageProfileFixture(profile)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let source = ClaudeCLIUsageSource(root: root, profileProvider: { profiles.current() }, collect: { _, _ in
+            profiles.replace(.init(directory: URL(fileURLWithPath: "/fixture/profile-b"), isDefault: false))
+            return record
+        }, consentProvider: { profile.id })
+        do { _ = try await source.read(.init(userInitiated: true))
+            XCTFail("Adopted changed profile")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+        let cancelled = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in throw CancellationError() }, consentProvider: { profile.id })
+        do { _ = try await cancelled.read(.init(userInitiated: true))
+            XCTFail("Ignored cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+    }
+
+    func testCLIUsagePersistsAndHydratesWithoutAnotherCollection() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let first = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in record }, consentProvider: { profile.id })
+        let value = try await first.read(.init(userInitiated: true))
+        let restarted = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in XCTFail("Hydration launches CLI")
+            return record
+        }, consentProvider: { profile.id })
+        let cached = await restarted.cachedSnapshot()
+        XCTAssertEqual(cached, value)
+        await restarted.clearCache()
+        let cleared = await restarted.cachedSnapshot()
+        XCTAssertNil(cleared)
+    }
+
+    func testCLIUsageDisclosureExplainsMethodAndUncertaintyWithoutCredentialAccess() {
+        let copy = ProviderUsageSectionConfiguration.claudeConsent.message
+        XCTAssertTrue(copy.contains("/usage"))
+        XCTAssertTrue(copy.contains("does not read login tokens"))
+        XCTAssertTrue(copy.contains("One-time setup opens Claude Code in Terminal"))
+        XCTAssertTrue(copy.contains("Check usage after setup"))
+        XCTAssertTrue(ProviderUsageSectionConfiguration.claudeConsent.confirmTitle.contains("open setup"))
+        XCTAssertTrue(copy.contains("has not explicitly approved automated usage monitoring"))
+        XCTAssertFalse(copy.lowercased().contains("ban"))
+    }
+
+    private final class UsageProfileFixture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: ClaudeUsageCredentialProfile
+        init(_ value: ClaudeUsageCredentialProfile) {
+            self.value = value
+        }
+
+        func current() -> ClaudeUsageCredentialProfile {
+            lock.withLock { value }
+        }
+
+        func replace(_ value: ClaudeUsageCredentialProfile) {
+            lock.withLock { self.value = value }
+        }
+    }
+
+    func testNativeControllerPreservesAllowedTelemetryOutsideTranscript() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
+            config: .discovery(commandName: "/usr/bin/false")
+        )
+        await controller.ensureEventsStreamReady()
+        let stream = await controller.events
+        let wire = #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1900000300}}"# + "\n"
+        await controller.test_handleConfigurationStdoutChunk(Data(wire.utf8))
+        await controller.shutdown()
+        var received: [ClaudeCompatiblePluginRateLimitInfo] = []
+        for await event in stream {
+            switch event {
+            case let .rateLimit(info): received.append(info)
+            case .stream: XCTFail("Routine allowed telemetry must not clutter the transcript")
+            default: break
+            }
+        }
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.status, .allowed)
+        XCTAssertNil(received.first?.utilization)
+        if let info = received.first {
+            let observation = ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info)
+            XCTAssertEqual(observation.status, .allowed)
+            XCTAssertEqual(observation.resetsAt, 1_900_000_300)
+            XCTAssertNil(observation.utilization)
+        }
+    }
+
     enum ResolverError: Error {
         case unsupportedModel
     }
@@ -201,7 +454,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             if request["subtype"] as? String == "apply_flag_settings" { controls.append(Data()) }
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "first ordinary turn", attachments: [], intent: intent,
@@ -382,7 +635,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     private func ordinaryTurnFixture(
         controller: ClaudeNativeProcessSessionController,
         replacement: ClaudeNativeProcessSessionController? = nil
-    ) -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
+    ) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         var creations = 0
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
@@ -391,13 +644,18 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 creations += 1
                 return creations == 1 ? controller : (replacement ?? controller)
             },
-            autoEffortEnabledProvider: { true }
+            autoEffortConfigurationProvider: { .init(enabled: true, selectedBackendRawValue: nil, revision: 0) }
         )
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-opus-5-5:high"
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The restored conversation must be ready before exercising native configuration."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -414,7 +672,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             await controller.test_installConfigurationTransport(
                 initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
             )
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
                 await coordinator.sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
@@ -444,7 +702,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         await controller.test_installConfigurationTransport(
             initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
         )
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
@@ -464,14 +722,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testOrdinaryApplicationFailurePreservesIdentityAndDoesNotPrompt() async {
+    func testOrdinaryApplicationFailurePreservesIdentityAndDoesNotPrompt() async throws {
         for failure in [NativeAgentRuntimeControllerError.invalidControlResponse("rejected")] {
             let controller = applicationController()
             let writes = WrittenLines()
             await controller.test_installConfigurationTransport(
                 initialized: true, controlRequest: { _ in throw failure }, write: { writes.append($0) }
             )
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let outcome = await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
@@ -484,7 +742,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testComposerModelSwitchRequiringRestartDeliversWithoutRetry() async {
+    func testComposerModelSwitchRequiringRestartDeliversWithoutRetry() async throws {
         let controller = applicationController()
         let replacement = applicationController()
         let writes = WrittenLines()
@@ -492,7 +750,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             throw NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart
         }, write: { writes.append($0) })
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
         let ready = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
         XCTAssertEqual(ready, .ready)
         session.selectedModelRaw = "claude-sonnet-4-6:high"
@@ -519,20 +777,20 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testOptionalAutoFailureReestablishesSameModelManualProofBeforePrompt() async {
+    func testOptionalAutoFailureReestablishesSameModelManualProofBeforePrompt() async throws {
         let controller = applicationController()
         let requests = EffortRequests()
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(
             initialized: true, controlRequest: { try await requests.respond($0) }, write: { writes.append($0) }
         )
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let outcome = await coordinator.sendClaudeNativeMessage(
             session: session, text: "ordinary", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
                 provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                manualEffortRaw: "high", effortRaw: "low"
+                manualEffortRaw: "high", effortRaw: "low", backendID: .jev, autoEffortRevision: 0
             )
         )
         XCTAssertEqual(outcome, .sent)
@@ -561,7 +819,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 if !isPreWriteRefusal { throw NativeAgentRuntimeControllerError.inputWriteFailed("uncertain write") }
             })
             await controller.test_setBeforeConfigurationSend { _ = await gate.respond() }
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             var notAttempted = 0
             var failed = 0
             var accepted = 0
@@ -575,7 +833,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 acceptAgentSessionLinkPromptClaim: { _, _, _ in accepted += 1 }
             ), providerBindingService: AgentModeProviderBindingService())
             var state = session.selfCompactState
-            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race")
+            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             else { return XCTFail("Expected parked note reservation") }
             let noteID = noteAttempt.id
             state.active?.phase = .parked
@@ -647,7 +905,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 }
                 return [:]
             }, write: { writes.append($0) })
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
                 await coordinator.sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
@@ -656,7 +914,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                         provider: .claudeCode,
                         selectedModelRaw: session.selectedModelRaw,
                         manualEffortRaw: "high",
-                        effortRaw: "low"
+                        effortRaw: "low", backendID: .jev, autoEffortRevision: 0
                     )
                 )
             }
@@ -686,7 +944,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         )
         let replacement = applicationController()
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
@@ -802,18 +1060,314 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         )
         XCTAssertEqual((allowForSession["updatedPermissions"] as? [[String: Any]])?.first?["name"] as? String, "mcp__RepoPromptCE__read_file")
 
-        let nestedMatch = try XCTUnwrap(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        // A RepoPrompt permission suggestion must not authorize a different actual invocation.
+        XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
             toolName: "Bash",
             requestPayload: [
                 "permission_suggestions": [["rules": [["toolName": "mcp__RepoPromptCE__read_file"]]]]
             ]
         ))
-        XCTAssertEqual(nestedMatch.source, .nestedToolName)
-        XCTAssertEqual(nestedMatch.normalizedToolName, "read_file")
+
+        for (tool, operation) in [
+            ("agent_session_link", "list"),
+            ("self_compact", "context"),
+            ("manage_worktree", "list")
+        ] {
+            let toolUseID = "toolu_\(tool)"
+            let qualifiedTool = "mcp__RepoPromptCE__\(tool)"
+            let payload: [String: Any] = [
+                "tool_name": qualifiedTool,
+                "tool_use_id": toolUseID,
+                "input": ["op": operation]
+            ]
+            XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+                toolName: tool,
+                requestPayload: ["tool_name": tool, "input": ["op": operation]]
+            ), "bare top-level name without provenance: \(tool)")
+            let match = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+                toolName: qualifiedTool,
+                requestPayload: payload
+            )
+            XCTAssertEqual(match?.source, .topLevelToolName, tool)
+            XCTAssertEqual(match?.normalizedToolName, tool, tool)
+
+            let response = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
+                pendingRequest: payload,
+                includeUpdatedPermissions: false
+            )
+            XCTAssertEqual(response["behavior"] as? String, "allow", tool)
+            XCTAssertEqual(response["toolUseID"] as? String, toolUseID, tool)
+            XCTAssertEqual((response["updatedInput"] as? [String: Any])?["op"] as? String, operation, tool)
+            XCTAssertNil(response["updatedPermissions"], tool)
+        }
+
+        let metadataMatch = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+            toolName: "",
+            requestPayload: ["server_name": "RepoPromptCE"]
+        )
+        XCTAssertEqual(metadataMatch?.source, .serverIdentifier)
+        XCTAssertEqual(metadataMatch?.serverIdentifier, "RepoPromptCE")
+        XCTAssertNil(metadataMatch?.normalizedToolName)
 
         XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
             toolName: "Bash",
             requestPayload: ["input": ["command": "rm -rf /tmp/example"]]
         ))
+    }
+
+    /// Issue #1243: a bare RepoPrompt tool name in request metadata must not auto-approve a
+    /// request that another MCP server owns. Codex elicitation/permission auto-accept uses the
+    /// same matcher with `requestToolName: nil`, so a nil match means Codex does not auto-accept.
+    func testRepoPromptPermissionAutoApprovalRequiresRepoPromptProvenance() {
+        let toolNames = MCPDomainToolCatalog.orderedToolNames
+        XCTAssertTrue(toolNames.contains("manage_worktree"))
+        XCTAssertTrue(toolNames.contains("agent_session_link"))
+        XCTAssertTrue(toolNames.contains("self_compact"))
+
+        for tool in toolNames {
+            let foreignPayloads: [[String: Any]] = [
+                ["serverName": "OtherServer", "request": ["_meta": ["tool_title": tool]]],
+                ["server_name": "OtherServer", "name": tool],
+                ["request": ["_meta": ["connector_name": "OtherServer", "tool_title": tool]]],
+                ["serverName": "OtherServer", "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__\(tool)"]]],
+                ["serverName": "OtherServer", "tool_name": tool]
+            ]
+            for payload in foreignPayloads {
+                XCTAssertNil(
+                    MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: payload),
+                    "foreign server payload must not match: \(tool) \(payload)"
+                )
+                XCTAssertNil(
+                    MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: tool, requestPayload: payload),
+                    "foreign server payload must not match with top-level name: \(tool)"
+                )
+            }
+
+            // Bare nested names without any server provenance do not auto-approve.
+            XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_title": tool]]]
+            ), tool)
+            // Free-text descriptions are not tool-name candidates.
+            XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_description": "mcp__RepoPromptCE__\(tool)"]]]
+            ), tool)
+
+            // Positive controls: RepoPrompt server identifier or a server-prefixed name.
+            let serverMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["serverName": "RepoPromptCE", "request": ["_meta": ["tool_title": tool]]]
+            )
+            XCTAssertEqual(serverMatch?.source, .nestedToolName, tool)
+            XCTAssertEqual(serverMatch?.normalizedToolName, tool, tool)
+
+            let connectorMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["connector_name": "RepoPromptCE", "tool_title": tool]]]
+            )
+            XCTAssertEqual(connectorMatch?.normalizedToolName, tool, tool)
+
+            let prefixedMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_title": "mcp__RepoPromptCE__\(tool)"]]]
+            )
+            XCTAssertEqual(prefixedMatch?.source, .nestedToolName, tool)
+
+            let grokMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["serverName": "RepoPromptCEGrokRuntime", "name": tool]
+            )
+            XCTAssertNotNil(grokMatch, tool)
+
+            // Look-alike server names that merely contain the RepoPrompt server name are foreign.
+            for lookAlike in ["NotRepoPromptCE", "RepoPromptCE-evil", "evil.repopromptce", "RepoPromptCEX"] {
+                XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                    requestToolName: nil,
+                    requestPayload: ["serverName": lookAlike, "request": ["_meta": ["tool_title": tool]]]
+                ), "\(lookAlike) \(tool)")
+            }
+        }
+
+        XCTAssertTrue(MCPIntegrationHelper.isRepoPromptServerIdentifier(" repopromptce "))
+        XCTAssertTrue(MCPIntegrationHelper.isRepoPromptServerIdentifier("RepoPromptCEGrokRuntime"))
+        XCTAssertFalse(MCPIntegrationHelper.isRepoPromptServerIdentifier("NotRepoPromptCE"))
+        XCTAssertFalse(MCPIntegrationHelper.isRepoPromptServerIdentifier("RepoPromptCE MCP Server"))
+    }
+
+    /// Issue #1243 review follow-ups: display labels, permission suggestions, foreign qualified
+    /// actual tool names, and server-field aliases must not grant RepoPrompt provenance.
+    func testRepoPromptPermissionAutoApprovalRejectsLabelAndSuggestionProvenance() {
+        func match(_ toolName: String?, _ payload: [String: Any]) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
+            MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: toolName, requestPayload: payload)
+        }
+
+        // Unanchored / look-alike labels.
+        for title in [
+            "RepoPromptCE-evil: git",
+            "RepoPromptCE anything: manage_worktree",
+            "Other RepoPromptCE MCP Server: git",
+            "Unrelated operation (RepoPromptCE MCP Server)",
+            "printf '(RepoPromptCE MCP Server)'"
+        ] {
+            XCTAssertNil(match(title, ["toolCall": ["title": title, "kind": "execute"], "title": title]), title)
+        }
+
+        // Anchored labels naming a catalog tool still match.
+        XCTAssertEqual(match("read_file (RepoPromptCE MCP Server)", [:])?.normalizedToolName, "read_file")
+        XCTAssertEqual(match("RepoPromptCE: git", [:])?.normalizedToolName, "git")
+        XCTAssertEqual(match("RepoPromptCE MCP Server: git", [:])?.normalizedToolName, "git")
+
+        // Foreign qualified actual tool cannot borrow a RepoPrompt suggestion or nested name.
+        XCTAssertNil(match("mcp__OtherServer__delete_files", [
+            "tool_name": "mcp__OtherServer__delete_files",
+            "permission_suggestions": [["rules": [["toolName": "mcp__RepoPromptCE__git"]]]]
+        ]))
+        XCTAssertNil(match("mcp__OtherServer__delete_files", [
+            "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]
+        ]))
+        XCTAssertNil(match(nil, [
+            "name": "mcp__OtherServer__git",
+            "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]
+        ]))
+
+        // Server-field aliases recognized by the Codex parser also veto.
+        for key in ["mcpServerName", "mcp_server_name"] {
+            XCTAssertNil(match(nil, [key: "OtherServer", "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]]), key)
+            XCTAssertNil(match(nil, ["request": [key: "OtherServer", "_meta": ["tool_title": "mcp__RepoPromptCE__git"]]]), key)
+            XCTAssertNotNil(match(nil, [key: "RepoPromptCE", "request": ["_meta": ["tool_title": "git"]]]), key)
+        }
+    }
+
+    func testCodexMCPElicitationAutoAcceptRequiresRepoPromptProvenance() {
+        // Reported shape and flattened upstream shape from a foreign server.
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "OtherServer",
+            "request": ["_meta": ["tool_title": "manage_worktree"]]
+        ]))
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "OtherServer",
+            "_meta": ["tool_title": "git"],
+            "message": "Allow git?"
+        ]))
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "request": ["_meta": ["tool_title": "git"]]
+        ]))
+        // Genuine RepoPrompt elicitation still auto-accepts.
+        XCTAssertTrue(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "RepoPromptCE",
+            "request": ["_meta": ["tool_title": "manage_worktree"]]
+        ]))
+        XCTAssertTrue(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "RepoPromptCE",
+            "message": "Approve?"
+        ]))
+    }
+}
+
+@MainActor
+final class ClaudeUsageSetupTests: XCTestCase {
+    func testProductionConnectAndSetupActionAcceptPendingConsentButCollectionDoesNot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ClaudeUsageSetupTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        var source: ClaudeCLIUsageSource?
+        let runtime = ProviderQuotaRuntime(
+            accountIDProvider: { nil },
+            managedAuthTransitions: { AsyncStream { $0.finish() } },
+            settingsStore: settings,
+            claudeSourceFactory: { readConsent, setupConsent in
+                let value = ClaudeCLIUsageSource(root: root.appendingPathComponent("usage"), collect: { _, _ in
+                    try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+                }, consentProvider: readConsent, setupConsentProvider: setupConsent, setupCommandProvider: { "/usr/bin/false" })
+                source = value
+                return value
+            }
+        )
+        let action = ClaudeUsageSetupAction()
+        // These are the production Connect confirmation and Open Terminal action, not a
+        // hand-built ready grant. Before this fix the latter failed with needsConsent.
+        runtime.connectClaudeUsage(startReading: false)
+        let grant = try XCTUnwrap(settings.claudeCLIUsageGrant())
+        XCTAssertFalse(grant.isReady)
+        var launched: URL?
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { launched = $0 })
+        XCTAssertNil(action.error)
+        let script = try XCTUnwrap(launched)
+        XCTAssertEqual(action.script, script)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: script.path))
+        XCTAssertTrue(try String(contentsOf: script, encoding: .utf8).contains("'--tools' ''"))
+        XCTAssertEqual(settings.claudeCLIUsageGrant(), grant, "Opening setup cannot mark consent ready")
+        let connectedSource = try XCTUnwrap(source)
+        do {
+            _ = try await connectedSource.read(.init(userInitiated: true))
+            XCTFail("Pending setup authorized collection")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+        try await runtime.completeClaudeUsageSetup()
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.grantedAt, grant.grantedAt)
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.isReady, true)
+        let reading = try await connectedSource.read(.init(userInitiated: true))
+        XCTAssertFalse(reading.buckets.isEmpty)
+        runtime.disconnectClaudeUsage()
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { _ in XCTFail("Revoked consent opened Terminal") })
+        XCTAssertNotNil(action.error)
+        XCTAssertNil(action.manualCommand, "Do not retain a runnable command after revocation")
+    }
+
+    func testTerminalFailureRetainsCopyableQuotedManualCommandAndSuccessClearsError() async throws {
+        let action = ClaudeUsageSetupAction()
+        let script = URL(fileURLWithPath: "/fixture/helper's folder/Set up Claude usage.command")
+        await action.open(prepare: { script }, launch: { _ in throw NSError(domain: "Terminal", code: 42, userInfo: [NSLocalizedDescriptionKey: "Automation denied"]) })
+        XCTAssertTrue(try XCTUnwrap(action.error).contains("Automation denied"))
+        XCTAssertEqual(action.manualCommand, "/bin/zsh '/fixture/helper'\\''s folder/Set up Claude usage.command'")
+        await action.open(prepare: { script }, launch: { XCTAssertEqual($0, script) })
+        XCTAssertNil(action.error)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testPreparationFailureNeverLaunchesOrOffersStaleCommand() async {
+        let action = ClaudeUsageSetupAction()
+        action.script = URL(fileURLWithPath: "/stale/setup.command")
+        await action.open(prepare: { throw ProviderQuotaReadError.needsConsent }, launch: { _ in XCTFail("No authorized setup script") })
+        XCTAssertNil(action.manualCommand)
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testMissingCLIProvidesPreparationFailureWithoutLaunching() async {
+        let profile = ClaudeUsageCredentialProfile.current()
+        let source = ClaudeCLIUsageSource(consentProvider: { nil }, setupConsentProvider: { profile.id }, setupCommandProvider: { "not-an-executable" })
+        do {
+            _ = try await source.prepareSetup()
+            XCTFail("Missing CLI accepted")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .cliUnavailable) }
+    }
+
+    func testSetupRevalidatesConsentAfterPreparingFiles() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile.current()
+        let consent = OneUseSetupConsent(profileID: profile.id)
+        let source = ClaudeCLIUsageSource(root: root, consentProvider: { nil }, setupConsentProvider: { await consent.next() }, setupCommandProvider: { "/usr/bin/false" })
+        let action = ClaudeUsageSetupAction()
+        await action.open(prepare: { try await source.prepareSetup() }, launch: { _ in XCTFail("Revoked consent launched setup") })
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertNil(action.manualCommand)
+    }
+
+    private actor OneUseSetupConsent {
+        let profileID: String
+        var calls = 0
+        init(profileID: String) {
+            self.profileID = profileID
+        }
+
+        func next() -> String? {
+            calls += 1
+            return calls == 1 ? profileID : nil
+        }
     }
 }

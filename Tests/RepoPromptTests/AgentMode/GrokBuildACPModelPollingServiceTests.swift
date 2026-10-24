@@ -14,6 +14,17 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testControllerDiscoveryReusesVerifiedSessionAcrossWorkspacesInNeutralDirectory() async throws {
+        let agentModeProvider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild, modelString: nil, grokAPIKeyProvider: { nil }
+        )
+        let agentModeEnvironment = try XCTUnwrap(agentModeProvider as? GrokBuildACPAgentProvider)
+            .test_config.backgroundFeatureEnvironment
+        let contextBuilderEnvironment = try XCTUnwrap(
+            AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild) as? GrokBuildACPHeadlessAgentProvider
+        ).test_config.backgroundFeatureEnvironment
+        let managedEnvironment = [
+            "GROK_MEMORY": "0", "GROK_SUBAGENTS": "0", "GROK_WORKFLOWS": "0", "GROK_AUTO_WAKE": "0"
+        ]
         let neutralPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
             .standardizedFileURL.path
@@ -39,6 +50,13 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
             providerFactory: { config in
                 XCTAssertFalse(config.includeRepoPromptMCPServer)
                 XCTAssertNil(config.apiKey)
+                for (usage, environment, expected) in [
+                    ("Agent Mode", agentModeEnvironment, managedEnvironment),
+                    ("model polling", config.backgroundFeatureEnvironment, managedEnvironment),
+                    ("Context Builder", contextBuilderEnvironment, managedEnvironment)
+                ] {
+                    XCTAssertEqual(environment, expected, "Background-feature policy for \(usage)")
+                }
                 return fixtureProvider
             },
             controllerFactory: { provider, request in
@@ -121,11 +139,32 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
             client: StubDiscoveryClient(models: nil, failure: AIProviderError.invalidConfiguration(detail: "boom"))
         )
         let refreshed = await failing.refreshNow(workspacePath: nil)
-        XCTAssertFalse(refreshed)
+        XCTAssertEqual(refreshed, .failed)
         let latest = await failing.latestSnapshot()
         XCTAssertEqual(latest?.models.options.map(\.rawValue), ["grok-4.6"])
         XCTAssertEqual(latest?.isLiveDiscovery, false)
         await failing.shutdown()
+    }
+
+    func testRefreshOutcomesDistinguishUpdatedUnchangedAndNoModels() async {
+        let service = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
+        )
+        let first = await service.refreshNow(workspacePath: nil)
+        let second = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(first, .updated)
+        XCTAssertEqual(second, .unchanged)
+        await service.shutdown()
+
+        let empty = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(
+                models: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil),
+                failure: nil
+            )
+        )
+        let emptyOutcome = await empty.refreshNow(workspacePath: nil)
+        XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
+        await empty.shutdown()
     }
 
     func testEmptyDiscoveryDoesNotPersistFakeDefaultSnapshot() async throws {
@@ -164,5 +203,56 @@ final class GrokBuildAgentToolPreferencesTests: XCTestCase {
         XCTAssertEqual(document.permissionLevel(), .fullAccess)
         let failClosed = SecureGrokBuildPermissionDocument.failClosedDocument()
         XCTAssertEqual(failClosed.permissionLevel(), .managedDefault)
+    }
+}
+
+final class GrokBuildPermissionDisclosureTests: XCTestCase {
+    func testDisclosureFollowsEffectivePermissionLevel() throws {
+        let suiteName = "GrokBuildPermissionDisclosureTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let defaultDetail = GrokBuildAgentToolPreferences.PermissionLevel.managedDefault.detailText
+        for fragment in [
+            "defaultMode",
+            "can allow",
+            "without asking RepoPrompt",
+            "many requests (`bypassPermissions`)",
+            "edit tools such as `write` (`acceptEdits`)"
+        ] {
+            XCTAssertTrue(defaultDetail.contains(fragment), "Default detail must disclose \(fragment)")
+        }
+
+        let cases: [(
+            name: String,
+            profile: AgentProviderPermissionProfile,
+            storedLevel: GrokBuildAgentToolPreferences.PermissionLevel,
+            expectsDefault: Bool
+        )] = [
+            ("Direct Default", .userConfigured, .managedDefault, true),
+            ("Safe Managed with stored Full Access", .mcpSafeDefaults, .fullAccess, true),
+            ("Direct Full Access", .userConfigured, .fullAccess, false)
+        ]
+        let builder = AgentPermissionCapabilitySummaryBuilder(defaults: defaults)
+        let availability = AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        for testCase in cases {
+            GrokBuildAgentToolPreferences.setPermissionLevel(testCase.storedLevel, defaults: defaults)
+            let summary = builder.summary(for: .grokBuild, profile: testCase.profile, availability: availability)
+            if testCase.expectsDefault {
+                XCTAssertEqual(
+                    summary.fileMutation,
+                    "Always-approve launch: off; Grok's rules can still allow requests",
+                    testCase.name
+                )
+                XCTAssertTrue(summary.warnings.isEmpty, testCase.name)
+            } else {
+                XCTAssertEqual(summary.fileMutation, "Always-approve launch: on", testCase.name)
+                XCTAssertEqual(
+                    summary.warnings,
+                    ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."],
+                    testCase.name
+                )
+            }
+        }
     }
 }

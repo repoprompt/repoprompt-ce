@@ -3,6 +3,7 @@ import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -194,6 +195,107 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async {
                 DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+    }
+}
+
+@MainActor
+final class StableMenuRowOwnershipTests: XCTestCase {
+    private final class Rows: ObservableObject {
+        @Published var order = ["A", "B", "C", "D"]
+        var frames: [String: CGRect] = [:]
+        var resolved: [String] = []
+    }
+
+    private struct RowFrames: PreferenceKey {
+        static let defaultValue: [String: CGRect] = [:]
+        static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+            value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+        }
+    }
+
+    private struct RowList: View {
+        @ObservedObject var rows: Rows
+
+        var body: some View {
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(rows.order, id: \.self) { id in
+                        HStack {
+                            Text(id)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .background {
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: RowFrames.self,
+                                    value: [id: proxy.frame(in: .named("menuRows"))]
+                                )
+                            }
+                        }
+                        .overlay {
+                            StableMenuContextRegion(anchor: StableMenuAnchor()) {
+                                rows.resolved.append(id)
+                                // Empty items expose every accepting region without native tracking.
+                                return []
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+            .coordinateSpace(name: "menuRows")
+            .onPreferenceChange(RowFrames.self) { rows.frames = $0 }
+        }
+    }
+
+    func testContextClickResolvesOnlyClickedRowBeforeAndAfterReorder() throws {
+        _ = NSApplication.shared
+        let rows = Rows()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 220),
+            styleMask: .borderless, backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: RowList(rows: rows))
+        window.contentView = host
+        defer { window.close() }
+
+        for order in [["A", "B", "C", "D"], ["D", "C", "B", "A"]] {
+            rows.order = order
+            host.layoutSubtreeIfNeeded()
+            let deadline = Date().addingTimeInterval(2)
+            func layoutMatches() -> Bool {
+                rows.frames.count == order.count
+                    && rows.frames.sorted { $0.value.minY < $1.value.minY }.map(\.key) == order
+            }
+            while !layoutMatches(), Date() < deadline {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+                host.layoutSubtreeIfNeeded()
+            }
+            XCTAssertTrue(layoutMatches(), "Displayed row geometry must settle before clicking")
+            for id in order {
+                let frame = try XCTUnwrap(rows.frames[id])
+                XCTAssertGreaterThan(frame.height, 0)
+                let point = host.convert(NSPoint(x: frame.midX, y: frame.midY), to: nil)
+                for (type, flags) in [
+                    (NSEvent.EventType.rightMouseDown, NSEvent.ModifierFlags()),
+                    (.leftMouseDown, .control)
+                ] {
+                    rows.resolved = []
+                    let event = try XCTUnwrap(NSEvent.mouseEvent(
+                        with: type, location: point, modifierFlags: flags,
+                        timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        eventNumber: 0, clickCount: 1, pressure: 0
+                    ))
+                    NSApp.sendEvent(event)
+                    XCTAssertEqual(rows.resolved, [id], "Click on \(id) must not resolve another row (order \(order), \(type))")
+                }
             }
         }
     }

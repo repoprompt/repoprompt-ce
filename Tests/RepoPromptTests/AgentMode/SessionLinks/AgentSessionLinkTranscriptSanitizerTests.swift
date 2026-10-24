@@ -314,6 +314,8 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
             "Forward cursor progress is what stops an oversized row from stalling the reader"
         )
         XCTAssertTrue(page.hasMore)
+        XCTAssertEqual(text.utf8.count, 256)
+        XCTAssertTrue(text.hasSuffix(AgentSessionLinkTranscriptBudget.clippedRowMarker))
     }
 
     /// A row that fits must never be clipped, and the whole page stays inside the budget.
@@ -367,7 +369,10 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
             homeDirectory: home
         )
         let first = try XCTUnwrap(page.items.first)
-        XCTAssertEqual(first.text, AgentSessionLinkTranscriptBudget.oversizedTextMarker)
+        XCTAssertEqual(
+            first.text,
+            AgentSessionLinkTranscriptBudget.oversizedTextMarker + AgentSessionLinkTranscriptBudget.clippedRowMarker
+        )
         XCTAssertEqual(
             page.nextAnchor?.itemID,
             first.itemID,
@@ -375,6 +380,190 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
         )
         XCTAssertTrue(page.truncated)
         XCTAssertTrue(page.hasMore)
+    }
+
+    func testLongNarrativeUsesPageBudgetAndCanBeRereadWhole() throws {
+        let text = String(repeating: "x", count: 10000)
+        let row = AgentChatItem.assistant(text, sequenceIndex: 0)
+        for direction in AgentSessionLinkReadDirectionInput.allCases {
+            let clipped = AgentSessionLinkTranscriptSanitizer.page(
+                rows: [row], anchor: nil, direction: direction, maxItems: 1,
+                maxOutputBytes: 8000, homeDirectory: home
+            )
+            let item = try XCTUnwrap(clipped.items.first)
+            let returned = try XCTUnwrap(item.text)
+            let marker = AgentSessionLinkTranscriptBudget.clippedRowMarker
+            XCTAssertEqual(returned, String(text.prefix(8000 - 256 - item.nonTextUTF8Cost - marker.utf8.count)) + marker)
+            XCTAssertEqual(clipped.outputUTF8Bytes, 8000)
+            XCTAssertTrue(clipped.truncated)
+            XCTAssertFalse(clipped.hasMore)
+            XCTAssertEqual(clipped.nextAnchor?.itemID, row.id.uuidString)
+
+            let whole = AgentSessionLinkTranscriptSanitizer.page(
+                rows: [row], anchor: nil, direction: direction, maxItems: 1,
+                maxOutputBytes: 20000, homeDirectory: home
+            )
+            XCTAssertEqual(whole.items.first?.text, text)
+            XCTAssertFalse(whole.truncated)
+            XCTAssertFalse(whole.hasMore)
+        }
+    }
+
+    func testMaximumBudgetClippingDoesNotSuggestAnImpossibleRetry() throws {
+        let text = String(repeating: "x", count: 20000)
+        let row = AgentChatItem.assistant(text, sequenceIndex: 0)
+        for direction in AgentSessionLinkReadDirectionInput.allCases {
+            let page = AgentSessionLinkTranscriptSanitizer.page(
+                rows: [row], anchor: nil, direction: direction, maxItems: 1,
+                maxOutputBytes: AgentSessionLinkTranscriptBudget.clampedMaxOutputBytes(30000),
+                homeDirectory: home
+            )
+            let returned = try XCTUnwrap(page.items.first?.text)
+            let marker = AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker
+            XCTAssertTrue(returned.hasSuffix(marker))
+            let item = try XCTUnwrap(page.items.first)
+            let keptBytes = 20000 - AgentSessionLinkTranscriptBudget.pageEnvelopeBytes
+                - item.nonTextUTF8Cost - marker.utf8.count
+            XCTAssertEqual(returned, String(text.prefix(keptBytes)) + marker)
+            XCTAssertFalse(returned.contains("re-read"))
+            XCTAssertFalse(returned.contains("larger max_output_bytes"))
+            XCTAssertTrue(page.truncated)
+            XCTAssertFalse(page.hasMore, "Omitted row text is not available through the successor cursor")
+            XCTAssertEqual(page.nextAnchor?.itemID, row.id.uuidString)
+            XCTAssertEqual(page.outputUTF8Bytes, 20000)
+            let next = AgentSessionLinkTranscriptSanitizer.page(
+                rows: [row], anchor: page.nextAnchor, direction: direction, maxItems: 1,
+                maxOutputBytes: 20000, homeDirectory: home
+            )
+            XCTAssertTrue(next.items.isEmpty)
+            XCTAssertFalse(next.truncated)
+            XCTAssertFalse(next.hasMore)
+        }
+    }
+
+    func testLongSecondRowWaitsForNextPageWithoutBeingConsumed() {
+        for size in [10000, 20000] {
+            let text = String(repeating: "x", count: size)
+            let rows = [
+                AgentChatItem.user("request", sequenceIndex: 0),
+                AgentChatItem.assistant(text, sequenceIndex: 1)
+            ]
+            let first = AgentSessionLinkTranscriptSanitizer.page(
+                rows: rows, anchor: nil, direction: .start, maxItems: 30,
+                maxOutputBytes: 8000, homeDirectory: home
+            )
+            XCTAssertEqual(first.items.map(\.text), ["request"])
+            XCTAssertTrue(first.hasMore)
+            XCTAssertTrue(first.truncated)
+            XCTAssertEqual(first.nextAnchor?.itemID, rows[0].id.uuidString)
+            let next = AgentSessionLinkTranscriptSanitizer.page(
+                rows: rows, anchor: first.nextAnchor, direction: .start, maxItems: 1,
+                maxOutputBytes: 20000, homeDirectory: home
+            )
+            XCTAssertEqual(next.items.first?.itemID, rows[1].id.uuidString)
+            XCTAssertEqual(next.nextAnchor?.itemID, rows[1].id.uuidString)
+            XCTAssertFalse(next.hasMore)
+            XCTAssertEqual(next.truncated, size == 20000)
+            if size == 10000 {
+                XCTAssertEqual(next.items.first?.text, text)
+            } else {
+                XCTAssertTrue(next.items.first?.text?.hasSuffix(AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker) == true)
+                XCTAssertEqual(next.outputUTF8Bytes, 20000)
+            }
+        }
+    }
+
+    func testCappedSecondRowIsRefusedEvenWhenItsCappedCostFits() {
+        let kept = String(repeating: "x", count: 7000)
+        let text = kept + "e" + String(repeating: "\u{0301}", count: 400) + "tail"
+        let rows = [AgentChatItem.user("request", sequenceIndex: 0), AgentChatItem.assistant(text, sequenceIndex: 1)]
+        let first = AgentSessionLinkTranscriptSanitizer.page(
+            rows: rows, anchor: nil, direction: .start, maxItems: 30,
+            maxOutputBytes: 8000, homeDirectory: home
+        )
+        XCTAssertEqual(first.items.map(\.text), ["request"])
+        XCTAssertTrue(first.truncated)
+        XCTAssertTrue(first.hasMore)
+        XCTAssertEqual(first.nextAnchor?.itemID, rows[0].id.uuidString)
+        let clipped = AgentSessionLinkTranscriptSanitizer.page(
+            rows: rows, anchor: first.nextAnchor, direction: .start, maxItems: 1,
+            maxOutputBytes: 8000, homeDirectory: home
+        )
+        XCTAssertEqual(clipped.items.first?.text, kept + AgentSessionLinkTranscriptBudget.clippedRowMarker)
+        XCTAssertTrue(clipped.truncated)
+        let whole = AgentSessionLinkTranscriptSanitizer.page(
+            rows: rows, anchor: first.nextAnchor, direction: .start, maxItems: 1,
+            maxOutputBytes: 20000, homeDirectory: home
+        )
+        XCTAssertEqual(whole.items.first?.text, text)
+        XCTAssertFalse(whole.truncated)
+    }
+
+    func testDiagnosticCapDoesNotDeferRowsThatFitThePage() {
+        let rows = [
+            AgentChatItem.user("request", sequenceIndex: 0),
+            AgentChatItem.error(String(repeating: "e", count: 1200), sequenceIndex: 1),
+            AgentChatItem.assistant("done", sequenceIndex: 2)
+        ]
+        let page = AgentSessionLinkTranscriptSanitizer.page(
+            rows: rows, anchor: nil, direction: .start, maxItems: 30,
+            maxOutputBytes: 8000, homeDirectory: home
+        )
+        XCTAssertEqual(page.items.map(\.text), ["request", String(repeating: "e", count: 500), "done"])
+        XCTAssertFalse(page.truncated)
+        XCTAssertFalse(page.hasMore)
+        XCTAssertEqual(page.nextAnchor?.itemID, rows[2].id.uuidString)
+    }
+
+    func testReadRedactsBeforeClippingAndKeepsWholeGraphemes() throws {
+        let prefix = String(repeating: "é", count: 3700)
+        let fence = String(repeating: "-", count: 5)
+        let begin = fence + "BEGIN PRIVATE KEY" + fence
+        let end = fence + "END PRIVATE KEY" + fence
+        let row = AgentChatItem.user(
+            prefix + " " + begin + "\n" + String(repeating: "z", count: 25000)
+                + "\n" + end + " ok", sequenceIndex: 0
+        )
+        let page = AgentSessionLinkTranscriptSanitizer.page(
+            rows: [row], anchor: nil, direction: .start, maxItems: 1,
+            maxOutputBytes: 8000, homeDirectory: home
+        )
+        XCTAssertEqual(page.items.first?.text, prefix + " [redacted] ok")
+        XCTAssertFalse(page.truncated, "Redaction shrinks the whole row enough to fit without clipping")
+
+        let graphemes = String(repeating: "👩🏽‍💻", count: 1000)
+        let clipped = AgentSessionLinkTranscriptSanitizer.page(
+            rows: [AgentChatItem.assistant(graphemes, sequenceIndex: 0)],
+            anchor: nil, direction: .start, maxItems: 1, maxOutputBytes: 8000,
+            homeDirectory: home
+        )
+        let text = try XCTUnwrap(clipped.items.first?.text)
+        let marker = AgentSessionLinkTranscriptBudget.clippedRowMarker
+        XCTAssertTrue(text.hasSuffix(marker))
+        XCTAssertTrue(text.dropLast(marker.count).allSatisfy { $0 == "👩🏽‍💻" })
+        XCTAssertLessThanOrEqual(clipped.outputUTF8Bytes, 8000)
+        XCTAssertTrue(clipped.truncated)
+    }
+
+    func testMaximumBudgetReadOfOneHundredLargeRowsStaysBounded() {
+        let rows = (0 ..< 100).map {
+            AgentChatItem.assistant(String(repeating: "x", count: 20000), sequenceIndex: $0)
+        }
+        // One page, including redaction; construction is outside the sample. One second is a
+        // generous regression ceiling for the bounded walk, not a microbenchmark target.
+        let start = ProcessInfo.processInfo.systemUptime
+        let page = AgentSessionLinkTranscriptSanitizer.page(
+            rows: rows, anchor: nil, direction: .start, maxItems: 100,
+            maxOutputBytes: 20000, homeDirectory: home
+        )
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        print("READ_ROW_BUDGET_STRESS_MS=\(elapsed * 1000)")
+        XCTAssertLessThan(elapsed, 1.0)
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(page.outputUTF8Bytes, 20000)
+        XCTAssertTrue(page.truncated)
+        XCTAssertTrue(page.hasMore)
+        XCTAssertEqual(page.nextAnchor?.itemID, rows[0].id.uuidString)
     }
 
     func testItemCountCapIsClampedToTheDocumentedMaximum() {

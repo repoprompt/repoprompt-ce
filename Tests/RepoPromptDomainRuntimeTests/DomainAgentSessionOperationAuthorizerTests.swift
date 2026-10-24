@@ -49,7 +49,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
     }
 
     func testAgentCallerMayControlOnlyItsDirectChildren() {
-        for operation in sessionControlOperations {
+        for operation in sessionControlOperations where operation != .manageCleanup {
             let child = DomainAgentSessionOperationAuthorizer.authorize(
                 operation: operation,
                 caller: .agentSession(callerSessionID),
@@ -81,6 +81,21 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
         }
     }
 
+    func testAgentCannotDeleteSavedSessionsEvenWithDirectSpawnProvenance() {
+        let targets: [DomainAgentSessionTargetProvenance] = [
+            .known(targetSessionID: childSessionID, parentSessionID: callerSessionID),
+            .known(targetSessionID: siblingSessionID, parentSessionID: nil),
+            .unknown(targetSessionID: siblingSessionID)
+        ]
+        for target in targets {
+            let decision = DomainAgentSessionOperationAuthorizer.authorize(
+                operation: .manageCleanup, caller: .agentSession(callerSessionID), target: target,
+                monitorGrant: monitorProof(capability: .sendWhenIdle)
+            )
+            XCTAssertEqual(decision.denial, .humanOnlyOperation)
+        }
+    }
+
     func testGrandchildIsNotDirectlyControllable() {
         let grandchildParent = childSessionID
         let decision = DomainAgentSessionOperationAuthorizer.authorize(
@@ -98,7 +113,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 caller: .agentSession(callerSessionID),
                 target: .unknown(targetSessionID: siblingSessionID)
             )
-            XCTAssertEqual(unknownTarget.denial, .targetProvenanceUnknown, "\(operation.rawValue)")
+            XCTAssertEqual(unknownTarget.denial, operation == .manageCleanup ? .humanOnlyOperation : .targetProvenanceUnknown, "\(operation.rawValue)")
 
             let unresolvedCaller = DomainAgentSessionOperationAuthorizer.authorize(
                 operation: operation,
@@ -132,7 +147,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             )
             XCTAssertEqual(
                 decision.denial,
-                .notDirectChild,
+                operation == .manageCleanup ? .humanOnlyOperation : .notDirectChild,
                 "an oversight link must not widen agent_run/agent_manage: \(operation.rawValue)"
             )
         }
@@ -155,7 +170,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorSteer: .manage,
             .monitorStop: .manage,
             .monitorSetModel: .manage,
-            .monitorRetireLane: .manage
+            .monitorRetireLane: .manage,
+            // Redirecting another session's execution checkout acts for the user in that target.
+            .monitorWorktreeBinding: .manage
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -340,7 +357,8 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.create_lane", "agent_session_link.retire_lane",
                 "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
                 "agent_session_link.respond",
-"agent_session_link.steer", "agent_session_link.stop", "agent_session_link.set_model"
+"agent_session_link.steer", "agent_session_link.stop", "agent_session_link.set_model",
+                "manage_worktree.binding"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {

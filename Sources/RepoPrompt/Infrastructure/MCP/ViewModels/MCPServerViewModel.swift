@@ -810,6 +810,19 @@ final class MCPServerViewModel: ObservableObject {
             }
         )
         toolService.perfRecorder = perfRecorder
+        toolService.forwardOversightSteer = { [self] args, metadata in
+            // AgentRunMCPToolService applies the exact argument allowlist before entering this forwarder.
+            guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
+                throw MCPError.invalidParams("Oversight steering is disabled. Enable agent_session_link in tool settings, then use its steer operation under a Manage link.")
+            }
+            var forwarded: [String: Value] = [
+                "op": .string("steer"),
+                "idempotency_key": args["idempotency_key"] ?? .string(UUID().uuidString)
+            ]
+            forwarded["session_id"] = args["session_id"]
+            forwarded["message"] = args["message"]
+            return try await makeAgentSessionLinkToolService(metadata: metadata).execute(args: forwarded)
+        }
         return toolService
     }
 
@@ -1102,10 +1115,43 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    private var becomeOverseerToolService: BecomeOverseerMCPToolService {
+        BecomeOverseerMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            resolveObserverEndpoint: { [self] metadata in
+                guard let invocation = try? service.captureInvocationContext(
+                    toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
+                ), let connectionID = metadata.connectionID,
+                let endpoint = await resolveAgentSessionLinkModelObserverEndpoint(
+                    metadata: metadata,
+                    modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
+                ), await ServerNetworkManager.shared.isBecomeOverseerAvailable(connectionID: connectionID, endpoint: endpoint)
+                else { return nil }
+                return endpoint
+            },
+            resolveRoutedEndpointForRefusal: { [self] metadata in
+                guard let invocation = try? service.captureInvocationContext(
+                    toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
+                ) else { return nil }
+                return await resolveAgentSessionLinkModelObserverEndpoint(
+                    metadata: metadata,
+                    modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
+                )
+            }
+        )
+    }
+
     private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
+        makeAgentSessionLinkToolService()
+    }
+
+    private func makeAgentSessionLinkToolService(metadata: RequestMetadata? = nil) -> AgentSessionLinkMCPToolService {
         AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
-            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            captureRequestMetadata: { [self] in
+                if let metadata { return metadata }
+                return await captureRequestMetadata()
+            },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             // Exact run-installed/handover/pending-run routing only: the observing endpoint can never
             // be supplied, hinted, or explicitly bound by the caller.
@@ -1138,6 +1184,8 @@ final class MCPServerViewModel: ObservableObject {
 
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
+    @Published private(set) var pendingApprovalGeneration: UInt64?
+    @Published private(set) var pendingApprovalExecutablePath: String?
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
         issue: .none,
         lastEventAt: nil,
@@ -1389,11 +1437,23 @@ final class MCPServerViewModel: ObservableObject {
             }
             return try await agentSessionLinkToolService.execute(args: args)
         },
+        executeBecomeOverseer: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing become_overseer") }
+            return try await becomeOverseerToolService.execute(args: args)
+        },
         executeAgentSelf: { [weak self] args in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing self_compact")
             }
             return try await agentSelfToolService.execute(args: args)
+        },
+        executeSessionAdmin: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
+            return try await sessionAdminToolService(requireTargetWindow: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                return try requireTargetWindow()
+            })
+            .execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
@@ -2005,7 +2065,9 @@ final class MCPServerViewModel: ObservableObject {
         selection: windowToolSelectionCapabilities
     )
     @MainActor
-    private lazy var historyToolProvider = MCPHistoryToolProvider(runtime: windowToolRuntime)
+    private lazy var historyToolProvider = MCPHistoryToolProvider(
+        runtime: windowToolRuntime, workspaceStore: domainWorkspaceAuthorityClient?.store
+    )
     @MainActor
     private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
         resolveContext: { [weak self] toolName, requirement in
@@ -2134,7 +2196,16 @@ final class MCPServerViewModel: ObservableObject {
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities,
                 context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities
+                selection: windowToolSelectionCapabilities,
+                resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
+                    await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                },
+                resolveObserverEndpoint: { [weak self] metadata, targetWindow in
+                    await self?.resolveAgentSessionLinkObserverEndpoint(
+                        metadata: metadata,
+                        targetWindow: targetWindow
+                    )
+                }
             ),
             MCPContextBuilderToolProvider(
                 runtime: windowToolRuntime,
@@ -2144,6 +2215,7 @@ final class MCPServerViewModel: ObservableObject {
             ),
             MCPAskUserToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
+            MCPSessionAdminToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentSessionControlToolProvider(
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities
@@ -3142,9 +3214,6 @@ final class MCPServerViewModel: ObservableObject {
                 self?.externalClientErrorCount = count
             }
             .store(in: &cancellables)
-
-        // Cleanup old events periodically (once per app launch is enough)
-        monitor.cleanupOldEvents()
     }
 
     /// Updates published properties and sets the overlay visibility.
@@ -3155,6 +3224,8 @@ final class MCPServerViewModel: ObservableObject {
 
         isRunning = snap.isRunning
         pendingClientID = snap.pendingClientID
+        pendingApprovalGeneration = snap.pendingApprovalGeneration
+        pendingApprovalExecutablePath = snap.pendingApprovalExecutablePath
         diagnostics = snap.diagnostics
         lastErrorMessage = humanReadableError(from: snap.diagnostics.issue)
 
@@ -3439,11 +3510,8 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Called by UI after the alert sheet closes
-    func resolveApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        await service.continuePendingApproval(
-            allow: allow,
-            alwaysAllow: alwaysAllow
-        )
+    func resolveApproval(allow: Bool, generation: UInt64) async {
+        await service.continuePendingApproval(allow: allow, generation: generation)
     }
 
     // MARK: - Dashboard Methods
@@ -3782,15 +3850,18 @@ final class MCPServerViewModel: ObservableObject {
             : nil
         // Capture the exact self caller at registration, before the tool body can suspend. Neither
         // request metadata nor a later live tab lookup may substitute a successor run attempt.
-        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
-                                                         let context = resolvedContext?.snapshot,
-                                                         let runID = context.runID,
-                                                         indexedRunID == runID,
-                                                         let window = try? requireTargetWindow(),
-                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
-                                                         let session = window.agentModeViewModel.sessions[context.tabID],
-                                                         session.runID == runID,
-                                                         let ownership = session.activeRunOwnership
+        // `manage_worktree` uses the same proof to defer a session's own worktree switch to the
+        // terminal boundary of exactly this turn.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf
+            || name == MCPWindowToolName.manageWorktree,
+            let context = resolvedContext?.snapshot,
+            let runID = context.runID,
+            indexedRunID == runID,
+            let window = try? requireTargetWindow(),
+            let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+            let session = window.agentModeViewModel.sessions[context.tabID],
+            session.runID == runID,
+            let ownership = session.activeRunOwnership
         {
             .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
         } else {
@@ -3850,11 +3921,11 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
+                        try await AgentSelfMCPCallOrigin.currentTaskLocal.withValue(selfCallOrigin) {
                             // Explicitly captured before this Task/start-gate hop; compatibility
                             // helpers project this same packet rather than a successor live route.
                             try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                                try await AgentSessionLinkWaitCallOrigin.$current.withValue(waitCallOrigin) {
+                                try await AgentSessionLinkWaitCallOrigin.currentTaskLocal.withValue(waitCallOrigin) {
                                     try await body()
                                 }
                             }
@@ -4528,30 +4599,20 @@ final class MCPServerViewModel: ObservableObject {
             return try await operation()
         }
 
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                    try await operation()
-                }
+        return try await MCPToolHeartbeat.run(interval: interval) {
+            await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                await ServerNetworkManager.shared.sendProgress(
+                    for: connectionID,
+                    tool: tool,
+                    kind: .heartbeat,
+                    stage: stage,
+                    message: message
+                )
             }
-            group.addTask {
-                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                    while !Task.isCancelled {
-                        try await Task.sleep(for: interval)
-                        await ServerNetworkManager.shared.sendProgress(
-                            for: connectionID,
-                            tool: tool,
-                            kind: .heartbeat,
-                            stage: stage,
-                            message: message
-                        )
-                    }
-                    throw CancellationError()
-                }
+        } operation: {
+            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                try await operation()
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
         }
     }
 
@@ -6229,7 +6290,9 @@ final class MCPServerViewModel: ObservableObject {
             let coverage = root.coverage
             var rootIssues = root.issues.map { issue in
                 let mapped = codeStructureIssueDTO(issue)
-                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                guard root.executionStop == nil, root.status != .unavailable, !graphInvalid,
+                      issue.code == "seed_not_indexed", coverage?.isComplete != true
+                else { return mapped }
                 return DTO.IssueDTO(
                     code: mapped.code,
                     phase: mapped.phase,
@@ -6279,15 +6342,28 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .ok
             }
+            let indexStopReason: String? = if let stop = root.executionStop {
+                stop.reason.rawValue
+            } else if case let .invalid(code, _)? = graphRevalidation {
+                code
+            } else if root.status == .unavailable {
+                rootIssues.first?.code ?? "graph_unavailable"
+            } else {
+                nil
+            }
             rootDTOs.append(DTO.RootDTO(
                 root: root.rootDisplayName,
                 status: status,
                 index: DTO.IndexDTO(
-                    state: coverage?.isComplete == true ? .complete : .indexing,
+                    state: root.executionStop != nil || root.status == .unavailable || graphInvalid
+                        ? .stopped : coverage?.isComplete == true ? .complete : .indexing,
                     indexed: coverage?.classifiedCount ?? 0,
-                    total: coverage?.supportedCount ?? 0
+                    total: coverage?.supportedCount ?? 0,
+                    reason: indexStopReason,
+                    attempted: root.executionStop?.budget.map { Int(clamping: $0.attempted) },
+                    limit: root.executionStop?.budget.map { Int(clamping: $0.limit) }
                 ),
-                updatesPending: (root.updatesPending || revalidationUpdatesPending) ? true : nil,
+                updatesPending: indexStopReason == nil && (root.updatesPending || revalidationUpdatesPending) ? true : nil,
                 seeds: root.seeds.map {
                     DTO.SeedDTO(path: $0.path, state: codeStructureSeedStateDTO($0.state))
                 },
@@ -7079,7 +7155,10 @@ final class MCPServerViewModel: ObservableObject {
         )
         return OracleExportFile(
             path: resolvedPath,
-            instruction: AgentOracleExport.instruction(path: resolvedPath)
+            instruction: AgentOracleExport.instruction(
+                path: resolvedPath,
+                oracleLaneCount: request.groupResult?.oracleResults.count
+            )
         )
     }
 

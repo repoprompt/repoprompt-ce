@@ -234,20 +234,30 @@ import XCTest
                 try await fixture.manager.addFolder(URL(fileURLWithPath: fixture.rootPaths[1]), to: fixture.workspace)
                 let current = await client.snapshot()
                 XCTAssertGreaterThan(current.catalogRevision, delayed.catalogRevision)
-                let decoded = try delayed.workspaces.map {
-                    try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL)
+                @MainActor func apply(_ snapshot: DomainWorkspaceCatalogSnapshot) throws -> Bool {
+                    let decoded = try snapshot.workspaces.map {
+                        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL)
+                    }
+                    return fixture.manager.applyDomainWorkspaceProjection(
+                        decoded,
+                        canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.metadata.repoPaths) }),
+                        fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) }),
+                        revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.revisions) }),
+                        digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
+                        healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.health) }),
+                        catalogRevision: snapshot.catalogRevision,
+                        preferredActiveWorkspaceID: fixture.workspace.id,
+                        publicationSequence: snapshot.publicationSequence
+                    )
                 }
-                fixture.manager.applyDomainWorkspaceProjection(
-                    decoded,
-                    canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.metadata.repoPaths) }),
-                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) }),
-                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.revisions) }),
-                    digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
-                    healthByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.health) }),
-                    catalogRevision: delayed.catalogRevision,
-                    preferredActiveWorkspaceID: fixture.workspace.id,
-                    publicationSequence: delayed.publicationSequence
-                )
+                // #1142: a catalog older than the floor learned from the command outcome is rejected whole.
+                let beforeDelayed = fixture.manager.workspaces
+                XCTAssertFalse(try apply(delayed), "An older catalog revision must not be reconciled")
+                XCTAssertEqual(fixture.manager.workspaces, beforeDelayed, "A rejected delayed catalog mutates no models")
+                // The freshly read current catalog converges the unrelated update; newer local roots survive.
+                let fresh = await client.snapshot()
+                XCTAssertGreaterThanOrEqual(fresh.catalogRevision, current.catalogRevision)
+                XCTAssertTrue(try apply(fresh))
                 XCTAssertEqual(fixture.manager.workspace(withID: other.id)?.currentPromptText, changedOther.currentPromptText)
                 XCTAssertEqual(fixture.manager.activeWorkspace?.repoPaths, fixture.rootPaths)
             }
@@ -311,7 +321,9 @@ import XCTest
                     revisionsByWorkspaceID: [fixture.workspace.id: before.canonical.revisions],
                     digestsByWorkspaceID: [fixture.workspace.id: before.canonical.document.contentDigest],
                     healthByWorkspaceID: [fixture.workspace.id: before.canonical.health],
-                    catalogRevision: oldCatalog.catalogRevision, publicationSequence: oldCatalog.publicationSequence
+                    catalogRevision: oldCatalog.catalogRevision,
+                    publicationSequence: oldCatalog.publicationSequence,
+                    canonicalSystemWorkspaceIDs: []
                 )
                 XCTAssertEqual(fixture.manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).revisions, newer?.revisions)
             }
@@ -1342,24 +1354,32 @@ import XCTest
                     )
                     let checkpoint = RootDirectoryProbeCheckpoint(heldPhase: .beforeFileSystem)
                     fixture.manager.rootDirectoryProbeCheckpointForTesting = checkpoint.checkpoint
+                    let switchRetiredProbe = XCTestExpectation(description: "workspace switch retired blocked directory probe")
+                    if !closesWindow {
+                        fixture.manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                            switchRetiredProbe.fulfill()
+                        }
+                    }
                     defer {
                         checkpoint.release()
                         fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
+                        fixture.manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
                     }
                     _ = try XCTUnwrap(fixture.manager.requestRootReconciliation(workspaceID: fixture.workspace.id))
                     try await fixture.awaitGateEvent(checkpoint.entered)
 
                     let finished = XCTestExpectation(description: "lifecycle transition detached from immutable read")
+                    var didSwitch = false
                     fixture.startOwnedTask {
                         if closesWindow {
                             fixture.manager.prepareForWindowClose()
                             await fixture.manager.awaitRootReconciliationShutdown()
                         } else {
-                            _ = await fixture.manager.switchWorkspace(to: alternate, saveState: false)
+                            didSwitch = await fixture.manager.switchWorkspace(to: alternate, saveState: false).didSwitch
                         }
                         finished.fulfill()
                     }
-                    await self.fulfillment(of: [finished], timeout: 1)
+                    await self.fulfillment(of: closesWindow ? [finished] : [switchRetiredProbe], timeout: 1)
                     XCTAssertLessThanOrEqual(
                         fixture.manager.rootReconciliationStateForTesting.outstandingProbes,
                         2
@@ -1374,6 +1394,10 @@ import XCTest
 
                     checkpoint.release()
                     await self.fulfillment(of: [checkpoint.finished], timeout: 1)
+                    if !closesWindow {
+                        try await fixture.awaitGateEvent(finished)
+                        XCTAssertTrue(didSwitch)
+                    }
                     fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
                 }
             }

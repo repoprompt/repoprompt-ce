@@ -7,8 +7,24 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptPersistence
 import RepoPromptProcess
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
+
+extension GitDiffCompareSpec {
+    /// Validate even programmatically constructed or decoded specs before Git runs.
+    func validateRevisionArgument() throws {
+        switch self {
+        case let .uncommitted(base), let .uncommittedMergeBase(base),
+             let .staged(base), let .stagedMergeBase(base):
+            try GitRevisionArgument.validate(base)
+        case let .revspec(spec):
+            try GitRevisionArgument.validate(spec)
+        case .unstaged:
+            break
+        }
+    }
+}
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -747,10 +763,13 @@ actor GitService {
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
     /// Receipt observation is additive and fail-open: creation remains successful when
     /// authority or witness evidence cannot be proven.
+    @TaskLocal private static var worktreeCreationCommitFence: (@Sendable () async throws -> Void)?
+
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
@@ -840,6 +859,9 @@ actor GitService {
                         throw error
                     }
                 }
+                // Deterministic Git refusals settle here, before any creation side effect and
+                // before the caller's commit fence, so a protected caller can report not-applied.
+                try await validateWorktreeCreatePreconditions(mutationRequest, at: repoURL)
                 var parentEvidence: (
                     lease: GitWorkspaceAuthorityLease,
                     snapshot: WorkspaceRootReusableSnapshot,
@@ -984,7 +1006,9 @@ actor GitService {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
+                        try await runGit(args, at: repoURL)
+                    }
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
@@ -2126,6 +2150,61 @@ actor GitService {
         }
     }
 
+    /// Refuses requests that `git worktree add` would deterministically reject. Runs under the
+    /// repository's worktree mutation lock and before any creation side effect, so a refusal here
+    /// proves this request created nothing. Races with Git processes outside RepoPrompt still
+    /// surface from `git worktree add` itself, after the commit fence.
+    private func validateWorktreeCreatePreconditions(
+        _ request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : $0 }
+        if let branch {
+            // `-b` never overwrites an existing branch, with or without `--force`.
+            let (_, _, exitCode) = try await runGit(
+                ["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"],
+                at: repoURL
+            )
+            if exitCode == 0 {
+                throw GitError(message: Self.worktreeCreateRefusal(
+                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out"
+                ))
+            }
+        }
+        // Without `-b`/`--detach`, Git may DWIM a remote-tracking branch name; leave that to Git.
+        if let baseRef = request.baseRef, !baseRef.isEmpty, branch != nil || request.detach {
+            // Like `git worktree add`, a lone "-" names the previously checked-out ref.
+            let resolvableRef = baseRef == "-" ? "@{-1}" : baseRef
+            let resolves: Bool
+            if resolvableRef.hasPrefix("-") {
+                resolves = false
+            } else {
+                let (_, _, exitCode) = try await runGit(
+                    ["rev-parse", "--verify", "--quiet", "\(resolvableRef)^{commit}"],
+                    at: repoURL
+                )
+                resolves = exitCode == 0
+            }
+            guard resolves else {
+                throw GitError(message: Self.worktreeCreateRefusal("base ref '\(baseRef)' does not resolve to a commit"))
+            }
+        }
+        // Git accepts an existing empty directory; anything else at the destination is refused.
+        let destinationPath = request.path.standardizedFileURL.path
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: destinationPath) {
+            let isDirectory = (attributes[.type] as? FileAttributeType) == .typeDirectory
+            let isEmptyDirectory = isDirectory
+                && ((try? FileManager.default.contentsOfDirectory(atPath: destinationPath).isEmpty) ?? false)
+            guard isEmptyDirectory else {
+                throw GitError(message: Self.worktreeCreateRefusal("destination path is occupied: \(destinationPath)"))
+            }
+        }
+    }
+
+    private static func worktreeCreateRefusal(_ detail: String) -> String {
+        "git worktree add refused before creation: \(detail). Nothing was created."
+    }
+
     private static func canonicalizedAppManagedRequestAtMutationBoundary(
         _ request: GitWorktreeCreateRequest
     ) throws -> GitWorktreeCreateRequest {
@@ -2174,6 +2253,8 @@ actor GitService {
     // MARK: - Worktree Merge Primitives
 
     func getMergeBase(sourceHead: String, targetHead: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(sourceHead)
+        try GitRevisionArgument.validate(targetHead)
         let (stdout, stderr, exitCode) = try await runGit(
             ["merge-base", targetHead, sourceHead],
             at: repoURL
@@ -2185,6 +2266,8 @@ actor GitService {
     }
 
     func isAncestor(_ ancestor: String, of descendant: String, at repoURL: URL) async throws -> Bool {
+        try GitRevisionArgument.validate(ancestor)
+        try GitRevisionArgument.validate(descendant)
         let (_, stderr, exitCode) = try await runGit(
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
@@ -2670,8 +2753,9 @@ actor GitService {
 
     /// Resolve any ref (branch, tag, commit-ish) to a SHA.
     func getRefSHA(at repoURL: URL, ref: String) async throws -> String {
+        try GitRevisionArgument.validate(ref)
         let (stdout, stderr, exitCode) = try await runGit(
-            ["rev-parse", ref],
+            ["rev-parse", "--verify", "--end-of-options", ref],
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -2779,6 +2863,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree
     func getDiff(from branch: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Compare branch to working tree to include all uncommitted changes
         let (stdout, stderr, exitCode) = try await runGit(
             ["diff", branch],
@@ -2794,6 +2879,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree for specific files
     func getDiff(from branch: String, for files: [String], at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Prefer normal argv for smaller file sets (compatibility),
         // use pathspec-from-file when args are large, and chunk as a fallback.
         let maxChunk = 3000
@@ -3207,6 +3293,7 @@ actor GitService {
         legacyTextOutput: Bool = false,
         at repoURL: URL
     ) async throws -> Data {
+        if let refArg { try GitRevisionArgument.validate(refArg) }
         let maxChunk = 3000
         let pathspecByteLimit = 128 * 1024
         let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
@@ -3230,7 +3317,7 @@ actor GitService {
             do {
                 var args = baseArgs()
                 args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
-                if let refArg, !refArg.isEmpty {
+                if let refArg {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
@@ -3248,9 +3335,10 @@ actor GitService {
 
         guard !cleanedPaths.isEmpty else {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
+            args.append("--")
             let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
@@ -3260,7 +3348,7 @@ actor GitService {
 
         if cleanedPaths.count <= maxChunk {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3275,7 +3363,7 @@ actor GitService {
         var combined = Data()
         for chunk in cleanedPaths.chunked(into: maxChunk) {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3783,6 +3871,9 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
         let numstatArgs = ["diff"] + reference + ["--numstat", "-z"]
         let nameStatusArgs = ["diff"] + reference + ["--name-status", "-z"]
 
@@ -3947,6 +4038,7 @@ actor GitService {
         paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        try compare.validateRevisionArgument()
         if let paths, paths.isEmpty { return [] }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
@@ -7287,6 +7379,7 @@ actor GitService {
 
     /// Get commit info (metadata only, no diff).
     func commitInfo(ref: String, at repoURL: URL) async throws -> CommitInfo {
+        try GitRevisionArgument.validate(ref)
         let args = [
             "show",
             "-s",
@@ -7295,7 +7388,9 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref
+            // Peel annotated tags so their headers cannot enter the commit metadata.
+            "\(ref)^{commit}",
+            "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -8112,6 +8207,12 @@ actor GitService {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        // Only delegated creation carries this callback. All repository resolution, mutation-lock,
+        // eligibility and process-lane waits have completed; rejection here leaves no Git worktree
+        // or branch. Once admitted, checkout and receipt completion retain ordinary semantics.
+        if args.prefix(2).elementsEqual(["worktree", "add"]) {
+            try await Self.worktreeCreationCommitFence?()
+        }
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {

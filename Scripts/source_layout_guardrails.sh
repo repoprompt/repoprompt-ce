@@ -399,7 +399,12 @@ if [[ -d "$workspace_core_source_dir" ]]; then
     printf '%s\n' "$unexpected_workspace_core_files" >&2
   fi
 
-  if ! workspace_core_imports="$(xcrun swiftc -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
+  # Keep Xcode's selected toolchain on macOS; the same compiler check also runs headlessly on Linux.
+  workspace_core_compiler=(swiftc)
+  if command -v xcrun >/dev/null 2>&1; then
+    workspace_core_compiler=(xcrun swiftc)
+  fi
+  if ! workspace_core_imports="$("${workspace_core_compiler[@]}" -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
     fail "Swift compiler could not inspect RepoPromptWorkspaceCore imports"
     printf '%s\n' "$workspace_core_imports" >&2
   elif [[ "$workspace_core_imports" != $'Foundation\nSystemPackage' ]]; then
@@ -594,8 +599,14 @@ else
   if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
     fail "M2 workspace presentation bridge declaration missing"
   fi
-  if ! grep -q 'guard subscription.snapshot.isBootstrapped' "$m2_presentation_bridge"; then
-    fail "M2 workspace presentation bridge lost first-projection readiness gate"
+  # Scope each readiness check to its owner: another guard elsewhere cannot cover its removal.
+  if ! awk '/^    private func projectInitial\(/ { scoped=1 } /^    private func consume\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep -q 'if initial.isBootstrapped, initial.workspaces.isEmpty,'; then
+    fail "M2 initial Default creation must be gated by authority bootstrap readiness"
+  fi
+  if ! awk '/^    private func project\(/ { scoped=1 } /^    private func commitAccepted\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep -q 'guard snapshot.isBootstrapped else'; then
+    fail "M2 catalog projection must reject unbootstrapped authority snapshots"
   fi
 fi
 
@@ -795,6 +806,7 @@ allowed_tracked_docs=(
   "docs/architecture/actionable-macos-notifications.md"
   "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
+  "docs/architecture/ci-reliability-2026-10-23.md"
   "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
@@ -804,6 +816,7 @@ allowed_tracked_docs=(
   "docs/architecture/modules.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
+  "docs/architecture/routing-profile-publication.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/self-compact-native-note-delivery.md"
   "docs/architecture/source-layout.md"
@@ -818,8 +831,11 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
+  "docs/plans/agent-mode-reprompter-2026-10-20.md"
+  "docs/plans/openai-decisions-contract-2026-10-07.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
+  "docs/reviews/model-router-auto-effort-openai-decisions-verification.md"
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"

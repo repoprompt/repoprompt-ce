@@ -358,7 +358,11 @@ struct AgentExploreMCPToolService {
         do {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
-                surface: .headless
+                surface: .headless,
+                baseline: context.selection.agentRaw.flatMap { agent in
+                    context.selection.modelRaw.map { .init(agentRaw: agent, modelRaw: $0, reasoningEffortRaw: nil, modelParameters: context.selection.modelParameterSelections) }
+                },
+                allowUsageBalance: context.selection.usageBalancingEligible
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,

@@ -930,7 +930,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
                 }
             }
             let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
-            try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
+            try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(correlation) {
                 let inputs = try [
                     WorkspaceExactFileInput.parse(existingURL.path),
                     WorkspaceExactFileInput.parse(materializedURL.path),
@@ -1072,7 +1072,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             }
             let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
             let resolutionTask = Task {
-                try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
+                try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(correlation) {
                     try await store.resolveExactExistingWorkspaceFile(
                         WorkspaceExactFileInput.parse(targetURL.path),
                         namespace: namespace
@@ -1152,7 +1152,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             }
             let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
             let resolutionTask = Task {
-                try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
+                try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(correlation) {
                     try await store.resolveExactExistingWorkspaceFile(
                         WorkspaceExactFileInput.parse(targetURL.path),
                         namespace: namespace

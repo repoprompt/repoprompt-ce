@@ -158,7 +158,7 @@ import Foundation
                 for index in values.indices {
                     do {
                         WorkspaceFileDecodeCache.shared.removeAllForTesting()
-                        values[index] = try Diagnostics.$context.withValue(.init(
+                        values[index] = try Diagnostics.contextTaskLocal.withValue(.init(
                             recorder: recorder, contentOrdinal: revision, consumerOrdinal: index + 1,
                             revision: UInt64(revision), schemaVersion: 1, onMainActor: true
                         )) { try fixture.decode(bytes[revision]) }

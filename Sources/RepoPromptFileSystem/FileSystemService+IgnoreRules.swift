@@ -96,6 +96,7 @@ extension FileSystemService {
         _ resolved: IgnoreRulesManager.ResolvedIgnoreRules
     ) {
         ignoreRules = resolved.rules
+        repositoryExcludeDigest = resolved.repositoryExcludeDigest
         catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
             schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
             mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
@@ -325,6 +326,25 @@ extension FileSystemService {
             // Clear the per-folder cache when disabling
             Task { await rebuildPerFolderIgnoreCache() }
         }
+    }
+
+    package struct RepositoryExcludePolicyRevision {
+        package let digest: String?
+        let revision: UInt64
+    }
+
+    package func repositoryExcludePolicyRevision() -> RepositoryExcludePolicyRevision {
+        RepositoryExcludePolicyRevision(digest: repositoryExcludeDigest, revision: ignoreRulesRevision)
+    }
+
+    package func repositoryExcludePolicyIsCurrent(_ policy: RepositoryExcludePolicyRevision) async throws -> Bool {
+        let currentDigest = try await currentRepositoryExcludeDigest()
+        return currentDigest == policy.digest && repositoryExcludeDigest == policy.digest &&
+            ignoreRulesRevision == policy.revision && pendingIgnoreRulesRebuildCount == 0
+    }
+
+    package func currentRepositoryExcludeDigest() async throws -> String? {
+        try await ignoreRulesManager.repositoryExcludeDigest(for: path, policy: ignoreRulePolicy)
     }
 
     public func refreshIgnoreRules() async throws {

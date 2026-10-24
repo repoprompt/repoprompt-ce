@@ -34,6 +34,9 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
         /// A judged choice was replaced by a deterministic/manual fallback, including effort-only fallback.
         var fallbackApplied = false
         var application: Application = .notObserved
+        /// Local advisory adjustment; contains no account, profile, or quota values.
+        var usageBalancingReason: String?
+        var usageBalancingProviderRaw: String?
 
         func discardedAfterMCPReclassification() -> Self {
             var result = self
@@ -43,6 +46,15 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
             }
             return result
         }
+    }
+
+    struct Reprompt: Codable, Equatable {
+        enum Outcome: String, Codable { case approved, sentOriginal, bypassed }
+        enum JudgedText: String, Codable { case approved, originalFallback }
+        enum Speculation: String, Codable { case none, reused, discardedEdited, discardedStale }
+        var outcome: Outcome
+        var automationJudgedText: JudgedText?
+        var routerSpeculation: Speculation = .none
     }
 
     enum CodexDelivery: String, Codable {
@@ -71,6 +83,8 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
     var providerTurnAccepted = false
     /// Codex's last observed delivery path. A queued fallback is local durability, not provider acceptance.
     var codexDelivery: CodexDelivery?
+    /// Optional and content-free, so historical audit records decode unchanged.
+    var reprompt: Reprompt?
 
     mutating func recordCodexQueuedFallback() {
         codexDelivery = .queuedFallback

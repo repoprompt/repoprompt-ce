@@ -14,11 +14,13 @@ import SwiftUI
 /// Aligned with MCPApprovalOverlayView for consistent UX.
 struct WorkspaceApprovalOverlayView: View {
     @ObservedObject var approvalManager: WorkspaceApprovalManager
+    @State private var isSubmitting = false
     @State private var alwaysAllow = false
     @State private var isAnimating = false
     @State private var pulseScale: CGFloat = 1.0
 
     let request: WorkspaceApprovalRequest
+    let respondingWindowID: Int
 
     var body: some View {
         ZStack {
@@ -166,6 +168,7 @@ struct WorkspaceApprovalOverlayView: View {
 
             // Always allow toggle
             alwaysAllowToggle
+                .disabled(isSubmitting)
         }
         .padding(24)
     }
@@ -340,7 +343,7 @@ struct WorkspaceApprovalOverlayView: View {
     private var actionsSection: some View {
         HStack(spacing: 12) {
             // Deny button
-            Button(action: { Task { await deny() } }) {
+            Button(action: { submit(allow: false) }) {
                 HStack(spacing: 6) {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .semibold))
@@ -353,7 +356,7 @@ struct WorkspaceApprovalOverlayView: View {
             .buttonStyle(WorkspaceApprovalDenyButtonStyle())
 
             // Allow button
-            Button(action: { Task { await allow() } }) {
+            Button(action: { submit(allow: true) }) {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 12, weight: .semibold))
@@ -367,29 +370,29 @@ struct WorkspaceApprovalOverlayView: View {
             .keyboardShortcut(.defaultAction)
         }
         .padding(20)
+        .disabled(isSubmitting)
     }
 
     // MARK: - Actions
 
-    private func allow() async {
+    private func submit(allow: Bool) {
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        let requestID = request.id
+        let windowID = respondingWindowID
+        let remember = allow && alwaysAllow
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
-        // Small delay for animation
-        try? await Task.sleep(nanoseconds: 150_000_000)
-        await MainActor.run {
-            approvalManager.resolveApproval(allow: true, alwaysAllow: alwaysAllow)
-        }
-    }
-
-    private func deny() async {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            isAnimating = false
-        }
-        // Small delay for animation
-        try? await Task.sleep(nanoseconds: 150_000_000)
-        await MainActor.run {
-            approvalManager.resolveApproval(allow: false, alwaysAllow: false)
+        Task { @MainActor in
+            // Keep the action bound to what was displayed before the animation delay.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            approvalManager.resolveApproval(
+                requestID: requestID,
+                respondingWindowID: windowID,
+                allow: allow,
+                alwaysAllow: remember
+            )
         }
     }
 }
@@ -463,7 +466,8 @@ private struct WorkspaceApprovalDenyButtonStyle: ButtonStyle {
                     operation: .addFolder,
                     workspaceName: "MyProject",
                     folderPath: "/Users/developer/Projects/MyProject/src"
-                )
+                ),
+                respondingWindowID: 1
             )
             .previewDisplayName("Add Folder")
 
@@ -473,7 +477,8 @@ private struct WorkspaceApprovalDenyButtonStyle: ButtonStyle {
                     clientID: "cursor-mcp-client",
                     operation: .deleteWorkspace,
                     workspaceName: "OldProject"
-                )
+                ),
+                respondingWindowID: 1
             )
             .previewDisplayName("Delete Workspace")
         }

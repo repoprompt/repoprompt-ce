@@ -24,6 +24,18 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(output, "tool-ok")
     }
 
+    func testOverseerDescriptionsTeachBothModesWithoutRequiringRedundantCards() throws {
+        // agent_session_link keeps its frozen, budgeted contract; the scope playbook lives on the
+        // tools that request and exercise scopes.
+        for name in [MCPWindowToolName.becomeOverseer, MCPWindowToolName.sessionAdmin, MCPWindowToolName.agentManage] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            XCTAssertTrue(definition.description.contains("Overseer full access"), name)
+            XCTAssertTrue(definition.description.contains("ON"), name)
+            XCTAssertTrue(definition.description.contains("OFF"), name)
+            XCTAssertTrue(definition.description.contains("standing consent"), name)
+        }
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
@@ -82,19 +94,69 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         }
     }
 
-    func testCanonicalAskOracleAdvertisesImageAttachments() throws {
-        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "ask_oracle"))
-        XCTAssertTrue(definition.description.contains("`images`"), "ask_oracle description must document images")
-        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
-        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
-        let images = try XCTUnwrap(properties["images"]?.objectValue)
-        XCTAssertEqual(images["type"], .string("array"))
-        XCTAssertEqual(images["maxItems"], .int(OracleImageAttachmentLimits.production.maxCount))
-        let items = try XCTUnwrap(images["items"]?.objectValue)
-        XCTAssertEqual(items["required"], .array([.string("path")]))
-        let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
-        XCTAssertEqual(itemProperties["path"]?.objectValue?["type"], .string("string"))
-        XCTAssertEqual(itemProperties["title"]?.objectValue?["type"], .string("string"))
+    func testCanonicalAgentControlDescriptionsExplainCompoundTaskRoles() throws {
+        let selectionClauses = [
+            "app-backed sessions", "compound model_id", "assigns no task role to a fresh session",
+            "set that role's default"
+        ]
+        let childClauses = [
+            "agent_explore requires an engineer, pair, or design task role",
+            "start a child that will need Explore helpers with one of those role labels"
+        ]
+        let resumeClauses = [
+            "parented MCP sub-agents cannot use create_session or resume_session, whatever their role",
+            "matching MCP control context keeps its task role even if model_id is supplied",
+            "otherwise a role label installs that role", "an omitted or compound model_id installs none"
+        ]
+        let pointerClauses = [
+            "effective workspace or global role defaults", "compound model_id",
+            "assigns no task role", "see the tool description"
+        ]
+        var cases: [(label: String, text: String, required: [String])] = []
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentManage] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let modelDescription = try XCTUnwrap(properties["model_id"]?.objectValue?["description"]?.stringValue)
+            let required = selectionClauses + childClauses
+                + (toolName == MCPWindowToolName.agentManage ? resumeClauses : ["effective workspace or global role defaults"])
+            let manageSelectionClauses = toolName == MCPWindowToolName.agentManage
+                ? ["on create_session, a compound model_id pins the exact target"] : []
+            let managePointerClauses = toolName == MCPWindowToolName.agentManage
+                ? [
+                    "on create_session, a compound model_id assigns no task role",
+                    "on resume_session, a matching MCP control context keeps its task role even if model_id is supplied",
+                    "otherwise an omitted or compound model_id installs none"
+                ] : []
+            cases.append(("\(toolName) description", definition.description, required + manageSelectionClauses))
+            cases.append(("\(toolName).model_id", modelDescription, pointerClauses + managePointerClauses))
+        }
+        for entry in cases {
+            let text = entry.text.replacingOccurrences(of: "`", with: "").lowercased()
+            XCTAssertFalse(text.contains("role-default mapping"), entry.label)
+            let missing = entry.required.filter { !text.contains($0.lowercased()) }
+            XCTAssertTrue(
+                missing.isEmpty,
+                "\(entry.label) is missing compound task-role guidance: \(missing.joined(separator: "; "))"
+            )
+        }
+    }
+
+    func testCanonicalOracleSendToolsAdvertiseImageAttachments() throws {
+        for toolName in ["ask_oracle", "oracle_send"] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            XCTAssertTrue(definition.description.contains("`images`"), "\(toolName) description must document images")
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let images = try XCTUnwrap(properties["images"]?.objectValue)
+            XCTAssertEqual(images["type"], .string("array"))
+            XCTAssertEqual(images["maxItems"], .int(OracleImageAttachmentLimits.production.maxCount))
+            let items = try XCTUnwrap(images["items"]?.objectValue)
+            XCTAssertEqual(items["required"], .array([.string("path")]))
+            let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
+            XCTAssertEqual(itemProperties["path"]?.objectValue?["type"], .string("string"))
+            XCTAssertEqual(itemProperties["title"]?.objectValue?["type"], .string("string"))
+        }
     }
 
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
@@ -359,6 +421,138 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             )
         ) { error in
             XCTAssertTrue(String(describing: error).contains("endpoint identity changed"), String(describing: error))
+        }
+    }
+
+    // MARK: - manage_worktree list page controls are app-backed only (#1091)
+
+    func testHeadlessManageWorktreeListRejectsAppOnlyPageControls() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        for arguments: [String: Value] in [
+            ["op": .string("list"), "limit": .int(1), "offset": .int(1)],
+            ["op": .string("list"), "limit": .int(1)],
+            ["limit": .int(1)],
+            ["op": .string("list"), "offset": .int(1)]
+        ] {
+            let outcome = try await Self.callManageWorktree(fixture.client, arguments: arguments)
+            XCTAssertTrue(outcome.isError, "page controls must not silently succeed: \(arguments)")
+            XCTAssertTrue(
+                outcome.text.contains(MCPWorktreeListPagination.headlessUnsupportedMessage),
+                "expected explicit unsupported error, got: \(outcome.text)"
+            )
+        }
+    }
+
+    func testHeadlessManageWorktreeListWithoutPageControlsStillListsWorktrees() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        let outcome = try await Self.callManageWorktree(fixture.client, arguments: ["op": .string("list")])
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertTrue(outcome.text.contains("worktree "), outcome.text)
+        XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
+    }
+
+    func testHeadlessGitShowRejectsOptionsAndPreservesValidRevision() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        let marker = fixture.linkedWorktree.deletingLastPathComponent().appendingPathComponent("show-output")
+        let original = Data("preserved\n".utf8)
+        try original.write(to: marker)
+        for ref in ["--output=\(marker.path)", "-p", "--", "HEAD\0tail"] {
+            do {
+                let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string(ref)])
+                XCTAssertEqual(result.isError, true)
+                let text = result.content.compactMap { content -> String? in
+                    guard case let .text(value, _, _) = content else { return nil }
+                    return value
+                }.joined()
+                XCTAssertTrue(text.contains("Invalid Git revision operand"), text)
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("Invalid Git revision operand"), String(describing: error))
+            }
+            XCTAssertEqual(try Data(contentsOf: marker), original)
+        }
+        let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string("HEAD")])
+        XCTAssertFalse(result.isError == true)
+        let text = result.content.compactMap { content -> String? in
+            guard case let .text(value, _, _) = content else { return nil }
+            return value
+        }.joined()
+        XCTAssertTrue(text.contains("Fixture"), text)
+        XCTAssertEqual(try Data(contentsOf: marker), original)
+    }
+
+    private struct HeadlessWorktreeFixture {
+        let client: Client
+        let linkedWorktree: URL
+    }
+
+    private func makeHeadlessWorktreeFixture() async throws -> HeadlessWorktreeFixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-worktree-list-\(UUID().uuidString)", isDirectory: true)
+        let repo = directory.appendingPathComponent("repo", isDirectory: true)
+        let linked = directory.appendingPathComponent("linked-worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        try Data("fixture\n".utf8).write(to: repo.appendingPathComponent("README.md"))
+        try Self.runGit(["init", "--quiet"], at: repo)
+        try Self.runGit(["add", "README.md"], at: repo)
+        try Self.runGit(
+            ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Fixture"],
+            at: repo
+        )
+        try Self.runGit(["worktree", "add", "--quiet", "--detach", linked.path, "HEAD"], at: repo)
+
+        let service = DirectHeadlessMCPService(environment: [
+            "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-list-contract",
+            "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": directory.appendingPathComponent("profile").path,
+            "REPOPROMPT_MCP_WORKING_DIRS": repo.path,
+            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+        ], currentDirectory: repo)
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let transports = await InMemoryTransport.createConnectedPair()
+        let server = Server(name: "Headless worktree test", version: "1", capabilities: .init(tools: .init()))
+        await service.installHandlers(server: server, prepared: prepared, connection: .init(
+            connectionID: prepared.connectionID, connectionGeneration: prepared.connectionGeneration,
+            principal: prepared.principal, policyProfile: .direct, restrictedToolNames: [],
+            additionalToolNames: [], ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
+        ))
+        try await server.start(transport: transports.server)
+        addTeardownBlock { await server.stop() }
+        let client = Client(name: "Headless worktree client", version: "1")
+        _ = try await client.connect(transport: transports.client)
+        addTeardownBlock { await client.disconnect() }
+        return HeadlessWorktreeFixture(client: client, linkedWorktree: linked)
+    }
+
+    /// Normalizes both wire shapes: an `isError` tool result and a thrown JSON-RPC error.
+    private static func callManageWorktree(
+        _ client: Client,
+        arguments: [String: Value]
+    ) async throws -> (isError: Bool, text: String) {
+        do {
+            let result = try await client.callTool(name: "manage_worktree", arguments: arguments)
+            let text = result.content.compactMap { content -> String? in
+                guard case let .text(value, _, _) = content else { return nil }
+                return value
+            }.joined(separator: "\n")
+            return (result.isError == true, text)
+        } catch {
+            return (true, String(describing: error))
+        }
+    }
+
+    private static func runGit(_ arguments: [String], at directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "git", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed"
+            ])
         }
     }
 }
