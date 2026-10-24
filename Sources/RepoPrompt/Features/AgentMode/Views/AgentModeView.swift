@@ -213,8 +213,10 @@ struct AgentModeChatDetailView: View {
     @State private var scrollViewState = AgentTranscriptScrollViewState()
     @StateObject private var scrollEngine = AgentTranscriptScrollEngine()
 
-    // Non-grouped state
+    /// Non-grouped state
     @State private var resetTextFieldTrigger = false
+    // Held without observation so drag updates re-render only the overlay, not the pane.
+    @State private var imageDropController = AgentImageDropController()
     @State private var isTranscriptWindowExpanded = false
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
@@ -1909,7 +1911,24 @@ struct AgentModeChatDetailView: View {
                 )
             }
             .frame(maxHeight: .infinity)
+            .overlay {
+                AgentImageDropOverlay(controller: imageDropController)
+            }
+            .onDrop(of: AgentImagePaneDropDelegate.acceptedTypes, delegate: imagePaneDropDelegate)
+            .environment(\.agentImageDropController, imageDropController)
         }
+    }
+
+    private var imagePaneDropDelegate: AgentImagePaneDropDelegate {
+        let tabID = currentTabID
+        let agentModeVM = agentModeVM
+        return AgentImagePaneDropDelegate(
+            controller: imageDropController,
+            currentTabID: { tabID },
+            prepareAttachImages: { tabID in
+                agentModeVM.prepareImageAttachmentIntake(tabID: tabID)
+            }
+        )
     }
 
     // MARK: - Chat Transcript

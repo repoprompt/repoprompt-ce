@@ -36,6 +36,7 @@ extension AgentModeViewModel {
             : nil
         return AgentComposerProps(
             computerUse: computerUseComposerProps(session: session),
+            imageAttachmentNotice: imageAttachmentNotice,
             currentTabID: tabID,
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(

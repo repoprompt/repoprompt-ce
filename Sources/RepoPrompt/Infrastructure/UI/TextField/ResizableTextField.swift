@@ -1,5 +1,6 @@
 // ResizableTextField.swift
 import AppKit
+import RepoPromptDomainRuntime
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -42,11 +43,18 @@ enum ImagePasteboardTypes {
 final class ImageAwareTextView: NSTextView {
     var imagePasteHandler: ((NSPasteboard) -> Bool)?
     var enablesImagePasteHandling = false
+    /// Reports image drags entering/leaving this view so an enclosing pane-wide drop overlay stays
+    /// lit while the text view owns the drag. Text and non-image drags are never reported.
+    var imageDragHoverHandler: ((Bool) -> Void)?
+    private var isReportingImageDragHover = false
     var commandReturnHandler: (() -> Bool)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
-           commandReturnHandler?() == true { return true }
+           commandReturnHandler?() == true
+        {
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
 
@@ -88,6 +96,7 @@ final class ImageAwareTextView: NSTextView {
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard isEditable else { return [] }
+        setImageDragHover(enablesImagePasteHandling && canHandleImageDrop(from: sender.draggingPasteboard))
         let superOperation = super.draggingEntered(sender)
         if superOperation != [] {
             return superOperation
@@ -96,6 +105,16 @@ final class ImageAwareTextView: NSTextView {
             return []
         }
         return canHandleImageDrop(from: sender.draggingPasteboard) ? .copy : []
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        setImageDragHover(false)
+        super.draggingExited(sender)
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        setImageDragHover(false)
+        super.concludeDragOperation(sender)
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -110,6 +129,7 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        setImageDragHover(false)
         guard isEditable else { return false }
         guard enablesImagePasteHandling else {
             return super.performDragOperation(sender)
@@ -123,27 +143,23 @@ final class ImageAwareTextView: NSTextView {
         return true
     }
 
+    /// Ends any reported image-drag hover (the view is being torn down mid-drag).
+    func endImageDragHover() {
+        setImageDragHover(false)
+    }
+
+    private func setImageDragHover(_ isActive: Bool) {
+        guard isReportingImageDragHover != isActive else { return }
+        isReportingImageDragHover = isActive
+        imageDragHoverHandler?(isActive)
+    }
+
+    /// Same rules as the pane-wide drop target (`AgentImageDropClassifier`).
     private func canHandleImageDrop(from pasteboard: NSPasteboard) -> Bool {
-        if let types = pasteboard.types {
-            for type in types where isImageLikePasteboardType(type) {
-                return true
-            }
-        }
-
-        if let urlObjects = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            for url in urlObjects where url.isFileURL {
-                if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
-                   contentType.conforms(to: .image)
-                {
-                    return true
-                }
-                if let extType = UTType(filenameExtension: url.pathExtension), extType.conforms(to: .image) {
-                    return true
-                }
-            }
-        }
-
-        return false
+        let typeIdentifiers = (pasteboard.types ?? []).map(\.rawValue)
+        let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? [])
+            .filter(\.isFileURL)
+        return RepoPromptDomainRuntime.AgentImageDropClassifier.classify(typeIdentifiers: typeIdentifiers, fileURLs: urls) == .images
     }
 
     private func isImageLikePasteboardType(_ type: NSPasteboard.PasteboardType) -> Bool {
@@ -201,6 +217,7 @@ struct ResizableTextField: View {
     var onReturn: () -> Void
     @Binding var resetTrigger: Bool
     var onImagePaste: ((NSPasteboard) -> Bool)?
+    var onImageDragHoverChange: ((Bool) -> Void)?
     var features: ResizableTextFieldFeatures = .plain
     /// Revision for intentional programmatic text changes while the editor is focused.
     var externalUpdateTick: Int? = .none
@@ -265,6 +282,7 @@ struct ResizableTextField: View {
             placeholder: placeholder,
             onReturn: onReturn,
             onImagePaste: onImagePaste,
+            onImageDragHoverChange: onImageDragHoverChange,
             features: features,
             externalUpdateTick: externalUpdateTick,
             isReadOnly: isReadOnly,
@@ -304,6 +322,7 @@ struct CustomTextField: NSViewRepresentable {
     var placeholder: String
     var onReturn: () -> Void
     var onImagePaste: ((NSPasteboard) -> Bool)?
+    var onImageDragHoverChange: ((Bool) -> Void)?
     var features: ResizableTextFieldFeatures = .plain
     var externalUpdateTick: Int? = .none
     var isReadOnly = false
@@ -381,6 +400,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
+        textView.imageDragHoverHandler = isReadOnly ? nil : onImageDragHoverChange
         context.coordinator.configureFileTagSupport(
             textView: textView,
             enabled: features.enableFileTagOverlay && !isReadOnly,
@@ -416,6 +436,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
         textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
+        textView.imageDragHoverHandler = isReadOnly ? nil : onImageDragHoverChange
         if textView.font != fontPreset.nsFont {
             textView.font = fontPreset.nsFont
             Task { @MainActor in
@@ -488,6 +509,8 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.delegate = nil
         textView.imagePasteHandler = nil
+        textView.endImageDragHover()
+        textView.imageDragHoverHandler = nil
         textView.commandReturnHandler = nil
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
@@ -517,7 +540,9 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
-            if internalUpdateInProgress { return }
+            if internalUpdateInProgress {
+                return
+            }
             guard isActive, let textView = notification.object as? NSTextView else { return }
 
             if textView.hasMarkedText() {
@@ -566,9 +591,13 @@ struct CustomTextField: NSViewRepresentable {
                 parent.onEscape?()
                 return true
             }
-            if parent.isReadOnly { return false }
+            if parent.isReadOnly {
+                return false
+            }
             // IME FIX: if composing, let IME handle keys (Return/space/numbers etc.)
-            if textView.hasMarkedText() { return false }
+            if textView.hasMarkedText() {
+                return false
+            }
             guard isActive else { return false }
             if slashSkillHelper.handleCommandIfNeeded(
                 textView: textView,
@@ -602,7 +631,9 @@ struct CustomTextField: NSViewRepresentable {
                 return true
             }
             // Some keyboards/IMEs use insertLineBreak for Shift+Return; let it fall through to newline.
-            if commandSelector == #selector(NSResponder.insertLineBreak(_:)) { return false }
+            if commandSelector == #selector(NSResponder.insertLineBreak(_:)) {
+                return false
+            }
             if commandSelector == #selector(NSText.paste(_:)) {
                 if let imageAwareTextView = textView as? ImageAwareTextView {
                     return imageAwareTextView.imagePasteHandler?(NSPasteboard.general) == true

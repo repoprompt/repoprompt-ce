@@ -23,6 +23,8 @@ struct AgentComposerActions {
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let cancelRouting: (_ tabID: UUID) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
+    /// Paste/drop entry point that applies the attach guard and explains a block.
+    var attachImagesIfAllowed: (_ tabID: UUID, _ urls: [URL]) -> Bool = { _, _ in false }
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
     let removeTaggedFile: (_ tabID: UUID, _ attachmentID: UUID) -> Void
@@ -134,6 +136,7 @@ struct AgentInputBar: View {
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
+            attachImagesIfAllowed: { tabID, urls in agentModeVM.attachImagesIfAllowed(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
                 agentModeVM.commitPendingTaggedFile(
@@ -304,7 +307,6 @@ struct AgentComposerView: View, Equatable {
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
     @State private var isSyncingDraftFromSession: Bool = false
-    @State private var isImageDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
@@ -315,6 +317,7 @@ struct AgentComposerView: View, Equatable {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.agentImageDropController) private var imageDropController
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -367,8 +370,12 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var canAttachImages: Bool {
-        // Grok Build advertises no ACP image capability; its provider rejects attachments.
-        !props.isAgentBusy && currentTabID.map(canMutateAttachments) == true && props.selectedAgent != .grokBuild
+        currentTabID.map(canMutateAttachments) == true && AgentImageAttachmentGuard.blockReason(
+            hasTab: currentTabID != nil,
+            isAgentBusy: props.isAgentBusy,
+            providerSupportsImages: AgentModeViewModel.providerSupportsImageAttachments(props.selectedAgent),
+            providerName: props.selectedAgent.displayName
+        ) == nil
     }
 
     private var renderedSubmitTarget: AgentComposerSubmitTarget? {
@@ -391,7 +398,9 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var repromptEditTransaction: TextFieldExternalEditTransaction? {
-        if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
+        if let presentation = repromptPresentation {
+            return .init(id: presentation.id, isComplete: presentation.phase == .completed)
+        }
         return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
     }
 
@@ -546,7 +555,9 @@ struct AgentComposerView: View, Equatable {
         }
         .onDisappear {
             // Store draft when leaving
-            if let tabID = currentTabID { flushDraftOnDeparture(tabID: tabID) }
+            if let tabID = currentTabID {
+                flushDraftOnDeparture(tabID: tabID)
+            }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -555,7 +566,9 @@ struct AgentComposerView: View, Equatable {
         }
         .onChange(of: currentTabID) { oldTabID, newTabID in
             // Switch drafts when tab changes
-            if let oldTabID { flushDraftOnDeparture(tabID: oldTabID) }
+            if let oldTabID {
+                flushDraftOnDeparture(tabID: oldTabID)
+            }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
@@ -622,8 +635,10 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(event.message)
             }
         }
-        .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
-        .overlay(imageDropOutline)
+        .onChange(of: props.imageAttachmentNotice) { _, notice in
+            guard let notice, notice.tabID == currentTabID else { return }
+            showSteeringUnsupportedNotice(notice.message)
+        }
     }
 
     // MARK: - Transient Submit Guidance
@@ -693,6 +708,9 @@ struct AgentComposerView: View, Equatable {
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onImagePaste: handleImagePaste(pasteboard:),
+                onImageDragHoverChange: { [weak imageDropController] isActive in
+                    imageDropController?.setTextViewImageDragActive(isActive)
+                },
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -711,15 +729,19 @@ struct AgentComposerView: View, Equatable {
                 isReadOnly: repromptPresentation?.phase.isBusy == true,
                 externalEditTransaction: repromptEditTransaction,
                 onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
-                    if let id { undoRepromptDraft(expectedID: id) }
-                    else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
+                    if let id {
+                        undoRepromptDraft(expectedID: id)
+                    } else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
                         _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
                     }
                 },
                 onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
                     guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
-                    if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
-                    else { operation.cancel() }
+                    if operation.phase == .completed {
+                        undoRepromptDraft(expectedID: id)
+                    } else {
+                        operation.cancel()
+                    }
                 },
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 onHeightChange: { newHeight in
@@ -1709,17 +1731,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    @ViewBuilder
-    private var imageDropOutline: some View {
-        if isImageDropTargeted {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                .foregroundColor(.accentColor)
-                .padding(.horizontal, 2)
-                .padding(.bottom, Self.footerHeight)
-        }
-    }
-
     // MARK: - Actions
 
     private func sendRepromptOriginal(expectedID: UUID) {
@@ -1771,7 +1782,9 @@ struct AgentComposerView: View, Equatable {
             return
         }
         actions.storeDraft(submitTarget.tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[submitTarget.tabID] ?? 0)
-        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
+        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) {
+            return
+        }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
@@ -1867,8 +1880,11 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func canMutateAttachments(tabID: UUID) -> Bool {
-        let liveTabID: UUID? = if let repromptViewModel { repromptViewModel.currentTabID }
-        else { currentTabID }
+        let liveTabID: UUID? = if let repromptViewModel {
+            repromptViewModel.currentTabID
+        } else {
+            currentTabID
+        }
         return repromptStore.allowsAttachmentMutation(tabID: tabID, currentTabID: liveTabID)
     }
 
@@ -1914,18 +1930,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func handleImageDrop(providers: [NSItemProvider]) -> Bool {
-        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
-            return false
-        }
-        return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
-            guard !prepared.isEmpty else { return }
-            Task { @MainActor in
-                attachPreparedImages(prepared, tabID: tabID)
-            }
-        }
-    }
-
     private func handleImagePaste(pasteboard: NSPasteboard) -> Bool {
         guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
@@ -1937,15 +1941,11 @@ struct AgentComposerView: View, Equatable {
         guard !prepared.isEmpty else {
             return false
         }
-        attachPreparedImages(prepared, tabID: tabID)
+        // Paste and text-view drops share the attach guard; a blocked attach is still consumed so
+        // the image is not inserted as text, and the view model explains why.
+        _ = actions.attachImagesIfAllowed(tabID, prepared.map(\.url))
+        imageInputAdapter.cleanupTemporaryFiles(prepared)
         return true
-    }
-
-    private func attachPreparedImages(_ prepared: [AgentImageInputAdapter.PreparedImage], tabID: UUID) {
-        defer { imageInputAdapter.cleanupTemporaryFiles(prepared) }
-        guard canMutateAttachments(tabID: tabID) else { return }
-        let urls = prepared.map(\.url)
-        actions.attachImages(tabID, urls)
     }
 
     private func normalizedServerToggleKey(_ value: String) -> String {
