@@ -309,6 +309,16 @@ package struct MCPDomainProtectedMutationToolProvider {
                 return result
             } catch let error as DomainProtectedMutationError {
                 throw error
+            } catch let refusal as DomainMutationRefusedBeforeEffects {
+                do {
+                    try await Task.detached(priority: .utility) {
+                        try await journal.finishRefusedBeforeEffects(ticket)
+                    }.value
+                    MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+                } catch {
+                    // No effects occurred, but durable settlement could not be confirmed.
+                }
+                throw refusal.underlying
             } catch {
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if didBeginCommit {
