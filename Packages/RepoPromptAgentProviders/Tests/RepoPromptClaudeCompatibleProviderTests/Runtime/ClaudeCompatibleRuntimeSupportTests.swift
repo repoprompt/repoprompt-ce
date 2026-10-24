@@ -14,7 +14,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         let config = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
         let restored = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(config))
         let overridden = restored.normalized.withSlotOverride(slot: "sonnet", backendModelID: "other")
-        let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: overridden, apiKey: "dummy")
+        let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: overridden, apiKey: "dummy")
         XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
         XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
         XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
@@ -24,7 +24,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             document["contextWindowTokens"] = invalid
             let invalidConfig = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
             XCTAssertFalse(invalidConfig.isValid)
-            let invalidEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalidConfig, apiKey: "dummy")
+            let invalidEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalidConfig, apiKey: "dummy")
             XCTAssertNil(invalidEnvironment["API_TIMEOUT_MS"])
             XCTAssertNil(invalidEnvironment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
         }
@@ -33,7 +33,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             document["requestTimeoutMilliseconds"] = Int(Int32.max)
             let bounded = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
             XCTAssertTrue(bounded.isValid)
-            let limits = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: bounded, apiKey: "dummy")
+            let limits = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: bounded, apiKey: "dummy")
             XCTAssertEqual(limits["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], String(window))
             XCTAssertEqual(limits["API_TIMEOUT_MS"], "2147483647")
             XCTAssertNil(limits["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
@@ -42,15 +42,15 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             document["requestTimeoutMilliseconds"] = timeout
             let invalid = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
             XCTAssertFalse(invalid.isValid)
-            XCTAssertNil(ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalid, apiKey: "dummy")["API_TIMEOUT_MS"])
+            XCTAssertNil(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalid, apiKey: "dummy")["API_TIMEOUT_MS"])
         }
         document["requestTimeoutMilliseconds"] = 1000
         document["contextWindowTokens"] = Int(Int32.max) + 1
         let tooLarge = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
         XCTAssertFalse(tooLarge.isValid)
-        XCTAssertNil(ClaudeCompatibleBackendEnvironmentBuilder.environment(config: tooLarge, apiKey: "dummy")["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
+        XCTAssertNil(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: tooLarge, apiKey: "dummy")["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
         let legacy = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(preset))
-        let legacyEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: legacy, apiKey: "dummy")
+        let legacyEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: legacy, apiKey: "dummy")
         XCTAssertNil(legacyEnvironment["API_TIMEOUT_MS"])
         XCTAssertNil(legacyEnvironment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
     }
@@ -86,7 +86,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             modelBehavior: .claudeSlotMapping(.init(haiku: " h ", sonnet: " s ", opus: " o ")),
             requestTimeoutMilliseconds: nil, contextWindowTokens: nil
         )
-        let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
+        let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
         XCTAssertEqual(config.normalizedDisplayName, "Claude Code GLM")
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
         XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "secret")
@@ -97,14 +97,14 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_OPUS_MODEL"], "o")
         XCTAssertEqual(ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config), ["ANTHROPIC_API_KEY"])
 
-        let oneMillionEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let oneMillionEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-5.2[1m]"
         )
         XCTAssertEqual(oneMillionEnvironment["API_TIMEOUT_MS"], "3000000")
         XCTAssertEqual(oneMillionEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
-        let haikuEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let haikuEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-4.5-air"

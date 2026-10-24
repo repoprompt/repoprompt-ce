@@ -212,16 +212,7 @@ public extension ClaudeCompatibleBackendConfig {
     }
 
     var normalizedBaseURL: String? {
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let components = URLComponents(string: trimmed),
-              let scheme = components.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              components.host?.isEmpty == false
-        else {
-            return nil
-        }
-        return trimmed
+        ProviderEndpointConsentPolicy.endpointIdentity(baseURL)
     }
 
     var normalized: ClaudeCompatibleBackendConfig {
@@ -239,7 +230,8 @@ public extension ClaudeCompatibleBackendConfig {
             auth: auth,
             modelBehavior: normalizedBehavior,
             requestTimeoutMilliseconds: requestTimeoutMilliseconds,
-            contextWindowTokens: contextWindowTokens
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 
@@ -289,7 +281,8 @@ public extension ClaudeCompatibleBackendConfig {
             auth: auth,
             modelBehavior: overrideBehavior,
             requestTimeoutMilliseconds: requestTimeoutMilliseconds,
-            contextWindowTokens: contextWindowTokens
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 }
@@ -348,10 +341,18 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
         config: ClaudeCompatibleBackendConfig,
         apiKey: String,
         selectedBackendModelID: String? = nil
-    ) -> [String: String] {
+    ) throws -> [String: String] {
         let normalizedConfig = config.normalized
+        try ProviderEndpointConsentPolicy.validate(
+            normalizedConfig.baseURL,
+            credentialBearing: !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            consentEndpoint: normalizedConfig.httpCredentialConsentEndpoint
+        )
+        guard let baseURL = normalizedConfig.normalizedBaseURL else {
+            throw ProviderEndpointConsentPolicy.ValidationError.invalidEndpoint
+        }
         var environment: [String: String] = [
-            "ANTHROPIC_BASE_URL": normalizedConfig.normalizedBaseURL ?? normalizedConfig.baseURL,
+            "ANTHROPIC_BASE_URL": baseURL,
             normalizedConfig.auth.environmentVariableName: apiKey
         ]
 
@@ -679,7 +680,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "\(config.normalizedDisplayName) requires a configured API key.")
         }
 
-        return ClaudeCompatibleLaunchEnvironment(
+        return try ClaudeCompatibleLaunchEnvironment(
             effectiveModel: effectiveModel,
             environmentOverrides: ClaudeCompatibleBackendEnvironmentBuilder.environment(
                 config: environmentConfig,

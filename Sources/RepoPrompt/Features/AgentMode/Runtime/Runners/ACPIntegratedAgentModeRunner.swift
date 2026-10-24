@@ -626,7 +626,8 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
-        targetController: ACPAgentSessionController
+        targetController: ACPAgentSessionController,
+        writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil
     ) async -> Bool {
         guard session.operationAdmissionFailureMessage == nil else { return false }
         guard runRequest.agentKind == session.selectedAgent,
@@ -699,10 +700,9 @@ final class ACPIntegratedAgentModeRunner {
                 runID,
                 attachments
             )
-        // Active ACP steering is its own logical dispatch. If this send returns `false` the batch is
-        // requeued as a follow-up, which composes again through `runPromptTurn` under a different
-        // dispatch ID — correct, because this attempt was never accepted and the follow-up must
-        // render whatever membership is current when it dispatches.
+        // Active ACP steering is its own logical dispatch. A false return proves only that
+        // completion was not observed. The caller must consult its write receipt before
+        // requeueing: a written prompt with a lost response must never be replayed.
         let oversightDispatch = AgentSessionLinkPromptDispatchID.acpActiveSteering(runAttemptID: runAttemptID)
         var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
         var inputProof: AgentSessionLinkProviderInputRelease.Proof?
@@ -754,7 +754,7 @@ final class ACPIntegratedAgentModeRunner {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
             guard released?.mustAbortDispatch != true else { return false }
-            try await controller.prompt(released?.message(agentMessage) ?? agentMessage, request: runRequest)
+            try await controller.prompt(released?.message(agentMessage) ?? agentMessage, request: runRequest, writeReceipt: writeReceipt)
             if let monitoring {
                 hooks.providerInput.acceptAgentSessionLinkPrompt(
                     session, monitoring.dispatchContext, released?.claim

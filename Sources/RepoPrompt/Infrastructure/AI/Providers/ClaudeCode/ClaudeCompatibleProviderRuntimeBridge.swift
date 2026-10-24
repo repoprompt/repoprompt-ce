@@ -97,7 +97,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             auth: pluginAuth(from: normalized.auth),
             modelBehavior: pluginModelBehavior(from: normalized.modelBehavior),
             requestTimeoutMilliseconds: normalized.requestTimeoutMilliseconds,
-            contextWindowTokens: normalized.contextWindowTokens
+            contextWindowTokens: normalized.contextWindowTokens,
+            httpCredentialConsentEndpoint: normalized.httpCredentialConsentEndpoint
         )
     }
 
@@ -190,8 +191,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String,
         selectedBackendModelID: String? = nil
-    ) -> [String: String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
+    ) throws -> [String: String] {
+        try RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: pluginBackendConfig(from: config),
             apiKey: apiKey,
             selectedBackendModelID: selectedBackendModelID

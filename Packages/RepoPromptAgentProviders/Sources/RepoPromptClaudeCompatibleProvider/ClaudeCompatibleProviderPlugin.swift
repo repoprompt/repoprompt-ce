@@ -71,6 +71,7 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
     public let modelBehavior: ClaudeCompatibleBackendModelBehavior
     public let requestTimeoutMilliseconds: Int?
     public let contextWindowTokens: Int?
+    public let httpCredentialConsentEndpoint: String?
 
     public init(
         id: ClaudeCompatibleBackendID,
@@ -80,7 +81,8 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         auth: ClaudeCompatibleBackendAuth,
         modelBehavior: ClaudeCompatibleBackendModelBehavior,
         requestTimeoutMilliseconds: Int?,
-        contextWindowTokens: Int?
+        contextWindowTokens: Int?,
+        httpCredentialConsentEndpoint: String? = nil
     ) {
         self.id = id
         self.isEnabled = isEnabled
@@ -90,6 +92,7 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         self.modelBehavior = modelBehavior
         self.requestTimeoutMilliseconds = requestTimeoutMilliseconds
         self.contextWindowTokens = contextWindowTokens
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 }
 

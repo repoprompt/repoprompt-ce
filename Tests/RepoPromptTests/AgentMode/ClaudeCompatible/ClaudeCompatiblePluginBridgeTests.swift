@@ -16,7 +16,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         store.saveConfig(config)
         let restored = ClaudeCodeCompatibleBackendStore(defaults: defaults).config(for: .custom)
         XCTAssertTrue(restored.isValid)
-        let environment = ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: restored, apiKey: "dummy")
+        let environment = try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: restored, apiKey: "dummy")
         XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
         XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
         XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
