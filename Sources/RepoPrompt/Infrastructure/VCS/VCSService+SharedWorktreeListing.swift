@@ -6,12 +6,16 @@ import RepoPromptWorkspaceCore
 
 /// Configuration for the process-wide worktree listing shared by periodic Git context refreshes.
 struct SharedWorktreeListingConfiguration {
-    /// Matches one `GitViewModel` context-refresh interval (2.5 s). A window's own previous
-    /// enumeration is always expired by its next refresh; a listing shared from another window can
-    /// be up to one interval older than an uncached enumeration would have been.
+    /// Retains a completed listing for one `GitViewModel` context-refresh interval (2.5 s).
+    /// Enumeration duration does not consume this freshness interval.
     static let defaultTimeToLive: TimeInterval = 2.5
 
     var timeToLive: TimeInterval = Self.defaultTimeToLive
+    /// Separate from completed-result freshness: cancel a slow shared enumeration, then retain
+    /// its flight until the worker drains so a stalled worker cannot create overlapping retries.
+    var maximumFlightDuration: Duration = .seconds(120)
+    /// Test seam for the cancellation deadline; production uses the monotonic task clock.
+    var waitForFlightDeadline: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     /// Monotonic clock in seconds.
     var now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     /// Test seam replacing `git worktree list` plus per-worktree layout resolution.
@@ -25,14 +29,14 @@ struct SharedWorktreeListingConfiguration {
 struct SharedWorktreeListingState {
     struct Entry {
         let descriptors: [GitWorktreeDescriptor]
-        /// Age is measured from the start of the enumeration that produced the entry.
-        let fetchStartedAt: TimeInterval
+        let completedAt: TimeInterval
     }
 
     struct Flight {
         let id: UInt64
-        let startedAt: TimeInterval
+        let generation: UInt64
         let task: Task<[GitWorktreeDescriptor], Error>
+        let deadlineTask: Task<Void, Never>
     }
 
     var entries: [String: Entry] = [:]
@@ -45,6 +49,10 @@ struct SharedWorktreeListingState {
     var keyByRootPath: [String: SharedWorktreeListingKey?] = [:]
     /// Memoized: sharing is disabled when Git subprocesses inherit a repository location.
     var environmentAllowsSharing: Bool?
+}
+
+private enum SharedWorktreeListingError: Error {
+    case invalidated
 }
 
 /// Identifies one repository's listing. Enumeration always runs from `mainRoot`, so neither the
@@ -66,12 +74,13 @@ extension VCSService {
     /// `git worktree list` and resolves every linked worktree's `.git` and `commondir`, so windows
     /// whose roots belong to one repository used to repeat the same enumeration. Here those
     /// refreshes share one enumeration per repository:
-    /// - entries expire `timeToLive` after their enumeration started;
-    /// - concurrent requests for one repository join a single in-flight enumeration;
+    /// - entries expire `timeToLive` after their enumeration completes;
+    /// - concurrent requests join one flight, regardless of completed-result freshness;
+    /// - the separate flight deadline cancels a slow enumeration without starting another while
+    ///   it drains; Git's subprocess cancellation and timeout still apply;
     /// - `invalidateSharedWorktreeListings()` (also run by `invalidateCache(for:)` and
-    ///   `clearCache()`) drops entries and in-flight joins and prevents an enumeration that
-    ///   started earlier from being stored, so RepoPrompt's own worktree mutations are visible
-    ///   on the next refresh;
+    ///   `clearCache()`) drops entries and cancels old flights; their slots remain until drained,
+    ///   and their results cannot be returned or stored after a RepoPrompt mutation;
     /// - failures are never cached, and there is no modification-time validation.
     ///
     /// The key is the standardized common Git directory plus the known main-worktree root, and the
@@ -93,6 +102,7 @@ extension VCSService {
             return try await lister(rootURL)
         }
         var descriptors: [GitWorktreeDescriptor] = []
+        var receivedCurrentListing = false
         do {
             // One retry: a result never predates an uncached enumeration started when the caller retried.
             for _ in 0 ..< 2 {
@@ -101,18 +111,30 @@ extension VCSService {
                     return try await lister(rootURL)
                 }
                 let generation = sharedWorktreeListing.generation
-                descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
+                do {
+                    descriptors = try await sharedWorktreeListing(forKey: key, lister: lister)
+                } catch SharedWorktreeListingError.invalidated {
+                    continue
+                }
+                try Task.checkCancellation()
+                guard sharedWorktreeListing.generation == generation else { continue }
                 guard Self.listing(descriptors, belongsTo: key) else {
                     // Not recognisably this repository's listing (an inherited GIT_DIR, or a main-root
                     // spelling that differs from Git's): bypass sharing for this root, as before the cache.
                     sharedWorktreeListing.keyByRootPath[rootURL.standardizedFileURL.path] = .some(nil)
                     return try await lister(rootURL)
                 }
-                if sharedWorktreeListing.generation == generation { break }
+                receivedCurrentListing = true
+                break
             }
+            guard receivedCurrentListing else { throw SharedWorktreeListingError.invalidated }
+        } catch SharedWorktreeListingError.invalidated {
+            // Repeated mutations must fail this refresh, not fall back to an unshared enumeration.
+            throw SharedWorktreeListingError.invalidated
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            try Task.checkCancellation()
             // The shared enumeration from the key's main root failed (e.g. the main checkout moved):
             // re-resolve this root and enumerate from it, as before sharing.
             dropCachedResolution(forRepoRoot: rootURL)
@@ -138,7 +160,10 @@ extension VCSService {
     func invalidateSharedWorktreeListings() {
         sharedWorktreeListing.generation &+= 1
         sharedWorktreeListing.entries.removeAll()
-        sharedWorktreeListing.flights.removeAll()
+        for flight in sharedWorktreeListing.flights.values {
+            flight.deadlineTask.cancel()
+            flight.task.cancel()
+        }
         sharedWorktreeListing.keyByRootPath.removeAll()
     }
 
@@ -147,18 +172,17 @@ extension VCSService {
         lister: @escaping @Sendable (URL) async throws -> [GitWorktreeDescriptor]
     ) async throws -> [GitWorktreeDescriptor] {
         let key = listingKey.cacheKey
-        let startedAt = sharedWorktreeListingConfiguration.now()
+        let now = sharedWorktreeListingConfiguration.now()
         if let entry = sharedWorktreeListing.entries[key] {
-            if startedAt - entry.fetchStartedAt < sharedWorktreeListingConfiguration.timeToLive {
+            if now - entry.completedAt < sharedWorktreeListingConfiguration.timeToLive {
                 return entry.descriptors
             }
             sharedWorktreeListing.entries.removeValue(forKey: key)
         }
-        if let flight = sharedWorktreeListing.flights[key],
-           startedAt - flight.startedAt < sharedWorktreeListingConfiguration.timeToLive
-        {
+        if let flight = sharedWorktreeListing.flights[key] {
             sharedWorktreeListing.joinedFlightCount &+= 1
-            return try await flight.task.value
+            let result = await flight.task.result
+            return try finishSharedWorktreeListing(result, flight: flight, key: listingKey)
         }
 
         let generation = sharedWorktreeListing.generation
@@ -166,27 +190,56 @@ extension VCSService {
         let flightID = sharedWorktreeListing.nextFlightID
         // Unstructured so one waiter's cancellation cannot fail the other joined waiters.
         let mainRoot = listingKey.mainRoot
-        let task = Task { try await lister(mainRoot) }
-        sharedWorktreeListing.flights[key] = SharedWorktreeListingState.Flight(
+        let task = Task {
+            let descriptors = try await lister(mainRoot)
+            try Task.checkCancellation()
+            return descriptors
+        }
+        let waitForDeadline = sharedWorktreeListingConfiguration.waitForFlightDeadline
+        let maximumDuration = sharedWorktreeListingConfiguration.maximumFlightDuration
+        let deadlineTask = Task {
+            do {
+                try await waitForDeadline(maximumDuration)
+                try Task.checkCancellation()
+                task.cancel()
+            } catch {}
+        }
+        let flight = SharedWorktreeListingState.Flight(
             id: flightID,
-            startedAt: startedAt,
-            task: task
+            generation: generation,
+            task: task,
+            deadlineTask: deadlineTask
         )
+        sharedWorktreeListing.flights[key] = flight
         let result = await task.result
-        if sharedWorktreeListing.flights[key]?.id == flightID {
+        return try finishSharedWorktreeListing(result, flight: flight, key: listingKey)
+    }
+
+    private func finishSharedWorktreeListing(
+        _ result: Result<[GitWorktreeDescriptor], Error>,
+        flight: SharedWorktreeListingState.Flight,
+        key listingKey: SharedWorktreeListingKey
+    ) throws -> [GitWorktreeDescriptor] {
+        flight.deadlineTask.cancel()
+        let key = listingKey.cacheKey
+        let ownsSlot = sharedWorktreeListing.flights[key]?.id == flight.id
+        if ownsSlot {
             sharedWorktreeListing.flights.removeValue(forKey: key)
         }
-        if case let .success(descriptors) = result,
-           sharedWorktreeListing.generation == generation,
-           Self.listing(descriptors, belongsTo: listingKey),
-           (sharedWorktreeListing.entries[key]?.fetchStartedAt ?? -.infinity) < startedAt
-        {
+        guard sharedWorktreeListing.generation == flight.generation else {
+            throw SharedWorktreeListingError.invalidated
+        }
+        // A cancelled subprocess may report its own timeout/error while cancellation drains.
+        // Normalize it before the caller's ordinary-error fallback can duplicate the enumeration.
+        guard !flight.task.isCancelled else { throw CancellationError() }
+        let descriptors = try result.get()
+        if ownsSlot, Self.listing(descriptors, belongsTo: listingKey) {
             sharedWorktreeListing.entries[key] = SharedWorktreeListingState.Entry(
                 descriptors: descriptors,
-                fetchStartedAt: startedAt
+                completedAt: sharedWorktreeListingConfiguration.now()
             )
         }
-        return try result.get()
+        return descriptors
     }
 
     private func sharedWorktreeListingKey(forRepoRoot rootURL: URL) -> SharedWorktreeListingKey? {

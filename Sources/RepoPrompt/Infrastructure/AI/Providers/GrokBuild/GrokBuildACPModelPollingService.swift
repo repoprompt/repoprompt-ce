@@ -112,6 +112,15 @@ actor GrokBuildACPModelPollingService {
         client: GrokBuildACPControllerModelDiscoveryClient()
     )
 
+    enum RefreshOutcome: Equatable {
+        case updated
+        case unchanged
+        case noModelsAdvertised
+        case skipped
+        case failed
+        case cancelled
+    }
+
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date
@@ -122,7 +131,7 @@ actor GrokBuildACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Bool, Never>?
+    private var inFlightRefresh: Task<RefreshOutcome, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     #if DEBUG
         private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -199,9 +208,8 @@ actor GrokBuildACPModelPollingService {
         return stream
     }
 
-    @discardableResult
-    func refreshNow(workspacePath: String?) async -> Bool {
-        guard !isShutdown else { return false }
+    func refreshNow(workspacePath: String?) async -> RefreshOutcome {
+        guard !isShutdown else { return .skipped }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
             #if DEBUG
@@ -273,30 +281,37 @@ actor GrokBuildACPModelPollingService {
         }
     #endif
 
-    private func performRefresh() async -> Bool {
-        guard !isShutdown else { return false }
+    private func performRefresh() async -> RefreshOutcome {
+        guard !isShutdown else { return .skipped }
         if let existing = inFlightRefresh {
             return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task<Bool, Never> { [weak self, workspacePath] in
-            guard let self else { return false }
+        let previous = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        let task = Task<RefreshOutcome, Never> { [weak self, workspacePath] in
+            guard let self else { return .cancelled }
             do {
                 let discovered = try await client.discoverModels(workspacePath: workspacePath)
-                guard !Task.isCancelled else { return false }
-                if let discovered {
-                    await applyRefreshResult(discovered)
-                } else {
+                guard !Task.isCancelled else { return .cancelled }
+                guard let discovered, !discovered.options.isEmpty else {
                     await publishLiveReadinessWithoutModels()
+                    return .noModelsAdvertised
                 }
-                return true
+                let didChange = await applyRefreshResult(discovered)
+                guard !Task.isCancelled else { return .cancelled }
+                guard didChange else { return .unchanged }
+                return previous == AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+                    ? .unchanged
+                    : .updated
+            } catch is CancellationError {
+                return .cancelled
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
                 if AgentRuntimeProviderService.enableDebugLogging {
                     print("[GrokBuildACPModelPolling] refresh failed: \(error.localizedDescription)")
                 }
-                return false
+                return Task.isCancelled ? .cancelled : .failed
             }
         }
         inFlightRefresh = task
@@ -317,22 +332,23 @@ actor GrokBuildACPModelPollingService {
         }
     }
 
-    private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) {
-        guard !isShutdown else { return }
+    private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) -> Bool {
+        guard !isShutdown else { return false }
         // A discovery response with no usable models publishes readiness but never writes a
         // fake snapshot; the static "default" option comes from the catalog, not the registry.
         guard !discovered.options.isEmpty else {
             publishLiveReadinessWithoutModels()
-            return
+            return false
         }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .grokBuild)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild) else { return }
+        let didChange = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .grokBuild)
+        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild) else { return false }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
-        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return didChange }
         latest = snapshot
         for continuation in continuations.values {
             continuation.yield(snapshot)
         }
+        return didChange
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {

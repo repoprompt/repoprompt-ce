@@ -42,6 +42,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     let promptTokens: Int
     let completionTokens: Int
     let contextUsedTokens: Int?
+    /// A zero-cost boundary record: older occupancy cannot describe the compacted context.
+    let contextCompacted: Bool
     let estimatedUserInputTokens: Int
     let estimatedToolInputTokens: Int
     let estimatedToolOutputTokens: Int
@@ -53,6 +55,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         promptTokens: Int,
         completionTokens: Int,
         contextUsedTokens: Int? = nil,
+        contextCompacted: Bool = false,
         estimatedUserInputTokens: Int = 0,
         estimatedToolInputTokens: Int = 0,
         estimatedToolOutputTokens: Int = 0,
@@ -62,6 +65,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         self.turnID = turnID
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
+        self.contextCompacted = contextCompacted
         if let contextUsedTokens {
             let normalized = max(0, contextUsedTokens)
             self.contextUsedTokens = normalized > 0 ? normalized : nil
@@ -99,6 +103,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         case promptTokens
         case completionTokens
         case contextUsedTokens
+        case contextCompacted
         case estimatedUserInputTokens
         case estimatedToolInputTokens
         case estimatedToolOutputTokens
@@ -111,6 +116,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
         promptTokens = try max(0, container.decode(Int.self, forKey: .promptTokens))
         completionTokens = try max(0, container.decode(Int.self, forKey: .completionTokens))
+        contextCompacted = try container.decodeIfPresent(Bool.self, forKey: .contextCompacted) ?? false
         if let decodedContext = try container.decodeIfPresent(Int.self, forKey: .contextUsedTokens) {
             let normalized = max(0, decodedContext)
             contextUsedTokens = normalized > 0 ? normalized : nil
@@ -130,6 +136,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(contextUsedTokens, forKey: .contextUsedTokens)
+        if contextCompacted { try container.encode(true, forKey: .contextCompacted) }
         try container.encode(estimatedUserInputTokens, forKey: .estimatedUserInputTokens)
         try container.encode(estimatedToolInputTokens, forKey: .estimatedToolInputTokens)
         try container.encode(estimatedToolOutputTokens, forKey: .estimatedToolOutputTokens)
@@ -142,6 +149,11 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     // 9 adds the granular observer-session Auto-wake target UUID set.
+    //
+    // Organizational placement (`organizationalParentID`, `delegationScopeID`) is additive and
+    // `decodeIfPresent` *without* a bump, matching the metadata index: a bump would make this build
+    // rewrite every older session file on load and would not stop an older build from dropping the
+    // fields on its own re-save. An older file decodes with no placement (spawn provenance applies).
     static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
@@ -232,6 +244,15 @@ struct AgentSession: Codable, Identifiable {
     /// Immutable creation provenance for an overseer-created top-level lane.
     var createdByOverseerSessionID: UUID?
 
+    /// Mutable organizational tree placement (delegation-scope `.tree` membership, re-parenting).
+    ///
+    /// Distinct from spawn provenance, which stays write-once: `nil` means "follow spawn provenance"
+    /// (`parentSessionID`, then `createdByOverseerSessionID`). Only scope administration writes it.
+    var organizationalParentID: UUID?
+
+    /// The delegation scope this session was created under, when one was live at creation.
+    var delegationScopeID: UUID?
+
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
     var isMCPOriginated: Bool
@@ -250,6 +271,13 @@ struct AgentSession: Codable, Identifiable {
     var pendingHandoffCreatedAt: Date?
     var pendingHandoffSourceItemID: UUID?
     var pendingHandoffDefersProviderLockUntilSend: Bool
+    /// A non-nil marker blocks every provider send until the user closes this incomplete fork.
+    /// Kept in the session payload so saving, reopening, and restarting cannot silently choose the
+    /// primary checkout when inherited worktree preparation did not complete.
+    var pendingHandoffExecutionLocationFailure: String?
+
+    static let incompleteHandoffExecutionLocationMessage =
+        "This fork did not finish preparing its worktree. Close this partial chat and create a new fork from the source after its worktree is ready."
 
     /// Optional recovery data. A decoded attempt is never authority to resume provider work.
     var selfCompactState: AgentSelfCompactState?
@@ -297,10 +325,13 @@ struct AgentSession: Codable, Identifiable {
         codexMcpSessionKey: String? = nil,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
+        organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
+        pendingHandoffExecutionLocationFailure: String? = nil,
         selfCompactState: AgentSelfCompactState? = nil,
         isMCPOriginated: Bool = false,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
@@ -344,10 +375,13 @@ struct AgentSession: Codable, Identifiable {
         self.codexMcpSessionKey = codexMcpSessionKey
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
+        self.organizationalParentID = organizationalParentID
+        self.delegationScopeID = delegationScopeID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
+        self.pendingHandoffExecutionLocationFailure = pendingHandoffExecutionLocationFailure
         self.selfCompactState = selfCompactState
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindings = worktreeBindings
@@ -393,10 +427,13 @@ struct AgentSession: Codable, Identifiable {
         case codexMcpSessionKey
         case parentSessionID
         case createdByOverseerSessionID
+        case organizationalParentID
+        case delegationScopeID
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
+        case pendingHandoffExecutionLocationFailure
         case selfCompactState
         case isMCPOriginated
         case worktreeBindings
@@ -463,10 +500,23 @@ struct AgentSession: Codable, Identifiable {
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
+        organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
+        delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
+        if container.contains(.pendingHandoffExecutionLocationFailure),
+           try !container.decodeNil(forKey: .pendingHandoffExecutionLocationFailure)
+        {
+            // Unknown/future marker shapes and malformed values are still evidence of incomplete
+            // execution preparation. Decode them as blocked, never as an ordinary unbound session.
+            let reason = try? container.decode(String.self, forKey: .pendingHandoffExecutionLocationFailure)
+            pendingHandoffExecutionLocationFailure = reason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? reason : Self.incompleteHandoffExecutionLocationMessage
+        } else {
+            pendingHandoffExecutionLocationFailure = nil
+        }
         if container.contains(.selfCompactState), try !(container.decodeNil(forKey: .selfCompactState)) {
             do {
                 var restored = try container.decode(AgentSelfCompactState.self, forKey: .selfCompactState)

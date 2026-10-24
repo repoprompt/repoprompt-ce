@@ -23,6 +23,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let claude: CompactRecordingNativeController
         let codexRecorder: LifecycleRecorder
         let driftHook: AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook
+        let managesCodexTooling: Bool
     }
 
     @MainActor
@@ -118,7 +119,16 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 events.record(.providerControllerCreated)
                 return claude
             },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, purpose, taskLabelKind, allowsExternalControl, requiresExpectedPID in
+                guard shouldManageCodexTooling else { return }
+                await ServerNetworkManager.shared.installClientConnectionPolicy(
+                    for: clientName, windowID: windowID, restrictedTools: restrictedTools,
+                    oneShot: oneShot, reason: reason, ttl: ttl, tabID: tabID, runID: runID,
+                    additionalTools: additionalTools, purpose: purpose, taskLabelKind: taskLabelKind,
+                    allowsAgentExternalControlTools: allowsExternalControl,
+                    requiresExpectedAgentPID: requiresExpectedPID
+                )
+            },
             mcpServerEnabler: { true },
             testCodexStallWatchdogPollIntervalNanos: codexStallWatchdogPollIntervalNanos,
             testCodexStallWatchdogProbeThreshold: codexStallWatchdogProbeThreshold,
@@ -153,13 +163,36 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             session.providerSessionID = "provider-conversation"
             session.codexConversationID = "codex-thread"
         }
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
             tabName: "Build API",
             isWindowClosing: false
         ))
+        if shouldManageCodexTooling {
+            addTeardownBlock { @MainActor in
+                let runID = session.runID
+                await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+                if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                    await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                        for: clientName, windowID: 1, runID: runID
+                    )
+                    await MCPRoutingWaiter.shared.cleanup(runID: runID)
+                }
+                _ = manager
+            }
+        }
         return Fixture(
             viewModel: viewModel,
             manager: manager,
@@ -169,7 +202,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             events: events,
             claude: claude,
             codexRecorder: codexRecorder,
-            driftHook: driftHook
+            driftHook: driftHook,
+            managesCodexTooling: shouldManageCodexTooling
         )
     }
 
@@ -200,12 +234,27 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         liveness: @escaping AgentSessionLinkSendLivenessProbe = { liveLiveness },
         commit: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkSendTransactionOutcome {
-        await fixture.viewModel.agentSessionLinkPerformCompact(
+        let routing = fixture.managesCodexTooling ? Task {
+            do {
+                try await AsyncTestWait.waitUntil("managed compact resume staged", timeout: 4) {
+                    fixture.viewModel.test_codexCoordinator.test_hasPendingCodexStart(for: fixture.session)
+                }
+                if !Task.isCancelled, let runID = fixture.session.runID {
+                    await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+                }
+            } catch {
+                if !Task.isCancelled { XCTFail("Managed compact routing fixture failed: \(error)") }
+            }
+        } : nil
+        let outcome = await fixture.viewModel.agentSessionLinkPerformCompact(
             to: fixture.candidate,
             request: request,
             liveness: liveness,
             commitAuthorization: commit
         )
+        routing?.cancel()
+        await routing?.value
+        return outcome
     }
 
     // MARK: - Support
@@ -267,6 +316,41 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         // `AgentSessionLinkCompactClaudeDispatchTests`, which drives the raw lane directly.
         XCTAssertEqual(fixture.session.runState, .running)
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim is released")
+    }
+
+    func testAgentSelfOversizeAdmissionReportsEnforcedWindowBasis() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.noteLimit")
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        let cases: [(Int?, Int, String)] = [
+            (1000, 400, "10% of context window at 4 UTF-8 bytes/token"),
+            (nil, 65536, "unknown context window fallback")
+        ]
+        for (window, maximum, basis) in cases {
+            fixture.session.contextUsageSnapshot = nil
+            if let window {
+                fixture.session.contextUsageSnapshot = ContextUsageSnapshot(
+                    used: 1, window: window, confidence: .exact, source: .claudeUsageEvent, compactedAt: nil
+                )
+                fixture.session.noteLiveContextUsageReport(contextUsedTokens: 1, promptTokens: nil, modelContextWindow: window)
+            }
+            let admission = await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: String(repeating: "x", count: maximum + 1), idempotencyKey: "oversized"
+            )
+            guard case let .noteTooLong(byteCount, enforcedMaximum, enforcedBasis) = admission else {
+                return XCTFail("Expected an oversized-note refusal from real VM admission")
+            }
+            XCTAssertEqual(byteCount, maximum + 1)
+            XCTAssertEqual(enforcedMaximum, maximum)
+            XCTAssertEqual(enforcedBasis, basis)
+            XCTAssertNil(fixture.session.selfCompactState.active)
+        }
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
     func testSelfTerminalBoundaryStartsNativeCommandPipelineAfterPersistingFixedRow() async throws {
@@ -756,7 +840,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
     }
 
-    func testIdleManagedCodexCompactionResumesExactThreadWithoutTurnBootstrap() async throws {
+    func testIdleManagedCodexCompactionResumesExactThreadWithRoutingWithoutUserTurn() async throws {
         let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true)
         fixture.session.codexConversationID = "lifecycle"
         XCTAssertNil(fixture.session.codexController, "Exercise idle controller restoration")
@@ -784,15 +868,22 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         guard await gate.waitUntilEntered() else { return }
         XCTAssertEqual(fixture.session.items.last?.text, AgentChatItem.overseerCompactionRequestText)
 
+        let runID = try XCTUnwrap(fixture.session.runID)
         operation.cancel()
         gate.release()
         let outcome = await operation.value
+        let policies = try await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+            for: XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint)
+        )
+        XCTAssertFalse(policies.contains { $0.runID == runID })
+        let routingOutcome = await MCPRoutingWaiter.currentTerminalOutcome(runID: runID)
+        XCTAssertNil(routingOutcome)
 
         guard case let .delivered(delivery) = outcome else {
             return XCTFail("The durable request survives cancellation: \(outcome)")
         }
         XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
-        XCTAssertEqual(fixture.session.codexController?.hasActiveThread, true, "Resume still completed")
+        XCTAssertNil(fixture.session.codexController, "Cancelled uncommitted resume is retired")
         XCTAssertEqual(delivery.deliveryState, .persisted, "The cancelled caller must not dispatch")
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))
@@ -936,7 +1027,17 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         session.claudeController = controller
         let inventory = MonitorInventoryPublisher(viewModel: viewModel, observerSessionID: sessionID, tabID: tabID)
         return (viewModel, session, inventory, tabID)
@@ -1060,7 +1161,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             runAttemptID: XCTUnwrap(session.activeRunAttemptID)
         )
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "native-note-test", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "native-note-test", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .dispatchingNote
         state.active?.compactProviderConversation = "monitor-native-session"
         let id = try XCTUnwrap(state.active?.id)

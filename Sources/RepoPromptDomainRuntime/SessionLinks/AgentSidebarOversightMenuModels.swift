@@ -101,7 +101,8 @@ package struct AgentSidebarOversightMenuProps: Equatable {
     package let targetDisplayName: String
 
     /// Oversee-by list: linked observers retained for unlinking, plus available candidates
-    /// that already hold an outbound link (the existing-overseer rule, enforced again at Add).
+    /// that already hold an outbound link (the existing-overseer rule, re-checked when a pick
+    /// from this list is added).
     package let observerOptions: [PeerOption]
     /// Oversee list: linked targets retained for unlinking, plus eligible target candidates.
     /// Available choices are hidden when the row cannot currently observe.
@@ -258,10 +259,11 @@ package enum AgentSidebarOversightActionKey: Hashable {
 /// live-candidate presentation snapshot; the exact Add operation revalidates them before
 /// mutating.
 ///
-/// Ordering contract (approved 2026-09-30): in both directions the row's own workspace cohort
-/// sorts first, then the rest by folded display name; the outbound list additionally keeps its
-/// linked (ticked) entries first. Ineligible directions produce a greyed reason instead of a
-/// hidden menu.
+/// Ordering contract: every list sorts alphabetically by the visible label — workspace name,
+/// then branch, then chat name — with fixed-locale case/diacritic folding, natural number order
+/// and exact-identity tie-breakers; collision-disambiguation suffixes never participate. The
+/// outbound list additionally keeps its linked (ticked) entries first. Ineligible directions
+/// produce a greyed reason instead of a hidden menu.
 package enum AgentSidebarOversightMenuProjection {
     fileprivate struct Seed {
         let peerEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -273,7 +275,7 @@ package enum AgentSidebarOversightMenuProjection {
 
         let baseMenuLabel: String
         let fullIdentityDescription: String
-        let foldedName: String
+        let labelSortKey: String
         let sessionSortKey: String
         let workspaceSortKey: String
         let tabSortKey: String
@@ -295,7 +297,7 @@ package enum AgentSidebarOversightMenuProjection {
             self.relationship = relationship
             let location = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             baseMenuLabel = location.isEmpty ? displayName : "\(location): \(displayName)"
-            foldedName = folded(displayName)
+            labelSortKey = folded(baseMenuLabel)
             sessionSortKey = peerSessionID.uuidString
             workspaceSortKey = peerEndpoint.workspaceID.uuidString
             tabSortKey = peerEndpoint.tabID.uuidString
@@ -315,7 +317,6 @@ package enum AgentSidebarOversightMenuProjection {
         package let firstBySessionID: [UUID: AgentSessionLinkEndpointCandidate]
         fileprivate let labelsAreUnique: Bool
         fileprivate let orderedPeers: [Seed]
-        fileprivate let peersByWorkspace: [UUID: [Seed]]
         fileprivate let observerEligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
         fileprivate let targetEligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
 
@@ -332,9 +333,8 @@ package enum AgentSidebarOversightMenuProjection {
                     locationLabel: candidate.locationLabel,
                     relationship: .available
                 )
-            }.sorted { orderedBefore($0, $1, currentWorkspaceID: nil) }
+            }.sorted(by: orderedBefore)
             labelsAreUnique = Set(orderedPeers.map(\.baseMenuLabel)).count == orderedPeers.count
-            peersByWorkspace = Dictionary(grouping: orderedPeers, by: { $0.peerEndpoint.workspaceID })
             observerEligibleEndpoints = Set(byEndpoint.values.filter {
                 AgentSessionLinkEndpointEligibility.addDisabledReason(
                     $0.eligibilityInput, roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
@@ -370,7 +370,6 @@ package enum AgentSidebarOversightMenuProjection {
         creatorSessionID: UUID? = nil
     ) -> AgentSidebarOversightMenuProps {
         let rowEndpoint = target.domainEndpoint
-        let rowWorkspaceID = target.workspaceID
 
         // Both directions carry independent eligibility: a session can be a valid target while
         // unable to observe (for example MCP-controlled), and vice versa.
@@ -382,9 +381,8 @@ package enum AgentSidebarOversightMenuProjection {
 
         let candidatesByEndpoint = candidateIndex.byEndpoint
         let candidatesBySessionID = candidateIndex.firstBySessionID
-        // Filtering this shared order preserves own-workspace-first without sorting N peers per row.
-        let orderedPeers = (candidateIndex.peersByWorkspace[rowWorkspaceID] ?? [])
-            + candidateIndex.orderedPeers.filter { $0.peerEndpoint.workspaceID != rowWorkspaceID }
+        // One shared label order serves every row; per-row filtering needs no re-sort.
+        let orderedPeers = candidateIndex.orderedPeers
 
         // MARK: Inbound (who oversees this row)
 
@@ -506,16 +504,13 @@ package enum AgentSidebarOversightMenuProjection {
 
         // MARK: Ordering and labels
 
-        // Inbound: one flat checkmark list — own workspace first, then folded name.
+        // Inbound: one flat checkmark list ordered by the visible label.
         let observerSeeds = mergeOrdered(
-            linkedObservers.sorted { orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID) },
-            availableObservers,
-            currentWorkspaceID: rowWorkspaceID
+            linkedObservers.sorted(by: orderedBefore),
+            availableObservers
         )
-        // Outbound: ticked first, then own-workspace-first and folded name within each group.
-        let targetSeeds = linkedTargets.sorted {
-            orderedBefore($0, $1, currentWorkspaceID: rowWorkspaceID)
-        } + availableTargets
+        // Outbound: ticked first, then label order within each group.
+        let targetSeeds = linkedTargets.sorted(by: orderedBefore) + availableTargets
 
         let observerLabels = collisionSafeLabels(for: observerSeeds, linked: linkedObservers, candidateIndex: candidateIndex)
         let targetLabels = collisionSafeLabels(for: targetSeeds, linked: linkedTargets, candidateIndex: candidateIndex)
@@ -586,19 +581,14 @@ package enum AgentSidebarOversightMenuProjection {
         return provider
     }
 
-    /// Own-workspace cohort first, then case/diacritic-insensitive name, then exact identity.
-    private static func orderedBefore(
-        _ lhs: Seed,
-        _ rhs: Seed,
-        currentWorkspaceID: UUID?
-    ) -> Bool {
-        let lhsInWorkspace = lhs.peerEndpoint.workspaceID == currentWorkspaceID
-        let rhsInWorkspace = rhs.peerEndpoint.workspaceID == currentWorkspaceID
-        if lhsInWorkspace != rhsInWorkspace { return lhsInWorkspace }
-
-        let lhsName = lhs.foldedName
-        let rhsName = rhs.foldedName
-        if lhsName != rhsName { return lhsName < rhsName }
+    /// Alphabetic by the visible label — "workspace (branch): chat name" — then exact identity.
+    /// The folded label is compared with `.numeric` so embedded numbers order naturally.
+    private static func orderedBefore(_ lhs: Seed, _ rhs: Seed) -> Bool {
+        switch lhs.labelSortKey.compare(rhs.labelSortKey, options: [.numeric], locale: foldingLocale) {
+        case .orderedAscending: return true
+        case .orderedDescending: return false
+        case .orderedSame: break
+        }
 
         let lhsSession = lhs.sessionSortKey
         let rhsSession = rhs.sessionSortKey
@@ -622,13 +612,13 @@ package enum AgentSidebarOversightMenuProjection {
             < rhs.peerEndpoint.bindingTransitionGeneration
     }
 
-    private static func mergeOrdered(_ linked: [Seed], _ available: [Seed], currentWorkspaceID: UUID) -> [Seed] {
+    private static func mergeOrdered(_ linked: [Seed], _ available: [Seed]) -> [Seed] {
         var result: [Seed] = []
         result.reserveCapacity(linked.count + available.count)
         var linkedIndex = 0
         var availableIndex = 0
         while linkedIndex < linked.count, availableIndex < available.count {
-            if orderedBefore(available[availableIndex], linked[linkedIndex], currentWorkspaceID: currentWorkspaceID) {
+            if orderedBefore(available[availableIndex], linked[linkedIndex]) {
                 result.append(available[availableIndex])
                 availableIndex += 1
             } else {

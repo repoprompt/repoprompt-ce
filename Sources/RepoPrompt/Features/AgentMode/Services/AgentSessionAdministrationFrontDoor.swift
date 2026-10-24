@@ -1,0 +1,826 @@
+import Foundation
+import MCP
+import RepoPromptDomainRuntime
+
+/// `session_admin`'s entry point over `AgentSessionAdministrationCore` (design §2.5, §3.1).
+///
+/// The core keeps the single authority check and dispatch; this front door adds the call-shaping that
+/// sits around it, without touching that check:
+/// - `filter` → targets (loaded scope members only, capped at `maxTargets`),
+/// - target derivation for ordered ops (`reorder_pins`, `reorder_groups`),
+/// - `preview` (a dry run listing exact items and effects; never reaches a handler),
+/// - idempotency for direct (uncarded) mutating calls,
+/// - `undo` tokens, re-authorized as the original operation at redemption,
+/// - apply-on-approval: when the user approves a batch card, the stored request is applied with the
+///   exact same arguments, narrowed to the ticked items, and the result is kept for
+///   `confirmation_status`.
+///
+/// All batch-card and projector usage for the organizing ops is localized here.
+@MainActor
+final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationService {
+    static let maxRetainedResults = 256
+
+    private let core: AgentSessionAdministrationCore
+    private let scopes: DelegationScopeRuntime
+    private let projector: any DelegationMembershipProjector
+    private let inventory: any AgentSessionInventorySource
+    /// The session a tab is explicitly bound to right now, or `nil` when unbound or ambiguous.
+    private let liveBoundSession: @MainActor (UUID) -> UUID?
+    private var handlers: [DomainAgentSessionTargetOperation: any AgentSessionAdministrationOperationHandler] = [:]
+    private weak var undoer: (any AgentSessionAdministrationUndoing)?
+    private var retainedHandlers: [any AgentSessionAdministrationOperationHandler] = []
+    private var idempotency = DomainAgentSessionAdministrationIdempotencyLedger<Value>()
+    private struct InFlightKey: Hashable {
+        let granteeSessionID: UUID
+        let idempotencyKey: String
+    }
+
+    /// Reserve before any shaping/handler suspension. A completed-result ledger alone cannot
+    /// prevent concurrent retries from both creating a session or worktree.
+    private var inFlight: [InFlightKey: String] = [:]
+    /// Input coverage is retained with the exact selected targets. It is not an authority proof,
+    /// nor does complete history establish that every loaded carrier has resolvable membership.
+    private struct FilterSelectionCoverage {
+        let loadedOnly: Bool
+        let recordsComplete: Bool
+        let endpointsComplete: Bool
+
+        var value: Value {
+            .object([
+                "domain": .string("loaded_scope_members"),
+                "read_mode": .string(loadedOnly ? "loaded_only" : "history_and_loaded"),
+                "records_complete": .bool(recordsComplete),
+                "endpoints_complete": .bool(endpointsComplete),
+                "detail": .string(
+                    recordsComplete
+                        ? "Only matching loaded scope members are selected. Inventory coverage is separate from current target authorization."
+                        : "Only known matching loaded scope members are selected; other matches may be absent."
+                )
+            ])
+        }
+
+        func adding(to value: Value) -> Value {
+            guard case var .object(object) = value else { return value }
+            object["selection"] = self.value
+            if !recordsComplete {
+                object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey)
+                // False means completeness is unproven, not that a specific omitted match is known.
+                // Never manufacture a positive selection proof from record coverage alone.
+                object["selection_complete"] = .bool(false)
+                if object["result"] == .string("applied") {
+                    object["selected_result"] = .string("applied")
+                    object["result"] = .string("partial")
+                }
+            }
+            return .object(object)
+        }
+    }
+
+    private struct ResolvedTargets {
+        let sessionIDs: [UUID]
+        let coverage: FilterSelectionCoverage?
+    }
+
+    private struct PendingApply {
+        let request: AgentSessionAdministrationRequest
+        let coverage: FilterSelectionCoverage?
+    }
+
+    /// Requests and original coverage behind undecided cards, keyed by confirmation ID.
+    private var pendingApplies: [UUID: PendingApply] = [:]
+    private var appliedResults: [UUID: Value] = [:]
+    private var appliedOrder: [UUID] = []
+
+    init(
+        core: AgentSessionAdministrationCore,
+        scopes: DelegationScopeRuntime,
+        projector: any DelegationMembershipProjector,
+        inventory: any AgentSessionInventorySource,
+        liveBoundSession: @escaping @MainActor (UUID) -> UUID?
+    ) {
+        self.core = core
+        self.scopes = scopes
+        self.projector = projector
+        self.inventory = inventory
+        self.liveBoundSession = liveBoundSession
+    }
+
+    /// The tab's unique loaded physical presenter. Inactive catalog copies are not presenters;
+    /// genuinely loaded duplicates remain ambiguous and fail closed.
+    static func liveExplicitBinding(forTab tabID: UUID) -> UUID? {
+        DelegationScopeRuntime.loadedPresentation(
+            forTab: tabID, in: WindowStatesManager.shared.allWindows
+        )?.sessionID
+    }
+
+    static func production(
+        core: AgentSessionAdministrationCore,
+        scopes: DelegationScopeRuntime,
+        workspaceLocations: HistoryWorkspaceLocationResolver
+    ) -> AgentSessionAdministrationFrontDoor {
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core,
+            scopes: scopes,
+            projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource()),
+            inventory: LiveAgentSessionInventorySource(scanner: HistorySessionScanner(workspaceLocations: workspaceLocations)),
+            liveBoundSession: { liveExplicitBinding(forTab: $0) }
+        )
+        frontDoor.registerOrganizingHandlers(
+            backend: OpenWindowsAgentSessionOrganizer(),
+            links: BridgeAgentSessionLinkReleaser()
+        )
+        return frontDoor
+    }
+
+    /// Registers Lane B's inventory, organize, and release handlers on the core.
+    func registerOrganizingHandlers(backend: any AgentSessionOrganizingBackend, links: any AgentSessionLinkReleasing) {
+        let scopes = scopes
+        let context = SessionAdminHandlerContext(scopes: scopes, projector: projector)
+        let isLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool = { lease in
+            guard let scope = scopes.record(id: lease.scopeID) else { return false }
+            return context.isStillAuthorized(lease, scope: scope)
+        }
+        let isReadLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool = { lease in
+            guard let scope = scopes.record(id: lease.scopeID) else { return false }
+            return context.isStillAuthorized(lease, scope: scope, requiresMutationOwner: false)
+        }
+        register(AgentSessionInventoryOperationHandler(
+            source: inventory,
+            scopeChain: { scopes.scopeChain(from: $0) },
+            isScopeCurrent: { record in
+                scopes.record(id: record.id).map { $0.isActive && $0.generation == record.generation } ?? false
+            },
+            isLeaseCurrent: isReadLeaseCurrent
+        ))
+        let holdsControl: @MainActor (DomainDelegationScopeRecord) -> Bool = { [weak self] scope in
+            self?.holdsControl(scope) ?? false
+        }
+        register(AgentSessionOrganizeOperationHandler(
+            backend: backend,
+            isLeaseCurrent: isLeaseCurrent,
+            holdsControl: holdsControl,
+            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false },
+            isGroupOrderLeaseCurrent: isReadLeaseCurrent
+        ))
+        register(AgentSessionReleaseOperationHandler(
+            backend: backend,
+            links: links,
+            isLeaseCurrent: isLeaseCurrent,
+            // Release reaches a counterpart only when permitted (`scopeMembership`), never by placement alone.
+            isMember: { sessionID, scope in context.permitsMember(sessionID, ofChainFrom: scope) },
+            holdsControl: holdsControl
+        ))
+    }
+
+    /// `OverseerAuthorizationEngine.holdsControl`.
+    func holdsControl(_ scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.holdsControl(scope)
+    }
+
+    /// `OverseerAuthorizationEngine.scopeChainHolds`.
+    private func chainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.scopeChainHolds(capability, scope: scope)
+    }
+
+    // MARK: - AgentSessionAdministrationService
+
+    func register(_ handler: any AgentSessionAdministrationOperationHandler) {
+        core.register(handler)
+        retainedHandlers.append(handler)
+        for operation in handler.operations {
+            handlers[operation] = handler
+        }
+        if let undoing = handler as? any AgentSessionAdministrationUndoing {
+            undoer = undoing
+        }
+    }
+
+    func authorize(_ request: AgentSessionAdministrationRequest) -> AgentSessionAdministrationAuthorization {
+        core.authorize(request)
+    }
+
+    func perform(_ request: AgentSessionAdministrationRequest) async throws -> AgentSessionAdministrationOutcome {
+        if AgentSessionInventoryInvocation.budget != nil {
+            return try await performWithinInventoryBudget(request)
+        }
+        return try await AgentSessionInventoryInvocation.budgetTaskLocal.withValue(.standalone()) {
+            try await performWithinInventoryBudget(request)
+        }
+    }
+
+    private func performWithinInventoryBudget(
+        _ request: AgentSessionAdministrationRequest
+    ) async throws -> AgentSessionAdministrationOutcome {
+        try Task.checkCancellation()
+        // Anything the front door cannot shape (no handler, no unique live scope, a non-Agent caller)
+        // goes straight to the core, which owns every denial.
+        guard handlers[request.operation] != nil,
+              let callerSessionID = request.caller.agentSessionID,
+              let scope = scopes.authorization.scopeForAdministrationShaping(request)
+        else { return try await core.perform(request) }
+        // Cards left behind on a tab that no longer shows the caller can never be presented again;
+        // release their pending slots before the call may need a new card.
+        scopes.confirmations.invalidateUnpresentableConfirmations(
+            granteeSessionID: callerSessionID, liveBoundSession: liveBoundSession
+        )
+        prunePendingApplies()
+
+        let mutating = request.operation.mutatesTarget
+        let fingerprint = Self.fingerprint(request, scopeID: scope.id)
+        let directKey = mutating && !request.preview && request.confirmationID == nil ? request.idempotencyKey : nil
+        if let directKey {
+            switch idempotency.lookup(granteeSessionID: callerSessionID, idempotencyKey: directKey, fingerprint: fingerprint) {
+            case let .replay(value): return .completed(Self.markReplay(value))
+            case .conflict: return .idempotencyConflict
+            case .miss: break
+            }
+        }
+
+        let inFlightKey = directKey.map { InFlightKey(granteeSessionID: callerSessionID, idempotencyKey: $0) }
+        if let inFlightKey {
+            if let existing = inFlight[inFlightKey] {
+                guard existing == fingerprint else { return .idempotencyConflict }
+                return .completed(.object([
+                    "result": .string("in_progress"),
+                    "op": .string(request.operation.adminOperationName),
+                    "retryable": .bool(true)
+                ]))
+            }
+            inFlight[inFlightKey] = fingerprint
+        }
+        defer {
+            if let inFlightKey { inFlight.removeValue(forKey: inFlightKey) }
+        }
+
+        var shaped = request.rebuilt(scopeID: scope.id)
+        var selectionCoverage: FilterSelectionCoverage?
+        var unloadedItems: [AgentSessionAdminItemResult] = []
+        if !request.operation.isScopeLevel {
+            // A filter enumerates sessions, so it needs a live scope holding `observe` and the
+            // operation's own capability before anything is resolved.
+            let groupDiscovery = request.operation == .adminReorderGroups
+                && (request.arguments["order"] == nil || request.arguments["expected_order"] == nil)
+            if request.arguments["filter"] != nil || groupDiscovery,
+               let denial = filterDenial(request.operation, scope: scope)
+            {
+                return .denied(denial, sessionID: nil)
+            }
+            let shapingChain = scopes.scopeChain(from: scope.id)
+            do {
+                if let resolved = try await resolveTargets(shaped, scope: scope, callerSessionID: callerSessionID) {
+                    selectionCoverage = resolved.coverage
+                    guard !resolved.sessionIDs.isEmpty else {
+                        let value: Value = if resolved.coverage?.recordsComplete == false {
+                            AgentSessionInventoryReadFailure.incomplete(.noMatchesWhileInventoryIncomplete).value
+                        } else {
+                            .object([
+                                "result": .string("no_matching_sessions"),
+                                "op": .string(request.operation.adminOperationName),
+                                "items": .array([])
+                            ])
+                        }
+                        return .completed(resolved.coverage?.adding(to: value) ?? value)
+                    }
+                    shaped = shaped.rebuilt(targets: resolved.sessionIDs)
+                } else {
+                    if let refusal = try await unresolvedTargetRefusal(shaped, scope: scope) {
+                        return .completed(refusal)
+                    }
+                    let split = try await splitUnloadedTargets(shaped.targetSessionIDs, scope: scope)
+                    if !mutating, !split.unloaded.isEmpty {
+                        return .completed(.object([
+                            "result": .string("unavailable"), "code": .string("workspace_not_loaded"),
+                            "op": .string(request.operation.adminOperationName), "retryable": .bool(true)
+                        ]))
+                    }
+                    unloadedItems = split.unloaded.map {
+                        AgentSessionAdminItemResult(sessionID: $0, status: .skipped, reason: "workspace_not_loaded")
+                    }
+                    if !unloadedItems.isEmpty {
+                        guard !split.remaining.isEmpty else {
+                            return .completed(AgentSessionAdminRendering.mutationValue(
+                                operation: request.operation,
+                                items: unloadedItems,
+                                itemsRequiringControl: [],
+                                extra: ["workspace_not_loaded_detail": .string(Self.unloadedDetail)]
+                            ))
+                        }
+                        shaped = shaped.rebuilt(targets: split.remaining)
+                    }
+                }
+            } catch let failure as AgentSessionInventoryReadFailure {
+                try checkInventoryAuthority(scope, chain: shapingChain)
+                return .completed(failure.value)
+            } catch let early as AgentSessionAdminEarlyResult {
+                return .completed(early.value)
+            }
+        }
+
+        if shaped.preview, mutating {
+            let outcome = try preview(shaped)
+            if case let .completed(value) = outcome, let selectionCoverage {
+                return .completed(selectionCoverage.adding(to: value))
+            }
+            return outcome
+        }
+
+        var outcome = try await core.perform(shaped)
+        if !unloadedItems.isEmpty, case let .completed(value) = outcome {
+            outcome = .completed(Self.appending(unloadedItems, to: value))
+        }
+        let receiptCoverage = request.confirmationID.flatMap { pendingApplies[$0]?.coverage } ?? selectionCoverage
+        if case let .completed(value) = outcome, let receiptCoverage {
+            outcome = .completed(receiptCoverage.adding(to: value))
+        }
+        switch outcome {
+        case let .completed(value):
+            if let confirmationID = request.confirmationID,
+               scopes.confirmations.confirmation(id: confirmationID, granteeSessionID: callerSessionID)?.state == .consumed
+            {
+                recordApplied(value, confirmationID: confirmationID)
+                pendingApplies.removeValue(forKey: confirmationID)
+            }
+            // Only a call that changed something (including partially committed work on items that
+            // then failed) is replayable; a no-op or a refused ordering is re-evaluated on retry, so
+            // the retry sees current state.
+            if let directKey, Self.changedSomething(value) {
+                idempotency.record(
+                    granteeSessionID: callerSessionID, idempotencyKey: directKey, fingerprint: fingerprint, result: value
+                )
+            }
+        case let .pendingConfirmation(card, _):
+            if card.state == .pending, pendingApplies[card.id] == nil {
+                pendingApplies[card.id] = PendingApply(request: shaped, coverage: selectionCoverage)
+            }
+        default:
+            break
+        }
+        return outcome
+    }
+
+    // MARK: - Undo
+
+    /// Redeems an `undo_token`. The undo is re-authorized as the original operation over the
+    /// original targets, so a revoked scope or a target that left the scope undoes nothing. Restoring
+    /// the exact prior state of items the user already approved needs no second bulk card.
+    func undo(token: String, caller: DomainAgentSessionCallerIdentity) async throws -> AgentSessionAdministrationOutcome {
+        guard let callerSessionID = caller.agentSessionID else {
+            return .denied(.callerNotAgentSession, sessionID: nil)
+        }
+        guard let undoer else { return .completed(Self.undoUnavailable) }
+        switch undoer.redeemUndo(token: token, granteeSessionID: callerSessionID) {
+        case .unavailable:
+            return .completed(Self.undoUnavailable)
+        case .expired:
+            return .completed(.object([
+                "result": .string("undo_expired"),
+                "detail": .string("The undo window for this token has passed.")
+            ]))
+        case let .redeemed(entry):
+            // Bound to the scope generation the call ran under: a re-generated scope undoes nothing.
+            guard let live = scopes.record(id: entry.scopeID), live.isActive, live.generation == entry.scopeGeneration else {
+                let state = scopes.record(id: entry.scopeID)?.state
+                let denial: DomainDelegationScopeDenial = switch state {
+                case .expired?: .expired
+                case .revoked?: .revoked
+                default: .generationStale
+                }
+                return .denied(denial, sessionID: nil)
+            }
+            let request = AgentSessionAdministrationRequest(
+                operation: entry.payload.authorizationOperation(original: entry.operation),
+                caller: caller,
+                scopeID: entry.scopeID,
+                targetSessionIDs: entry.targetSessionIDs
+            )
+            let outcome: AgentSessionAdministrationOutcome
+            switch core.authorize(request) {
+            case let .authorized(batch), let .confirmationRequired(.bulkThreshold, batch):
+                return try await .completed(undoer.performUndo(entry, batch: batch))
+            case let .confirmationRequired(reason, _):
+                outcome = .denied(.confirmationRequired(reason: reason), sessionID: nil)
+            case let .denied(denial, sessionID):
+                outcome = .denied(denial, sessionID: sessionID)
+            case let .scopeSelectionRequired(scopeIDs):
+                outcome = .scopeSelectionRequired(scopeIDs: scopeIDs)
+            }
+            // A refused undo never burns its token.
+            undoer.restoreUndo(entry)
+            return outcome
+        }
+    }
+
+    private static let undoUnavailable: Value = .object([
+        "result": .string("undo_unavailable"),
+        "detail": .string("This undo_token is unknown, already used, or not yours.")
+    ])
+
+    // MARK: - Apply on approval
+
+    /// The user approved a card: apply its stored request with identical arguments, narrowed to the
+    /// ticked items. Cards created outside this front door are only approved; their caller re-calls.
+    ///
+    /// `presentedTabID`/`presentedSessionID` are the tab and the session it showed when the user acted.
+    /// The approval is decided synchronously, before any suspension, against the tab's *live* binding:
+    /// a card whose tab is now bound to another session (or that is no longer pending) is never
+    /// approved or applied.
+    func approveAndApply(confirmationID: UUID, presentedTabID: UUID, presentedSessionID: UUID?) async {
+        guard isLivePresentation(confirmationID, tabID: presentedTabID, sessionID: presentedSessionID) else { return }
+        prunePendingApplies()
+        // An ordered change (pins, groups) is one permutation: it applies to every item or none.
+        if let pending = pendingApplies[confirmationID],
+           Self.orderedOperations.contains(pending.request.operation),
+           let grantee = pending.request.caller.agentSessionID,
+           let card = scopes.confirmations.confirmation(id: confirmationID, granteeSessionID: grantee),
+           !card.untickedSessionIDs.isEmpty
+        {
+            scopes.confirmations.deny(confirmationID: confirmationID, reason: Self.orderedAllOrNothing)
+            pendingApplies.removeValue(forKey: confirmationID)
+            recordApplied(
+                .object(["result": .string("denied"), "detail": .string(Self.orderedAllOrNothing)]),
+                confirmationID: confirmationID
+            )
+            return
+        }
+        _ = scopes.confirmations.approve(confirmationID: confirmationID)
+        guard let pending = pendingApplies[confirmationID],
+              let grantee = pending.request.caller.agentSessionID,
+              let card = scopes.confirmations.confirmation(id: confirmationID, granteeSessionID: grantee),
+              card.state == .approved
+        else { return }
+        let approved = card.approvedSessionIDs
+        // Same arguments (and so the same arguments digest) as the carded call; only the targets
+        // narrow to the ticked items.
+        let request = pending.request.rebuilt(
+            targets: pending.request.targetSessionIDs.filter(approved.contains),
+            confirmationID: confirmationID
+        )
+        // The core validates, claims, and settles every supplied confirmation exactly once
+        // (beginApplying/finishApplying), including when unticking brought the batch to or below the
+        // threshold, so an approved card ends `consumed` after a successful application or returns
+        // to `approved` after a failed one. The front door never claims it itself.
+        let result: Value
+        do {
+            switch try await core.perform(request) {
+            case let .completed(value):
+                result = value
+            case let .denied(denial, sessionID):
+                result = (try? SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID))
+                    ?? .object(["result": .string("denied")])
+            default:
+                result = .object(["result": .string("not_applied")])
+            }
+        } catch {
+            result = .object(SessionAdminReply.diagnostic(
+                code: "operation_failed", sessionIDs: pending.request.targetSessionIDs,
+                fields: [
+                    "result": .string("not_applied"), "subreason": .string("handler_threw"),
+                    "detail": .string(error.localizedDescription + " The handler returned no completion receipt. Inspect the targets and confirmation status before retrying."),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("confirmation_status"), "confirmation_id": .string(confirmationID.uuidString)
+                    ])])
+                ]
+            ))
+        }
+        recordApplied(pending.coverage?.adding(to: result) ?? result, confirmationID: confirmationID)
+        prunePendingApplies()
+    }
+
+    func denyConfirmation(confirmationID: UUID, presentedTabID: UUID, presentedSessionID: UUID?) {
+        guard isLivePresentation(confirmationID, tabID: presentedTabID, sessionID: presentedSessionID) else { return }
+        scopes.confirmations.deny(confirmationID: confirmationID, reason: "Denied by user")
+        pendingApplies.removeValue(forKey: confirmationID)
+    }
+
+    /// The tab still shows the session the user saw, it is the card's requester, and the card is pending.
+    private func isLivePresentation(_ confirmationID: UUID, tabID: UUID, sessionID: UUID?) -> Bool {
+        guard let sessionID, liveBoundSession(tabID) == sessionID else { return false }
+        return scopes.confirmations.isCurrentPresentation(confirmationID: confirmationID, tabID: tabID, sessionID: sessionID)
+    }
+
+    /// The applied result of an approved card, for `confirmation_status`.
+    func appliedResult(forConfirmation confirmationID: UUID) -> Value? {
+        appliedResults[confirmationID]
+    }
+
+    /// Pending and completed card replies use the coverage captured with the approved selection,
+    /// never a later filter read which might have different matches or completeness.
+    func selectionCoverage(forConfirmation confirmationID: UUID) -> Value? {
+        pendingApplies[confirmationID]?.coverage?.value
+            ?? appliedResults[confirmationID]?.objectValue?["selection"]
+    }
+
+    private func recordApplied(_ value: Value, confirmationID: UUID) {
+        if appliedResults[confirmationID] == nil { appliedOrder.append(confirmationID) }
+        appliedResults[confirmationID] = value
+        while appliedOrder.count > Self.maxRetainedResults {
+            appliedResults.removeValue(forKey: appliedOrder.removeFirst())
+        }
+    }
+
+    static let orderedOperations: Set<DomainAgentSessionTargetOperation> = [.adminReorderPins, .adminReorderGroups]
+    static let orderedAllOrNothing = "Ordered changes apply to every item or none; untick nothing, or deny the card."
+
+    /// Retain captured coverage while a card can still apply, including explicit agent redemption
+    /// after approval. Terminal or evicted cards no longer hold a pending request.
+    private func prunePendingApplies() {
+        pendingApplies = pendingApplies.filter {
+            switch scopes.confirmations.confirmations[$0.key]?.state {
+            case .pending?, .approved?, .applying?: true
+            default: false
+            }
+        }
+    }
+
+    // MARK: - Shaping
+
+    private static let unloadedDetail =
+        "Sessions in workspaces that no open window shows are listed but not changed; open the workspace to organize them."
+
+    /// Filter targeting enumerates sessions: the scope must be live and hold `observe` plus the
+    /// operation's idle-state capabilities before anything is resolved.
+    private func filterDenial(
+        _ operation: DomainAgentSessionTargetOperation,
+        scope: DomainDelegationScopeRecord
+    ) -> DomainDelegationScopeDenial? {
+        let probe = AgentSessionAdministrationRequest(
+            operation: .adminInventory,
+            caller: .agentSession(scope.grant.granteeSessionID),
+            scopeID: scope.id
+        )
+        if case let .denied(denial, _) = core.authorize(probe) { return denial }
+        let required = operation.requiredScopeCapabilities(for: .idle).union([.observe])
+        if let missing = DomainDelegationScopeCapability.allCases.first(where: {
+            required.contains($0) && !chainHolds($0, scope: scope)
+        }) {
+            return .capabilityMissing(missing)
+        }
+        return nil
+    }
+
+    /// A read-authorized caller may diagnose a conflict, but never acquires a mutation lease from
+    /// it. Use the same unresolved-ID visibility rule as inventory: a workspace/tree membership
+    /// that depends on disputed placement cannot disclose the competing carriers.
+    private func unresolvedTargetRefusal(
+        _ request: AgentSessionAdministrationRequest, scope: DomainDelegationScopeRecord
+    ) async throws -> Value? {
+        let visibility = AgentSessionScopeVisibility(chain: scopes.scopeChain(from: scope.id))
+        let candidates = Set(request.targetSessionIDs.filter { visibility.mayDiscloseUnresolved($0) })
+        guard !candidates.isEmpty, filterDenial(request.operation, scope: scope) == nil else { return nil }
+        let targets = projector.withSynchronousTargets(candidates) { projector in
+            Set(candidates.filter { projector.pointResolutionState(for: $0) == .ambiguous })
+        }
+        guard !targets.isEmpty else { return nil }
+        let chain = scopes.scopeChain(from: scope.id)
+        let snapshot = try await inventory.snapshot(read: .init(loadedOnly: true, sessionIDs: targets))
+        try checkInventoryAuthority(scope, chain: chain)
+        guard filterDenial(request.operation, scope: scope) == nil else { return nil }
+        let unresolved = snapshot.restricted(to: targets, includingUnresolvedDetails: visibility.mayDiscloseCompetingCarriers)
+        guard let id = request.targetSessionIDs.first(where: { unresolved.unresolvedSessions[$0] != nil }),
+              let reason = unresolved.unresolvedSessions[id] else { return nil }
+        var result = AgentSessionInventoryRendering.unresolvedValue(
+            id: id, reason: reason, detail: unresolved.unresolvedDetails[id]
+        ).objectValue ?? [:]
+        result["result"] = .string("not_applied")
+        result["op"] = .string(request.operation.adminOperationName)
+        return .object(result)
+    }
+
+    /// Explicit targets the projector cannot prove (it only sees loaded workspaces) that inventory
+    /// shows as scope-visible sessions in an unloaded workspace are reported per item as
+    /// `workspace_not_loaded`. Unknown or invisible targets stay in the batch, so the core's uniform
+    /// denial still covers them. Needs `observe`, since it consults inventory.
+    private func splitUnloadedTargets(
+        _ targets: [UUID],
+        scope: DomainDelegationScopeRecord
+    ) async throws -> (remaining: [UUID], unloaded: [UUID]) {
+        // A known conflict is not missing history. Keep it in the core batch for a uniform
+        // denial rather than invoking a census that could turn arbitrary history into authority.
+        let unproven = targets.filter {
+            let state = projector.pointResolutionState(for: $0)
+            return state != .ambiguous && state != .unproven && !isMember($0, of: scope)
+        }
+        guard !unproven.isEmpty, chainHolds(.observe, scope: scope) else { return (targets, []) }
+        let chain = scopes.scopeChain(from: scope.id)
+        var read = AgentSessionInventoryRead.scoped(chain: chain)
+        read.loadedOnly = true
+        read.historyTargetIDs = Set(unproven)
+        let snapshot = try await inventory.snapshot(read: read)
+        try checkInventoryAuthority(scope, chain: chain)
+        let visibility = AgentSessionScopeVisibility(chain: chain)
+        let unloaded = Set(unproven.filter { id in
+            snapshot.records[id].map { !$0.isLoaded && visibility.isVisible($0, in: snapshot) } ?? false
+        })
+        return (targets.filter { !unloaded.contains($0) }, targets.filter(unloaded.contains))
+    }
+
+    /// Call shaping can return early without reaching the core, so it must fence every awaited
+    /// inventory read against revocation/attenuation, including ancestors, before disclosing data.
+    private func checkInventoryAuthority(
+        _ scope: DomainDelegationScopeRecord,
+        chain: [DomainDelegationScopeRecord]
+    ) throws {
+        try Task.checkCancellation()
+        let current = scopes.scopeChain(from: scope.id)
+        guard scopes.record(id: scope.id).map({ $0.isActive && $0.generation == scope.generation }) == true,
+              !chain.isEmpty, current.count == chain.count,
+              zip(chain, current).allSatisfy({ before, after in
+                  before.id == after.id && before.generation == after.generation && after.isActive
+              }), chainHolds(.observe, scope: scope)
+        else { throw SessionAdminMCPToolService.unavailableError }
+    }
+
+    private static func appending(_ items: [AgentSessionAdminItemResult], to value: Value) -> Value {
+        guard case var .object(object) = value else { return value }
+        object["items"] = .array((object["items"]?.arrayValue ?? []) + items.map(\.value))
+        object["workspace_not_loaded_detail"] = .string(unloadedDetail)
+        return .object(AgentSessionAdminRendering.refreshingOrganizingResult(object))
+    }
+
+    static func changedSomething(_ value: Value) -> Bool {
+        guard let object = value.objectValue else { return false }
+        return (object["changed_count"]?.intValue ?? 0) > 0
+            || object[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
+    }
+
+    func isMember(_ sessionID: UUID, of scope: DomainDelegationScopeRecord) -> Bool {
+        let chain = scopes.scopeChain(from: scope.id)
+        return !chain.isEmpty && chain.allSatisfy { projector.membershipProof(for: sessionID, in: $0.grant) != nil }
+    }
+
+    /// `nil` keeps the request's explicit targets.
+    private func resolveTargets(
+        _ request: AgentSessionAdministrationRequest,
+        scope: DomainDelegationScopeRecord,
+        callerSessionID: UUID
+    ) async throws -> ResolvedTargets? {
+        if let rawFilter = request.arguments["filter"] {
+            guard request.targetSessionIDs.isEmpty else {
+                throw AgentSessionAdminArguments.invalid("filter is exclusive with targets and session_id.")
+            }
+            guard let filter = try AgentSessionAdminArguments.filter(rawFilter) else { return nil }
+            let chain = scopes.scopeChain(from: scope.id)
+            let read = AgentSessionInventoryRead.scoped(chain: chain, filter: filter)
+            let full = try await inventory.snapshot(read: read)
+            try checkInventoryAuthority(scope, chain: chain)
+            // Link/role/orphan predicates rely on the complete endpoint census. An incomplete
+            // read cannot turn an unknown edge into has_links:false and widen a mutation.
+            if !full.isComplete, filter.hasLinks != nil || filter.role != nil || filter.orphaned != nil {
+                throw AgentSessionInventoryReadFailure.incomplete(.filterNeedsCompleteCensus)
+            }
+            // Filters see only the scope-restricted view, so link/role/orphan predicates can never
+            // react to sessions outside the scope.
+            let visibility = AgentSessionScopeVisibility(chain: chain)
+            let snapshot = full.restricted(to: Set(
+                full.records.values
+                    .filter { visibility.isVisible($0, in: full) }
+                    .map(\.sessionID)
+            ))
+            if filter.requiresOrganizationState || filter.query != nil {
+                guard full.unresolvedSessionCount == 0,
+                      snapshot.records.values.allSatisfy(\.organizationStateIsKnown)
+                else {
+                    // History rows do not contain sidebar state. Treating their defaults as
+                    // unpinned/unarchived/ungrouped would produce a false empty or partial batch.
+                    throw AgentSessionInventoryReadFailure.incomplete(.organizationStateUnknown)
+                }
+            }
+            if filter.orphaned != nil,
+               !snapshot.records.keys.allSatisfy({ snapshot.orphanStatusIsComplete(for: $0) })
+            {
+                throw AgentSessionInventoryReadFailure.incomplete(.orphanStatusUnknown)
+            }
+            let now = Date()
+            let excludeCaller = request.operation.deniesScopeSelfTarget
+            // One fresh synchronous region after the read/authority fence. The census cannot
+            // escape or span a suspension; handlers still re-prove live membership at each write.
+            let matches = projector.withSynchronousCensus { census in
+                snapshot.records.values
+                    .filter(\.isLoaded)
+                    .filter { filter.matchesStructured($0, in: snapshot, now: now) }
+                    .filter { AgentSessionInventoryRendering.matchesQuery(filter.query, record: $0) }
+                    .filter { !(excludeCaller && $0.sessionID == callerSessionID) }
+                    .filter { record in
+                        !chain.isEmpty && chain.allSatisfy { census.membershipProof(for: record.sessionID, in: $0.grant) != nil }
+                    }
+                    .sorted { lhs, rhs in
+                        if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt > rhs.lastActivityAt }
+                        return lhs.sessionID.uuidString < rhs.sessionID.uuidString
+                    }
+                    .map(\.sessionID)
+            }
+            guard matches.count <= AgentSessionAdminArguments.maxTargets else {
+                throw AgentSessionAdminArguments.invalid(
+                    "filter matched \(matches.count) sessions; at most \(AgentSessionAdminArguments.maxTargets) per call. Narrow the filter."
+                )
+            }
+            return ResolvedTargets(
+                sessionIDs: matches,
+                coverage: FilterSelectionCoverage(
+                    loadedOnly: read.loadedOnly,
+                    recordsComplete: full.recordsComplete,
+                    endpointsComplete: full.isComplete
+                )
+            )
+        }
+        guard request.targetSessionIDs.isEmpty,
+              let deriving = handlers[request.operation] as? any AgentSessionAdministrationTargetDeriving,
+              let derived = try deriving.derivedTargets(for: request)
+        else { return nil }
+        // Derived targets can include sessions the caller never named (every carrier of a group). Only
+        // members are kept, so a denial can never name a session outside the scope; the handler refuses
+        // an ordering that would also touch the rest.
+        return ResolvedTargets(sessionIDs: derived.filter { isMember($0, of: scope) }, coverage: nil)
+    }
+
+    /// Dry run: exact items and effects, the confirmation requirement, and `requires_control`.
+    private func preview(_ request: AgentSessionAdministrationRequest) throws -> AgentSessionAdministrationOutcome {
+        let batch: AgentSessionAdministrationAuthorizedBatch
+        var reason: DomainDelegationScopeConfirmationReason?
+        switch core.authorize(request) {
+        case let .authorized(authorized):
+            batch = authorized
+        case let .confirmationRequired(required, authorized):
+            batch = authorized
+            reason = required
+        case let .denied(denial, sessionID):
+            return .denied(denial, sessionID: sessionID)
+        case let .scopeSelectionRequired(scopeIDs):
+            return .scopeSelectionRequired(scopeIDs: scopeIDs)
+        }
+        // A dry run reports the same structural refusal a real call would, before listing items.
+        if let refusal = try handlers[request.operation]?.preflight(batch) {
+            return .completed(refusal)
+        }
+        let narrowed = request.rebuilt(targets: batch.admittedSessionIDs)
+        let items = handlers[request.operation].map { $0.confirmationItems(for: narrowed, scope: batch.scope) }
+            ?? narrowed.targetSessionIDs.map {
+                BatchConfirmationItem(sessionID: $0, title: $0.uuidString, effect: request.operation.adminOperationName)
+            }
+        var object: [String: Value] = [
+            "result": .string("preview"),
+            "op": .string(request.operation.adminOperationName),
+            "item_count": .int(items.count),
+            "items": .array(items.map { item in
+                .object([
+                    "session_id": .string(item.sessionID.uuidString),
+                    "title": .string(item.title),
+                    "effect": .string(item.effect)
+                ])
+            }),
+            "requires_confirmation": .bool(reason != nil)
+        ]
+        if let reason { object["confirmation_reason"] = .string(reason.rawValue) }
+        if !batch.itemsRequiringControl.isEmpty {
+            object["requires_control"] = .array(batch.itemsRequiringControl.map { .string($0.uuidString) })
+        }
+        if request.operation == .adminAdopt, let grantee = request.caller.agentSessionID {
+            // The adopt card's descendants are outside the scope: the agent sees adoptees and counts.
+            let layout = SessionAdminAdoptCardProjection.layout(
+                granteeSessionID: grantee, idempotencyKey: request.idempotencyKey, itemSessionIDs: Set(items.map(\.sessionID))
+            )
+            object["items"] = .array(SessionAdminAdoptCardProjection.agentItems(items, layout: layout, approved: nil))
+            object["item_count"] = .int(layout?.visibleSessionIDs.count ?? 0)
+            object.merge(SessionAdminAdoptCardProjection.aggregates(items, layout: layout)) { _, new in new }
+        }
+        return .completed(.object(object))
+    }
+
+    /// Canonical request identity for idempotency: operation, scope, explicit targets, and every
+    /// argument except the transport-only ones.
+    static func fingerprint(_ request: AgentSessionAdministrationRequest, scopeID: UUID) -> String {
+        var args = request.arguments
+        for key in ["idempotency_key", "preview", "confirmation_id", "scope_id"] {
+            args.removeValue(forKey: key)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let argsText = (try? encoder.encode(Value.object(args))).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        let targets = request.targetSessionIDs.map(\.uuidString).joined(separator: ",")
+        return "\(request.operation.rawValue)|\(scopeID.uuidString)|\(targets)|\(argsText)"
+    }
+
+    private static func markReplay(_ value: Value) -> Value {
+        guard case var .object(object) = value else { return value }
+        object["idempotent_replay"] = .bool(true)
+        return .object(object)
+    }
+}
+
+extension AgentSessionAdministrationRequest {
+    /// The same request with a different target list, scope, or confirmation. Arguments are never
+    /// changed, so a card's bound arguments always reach the handler verbatim.
+    func rebuilt(targets: [UUID]? = nil, scopeID: UUID? = nil, confirmationID: UUID? = nil) -> AgentSessionAdministrationRequest {
+        AgentSessionAdministrationRequest(
+            operation: operation,
+            caller: caller,
+            callerTabID: callerTabID,
+            scopeID: scopeID ?? self.scopeID,
+            targetSessionIDs: targets ?? targetSessionIDs,
+            idempotencyKey: idempotencyKey,
+            confirmationID: confirmationID ?? self.confirmationID,
+            preview: preview,
+            arguments: arguments
+        )
+    }
+}

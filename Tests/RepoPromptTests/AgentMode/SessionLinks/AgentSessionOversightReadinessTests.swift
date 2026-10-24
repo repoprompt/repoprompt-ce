@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Binding-qualified hydration proof and owner-qualified discovery levels.
@@ -44,6 +45,16 @@ final class AgentSessionOversightReadinessTests: XCTestCase {
         )
     }
 
+    private func makeCreation() throws -> (
+        AgentModeViewModel.TabSession, AgentSessionCreationClaim, AgentSessionCreationHandle
+    ) {
+        let session = makeSession()
+        let claim = AgentSessionCreationClaim(workspaceID: UUID())
+        bind(session, sessionID: claim.sessionID)
+        let handle = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+        return (session, claim, handle)
+    }
+
     // MARK: - Readiness
 
     func testUnboundTabProvesNothing() {
@@ -77,9 +88,9 @@ final class AgentSessionOversightReadinessTests: XCTestCase {
         XCTAssertEqual(session.qualifiedRestorationReadiness.terminalFailure, .missingPayload)
     }
 
-    /// A fresh session has no payload, so its cold load correctly records `.missingPayload`. Durable
-    /// persistence is what promotes it; without this it would stay permanently unrestorable.
-    func testFirstDurableSavePromotesAFreshSessionOutOfTerminal() throws {
+    /// A missing payload does not prove that this runtime allocated the session. A generic save
+    /// acknowledgment must not authorize replacing data that failed to restore.
+    func testGenericFreshSaveAcknowledgmentCannotPromoteTerminalRestoration() throws {
         let session = makeSession()
         bind(session)
         session.recordRestorationTerminal(.missingPayload)
@@ -87,7 +98,106 @@ final class AgentSessionOversightReadinessTests: XCTestCase {
         session.recordRestorationAuthoritativeIfNeeded(.freshBindingDurablyCreated)
 
         let token = try XCTUnwrap(session.currentRestorationBindingToken)
-        XCTAssertEqual(session.qualifiedRestorationReadiness, .authoritative(token, .freshBindingDurablyCreated))
+        XCTAssertEqual(session.qualifiedRestorationReadiness, .terminal(token, .missingPayload))
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        XCTAssertNil(session.captureCreationRetryHandle())
+        XCTAssertEqual(
+            session.restorationAdmissionFailureMessage,
+            "This session could not be restored. Retry loading it or create a new session; its saved data has not been replaced."
+        )
+    }
+
+    func testOnlyExactConfiguredAcknowledgmentReleasesCreationOwner() throws {
+        let (session, claim, handle) = try makeCreation()
+        let stamp = Data("configured payload".utf8)
+        let otherStamp = Data("different payload".utf8)
+        XCTAssertEqual(claim.creationHandle, handle)
+        XCTAssertEqual(session.creationState?.phase, .preparing)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertTrue(session.isDirty)
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        XCTAssertNil(session.captureCreationRetryHandle())
+        XCTAssertFalse(session.acknowledgeConfiguredCreationSave(handle, configurationStamp: stamp))
+
+        // A late generic loader/save result cannot replace the active creation owner.
+        session.recordRestorationTerminal(.missingPayload)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.recordRestorationAuthoritativeIfNeeded(.freshBindingDurablyCreated)
+        XCTAssertEqual(session.creationState?.phase, .preparing)
+
+        XCTAssertTrue(session.markCreationReady(handle, configurationStamp: stamp))
+        XCTAssertTrue(session.markCreationReady(handle, configurationStamp: stamp))
+        XCTAssertFalse(session.markCreationReady(handle, configurationStamp: otherStamp))
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        let retry = try XCTUnwrap(session.captureCreationRetryHandle())
+        XCTAssertEqual(retry.expectedConfigurationStamp, stamp)
+        XCTAssertEqual(session.captureCreationRetryHandle(), retry)
+        XCTAssertNotEqual(retry, handle)
+        XCTAssertTrue(session.creationHandleIsCurrent(retry))
+        XCTAssertFalse(session.acknowledgeConfiguredCreationSave(retry, configurationStamp: otherStamp))
+
+        session.failCreationPreparation(handle, message: "Late preparation failure.")
+        XCTAssertEqual(session.creationConfigurationStamp, stamp)
+        XCTAssertTrue(session.acknowledgeConfiguredCreationSave(retry, configurationStamp: stamp))
+        XCTAssertEqual(
+            session.qualifiedRestorationReadiness,
+            .authoritative(handle.bindingToken, .freshBindingDurablyCreated)
+        )
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        XCTAssertNil(session.restorationAdmissionFailureMessage)
+        XCTAssertNil(session.captureCreationRetryHandle())
+        XCTAssertFalse(session.creationHandleIsCurrent(handle))
+        XCTAssertFalse(session.acknowledgeConfiguredCreationSave(retry, configurationStamp: stamp))
+        session.failCreationPreparation(handle, message: "Late preparation failure.")
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+    }
+
+    func testFailedPreparationCannotBecomeConfiguredOrRetryable() throws {
+        let (session, _, handle) = try makeCreation()
+        let message = "Could not prepare the requested worktree."
+        session.failCreationPreparation(handle, message: message)
+
+        XCTAssertEqual(session.creationState?.phase, .failedBeforeConfiguration(message))
+        XCTAssertEqual(session.restorationAdmissionFailureMessage, message + " Create a new session to try again.")
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        XCTAssertNil(session.captureCreationRetryHandle())
+        let stamp = Data("partial recovery payload".utf8)
+        XCTAssertFalse(session.markCreationReady(handle, configurationStamp: stamp))
+        XCTAssertFalse(session.acknowledgeConfiguredCreationSave(handle, configurationStamp: stamp))
+        session.recordRestorationAuthoritativeIfNeeded(.freshBindingDurablyCreated)
+        XCTAssertEqual(session.creationState?.phase, .failedBeforeConfiguration(message))
+    }
+
+    func testCreationReceiptCannotActOnSameIDReplacementOrRebinding() throws {
+        let (session, claim, handle) = try makeCreation()
+        let stamp = Data("configured payload".utf8)
+        XCTAssertTrue(session.markCreationReady(handle, configurationStamp: stamp))
+        let retry = try XCTUnwrap(session.captureCreationRetryHandle())
+        let replacement = AgentModeViewModel.TabSession(tabID: session.tabID)
+        replacement.installPersistentSessionBinding(handle.bindingToken.bindingIdentity)
+        XCTAssertFalse(replacement.creationHandleIsCurrent(handle))
+        XCTAssertFalse(replacement.acknowledgeConfiguredCreationSave(retry, configurationStamp: stamp))
+
+        bind(session, sessionID: claim.sessionID)
+        XCTAssertFalse(session.creationHandleIsCurrent(handle))
+        XCTAssertFalse(session.creationHandleIsCurrent(retry))
+        XCTAssertFalse(session.markCreationReady(handle, configurationStamp: stamp))
+        XCTAssertFalse(session.acknowledgeConfiguredCreationSave(retry, configurationStamp: stamp))
+        XCTAssertNil(session.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+        let current = try XCTUnwrap(session.currentRestorationBindingToken)
+        XCTAssertEqual(session.qualifiedRestorationReadiness, .pending(current))
+    }
+
+    func testRejectedCreationClaimCannotBeReusedWithCorrectedWorkspace() throws {
+        let session = makeSession()
+        let claim = AgentSessionCreationClaim(workspaceID: UUID())
+        bind(session, sessionID: claim.sessionID)
+
+        XCTAssertNil(session.acceptFreshCreation(claim, workspaceID: UUID()))
+        XCTAssertNil(claim.creationHandle)
+        XCTAssertNil(session.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+        let current = try XCTUnwrap(session.currentRestorationBindingToken)
+        XCTAssertEqual(session.qualifiedRestorationReadiness, .pending(current))
     }
 
     func testLaterDurableSaveDoesNotRelabelAPayloadAppliedProof() throws {

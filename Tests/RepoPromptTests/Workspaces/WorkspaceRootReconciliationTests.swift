@@ -1354,24 +1354,32 @@ import XCTest
                     )
                     let checkpoint = RootDirectoryProbeCheckpoint(heldPhase: .beforeFileSystem)
                     fixture.manager.rootDirectoryProbeCheckpointForTesting = checkpoint.checkpoint
+                    let switchRetiredProbe = XCTestExpectation(description: "workspace switch retired blocked directory probe")
+                    if !closesWindow {
+                        fixture.manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                            switchRetiredProbe.fulfill()
+                        }
+                    }
                     defer {
                         checkpoint.release()
                         fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
+                        fixture.manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
                     }
                     _ = try XCTUnwrap(fixture.manager.requestRootReconciliation(workspaceID: fixture.workspace.id))
                     try await fixture.awaitGateEvent(checkpoint.entered)
 
                     let finished = XCTestExpectation(description: "lifecycle transition detached from immutable read")
+                    var didSwitch = false
                     fixture.startOwnedTask {
                         if closesWindow {
                             fixture.manager.prepareForWindowClose()
                             await fixture.manager.awaitRootReconciliationShutdown()
                         } else {
-                            _ = await fixture.manager.switchWorkspace(to: alternate, saveState: false)
+                            didSwitch = await fixture.manager.switchWorkspace(to: alternate, saveState: false).didSwitch
                         }
                         finished.fulfill()
                     }
-                    await self.fulfillment(of: [finished], timeout: 1)
+                    await self.fulfillment(of: closesWindow ? [finished] : [switchRetiredProbe], timeout: 1)
                     XCTAssertLessThanOrEqual(
                         fixture.manager.rootReconciliationStateForTesting.outstandingProbes,
                         2
@@ -1386,6 +1394,10 @@ import XCTest
 
                     checkpoint.release()
                     await self.fulfillment(of: [checkpoint.finished], timeout: 1)
+                    if !closesWindow {
+                        try await fixture.awaitGateEvent(finished)
+                        XCTAssertTrue(didSwitch)
+                    }
                     fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
                 }
             }

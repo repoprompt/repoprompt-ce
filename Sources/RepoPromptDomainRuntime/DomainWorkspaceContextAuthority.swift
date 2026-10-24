@@ -15,7 +15,7 @@ package enum DomainExternalReloadActivity: Equatable {
     }
 #endif
 
-package struct DomainWorkspaceStore {
+package struct DomainWorkspaceStore: Sendable {
     private let authority: DomainWorkspaceContextAuthority
 
     init(authority: DomainWorkspaceContextAuthority) {
@@ -24,6 +24,11 @@ package struct DomainWorkspaceStore {
 
     package func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await authority.readySnapshot()
+    }
+
+    /// A bounded routing read. It never starts or waits for whole-catalog bootstrap.
+    package func readLocation(matching selector: DomainWorkspaceReadSelector) async -> DomainWorkspaceLocationSelection {
+        await authority.readLocation(matching: selector)
     }
 
     package func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
@@ -233,6 +238,10 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    private var workspaceIDsByReadName: [String: Set<UUID>] = [:]
+    private var workspaceLocationGenerations: [UUID: UInt64] = [:]
+    private var unreadableLocationIDs: Set<UUID> = []
+    private var nextWorkspaceLocationGeneration: UInt64 = 0
     #if DEBUG
         func savedStateForTesting(_ workspaceID: UUID) -> DomainWorkspaceSavedStateForTesting? {
             records[workspaceID].map { .init(revision: $0.revisions.savedRevision, digest: $0.savedDigest) }
@@ -314,6 +323,9 @@ actor DomainWorkspaceContextAuthority {
             )
             return (workspace.document.workspaceID, record)
         })
+        for record in records.values {
+            updateWorkspaceLocationIndex(previous: nil, next: record)
+        }
         for workspaceID in records.keys {
             recordReconstruction(workspaceID)
         }
@@ -346,6 +358,77 @@ actor DomainWorkspaceContextAuthority {
                 .subtracting(records.keys)
                 .subtracting(deletedWorkspaceIDs)
         )
+    }
+
+    /// Canonical records alone issue location evidence. A read registration cannot revive a
+    /// deleted identity, bypass unavailable storage, or publish a partial catalog during startup.
+    func readLocation(matching selector: DomainWorkspaceReadSelector) -> DomainWorkspaceLocationSelection {
+        guard didBootstrap else { return .notReady }
+        let workspaceID: UUID
+        switch selector {
+        case let .id(id):
+            workspaceID = id
+        case let .exactName(name):
+            // An unavailable member may have an unknown current name. Do not invent uniqueness.
+            guard health.acceptsMutations, unavailableWorkspaces.isEmpty, unreadableLocationIDs.isEmpty else {
+                return .unavailable
+            }
+            let matches = workspaceIDsByReadName[Self.readNameKey(name)] ?? []
+            guard matches.count <= 1 else { return .ambiguous }
+            guard let id = matches.first else { return .notRegistered }
+            workspaceID = id
+        }
+        guard !deletedWorkspaceIDs.contains(workspaceID) else { return .notRegistered }
+        guard let record = records[workspaceID] else {
+            return unavailableWorkspaces[workspaceID] == nil ? .notRegistered : .unavailable
+        }
+        guard record.health.acceptsMutations,
+              let generation = workspaceLocationGenerations[workspaceID]
+        else { return .unavailable }
+        return .matched(.init(
+            runtimeID: identity.runtimeID, lifecycleGeneration: identity.lifecycleGeneration,
+            locationGeneration: generation, workspaceID: workspaceID,
+            name: record.document.metadata.name,
+            directory: record.document.fileURL.deletingLastPathComponent().standardizedFileURL
+        ))
+    }
+
+    private static func readNameKey(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private func updateWorkspaceLocationIndex(previous: WorkspaceRecord?, next: WorkspaceRecord) {
+        let id = next.document.workspaceID
+        let nextName = Self.readNameKey(next.document.metadata.name)
+        if let previous, Self.readNameKey(previous.document.metadata.name) != nextName {
+            removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
+        }
+        workspaceIDsByReadName[nextName, default: []].insert(id)
+        if next.health.acceptsMutations { unreadableLocationIDs.remove(id) }
+        else { unreadableLocationIDs.insert(id) }
+        if previous?.document.fileURL != next.document.fileURL
+            || previous?.document.metadata.name != next.document.metadata.name
+            || previous?.health.acceptsMutations != next.health.acceptsMutations
+            || workspaceLocationGenerations[id] == nil
+        {
+            nextWorkspaceLocationGeneration &+= 1
+            workspaceLocationGenerations[id] = nextWorkspaceLocationGeneration
+        }
+    }
+
+    private func removeReadName(_ name: String, workspaceID: UUID) {
+        workspaceIDsByReadName[name]?.remove(workspaceID)
+        if workspaceIDsByReadName[name]?.isEmpty == true { workspaceIDsByReadName.removeValue(forKey: name) }
+    }
+
+    @discardableResult
+    private func removeCanonicalRecord(_ id: UUID) -> WorkspaceRecord? {
+        guard let previous = records.removeValue(forKey: id) else { return nil }
+        removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
+        workspaceLocationGenerations.removeValue(forKey: id)
+        unreadableLocationIDs.remove(id)
+        return previous
     }
 
     func workspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
@@ -390,6 +473,7 @@ actor DomainWorkspaceContextAuthority {
         replacement.diagnosticDirtyOrigin = record.revisions.dirtyRevision == nil || continuesDirtyLineage
             ? current?.diagnosticDirtyOrigin : nil
         replacement.diagnosticLastSave = current?.diagnosticLastSave
+        updateWorkspaceLocationIndex(previous: current, next: replacement)
         records[workspaceID] = replacement
     }
 
@@ -943,7 +1027,7 @@ actor DomainWorkspaceContextAuthority {
                 $0.uuidString < $1.uuidString
             }) {
                 unavailableWorkspaces.removeValue(forKey: workspaceID)
-                if records.removeValue(forKey: workspaceID) != nil {
+                if removeCanonicalRecord(workspaceID) != nil {
                     readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
@@ -1939,7 +2023,7 @@ actor DomainWorkspaceContextAuthority {
                 operation: operation,
                 now: operation.recordedAt
             )
-            records.removeValue(forKey: workspaceID)
+            removeCanonicalRecord(workspaceID)
             deletedWorkspaceIDs.insert(workspaceID)
             catalogRevision = deleted.catalogRevision
             let cleanupDiagnostic = deleted.tombstone.operation.diagnostic
@@ -2690,7 +2774,7 @@ actor DomainWorkspaceContextAuthority {
         health = refreshed.health
         catalogRevision = max(catalogRevision, refreshed.catalogRevision)
         if refreshed.workspaceIsDeleted {
-            records.removeValue(forKey: workspaceID)
+            removeCanonicalRecord(workspaceID)
             unavailableWorkspaces.removeValue(forKey: workspaceID)
             deletedWorkspaceIDs.insert(workspaceID)
             return

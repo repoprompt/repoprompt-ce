@@ -5,10 +5,10 @@ import RepoPromptInstrumentation
 /// Window-local seam between the authoritative link inventory and the provider dispatch adapters.
 ///
 /// The adapters (Codex start/steer/fallback, Claude native, Claude/generic headless, ACP prompt and
-/// active steering, waiting-instruction continuation) all reduce to two synchronous MainActor calls:
-/// compose immediately before the physical dispatch, acknowledge at the provider's acceptance
-/// signal. Keeping the actor hop out of the dispatch path matters — every one of those sites runs
-/// while a user turn is already committed, and none of them may block on the domain actor.
+/// active steering, waiting-instruction continuation) preserve synchronous baseline composition and
+/// acceptance. Optional user-input disclosure adds an exact Read proof after all other preparation
+/// awaits, followed by synchronous MainActor revalidation/consumption at the final provider handoff.
+/// A failed optional proof falls back to the unchanged baseline; it never creates a dispatch.
 /// The authoritative outbound inventory published to one exact incarnation.
 ///
 /// The endpoint is stored alongside the value rather than implied by the map key: an in-place rebind
@@ -118,7 +118,7 @@ extension AgentModeViewModel {
         return .ready(token)
     }
 
-    private func agentSessionLinkHasActiveOutboundLink(
+    func agentSessionLinkHasActiveOutboundLink(
         _ endpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         #if DEBUG
@@ -309,12 +309,9 @@ extension AgentModeViewModel {
     /// Opens, holds, or closes the Codex session-link catalog-repair cycle for one exact accepted
     /// projection.
     ///
-    /// The condition being recognized is a *returned* catalog that says `agent_session_link` is
-    /// absent while the link authority says this exact endpoint still holds a live outbound grant.
-    /// `notifyToolListChangedForAgentSession` republishes precisely that pair when a restored grant
-    /// activates against a run whose client has not yet re-read `tools/list`, and
-    /// `agentSessionLinkPromptContext` then fails closed for the whole established run — so Auto-wake
-    /// is blocked behind a projection nothing in the existing pipeline can heal.
+    /// The exact client-shaped expected and returned oversight surfaces disagree. Invalidation
+    /// preserves returned evidence, so activation without links and same-name schema transitions
+    /// are discovered here without treating catalog state as prompt or target authority.
     ///
     /// Opening belongs here rather than in the coordinator because this is the only frame where the
     /// mismatch and the projection storage that produced it are visible in one synchronous MainActor
@@ -354,9 +351,7 @@ extension AgentModeViewModel {
         guard session.selectedAgent == .codexExec,
               AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection),
               session.codexController != nil,
-              // Disablement is a reason not to repair, never a reason to reconnect: the returned
-              // catalog is then truthfully absent and the user asked for that.
-              ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink)
+              agentSessionLinkCatalogRepairIsEnabled(for: session)
         else {
             return
         }
@@ -371,6 +366,21 @@ extension AgentModeViewModel {
             ))
         }
         codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
+    }
+
+    /// Shared by opening and spending a repair cycle, so a later tool disablement is
+    /// rechecked. Scope-only administration discovery remains independent of oversight.
+    func agentSessionLinkCatalogRepairIsEnabled(for session: TabSession) -> Bool {
+        let availability = ToolAvailabilityStore.shared
+        if availability.isEnabled(MCPWindowToolName.agentSessionLink) { return true }
+        guard availability.isEnabled(MCPWindowToolName.sessionAdmin),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let projection = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+              projection.runID == session.runID else { return false }
+        return AgentSessionLinkCatalogSurface.differs(
+            toolName: MCPWindowToolName.sessionAdmin,
+            expected: projection.expectedSurface, returned: projection.returnedSurface
+        )
     }
 
     /// Stores one exact incarnation's passive status-notice queue.
@@ -739,6 +749,14 @@ extension AgentModeViewModel {
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
             allowsClaimlessAutoWake: periodicAttempt != nil,
+            decorateLocalInputs: { baseline in
+                #if DEBUG
+                    if let decorate = self.test_agentSessionLinkLocalInputDecoration { return decorate(baseline) }
+                #endif
+                return AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
+                    observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
+                )
+            },
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -840,6 +858,34 @@ extension AgentModeViewModel {
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,
             mustAbortDispatch: false
+        )
+    }
+
+    func agentSessionLinkProveProviderInput(
+        for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?
+    ) async -> AgentSessionLinkProviderInputRelease.Proof {
+        await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
+            guard let observer = claim?.observerEndpoint,
+                  self.sessions[session.tabID] === session else { return false }
+            #if DEBUG
+                if let readProof = self.test_agentSessionLinkLocalInputReadProof { return await readProof(decoration) }
+            #endif
+            return await AgentSessionLinkRuntimeBridge.shared.proveLocalInputRead(decoration, observer: observer)
+        }
+    }
+
+    func agentSessionLinkHandoffProviderInput(
+        for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
+        claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
+    ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        AgentSessionLinkProviderInputRelease.handoff(
+            original: claim, proof: proof,
+            current: { self.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID) },
+            isPending: { self.agentSessionLinkPromptClaimStore.isPending($0) },
+            consume: { decoration in
+                guard let observer = claim?.observerEndpoint, self.sessions[session.tabID] === session else { return false }
+                return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
+            }
         )
     }
 

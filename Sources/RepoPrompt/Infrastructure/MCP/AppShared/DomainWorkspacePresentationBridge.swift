@@ -3,6 +3,7 @@
 #endif
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 struct DomainWorkspaceSaveOperationIDs {
     let working: UUID
@@ -47,6 +48,17 @@ private enum DomainWorkspaceModelEncoder {
 struct DomainWorkspaceAuthorityClient {
     let store: DomainWorkspaceStore
     let windowID: Int
+    var metadataPathPolicy: AppMetadataPathPolicy?
+
+    /// Admit through the same policy the runtime writer uses, before UI relocation mutates disk.
+    func admitStorageRoot(_ root: URL) throws {
+        try metadataPathPolicy?.admitWorkspaceRoot(root)
+    }
+
+    /// The exact digest used by document submission, shared with presentation write receipts.
+    static func documentDigest(for workspace: WorkspaceModel) throws -> String {
+        try DomainContentDigest.sha256(DomainWorkspaceModelEncoder.encode(workspace))
+    }
 
     #if DEBUG
         /// Per-client suspension only: the real envelope and authority execution remain unchanged.
@@ -83,7 +95,7 @@ struct DomainWorkspaceAuthorityClient {
         _ workspace: WorkspaceModel,
         fileURL: URL
     ) async throws -> DomainWorkspaceSnapshot {
-        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL))
+        try await store.registerReadDocument(Self.document(for: workspace, fileURL: fileURL))
     }
 
     func create(
@@ -92,7 +104,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
             expectedCatalogRevision: expectedCatalogRevision,
@@ -119,7 +131,7 @@ struct DomainWorkspaceAuthorityClient {
         canonicalRootPath: String,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: 0,
@@ -137,10 +149,37 @@ struct DomainWorkspaceAuthorityClient {
         expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
+            origin: .appPresentation(windowID: windowID),
+            command: .replaceWorkingDocument(document)
+        ))
+    }
+
+    /// Submits the captured document against its adopted revision without replaying its bytes
+    /// over an interleaved durable writer.
+    func replaceWorkingFailClosed(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        expectedWorkspaceRevision: UInt64,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
+        return try await replaceWorkingFailClosed(document, expectedWorkspaceRevision: expectedWorkspaceRevision, operationID: operationID)
+    }
+
+    func replaceWorkingFailClosed(
+        _ document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        try Task.checkCancellation()
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
+            conflictRecoveryPolicy: .failClosed,
             origin: .appPresentation(windowID: windowID),
             command: .replaceWorkingDocument(document)
         ))
@@ -171,7 +210,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String?,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspacePhasedSaveOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -224,7 +263,22 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
+        return try await saveFailClosed(
+            document,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
+            expectedContentDigest: expectedContentDigest,
+            operationIDs: operationIDs
+        )
+    }
+
+    func saveFailClosed(
+        _ document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        expectedContentDigest: String,
+        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
+    ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
+        try Task.checkCancellation()
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -251,7 +305,7 @@ struct DomainWorkspaceAuthorityClient {
             expectedWorkspaceRevision: saveRevision,
             conflictRecoveryPolicy: .failClosed,
             origin: .appPresentation(windowID: windowID),
-            command: .saveWorkspaceDocument(workspaceID: workspace.id)
+            command: .saveWorkspaceDocument(workspaceID: document.workspaceID)
         ))
         return DomainWorkspaceFailClosedSaveOutcome(
             working: workingOutcome,
@@ -279,7 +333,7 @@ struct DomainWorkspaceAuthorityClient {
         return await store.snapshot()
     }
 
-    private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
+    static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
         let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
@@ -321,6 +375,9 @@ final class DomainWorkspacePresentationBridge {
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
     private var projectedModels: [UUID: WorkspaceModel] = [:]
+    /// Cached models can contain local edits beyond their canonical digest. A point adoption can
+    /// discard those edits without reconciling the catalog, so each row keeps its owner generation.
+    private var projectedAdoptionGenerations: [UUID: UInt64] = [:]
     /// Manager reconciliation generation the caches above were committed against; nil until this
     /// run's first accepted full reconciliation. A mismatch (manager-owned reload or cleanup) forces
     /// a complete decode/reconcile before the caches are trusted again.
@@ -356,6 +413,7 @@ final class DomainWorkspacePresentationBridge {
         acceptedReconciliationGeneration = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
+        projectedAdoptionGenerations.removeAll(keepingCapacity: false)
         #if DEBUG
             projectionCheckpoint = nil
             catalogProjectionCheckpoint = nil
@@ -405,6 +463,16 @@ final class DomainWorkspacePresentationBridge {
         }
     }
 
+    /// Admission joins the existing catalog owner before creating or re-submitting a provisional
+    /// binding. Reading a newer revision alone never qualifies a local whole-document write.
+    func refreshForAgentAdmission() async -> Bool {
+        guard let runID = subscriptionRunID, isCurrentRun(runID) else { return false }
+        requestCatalogRefresh(isRetry: false)
+        guard let task = catalogRefreshTask else { return false }
+        await task.value
+        return isCurrentRun(runID)
+    }
+
     /// Close/stop cancellation: never publishes an error. A task already inside runtime I/O may finish
     /// there; its result is discarded by the run/cancellation checks.
     func cancelCatalogRefresh() {
@@ -430,6 +498,8 @@ final class DomainWorkspacePresentationBridge {
     #if DEBUG
         /// Captured by each refresh before scheduling; never substitutes the authority result.
         var afterCatalogReloadForTesting: (@MainActor () async -> Void)?
+        /// Holds the real preparation/apply boundary, never substitutes decoded models.
+        var catalogPreparationDidFinishForTesting: (@MainActor (_ wasOnMainThread: Bool) async -> Void)?
 
         private var initialDefaultCreateOverride: (outcome: DomainCommandOutcome, observeCandidate: (WorkspaceModel) -> Void)?
 
@@ -630,23 +700,34 @@ final class DomainWorkspacePresentationBridge {
         attempt: DomainCatalogAttempt,
         runID: UUID
     ) async {
-        /// A covering accepted reconciliation (e.g. a newer retry/event/reload) needs nothing further.
-        func isUncoveredFreshnessRejection(
+        /// A manager reconciliation can cover the data without crediting this bridge's waiter/cache.
+        /// Give that handoff the same single refetch budget, never an invented checkpoint.
+        func needsCurrentSnapshot(
             _ rejection: DomainCatalogRejection?, _ snapshot: DomainWorkspaceCatalogSnapshot
         ) -> Bool {
             guard let rejection, [.stalePublication, .staleCatalogRevision, .reentrant, .superseded].contains(rejection)
             else { return false }
-            return workspaceManager?.coversDomainCatalog(snapshot) == false
+            guard let manager = workspaceManager else { return false }
+            return !manager.coversDomainCatalog(snapshot)
+                || lastPublicationSequence < snapshot.publicationSequence
+                || acceptedReconciliationGeneration != manager.domainCatalogReconciliationGeneration
         }
-        var rejection = project(snapshot, attempt: attempt, runID: runID)
+        var rejection = await project(snapshot, attempt: attempt, runID: runID)
         var resolved = snapshot
-        if isUncoveredFreshnessRejection(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
+        if needsCurrentSnapshot(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
             let refetched = await client.snapshot()
             guard isCurrentRun(runID) else { return }
-            rejection = project(refetched, attempt: refetchAttempt, runID: runID)
+            rejection = await project(refetched, attempt: refetchAttempt, runID: runID, allowCoveredMetadata: true)
             resolved = refetched
+            // A covering reconciliation can also win during the FINAL decode suspension.
+            // Complete its metadata handoff synchronously; no third read/decode or retry budget.
+            if rejection == .superseded,
+               acceptCoveredCatalogMetadata(refetched, attempt: refetchAttempt, runID: runID)
+            {
+                rejection = nil
+            }
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
-            if isUncoveredFreshnessRejection(rejection, refetched) {
+            if needsCurrentSnapshot(rejection, refetched), workspaceManager?.coversDomainCatalog(refetched) == false {
                 workspaceManager?.reportDomainCatalogFailure(
                     .catalogChangedDuringRefresh, snapshot: refetched, attempt: refetchAttempt
                 )
@@ -657,10 +738,42 @@ final class DomainWorkspacePresentationBridge {
         }
     }
 
-    /// The originating window already applied its command outcome (revisions + digest) via
-    /// `applyDomainAuthorityOutcome`, so echoing its own commit back through a full catalog
-    /// snapshot plus a MainActor document decode would only amplify every capture by W windows.
-    /// Bookkeeping is refreshed from a single-workspace snapshot instead.
+    /// Only an already-accepted catalog with exact qualified document descendants can hand off.
+    /// Preserve the suspended attempt's failure witnesses: a newer report must not be cleared.
+    private func acceptCoveredCatalogMetadata(
+        _ snapshot: DomainWorkspaceCatalogSnapshot,
+        attempt: DomainCatalogAttempt,
+        runID: UUID
+    ) -> Bool {
+        guard isCurrentRun(runID), let manager = workspaceManager,
+              manager.domainCatalogReconciliationGeneration > 0,
+              !manager.requiresFullCatalogReconciliation,
+              manager.coversDomainCatalog(snapshot),
+              snapshot.workspaces.allSatisfy({ manager.qualifiedDomainWorkspaceDescendant($0) != nil })
+        else { return false }
+        let handoff = DomainCatalogAttempt(
+            generation: manager.beginDomainCatalogAttempt().generation,
+            failureWitness: attempt.failureWitness,
+            projectionIssueWitness: attempt.projectionIssueWitness
+        )
+        guard case let .accepted(receipt) = manager.applyDomainWorkspaceCatalog(
+            snapshot,
+            projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+            preferredActiveWorkspaceID: nil,
+            rootMapPolicy: .snapshotMetadata,
+            attempt: handoff
+        ), isCurrentRun(runID) else { return false }
+        let digests = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0.document.contentDigest)
+        })
+        cacheAcceptedModels(snapshot.workspaces, availableModelIDs: Set(digests.keys))
+        commitAccepted(receipt, digests: digests, runID: runID)
+        return true
+    }
+
+    /// A proven own document submission or already-adopted document may refresh bookkeeping from
+    /// one record. Window identity alone cannot prove that a later canonical document belongs to
+    /// this event: another command may have committed before the point read resumes.
     private func suppressSelfEcho(for event: DomainWorkspaceEvent, runID: UUID?) async -> Bool {
         let ownerRunID = runID ?? subscriptionRunID
         let suppressibleKinds: Set<DomainWorkspaceEventKind> = [
@@ -675,8 +788,7 @@ final class DomainWorkspacePresentationBridge {
               workspaceManager?.admitsDomainSelfEcho(baselineGeneration: baselineGeneration) == true
         else { return false }
         guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
-              workspace.health.acceptsMutations,
-              let model = workspaceManager?.workspace(withID: workspaceID)
+              workspace.health.acceptsMutations
         else { return false }
         if let runID, !isCurrentRun(runID) { return false }
         // Only an accepted one-record baseline may advance caches; otherwise take the full path.
@@ -687,18 +799,23 @@ final class DomainWorkspacePresentationBridge {
             health: workspace.health,
             catalogRevision: event.catalogRevision,
             publicationSequence: event.sequence,
-            baselineGeneration: baselineGeneration
+            baselineGeneration: baselineGeneration,
+            operationID: event.operationID,
+            eventRevisions: event.revisions
         ) == true else { return false }
         guard subscriptionRunID == ownerRunID, !Task.isCancelled,
-              workspaceManager?.isPreparingForWindowClose == false
+              let manager = workspaceManager, !manager.isPreparingForWindowClose,
+              let generation = manager.adoptedFullDocumentGeneration(
+                  workspaceID: workspaceID, contentDigest: workspace.document.contentDigest
+              ),
+              let model = manager.workspace(withID: workspaceID)
         else { return false }
-        // A same-window commit can be accepted just before a newer local edit is captured. Keep the
-        // local model in both the manager and bridge cache: advancing the baseline below lets the
-        // newer edit commit from the accepted revision, and explicit failed-save reconciliation
-        // remains responsible for authoritative replacement when a two-phase cleanup save does not
-        // complete. The outcome does not depend on re-encoding the model to compare digests.
+        // Manager acceptance proves this canonical document belongs to the local edit lineage.
+        // Preserve a newer local edit without treating an unrelated newer canonical snapshot as
+        // its write baseline. Cached overlays remain subject to the same per-record witness.
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
+        projectedAdoptionGenerations[workspaceID] = generation
         lastPublicationSequence = event.sequence
         didApplyProjection(runID: runID, publicationSequence: event.sequence, application: .selfEchoBaseline)
         return true
@@ -710,8 +827,9 @@ final class DomainWorkspacePresentationBridge {
     private func project(
         _ snapshot: DomainWorkspaceCatalogSnapshot,
         attempt: DomainCatalogAttempt,
-        runID: UUID
-    ) -> DomainCatalogRejection? {
+        runID: UUID,
+        allowCoveredMetadata: Bool = false
+    ) async -> DomainCatalogRejection? {
         guard isCurrentRun(runID), let manager = workspaceManager else { return nil }
         if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
         guard snapshot.isBootstrapped else {
@@ -733,15 +851,39 @@ final class DomainWorkspacePresentationBridge {
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
-        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests {
+        let cachedMetadataIsQualified = baselineGeneration != nil
+            && Set(projectedModels.keys) == Set(nextDigests.keys) && projectedDigests == nextDigests
+            && records.allSatisfy { record in
+                guard let generation = manager.adoptedFullDocumentGeneration(
+                    workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
+                ) else { return false }
+                return projectedAdoptionGenerations[record.document.workspaceID] == generation
+            }
+        // A real full reconciliation may have won while our CPU preparation was suspended.
+        // Its qualified descendants already contain these exact canonical documents. Adopt that
+        // owner's metadata baseline instead of decoding/adopting them again or stranding waiters.
+        let coveredMetadataIsQualified = allowCoveredMetadata && baselineGeneration == nil
+            && manager.domainCatalogReconciliationGeneration > 0
+            && !manager.requiresFullCatalogReconciliation
+            && manager.coversDomainCatalog(snapshot)
+            && records.allSatisfy { record in
+                manager.qualifiedDomainWorkspaceDescendant(record) != nil
+            }
+        let metadataGeneration = cachedMetadataIsQualified ? baselineGeneration
+            : (coveredMetadataIsQualified ? manager.domainCatalogReconciliationGeneration : nil)
+        if let metadataGeneration {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
-                projection: .metadata(baselineGeneration: baselineGeneration),
+                projection: .metadata(baselineGeneration: metadataGeneration),
                 preferredActiveWorkspaceID: nil,
                 rootMapPolicy: .snapshotMetadata,
                 attempt: attempt
             ) {
             case let .accepted(receipt):
+                guard isCurrentRun(runID) else { return nil }
+                if coveredMetadataIsQualified {
+                    cacheAcceptedModels(records, availableModelIDs: Set(nextDigests.keys))
+                }
                 commitAccepted(receipt, digests: nextDigests, runID: runID)
                 return nil
             case .rejected(.fullProjectionRequired):
@@ -751,26 +893,66 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
-        // Decode failures degrade only their authoritative member. Keep all-record digests below:
-        // missing model keys force the next snapshot to retry even an unchanged failed document.
-        var nextModels: [UUID: WorkspaceModel] = [:]
+        // Capture provenance, not manager references, before yielding for CPU work. Cached local
+        // descendants are re-read only after that witness and the authority floors are revalidated.
+        let preparationWitness = manager.catalogPreparationWitness
+        var reusableIDs: Set<UUID> = []
+        var recordsToDecode: [DomainWorkspaceSnapshot] = []
         var failedIDs: Set<UUID> = []
         for record in records {
             let workspaceID = record.document.workspaceID
             if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
-               let cached = projectedModels[workspaceID]
+               let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
+               projectedAdoptionGenerations[workspaceID] == generation,
+               projectedModels[workspaceID] != nil,
+               manager.workspace(withID: workspaceID) != nil
             {
-                nextModels[workspaceID] = cached
+                reusableIDs.insert(workspaceID)
             } else {
                 do {
-                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)
+                    try manager.checkDomainWorkspaceCatalogRecordDecoding(record)
+                    recordsToDecode.append(record)
                 } catch {
                     failedIDs.insert(workspaceID)
                 }
             }
         }
+        var nextModels: [UUID: WorkspaceModel] = [:]
+        if !recordsToDecode.isEmpty {
+            do {
+                let prepared = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode(recordsToDecode)
+                #if DEBUG
+                    await catalogPreparationDidFinishForTesting?(prepared.wasOnMainThread)
+                #endif
+                guard isCurrentRun(runID) else { return .cancelled }
+                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
+                guard manager.catalogPreparationWitness == preparationWitness else {
+                    #if DEBUG
+                        AgentModePerfDiagnostics.increment("workspace.prepare.projectionDiscarded")
+                    #endif
+                    return .superseded
+                }
+                nextModels = prepared.models
+                failedIDs.formUnion(prepared.failedIDs)
+                // A point read may have adopted this exact document before this bridge had a cache.
+                // Keep its current local descendant, but only after a successful canonical decode
+                // and the unchanged preparation witness. A failed decode is never rescued here.
+                for record in recordsToDecode where nextModels[record.document.workspaceID] != nil {
+                    if let descendant = manager.qualifiedDomainWorkspaceDescendant(record) {
+                        nextModels[record.document.workspaceID] = descendant
+                    }
+                }
+            } catch {
+                return .cancelled
+            }
+        }
+        for workspaceID in reusableIDs {
+            nextModels[workspaceID] = manager.workspace(withID: workspaceID)
+        }
         // Presentation-only availability, never a write to authoritative membership. The existing
-        // incomplete-catalog warning carries the failed IDs and keeps valid rows usable.
+        // incomplete-catalog warning carries the failed IDs and keeps valid rows usable. The manager
+        // retains last-known models for unavailable members; do not cache failed decodes here,
+        // otherwise an unchanged failed digest could incorrectly take the metadata fast path.
         let available = DomainWorkspaceCatalogSnapshot(
             runtimeIdentity: snapshot.runtimeIdentity, isBootstrapped: snapshot.isBootstrapped,
             publicationSequence: snapshot.publicationSequence, catalogRevision: snapshot.catalogRevision,
@@ -786,9 +968,29 @@ final class DomainWorkspacePresentationBridge {
         )
         guard case let .accepted(receipt) = result else { return result.rejection }
         guard isCurrentRun(runID) else { return nil }
-        projectedModels = nextModels
+        // Accepted chooser publication can synchronously adopt another model for the same digest.
+        // Read each model and its witness together after those callbacks; never stamp an older
+        // pre-application overlay with a newly observed owner generation.
+        cacheAcceptedModels(records, availableModelIDs: Set(nextModels.keys))
         commitAccepted(receipt, digests: nextDigests, runID: runID)
         return nil
+    }
+
+    private func cacheAcceptedModels(_ records: [DomainWorkspaceSnapshot], availableModelIDs: Set<UUID>) {
+        guard let manager = workspaceManager else { return }
+        var acceptedModels: [UUID: WorkspaceModel] = [:]
+        var acceptedGenerations: [UUID: UInt64] = [:]
+        for record in records {
+            let workspaceID = record.document.workspaceID
+            guard availableModelIDs.contains(workspaceID),
+                  let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
+                  let model = manager.workspace(withID: workspaceID)
+            else { continue }
+            acceptedModels[workspaceID] = model
+            acceptedGenerations[workspaceID] = generation
+        }
+        projectedModels = acceptedModels
+        projectedAdoptionGenerations = acceptedGenerations
     }
 
     private func commitAccepted(

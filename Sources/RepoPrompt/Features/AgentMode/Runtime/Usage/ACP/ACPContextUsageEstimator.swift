@@ -11,9 +11,10 @@ import Foundation
 ///   and `size` its context window, so the snapshot is `exact`. An occupancy report also marks
 ///   the turn: a later billed prompt-call count from the same turn may not replace it, since the
 ///   billed figure can be cumulative across the turn's internal requests.
-/// - Prompt-response usage (`ingestTurnFinalizationSignal`): `inputTokens` plus the cache fields
-///   are billed per-call input, so the snapshot is `bestEffort` — unless the provider already
-///   reported occupancy this turn, in which case only a new window is adopted. A billed count
+/// - Prompt-response usage (`ingestTurnFinalizationSignal`): the controller maps provider-specific
+///   context metadata separately from billing usage. Finalization figures remain `bestEffort`,
+///   not verified occupancy — unless the provider already reported occupancy this turn, in which
+///   case only a new window is adopted. A billed count
 ///   that exceeds the known window is provably cumulative rather than occupancy and is not
 ///   stored as the context count.
 ///
@@ -145,7 +146,10 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
         let freshWindow = normalizedPositive(modelContextWindow)
-        let resolvedWindow = freshWindow ?? existing?.modelContextWindow
+        // Zero is an explicit withdrawal (e.g. Grok changed models but cannot resolve
+        // capacity); nil remains "no new claim" for providers that omit a window.
+        let clearsWindow = modelContextWindow == 0
+        let resolvedWindow = clearsWindow ? nil : (freshWindow ?? existing?.modelContextWindow)
         let reportedUsed = normalizedContextUsedTokens(
             contextUsedTokens,
             modelContextWindow: resolvedWindow
@@ -157,7 +161,7 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
         // A call carrying no fresh figure must not relabel the snapshot it would carry forward;
         // a positive report still counts as fresh even when the window bound rejects it.
         let rejectedOverWindow = normalizedPositive(contextUsedTokens) != nil && reportedUsed == nil
-        guard reportedUsed != nil || freshWindow != nil || rejectedOverWindow else { return nil }
+        guard reportedUsed != nil || freshWindow != nil || rejectedOverWindow || clearsWindow else { return nil }
         // A billed prompt-call count can be cumulative across the turn's internal requests, so it
         // never replaces a same-turn occupancy figure. Without one, it replaces a figure stored by
         // an earlier turn, being the later report; oversight never exports it (see

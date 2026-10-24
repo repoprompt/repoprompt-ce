@@ -233,10 +233,29 @@ extension GlobalSettingsStore {
         }
     }
 
+    func autoEffortConfiguration() -> AutoEffortConfiguration {
+        .init(
+            enabled: scalarPreferences.agentMode?.autoEffortEnabled == true,
+            selectedBackendRawValue: scalarPreferences.agentMode?.autoEffortBackendRawValue,
+            revision: autoEffortSettingsRevision
+        )
+    }
+
+    func setAutoEffortBackend(_ id: DecisionServiceID, commit: Bool = true) {
+        setAutoEffortBackendRaw(id.rawValue, commit: commit)
+    }
+
+    func materializeModelRouterDefaultIfAbsent(_ id: DecisionServiceID) {
+        guard persistenceBlockReason == nil,
+              scalarPreferences.modelRouter?.selectedBackendRawValue == nil
+        else { return }
+        setModelRouterBackend(id)
+    }
+
     func modelRouterConfiguration() -> AgentTaskRouterConfiguration {
         let stored = scalarPreferences.modelRouter
-        let backendRaw = stored?.selectedBackendRawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let backendID = backendRaw.flatMap { $0.isEmpty ? nil : AgentTaskRouterBackendID(rawValue: $0) }
+        let backendRaw = stored?.selectedBackendRawValue
+        let backendID = backendRaw.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : DecisionServiceID(rawValue: $0) }
 
         let rolesMaterialized = stored?.candidateRoleRawValues != nil
         let rawRoles = stored?.candidateRoleRawValues ?? []
@@ -286,7 +305,8 @@ extension GlobalSettingsStore {
             revision: modelRouterSettingsRevision,
             usageBalancing: AgentUsageBalancingConfiguration(
                 enabled: stored?.usageBalancingEnabled == true && AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) != nil,
-                preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace
+                preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace,
+                overrideRouter: stored?.usageBalancingOverride == true
             ),
             allowPaidFastRouting: stored?.allowPaidFastRouting == true
         )
@@ -300,35 +320,57 @@ extension GlobalSettingsStore {
         updateModelRouterScalar(commit: true) { $0.usageBalancingPreset = preset.rawValue }
     }
 
+    func setUsageBalancingOverride(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingOverride = enabled }
+    }
+
     func setAllowPaidFastRouting(_ enabled: Bool) {
         updateModelRouterScalar(commit: true) { $0.allowPaidFastRouting = enabled }
     }
 
-    func setModelRouterBackend(_ backendID: AgentTaskRouterBackendID, commit: Bool = true) {
+    func setModelRouterBackend(_ backendID: DecisionServiceID, commit: Bool = true) {
         updateModelRouterScalar(commit: commit) { $0.selectedBackendRawValue = backendID.rawValue }
+    }
+
+    private func canonicalModelRouterCandidateRoleRawValues(
+        selectedRoles: Set<AgentModelCatalog.TaskLabelKind>,
+        preserving existingRawValues: [String]?
+    ) -> [String] {
+        AgentModelCatalog.TaskLabelKind.allCases
+            .filter(selectedRoles.contains)
+            .map(\.rawValue) + (existingRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
+            }
+    }
+
+    private func canonicalModelRouterAllowedProviderRawValues(
+        selectedProviders: Set<AgentProviderKind>,
+        preserving existingRawValues: [String]?
+    ) -> [String] {
+        AgentProviderKind.allCases
+            .filter(selectedProviders.contains)
+            .map(\.rawValue) + (existingRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentProviderKind(rawValue: $0) == nil
+            }
     }
 
     func setModelRouterCandidateRoles(_ roles: Set<AgentModelCatalog.TaskLabelKind>, commit: Bool = true) {
         updateModelRouterScalar(commit: commit) { settings in
-            let unknown = (settings.candidateRoleRawValues ?? []).filter {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
-            }
-            settings.candidateRoleRawValues = AgentModelCatalog.TaskLabelKind.allCases
-                .filter(roles.contains)
-                .map(\.rawValue) + unknown
+            settings.candidateRoleRawValues = canonicalModelRouterCandidateRoleRawValues(
+                selectedRoles: roles,
+                preserving: settings.candidateRoleRawValues
+            )
         }
     }
 
     func setModelRouterAllowedProviders(_ providers: Set<AgentProviderKind>, commit: Bool = true) {
         updateModelRouterScalar(commit: commit) { settings in
-            let unknown = (settings.allowedProviderRawValues ?? []).filter {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && AgentProviderKind(rawValue: $0) == nil
-            }
-            settings.allowedProviderRawValues = AgentProviderKind.allCases
-                .filter(providers.contains)
-                .map(\.rawValue) + unknown
+            settings.allowedProviderRawValues = canonicalModelRouterAllowedProviderRawValues(
+                selectedProviders: providers,
+                preserving: settings.allowedProviderRawValues
+            )
         }
     }
 
@@ -344,27 +386,21 @@ extension GlobalSettingsStore {
     /// Materializes the currently visible policy on first enable; subsequent provider additions
     /// remain opt-in because these arrays are thereafter explicit.
     func enableModelRouterWithCurrentPolicy(
-        backendID: AgentTaskRouterBackendID,
+        backendID: DecisionServiceID,
         roles: Set<AgentModelCatalog.TaskLabelKind>,
         providers: Set<AgentProviderKind>,
         commit: Bool = true
     ) {
         updateModelRouterScalar(commit: commit) { settings in
-            let unknownRoles = (settings.candidateRoleRawValues ?? []).filter {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
-            }
-            let unknownProviders = (settings.allowedProviderRawValues ?? []).filter {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && AgentProviderKind(rawValue: $0) == nil
-            }
             settings.selectedBackendRawValue = backendID.rawValue
-            settings.candidateRoleRawValues = AgentModelCatalog.TaskLabelKind.allCases
-                .filter(roles.contains)
-                .map(\.rawValue) + unknownRoles
-            settings.allowedProviderRawValues = AgentProviderKind.allCases
-                .filter(providers.contains)
-                .map(\.rawValue) + unknownProviders
+            settings.candidateRoleRawValues = canonicalModelRouterCandidateRoleRawValues(
+                selectedRoles: roles,
+                preserving: settings.candidateRoleRawValues
+            )
+            settings.allowedProviderRawValues = canonicalModelRouterAllowedProviderRawValues(
+                selectedProviders: providers,
+                preserving: settings.allowedProviderRawValues
+            )
             settings.enabled = true
         }
     }

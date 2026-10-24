@@ -554,10 +554,46 @@ enum CodeMapPerfRuntime {
         let queueWaitMilliseconds: [UInt64]
     }
 
+    struct CodemapManifestWriterTaskSnapshot: Equatable {
+        let writerID: UUID
+        let namespaceDigest: String
+        var rootEpoch: WorkspaceCodemapRootEpoch?
+        var batchID: UUID?
+        var origin: String?
+        var phase: String
+        let taskStartedUptimeNanoseconds: UInt64
+        var batchStartedUptimeNanoseconds: UInt64?
+        var phaseStartedUptimeNanoseconds: UInt64
+    }
+
+    struct CodemapManifestWriterQueueSnapshot: Equatable {
+        let namespaceDigest: String
+        let queuedItemCount: Int
+        let deferredTailItemCount: Int
+        let deferredHeadWaitingItemCount: Int
+        let inFlightItemCount: Int
+        let retryPending: Bool
+    }
+
+    struct CodemapManifestWriterActivitySnapshot: Equatable {
+        let engineInstanceID: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let sampledUptimeNanoseconds: UInt64
+        let liveTaskCount: Int
+        let namespaceCount: Int
+        let accountingComplete: Bool
+        let quiescenceConfirmed: Bool
+        let omittedLiveTaskCount: Int
+        let tasks: [CodemapManifestWriterTaskSnapshot]
+        let namespaces: [CodemapManifestWriterQueueSnapshot]
+        let omittedNamespaceCount: Int
+    }
+
     struct CodemapGraphStatusManifestSnapshot: Equatable {
         let failureCounts: [WorkspaceCodemapManifestFailureReason: UInt64]
         let lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
         let measurements: WorkspaceCodemapManifestMeasurementSnapshot
+        var writerActivity: CodemapManifestWriterActivitySnapshot?
     }
 
     struct CodemapGraphStatusRootSnapshot: Equatable {

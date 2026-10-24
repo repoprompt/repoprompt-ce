@@ -268,6 +268,31 @@
           "nullable": false
         },
         {
+          "path": "data[].serviceTiers",
+          "presence": "optional",
+          "nullable": false
+        },
+        {
+          "path": "data[].serviceTiers[].id",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].serviceTiers[].name",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].serviceTiers[].description",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].additionalSpeedTiers",
+          "presence": "optional",
+          "nullable": false
+        },
+        {
           "path": "nextCursor",
           "presence": "optional",
           "nullable": true
