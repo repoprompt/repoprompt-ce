@@ -6,6 +6,25 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
     private let engine = ApplyEditsEngine.default
     private let builder = ApplyEditsRequestBuilder()
 
+    func testNoChangeReceiptUsesExplicitStatusInDecodedAndFallbackResults() throws {
+        for extra in [[:], ["results": Value.string("legacy")]] {
+            var object: [String: Value] = [
+                "status": .string("no_change"),
+                "edits_requested": .int(2),
+                "edits_applied": .int(0)
+            ]
+            object.merge(extra) { _, new in new }
+            let blocks = ToolOutputFormatter.formatApplyEdits(value: .object(object), emitResources: false)
+            guard case let .text(text, _, _) = try XCTUnwrap(blocks.first) else {
+                return XCTFail("Expected text receipt")
+            }
+            XCTAssertTrue(text.contains("## Apply Edits ℹ️"), text)
+            XCTAssertTrue(text.contains("No net change"), text)
+            XCTAssertFalse(text.contains("✅"), text)
+            XCTAssertFalse(text.contains("❌"), text)
+        }
+    }
+
     func testRewriteUpdatesTextAndVerboseDiff() async throws {
         let request = ApplyEditsRequest(
             path: "file.swift",
