@@ -32,6 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
+    package static let sessionAdmin = "session_admin"
     package static let becomeOverseer = "become_overseer"
     package static let agentSelf = "self_compact"
     package static let history = "history"
@@ -44,13 +45,13 @@ package enum MCPWindowToolName {
     }
 }
 
-package enum MCPDomainToolScopeKind: String, CaseIterable, Sendable {
+package enum MCPDomainToolScopeKind: String, CaseIterable {
     case application
     case window
     case standalone
 }
 
-package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
+package enum MCPToolCapability: String, CaseIterable, Hashable {
     case conversationSend = "conversation_send"
     case conversationHelper = "conversation_helper"
     case conversationLog = "conversation_log"
@@ -73,6 +74,9 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     /// an oversight link.
     case agentSessionLinkControl = "agent_session_link_control"
     case agentSelfControl = "agent_self_control"
+    /// Delegation-scope administration (`session_admin`). Agent-session only: granted live from the
+    /// exact caller's scope state, never by a static profile, and never to administrative principals.
+    case agentSessionAdmin = "agent_session_admin"
     case agentReasoningControl = "agent_reasoning_control"
     case fileContentEdit = "file_content_edit"
     case fileManagement = "file_management"
@@ -87,7 +91,7 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     }
 }
 
-package enum MCPToolAdmissionClass: String, CaseIterable, Sendable {
+package enum MCPToolAdmissionClass: String, CaseIterable {
     case exclusive
     case control
     case smallRead = "small_read"
@@ -96,13 +100,13 @@ package enum MCPToolAdmissionClass: String, CaseIterable, Sendable {
     case fileSearch = "file_search"
 }
 
-package enum MCPDomainToolOperationInput: Equatable, Sendable {
+package enum MCPDomainToolOperationInput: Equatable {
     case missing
     case value(String)
     case malformed
 }
 
-package struct MCPDomainToolOperationIdentity: Equatable, Hashable, Sendable {
+package struct MCPDomainToolOperationIdentity: Equatable, Hashable {
     package static let unknownToolName = "unknown"
     package static let unknownOperation = "unknown"
     package static let callOperation = "call"
@@ -121,25 +125,25 @@ package struct MCPDomainToolOperationIdentity: Equatable, Hashable, Sendable {
     )
 }
 
-package enum MCPDomainToolResourceLimitScope: String, Sendable {
+package enum MCPDomainToolResourceLimitScope: String {
     case application
     case window
     case repository
 }
 
-package struct MCPDomainToolConfiguredLimits: Equatable, Sendable {
+package struct MCPDomainToolConfiguredLimits: Equatable {
     package let connectionLane: Int
     package let resourceLease: Int?
     package let resourceScope: MCPDomainToolResourceLimitScope?
 }
 
-private enum MCPDomainToolOperationNormalization: Hashable, Sendable {
+private enum MCPDomainToolOperationNormalization: Hashable {
     case exact
     case lowercased
     case trimmedLowercased
 }
 
-private struct MCPDomainToolOperationPolicy: Hashable, Sendable {
+private struct MCPDomainToolOperationPolicy: Hashable {
     let argumentKey: String
     let canonicalOperationByInput: [String: String]
     let defaultOperation: String?
@@ -188,7 +192,7 @@ private struct MCPDomainToolOperationPolicy: Hashable, Sendable {
     }
 }
 
-package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
+package struct MCPDomainToolCatalogEntry: Hashable {
     package let name: String
     package let scope: MCPDomainToolScopeKind
     package let capability: MCPToolCapability
@@ -313,7 +317,12 @@ package enum MCPDomainToolCatalog {
             ],
             normalization: .trimmedLowercased
         )),
+        .init(name: MCPWindowToolName.sessionAdmin, scope: .window, capability: .agentSessionAdmin, admissionClass: .control, operationPolicy: .init(
+            operations: MCPDomainSessionAdminToolDefinition.operations,
+            normalization: .trimmedLowercased
+        )),
         .init(name: MCPWindowToolName.becomeOverseer, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control),
+
         .init(name: MCPWindowToolName.agentSelf, scope: .window, capability: .agentSelfControl, admissionClass: .control, operationPolicy: .init(
             operations: ["context", "compact"],
             normalization: .trimmedLowercased

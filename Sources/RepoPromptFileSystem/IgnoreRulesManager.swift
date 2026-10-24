@@ -31,6 +31,13 @@ package actor IgnoreRulesManager {
     package struct ResolvedIgnoreRules {
         package let rules: IgnoreRules
         package let globalIgnoreDefaultsDigest: String
+        package let repositoryExcludeDigest: String?
+
+        package init(rules: IgnoreRules, globalIgnoreDefaultsDigest: String, repositoryExcludeDigest: String? = nil) {
+            self.rules = rules
+            self.globalIgnoreDefaultsDigest = globalIgnoreDefaultsDigest
+            self.repositoryExcludeDigest = repositoryExcludeDigest
+        }
     }
 
     private let fileManager = FileManager.default
@@ -66,15 +73,18 @@ package actor IgnoreRulesManager {
     private let globalIgnoreProvider: @Sendable () -> String
     private nonisolated let ignorePolicyResolver: @Sendable (URL) throws -> IgnoreRulePolicy
     private let repositoryRootValidator: @Sendable (URL) -> Bool
+    private let repositoryExcludeURL: @Sendable (URL) throws -> URL?
 
     package init(
         globalIgnoreProvider: @escaping @Sendable () -> String,
         ignorePolicyResolver: @escaping @Sendable (URL) throws -> IgnoreRulePolicy,
-        repositoryRootValidator: @escaping @Sendable (URL) -> Bool
+        repositoryRootValidator: @escaping @Sendable (URL) -> Bool,
+        repositoryExcludeURL: @escaping @Sendable (URL) throws -> URL? = { _ in nil }
     ) {
         self.globalIgnoreProvider = globalIgnoreProvider
         self.ignorePolicyResolver = ignorePolicyResolver
         self.repositoryRootValidator = repositoryRootValidator
+        self.repositoryExcludeURL = repositoryExcludeURL
     }
 
     package nonisolated func resolvingLoadedRoot(_ root: URL) throws -> IgnoreRulePolicy {
@@ -194,6 +204,13 @@ package actor IgnoreRulesManager {
 
         let globalIgnoreContent = fetchGlobalDefaults()
         let rules = IgnoreRules(policy: policy)
+        let repositoryExclude = try repositoryExcludeContent(for: repositoryRoot)
+        if let content = repositoryExclude {
+            rules.addCompiledLayer(
+                GitignoreCompiler.compile(content: content),
+                authority: .mandatoryGit
+            )
+        }
         var directory = repositoryRoot
         var relativeDirectory = ""
         for depth in 0 ... prefixComponents.count {
@@ -241,8 +258,26 @@ package actor IgnoreRulesManager {
         guard directory == loadedRoot else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
         return ResolvedIgnoreRules(
             rules: rules,
-            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent)
+            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent),
+            repositoryExcludeDigest: repositoryExclude.map(Self.globalIgnoreDefaultsDigest)
         )
+    }
+
+    package func repositoryExcludeDigest(for loadedPath: String, policy: IgnoreRulePolicy) throws -> String? {
+        guard case let .gitRoot(prefix) = policy else { return nil }
+        var root = URL(fileURLWithPath: loadedPath).resolvingSymlinksInPath().standardizedFileURL
+        for _ in prefix.value.split(separator: "/") {
+            root.deleteLastPathComponent()
+        }
+        guard repositoryRootValidator(root) else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+        return try repositoryExcludeContent(for: root).map(Self.globalIgnoreDefaultsDigest)
+    }
+
+    private func repositoryExcludeContent(for root: URL) throws -> String? {
+        guard let url = try repositoryExcludeURL(root),
+              try Self.mandatoryGitIgnoreControlExists(at: url)
+        else { return nil }
+        return try Self.loadMandatoryGitIgnoreContent(at: url)
     }
 
     package nonisolated static func globalIgnoreDefaultsDigest(for content: String) -> String {

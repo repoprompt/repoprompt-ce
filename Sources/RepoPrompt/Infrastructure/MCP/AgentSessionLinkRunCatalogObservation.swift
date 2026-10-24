@@ -59,13 +59,37 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
 /// Fingerprints the actual client-shaped definitions, not tool-name presence or grant membership.
 /// Kept internal: no MCP wire fields and no authority are introduced.
 enum AgentSessionLinkCatalogSurface {
+    static let toolNames: Set<String> = [
+        MCPWindowToolName.agentSessionLink,
+        MCPWindowToolName.becomeOverseer,
+        MCPWindowToolName.sessionAdmin
+    ]
+
     static func fingerprint(_ tools: [MCP.Tool]) throws -> Data {
         let family = tools.filter {
-            $0.name == MCPWindowToolName.agentSessionLink || $0.name == MCPWindowToolName.becomeOverseer
+            toolNames.contains($0.name)
         }.sorted { $0.name < $1.name }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try encoder.encode(family)
+    }
+
+    /// A disabled oversight family must not prevent repair of an independently granted
+    /// administration tool. Compare its actual client-shaped definition, including withdrawal;
+    /// unknown evidence cannot justify replacing a provider.
+    static func differs(toolName: String, expected: Data?, returned: Data?) -> Bool {
+        guard let expectedTools = definitions(in: expected),
+              let returnedTools = definitions(in: returned) else { return false }
+        let expectedTool = expectedTools.first { $0["name"] as? String == toolName }
+            .map { NSDictionary(dictionary: $0) }
+        let returnedTool = returnedTools.first { $0["name"] as? String == toolName }
+            .map { NSDictionary(dictionary: $0) }
+        return expectedTool != returnedTool
+    }
+
+    private static func definitions(in data: Data?) -> [[String: Any]]? {
+        guard let data else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
     }
 }
 

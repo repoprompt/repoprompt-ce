@@ -123,12 +123,14 @@ extension AgentModeViewModel {
 
     func mcpApplyModelParameterSelections(
         tabID: UUID,
-        selections: [ACPModelParameterSelection]
+        selections: [ACPModelParameterSelection],
+        creationHandle: AgentSessionCreationHandle? = nil
     ) throws {
         guard !selections.isEmpty else { return }
         guard let session = session(for: tabID, createIfNeeded: false) else {
             throw MCPError.internalError("Failed to resolve the Agent session for model parameter configuration.")
         }
+        try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
         try mcpStoreModelParameterSelections(
             tabID: tabID,
             selectedAgent: session.selectedAgent,

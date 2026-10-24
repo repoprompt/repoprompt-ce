@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+import RepoPromptShared
 import SwiftUI
 
 /// Error definitions analogous to ChatSessionError:
@@ -113,7 +114,7 @@ actor ChatDataService {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         return supportDirectory
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             .appendingPathComponent("Workspaces", isDirectory: true)
     }
 
@@ -131,6 +132,7 @@ actor ChatDataService {
             (continuation: CheckedContinuation<Void, Error>) in
             fileSaveQueue.async {
                 do {
+                    try AppProfileLocations.current.validateMetadataFile(url)
                     try FileManager.default.removeItem(at: url)
                     continuation.resume(returning: ())
                 } catch {
@@ -320,6 +322,7 @@ actor ChatDataService {
                 do {
                     let freshEncoder = JSONEncoder() // Use a fresh encoder
                     let data = try freshEncoder.encode(sessionCopy)
+                    try AppProfileLocations.current.validateMetadataFile(fileURL)
                     try data.write(to: fileURL, options: .atomic)
                     continuation.resume(returning: fileURL)
                 } catch {
@@ -664,6 +667,7 @@ actor ChatDataService {
         let baseFolder = try workspaceFolderURL(for: workspace)
         let chatsFolder = baseFolder.appendingPathComponent("Chats")
 
+        try AppProfileLocations.current.validateMetadataFile(chatsFolder)
         if !FileManager.default.fileExists(atPath: chatsFolder.path) {
             try FileManager.default.createDirectory(at: chatsFolder, withIntermediateDirectories: true)
         }
@@ -680,6 +684,7 @@ actor ChatDataService {
     /// Return the main folder for the workspace.
     private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
         let workspaceDir = Self.resolvedWorkspaceFolderURL(for: workspace)
+        try AppProfileLocations.current.validateMetadataFile(workspaceDir)
         if !FileManager.default.fileExists(atPath: workspaceDir.path) {
             try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         }

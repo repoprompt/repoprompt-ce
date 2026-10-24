@@ -139,11 +139,32 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
             client: StubDiscoveryClient(models: nil, failure: AIProviderError.invalidConfiguration(detail: "boom"))
         )
         let refreshed = await failing.refreshNow(workspacePath: nil)
-        XCTAssertFalse(refreshed)
+        XCTAssertEqual(refreshed, .failed)
         let latest = await failing.latestSnapshot()
         XCTAssertEqual(latest?.models.options.map(\.rawValue), ["grok-4.6"])
         XCTAssertEqual(latest?.isLiveDiscovery, false)
         await failing.shutdown()
+    }
+
+    func testRefreshOutcomesDistinguishUpdatedUnchangedAndNoModels() async {
+        let service = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
+        )
+        let first = await service.refreshNow(workspacePath: nil)
+        let second = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(first, .updated)
+        XCTAssertEqual(second, .unchanged)
+        await service.shutdown()
+
+        let empty = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(
+                models: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil),
+                failure: nil
+            )
+        )
+        let emptyOutcome = await empty.refreshNow(workspacePath: nil)
+        XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
+        await empty.shutdown()
     }
 
     func testEmptyDiscoveryDoesNotPersistFakeDefaultSnapshot() async throws {

@@ -81,7 +81,7 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
                 runID: runID,
                 runAttemptID: attemptID
             )
-            _ = state.reserve(note: "resume here", idempotencyKey: "key", owner: owner)
+            _ = state.reserve(note: "resume here", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.admittedSupport = .claudeCode
         }
     }

@@ -194,6 +194,21 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
+    func testPendingCursorFullAccessResolvesApprovalUUIDForTypedWireIDs() async throws {
+        for wireIDJSON in [#""7""#, "7"] {
+            let result = try await autoApprovalOutcome(
+                toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                providerID: .cursor, options: [
+                    ["optionId": "allow_always", "kind": "allow_always"],
+                    ["optionId": "allow_once", "kind": "allow_once"],
+                    ["optionId": "reject_once", "kind": "reject_once"]
+                ], pendingFullAccess: true, expectedPendingAutoApproval: true, wireIDJSON: wireIDJSON
+            )
+            XCTAssertTrue(result.approvalRequested, wireIDJSON)
+            XCTAssertEqual(result.outcome["optionId"], "allow_once", wireIDJSON)
+        }
+    }
+
     func testPendingFullAccessRequiresCurrentFlagAndSupportedProvider() async throws {
         for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
             for enabled in [false, true] {
@@ -232,7 +247,8 @@ final class ACPPermissionScopeTests: XCTestCase {
         fullAccess: Bool = false,
         pendingFullAccess: Bool? = nil,
         expectedPendingAutoApproval: Bool = false,
-        manualDecision: AgentApprovalDecision = .decline
+        manualDecision: AgentApprovalDecision = .decline,
+        wireIDJSON: String = #""permission-1""#
     ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPAutoApprovalProvenance")
@@ -245,6 +261,7 @@ final class ACPPermissionScopeTests: XCTestCase {
         def send(message):
             print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
         prompt_id = None
+        permission_id = json.loads(r'\#(wireIDJSON)')
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
@@ -254,11 +271,11 @@ final class ACPPermissionScopeTests: XCTestCase {
                 send({"id": request["id"], "result": {"sessionId": "test-session"}})
             elif method == "session/prompt":
                 prompt_id = request["id"]
-                send({"id": "permission-1", "method": "session/request_permission", "params": {
+                send({"id": permission_id, "method": "session/request_permission", "params": {
                     "sessionId": "test-session", "toolCall": json.loads(r'\#(toolCallJSON)'),
                     "options": json.loads(r'\#(optionsJSON)')
                 }})
-            elif request.get("id") == "permission-1":
+            elif type(request.get("id")) is type(permission_id) and request.get("id") == permission_id:
                 with open(r"\#(record.path)", "a", encoding="utf-8") as output:
                     output.write(json.dumps(request["result"]["outcome"]) + "\n")
                 send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
@@ -290,15 +307,24 @@ final class ACPPermissionScopeTests: XCTestCase {
                 for await event in events {
                     if case let .approvalRequested(approval) = event {
                         if let pendingFullAccess {
+                            XCTAssertNotNil(UUID(uuidString: approval.requestID.displayValue), "Approval identity is not the provider's wire ID")
                             // Revoke a previously enabled flag too: the response must use
                             // current actor-owned state, not the caller's activation snapshot.
                             await controller.setAutoApproveAllToolPermissions(true)
                             await controller.setAutoApproveAllToolPermissions(pendingFullAccess)
+                            for wireID in ["permission-1", "7", "s:permission-1", "s:7", "i:7"] {
+                                let wireIDSubmitted = await controller.respondToPendingPermissionRequestForFullAccess(id: wireID)
+                                XCTAssertFalse(wireIDSubmitted, "Wire identities must not authorize an approval incarnation")
+                            }
                             let wrongIDSubmitted = await controller.respondToPendingPermissionRequestForFullAccess(id: "not-the-pending-request")
                             XCTAssertFalse(wrongIDSubmitted)
                             let submitted = await controller.respondToPendingPermissionRequestForFullAccess(id: approval.requestID.displayValue)
                             XCTAssertEqual(submitted, expectedPendingAutoApproval)
-                            if submitted { return true }
+                            if submitted {
+                                let submittedAgain = await controller.respondToPendingPermissionRequestForFullAccess(id: approval.requestID.displayValue)
+                                XCTAssertFalse(submittedAgain, "A consumed approval UUID must not send a second response")
+                                return true
+                            }
                         }
                         await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: manualDecision)
                         return true
@@ -436,6 +462,237 @@ private extension XCTestCase {
             throw error
         }
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+    }
+}
+
+@MainActor
+final class ACPPermissionIdentityTests: XCTestCase {
+    func testTypedWireIDsHaveIndependentApprovalIncarnations() async throws {
+        let fixture = try await makeFixture(scenario: "typed")
+        let watchdog = watchdog(for: fixture)
+        defer { watchdog.cancel() }
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        do {
+            let first = try await nextApproval(&events)
+            let second = try await nextApproval(&events)
+            XCTAssertNotEqual(first.id, second.id)
+            await fixture.controller.respondToPermissionRequest(id: first.requestID.displayValue, decision: .accept)
+            await fixture.controller.respondToPermissionRequest(id: second.requestID.displayValue, decision: .decline)
+            try await prompt.value
+            let responses = try fixture.responses()
+            XCTAssertEqual(responses.count, 2)
+            XCTAssertTrue(responses[0]["id"] is String)
+            XCTAssertEqual(responses[1]["id"] as? Int, 7)
+            XCTAssertEqual(outcome(responses[0]), "selected")
+            await fixture.controller.shutdown()
+        } catch {
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    func testDuplicateDuringAuthorizationInvalidatesPendingApproval() async throws {
+        let fixture = try await makeFixture(scenario: "duplicate")
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        let gate = AuthorizationGate()
+        let watchdog = watchdog(for: fixture, gate: gate)
+        defer { watchdog.cancel() }
+        do {
+            let first = try await nextApproval(&events)
+            let response = Task {
+                await fixture.controller.respondToPermissionRequestForOverseer(id: first.requestID.displayValue, decision: .accept) {
+                    await gate.hold()
+                }
+            }
+            await gate.waitForEntry()
+            try Data().write(to: fixture.trigger)
+            guard case let .stream(error) = await events.next() else {
+                gate.release()
+                XCTFail("Duplicate active wire IDs must fail the protocol, not publish another approval")
+                await fixture.controller.shutdown()
+                _ = await response.value
+                _ = try? await prompt.value
+                return
+            }
+            XCTAssertEqual(error.type, "error")
+            gate.release()
+            let result = await response.value
+            XCTAssertEqual(result, .notSubmitted)
+            do {
+                try await prompt.value
+                XCTFail("Duplicate active wire IDs must fail the active prompt")
+            } catch {}
+            await fixture.controller.shutdown()
+            XCTAssertTrue(try fixture.responses().isEmpty)
+        } catch {
+            gate.release()
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    func testCancellationAndWireIDReuseCannotConsumeAnEarlierApproval() async throws {
+        let fixture = try await makeFixture(scenario: "reuse")
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        let gate = AuthorizationGate()
+        let watchdog = watchdog(for: fixture, gate: gate)
+        defer { watchdog.cancel() }
+        do {
+            let first = try await nextApproval(&events)
+            let staleResponse = Task {
+                await fixture.controller.respondToPermissionRequestForOverseer(id: first.requestID.displayValue, decision: .accept) {
+                    await gate.hold()
+                }
+            }
+            await gate.waitForEntry()
+            await fixture.controller.cancelPrompt()
+            let replacement = try await nextApproval(&events)
+            XCTAssertNotEqual(first.id, replacement.id)
+            gate.release()
+            let staleResult = await staleResponse.value
+            XCTAssertEqual(staleResult, .notSubmitted)
+            let freshResult = await fixture.controller.respondToPermissionRequestForOverseer(
+                id: replacement.requestID.displayValue, decision: .accept, authorize: { true }
+            )
+            XCTAssertEqual(freshResult, .submitted)
+            try await prompt.value
+            let responses = try fixture.responses()
+            XCTAssertEqual(responses.map { outcome($0) }, ["cancelled", "selected"])
+            await fixture.controller.shutdown()
+        } catch {
+            gate.release()
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    private func watchdog(for fixture: Fixture, gate: AuthorizationGate? = nil) -> Task<Void, Never> {
+        Task {
+            do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            XCTFail("Permission identity fixture exceeded its bounded deadline")
+            gate?.release()
+            await fixture.controller.shutdown()
+        }
+    }
+
+    private func nextApproval(_ events: inout AsyncStream<NormalizedAgentRuntimeEvent>.Iterator) async throws -> AgentApprovalRequest {
+        while let event = await events.next() {
+            if case let .approvalRequested(approval) = event { return approval }
+        }
+        throw NSError(domain: "ACPPermissionIdentityTests", code: 1)
+    }
+
+    private func outcome(_ response: [String: Any]) -> String? {
+        ((response["result"] as? [String: Any])?["outcome"] as? [String: Any])?["outcome"] as? String
+    }
+
+    private struct Fixture {
+        let controller: ACPAgentSessionController
+        let request: ACPRunRequest
+        let trigger: URL
+        let record: URL
+
+        func responses() throws -> [[String: Any]] {
+            let text = try String(contentsOf: record, encoding: .utf8)
+            return try text.split(separator: "\n").map {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+            }
+        }
+    }
+
+    private func makeFixture(scenario: String) async throws -> Fixture {
+        let directory = try makeTestDirectory(name: "ACPPermissionIdentity")
+        let executable = directory.appendingPathComponent("scripted-acp")
+        let trigger = directory.appendingPathComponent("continue")
+        let record = directory.appendingPathComponent("responses.jsonl")
+        try Data().write(to: record)
+        let script = #"""
+        #!/usr/bin/env python3
+        import json, sys, os, time
+        scenario = "\#(scenario)"
+        def send(message):
+            print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+        def permission(wire_id, item):
+            send({"id": wire_id, "method": "session/request_permission", "params": {
+                "sessionId": "test-session", "toolCall": {"toolCallId": item, "title": item, "kind": "execute"},
+                "options": [{"optionId": "once", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]}})
+        prompt_id = None
+        response_count = 0
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "initialize":
+                send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+            elif method == "session/new":
+                send({"id": request["id"], "result": {"sessionId": "test-session"}})
+            elif method == "session/prompt":
+                prompt_id = request["id"]
+                permission("7", "first")
+                if scenario == "typed":
+                    permission(7, "second")
+                elif scenario == "duplicate":
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(r"\#(trigger.path)") and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    permission("7", "second")
+            elif "result" in request:
+                with open(r"\#(record.path)", "a", encoding="utf-8") as output:
+                    output.write(json.dumps(request) + "\n")
+                response_count += 1
+                if scenario == "reuse" and response_count == 1:
+                    permission("7", "second")
+                elif response_count == 2:
+                    send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let request = ACPRunRequest(
+            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(
+            provider: ScriptedScopeProvider(providerID: .openCode, executable: executable.path), runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
+        )
+        do { _ = try await controller.bootstrap() } catch {
+            await controller.shutdown()
+            throw error
+        }
+        return Fixture(controller: controller, request: request, trigger: trigger, record: record)
+    }
+
+    @MainActor
+    private final class AuthorizationGate {
+        private var entered = false
+        private var released = false
+        private var entryWaiter: CheckedContinuation<Void, Never>?
+        private var continuation: CheckedContinuation<Bool, Never>?
+
+        func hold() async -> Bool {
+            if released { return true }
+            return await withCheckedContinuation {
+                continuation = $0
+                entered = true
+                entryWaiter?.resume()
+                entryWaiter = nil
+            }
+        }
+
+        func waitForEntry() async {
+            if entered || released { return }
+            await withCheckedContinuation { entryWaiter = $0 }
+        }
+
+        func release() {
+            released = true
+            entryWaiter?.resume()
+            entryWaiter = nil
+            continuation?.resume(returning: true)
+            continuation = nil
+        }
     }
 }
 

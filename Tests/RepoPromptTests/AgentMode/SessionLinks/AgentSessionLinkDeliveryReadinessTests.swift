@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Truth table for the pure send-admission reducer.
@@ -26,8 +27,8 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(Readiness.evaluate(snapshot: .ready).isReady)
         XCTAssertEqual(
             Set(Readiness.BlockReason.allCases),
-            [.endpointInvalidated, .targetLoading, .targetNotIdle],
-            "Only target lifecycle, hydration, and busy state may refuse a send."
+            [.endpointInvalidated, .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle],
+            "Only target lifecycle, creation, restoration, and busy state may refuse a send."
         )
     }
 
@@ -118,6 +119,45 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertEqual(Readiness.evaluate(snapshot: rebinding), .blocked(.targetLoading))
     }
 
+    func testCompletedLoadLatchDoesNotAdmitUnfinishedCreationOrFailedRestoration() throws {
+        var snapshot = Snapshot.ready
+        let token = try XCTUnwrap(snapshot.restorationReadiness.bindingToken)
+        let creationPhases: [AgentSessionRestorationReadiness.CreationState.Phase] = [
+            .preparing,
+            .readyToPersist(configurationStamp: Data("configured payload".utf8)),
+            .failedBeforeConfiguration("Preparation failed.")
+        ]
+        for phase in creationPhases {
+            snapshot.restorationReadiness = .creating(token, .init(
+                workspaceID: UUID(), ownerID: UUID(), phase: phase
+            ))
+            XCTAssertTrue(snapshot.hasLoadedPersistedState)
+            XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetCreationIncomplete))
+        }
+        let failures: [AgentSessionRestorationReadiness.Failure] = [
+            .missingPayload, .loadFailed, .sourceRevisionSuperseded
+        ]
+        for failure in failures {
+            snapshot.restorationReadiness = .terminal(token, failure)
+            XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetRestoreUnavailable))
+        }
+        let pendingStates: [AgentSessionRestorationReadiness] = [.unbound, .pending(token)]
+        for pending in pendingStates {
+            snapshot.restorationReadiness = pending
+            XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetLoading))
+        }
+    }
+
+    func testBindingTransitionAndEndpointDriftOutrankPermanentRestorationFailure() throws {
+        var snapshot = Snapshot.ready
+        let token = try XCTUnwrap(snapshot.restorationReadiness.bindingToken)
+        snapshot.restorationReadiness = .terminal(token, .loadFailed)
+        snapshot.bindingTransitionInProgress = true
+        XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetLoading))
+        snapshot.endpointMatchesGrant = false
+        XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.endpointInvalidated))
+    }
+
     // MARK: - Failure vocabulary
 
     /// Terminal prior runs are idle. A completed/cancelled/failed run in a live session must stay
@@ -140,6 +180,8 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(AgentSessionLinkSendFailure.persistenceFailed.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.linkRevoked.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.endpointInvalidated.isRetryable)
+        XCTAssertFalse(AgentSessionLinkSendFailure.targetRestoreUnavailable.isRetryable)
+        XCTAssertFalse(AgentSessionLinkSendFailure.targetCreationIncomplete.isRetryable)
     }
 
     /// The retired transport refusal must not survive anywhere on the wire. A caller that still

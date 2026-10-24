@@ -39,7 +39,19 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         locationLabel: String? = nil,
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let readiness: AgentSessionRestorationReadiness
+        if let bindingID {
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: tabID, sessionID: sessionID, generation: bindingID
+                ),
+                bindingTransitionGeneration: transitionGeneration
+            )
+            readiness = hasLoadedPersistedState ? .authoritative(token, .persistedPayloadApplied) : .pending(token)
+        } else {
+            readiness = .unbound
+        }
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
@@ -56,6 +68,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
+            restorationReadiness: readiness,
             isDeletionInProgress: isDeletionInProgress
         )
     }
@@ -210,24 +223,30 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(menu.availableObservers.map(\.peerEndpoint), [eligibleOverseer.domainEndpoint])
     }
 
-    /// Ordering contract: the row's own workspace cohort first, then folded name — flat across
-    /// linked and available observers in the inbound list.
-    func testInboundListOrdersOwnWorkspaceFirstThenName() {
+    /// Ordering contract: one alphabetical order by the visible label — workspace, branch, then
+    /// chat name — flat across linked and available observers and across workspaces.
+    func testInboundListOrdersAlphabeticallyByVisibleLabelAcrossWorkspaces() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
         let target = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Target")
-        // In the row's workspace but sorts last by name; a linked observer elsewhere sorts first
-        // among the other-workspace group but still after every same-workspace option.
+        // Same workspace as the row but its label sorts last — no own-workspace priority.
+        let availableLocal = candidate(
+            windowID: 3,
+            workspaceID: ownWorkspace,
+            displayName: "Zed",
+            locationLabel: "zeta (main)"
+        )
         let linkedRemote = candidate(
             windowID: 2,
             workspaceID: otherWorkspace,
-            displayName: "AAA linked remote"
+            displayName: "Chat",
+            locationLabel: "beta (main)"
         )
-        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Zeta local")
         let availableRemote = candidate(
             windowID: 4,
             workspaceID: otherWorkspace,
-            displayName: "BBB remote"
+            displayName: "Able",
+            locationLabel: "beta (main)"
         )
         let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 3)
 
@@ -246,47 +265,157 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            menu.observerOptions.map(\.displayName),
-            ["Zeta local", "AAA linked remote", "BBB remote"]
+            menu.observerOptions.map(\.menuLabel),
+            ["beta (main): Able", "beta (main): Chat", "zeta (main): Zed"]
         )
-        guard case .linked = menu.observerOptions[1].relationship else {
+        guard menu.observerOptions.indices.contains(1),
+              case .linked = menu.observerOptions[1].relationship
+        else {
             return XCTFail("expected the remote option to stay linked after sorting")
         }
     }
 
-    /// The inverse list keeps ticked (linked) targets first, then applies the same
-    /// own-workspace/name ordering inside each group.
-    func testOutboundListKeepsLinkedFirstThenWorkspaceThenName() {
+    /// The inverse list keeps ticked (linked) targets first, then applies the same label
+    /// ordering inside each group — again without own-workspace priority.
+    func testOutboundListKeepsLinkedFirstThenLabelOrder() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
-        let observer = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Observer")
-        let linkedRemote = candidate(
-            windowID: 2,
-            workspaceID: otherWorkspace,
-            displayName: "Linked target"
+        let observer = candidate(
+            windowID: 10,
+            workspaceID: ownWorkspace,
+            displayName: "Observer",
+            locationLabel: "zeta (main)"
         )
-        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Alpha local")
+        let linkedZeta = candidate(
+            windowID: 2,
+            workspaceID: ownWorkspace,
+            displayName: "Linked zeta",
+            locationLabel: "zeta (main)"
+        )
+        let linkedAlpha = candidate(
+            windowID: 8,
+            workspaceID: otherWorkspace,
+            displayName: "Linked alpha",
+            locationLabel: "alpha (main)"
+        )
+        let availableLocal = candidate(
+            windowID: 3,
+            workspaceID: ownWorkspace,
+            displayName: "Alpha local",
+            locationLabel: "alpha (dev)"
+        )
         let selfSession = candidate(windowID: 5, sessionID: observer.sessionID, displayName: "Self")
         let ineligibleTarget = candidate(
             windowID: 6,
             hasLoadedPersistedState: false,
             displayName: "Loading target"
         )
-        let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 9)
+        let relationships = [
+            Linked(endpoint: linkedZeta.domainEndpoint, linkID: UUID(), generation: 9),
+            Linked(endpoint: linkedAlpha.domainEndpoint, linkID: UUID(), generation: 4)
+        ]
 
         let menu = AgentSidebarOversightMenuProjection.make(
             target: observer,
-            inputs: inputs(target: observer, linkedTargets: [relationship]),
-            candidates: [observer, linkedRemote, availableLocal, selfSession, ineligibleTarget]
+            inputs: inputs(target: observer, linkedTargets: relationships),
+            candidates: [
+                observer, linkedZeta, linkedAlpha, availableLocal, selfSession, ineligibleTarget
+            ]
         )
 
         XCTAssertEqual(
-            menu.targetOptions.map(\.peerEndpoint),
-            [linkedRemote.domainEndpoint, availableLocal.domainEndpoint]
+            menu.targetOptions.map(\.menuLabel),
+            [
+                "alpha (main): Linked alpha",
+                "zeta (main): Linked zeta",
+                "alpha (dev): Alpha local"
+            ]
         )
         XCTAssertTrue(menu.isOverseer)
-        XCTAssertEqual(menu.outboundTargetNames, ["Linked target"])
+        XCTAssertEqual(menu.outboundTargetNames, ["Linked zeta", "Linked alpha"])
         XCTAssertNil(menu.observerIneligibleReason)
+    }
+
+    /// Label ordering folds case and diacritics in a fixed locale and orders embedded numbers
+    /// naturally — in the chat name ("Chat 2" before "Chat 10") and in the workspace name
+    /// ("ws2" before "ws10", even when the chat names invert).
+    func testAvailableListOrdersCaseDiacriticAndNumberInsensitiveNaturally() {
+        let target = candidate(windowID: 10, displayName: "Target")
+        func peer(_ windowID: Int, _ name: String, _ location: String) -> AgentSessionLinkEndpointCandidate {
+            candidate(windowID: windowID, displayName: name, locationLabel: location)
+        }
+        // "Beta" before "alpha" under raw byte order, so this pair pins case folding;
+        // "Étude" lands after ASCII names without diacritic folding.
+        let peers = [
+            peer(2, "Beta", "ws (main)"),
+            peer(3, "alpha", "ws (main)"),
+            peer(4, "Chat 10", "ws (main)"),
+            peer(5, "Chat 2", "ws (main)"),
+            peer(6, "delta", "ws (main)"),
+            peer(7, "Étude", "ws (main)"),
+            peer(8, "foxtrot", "ws (main)"),
+            peer(9, "zzz", "ws2 (main)"),
+            peer(11, "aaa", "ws10 (main)")
+        ]
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                activeOutboundObserverEndpoints: Set(peers.map(\.domainEndpoint))
+            ),
+            candidates: [target] + peers
+        )
+
+        XCTAssertEqual(
+            menu.availableObservers.map(\.menuLabel),
+            [
+                "ws2 (main): zzz",
+                "ws10 (main): aaa",
+                "ws (main): alpha",
+                "ws (main): Beta",
+                "ws (main): Chat 2",
+                "ws (main): Chat 10",
+                "ws (main): delta",
+                "ws (main): Étude",
+                "ws (main): foxtrot"
+            ]
+        )
+    }
+
+    /// Identical visible labels stay deterministic: exact identity breaks the tie, so menu order
+    /// never depends on dictionary or input ordering.
+    func testDuplicateLabelsBreakTiesDeterministically() {
+        let target = candidate(windowID: 10, displayName: "Target")
+        let lowSession = candidate(
+            windowID: 2,
+            sessionID: id("10000000-0000-0000-0000-00000000000A"),
+            displayName: "Same",
+            locationLabel: "ws (main)"
+        )
+        let highSession = candidate(
+            windowID: 3,
+            sessionID: id("F0000000-0000-0000-0000-00000000000B"),
+            displayName: "Same",
+            locationLabel: "ws (main)"
+        )
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                activeOutboundObserverEndpoints: [
+                    highSession.domainEndpoint,
+                    lowSession.domainEndpoint
+                ]
+            ),
+            candidates: [target, highSession, lowSession]
+        )
+
+        XCTAssertEqual(
+            menu.availableObservers.map(\.peerSessionID),
+            [lowSession.sessionID, highSession.sessionID]
+        )
     }
 
     /// An ineligible target keeps its menu with a greyed reason and retains linked observers for
@@ -1047,7 +1176,7 @@ final class AgentOversightColourAssignmentTests: XCTestCase {
 
 // MARK: - Oversight mark rendering
 
-/// The interactive oversight mark must keep its palette colour. Wrapping the glyph in a macOS
+/// The interactive oversight mark must keep its role colour. Wrapping the glyph in a macOS
 /// `Menu` label template-renders it, flattening every `foregroundStyle` to the control tint —
 /// the fix keeps the glyph as ordinary content underneath a clear-label Menu hit target.
 /// These tests rasterize the row and sample pixels, because a structure check cannot see
@@ -1104,17 +1233,23 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
     /// Hosts a row in a real window so the Menu materializes its native control, then
     /// rasterizes it in dark appearance (the reported failure environment).
-    private func rasterize(_ view: some View) -> (rep: NSBitmapImageRep, window: NSWindow) {
-        let host = NSHostingView(rootView: AnyView(view.frame(width: 280)))
-        host.appearance = NSAppearance(named: .darkAqua)
+    private func rasterize(
+        _ view: some View,
+        appearance: NSAppearance.Name = .darkAqua,
+        size: NSSize = NSSize(width: 280, height: 60)
+    ) -> (rep: NSBitmapImageRep, window: NSWindow) {
+        let host = NSHostingView(rootView: AnyView(view.frame(width: size.width, height: size.height)))
+        host.appearance = NSAppearance(named: appearance)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 60),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: .darkAqua)
+        // Keep capture independent of the attached display's colour profile.
+        window.colorSpace = .sRGB
+        window.appearance = NSAppearance(named: appearance)
         window.contentView = host
         host.layoutSubtreeIfNeeded()
         host.display()
@@ -1124,6 +1259,17 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         }
         host.cacheDisplay(in: host.bounds, to: rep)
         return (rep, window)
+    }
+
+    private func pixelColor(atX x: Int, y: Int, in rep: NSBitmapImageRep) -> NSColor? {
+        guard let sample = rep.colorAt(x: x, y: y) else { return nil }
+        // colorAt can label samples calibrated RGB even when the bitmap is sRGB. Interpret the
+        // components in the bitmap's profile before converting, not the sample's label.
+        return NSColor(
+            colorSpace: rep.colorSpace,
+            components: [sample.redComponent, sample.greenComponent, sample.blueComponent, sample.alphaComponent],
+            count: 4
+        ).usingColorSpace(.sRGB)
     }
 
     /// Pixels within `tolerance` (per sRGB channel) of `expected`. A template-rendered mark
@@ -1138,7 +1284,7 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         var count = 0
         for x in 0 ..< rep.pixelsWide {
             for y in 0 ..< rep.pixelsHigh {
-                guard let pixel = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                guard let pixel = pixelColor(atX: x, y: y, in: rep) else { continue }
                 if abs(pixel.redComponent - want.redComponent) < tolerance,
                    abs(pixel.greenComponent - want.greenComponent) < tolerance,
                    abs(pixel.blueComponent - want.blueComponent) < tolerance
@@ -1153,56 +1299,77 @@ final class AgentOversightMarkRenderTests: XCTestCase {
     /// A glyph-sized mark is far more than a stray matching pixel even at 1x backing.
     private let markPixelFloor = 8
 
-    /// The failing case from Cristian's live check: an overseen row's interactive mark must
-    /// paint the overseer's slot-0 group colour, not the control tint. The selected row
-    /// reported identical white pixels — same template path — so both states are asserted.
-    func testInteractiveOverseenMarkKeepsTheFirstOverseersPaletteColour() {
+    func testSelectedInteractiveOverseerKeepsAmber() {
+        for (appearance, expected) in [
+            (NSAppearance.Name.darkAqua, NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1)),
+            (NSAppearance.Name.aqua, NSColor(srgbRed: 194 / 255, green: 106 / 255, blue: 0, alpha: 1))
+        ] {
+            var selectedRow = row(role: role(own: 0, overseers: 0), interactive: true)
+            selectedRow.isSelected = true
+            let (rep, window) = rasterize(selectedRow, appearance: appearance)
+            XCTAssertGreaterThanOrEqual(
+                pixelCount(near: expected, in: rep), markPixelFloor,
+                "selected overseer mark lost adaptive amber in \(appearance)"
+            )
+            window.close()
+        }
+    }
+
+    /// Worker grey must survive the native menu label path, including a selected row.
+    func testInteractiveOverseenMarkKeepsWorkerGrey() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: nil,
             overseers: [.init(sessionID: id(1), displayName: "Overseer", slot: 0)],
             overseeingNames: []
         )
-        let expected = AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)
+        let expected = NSColor.systemGray
+        let (controlRep, controlWindow) = rasterize(row(role: .none, interactive: true))
+        defer { controlWindow.close() }
+        let workerPixelFloor = pixelCount(near: expected, in: controlRep) + markPixelFloor
 
         let (rep, window) = rasterize(row(role: role, interactive: true))
         defer { window.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: rep), markPixelFloor,
-            "interactive overseen mark lost the overseer's palette colour (template-flattened)"
+            pixelCount(near: expected, in: rep), workerPixelFloor,
+            "interactive worker mark lost system grey (template-flattened)"
         )
 
         var selectedRow = row(role: role, interactive: true)
         selectedRow.isSelected = true
         let (selectedRep, selectedWindow) = rasterize(selectedRow)
         defer { selectedWindow.close() }
+        var selectedControl = row(role: .none, interactive: true)
+        selectedControl.isSelected = true
+        let (selectedControlRep, selectedControlWindow) = rasterize(selectedControl)
+        defer { selectedControlWindow.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: selectedRep), markPixelFloor,
-            "interactive overseen mark lost the palette colour on the selected row"
+            pixelCount(near: expected, in: selectedRep),
+            pixelCount(near: expected, in: selectedControlRep) + markPixelFloor,
+            "interactive worker mark lost system grey on the selected row"
         )
     }
 
-    /// The non-interactive branch was already correct — the mark was only template-flattened
-    /// inside a Menu label — so a muted row keeps its colour too. Guards the two branches
-    /// staying visually identical.
-    func testNonInteractiveOverseenMarkKeepsTheSamePaletteColour() {
+    /// Passive role marks use the same vector and colour as interactive marks.
+    func testNonInteractiveOverseenMarkKeepsWorkerGrey() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: nil,
             overseers: [.init(sessionID: id(1), displayName: "Overseer", slot: 0)],
             overseeingNames: []
         )
-        let expected = AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true)
+        let expected = NSColor.systemGray
 
+        let (controlRep, controlWindow) = rasterize(row(role: .none, interactive: false))
+        defer { controlWindow.close() }
         let (rep, window) = rasterize(row(role: role, interactive: false))
         defer { window.close() }
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: expected, in: rep), markPixelFloor,
-            "non-interactive overseen mark lost the palette colour"
+            pixelCount(near: expected, in: rep), pixelCount(near: expected, in: controlRep) + markPixelFloor,
+            "non-interactive worker mark lost system grey"
         )
     }
 
-    /// A selected/active-looking row hits the same Menu label path — the palette survives
-    /// because the glyph is ordinary content, not a template image.
-    func testInteractiveBothRolesMarkKeepsBothPaletteColours() {
+    /// Dual-role rows retain both the amber hub and grey worker, plus the inbound count.
+    func testInteractiveBothRolesMarkKeepsBothRoleColours() {
         let role = AgentSessionOversightRole(
             ownOverseerSlot: 1,
             overseers: [
@@ -1211,31 +1378,119 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             ],
             overseeingNames: ["Lane B"]
         )
-        let (rep, window) = rasterize(row(role: role, interactive: true))
+        // Keep the count out of this render assertion: it also paints grey pixels.
+        let singleInboundRole = AgentSessionOversightRole(
+            ownOverseerSlot: role.ownOverseerSlot,
+            overseers: Array(role.overseers.prefix(1)),
+            overseeingNames: role.overseeingNames
+        )
+        let (controlRep, controlWindow) = rasterize(row(role: self.role(own: 1, overseers: 0), interactive: true))
+        defer { controlWindow.close() }
+        let (rep, window) = rasterize(row(role: singleInboundRole, interactive: true))
         defer { window.close() }
 
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 1, darkAppearance: true), in: rep),
+            pixelCount(near: NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1), in: rep),
             markPixelFloor,
-            "dual-role mark lost the row's own group colour"
+            "dual-role mark lost the amber hub"
         )
         XCTAssertGreaterThanOrEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
-            markPixelFloor,
-            "dual-role mark lost the first overseer's ring colour"
+            pixelCount(near: .systemGray, in: rep),
+            pixelCount(near: .systemGray, in: controlRep) + markPixelFloor,
+            "dual-role mark lost the grey worker"
         )
     }
 
-    /// Control: an inactive (no link) row draws no palette pixels at all, proving the colour
-    /// assertions above come from the mark rather than stray UI.
-    func testRowWithoutRolePaintsNoPalettePixels() {
+    /// Control: an inactive (no link) row draws no amber role pixels.
+    func testRowWithoutRolePaintsNoAmberPixels() {
         let (rep, window) = rasterize(row(role: .none, interactive: false))
         defer { window.close() }
         XCTAssertGreaterThan(rep.pixelsWide, 0, "raster produced an empty bitmap")
         XCTAssertEqual(
-            pixelCount(near: AgentOversightPalette.resolvedColor(for: 0, darkAppearance: true), in: rep),
+            pixelCount(near: NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1), in: rep),
             0
         )
+    }
+
+    /// The shared vectors must paint with the caller's foreground at the intended 16px size.
+    func testRoleVectorsRespectForegroundAtSixteenPoints() {
+        let colours = [
+            NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+            NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+        ]
+        for role in [AgentOversightRoleIcon.Role.overseer, .worker] {
+            for expected in colours {
+                let (rep, window) = rasterize(
+                    AgentOversightRoleIcon(role: role, size: 16).foregroundStyle(Color(nsColor: expected))
+                )
+                XCTAssertGreaterThanOrEqual(
+                    pixelCount(near: expected, in: rep), markPixelFloor,
+                    "\(role) lost caller foreground \(expected) at 16 points"
+                )
+                for other in colours where other != expected {
+                    XCTAssertEqual(
+                        pixelCount(near: other, in: rep), 0,
+                        "\(role) painted \(other) when styled \(expected) at 16 points"
+                    )
+                }
+                window.close()
+            }
+        }
+    }
+
+    func testToolbarRoleMapping() {
+        typealias Role = AgentOversightRoleIcon.Role
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: false, hasInbound: false), [.overseer])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: false, hasInbound: true), [.worker])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: true, hasInbound: false), [.overseer])
+        XCTAssertEqual(Role.toolbarRoles(isOverseer: true, hasInbound: true), [.overseer, .worker])
+    }
+
+    func testRoleGeometryAndWorkerParentFade() throws {
+        for role in [AgentOversightRoleIcon.Role.overseer, .worker] {
+            let (rep, window) = rasterize(
+                AgentOversightRoleIcon(role: role, size: 24)
+                    .foregroundStyle(Color(nsColor: .red))
+                    .background(Color.black),
+                size: NSSize(width: 24, height: 24)
+            )
+            defer { window.close() }
+            func red(atX x: CGFloat, y: CGFloat) throws -> CGFloat {
+                let pixel = try XCTUnwrap(pixelColor(
+                    atX: Int(x * CGFloat(rep.pixelsWide) / 24),
+                    y: Int(y * CGFloat(rep.pixelsHigh) / 24),
+                    in: rep
+                ))
+                return pixel.redComponent
+            }
+            if role == .overseer {
+                XCTAssertGreaterThan(try red(atX: 12, y: 12), 0.9, "hub must be filled")
+                XCTAssertLessThan(try red(atX: 12, y: 17), 0.1, "hub must not use worker geometry")
+                XCTAssertLessThan(try red(atX: 12, y: 3.5), 0.1, "satellite must be hollow")
+            } else {
+                XCTAssertGreaterThan(try red(atX: 12, y: 17), 0.9, "worker must be filled")
+                XCTAssertLessThan(try red(atX: 12, y: 4.5), 0.1, "parent must be hollow")
+                XCTAssertEqual(try red(atX: 12, y: 9), 0.5, accuracy: 0.1, "parent link must be faded")
+                XCTAssertEqual(try red(atX: 12, y: 7), 0.5, accuracy: 0.1, "parent overlap must not darken")
+            }
+        }
+    }
+
+    func testOverseerAmberResolvesForBothAppearances() throws {
+        for (appearanceName, expected) in [
+            (NSAppearance.Name.darkAqua, NSColor(srgbRed: 1, green: 179 / 255, blue: 64 / 255, alpha: 1)),
+            (NSAppearance.Name.aqua, NSColor(srgbRed: 194 / 255, green: 106 / 255, blue: 0, alpha: 1))
+        ] {
+            let appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+            var resolved: NSColor?
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = AgentOversightRoleStyle.overseerNSColor.usingColorSpace(.sRGB)
+            }
+            let actual = try XCTUnwrap(resolved)
+            XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.001)
+            XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.001)
+            XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.001)
+        }
     }
 
     // MARK: - Passive-mark switch
@@ -1495,14 +1750,16 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertEqual(chooseTargetCount, 1)
     }
 
-    func testPersistenceOverlayRetainsDisabledOutboundChoicesAndAccessibilityCount() throws {
+    func testPersistenceDiagnosticRetainsLifecycleDisabledChoicesAndAccessibilityCount() throws {
         let offered = [peer("Session B", seed: 1), peer("Session C", seed: 2)]
         let presentation = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
-        let blocker = try XCTUnwrap(presentation.addBlockerMessage)
+        XCTAssertNil(presentation.addBlockerMessage, "Continuity is not live authority")
+        XCTAssertTrue(presentation.noticeMessage?.contains("Persistence blocked") == true)
+        let blocker = "Lifecycle reason"
         let published = AgentMonitorPillProps(
             sessionID: nil, outbound: [], inbound: [], recentNotices: [], canAddReason: nil
         )
-        // Menus are lazy now: apply the same persistence-first reason supplied by the shared pill.
+        // The diagnostic must not replace the real lifecycle reason supplied by the shared pill.
         let reason = published.withPersistence(presentation, eligibilityReason: "Lifecycle reason").canAddReason
         let overlaid = props(targetOptions: offered).withObserverIneligibleReason(reason)
         XCTAssertEqual(overlaid.observerIneligibleReason, blocker)
@@ -1917,6 +2174,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
             sessionID: firstID, on: session, compareAndSetInWorkspaceID: workspaceID
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(session.permitsBoundOperationAndSave ? session : nil)
         session.items = [AgentChatItem(kind: .user, text: "First bound fixture message")]
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
         await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
@@ -1953,6 +2213,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
             sessionID: replacementID, on: session, compareAndSetInWorkspaceID: workspaceID
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(session.permitsBoundOperationAndSave ? session : nil)
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
         await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
         await settleHostedPublication(in: fixture)
@@ -2564,6 +2827,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             _ = vm.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session, updateWorkspaceMetadata: true)
             session.hasLoadedPersistedState = true
             if tab.activeAgentSessionID != nil {
+                XCTAssertNotNil(session.operationAdmissionFailureMessage)
+                // Hosted menu fixtures begin with an existing restored conversation.
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                _ = try XCTUnwrap(
+                    session.permitsBoundOperationAndSave ? session : nil,
+                    "Hosted menu participants must be restored before installing grants"
+                )
                 session.items = [AgentChatItem(kind: .user, text: "Hosted fixture message")]
             }
         }
@@ -2674,6 +2944,21 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         await fulfillment(of: [finished], timeout: timeout)
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
+    }
+
+    /// Both Session-ID sheet directions submit through the shared general-Add callback, so the
+    /// direction's ordering is the only place observer → target can be inverted. Pin it.
+    func testOversightSessionIDSheetDirectionOrdersObserverAndTarget() {
+        let row = "row-party"
+        let peer = "peer-party"
+        let inbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseOverseer
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(inbound.observer, peer)
+        XCTAssertEqual(inbound.target, row)
+        let outbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseTarget
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(outbound.observer, row)
+        XCTAssertEqual(outbound.target, peer)
     }
 
     private func mountedRegion(in fixture: Fixture) throws -> StableMenuContextView {

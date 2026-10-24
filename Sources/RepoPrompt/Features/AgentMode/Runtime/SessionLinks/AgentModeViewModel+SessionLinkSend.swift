@@ -33,6 +33,7 @@ extension AgentModeViewModel {
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
+            restorationReadiness: session.qualifiedRestorationReadiness,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,
             endpointMatchesGrant: endpointMatchesGrant,
@@ -255,6 +256,13 @@ extension AgentModeViewModel {
         stopFence: AgentRunStartStopFence,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
+        // Every noncomposer caller shares this pre-row fence. A completed but failed restoration
+        // must never become a replacement transcript merely because it reached an idle runtime.
+        guard liveSession.permitsBoundOperationAndSave else {
+            releaseComposerSubmitClaim(claim)
+            let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
+            return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
+        }
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
             displayText,
@@ -291,12 +299,22 @@ extension AgentModeViewModel {
             return .blocked(.persistenceFailed)
         }
 
-        // Past this point the message is durably the target's. Every later failure reports a
-        // delivery state rather than rolling back, so a retry with the same key can never deliver
-        // the row twice.
-        let acceptedAt = Date()
+        return await startPersistedNoncomposerTurn(
+            session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
+            acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
+            dispatchIsCurrent: dispatchIsCurrent
+        )
+    }
+
+    /// Retry dispatch of an already accepted row without appending or saving the input again.
+    /// The caller still owns an empty composer claim and the exact identity/Stop/readiness fence.
+    func startPersistedNoncomposerTurn(
+        session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
+        savedItemID: UUID, acceptedAt: Date, providerMessage: String,
+        stopFence: AgentRunStartStopFence, dispatchIsCurrent: @MainActor () -> Bool
+    ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
-            targetItemID: userItem.id,
+            targetItemID: savedItemID,
             acceptedAt: acceptedAt,
             deliveryState: .persisted,
             resultingRunState: liveSession.runState.rawValue
@@ -318,7 +336,7 @@ extension AgentModeViewModel {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        guard dispatchIsCurrent() else {
+        guard liveSession.permitsBoundOperationAndSave, dispatchIsCurrent() else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -341,7 +359,7 @@ extension AgentModeViewModel {
             : providerMessage
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
-        if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+        if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
             var dispatchedRow = liveSession.items[index]
             dispatchedRow.dispatchedProviderText = dispatchedProviderMessage
             liveSession.replaceItem(at: index, with: dispatchedRow)
@@ -361,7 +379,7 @@ extension AgentModeViewModel {
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {
             agentSessionLinkClearWaitingOnAfterAcceptedTurn(liveSession)
-        } else if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+        } else if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
             var undispatchedRow = liveSession.items[index]
             undispatchedRow.dispatchedProviderText = nil
             liveSession.replaceItem(at: index, with: undispatchedRow)
@@ -370,7 +388,7 @@ extension AgentModeViewModel {
 
         let resultingRunState = sessions[tabID]?.runState ?? liveSession.runState
         return .delivered(AgentSessionLinkSendDelivery(
-            targetItemID: userItem.id,
+            targetItemID: savedItemID,
             acceptedAt: acceptedAt,
             deliveryState: startRecorder.outcome.didStart ? .runStarted : .runStartFailed,
             resultingRunState: resultingRunState.rawValue

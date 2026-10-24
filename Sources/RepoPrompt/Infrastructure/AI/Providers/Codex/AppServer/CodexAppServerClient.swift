@@ -89,6 +89,7 @@ actor CodexAppServerClient {
         let isDefault: Bool
         let supportedReasoningEfforts: [RemoteReasoningEffort]
         let defaultReasoningEffort: String?
+        var serviceTiers: [CodexModelServiceTier] = []
     }
 
     struct ServerRequest {
@@ -528,9 +529,10 @@ actor CodexAppServerClient {
             )
         )
         var environment = environmentResult.environment
+        let probeEnvironment = await ProviderEnvironmentFiltering.filter(environment, for: .codexExec)
         let resolution = CodexProviderHelpers.resolveCodexExecutable(
             commandName: config.commandName,
-            environment: environment,
+            environment: probeEnvironment,
             additionalPathHints: config.additionalPathHints,
             launchSnapshot: launchSnapshot,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
@@ -1488,6 +1490,7 @@ actor CodexAppServerClient {
                         let effortDescription = (effortEntry["description"] as? String) ?? ""
                         return RemoteReasoningEffort(reasoningEffort: reasoningEffort, description: effortDescription)
                     }
+                let serviceTiers = CodexServiceTierVariantCatalog.advertisedTiers(from: entry)
                 models.append(
                     RemoteModel(
                         id: id,
@@ -1496,7 +1499,8 @@ actor CodexAppServerClient {
                         description: description,
                         isDefault: isDefault,
                         supportedReasoningEfforts: supportedReasoningEfforts,
-                        defaultReasoningEffort: defaultReasoningEffort
+                        defaultReasoningEffort: defaultReasoningEffort,
+                        serviceTiers: serviceTiers
                     )
                 )
             }
@@ -1604,8 +1608,13 @@ actor CodexAppServerClient {
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
         let resolution = launchContext.resolution
+        let filtered = await ProviderEnvironmentFiltering.filter(
+            launchContext.environment,
+            for: .codexExec,
+            explicitOverrides: resolution.environmentOverrides
+        )
+        let environment = Self.processEnvironmentForCurrentLaunch(filtered)
         if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
             guard provisioning.success else {

@@ -24,8 +24,13 @@ for forbidden in \
   fi
 done
 
+# The retired MCP ServiceRegistry is a whole symbol, not a substring of unrelated registries.
+if grep -R -n -w --include='*.swift' ServiceRegistry Sources; then
+  echo "error: retired M7 migration authority remains in production sources: ServiceRegistry" >&2
+  exit 1
+fi
+
 for retired in \
-  ServiceRegistry \
   MCPWindowToolRuntime \
   MCPWindowToolDependencies \
   MCPWindowToolContext \

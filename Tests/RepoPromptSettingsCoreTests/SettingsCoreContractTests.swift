@@ -17,7 +17,7 @@ final class SettingsCoreContractTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let expected = #"{"chatSettingsByWorkspaceID":{"00000000-0000-0000-0000-000000000001":{"codeMapUsage":"auto","fileTreeOption":"Auto","gitInclusion":"none","manualPlanActMode":"Edit","planActMode":"Plan","proFileEdits":false,"workspaceID":"00000000-0000-0000-0000-000000000001"}},"copySettingsByWorkspaceID":{},"globalDefaults":{},"schemaLineage":"repoprompt-ce.global-settings","schemaVersion":10,"updatedAt":"1970-01-01T00:00:00Z"}"#
+        let expected = #"{"chatSettingsByWorkspaceID":{"00000000-0000-0000-0000-000000000001":{"codeMapUsage":"auto","fileTreeOption":"Auto","gitInclusion":"none","manualPlanActMode":"Edit","planActMode":"Plan","proFileEdits":false,"workspaceID":"00000000-0000-0000-0000-000000000001"}},"copySettingsByWorkspaceID":{},"globalDefaults":{},"schemaLineage":"repoprompt-ce.global-settings","schemaVersion":13,"updatedAt":"1970-01-01T00:00:00Z"}"#
         XCTAssertEqual(try encoder.encode(document), Data(expected.utf8))
 
         let decoder = JSONDecoder()
@@ -33,6 +33,27 @@ final class SettingsCoreContractTests: XCTestCase {
             XCTAssertEqual(try encoder.encode(mode), Data(literal.utf8))
             XCTAssertEqual(try decoder.decode(SettingsPlanActMode.self, from: Data(literal.utf8)), mode)
         }
+    }
+
+    func testOracleGuidanceAndAutoEffortServiceUseSeparateSchemaFences() throws {
+        let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(
+            modelSelection: .init(oracleReconciliationGuidance: "Keep guidance"),
+            agentMode: .init(autoEffortBackendRawValue: "openai-decisions")
+        ))
+        XCTAssertEqual(GlobalSettingsDocument.oracleReconciliationGuidanceSchemaVersion, 11)
+        XCTAssertEqual(GlobalSettingsDocument.autoEffortServiceSchemaVersion, 12)
+        XCTAssertEqual(document.requiredSchemaVersion, 12)
+        let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: JSONEncoder().encode(document))
+        XCTAssertEqual(decoded.scalarPreferences?.modelSelection?.oracleReconciliationGuidance, "Keep guidance")
+        XCTAssertEqual(decoded.scalarPreferences?.agentMode?.autoEffortBackendRawValue, "openai-decisions")
+        XCTAssertEqual(
+            GlobalSettingsFileStore.preservationBlockReason(
+                schemaVersion: document.requiredSchemaVersion,
+                schemaLineage: document.schemaLineage,
+                supportedVersion: GlobalSettingsDocument.oracleReconciliationGuidanceSchemaVersion
+            ),
+            .unsupportedFutureSchema(onDiskVersion: 12, supportedVersion: 11)
+        )
     }
 
     func testComputerUseOptInIsAdditiveAndRoundTripsBothValues() throws {

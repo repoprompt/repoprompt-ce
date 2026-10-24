@@ -352,10 +352,17 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         let resolved = resolvedGit(mainRoot)
 
         let inFlight = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await waitUntil { await spy.callCount >= 1 }
+        await waitUntil { await spy.gatedCallCount == 1 }
         await service.invalidateSharedWorktreeListings()
+        let oldWorkerWasCancelled = await service.sharedWorktreeListing.flights.values.first?.task.isCancelled
+        XCTAssertEqual(oldWorkerWasCancelled, true)
+        let afterInvalidation = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount == 1 }
+        let beforeDrain = await spy.callCount
+        XCTAssertEqual(beforeDrain, 1, "Invalidation must not overlap the cancelled enumeration with its replacement")
         await gate.open()
         _ = try await inFlight.value
+        _ = try await afterInvalidation.value
 
         _ = try await service.sharedGitWorktreeListing(for: resolved)
         let enumerations = await spy.callCount
@@ -473,7 +480,7 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
 
         // The first enumeration snapshots the worktree list, then blocks.
         let initiator = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await waitUntil { await spy.callCount >= 1 }
+        await waitUntil { await spy.gatedCallCount == 1 }
         let joiner = Task { try await service.sharedGitWorktreeListing(for: resolvedGit(linkedRoot)) }
         // Rendezvous: the joiner must be attached to the pre-mutation flight before the mutation.
         await waitUntil { await service.sharedWorktreeListing.joinedFlightCount >= 1 }
@@ -500,7 +507,7 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         XCTAssertEqual(enumerations, 2, "Invalidated waiters retry once on a fresh enumeration")
     }
 
-    func testRequestAfterTimeToLiveDoesNotJoinAStaleInFlightEnumeration() async throws {
+    func testSlowEnumerationStaysSharedAndCompletedEntryReceivesFullTimeToLive() async throws {
         let clock = ManualClock()
         let gate = Gate()
         let spy = ListingSpy(gate: gate)
@@ -508,18 +515,133 @@ final class VCSServiceSharedWorktreeListingTests: XCTestCase {
         let resolved = resolvedGit(mainRoot)
 
         let slow = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await waitUntil { await spy.callCount >= 1 }
-        clock.advance(by: 3.0)
+        await waitUntil { await spy.gatedCallCount == 1 }
+        clock.advance(by: 10)
         let late = Task { try await service.sharedGitWorktreeListing(for: resolved) }
-        await waitUntil { await spy.callCount >= 2 }
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount == 1 }
+        let pendingEnumerations = await spy.callCount
+        XCTAssertEqual(pendingEnumerations, 1, "Slow enumeration must remain shared beyond the completed-entry TTL")
         await gate.open()
-        _ = try await slow.value
-        _ = try await late.value
+        let firstResult = try await slow.value
+        let lateResult = try await late.value
+        XCTAssertEqual(firstResult.map(\.path), lateResult.map(\.path))
 
-        let joined = await service.sharedWorktreeListing.joinedFlightCount
-        XCTAssertEqual(joined, 0, "A flight older than the TTL must not be joined")
+        clock.advance(by: 2.4)
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        let freshEnumerations = await spy.callCount
+        XCTAssertEqual(freshEnumerations, 1, "Enumeration time must not consume the completed entry's freshness")
+        clock.advance(by: 0.1)
+        _ = try await service.sharedGitWorktreeListing(for: resolved)
+        let expiredEnumerations = await spy.callCount
+        XCTAssertEqual(expiredEnumerations, 2, "The completed entry must still expire on schedule")
+    }
+
+    func testCancellingOneWaiterPreservesTheSharedEnumeration() async throws {
+        let gate = Gate()
+        let spy = ListingSpy(gate: gate)
+        let service = makeService(spy: spy, clock: ManualClock(), timeToLive: 60)
+        let main = resolvedGit(mainRoot)
+        let linked = resolvedGit(linkedRoot)
+        let cancelled = Task { try await service.sharedGitWorktreeListing(for: main) }
+        await waitUntil { await spy.gatedCallCount == 1 }
+        let survivor = Task { try await service.sharedGitWorktreeListing(for: linked) }
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount == 1 }
+        cancelled.cancel()
+        await gate.open()
+
+        do {
+            _ = try await cancelled.value
+            XCTFail("A cancelled waiter must not return a listing")
+        } catch is CancellationError {} catch {
+            XCTFail("Expected cancellation, received \(error)")
+        }
+        let result = try await survivor.value
+        XCTAssertEqual(currentPaths(result), [linkedRoot.path])
+        _ = try await service.sharedGitWorktreeListing(for: main)
         let enumerations = await spy.callCount
-        XCTAssertEqual(enumerations, 2)
+        XCTAssertEqual(enumerations, 1, "One caller's cancellation must not cancel or discard shared work")
+    }
+
+    func testCancelledWaiterDoesNotStartUncachedFailureFallback() async throws {
+        let gate = Gate()
+        let spy = ListingSpy(gate: gate)
+        let backend = GitBackend()
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                lister: { url in
+                    await spy.recordCall(url)
+                    if await spy.callCount == 1 {
+                        await spy.waitAtGate()
+                        throw NSError(domain: "SharedWorktreeListingTests", code: 1)
+                    }
+                    return try await backend.listWorktrees(at: url)
+                },
+                gitProcessEnvironment: { [:] }
+            )
+        )
+        let resolved = resolvedGit(mainRoot)
+        let cancelled = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await spy.gatedCallCount == 1 }
+        let survivor = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount == 1 }
+        cancelled.cancel()
+        await gate.open()
+        do {
+            _ = try await cancelled.value
+            XCTFail("A cancelled waiter must not start fallback work")
+        } catch is CancellationError {} catch {
+            XCTFail("Expected cancellation, received \(error)")
+        }
+        let result = try await survivor.value
+        XCTAssertEqual(currentPaths(result), [mainRoot.path])
+        let enumerations = await spy.callCount
+        XCTAssertEqual(enumerations, 2, "Only the surviving caller may retry a failed enumeration")
+    }
+
+    func testFlightDeadlineCancelsAndDrainsWithoutOverlapOrUncachedFallback() async throws {
+        let workerGate = Gate()
+        let deadlineGate = Gate()
+        let spy = ListingSpy(gate: workerGate)
+        let service = VCSService(
+            jjRunner: JJCommandRunner(),
+            sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration(
+                waitForFlightDeadline: { _ in await deadlineGate.wait() },
+                lister: { url in
+                    await spy.recordCall(url)
+                    await spy.waitAtGate()
+                    // A subprocess timeout or teardown error can win its cancellation race.
+                    throw NSError(domain: "SharedWorktreeListingTests", code: 1)
+                },
+                gitProcessEnvironment: { [:] }
+            )
+        )
+        let resolved = resolvedGit(mainRoot)
+        let first = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await spy.gatedCallCount == 1 }
+        await deadlineGate.open()
+        await waitUntil {
+            await service.sharedWorktreeListing.flights.values.first?.task.isCancelled == true
+        }
+        let late = Task { try await service.sharedGitWorktreeListing(for: resolved) }
+        await waitUntil { await service.sharedWorktreeListing.joinedFlightCount == 1 }
+        let beforeDrain = await spy.callCount
+        XCTAssertEqual(beforeDrain, 1, "A cancelled worker owns its slot until it drains")
+        await workerGate.open()
+        for waiter in [first, late] {
+            do {
+                _ = try await waiter.value
+                XCTFail("The shared deadline must cancel every waiter")
+            } catch is CancellationError {} catch {
+                XCTFail("Expected cancellation, received \(error)")
+            }
+        }
+        let afterDrain = await spy.callCount
+        let remainingFlights = await service.sharedWorktreeListing.flights.count
+        let cachedEntries = await service.sharedWorktreeListing.entries.count
+        XCTAssertEqual(afterDrain, 1, "Deadline cancellation must not start an uncached fallback")
+        XCTAssertEqual(remainingFlights, 0)
+        XCTAssertEqual(cachedEntries, 0)
     }
 
     func testListingWithoutTheKeysMainRootIsNotCachedAndFallsBackToCallerRoot() async throws {
@@ -814,6 +936,7 @@ private actor Gate {
 private actor ListingSpy {
     private let gate: Gate?
     private(set) var calledURLs: [URL] = []
+    private(set) var gatedCallCount = 0
 
     var callCount: Int {
         calledURLs.count
@@ -828,6 +951,8 @@ private actor ListingSpy {
     }
 
     func waitAtGate() async {
-        await gate?.wait()
+        guard let gate else { return }
+        gatedCallCount += 1
+        await gate.wait()
     }
 }

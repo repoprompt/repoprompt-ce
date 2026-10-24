@@ -14,6 +14,7 @@ struct AgentSelfMCPToolService {
         case scheduled(AgentSelfCompactAttempt)
         case duplicate(requestID: UUID, status: AgentSelfCompactStatus?)
         case blocked(reason: String)
+        case noteTooLong(byteCount: Int, maximum: Int, basis: String)
         case unavailable
     }
 
@@ -65,12 +66,14 @@ struct AgentSelfMCPToolService {
             guard case let .string(note)? = args["note"] else {
                 throw MCPError.invalidParams("self_compact compact note is required as a string.")
             }
+            guard let snapshot = readSelf(window, endpoint, origin) else { throw Self.unavailableError }
             let bytes: Int
-            switch AgentSessionSelfCompactNotePolicy.validation(of: note) {
+            switch AgentSessionSelfCompactNotePolicy.validation(of: note, maximum: nil) {
             case let .valid(byteCount): bytes = byteCount
             case .empty: throw MCPError.invalidParams("self_compact compact note must not be empty or whitespace-only.")
             case let .tooLong(byteCount, maximum):
-                throw MCPError.invalidParams("self_compact compact note is \(byteCount) UTF-8 bytes; maximum \(maximum).")
+                let limit = AgentSessionSelfCompactNotePolicy.noteLimit(windowTokens: snapshot.context?.windowTokens)
+                throw Self.noteTooLongError(byteCount: byteCount, maximum: maximum, basis: limit.basis)
             case .invalidScalar:
                 throw MCPError.invalidParams("self_compact compact note contains a disallowed control character.")
             }
@@ -106,12 +109,18 @@ struct AgentSelfMCPToolService {
                     "reason": .string(reason),
                     "detail": .string(Self.blockedDetail(for: reason))
                 ])
+            case let .noteTooLong(byteCount, maximum, basis):
+                throw Self.noteTooLongError(byteCount: byteCount, maximum: maximum, basis: basis)
             case .unavailable:
                 throw Self.unavailableError
             }
         default:
             preconditionFailure("Validated self_compact operation")
         }
+    }
+
+    private static func noteTooLongError(byteCount: Int, maximum: Int, basis: String) -> MCPError {
+        .invalidParams("self_compact compact note is \(byteCount) UTF-8 bytes; maximum \(maximum) for this session (\(basis)).")
     }
 
     private static func blockedDetail(for reason: String) -> String {

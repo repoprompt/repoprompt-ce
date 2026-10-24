@@ -36,8 +36,10 @@ dist/
 docs/analysis/
 docs/designs/
 docs/references/
-docs/reviews/
+docs/reviews/*
+!docs/reviews/model-router-auto-effort-openai-decisions-verification.md
 docs/plans/*
+!docs/plans/openai-decisions-contract-2026-10-07.md
 
 # Python cache artifacts
 __pycache__/

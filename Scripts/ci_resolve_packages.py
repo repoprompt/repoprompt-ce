@@ -10,30 +10,70 @@ import subprocess
 import time
 
 
+def session_process_groups(session_id: int) -> set[int]:
+    try:
+        listing = subprocess.run(
+            ['ps', '-U', str(os.getuid()), '-o', 'pid=,stat='],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+    except subprocess.SubprocessError as error:
+        raise RuntimeError('Cannot inventory dependency attempt processes; refusing to retry') from error
+    groups = set()
+    for line in listing.stdout.splitlines():
+        raw_pid, state = line.split(maxsplit=1)
+        if state.startswith('Z'):
+            continue
+        pid = int(raw_pid)
+        try:
+            if os.getsid(pid) == session_id:
+                groups.add(os.getpgid(pid))
+        except ProcessLookupError:
+            pass
+    return groups
+
+
+def terminate_resolution(process: subprocess.Popen) -> None:
+    # Swift's Process creates a new process group for Git children. They remain
+    # in this attempt's private session, even after their parent has exited.
+    for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 1)):
+        deadline = None
+        while True:
+            process.poll()
+            groups = session_process_groups(process.pid)
+            if not groups:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError('Dependency launcher has not exited; refusing to retry') from error
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            for group in groups:
+                try:
+                    os.killpg(group, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # Darwin may report EPERM for a group emptied since the scan.
+                    if group in session_process_groups(process.pid):
+                        raise
+            if deadline is None:
+                # Inventory can take longer than the kill grace. Start the clock
+                # after signaling, then always inventory again to confirm exit.
+                deadline = time.monotonic() + grace
+            time.sleep(0.05)
+    raise RuntimeError('Dependency attempt still has live processes; refusing to retry')
+
+
 def run_resolution(command, *, cwd, check, timeout):
-    # SwiftPM may spawn git/download children. Kill the whole attempt on timeout,
-    # not just its launcher, before the next attempt touches the same scratch path.
     process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
     try:
         status = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                # Darwin may report EPERM for an emptied group after TERM. Never
-                # suppress a denied kill while the launcher is still alive.
-                if process.poll() is None:
-                    raise
-            process.wait()
+        terminate_resolution(process)
         raise
+    if status:
+        terminate_resolution(process)
     return subprocess.CompletedProcess(command, status)
 
 
@@ -54,6 +94,8 @@ def resolve(root: Path, scratch_path: str | None = None, *, attempts: int = 3,
         try:
             status = run(command, cwd=root, check=False, timeout=timeout).returncode
         except subprocess.TimeoutExpired:
+            print(f'::warning::Dependency resolution attempt {attempt} timed out after {timeout}s; '
+                  'all attempt processes were stopped', flush=True)
             status = 124
         if status == 0:
             return 0

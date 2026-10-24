@@ -164,6 +164,21 @@ package enum MCPToolExecutionContractCatalog {
                 cleanupDisposition: .detachAndSettle
             )
         }
+        if toolName == MCPWindowToolName.sessionAdmin {
+            // Session/worktree lifecycle mutations can suspend for cancellation, persistence,
+            // or git settlement, just like their dedicated agent/worktree surfaces. VCS
+            // inventory/preview share the worktree owner; ordinary session reads and
+            // malformed operations retain the bounded watchdog and fail-closed cleanup policy.
+            switch arguments["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "worktree_create", "worktree_bind", "worktree_unbind", "worktree_release", "worktree_inventory", "merge_preview", "merge_apply":
+                return .workspaceLifecycleCancellable
+            case "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
+                 "link", "unlink", "reparent", "adopt", "release", "retire", "fork", "set_model", "set_effort", "undo":
+                return .lifecycleManagedCancellable
+            default:
+                return baseContract
+            }
+        }
         guard toolName == MCPGlobalToolName.manageWorkspaces else { return baseContract }
         guard let rawAction = arguments["action"]?.stringValue else {
             return baseContract

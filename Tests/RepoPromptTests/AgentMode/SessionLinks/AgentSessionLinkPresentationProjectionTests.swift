@@ -46,10 +46,12 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         return try Fixture(
             viewModel: viewModel,
             session: session,
@@ -217,6 +219,119 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
     }
 
+    func testActivationRetirementSettersPublishOnceWithoutLinkOrWakeEvents() async throws {
+        let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousSink }
+        for mutation in ["mcp-origin", "parent", "creator", "mcp-control", "transition", "binding"] {
+            let fixture = try makeFixture()
+            let expected = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+            )
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkActivateOverseer(for: fixture.endpoint, expected: expected))
+            var retiredSessionIDs: [UUID] = []
+            let retired = expectation(description: "One retirement for \(mutation)")
+            let unrelated = expectation(description: "Unrelated oversight does not retire activation")
+            unrelated.isInverted = true
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                unrelated.fulfill()
+            }
+            var projectionNotifications = 0
+            let subscription = NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange, object: fixture.viewModel
+            ).sink { _ in projectionNotifications += 1 }
+            fixture.session.oversight.autoWakeOnUpdates.toggle()
+            await fulfillment(of: [unrelated], timeout: 0.1)
+            XCTAssertTrue(retiredSessionIDs.isEmpty, "unrelated oversight writes must not emit retirement")
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                retired.fulfill()
+            }
+            switch mutation {
+            case "mcp-origin": fixture.session.isMCPOriginated = true
+            case "parent": fixture.session.parentSessionID = UUID()
+            case "creator": fixture.session.createdByOverseerSessionID = UUID()
+            case "mcp-control":
+                let registration = await AgentRunSessionStore.register(sessionID: fixture.endpoint.sessionID)
+                fixture.session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                    sessionID: fixture.endpoint.sessionID, activationID: UUID(), registration: registration,
+                    currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                    originatingConnectionID: nil,
+                    interactionTransport: .mcp(sessionID: fixture.endpoint.sessionID, originatingConnectionID: nil),
+                    suppressUserNotifications: true, forceAutoEditEnabled: false,
+                    autoEditEnabledBeforeOverride: fixture.session.autoEditEnabled, taskLabelKind: .explore
+                )
+            case "transition":
+                let generation = fixture.session.beginPersistentBindingTransition()
+                fixture.session.finishPersistentBindingTransition(generation: generation)
+            default:
+                fixture.session.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+                    tabID: fixture.tabID, sessionID: fixture.endpoint.sessionID
+                ))
+            }
+            await fulfillment(of: [retired], timeout: 1)
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], mutation)
+            XCTAssertNil(fixture.session.oversight.overseerActivation)
+            // Discovery is notified synchronously; the pill repaint is deferred past the setter.
+            try await AsyncTestWait.waitUntil("retired pill repaint for \(mutation)", timeout: 10) {
+                fixture.viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation == nil
+            }
+            let replay = expectation(description: "Nil clears and unrelated writes do not replay")
+            replay.isInverted = true
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                replay.fulfill()
+            }
+            fixture.session.oversight.overseerActivation = nil
+            fixture.session.oversight.overseerActivation = nil
+            fixture.session.oversight.autoWakeOnUpdates.toggle()
+            await fulfillment(of: [replay], timeout: 0.1)
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], "nil clears and unrelated writes do not replay")
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(projectionNotifications, 0, "activation loss is not a link/prompt inventory publication")
+            if fixture.session.mcpControlContext != nil {
+                await fixture.viewModel.mcpDeactivateControlContext(sessionID: fixture.endpoint.sessionID, cleanupSessionStore: true)
+            }
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    func testRetiredSessionCallbackRetiresDiscoveryWithoutRepaintingReplacementOwner() async throws {
+        let fixture = try makeFixture()
+        let expected = AgentSessionOverseerBootstrapState(
+            sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+        )
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkActivateOverseer(for: fixture.endpoint, expected: expected))
+        let successor = AgentTabSession(tabID: fixture.tabID)
+        successor.selectedAgent = .claudeCode
+        successor.hasLoadedPersistedState = true
+        successor.installPersistentSessionBinding(fixture.session.persistentSessionBindingIdentity)
+        successor.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(successor.permitsBoundOperationAndSave)
+        fixture.viewModel.test_installLiveSession(successor)
+        fixture.viewModel.syncStatusPillsUIState()
+        let snapshot = fixture.viewModel.ui.statusPills.snapshot
+        let revision = fixture.viewModel.ui.statusPills.revision
+        let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousSink }
+        let retiredAdvertisement = expectation(description: "Discovery retires the outgoing endpoint despite replacement")
+        var retiredSessionIDs: [UUID] = []
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+            retiredSessionIDs.append(sessionID)
+            retiredAdvertisement.fulfill()
+        }
+        fixture.session.parentSessionID = UUID()
+        await fulfillment(of: [retiredAdvertisement], timeout: 1)
+        // The deferred repaint hop was enqueued on the main actor before this one; MainActor jobs run
+        // FIFO, so awaiting it proves the hop ran and was fenced off the replacement owner.
+        await Task { @MainActor in }.value
+        XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID])
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot, snapshot)
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.revision, revision)
+        XCTAssertEqual(snapshot.monitor.overseerBootstrapState?.sessionIdentity, ObjectIdentifier(successor))
+        XCTAssertNil(snapshot.monitor.overseerBootstrapState?.activation)
+    }
+
     func testProjectionOverlayPreservesLinkedSummary() throws {
         let fixture = try makeFixture()
         let published = props(endpoint: fixture.endpoint)
@@ -239,9 +354,13 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             notifications.append(notification)
             let stored = fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
             XCTAssertEqual(stored?.endpoint, fixture.endpoint)
-            // Queue presentation is derived live; this fixture has no pending updates.
+            XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+            // Queue and bootstrap presentation are derived live, not stored in the bridge projection.
             var expectedDisplay = stored
             expectedDisplay?.pendingUpdates = .empty
+            expectedDisplay?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+            )
             XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor, expectedDisplay)
         }
 
@@ -688,10 +807,12 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         let fixture = try Fixture(
             viewModel: viewModel,
             session: session,
@@ -796,8 +917,13 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
 
         XCTAssertEqual(viewModel.test_statusPillsSnapshotBuildCount, 1)
         XCTAssertEqual(notificationCount(), 1)
-        var expected = viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+        let stored = viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+        XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+        var expected = stored
         expected?.pendingUpdates = .empty
+        expected?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+            sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+        )
         XCTAssertNotNil(expected)
         XCTAssertEqual(monitorAtNotification, expected)
         XCTAssertEqual(monitorAtNotification?.outbound.count, 2)

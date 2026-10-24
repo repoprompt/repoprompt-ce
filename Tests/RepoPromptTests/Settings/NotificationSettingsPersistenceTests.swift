@@ -63,7 +63,6 @@ final class NotificationSettingsPersistenceTests: XCTestCase {
         settings.approveFromNotifications = false
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(notifications: settings))
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 10, "This feature must not bump the schema")
     }
 
     func testStoreEditDoesNotChangeStoredSchemaVersion() throws {

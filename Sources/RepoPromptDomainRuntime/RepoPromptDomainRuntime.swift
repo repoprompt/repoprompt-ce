@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 package enum DomainRuntimeMode: String, CaseIterable, Sendable {
     case app
@@ -6,6 +7,7 @@ package enum DomainRuntimeMode: String, CaseIterable, Sendable {
 }
 
 package struct DomainRuntimeConfiguration: Sendable {
+    package let metadataPathPolicy: AppMetadataPathPolicy?
     package let mode: DomainRuntimeMode
     package let profileIdentifier: String
     package let storageDirectory: URL
@@ -29,8 +31,10 @@ package struct DomainRuntimeConfiguration: Sendable {
         externalReloadInterval: Duration? = .seconds(1),
         externalReloadMaximumInterval: Duration = .seconds(30),
         metrics: DomainRuntimeMetricsSink = .disabled,
-        hostDrainTimeout: Duration = .seconds(5)
+        hostDrainTimeout: Duration = .seconds(5),
+        metadataPathPolicy: AppMetadataPathPolicy? = nil
     ) {
+        self.metadataPathPolicy = metadataPathPolicy
         self.mode = mode
         self.profileIdentifier = profileIdentifier
         self.storageDirectory = storageDirectory

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFileSystem
+import RepoPromptShared
 
 /// File-backed store for copy/chat/model presets.
 ///
@@ -9,7 +10,7 @@ import RepoPromptFileSystem
 final class PresetFileStore {
     static let shared = PresetFileStore()
 
-    static let appSupportDirectoryName = "RepoPrompt CE"
+    static let appSupportDirectoryName = MCPFilesystemIdentity.current.applicationStateDirectoryName
     static let presetsDirectoryName = "Presets"
     static let workflowFilename = "workflowPresets.json"
     static let modelFilename = "modelPresets.json"
@@ -248,6 +249,7 @@ final class PresetFileStore {
     }
 
     private func ensurePresetDirectoryExists(for fileURL: URL) throws {
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         try fileManager.createDirectory(
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -259,6 +261,8 @@ final class PresetFileStore {
             let backupDirectory = fileURL
                 .deletingLastPathComponent()
                 .appendingPathComponent("Backups", isDirectory: true)
+            try AppProfileLocations.current.validateMetadataFile(fileURL)
+            try AppProfileLocations.current.validateMetadataFile(backupDirectory)
             try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
 
             var backupURL = backupDirectory
