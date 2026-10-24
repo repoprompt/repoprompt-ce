@@ -2554,7 +2554,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             let replacements = [
                 (
                     "- `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: \"when_sendable\"`.",
-                    "- `send`: coordination only; `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`. Managed tasks: `steer`."
+                    "- `send`: `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`; exact Manage grants use task framing."
                 ),
                 (
                     "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.",

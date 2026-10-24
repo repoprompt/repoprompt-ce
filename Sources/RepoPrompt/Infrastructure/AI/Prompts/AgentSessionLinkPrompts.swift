@@ -828,16 +828,16 @@ enum AgentSessionLinkPrompts {
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
             MCPDomainSessionAdminToolDefinition.overseerPlaybook,
-            "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
-            "For managed task assignments or resumes, use `steer` even when the target is idle. `send` is coordination only: it delivers at `idle_for_send: true` or queues with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws it. Use a new `idempotency_key` per delivery; reuse it only for the same retry.",
+            "`list` refreshes outbound grants; `poll` snapshots status/readiness and managed-only pending prompts; `wait` waits on a returned cursor for change/idle/sendable without busy-polling; `read` pages redacted transcript.",
+            "Managed assignments/resumes: prefer `steer`, including idle. `send`: `idle_for_send: true` or queue `delivery: \"when_sendable\"`; exact current Manage authority gives it task framing, otherwise coordination only. `cancel_pending_send` withdraws it. New `idempotency_key` per delivery; reuse only for the same retry.",
             "`compact` requests native context compaction of an `idle_for_send: true` target.",
             "`snooze_auto_wake` pauses only routine status-triggered admission on one lane, not collection or delivery. Exact purposeful attention may bypass its snooze. `set_waiting_on` is self-scoped; `request_attention` is an attributed inverse signal, not a reverse observer grant.",
             "Managed `poll`/`wait` may include a redacted `pending_interaction` beside the snapshot. `respond` applies only to its exact current `interaction_id`; manual-only prompts remain with the target's user. `steer` cannot bypass a pending prompt; `stop` cancels one current run and never queues a continuation.",
-            "`create_lane` makes your own top-level lane with no inherited authority. Its first message assigns the lane job, without inheriting unrelated authority or approval. `retire_lane` unlinks/stashes only your own idle creation under a live manage grant; it never deletes it.",
-            "A `read` may repeat an updated newest `item_id`; replace your prior copy rather than appending it.",
+            "`create_lane` creates your lane; its first message assigns the lane job, not unrelated authority or approval. `retire_lane` unlinks/stashes only your own idle lane under a live manage grant; never deletes.",
+            "A `read` may repeat the newest `item_id`; replace that item, do not append.",
             "`status: \"idle\"` is not send readiness. Use `idle_for_send: true` or wait for `sendable`; `awaiting_user` without a pending interaction is waiting for its next instruction, not asking you a question. On a managed link, `steer` may deliver that instruction only when your own user's instruction covers it.",
-            "Idle alone does not prove completion. Previews may be stale: inspect current child/ticket outcomes; queued work and no-match tests are not passes. Preserve explicit approval/conflict gates. Revocation may close an inventory without a notice; never treat an old list as authority.",
-            "This block is versioned by membership `revision` and `guidance_revision`. If several active `\(envelopeTag)` blocks appear, only the newest is current; never merge older targets or permissions into it."
+            "Idle does not prove completion. Inspect current child/ticket outcomes; queued work and no-match tests are not passes. Preserve explicit approval/conflict gates. Revocation may close an inventory silently; old lists grant nothing.",
+            "Versioned by membership `revision` and `guidance_revision`. Of active `\(envelopeTag)` blocks, only the newest is current; never merge older targets or permissions."
         ])
         let escapedLines = lines.map { escaped($0) }.joined(separator: "\n")
         return """

@@ -4598,8 +4598,8 @@ final class AgentOrchestrationGuidanceTests: XCTestCase {
             kind: .inventory, inventory: inventory, toolReference: "agent_session_link"
         )
         for required in [
-            "For managed task assignments or resumes, use `steer` even when the target is idle",
-            "`send` is coordination only", "first message assigns the lane job",
+            "Managed assignments/resumes: prefer `steer`, including idle",
+            "exact current Manage authority gives it task framing, otherwise coordination only", "first message assigns the lane job",
             "queued work and no-match tests are not passes", "explicit approval/conflict gates"
         ] {
             XCTAssertTrue(rendered.contains(AgentSessionLinkMessageEnvelope.escaped(required)), required)
@@ -4635,7 +4635,10 @@ final class AgentOrchestrationGuidanceTests: XCTestCase {
             for required in [
                 "`agent_session_link op=steer` for initial assignments and resumes, even while idle",
                 "optional `message` assigns the lane job", "without inherited grants",
-                "an active target cannot self-rebind", "idle provider, no queued work or pending interaction",
+                "external rebinding of such a managed target requires it to be idle",
+                "self-targeted request may schedule relocation after successful turn completion",
+                "Stop cancels that pending relocation", "bootstrap `create_lane` without an existing link",
+                "without it they remain bounded coordination", "idle provider, no queued work or pending interaction",
                 "Verify the durable binding, physical path, HEAD, full porcelain, and source routing",
                 "`agent_run op=start` plus `worktree`/`worktree_id`", "inspect exact session/worktree/operation state before retrying",
                 "provider-not-started", "allocated-child cleanup/no orphan", "rather than create duplicates",

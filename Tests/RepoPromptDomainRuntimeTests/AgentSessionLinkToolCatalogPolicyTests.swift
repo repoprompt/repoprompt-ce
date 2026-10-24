@@ -89,7 +89,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(current.isEnabledByDefault, previous.isEnabledByDefault)
         XCTAssertLessThanOrEqual(current.description.utf8.count, previous.description.utf8.count)
         for required in [
-            "`send`: coordination only", "Managed tasks: `steer`",
+            "`send`: `idle_for_send: true`", "exact Manage grants use task framing",
             "`steer`: [manage] assign/resume, even idle", "Pending prompts block steering", "ACP live steering is supported",
             "Its first message assigns the lane's job",
             "Only a current exact grant with `manage`", "not authority over targets-of-targets",
