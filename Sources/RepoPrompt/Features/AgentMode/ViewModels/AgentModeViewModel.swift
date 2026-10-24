@@ -2779,6 +2779,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexComputerUseRuntimeUnavailableMessage: @escaping () -> String? = { nil },
+            testCodexComputerUseRuntimePreflight: (() async -> String?)? = nil,
             testCodexComputerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
             testCodexComputerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
             testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
@@ -2860,6 +2862,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 routeOwnerValidator: testCodexRouteOwnerValidator,
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
+                computerUseRuntimeUnavailableMessage: testCodexComputerUseRuntimeUnavailableMessage,
+                computerUseRuntimePreflight: testCodexComputerUseRuntimePreflight,
                 computerUseCompanionReady: testCodexComputerUseCompanionReady,
                 computerUseReservedEntryExists: testCodexComputerUseReservedEntryExists,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
@@ -3846,6 +3850,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 && session.persistentSessionBindingIdentity == binding && session.bindingTransitionGeneration == generation
                 && computerUseComposerProps(session: session).isVisible
         }
+        let runtimeMessage = await codexCoordinator.computerUseRuntimeRequirementMessage()
+        guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if let runtimeMessage { return runtimeMessage }
         if !CodexComputerUseWorkflow.isEnabled {
             let accepted: Bool = if let confirmOptIn {
                 await confirmOptIn()
@@ -18630,7 +18637,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session: session,
                attachments: attachments,
                taggedFiles: taggedFiles,
-               activeWorkflow: workflow
+               activeWorkflow: workflow,
+               deferComputerUseRuntimeCheckUntilArming: true
            )
         {
             return validationFailure
@@ -20661,7 +20669,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
-        activeWorkflow: AgentWorkflowDefinition?
+        activeWorkflow: AgentWorkflowDefinition?,
+        deferComputerUseRuntimeCheckUntilArming: Bool = false
     ) -> UserTurnSubmissionResult? {
         let argumentsText = invocation.argumentsText
         if activeWorkflow != nil,
@@ -20707,7 +20716,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            let availabilityMessage = codexCoordinator.nativeSlashCommandAvailabilityMessage(
                invocation.command,
                argumentsText: argumentsText,
-               session: session
+               session: session,
+               deferComputerUseRuntimeCheckUntilArming: deferComputerUseRuntimeCheckUntilArming
            )
         {
             return .blocked(message: availabilityMessage)
