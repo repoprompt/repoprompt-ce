@@ -1088,6 +1088,8 @@ struct CLIProvidersSettingsView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
             }
 
+            customBackendLimitField("Request timeout (milliseconds)", keyPath: \.requestTimeoutMilliseconds, isTimeout: true)
+            customBackendLimitField("Context window (tokens)", keyPath: \.contextWindowTokens)
             compatibleHTTPConsentView(for: .custom)
 
             // Auth style picker
@@ -1382,6 +1384,21 @@ struct CLIProvidersSettingsView: View {
                     .font(.system(size: 11))
             }
         }
+    }
+
+    private func customBackendLimitField(
+        _ title: String,
+        keyPath: WritableKeyPath<ClaudeCodeCompatibleBackendConfig, Int?>,
+        isTimeout: Bool = false
+    ) -> some View {
+        CompatibleBackendLimitField(title: title, isTimeout: isTimeout, value: Binding(
+            get: { viewModel.compatibleBackendConfig(for: .custom)[keyPath: keyPath] },
+            set: { value in
+                var config = viewModel.compatibleBackendConfig(for: .custom)
+                config[keyPath: keyPath] = value
+                viewModel.saveCompatibleBackendConfig(config)
+            }
+        ))
     }
 
     // MARK: Advanced disclosure (base URL + auth style) for presets
@@ -2995,5 +3012,69 @@ struct CLIProvidersSettingsView: View {
         showGrokBuildTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+}
+
+private struct CompatibleBackendLimitField: View {
+    let title: String
+    let isTimeout: Bool
+    @Binding var value: Int?
+    @State private var input = ""
+
+    private var trimmedInput: String {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var allowedRange: ClosedRange<Int> {
+        isTimeout ? ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds : ClaudeCompatibleBackendLimits.contextWindowTokens
+    }
+
+    private var isValid: Bool {
+        trimmedInput.isEmpty || Int(trimmedInput).map(allowedRange.contains) == true
+    }
+
+    private var helpText: String {
+        guard isValid else {
+            return isTimeout
+                ? "Enter 1000–2147483647 milliseconds. For 10 minutes enter 600000, not 600. Change not saved."
+                : "Enter 1–2147483647 tokens. Change not saved."
+        }
+        if isTimeout {
+            return "Default: 600000 ms (10 min). Values are milliseconds, not seconds. Applies to new launches."
+        }
+        return "Default for unrecognized IDs: 200K tokens. One window applies to all three slots on new launches. IDs with [1m], bare claude- names, and recognized Claude models follow Claude Code’s own window rules."
+    }
+
+    private var unusualWindow: Bool {
+        guard !isTimeout, let window = Int(trimmedInput), isValid else { return false }
+        return !(4096 ... 1_000_000).contains(window)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            TextField(isTimeout ? "600000 ms (10 min)" : "200000 tokens (200K)", text: $input)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .onAppear { input = value.map(String.init) ?? "" }
+                .onChange(of: input) { _, _ in
+                    guard isValid else { return }
+                    value = Int(trimmedInput)
+                }
+                .onChange(of: value) { _, newValue in
+                    input = newValue.map(String.init) ?? ""
+                }
+            Text(helpText + " Leave blank to use the default.")
+                .font(.caption)
+                .foregroundColor(isValid ? .secondary : .red)
+                .fixedSize(horizontal: false, vertical: true)
+            if unusualWindow {
+                Text("Outside the typical 4K–1M range; verify the server’s real context limit. This does not set an auto-compaction threshold.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
