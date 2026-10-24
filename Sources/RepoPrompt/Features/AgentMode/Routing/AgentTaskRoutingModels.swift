@@ -1,47 +1,6 @@
 import Foundation
 import RepoPromptSettingsCore
 
-/// Stable identity for a bundled routing backend. Router selection is exact and never falls back.
-struct AgentTaskRouterBackendID: RawRepresentable, Codable, Hashable, Comparable {
-    let rawValue: String
-
-    init(rawValue: String) {
-        self.rawValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    static func < (lhs: Self, rhs: Self) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-
-    static let jev = AgentTaskRouterBackendID(rawValue: "jev")
-}
-
-enum AgentTaskRouterBackendReadiness: Equatable {
-    case ready(generation: UInt64, policyVersion: String)
-    case needsConfiguration(generation: UInt64, reason: String)
-    case validating(generation: UInt64)
-    case policyUnavailable(generation: UInt64, reason: String)
-    case temporarilyUnavailable(generation: UInt64, reason: String)
-
-    var generation: UInt64 {
-        switch self {
-        case let .ready(generation, _),
-             let .needsConfiguration(generation, _),
-             let .validating(generation),
-             let .policyUnavailable(generation, _),
-             let .temporarilyUnavailable(generation, _):
-            generation
-        }
-    }
-
-    var isReady: Bool {
-        if case .ready = self {
-            return true
-        }
-        return false
-    }
-}
-
 /// Complete executable identity used for candidate deduplication and commit/rollback.
 /// It deliberately retains effort and normalized ACP parameters; provider/model alone is not executable identity.
 struct AgentRoutingExecutableTarget: Hashable {
@@ -89,63 +48,6 @@ enum AgentTaskRoutingDecisionStage: String, Codable, Equatable {
     case effort
 }
 
-struct AgentTaskRoutingRequest: Equatable {
-    static let currentContractVersion = "rpce.agent-session-router.v3"
-
-    let requestID: UUID
-    let contractVersion: String
-    let task: String
-    let scope: AgentTaskRoutingScope
-    let decisionStage: AgentTaskRoutingDecisionStage
-    let customInstructions: String?
-    let candidates: [AgentTaskRoutingCandidateDescriptor]
-
-    init(
-        requestID: UUID,
-        contractVersion: String,
-        task: String,
-        scope: AgentTaskRoutingScope,
-        decisionStage: AgentTaskRoutingDecisionStage = .model,
-        customInstructions: String?,
-        candidates: [AgentTaskRoutingCandidateDescriptor]
-    ) {
-        self.requestID = requestID
-        self.contractVersion = contractVersion
-        self.task = task
-        self.scope = scope
-        self.decisionStage = decisionStage
-        self.customInstructions = customInstructions
-        self.candidates = candidates
-    }
-}
-
-struct AgentTaskRoutingDecisionEvidence: Equatable {
-    let policyVersion: String?
-    let confidence: Double?
-    let scores: [String: Double]?
-    let inputTokens: Int?
-    let outputTokens: Int?
-    let reasonCode: String?
-}
-
-enum AgentTaskRoutingBackendFailureCategory: String, Equatable {
-    case authentication
-    case invalidRequest
-    case rateLimited
-    case overloaded
-    case transport
-    case timeout
-    case invalidResponse
-    case policyUnavailable
-}
-
-enum AgentTaskRoutingBackendOutcome: Equatable {
-    case selected(opaqueKey: String, evidence: AgentTaskRoutingDecisionEvidence?)
-    case abstained(reason: String, evidence: AgentTaskRoutingDecisionEvidence?)
-    case failed(category: AgentTaskRoutingBackendFailureCategory, retryable: Bool, evidence: AgentTaskRoutingDecisionEvidence?)
-    case cancelled
-}
-
 struct AgentTaskRouterConfiguration: Equatable {
     enum Validity: Equatable {
         case valid
@@ -156,7 +58,7 @@ struct AgentTaskRouterConfiguration: Equatable {
     }
 
     let enabled: Bool
-    let selectedBackendID: AgentTaskRouterBackendID?
+    let selectedBackendID: DecisionServiceID?
     let selectedBackendRawValue: String?
     let candidateRoles: [AgentModelCatalog.TaskLabelKind]
     let allowedProviders: Set<AgentProviderKind>

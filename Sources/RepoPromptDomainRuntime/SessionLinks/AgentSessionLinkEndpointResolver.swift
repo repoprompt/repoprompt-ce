@@ -29,7 +29,7 @@ package struct AgentSessionRestorationBindingToken: Equatable, Hashable {
     }
 }
 
-/// Binding-qualified hydration outcome, used by automatic restoration and fresh lane Add.
+/// Binding-qualified creation and hydration outcome, used by operation admission and oversight.
 ///
 /// `hasLoadedPersistedState` cannot serve this purpose: it is a completion latch, and a missing
 /// payload, a superseded source revision, and a thrown load error all set it true. Reauthorizing a
@@ -51,16 +51,72 @@ package enum AgentSessionRestorationReadiness: Equatable {
         case sourceRevisionSuperseded
     }
 
+    /// One creation owner's progress for this binding. Preparation and its first payload save
+    /// remain owned operations; ordinary operations cannot act on a partially created session.
+    package struct CreationState: Equatable {
+        package enum Phase: Equatable {
+            case preparing
+            case readyToPersist(configurationStamp: Data)
+            case failedBeforeConfiguration(String)
+        }
+
+        package let workspaceID: UUID
+        package let ownerID: UUID
+        package let phase: Phase
+
+        package init(workspaceID: UUID, ownerID: UUID, phase: Phase) {
+            self.workspaceID = workspaceID
+            self.ownerID = ownerID
+            self.phase = phase
+        }
+    }
+
     /// No durable binding to prove anything about.
     case unbound
     case pending(AgentSessionRestorationBindingToken)
+    case creating(AgentSessionRestorationBindingToken, CreationState)
     case authoritative(AgentSessionRestorationBindingToken, Source)
     case terminal(AgentSessionRestorationBindingToken, Failure)
 
     package var bindingToken: AgentSessionRestorationBindingToken? {
         switch self {
         case .unbound: nil
-        case let .pending(token), let .authoritative(token, _), let .terminal(token, _): token
+        case let .pending(token), let .creating(token, _), let .authoritative(token, _), let .terminal(token, _): token
+        }
+    }
+
+    package var creationState: CreationState? {
+        if case let .creating(_, state) = self { return state }
+        return nil
+    }
+
+    package var isCreating: Bool {
+        creationState != nil
+    }
+
+    /// Generic bound operations and saves require a completed payload. The creation owner uses
+    /// its exact binding, owner identity and prepared configuration to authorize the first save.
+    package var permitsBoundOperationAndSave: Bool {
+        isAuthoritative
+    }
+
+    package var operationAdmissionFailureMessage: String? {
+        switch self {
+        case .unbound, .authoritative:
+            nil
+        case .pending:
+            "Wait for this session to finish loading."
+        case .terminal:
+            "This session could not be restored. Retry loading it or create a new session; its saved data has not been replaced."
+        case let .creating(_, state):
+            switch state.phase {
+            case .preparing:
+                "This session is still being created. Wait for preparation to finish."
+            case .readyToPersist:
+                "This session has not been saved. Retry saving it before starting a turn."
+            case let .failedBeforeConfiguration(message):
+                message + " Create a new session to try again."
+            }
         }
     }
 
@@ -79,8 +135,8 @@ package enum AgentSessionRestorationReadiness: Equatable {
 
 /// The exact incarnations and binding-qualified hydration outcomes carried into an Add.
 ///
-/// Manual Add carries none of this: pasting a UUID keeps the resolver's existing behaviour. Automatic
-/// restoration and fresh lane creation differ, because they are authorized on a proof read at
+/// Manual Add requires an eligible endpoint with a complete payload. Automatic restoration and
+/// fresh lane creation additionally carry a proof read at
 /// classification time and every authority hop between then and activation is a chance for that
 /// endpoint to rebind, go terminal, or be replaced by an incarnation whose legacy
 /// `hasLoadedPersistedState` latch is true while its proof is pending or terminal. Carrying the proof
@@ -213,8 +269,11 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     package let sessionID: UUID
     package let persistentBindingGeneration: UUID?
     package let bindingTransitionGeneration: UInt64
-    /// `parentSessionID == nil`. Child sessions are never overseeable endpoints.
+    /// `parentSessionID == nil`. Observer eligibility still requires a top-level session.
     package let isTopLevel: Bool
+    /// App-owned immutable spawn/creation provenance, never organizational placement or tool input.
+    package let parentSessionID: UUID?
+    package let createdByOverseerSessionID: UUID?
     package let hasLoadedPersistedState: Bool
     package let bindingTransitionInProgress: Bool
     /// The owning window or tab is closing, or the session is being deleted.
@@ -236,8 +295,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     /// Binding-qualified hydration proof, already resolved against this candidate's *current*
     /// binding state by its owning window.
     ///
-    /// Consumed only by automatic restoration. Manual Add keeps using the resolver's existing
-    /// `hasLoadedPersistedState` gate, so pasting a UUID behaves exactly as before.
+    /// Both manual Add and automatic restoration require a completed payload. The legacy load
+    /// completion latch alone cannot admit an incomplete creation or a failed restoration.
     package var restorationReadiness: AgentSessionRestorationReadiness = .unbound
 
     /// Whether a durable deletion of this session has begun or committed.
@@ -265,8 +324,12 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
         providerDisplayName: String?,
         locationLabel: String?,
         restorationReadiness: AgentSessionRestorationReadiness = .unbound,
-        isDeletionInProgress: Bool = false
+        isDeletionInProgress: Bool = false,
+        parentSessionID: UUID? = nil,
+        createdByOverseerSessionID: UUID? = nil
     ) {
+        self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
         self.windowID = windowID
         self.workspaceID = workspaceID
         self.tabID = tabID
@@ -290,7 +353,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     package var eligibilityInput: AgentSessionLinkEndpointEligibility.Input {
         AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: persistentBindingGeneration != nil,
-            hasLoadedPersistedState: hasLoadedPersistedState,
+            hasLoadedPersistedState: hasLoadedPersistedState
+                && restorationReadiness.permitsBoundOperationAndSave,
             isChildSession: !isTopLevel,
             isMCPControlled: isMCPControlled,
             isMCPOriginated: isMCPOriginated,
@@ -378,13 +442,17 @@ package enum AgentSessionLinkEndpointResolver {
 
     package static func resolve(
         sessionID: UUID,
-        candidates: [AgentSessionLinkEndpointCandidate]
+        candidates: [AgentSessionLinkEndpointCandidate],
+        observerSessionID: UUID? = nil,
+        permitsChildTarget: Bool = false
     ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
         let matches = candidates.filter { $0.sessionID == sessionID }
         guard !matches.isEmpty else { return .failure(.notFound) }
         guard matches.count == 1 else { return .failure(.ambiguous) }
         let match = matches[0]
-        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: match) {
+        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(
+            for: match, observerSessionID: observerSessionID, permitsChildTarget: permitsChildTarget
+        ) {
             return .failure(failure)
         }
         return .success(match)
@@ -449,9 +517,14 @@ package enum AgentSessionLinkEndpointEligibility {
     /// and ambiguity, then delegates its unique candidate here; exact sidebar projection and Add
     /// revalidation call the same candidate-local helper without ever choosing between incarnations.
     package static func targetResolveFailure(
-        for candidate: AgentSessionLinkEndpointCandidate
+        for candidate: AgentSessionLinkEndpointCandidate,
+        observerSessionID: UUID? = nil,
+        permitsChildTarget: Bool = false
     ) -> AgentSessionLinkResolveFailure? {
-        targetResolveFailure(for: candidate.eligibilityInput)
+        let isCreator = observerSessionID.map {
+            candidate.parentSessionID == $0 || candidate.createdByOverseerSessionID == $0
+        } ?? false
+        return targetResolveFailure(for: candidate.eligibilityInput, permitsChildTarget: isCreator || permitsChildTarget)
     }
 
     /// Boolean compatibility for consumers that only need offerability. It is intentionally a thin
@@ -460,9 +533,9 @@ package enum AgentSessionLinkEndpointEligibility {
         targetResolveFailure(for: input) == nil
     }
 
-    private static func targetResolveFailure(for input: Input) -> AgentSessionLinkResolveFailure? {
-        // Keep this precedence synchronized with the user-facing resolver contract.
-        if input.isChildSession { return .childSession }
+    private static func targetResolveFailure(for input: Input, permitsChildTarget: Bool = false) -> AgentSessionLinkResolveFailure? {
+        // This qualifies only the child fence; it never changes provenance or observer eligibility.
+        if input.isChildSession, !permitsChildTarget { return .childSession }
         if input.isClosing { return .closing }
         // Transient: a running deletion refuses a new link without implying permanent endpoint loss.
         if input.isDeletionInProgress { return .closing }

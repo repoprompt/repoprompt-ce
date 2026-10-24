@@ -49,7 +49,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
     }
 
     func testAgentCallerMayControlOnlyItsDirectChildren() {
-        for operation in sessionControlOperations {
+        for operation in sessionControlOperations where operation != .manageCleanup {
             let child = DomainAgentSessionOperationAuthorizer.authorize(
                 operation: operation,
                 caller: .agentSession(callerSessionID),
@@ -81,6 +81,21 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
         }
     }
 
+    func testAgentCannotDeleteSavedSessionsEvenWithDirectSpawnProvenance() {
+        let targets: [DomainAgentSessionTargetProvenance] = [
+            .known(targetSessionID: childSessionID, parentSessionID: callerSessionID),
+            .known(targetSessionID: siblingSessionID, parentSessionID: nil),
+            .unknown(targetSessionID: siblingSessionID)
+        ]
+        for target in targets {
+            let decision = DomainAgentSessionOperationAuthorizer.authorize(
+                operation: .manageCleanup, caller: .agentSession(callerSessionID), target: target,
+                monitorGrant: monitorProof(capability: .sendWhenIdle)
+            )
+            XCTAssertEqual(decision.denial, .humanOnlyOperation)
+        }
+    }
+
     func testGrandchildIsNotDirectlyControllable() {
         let grandchildParent = childSessionID
         let decision = DomainAgentSessionOperationAuthorizer.authorize(
@@ -98,7 +113,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 caller: .agentSession(callerSessionID),
                 target: .unknown(targetSessionID: siblingSessionID)
             )
-            XCTAssertEqual(unknownTarget.denial, .targetProvenanceUnknown, "\(operation.rawValue)")
+            XCTAssertEqual(unknownTarget.denial, operation == .manageCleanup ? .humanOnlyOperation : .targetProvenanceUnknown, "\(operation.rawValue)")
 
             let unresolvedCaller = DomainAgentSessionOperationAuthorizer.authorize(
                 operation: operation,
@@ -132,7 +147,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             )
             XCTAssertEqual(
                 decision.denial,
-                .notDirectChild,
+                operation == .manageCleanup ? .humanOnlyOperation : .notDirectChild,
                 "an oversight link must not widen agent_run/agent_manage: \(operation.rawValue)"
             )
         }

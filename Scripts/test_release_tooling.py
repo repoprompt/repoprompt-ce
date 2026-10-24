@@ -61,6 +61,25 @@ class DebugPackagingIdentityTests(unittest.TestCase):
             self.assertIn(f'"{placeholder}":', validator, placeholder)
 
 
+class PackagedSmokeExternalProbeTests(unittest.TestCase):
+    @staticmethod
+    def probe_source() -> str:
+        source = (SCRIPT_DIR / "smoke_packaged_mcp_roundtrip.sh").read_text(encoding="utf-8")
+        match = re.search(r"run_external_initialize_request\(\) \{.*?\nPYTHON\n\}\n", source, re.DOTALL)
+        assert match, "run_external_initialize_request not found"
+        return match.group(0)
+
+    def test_probe_uses_auto_admitted_helper_client_name(self) -> None:
+        probe = self.probe_source()
+        self.assertRegex(probe, r'"name":\s*"RepoPrompt CLI \(Packaged Smoke\)"')
+        self.assertNotIn("codex-mcp-client", probe)
+
+    def test_probe_keeps_object_valued_capabilities(self) -> None:
+        probe = self.probe_source()
+        self.assertRegex(probe, r'"experimental":\s*\{\s*"codex/auth-change":\s*\{\}')
+        self.assertRegex(probe, r'"elicitation":\s*\{\s*"form":\s*\{\},\s*"url":\s*\{\}')
+
+
 class StableTipFloorTests(unittest.TestCase):
     def rollout(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

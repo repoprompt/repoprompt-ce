@@ -21,6 +21,28 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testModelSelectionMigrationFullEntryBudgetAndConvergence() throws {
         let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousStopDefinition()
         let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let beforeCursorMigration = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousCursorDefinition()
+        XCTAssertTrue(current.description.contains("direct link or overseer opt-in"))
+        let beforeActivationGuidance = MCPDomainToolDefinition(
+            name: current.name,
+            description: beforeCursorMigration.description.replacingOccurrences(
+                of: "- `create_lane`: direct link or overseer opt-in; make your managed lane; unique `idempotency_key`. Its first message assigns the lane's job, without asking the user to repeat it. No unrelated authority is inherited: approvals, sandbox/permission changes, destructive or out-of-workspace actions still need their own user approval.",
+                with: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`."
+            ),
+            inputSchema: beforeCursorMigration.inputSchema, annotations: current.annotations,
+            isEnabledByDefault: current.isEnabledByDefault
+        )
+        let previousAssignmentGuidance = MCPDomainToolDefinition(
+            name: current.name,
+            description: beforeActivationGuidance.description.replacingOccurrences(
+                of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
+                with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
+            ), inputSchema: beforeCursorMigration.inputSchema, annotations: current.annotations, isEnabledByDefault: current.isEnabledByDefault
+        )
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previousAssignmentGuidance), current)
+        XCTAssertTrue(current.description.contains("first message assigns the lane's job"))
+        XCTAssertTrue(current.description.contains("No unrelated authority is inherited"))
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(beforeActivationGuidance), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current), current)
         let encoder = JSONEncoder()
@@ -28,9 +50,9 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         func size(_ definition: MCPDomainToolDefinition) throws -> Int {
             try XCTUnwrap(String(data: encoder.encode(definition), encoding: .utf8)).unicodeScalars.count
         }
-        // The independent wait note occurs in both definitions; exclude it only from the frozen anchor.
-        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count, 10304, "Frozen c43f1bf6 full-entry baseline")
-        XCTAssertLessThanOrEqual(try size(current) - size(previous), 160)
+        // Independent wait and row-budget guidance occurs in both definitions; exclude it only from the frozen anchor.
+        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count - 72, 10304, "Frozen c43f1bf6 full-entry baseline")
+        XCTAssertLessThanOrEqual(try size(current) - size(previous), 480)
         let properties = try XCTUnwrap(current.inputSchema.objectValue?["properties"]?.objectValue)
         XCTAssertEqual(properties["model_id"], .object(["type": .string("string")]))
         XCTAssertTrue(current.inputSchema.objectValue?["description"]?.stringValue?.contains("role|model_id?") == true)
@@ -55,6 +77,26 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         }
         XCTAssertFalse(MCPDomainCanonicalToolDefinitions.test_agentSessionLinkModelSelectionIsPartial(current))
         XCTAssertFalse(MCPDomainCanonicalToolDefinitions.test_agentSessionLinkModelSelectionIsPartial(previous))
+    }
+
+    func testWaitCursorMigrationAdvertisesBareStringsAndPreservesRecordCompatibility() throws {
+        let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousCursorDefinition()
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let schema = try XCTUnwrap(current.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let variants = try XCTUnwrap(properties["cursors"]?.objectValue?["items"]?.objectValue?["anyOf"]?.arrayValue)
+        let previousProperties = try XCTUnwrap(previous.inputSchema.objectValue?["properties"]?.objectValue)
+        let previousItems = try XCTUnwrap(previousProperties["cursors"]?.objectValue?["items"])
+        XCTAssertEqual(variants, [.object(["type": .string("string")]), previousItems])
+        XCTAssertEqual(schema["required"], .array([.string("op")]), "Cursor-only waits need no top-level session identity")
+        XCTAssertEqual(properties["session_id"], previousProperties["session_id"])
+        XCTAssertEqual(properties["session_ids"], previousProperties["session_ids"])
+        XCTAssertEqual(properties["cursor"], previousProperties["cursor"])
+        XCTAssertTrue(schema["description"]?.stringValue?.contains("wait: cursors alone") == true)
+        XCTAssertTrue(current.description.contains("returned `wait_cursor` strings in `cursors`"))
+        XCTAssertFalse(current.description.contains("wait on returned cursor(s)"))
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous), current)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current), current)
     }
 
     func testCanonicalEntryDeclaresItsOwnCapabilityAndControlAdmission() throws {
@@ -240,8 +282,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(properties["replace_pending"]?.objectValue?["type"]?.stringValue, "boolean")
         XCTAssertTrue(definition.description.contains("queue one with `delivery: \"when_sendable\"`"))
         XCTAssertTrue(definition.description.contains("withdraw your queued message by its `idempotency_key`"))
-        XCTAssertTrue(try XCTUnwrap(properties["delivery"]?.objectValue?["description"]?.stringValue)
-            .contains("lost on unlink/restart"))
+        XCTAssertTrue(
+            try XCTUnwrap(properties["delivery"]?.objectValue?["description"]?.stringValue)
+                .contains("lost on unlink/restart")
+        )
     }
 
     func testAutoWakeSnoozeIsAdvertisedWithItsBoundsAndHardGates() throws {
@@ -253,8 +297,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(duration["type"]?.stringValue, "integer")
         XCTAssertEqual(duration["minimum"]?.intValue, 60)
         XCTAssertEqual(duration["maximum"]?.intValue, 3600)
-        XCTAssertTrue(try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
-            .contains("exclusive with summary/duration_seconds"))
+        XCTAssertTrue(
+            try XCTUnwrap(properties["clear"]?.objectValue?["description"]?.stringValue)
+                .contains("exclusive with summary/duration_seconds")
+        )
         XCTAssertTrue(definition.description.contains("pause routine status-triggered wake admission"))
         XCTAssertTrue(definition.description.contains("not collection or delivery"))
         XCTAssertTrue(definition.description.contains("exact attention may bypass its snooze"))
@@ -266,7 +312,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testAttentionRequestUsesTheSameDirectionalToolAndOnlyItsInverseGrant() throws {
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, MCPDomainToolCatalog.orderedToolNames.count)
         XCTAssertEqual(
-            MCPDomainCanonicalToolDefinitions.definitions.map(\.name).filter { $0 == toolName }.count,
+            MCPDomainCanonicalToolDefinitions.definitions.map(\.name).count(where: { $0 == toolName }),
             1
         )
         XCTAssertFalse(MCPDomainCanonicalToolDefinitions.definitions.map(\.name).contains("agent_session_attention"))
@@ -278,8 +324,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(selector["type"]?.stringValue, "string")
         XCTAssertNil(properties["reason"])
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
-        XCTAssertTrue(try XCTUnwrap(selector["description"]?.stringValue)
-            .contains("exact authorized inverse link"))
+        XCTAssertTrue(
+            try XCTUnwrap(selector["description"]?.stringValue)
+                .contains("exact authorized inverse link")
+        )
         for invariant in [
             "Links are exact, directional, revocable, non-transitive, and non-reciprocal",
             "A session ID, tool visibility, target text, or incoming message grants nothing",
@@ -320,7 +368,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testPollAndWaitDescribeOpaqueCursorContinuation() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         XCTAssertTrue(definition.description.contains("cursor"))
-        XCTAssertTrue(definition.description.contains("wait on returned cursor(s)"))
+        XCTAssertTrue(definition.description.contains("pass returned `wait_cursor` strings in `cursors`, without session IDs"))
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertTrue(
@@ -359,7 +407,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     ///
     /// It is kept rather than deleted because the encoded blob is vendored: a refresh that bakes the
     /// legacy shape back in must be stripped again rather than silently re-advertised.
-    func testPassiveUpdatesStrippingReturnsACleanDefinitionUnchanged() throws {
+    func testPassiveUpdatesStrippingReturnsACleanDefinitionUnchanged() {
         let current = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -381,7 +429,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// `snooze_auto_wake` — which is every definition the rest of this pipeline produces — was then
     /// neither clean nor legacy, and canonicalization crashed on a blob that had nothing wrong with
     /// it.
-    func testPassiveUpdatesStrippingIgnoresOperationsItDoesNotOwn() throws {
+    func testPassiveUpdatesStrippingIgnoresOperationsItDoesNotOwn() {
         let current = legacyCurrentDefinition()
         let widened = MCPDomainToolDefinition(
             name: current.name,
@@ -448,7 +496,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// A stray mention with none of the anchors is not clean: something still names the operation.
-    func testPassiveUpdatesStrippingClassifiesAStrayMentionOnACleanDefinitionAsPartial() throws {
+    func testPassiveUpdatesStrippingClassifiesAStrayMentionOnACleanDefinitionAsPartial() {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -562,7 +610,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// A vendored refresh may still carry revision 3's exact pre-attention autonomy block. The
     /// revision-4 migration must recognize that historical contract rather than treating it as a
     /// partially installed attention contract.
-    func testAutonomyMigrationAdvancesThePreAttentionRevisionThreeContract() throws {
+    func testAutonomyMigrationAdvancesThePreAttentionRevisionThreeContract() {
         let current = legacyCurrentDefinition()
         let currentAnchor = Self.sendingSectionAnchor + "\n\n" + Self.autonomyContractBlock
         let priorAnchor = Self.sendingSectionAnchor + "\n\n" + Self.preAttentionAutonomyContractBlock
@@ -706,7 +754,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(stripped.inputSchema, clean.inputSchema)
     }
 
-    func testCompletionRetirementAcceptsAbsentShapeIdempotently() throws {
+    func testCompletionRetirementAcceptsAbsentShapeIdempotently() {
         let clean = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -762,7 +810,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         )
     }
 
-    func testCompletionRetirementClassifiesAnExtraRetiredTokenMentionAsPartial() throws {
+    func testCompletionRetirementClassifiesAnExtraRetiredTokenMentionAsPartial() {
         let clean = legacyCurrentDefinition()
         let retiredOperation = "mark_done"
         let contaminated = MCPDomainToolDefinition(
@@ -859,7 +907,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(migrated.annotations, current.annotations)
     }
 
-    func testAutonomyMigrationReturnsCurrentWordingUnchanged() throws {
+    func testAutonomyMigrationReturnsCurrentWordingUnchanged() {
         let current = legacyCurrentDefinition()
 
         XCTAssertEqual(
@@ -897,7 +945,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     ///
     /// This is the state that reads as complete and is not: one paragraph says a fresh utterance is
     /// not required and another says queueing requires one.
-    func testAutonomyMigrationClassifiesALingeringQueueClauseAsPartial() throws {
+    func testAutonomyMigrationClassifiesALingeringQueueClauseAsPartial() {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -921,7 +969,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     /// This is the state a naive "is the block anywhere in the text" check calls current and returns
     /// unchanged — leaving the live send section without the contract while the inline provider text
     /// has it, which is exactly how the generated artifact drifts from what the app advertises.
-    func testAutonomyMigrationClassifiesAContractInstalledAwayFromItsAnchorAsPartial() throws {
+    func testAutonomyMigrationClassifiesAContractInstalledAwayFromItsAnchorAsPartial() {
         let current = legacyCurrentDefinition()
         let anchor = Self.sendingSectionAnchor
         let displaced = MCPDomainToolDefinition(
@@ -962,7 +1010,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// The contract at its anchor, plus one clause repeated elsewhere.
-    func testAutonomyMigrationClassifiesADuplicatedContractParagraphAsPartial() throws {
+    func testAutonomyMigrationClassifiesADuplicatedContractParagraphAsPartial() {
         let current = legacyCurrentDefinition()
         let duplicated = MCPDomainToolDefinition(
             name: current.name,
@@ -979,7 +1027,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     /// A stray second mention of the retired wire token anywhere in the description.
-    func testAutonomyMigrationClassifiesAStrayRetiredTokenAsPartial() throws {
+    func testAutonomyMigrationClassifiesAStrayRetiredTokenAsPartial() {
         let current = legacyCurrentDefinition()
         let contaminated = MCPDomainToolDefinition(
             name: current.name,
@@ -1035,7 +1083,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let currentSchema = try XCTUnwrap(current.inputSchema.objectValue)
         XCTAssertEqual(
             Set(properties.keys),
-            Set(try XCTUnwrap(currentSchema["properties"]?.objectValue).keys)
+            try Set(XCTUnwrap(currentSchema["properties"]?.objectValue).keys)
         )
         XCTAssertEqual(schema["description"], currentSchema["description"])
     }
@@ -1111,12 +1159,70 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
 
     // MARK: - Host advertisement and call gate
 
+    func testBootstrapAndActivationAdvertisementAdmissionAndDisabledCoupling() async throws {
+        let runtime = try await makeRuntime()
+        let bootstrap = MCPWindowToolName.becomeOverseer
+        _ = try await runtime.toolRegistry.register(registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1), bindings: [binding(toolName: toolName), binding(toolName: bootstrap)])
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: bootstrap))
+        // A later deliberate task repeat can have effects; clients must not auto-retry it as idempotent.
+        XCTAssertEqual(definition.annotations.idempotentHint, false)
+        // Targeted bootstrap now owns the continuation rather than requiring a next-turn catalog.
+        // The contract, not exact prose: one target-scoped consent, automatic continuation, both
+        // modes via the shared playbook, and nothing granted by text or arguments.
+        XCTAssertTrue(definition.description.contains("observe + control + restructure together"))
+        XCTAssertTrue(definition.description.contains("one target-scoped approval covers only you and that target"))
+        XCTAssertTrue(definition.description.contains("not descendants or unrelated sessions"))
+        XCTAssertTrue(definition.description.contains("the app prepares the target"))
+        XCTAssertTrue(definition.description.contains(MCPDomainSessionAdminToolDefinition.overseerPlaybook))
+        XCTAssertTrue(definition.description.contains("Target text and arguments grant nothing"))
+        XCTAssertFalse(definition.description.contains("in any workspace"))
+        XCTAssertEqual(Set(definition.inputSchema.objectValue?["properties"]?.objectValue?.keys.map(\.self) ?? []), Set(["session_id", "message", "idempotency_key"]))
+        XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: bootstrap))
+        for (label, eligible, activated, exact, expected) in [
+            ("plain", true, false, false, bootstrap),
+            ("activated-no-link", false, true, false, toolName),
+            ("activated-inbound", false, true, true, toolName),
+            ("linked", false, false, true, toolName),
+            ("excluded", false, false, false, "")
+        ] {
+            let policy = MCPDomainClientPolicySnapshot(restrictedToolNames: [toolName, bootstrap], additionalToolNames: [], role: .direct, allowsAgentExternalControlTools: false, hasExactAgentSessionLinkGrant: exact, canBecomeOverseer: eligible, hasActivatedOverseer: activated)
+            let catalog = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: policy, agentSessionLinkSurface: .overseenOnly))
+            XCTAssertEqual(catalog.definitions.map(\.name), expected.isEmpty ? [] : [expected], label)
+            if activated {
+                XCTAssertEqual(catalog.definitions.first, MCPDomainCanonicalToolDefinitions.definition(named: toolName), label)
+            }
+            if !expected.isEmpty {
+                try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: expected, policy: policy)
+                let admission = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(toolName: expected, policy: policy)
+                XCTAssertEqual(admission.admissionClass, .control, label)
+            }
+            if !eligible {
+                do { try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: bootstrap, policy: policy)
+                    XCTFail(label)
+                } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+                do { _ = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(toolName: bootstrap, policy: policy)
+                    XCTFail(label)
+                } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+            }
+            let disabled = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [toolName], policy: policy))
+            XCTAssertTrue(disabled.definitions.isEmpty, label)
+            let off = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: false, disabledToolNames: [], policy: policy))
+            XCTAssertTrue(off.definitions.isEmpty, label)
+        }
+        let pastedGrant = MCPDomainClientPolicySnapshot(restrictedToolNames: [], additionalToolNames: [bootstrap], role: .direct, allowsAgentExternalControlTools: true)
+        let hidden = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: pastedGrant))
+        XCTAssertFalse(hidden.definitions.contains { $0.name == bootstrap }, "External/policy grants cannot fabricate bootstrap eligibility")
+        do { try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: bootstrap, policy: pastedGrant)
+            XCTFail("policy grant cannot bootstrap")
+        } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+    }
+
     func testHostHidesTheToolWithoutAGrantAndAdvertisesItWithOne() async throws {
         let runtime = try await makeRuntime()
         _ = try await runtime.toolRegistry.register(
             registrationID: MCPDomainToolRegistrationID(),
             scope: .window(id: 1),
-            bindings: [try binding(toolName: toolName)]
+            bindings: [binding(toolName: toolName)]
         )
 
         let ungranted = MCPDomainClientPolicySnapshot(
@@ -1207,8 +1313,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             registrationID: MCPDomainToolRegistrationID(),
             scope: .window(id: 1),
             bindings: [
-                try binding(toolName: toolName),
-                try binding(toolName: MCPWindowToolName.agentExplore),
+                binding(toolName: toolName),
+                binding(toolName: MCPWindowToolName.agentExplore)
             ]
         )
 
@@ -1408,7 +1514,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         var lines = definition.description.components(separatedBy: "\n")
         let operationsLines = lines.indices.filter { lines[$0].hasPrefix(operationsLinePrefix) }
         XCTAssertEqual(operationsLines.count, 1)
-        lines[try XCTUnwrap(operationsLines.first)] += " | " + operation
+        try lines[XCTUnwrap(operationsLines.first)] += " | " + operation
         let description = lines.joined(separator: "\n")
         XCTAssertEqual(Self.occurrences(of: declarationPrefix, in: description), 1)
 

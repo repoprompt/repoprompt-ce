@@ -65,6 +65,7 @@ extension AgentModeViewModel {
     /// rejections each restore exactly once even when restoration events
     /// coalesce in the UI.
     func restoreRejectedManualSubmissionComposerState(
+        repromptedText: String? = nil,
         tabID: UUID,
         session: TabSession,
         draftText: String,
@@ -125,6 +126,12 @@ extension AgentModeViewModel {
             strategy: .replaceAlways,
             operation: operation
         )
+        if let repromptedText {
+            repromptUIStore.recoveries[tabID] = .init(
+                text: repromptedText, originalDraft: draftText, reason: message,
+                draftAtInvalidation: retrieveDraftText(for: tabID)
+            )
+        }
     }
 
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
@@ -156,6 +163,17 @@ extension AgentModeViewModel {
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
+            if repromptOperation?.sourceTabID == tabID {
+                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            } else if let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+                      !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
+            {
+                // A kept draft authorizes only its exact text; edits need a new explicit recovery choice.
+                repromptUIStore.recoveries[tabID] = .init(
+                    text: text, originalDraft: recovery.originalDraft, reason: recovery.reason,
+                    draftAtInvalidation: text, requiresDecision: true
+                )
+            }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -164,6 +182,7 @@ extension AgentModeViewModel {
                 tabDraftText[tabID] = text
             }
         }
+        invalidateRepromptIfNeeded()
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)
@@ -186,7 +205,8 @@ extension AgentModeViewModel {
         guard let tabID,
               CodexGoalSupport.isEnabled
         else { return nil }
-        let session = session(for: tabID, createIfNeeded: false)
+        // Presentation reads must not recreate a runtime while its saved carrier is retiring.
+        let session = sessions[tabID]
         let targetAgent = session?.selectedAgent ?? (tabID == currentTabID ? selectedAgent : nil)
         guard targetAgent == .codexExec else { return nil }
         let draftText = draftTextOverride ?? session?.draftText ?? tabDraftText[tabID] ?? ""
@@ -323,7 +343,11 @@ extension AgentModeViewModel {
     /// Paste and drop entry point: attaches when the guard allows it, otherwise explains why not.
     @discardableResult
     func attachImagesIfAllowed(tabID: UUID, urls: [URL]) -> Bool {
-        guard !urls.isEmpty else { return false }
+        guard !urls.isEmpty,
+              // Pane drops retain their drag-start tab even after a tab switch, but must not
+              // mutate a draft while that tab's reprompt operation owns it.
+              repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID)
+        else { return false }
         if let reason = imageAttachmentBlockReason(tabID: tabID) {
             reportImageAttachmentBlocked(reason, tabID: tabID)
             return false
@@ -519,7 +543,13 @@ extension AgentModeViewModel {
               let root = sessionAttachmentsRootURL()
         else { return }
         let attachments = session.items.filter { $0.kind == .user }.flatMap(\.attachments)
-        guard attachments.contains(where: { if case .localFile = $0.source { true } else { false } }) else { return }
+        guard attachments.contains(where: {
+            if case .localFile = $0.source {
+                true
+            } else {
+                false
+            }
+        }) else { return }
         let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
         let token = UUID()
         attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
@@ -674,10 +704,14 @@ extension AgentModeViewModel {
         case .idle:
             return
         case let .reserved(storedID, attachments):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             session.attachmentTurnState = .consumed(reservationID: storedID, attachments: attachments)
         case let .consumed(storedID, _):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             return
         }
     }
@@ -718,7 +752,9 @@ extension AgentModeViewModel {
             return
         case let .reserved(storedID, storedAttachments),
              let .consumed(storedID, storedAttachments):
-            if let reservationID, reservationID != storedID { return }
+            if let reservationID, reservationID != storedID {
+                return
+            }
             attachments = storedAttachments
         }
 

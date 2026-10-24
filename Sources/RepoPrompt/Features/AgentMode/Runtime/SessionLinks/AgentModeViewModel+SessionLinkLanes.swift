@@ -23,7 +23,8 @@ extension AgentModeViewModel {
         var records = ownerValidatedSessionIndex.values.filter { !loadedSessionIDs.contains($0.id) }.map { entry in
             AgentSessionLaneChildRetirementRecord(
                 sessionID: entry.id, parentSessionID: entry.parentSessionID,
-                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true
+                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true,
+                source: .sessionIndex
             )
         }
         for session in sessions.values {
@@ -33,7 +34,8 @@ extension AgentModeViewModel {
                 sessionID: sessionID,
                 parentSessionID: session.hasLoadedPersistedState
                     ? session.parentSessionID : session.parentSessionID ?? indexed?.parentSessionID,
-                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session)
+                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session),
+                source: session.hasLoadedPersistedState ? .hydratedSession : .unhydratedSession
             ))
         }
         return records
@@ -68,8 +70,16 @@ extension AgentModeViewModel {
         guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
               workspaceManager?.activeWorkspace?.id == expectedWorkspaceID
         else {
-            throw MCPError.invalidParams("The destination workspace is not active.")
+            throw AgentSessionLaneDestinationFailure.destinationChanged
         }
+        // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
+        let spawnAdmission: DelegationSpawnAdmission.Admission?
+        do {
+            spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneSpawnAdmissionFailure(detail: detail ?? "Scoped spawn admission was refused. Call session_admin scope_status to inspect authority and placement.")
+        }
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target: MCPSessionTarget
         do {
             target = try await mcpResolveOrCreateSessionTarget(
@@ -84,18 +94,31 @@ extension AgentModeViewModel {
             )
         } catch let published as AgentSessionLanePublishedFailure {
             return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
+        } catch let failure as AgentSessionLaneAdmissionFailure {
+            throw AgentSessionLaneDestinationFailure.admissionRejected(failure)
+        } catch let MCPError.internalError(detail) {
+            // Every internal error on this path is app-authored (binding admission, workspace or
+            // prompt-manager availability), so the reason reaches the caller instead of a type name.
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
         }
         guard let sessionID = target.sessionID ?? target.recoveryClaim?.identity.sessionID else {
             throw MCPError.internalError("The new lane has no session ID.")
         }
-        // A published lane is an ordinary session even if later configuration or persistence fails.
+        // A published lane keeps its visible identity even if configuration or persistence fails.
         // Accept the provisional admission rather than invoking MCP's discard/delete recovery path.
         mcpAcceptSessionTarget(target)
         // Acceptance settles the recovery claim. Subsequent configuration checks must use the
         // claimless exact lifecycle identity, not ask a settled claim to still be provisional.
         let settledTarget = MCPSessionTarget(
             tabID: target.tabID, sessionID: target.sessionID,
-            origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity
+            origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity,
+            creationHandle: target.creationHandle
         )
         let incomplete: MCPOversightLaneCreationOutcome = .creationIncomplete(
             sessionID: sessionID,
@@ -107,8 +130,32 @@ extension AgentModeViewModel {
               session.parentSessionID == nil,
               !session.isMCPOriginated,
               session.mcpControlContext == nil
-        else { return incomplete }
+        else {
+            failSessionCreation(target.creationHandle, message: "This lane changed before its initial configuration completed.")
+            return incomplete
+        }
 
+        do {
+            try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
+            try requireSessionConfigurationAdmission(session, creationHandle: target.creationHandle)
+        } catch {
+            failSessionCreation(target.creationHandle, message: "This lane changed before its initial configuration completed.")
+            return incomplete
+        }
+        if let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
+           AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease),
+           DelegationSpawnTargetPlacement(
+               organizationalParentID: session.organizationalParentID,
+               parentSessionID: session.parentSessionID,
+               createdByOverseerSessionID: session.createdByOverseerSessionID,
+               delegationScopeID: session.delegationScopeID
+           ).admitsStamp(by: creatorSessionID)
+        {
+            // Auto-join before the first save so the lane's placement is durable with it. Like every
+            // stamp, it never overwrites an existing placement or scope.
+            session.organizationalParentID = creatorSessionID
+            session.delegationScopeID = scopeID
+        }
         // Provenance was installed by the fresh-session seam before this first dirty marking.
         session.isDirty = true
         #if DEBUG
@@ -126,31 +173,38 @@ extension AgentModeViewModel {
                     target: settledTarget,
                     expectedWorkspaceID: expectedWorkspaceID,
                     allowMatchingControlledSession: false
-                )
+                ),
+                creationHandle: target.creationHandle
             )
             try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
             try mcpApplyModelParameterSelections(
                 tabID: target.tabID,
-                selections: selection.modelParameterSelections
+                selections: selection.modelParameterSelections,
+                creationHandle: target.creationHandle
             )
             guard mcpOversightLaneSelectionMatches(selection, session: session)
             else {
-                scheduleSave(for: session)
+                failSessionCreation(target.creationHandle, message: "This lane's initial model selection could not be configured.")
                 return incomplete
             }
+            try Task.checkCancellation()
         } catch {
-            scheduleSave(for: session)
+            failSessionCreation(target.creationHandle, message: "This lane did not finish its initial configuration. Create a new lane.")
             return incomplete
         }
 
         guard await mcpCommitOversightLaneFirstSave(
             session: session,
             sessionID: sessionID,
-            workspaceID: expectedWorkspaceID
+            workspaceID: expectedWorkspaceID,
+            creationHandle: target.creationHandle
         ) else {
-            scheduleSave(for: session)
+            // A configured write failure retains the same owner's ready-to-persist snapshot.
+            // Only a still-preparing creation can be failed here; ordinary autosave stays blocked.
+            failSessionCreation(target.creationHandle, message: "This lane did not finish its initial configuration. Create a new lane.")
             return incomplete
         }
+        guard !Task.isCancelled else { return incomplete }
         guard session.activeAgentSessionID == sessionID,
               session.createdByOverseerSessionID == creatorSessionID,
               session.parentSessionID == nil,
@@ -235,8 +289,11 @@ extension AgentModeViewModel {
             ?? AgentMonitorSessionIDFormatter.short(creatorID)
     }
 
-    /// Preflight or stash one exact inactive lane. Both removal CAS hooks repeat the check around
-    /// the required session flush; a prompt or run starting during that await keeps the tab open.
+    /// Preflight or stash one exact inactive lane. The commit:false phase runs the same required
+    /// flush, cascade, and post-preflight CAS checks as the stash, plus a non-mutating save-admission
+    /// probe — it only skips the projection mutation. The flush is deliberately effectful: real
+    /// save I/O is what freshens the stale child headers the post-preflight rescan relies on.
+    /// Commit re-runs every check with fresh claims.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
@@ -257,8 +314,7 @@ extension AgentModeViewModel {
             else { return false }
             return true
         }
-        guard canRetire(), let promptManager else { return false }
-        guard commit else { return true }
+        guard canRetire(), let promptManager, let workspaceManager else { return false }
         let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
             tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
         }).union([endpoint.tabID])
@@ -266,22 +322,53 @@ extension AgentModeViewModel {
             withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
             postPreflightValidation: canRetire,
-            expandCascade: true
+            expandCascade: true,
+            validateOnly: !commit
         )
-        guard report.rejections.isEmpty,
-              report.removedComposeTabIDs.contains(endpoint.tabID),
-              workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
+        guard report.rejections.isEmpty else { return false }
+        guard commit else {
+            return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+        }
+        guard report.removedComposeTabIDs.contains(endpoint.tabID),
+              workspaceManager.activeWorkspace?.stashedTabs.contains(where: {
                   $0.tab.id == endpoint.tabID
-              }) == true,
-              let workspaceManager
+              }) == true
         else { return false }
         didStash(report.removedComposeTabIDs)
-        // The retirement activation claim stays held by the bridge until this canonical save
-        // settles, so another window cannot reload the pre-stash binding in the meantime.
-        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+        // The stash has committed in memory, so the lane is retired even when this canonical save
+        // is not admitted: the normal save cadence persists it later, and the accepted worst case
+        // is the tab returning unlinked after a crash. The save still runs — the retirement
+        // activation claim stays held by the bridge until it settles, so another window cannot
+        // reload the pre-stash binding in the meantime — but its admission no longer gates the
+        // outcome; only an uncommitted stash may report `unlinked_not_stashed`.
+        _ = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
             workspaceID: endpoint.workspaceID,
             source: WorkspaceSaveSource("oversightLaneRetirement")
         )
-        return persistence.acceptedForLifecycleAdmission
+        return true
+    }
+
+    /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and the save-admission probe.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = session(for: endpoint.tabID, createIfNeeded: false),
+              session.activeAgentSessionID == endpoint.sessionID,
+              agentSessionLinkLaneSessionIsQuiescent(session),
+              !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+                  of: endpoint.sessionID, in: agentSessionLinkChildRetirementRecords()
+              ),
+              let workspaceManager
+        else { return false }
+        return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+    }
+}
+
+extension AgentSessionLinkRuntimeBridge {
+    /// Agent-facing detail for an unclassified lane host error, or nil when the text is internal.
+    static func laneHostAgentFacingDetail(_ error: any Error) -> String? {
+        guard case let MCPError.invalidParams(detail)? = error as? MCPError,
+              let detail, !detail.isEmpty else { return nil }
+        return String(detail.prefix(400))
     }
 }

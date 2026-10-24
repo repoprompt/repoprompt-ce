@@ -948,6 +948,8 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "session_admin":
+            return SessionAdminToolOutputFormatter.format(args: args, value: result)
         case "history":
             return formatHistory(args: args, value: result)
         default:
@@ -973,8 +975,9 @@ extension ToolOutputFormatter {
         }
 
         let op = args["op"]?.stringValue ?? "history"
-        let status = object["scan_truncated"]?.boolValue == true ? "⚠️" : statusIcon(success: true)
-        let lowerBoundSuffix = object["totals_are_lower_bounds"]?.boolValue == true ? " (lower bound)" : ""
+        let incomplete = isHistoryScanIncomplete(object)
+        let status = incomplete ? "⚠️" : statusIcon(success: true)
+        let lowerBoundSuffix = incomplete ? " (lower bound)" : ""
         var lines: [String] = []
         switch op {
         case "list_sessions":
@@ -982,7 +985,7 @@ extension ToolOutputFormatter {
             let sessions = object["sessions"]?.arrayValue ?? []
             lines.append("## History Sessions \(status)")
             lines.append("- **Total sessions**: \(total)\(lowerBoundSuffix) • **Returned**: \(sessions.count)")
-            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
                 lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
@@ -1009,7 +1012,7 @@ extension ToolOutputFormatter {
             let results = object["results"]?.arrayValue ?? []
             lines.append("## History Search \(status)")
             lines.append("- **Total matches**: \(total)\(lowerBoundSuffix) • **Returned**: \(results.count)")
-            if total == 0 { lines.append("- **Status**: No matching turns found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching turns found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results {
@@ -1033,7 +1036,7 @@ extension ToolOutputFormatter {
             let groups = object["groups"]?.arrayValue ?? []
             lines.append("## History Time \(status)")
             lines.append("- **Total sessions**: \(totalSessions)\(lowerBoundSuffix) • **Active duration**: \(totalDuration)s\(lowerBoundSuffix) • **Groups**: \(groups.count)")
-            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
+            if totalSessions == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups {
@@ -1163,7 +1166,17 @@ extension ToolOutputFormatter {
         return max(1, min(value, 20000))
     }
 
+    private static func isHistoryScanIncomplete(_ object: [String: Value]) -> Bool {
+        object["scan_complete"]?.boolValue == false
+            || object["scan_truncated"]?.boolValue == true
+            || object["totals_are_lower_bounds"]?.boolValue == true
+            || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+    }
+
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if isHistoryScanIncomplete(object) {
+            lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
+        }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
             guard let diagnostic = value.objectValue,
@@ -4570,6 +4583,19 @@ extension ToolOutputFormatter {
                 errorMessage: lane.error?.message
             )
         })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
+            lines.append("")
+            lines.append(preamble)
+        }
         let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
         if !laneMarkdown.isEmpty {
             lines.append("")
@@ -4581,7 +4607,13 @@ extension ToolOutputFormatter {
                 lines.append("Warning [\(warning.code)]: \(warning.message)")
             }
         }
-        return lines.joined(separator: "\n")
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
+        }
+        // MCP clients may concatenate adjacent text blocks with no separator;
+        // end with a line break so the end marker stays on its own line.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
@@ -4685,6 +4717,13 @@ extension ToolOutputFormatter {
             }
         default:
             break
+        }
+        if let pending = dto.pendingApplication {
+            out.append("")
+            out.append("### Pending Switch")
+            out.append("- **State**: \(pending.state) (applies after: \(pending.appliesAfter); continuation: \(pending.continuation))")
+            out.append("- **Relocation ID**: `\(pending.relocationID)`")
+            out.append("- \(pending.detail)")
         }
 
         if let graph = dto.graph {
@@ -6421,7 +6460,23 @@ extension ToolOutputFormatter {
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
-            lines.append("- Sessions: **\(sessions.count)**")
+            if let scope = object["scope"]?.stringValue {
+                lines.append("- Scope: `\(scope)` (not a workspace inventory)")
+            }
+            if let note = object["note"]?.stringValue {
+                lines.append("- Note: \(note)")
+            }
+            if object["scope"]?.stringValue == "spawned_by_caller" {
+                let matching = object["matching_child_count"]?.intValue ?? sessions.count
+                lines.append("- Matching child sessions: **\(matching)** · returned **\(sessions.count)**; workspace inventory not requested")
+                if let workspaceID = object["workspace_id"]?.stringValue {
+                    lines.append("- Current workspace: `\(workspaceID)`")
+                }
+            } else if object["scope"]?.stringValue == "unresolved_caller" {
+                lines.append("- Session discovery unavailable; no workspace count was determined")
+            } else {
+                lines.append("- Sessions: **\(sessions.count)**")
+            }
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }
                 let name = session["name"]?.stringValue ?? "Unnamed"
@@ -6463,6 +6518,22 @@ extension ToolOutputFormatter {
             lines.append("- Deleted: **\(deletedCount)** sessions")
             if skippedCount > 0 {
                 lines.append("- Skipped: **\(skippedCount)** sessions")
+            }
+            if let result = object["result"]?.stringValue { lines.append("- Result: `\(result)`") }
+            // Every item is listed, so a caller can see what was deleted, not only what failed.
+            for (key, label) in [("deleted_sessions", "deleted"), ("skipped_sessions", "skipped"), ("unprocessed_sessions", "unprocessed")] {
+                for entry in object[key]?.arrayValue ?? [] {
+                    guard let item = entry.objectValue else { continue }
+                    let id = item["session_id"]?.stringValue ?? "unknown"
+                    let name = item["name"]?.stringValue.map { " (\($0))" } ?? ""
+                    guard let code = item["code"]?.stringValue ?? item["reason"]?.stringValue else {
+                        lines.append("  - `\(id)`\(name) — \(label)")
+                        continue
+                    }
+                    let detail = item["detail"]?.stringValue ?? item["message"]?.stringValue ?? ""
+                    let next = item["next_step"]?.stringValue ?? "Inspect the session in the app."
+                    lines.append("  - `\(id)`\(name) — \(label) `\(code)`: \(detail) Next: \(next)")
+                }
             }
         }
         if let returned = object["returned_turn_count"]?.intValue,

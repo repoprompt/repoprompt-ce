@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptShared
 
@@ -135,6 +136,14 @@ import RepoPromptShared
                                 "cleanup_grace_seconds": override.cleanupGraceSeconds,
                                 "cleanup_disposition": override.cleanupDisposition.rawValue
                             ]
+                        }
+                    }
+                    if entry.toolName == MCPWindowToolName.sessionAdmin {
+                        payload["conditional_execution_overrides"] = MCPDomainSessionAdminToolDefinition.operations.compactMap { operation -> [String: Any]? in
+                            guard let selected = MCPToolExecutionContractCatalog.contract(
+                                for: entry.toolName, arguments: ["op": .string(operation)]
+                            ), selected.kind != entry.contractKind else { return nil }
+                            return ["op": operation, "execution_contract": selected.kind.rawValue]
                         }
                     }
                     return payload

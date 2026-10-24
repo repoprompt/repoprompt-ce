@@ -104,7 +104,8 @@ extension AgentModeRunService {
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentTabSession?
+            _ session: AgentTabSession?,
+            _ skipsSlashExpansion: Bool
         ) async -> String
         /// Stages a transcript handoff for fresh-session resume recovery.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
@@ -141,6 +142,14 @@ extension AgentModeRunService {
         /// Acknowledges whichever opaque membership/passive components the provider accepted; their
         /// respective owners settle them behind this one runner-neutral call.
         let acceptAgentSessionLinkPrompt: (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
+
+        var proveAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof = { _, claim in
+            await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+        }
+
+        var handoffAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim?, AgentSessionLinkProviderInputRelease.Proof) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext = { _, _, claim, proof in
+            AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed }, isPending: { _ in false }, consume: { _ in false })
+        }
 
         /// Attaches the cross-window oversight supplement to an already-built provider message.
         ///

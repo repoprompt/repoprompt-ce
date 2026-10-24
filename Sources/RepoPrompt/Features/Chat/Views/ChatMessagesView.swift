@@ -228,17 +228,19 @@ struct ChatMessagesView: View {
         // Read the rendered messages and latest id once so both stay coherent.
         let messages = renderedMessages
         let latestMessageID = messages.last?.id
-        return LazyVStack(alignment: .leading, spacing: 20) {
-            topSentinel
-            ForEach(messages) { message in
-                MessageBubble(
-                    message: message,
-                    viewModel: viewModel,
-                    isLatestMessage: message.id == latestMessageID,
-                    actionPolicy: actionPolicy
-                )
-                .id(message.id)
-                .animation(.default, value: message.revisionCount)
+        return VStack(alignment: .leading, spacing: 20) {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                topSentinel
+                ForEach(messages) { message in
+                    MessageBubble(
+                        message: message,
+                        viewModel: viewModel,
+                        isLatestMessage: message.id == latestMessageID,
+                        actionPolicy: actionPolicy
+                    )
+                    .id(message.id)
+                    .animation(.default, value: message.revisionCount)
+                }
             }
             bottomTarget
             versionedBottomSentinel

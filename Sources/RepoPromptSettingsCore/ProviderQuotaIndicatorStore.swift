@@ -23,9 +23,15 @@ package struct ProviderQuotaIndicatorState: Equatable {
         case unavailable
     }
 
+    /// The account-wide (longest declared) window. This is the pill's printed figure.
     package let usedPercent: Int?
     package let isReached: Bool
     package let resetAt: Date?
+    /// A shorter rolling window (e.g. Claude's 5-hour limit) shown as a secondary marker.
+    /// Nil when the provider declares only one window.
+    package let shortWindowPercent: Int?
+    package let shortWindowIsReached: Bool
+    package let shortWindowResetAt: Date?
     /// Newest contributing observation, rounded down to the minute.
     package let observedAt: Date?
     package let freshness: Freshness
@@ -38,6 +44,9 @@ package struct ProviderQuotaIndicatorState: Equatable {
         usedPercent: Int?,
         isReached: Bool,
         resetAt: Date?,
+        shortWindowPercent: Int? = nil,
+        shortWindowIsReached: Bool = false,
+        shortWindowResetAt: Date? = nil,
         observedAt: Date? = nil,
         freshness: Freshness = .fresh,
         isUpdating: Bool = false,
@@ -46,6 +55,9 @@ package struct ProviderQuotaIndicatorState: Equatable {
         self.usedPercent = usedPercent
         self.isReached = isReached
         self.resetAt = resetAt
+        self.shortWindowPercent = shortWindowPercent
+        self.shortWindowIsReached = shortWindowIsReached
+        self.shortWindowResetAt = shortWindowResetAt
         self.observedAt = observedAt
         self.freshness = freshness
         self.isUpdating = isUpdating
@@ -63,14 +75,33 @@ package struct ProviderQuotaIndicatorState: Equatable {
         let fresh = valued.filter(\.availability.isFresh)
         let signals = fresh.isEmpty ? valued : fresh
         let reached = signals.first { $0.headroom == .reached }
-        let numeric = signals.compactMap { signal -> (Double, Date?)? in
-            guard case let .remainingPercent(remaining) = signal.headroom else { return nil }
-            let used = 100 - remaining
-            guard used.isFinite, used > Double(Int.min), used < Double(Int.max) else { return nil }
-            return (used, signal.resetsAt)
-        }.max { $0.0 < $1.0 }
+        let readings = signals.compactMap { signal -> WindowReading? in
+            switch signal.headroom {
+            case .reached:
+                return WindowReading(used: nil, reached: true, reset: signal.resetsAt, duration: signal.windowDuration)
+            case let .remainingPercent(remaining):
+                let used = 100 - remaining
+                guard used.isFinite, used > Double(Int.min), used < Double(Int.max) else { return nil }
+                return WindowReading(used: used, reached: false, reset: signal.resetsAt, duration: signal.windowDuration)
+            case .unknown:
+                return nil
+            }
+        }
+        // Primary = the longest declared window (account-wide budget). Without durations we
+        // cannot tell windows apart, so fall back to the most-used one.
+        let withDuration = readings.filter { $0.duration != nil }
+        let primaryDuration = withDuration.compactMap(\.duration).max()
+        let primaryPool = primaryDuration.map { d in readings.filter { $0.duration == d } } ?? readings
+        let numeric = primaryPool.filter { $0.used != nil }.max { ($0.used ?? 0) < ($1.used ?? 0) }
+            ?? readings.filter { $0.used != nil }.max { ($0.used ?? 0) < ($1.used ?? 0) }
+        let short: WindowReading? = primaryDuration.flatMap { primary in
+            let shorter = withDuration.filter { ($0.duration ?? primary) < primary }
+            guard let shortest = shorter.compactMap(\.duration).min() else { return nil }
+            let pool = shorter.filter { $0.duration == shortest }
+            return pool.first(where: \.reached) ?? pool.max { ($0.used ?? 0) < ($1.used ?? 0) }
+        }
         guard reached != nil || numeric != nil else { return nil }
-        let reset = reached?.resetsAt ?? numeric?.1
+        let reset = reached?.resetsAt ?? numeric?.reset
         let freshness: Freshness = if !fresh.isEmpty {
             .fresh
         } else if signals.contains(where: { if case .stale(_, .resetElapsed) = $0.availability { true } else { false } }) {
@@ -79,12 +110,22 @@ package struct ProviderQuotaIndicatorState: Equatable {
             .stale
         }
         return Self(
-            usedPercent: numeric.map { Int($0.0.rounded()) },
+            usedPercent: numeric?.used.map { Int($0.rounded()) },
             isReached: reached != nil,
             resetAt: reset.map(minute),
+            shortWindowPercent: short?.used.map { Int($0.rounded()) },
+            shortWindowIsReached: short?.reached ?? false,
+            shortWindowResetAt: short?.reset.map(minute),
             observedAt: signals.compactMap(\.availability.observedAt).max().map(minute),
             freshness: freshness
         )
+    }
+
+    private struct WindowReading {
+        let used: Double?
+        let reached: Bool
+        let reset: Date?
+        let duration: TimeInterval?
     }
 
     private static func minute(_ date: Date) -> Date {

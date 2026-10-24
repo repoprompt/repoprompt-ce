@@ -19,6 +19,17 @@ struct AgentStatusPillsRow: View {
         statusPillsUI.snapshot
     }
 
+    private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
+        NotificationCenter.default.post(
+            name: .showModelRouterSettingsTab,
+            object: nil,
+            userInfo: [
+                "windowID": windowID,
+                "agentDecisionsSection": section
+            ]
+        )
+    }
+
     var body: some View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.statusPillsRow")
@@ -52,21 +63,33 @@ struct AgentStatusPillsRow: View {
                     onToggle: { agentModeVM.toggleInterviewFirst() }
                 )
 
+                AgentRepromptPill(
+                    props: snapshot.reprompt,
+                    store: agentModeVM.repromptUIStore,
+                    viewModel: agentModeVM,
+                    setEnabled: { agentModeVM.setRepromptEnabled($0, acknowledgingProviderID: $1) },
+                    openSettings: {
+                        NotificationCenter.default.post(name: .showAgentModelsSettingsTab, object: nil, userInfo: ["windowID": windowID])
+                    }
+                )
+
                 AgentModelRouterPill(
                     props: snapshot.modelRouter,
-                    onToggle: { agentModeVM.toggleGlobalModelRouter() }
+                    onToggle: { agentModeVM.toggleGlobalModelRouter() },
+                    onOpenSettings: { openAgentDecisionsSettings(section: .modelRouter) }
                 )
 
                 AgentAutoEffortPill(
                     props: snapshot.autoEffort,
-                    onToggle: { agentModeVM.toggleAutoEffort() }
+                    onToggle: { agentModeVM.toggleAutoEffort() },
+                    onOpenSettings: { openAgentDecisionsSettings(section: .autoEffort) }
                 )
 
                 if computerUse.isVisible, let target = computerUseTarget,
                    target.route == .existingAgentSession
                 {
                     AgentIconTogglePill(
-                        systemImage: "cursorarrow",
+                        systemImage: "desktopcomputer",
                         isOn: computerUse.isOn,
                         isBusy: computerUse.isBusy,
                         onToggle: {

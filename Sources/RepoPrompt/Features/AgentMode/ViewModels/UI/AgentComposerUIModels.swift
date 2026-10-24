@@ -322,6 +322,19 @@ struct AgentImageAttachmentNoticeProps: Equatable {
 }
 
 struct AgentComposerProps: Equatable {
+    enum ManualEffortControl: Equatable {
+        case codex
+        case claude
+    }
+
+    /// Auto Effort status is informational; users can still choose the fallback effort.
+    var manualEffortControl: ManualEffortControl? {
+        guard hasAvailableAgentProviders, !isGlobalModelRouterControllingFreshTask else { return nil }
+        if selectedAgent == .codexExec { return .codex }
+        if selectedAgent.usesClaudeTooling, providerControls?.claudeTools != nil { return .claude }
+        return nil
+    }
+
     var computerUse: AgentComputerUseComposerProps = .hidden
     var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
     let currentTabID: UUID?
@@ -340,6 +353,8 @@ struct AgentComposerProps: Equatable {
     let canSendWithCurrentProvider: Bool
     let isRoutingFreshTask: Bool
     let isGlobalModelRouterControllingFreshTask: Bool
+    let automaticRouterServiceName: String?
+    let autoEffortServiceName: String?
     let unavailableSelectedAgentMessage: String?
     let selectedAgent: AgentProviderKind
     var selectedModelRaw: String
@@ -375,6 +390,8 @@ struct AgentComposerProps: Equatable {
         canSendWithCurrentProvider: false,
         isRoutingFreshTask: false,
         isGlobalModelRouterControllingFreshTask: false,
+        automaticRouterServiceName: nil,
+        autoEffortServiceName: nil,
         unavailableSelectedAgentMessage: nil,
         selectedAgent: .claudeCode,
         selectedModelRaw: AgentModel.defaultModel.rawValue,

@@ -82,11 +82,14 @@ package enum AgentOversightUICopy {
     package static let sessionIDMenuItem = "Session ID…"
     package static let noEligibleOverseers = "No eligible overseers"
     package static let noSessionsToOversee = "No sessions to oversee"
-    /// Disabled labels over the linked-jump lists at the top of the menu — and for the
-    /// matching groups inside Unlink ▸, which reuse these same constants. Colon-less per
-    /// Cristian 2026-10-01.
+    /// Disabled labels over the linked-jump lists at the top of the menu. Colon-less per
+    /// Cristian 2026-10-01. The Unlink ▸ groups use their own action-named headings below.
     package static let overseeingSectionLabel = "Overseeing"
     package static let overseenBySectionLabel = "Overseen by"
+    /// Group headings inside Unlink ▸ name the action instead of the relationship: the row's
+    /// overseers sit under "Unlink overseer", the sessions it oversees under "Unlink overseen".
+    package static let unlinkOverseerSectionLabel = "Unlink overseer"
+    package static let unlinkOverseenSectionLabel = "Unlink overseen"
     /// Creator-collapse variants of the section labels: the combined label when the creator is
     /// the row's only overseer, and the standalone label when the creator is not linked.
     /// Approved by Cristian 2026-10-01.
@@ -101,6 +104,9 @@ package enum AgentOversightUICopy {
     /// Disabled reason shown in the Link-overseer / Oversee context submenus on a row whose chat
     /// has no session ID yet (fresh chat before the first send). Approved by Cristian 2026-10-01.
     package static let oversightAvailableAfterFirstMessage = "Available after the first message"
+    /// A session-ID row confirmed unopened in this window has no live bound endpoint, so
+    /// reopening the menu cannot help — only opening the chat installs the binding.
+    package static let oversightMenuOpenChatMessage = "Open the chat to enable linking"
     /// A frozen submenu cannot promise that waiting will make its choices appear.
     package static let oversightMenuUnavailableMessage = "Not available yet — reopen this menu"
 
