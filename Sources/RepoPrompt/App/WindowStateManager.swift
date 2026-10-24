@@ -1,4 +1,5 @@
 import RepoPromptSettingsCore
+import RepoPromptShared
 
 //
 //  WindowStateManager.swift
@@ -129,8 +130,7 @@ enum WindowSessionStore {
     static func sessionFileURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
         return base.appendingPathComponent("windowSessions.json")
     }
 }
@@ -177,6 +177,8 @@ actor WindowSessionDiskWriter {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         do {
+            try AppProfileLocations.current.validateMetadataFile(fileURL)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try encoder.encode(snapshot)
             try data.write(to: fileURL, options: .atomic)
         } catch {
@@ -575,11 +577,46 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
+    // Nonvisual exact-session owners are not windows: never persist them in window restore state,
+    // present them, or include them in workspace-selection UI.
+    var preparedOversightLocations: [UUID: SavedOversightSessionLocation] = [:]
+    var preparedOversightWindows: [UUID: WindowState] = [:]
+    var preparedOversightOwnerLocations: [UUID: SavedOversightSessionLocation] = [:]
+    var preparedOversightPreparationInFlight: [UUID: Int] = [:]
+    var preparedOversightHandoffs: Set<UUID> = []
+    var preparedOversightUIVisits: Set<UUID> = []
+    var preparedOversightCleanupTask: Task<Void, Never>?
+    var preparedOversightCleanupDirty = false
+    var preparedOversightCarrierSubscriptions: [UUID: AnyCancellable] = [:]
+    var retiringPreparedOversightWindows: [UUID: WindowState] = [:]
+    var preparedOversightConsentPairs: [UUID: Set<AgentSessionOversightIntent>] = [:]
+    var preparedOversightRunObservations: [UUID: AgentSessionLinkObservationToken] = [:]
+    var preparedOversightPendingVisits: [UUID: @MainActor () async -> Void] = [:]
+    var sessionRuntimeWindows: [WindowState] {
+        guard !preparedOversightWindows.isEmpty else { return allWindows }
+        return allWindows + preparedOversightWindows.compactMap { id, owner in
+            guard let witness = preparedOversightOwnerLocations[id], witness.isCurrent,
+                  let current = preparedOversightLocations[id], witness.agreesOnCarrierAndProvenance(with: current),
+                  !preparedOversightHandoffs.contains(id) else { return nil }
+            return owner
+        }
+    }
+
+    #if DEBUG
+        var test_preparedOversightOwnerFactory: ((WorkspaceModel, WindowState) -> WindowState)?
+    #endif
+
     private var modelRoutingWindowIndexes: [Int: Int] = [:]
 
     /// Read-only exact lookup for configuration-only routing. Never falls back to discovery.
     func modelRoutingWindow(withID id: Int) -> WindowState? {
-        guard !isTerminating, let index = modelRoutingWindowIndexes[id],
+        guard !isTerminating else { return nil }
+        if !preparedOversightWindows.isEmpty,
+           let prepared = sessionRuntimeWindows.first(where: { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing })
+        {
+            return prepared
+        }
+        guard let index = modelRoutingWindowIndexes[id],
               allWindows.indices.contains(index), allWindows[index].windowID == id,
               !allWindows[index].isClosing else { return nil }
         return allWindows[index]
@@ -678,8 +715,11 @@ class WindowStatesManager: ObservableObject {
             autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
         )
         let store = AgentSessionOversightIntentStore.production(mode: mode, restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
+        // Delegation scopes share the oversight persistence mode: suppressed launches touch no file.
+        let scopeStore = DelegationScopeStore.production(mode: mode)
         Task { @MainActor in
-            await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
+            await AgentSessionLinkRuntimeBridge.shared.bootstrapContinuity(scopeStore: scopeStore, intentStore: store)
+            await AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.bootstrapProduction(mode: mode)
         }
     }
 
@@ -816,10 +856,11 @@ class WindowStatesManager: ObservableObject {
             maxByWorkspace[workspaceID] = max(maxByWorkspace[workspaceID] ?? number, number)
         }
 
-        // Normalize lists (unique, sorted) for deterministic consumption order
+        // Restore consumes entries in saved window order. Sorting numbers would transfer a
+        // later window's persisted MCP identity to an earlier window on the same workspace.
         for (wsID, numbers) in restoredInstanceNumbersByWorkspace {
-            let uniqueSorted = Array(Set(numbers)).sorted()
-            restoredInstanceNumbersByWorkspace[wsID] = uniqueSorted
+            var seen: Set<Int> = []
+            restoredInstanceNumbersByWorkspace[wsID] = numbers.filter { seen.insert($0).inserted }
         }
 
         // Set "next" counters just past the highest restored instance
@@ -1052,10 +1093,35 @@ class WindowStatesManager: ObservableObject {
         state.workspaceManager.addWorkspaceDidSwitchListener(label: "windowStateManager") { [weak self, weak state] newWorkspace in
             guard let self, let state else { return }
             let number = recordWorkspaceSwitch(forWindowID: state.windowID, to: newWorkspace)
-            // Publish to the window so UI can react (e.g., in the title)
-            state.workspaceInstanceNumber = number
-            state.requestWindowTitleUpdate(reason: .workspaceChanged)
+            // Publish the workspace-qualified pair; the window refreshes its coherent title.
+            state.setWorkspaceInstanceAssignment(newWorkspace.flatMap { workspace in
+                number.map { WorkspaceInstanceAssignment(workspaceID: workspace.id, number: $0) }
+            })
             persistWindowSession(reason: "workspaceSwitch")
+        }
+
+        state.workspaceManager.onSettledProjectedWorkspaceSelection = { [weak self, weak state] workspace in
+            guard let self, let state else { return }
+            @MainActor func canInstall() -> Bool {
+                !isTerminating && !state.isClosing
+                    && allWindows.contains(where: { $0 === state })
+                    && !state.workspaceManager.isSwitchingWorkspace
+                    && state.workspaceManager.activeWorkspaceSwitch == nil
+                    && state.workspaceManager.activeWorkspaceID == workspace?.id
+            }
+            guard canInstall() else { return }
+            let number = recordWorkspaceSwitch(
+                forWindowID: state.windowID, to: workspace, consumeRestoredNumbers: false
+            )
+            // Allocation posts synchronously: a notification may close or change this window.
+            guard canInstall(),
+                  assignedInstanceByWindowID[state.windowID]?.workspaceID == workspace?.id,
+                  assignedInstanceByWindowID[state.windowID]?.number == number
+            else { return }
+            state.setWorkspaceInstanceAssignment(workspace.flatMap { workspace in
+                number.map { WorkspaceInstanceAssignment(workspaceID: workspace.id, number: $0) }
+            })
+            persistWindowSession(reason: "settledProjectedWorkspaceSelection")
         }
 
         applyNextRestoreEntryIfAvailable(to: state)
@@ -1063,8 +1129,7 @@ class WindowStatesManager: ObservableObject {
         // Assign an initial instance number if the workspace is already set
         if let ws = state.workspaceManager.activeWorkspace {
             let n = recordWorkspaceSwitch(forWindowID: state.windowID, to: ws)
-            state.workspaceInstanceNumber = n
-            state.requestWindowTitleUpdate(reason: .workspaceChanged)
+            state.setWorkspaceInstanceAssignment(n.map { WorkspaceInstanceAssignment(workspaceID: ws.id, number: $0) })
         }
 
         // If we have pending URLs that arrived *before* any windows,
@@ -1100,6 +1165,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func unregisterWindowState(_ state: WindowState) {
+        state.workspaceManager.onSettledProjectedWorkspaceSelection = nil
         state.beginClose()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
@@ -1248,6 +1314,7 @@ class WindowStatesManager: ObservableObject {
     /// Lookup a window by its ID.
     func window(withID id: Int) -> WindowState? {
         allWindows.first { $0.windowID == id }
+            ?? sessionRuntimeWindows.first { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing }
     }
 
     /// Check if a window with the given ID exists.
@@ -1291,10 +1358,11 @@ class WindowStatesManager: ObservableObject {
             self.closingWindowReferences.removeAll { $0.value == nil }
             self.terminationWindowSnapshot = self.deduplicatedWindows(
                 self.terminationWindowSnapshot +
-                    self.allWindows +
+                    self.allWindows + Array(self.preparedOversightWindows.values) + Array(self.retiringPreparedOversightWindows.values) +
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
@@ -1307,6 +1375,39 @@ class WindowStatesManager: ObservableObject {
             if !isTerminating {
                 terminationWindowSnapshot.removeAll()
             }
+        }
+
+        /// Opaque instance-allocator state, so a test can seed exact numbering from an empty
+        /// allocator and then restore the process-wide history. Allocation policy is unchanged.
+        struct InstanceAllocatorStateForTesting {
+            fileprivate var next: [UUID: Int] = [:]
+            fileprivate var assigned: [Int: (workspaceID: UUID, number: Int)] = [:]
+            fileprivate var history: [Int: [UUID: Int]] = [:]
+            fileprivate var restored: [UUID: [Int]] = [:]
+
+            init() {}
+        }
+
+        /// Seeds instance numbers from `snapshot` exactly as session restore does.
+        func preseedInstanceNumberStateForTesting(from snapshot: WindowSessionSnapshot?) {
+            preseedInstanceNumberState(from: snapshot)
+        }
+
+        /// Installs `state` (empty by default) and returns the state it replaced.
+        @discardableResult
+        func replaceInstanceAllocatorStateForTesting(
+            _ state: InstanceAllocatorStateForTesting = InstanceAllocatorStateForTesting()
+        ) -> InstanceAllocatorStateForTesting {
+            var previous = InstanceAllocatorStateForTesting()
+            previous.next = nextInstanceNumberByWorkspace
+            previous.assigned = assignedInstanceByWindowID
+            previous.history = windowWorkspaceNumberHistory
+            previous.restored = restoredInstanceNumbersByWorkspace
+            nextInstanceNumberByWorkspace = state.next
+            assignedInstanceByWindowID = state.assigned
+            windowWorkspaceNumberHistory = state.history
+            restoredInstanceNumbersByWorkspace = state.restored
+            return previous
         }
     #endif
 
@@ -1324,7 +1425,7 @@ class WindowStatesManager: ObservableObject {
     /// Stops MCP servers in **all** windows (unconditionally).
     /// During teardown, "running" state can be stale; we just want tools off.
     func stopAllServers() async {
-        let windowIDs = allWindows.map(\.windowID)
+        let windowIDs = (allWindows + Array(preparedOversightWindows.values)).map(\.windowID)
         await withTaskGroup(of: Void.self) { group in
             for windowID in windowIDs {
                 group.addTask { @MainActor [weak self] in
@@ -1336,7 +1437,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func stopCodexSessionsAndSignOut() async -> CodexManagedAuthLogoutResult {
-        let participants: [any CodexManagedSessionShutdownParticipant] = allWindows.map(\.agentModeViewModel)
+        let participants: [any CodexManagedSessionShutdownParticipant] = (allWindows + Array(preparedOversightWindows.values)).map(\.agentModeViewModel)
         return await CodexManagedLogoutCoordinator.shared.stopSessionsAndSignOut(
             participants: participants,
             additionalTeardown: {
@@ -1357,20 +1458,36 @@ class WindowStatesManager: ObservableObject {
     func shutdownAllAgentSessions() async {
         closingWindowReferences.removeAll { $0.value == nil }
         let windows = deduplicatedWindows(
-            terminationWindowSnapshot + allWindows + closingWindowReferences.compactMap(\.value)
+            terminationWindowSnapshot + allWindows + Array(preparedOversightWindows.values) + Array(retiringPreparedOversightWindows.values) + closingWindowReferences.compactMap(\.value)
         )
-        defer { terminationWindowSnapshot.removeAll() }
+        defer {
+            terminationWindowSnapshot.removeAll()
+            preparedOversightWindows.removeAll()
+            retiringPreparedOversightWindows.removeAll()
+            preparedOversightOwnerLocations.removeAll()
+            preparedOversightLocations.removeAll()
+            preparedOversightCarrierSubscriptions.removeAll()
+            preparedOversightConsentPairs.removeAll()
+            preparedOversightRunObservations.values.forEach { $0.invalidate() }
+            preparedOversightRunObservations.removeAll()
+            preparedOversightPendingVisits.removeAll()
+            preparedOversightPreparationInFlight.removeAll()
+            preparedOversightHandoffs.removeAll()
+            preparedOversightCleanupTask?.cancel()
+            preparedOversightCleanupTask = nil
+        }
         let participatingWindowIdentities = Set(windows.map(ObjectIdentifier.init))
 
         // The strong snapshot owns every participant until both shutdown paths have joined.
         await withTaskGroup(of: Void.self) { group in
-            for window in windows {
+            for window in windows where !window.isPreparedSessionOwner {
                 group.addTask { @MainActor [window] in
                     await window.contextBuilderAgentViewModel.shutdownForAppTermination()
                     await window.agentModeViewModel.prepareForWindowClose()
                 }
             }
         }
+        _ = await shutdownPreparedOversightOwners(timeout: 2)
         closingWindowReferences.removeAll { reference in
             guard let window = reference.value else { return true }
             return participatingWindowIdentities.contains(ObjectIdentifier(window))
@@ -1397,7 +1514,11 @@ class WindowStatesManager: ObservableObject {
     /// Records that a window switched to a given workspace and assigns a new sticky instance number.
     /// Returns the assigned number, or nil if workspace is nil.
     @discardableResult
-    func recordWorkspaceSwitch(forWindowID windowID: Int, to workspace: WorkspaceModel?) -> Int? {
+    func recordWorkspaceSwitch(
+        forWindowID windowID: Int,
+        to workspace: WorkspaceModel?,
+        consumeRestoredNumbers: Bool = true
+    ) -> Int? {
         // Skip during termination to prevent observation crashes
         guard !isTerminating else { return nil }
 
@@ -1430,7 +1551,10 @@ class WindowStatesManager: ObservableObject {
             let isOccupied = assignedInstanceByWindowID.contains { otherWindowID, current in
                 otherWindowID != windowID && current.workspaceID == wsID && current.number == remembered
             }
-            if !isOccupied {
+            // Settled adoption must not claim a pending saved window's routing identity.
+            let isReserved = !consumeRestoredNumbers
+                && (restoredInstanceNumbersByWorkspace[wsID]?.contains(remembered) ?? false)
+            if !isOccupied, !isReserved {
                 let assignedNumber = remembered
                 assignedInstanceByWindowID[windowID] = (workspaceID: wsID, number: assignedNumber)
                 // Ensure 'next' is beyond assigned
@@ -1449,7 +1573,9 @@ class WindowStatesManager: ObservableObject {
 
         // 2) Try to consume a restored instance number for this workspace
         var assignedNumber: Int
-        if var restored = restoredInstanceNumbersByWorkspace[wsID], !restored.isEmpty {
+        if consumeRestoredNumbers,
+           var restored = restoredInstanceNumbersByWorkspace[wsID], !restored.isEmpty
+        {
             assignedNumber = restored.removeFirst()
             restoredInstanceNumbersByWorkspace[wsID] = restored
         } else if let next = nextInstanceNumberByWorkspace[wsID] {

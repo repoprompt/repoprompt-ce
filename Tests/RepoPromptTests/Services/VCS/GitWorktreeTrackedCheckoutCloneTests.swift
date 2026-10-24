@@ -745,3 +745,152 @@ final class GitWorktreeTrackedCheckoutCloneTests: XCTestCase {
         try fixture.runGit(arguments, at: root).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+/// `git worktree add` refusals that are knowable before creation must fail before the caller's
+/// commit fence, so a protected caller settles them as not-applied instead of indeterminate.
+final class GitWorktreeCreatePreconditionTests: XCTestCase {
+    private actor CommitFence {
+        private(set) var calls = 0
+        private(set) var destinationWasRegisteredAtFence: Bool?
+
+        func record(destination: URL) {
+            calls += 1
+            destinationWasRegisteredAtFence = FileManager.default.fileExists(
+                atPath: destination.appendingPathComponent(".git").path
+            )
+        }
+    }
+
+    func testDeterministicGitRefusalsFailBeforeCommitFenceWithoutSideEffects() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: "GitWorktreeCreatePreconditions")
+        defer { repository.cleanup() }
+        let source = try repository.makeRepository(named: "source", files: ["README.md": "fixture\n"])
+        _ = try repository.runGit(["branch", "taken"], at: source)
+        let occupied = repository.sandbox.appendingPathComponent("occupied", isDirectory: true)
+        try repository.write("keep\n", to: "keep.txt", at: occupied)
+        let sandbox = repository.sandbox
+
+        let cases: [(label: String, request: GitWorktreeCreateRequest, newBranch: String?, detail: String)] = [
+            (
+                "existing branch",
+                .init(path: sandbox.appendingPathComponent("existing-branch"), branch: "taken", baseRef: "HEAD"),
+                nil,
+                "a branch named 'taken' already exists"
+            ),
+            (
+                "unresolved base",
+                .init(path: sandbox.appendingPathComponent("bad-base"), branch: "fresh-base", baseRef: "no-such-ref"),
+                "fresh-base",
+                "base ref 'no-such-ref' does not resolve to a commit"
+            ),
+            (
+                "detached unresolved base",
+                .init(path: sandbox.appendingPathComponent("bad-detached"), baseRef: "no-such-ref", detach: true),
+                nil,
+                "base ref 'no-such-ref' does not resolve to a commit"
+            ),
+            (
+                "occupied destination",
+                .init(path: occupied, branch: "fresh-occupied"),
+                "fresh-occupied",
+                "destination path is occupied"
+            )
+        ]
+        for testCase in cases {
+            let fence = CommitFence()
+            let registrationsBefore = try repository.runGit(["worktree", "list", "--porcelain"], at: source)
+            let branchesBefore = try repository.runGit(["for-each-ref", "--format=%(refname)", "refs/heads"], at: source)
+            do {
+                _ = try await GitService().createWorktreeWithResult(
+                    request: testCase.request,
+                    at: source,
+                    beforeCommit: { await fence.record(destination: testCase.request.path) }
+                )
+                XCTFail("\(testCase.label): Git would refuse this request")
+            } catch {
+                let message = error.localizedDescription
+                XCTAssertTrue(message.contains("refused before creation"), "\(testCase.label): \(message)")
+                XCTAssertTrue(message.contains(testCase.detail), "\(testCase.label): \(message)")
+                XCTAssertTrue(message.contains("Nothing was created."), "\(testCase.label): \(message)")
+            }
+            let fenceCalls = await fence.calls
+            XCTAssertEqual(fenceCalls, 0, testCase.label)
+            XCTAssertEqual(
+                try repository.runGit(["worktree", "list", "--porcelain"], at: source),
+                registrationsBefore,
+                testCase.label
+            )
+            XCTAssertEqual(
+                try repository.runGit(["for-each-ref", "--format=%(refname)", "refs/heads"], at: source),
+                branchesBefore,
+                testCase.label
+            )
+            if let newBranch = testCase.newBranch {
+                XCTAssertFalse(branchesBefore.contains("refs/heads/\(newBranch)"), testCase.label)
+            }
+            if testCase.request.path != occupied {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: testCase.request.path.path), testCase.label)
+            }
+        }
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: occupied.path),
+            ["keep.txt"]
+        )
+    }
+
+    func testPreviousCheckoutShorthandBaseRefRemainsAccepted() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: "GitWorktreeCreatePreviousCheckout")
+        defer { repository.cleanup() }
+        let source = try repository.makeRepository(named: "source", files: ["README.md": "fixture\n"])
+        _ = try repository.runGit(["checkout", "-q", "-b", "previous"], at: source)
+        try repository.write("previous\n", to: "previous.txt", at: source)
+        _ = try repository.runGit(["add", "previous.txt"], at: source)
+        try repository.commit("previous", at: source)
+        let previous = try repository.runGit(["rev-parse", "HEAD"], at: source)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try repository.runGit(["checkout", "-q", "-"], at: source)
+        let destination = repository.sandbox.appendingPathComponent("from-previous", isDirectory: true)
+
+        _ = try await GitService().createWorktreeWithResult(
+            request: .init(path: destination, branch: "from-previous", baseRef: "-"),
+            at: source
+        )
+
+        XCTAssertEqual(
+            try repository.runGit(["rev-parse", "HEAD"], at: destination).trimmingCharacters(in: .whitespacesAndNewlines),
+            previous
+        )
+    }
+
+    func testCommitFenceRunsOnceBeforeGitAddForAcceptedRequest() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: "GitWorktreeCreateFence")
+        defer { repository.cleanup() }
+        let source = try repository.makeRepository(named: "source", files: ["README.md": "fixture\n"])
+        let base = try repository.runGit(["rev-parse", "HEAD"], at: source)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Git accepts an existing empty directory as the destination.
+        let destination = repository.sandbox.appendingPathComponent("empty-destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let fence = CommitFence()
+
+        let result = try await GitService().createWorktreeWithResult(
+            request: .init(path: destination, branch: "fresh", baseRef: base),
+            at: source,
+            beforeCommit: { await fence.record(destination: destination) }
+        )
+
+        let fenceCalls = await fence.calls
+        let registeredAtFence = await fence.destinationWasRegisteredAtFence
+        XCTAssertEqual(fenceCalls, 1)
+        XCTAssertEqual(registeredAtFence, false)
+        XCTAssertFalse(result.descriptor.isMain)
+        XCTAssertEqual(
+            try repository.runGit(["rev-parse", "HEAD"], at: destination).trimmingCharacters(in: .whitespacesAndNewlines),
+            base
+        )
+        XCTAssertEqual(
+            try repository.runGit(["branch", "--show-current"], at: destination).trimmingCharacters(in: .whitespacesAndNewlines),
+            "fresh"
+        )
+    }
+}

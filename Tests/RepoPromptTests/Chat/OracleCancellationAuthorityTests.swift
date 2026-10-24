@@ -38,7 +38,7 @@ final class OracleCancellationAuthorityTests: XCTestCase {
         }
         composition.apiSettingsViewModel.openAIApiKey = "test-key"
         composition.apiSettingsViewModel.isOpenAIKeyValid = true
-        await oracle.startNewChatSession()
+        await oracle.startNewChatSession(reuseBlankSession: false)
         let sessionID = try XCTUnwrap(oracle.currentSessionID)
         let original = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: "original")
         var gates: [CheckedContinuation<[AIChatImageAttachment], Error>] = []
@@ -127,7 +127,7 @@ final class OracleCancellationAuthorityTests: XCTestCase {
 
         let background = begin("background")
         try await waitForGate(8)
-        await oracle.startNewChatSession()
+        await oracle.startNewChatSession(reuseBlankSession: false)
         gates[7].resume(returning: [])
         let backgroundResult = await background.value
         XCTAssertNotNil(backgroundResult)
@@ -151,6 +151,9 @@ final class OracleCancellationAuthorityTests: XCTestCase {
         )
         XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).filter(\.isUser).allSatisfy(\.imageAttachments.isEmpty))
 
+        // This scenario purges a background session. Blank-session reuse can
+        // otherwise keep the original foreground before autosave updates counts.
+        XCTAssertNotEqual(oracle.currentSessionID, sessionID)
         let deleted = begin("deleted")
         try await waitForGate(11)
         oracle.purgeSessionStorage(sessionID)

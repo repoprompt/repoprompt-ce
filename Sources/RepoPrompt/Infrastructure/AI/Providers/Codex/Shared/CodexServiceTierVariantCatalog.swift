@@ -1,8 +1,33 @@
 import Foundation
 
+/// Speed capabilities published by the signed-in Codex model catalog.
+struct CodexModelServiceTier: Codable, Hashable {
+    let id: String
+    let name: String
+    let description: String
+}
+
 enum CodexServiceTierVariantCatalog {
+    static let ultrafastServiceTier = "ultrafast"
+    static let knownServiceTiers = [fastServiceTier, ultrafastServiceTier]
     static let fastServiceTier = "fast"
     static let fastCostWarningText = "Fast service tier uses your usage limits about 2× faster."
+
+    /// An explicitly empty structured list wins over deprecated tier IDs.
+    static func advertisedTiers(from entry: [String: Any]) -> [CodexModelServiceTier] {
+        if let tiers = entry["serviceTiers"] as? [[String: Any]] {
+            return tiers.compactMap { tier in
+                guard let id = tier["id"] as? String, !id.isEmpty else { return nil }
+                return CodexModelServiceTier(
+                    id: id, name: tier["name"] as? String ?? id.capitalized,
+                    description: tier["description"] as? String ?? ""
+                )
+            }
+        }
+        return (entry["additionalSpeedTiers"] as? [String] ?? []).map {
+            CodexModelServiceTier(id: $0, name: $0.capitalized, description: "")
+        }
+    }
 
     static func isFastEligible(baseModelID: String) -> Bool {
         guard let version = gptVersion(from: baseModelID) else { return false }
@@ -60,6 +85,9 @@ enum CodexServiceTierVariantCatalog {
     static func supportedServiceTier(baseModelID: String, serviceTier: String?) -> String? {
         guard let serviceTier else { return nil }
         let normalizedTier = serviceTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedTier == ultrafastServiceTier {
+            return baseModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : normalizedTier
+        }
         guard normalizedTier == fastServiceTier,
               isFastEligible(baseModelID: baseModelID) else { return nil }
         return normalizedTier

@@ -536,6 +536,7 @@ package actor FileSystemService {
     package var fseventCallbackContextPointer: UnsafeMutableRawPointer?
 
     /// The in-memory IgnoreRules instance for our path
+    package var repositoryExcludeDigest: String?
     package var ignoreRules: IgnoreRules
     package var catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
 
@@ -700,6 +701,7 @@ package actor FileSystemService {
             policy: ignoreRulePolicy
         )
         ignoreRules = resolvedIgnoreRules.rules
+        repositoryExcludeDigest = resolvedIgnoreRules.repositoryExcludeDigest
         catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
             schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
             mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,

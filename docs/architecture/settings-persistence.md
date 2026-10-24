@@ -183,14 +183,166 @@ of saving provisional defaults.
 
 Close older CE versions before upgrading or using this shared settings location. Older
 released binaries and arbitrary external editors do not honor this cooperative protocol;
-the sidecar does not make them safe concurrent writers. Current debug and release builds
-use the same protocol and file identity. No lifetime app lock or new settings namespace is
-required for the supported cooperative-current-writer contract.
+the sidecar does not make them safe concurrent writers. Current writers within one build
+flavor use this cooperative protocol. Debug and release now select separate application
+state roots as described below; no lifetime app lock is introduced.
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
+
+## Debug session-state boundary
+
+Debug and release builds must not normalize, overwrite, lock, or delete the same
+application-owned session metadata. `MCPFilesystemIdentity.current` selects the
+compiled build flavor; `applicationStateDirectoryName` selects mutable state.
+
+| State | Release | Debug |
+| --- | --- | --- |
+| Workspaces, conversations, Agent Mode sessions, catalog/journals, window continuity | `~/Library/Application Support/RepoPrompt CE` | `~/Library/Application Support/RepoPrompt CE Debug` |
+| Settings, presets, custom workflows, and persisted slice selections (`Partitions`) | Same release root | Same debug root |
+| Saved prompts, including context-builder prompts | `~/Library/Application Support/com.pvncher.repoprompt` | Debug root, `SavedPrompts` |
+| Oversight intents, scope continuity, worktree ownership | Same release root | Same debug root |
+| One-click recovery archive in Downloads | `RepoPrompt-Backup` | `RepoPrompt-Debug-Backup` |
+
+Release paths and formats are unchanged. Each normal debug **app process launch**
+prepares a new independent working snapshot of production state before app stores
+open. `--debug-clean-slate` skips the production seed for that launch only; it is
+not a preference, and the next normal launch seeds production again. This is
+state initialization, not a compiler/cache cold build. Ordinary refresh retains
+this debug profile's transactional oversight DB and legacy continuity records.
+Workspaces containing saved debug endpoints (or named by a saved workspace scope)
+retain their intact debug-owned tabs/conversations, rather than replacing their
+identities with the production baseline. Their debug windows are retained too;
+settings and unrelated workspaces still refresh. Runtime restoration remains
+responsible for profile/identity validation: retaining bytes does not mint authority.
+Missing original endpoints stay recorded, not fabricated or silently revoked.
+`--debug-clean-slate` intentionally archives rather than carries this debug control
+continuity; it is a genuinely clean launch, not an ordinary restart. Existing provider homes,
+authentication, Keychain items and harmless runtime caches remain shared; the
+bootstrap never copies credentials or requires a new login.
+
+The seed follows the current workspace catalog/index, copies workspace documents
+and conversation backing files, and materializes pending workspace journal bytes
+into the destination. Custom metadata sources are copied into the debug root;
+repository paths remain repository paths. Settings, presets, prompts, workflows,
+window state, slice selections and Oracle conversation artifacts are included.
+Rebuildable session indexes, locks/PIDs/runtime claims, Git data, workspace folders outside the live catalog and source recovery/backup trees are not restored as active state. Source
+history/recovery files remain at their original locations; an omitted unavailable
+workspace cannot be reconstructed from an absent source document.
+
+The published snapshot is point-in-time: every captured source byte and captured
+directory membership must match its source during one verification pass taken
+before anything is staged. Publication writes only those verified captured bytes
+(SQLite backups are re-verified after copying), so production writes after that
+pass cannot tear the snapshot. A running release app keeps writing, so capture is
+bounded but convergent rather than requiring an idle release: up to ten attempts
+share a stamp-keyed cache of captured bytes and derived records, so only the first
+attempt reads and transforms the whole profile and each retry re-reads only what
+changed. A source removed mid-capture is a retryable change, not an unsafe alias.
+Each directory listing records the selection rule it consumed (caller exclusions,
+locks/claims/backups/recovery trees, the rebuildable session index, and exactly
+recognized Finder metadata and atomic-write/lock temporaries), and verification
+re-applies every rule to one fresh listing, so excluded names are neither seeded nor
+treated as state changes while names derived from user repositories or workspaces
+are kept. If production never settles, startup fails closed without staging or
+replacing anything. SQLite backups copy in bounded page batches; a source write or
+lock contention between batches ends that attempt as a retryable change rather than
+letting a restarting backup run unbounded. SIGTERM (conductor
+stop, `kill`, logout) received during preparation stops at the next safe point —
+before staging, between staged entries or backup batches, never after the swap —
+removes any partial stage, and then terminates the process. Database snapshots use SQLite's backup API, never an
+uncoordinated live database-file copy, source migration or checkpoint. The current
+rollback-journal continuity store is supported. WAL sources currently fail closed
+rather than risk a write to production SHM read marks; they are not silently
+omitted or opened with the unsafe `immutable` promise.
+
+Copied provider conversation/cleanup handles are detached so a debug continuation
+cannot append to or delete its production provider conversation. Local transcript
+history is retained for the ordinary history-replay/new-conversation path. Saved
+production grants/continuity are preserved separately in `ProductionContinuity`,
+not promoted into debug authority. Automatic wakes and active merge/compact claims
+are not revived. No provider mode is disabled.
+
+Verified bytes are prepared in staging. A same-volume atomic directory swap
+publishes the complete profile; a failed preparation leaves prior debug and source
+bytes intact. Prior debug-only work and its preferences are recoverable under
+`RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
+snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
+deleted. Normal startup is silent. Failure presents an actionable debug-only error
+instead of opening a partial mixture: Quit, Retry, or — for production-capture
+failures — Start Empty, which runs this launch in clean mode (prior debug profile
+and preferences archived, not deleted). The prior debug profile is never reused
+automatically while release may be writing. `debugSeed.json` and the redacted
+startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
+preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
+CLI requests do not re-seed a running app. Explicit standalone headless profiles
+remain independent and do not run the app launch bootstrap. The default debug
+headless runtime and interactive policy administrator hold shared admission on a
+stable sibling profile lock for their store lifetime. Bootstrap requires exclusive
+admission before capture/publication; the app then retains shared admission. A
+busy owner causes an explicit startup refusal, never a swap under a live writer.
+
+Missing release preference data is not an empty domain: ordinary startup retains
+prior debug preferences when that source is absent, and retains debug-only Agent
+Mode diagnostic toggles even when release preferences are available. Ordinary
+refresh also carries debug runtime settings/grants/bindings, settings/preset backups,
+workspace cleanup backups and self-compact recovery bytes verbatim. Clean-slate
+continues to archive rather than carry these bytes. Continuity retention reads the
+owning legacy Codable models and read-only database projection; incompatible input
+aborts refresh without displacing the previous profile. Archived endpoint backing
+counts even when no compose tab currently selects it.
+
+Copied Agent session items, transcript request anchors and response activities
+rebase only typed local image references under the copied workspace's managed
+attachment store. External paths, remote URLs, text and arbitrary tool payloads
+remain unchanged. Storage relocation admits the validated debug workspace root
+through the same runtime metadata policy **before** any directory is moved; each
+later write still checks production aliases and symlink components.
+
+Custom debug storage selections and explicit headless profiles use a build-flavor-namespaced child directory. Runtime profile IDs and release directory semantics remain unchanged. Known
+release roots (including configured custom storage), canonical aliases, symlinked
+metadata descendants are rejected before metadata writes,
+lock creation, or destructive cleanup. Nearest-existing-ancestor canonicalization
+also covers symlink parents with an absent final child. These checks protect
+against accidental cross-profile writes, not a malicious same-user process
+racing filesystem changes. Repository edits and user-selected exports are not
+application-metadata writes and do not acquire this restriction.
+
+The app and standalone headless runtime share this location policy. Debug CLI
+policy administration targets debug runtime policy, not release policy.
+
+This is **not** blanket filesystem isolation. Existing flavor-specific MCP
+socket/config names, wrappers/install destinations, provider homes/authentication,
+Keychain behavior, telemetry/device identity, tooling, and harmless shared caches
+or runtime downloads retain their existing behavior. Oversight transaction and
+permission semantics are owned by their separate repair track.
+
+### Acceptance evidence
+
+Use conductor for focused profile tests, relevant persistence/app suites, lint,
+product compilation and packaging. Packaged Agent Mode validation must use an
+explicitly approved app lifecycle action, coexist with release, and attribute
+writes to the debug process. Helper/unit tests alone do not establish live
+no-production-write behavior. Do not claim that acceptance until observed.
+
+#### Two-app same-workspace regression
+
+With release and the approved packaged debug build running together, exercise
+the same repository/workspace reference that previously resolved to one shared
+persisted document. Record each PID/executable and effective metadata path. A
+debug request to use the release document as writable metadata must be rejected
+before lock creation, normalization, or cleanup; the usable debug workspace must
+resolve to separate metadata. Exercise repeated selection switches and restore,
+then compare release workspace bytes, catalog/index, window state, settings,
+presets, prompts and oversight metadata against the baseline, attributing debug
+writes to the debug process. Repository access remains shared and usable.
+
+Do not disable saves, suppress CAS checks, copy production grants, or dismiss a
+conflict without writer attribution. Do not copy private live history into public
+fixtures/artifacts. This requires fresh lifecycle approval and coordination with
+other tracks, not an unapproved stress sequence against production.
 
 ## Model Router settings
 
@@ -208,7 +360,15 @@ scalarPreferences.modelRouter.customInstructions
 
 The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
-Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. Scope provider fields are optional limits over the allowed-provider set. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+Missing values resolve disabled. Production materializes Jev only for an absent Router service raw value before initial demand reconciliation; blank/unknown raw values are preserved and unavailable, not normalized into a different service. Provider scope fields are optional preferences: an available selected provider narrows that scope's candidates to it, while an unavailable selection falls back to the other connected providers. The legacy candidate-role and allowed-provider arrays remain for schema/rollback preservation but no longer authorize the provider-catalog frontier. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory Router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+
+## Independent Auto Effort service selection
+
+The existing `scalarPreferences.agentMode.autoEffortEnabled` flag remains a separate, default-off user intent. The optional `scalarPreferences.agentMode.autoEffortBackendRawValue` is an **independent exact decision-service selection**. An absent field resolves to Jev in memory for existing users without writing or raising the document schema. An explicit known, blank, or unknown raw value is preserved through unrelated edits; blank/unknown values resolve unavailable and never silently select Jev or the Router's service. Writing the explicit field requires schema v12, so an older v11 writer rejects the document rather than silently reinterpreting a non-Jev selection. For its service selection, Auto Effort persists only the raw value; its revision is process-local, held in memory, and advances only on actual enablement/selection/install changes. Removing a decision-service credential does not clear this flag or selection; the feature keeps manual effort until its selected service is usable.
+
+## Legacy routing-profile settings
+
+`scalarPreferences.modelRoutingProfiles.remoteUpdatesDisabled` and `lastCheckAt` are deprecated, inert optional fields retained for schema-v12 Codable and rollback compatibility. The content-derived schema fence still requires v12 whenever either value is present. Current code has no active manager reader/writer for them: it does not materialize, update, clear, or migrate them. Unrelated settings edits preserve both values and continue to write a schema-v12-compatible document, allowing an older v12-aware app to read them after rollback. These fields do not control any current profile behavior; bundled routing profiles are the only source. See [model routing](model-routing.md) and the [bundled profile publication boundary](routing-profile-publication.md).
 
 ## Agent Mode Handoff instructions
 
@@ -383,6 +543,103 @@ The MCP `app_settings` surface remains global for model-related keys such as:
 - `context_builder.model`
 
 Those keys write the global backing fields. Workspace-specific Agent Models overrides are not exposed through `app_settings`; they are selected by the active RepoPrompt workspace/window and resolved by runtime services.
+
+## Delegation scope intent
+
+Delegation scopes are not settings. `DelegationScopeRuntime` owns current user decisions;
+continuity storage records them but never authorizes or vetoes a live action. Scope grants/revokes,
+link intent, and delegation worktree ownership share a row-transaction repository:
+
+```text
+Release: ~/Library/Application Support/RepoPrompt CE/Overseer/continuity.sqlite
+Debug:   ~/Library/Application Support/RepoPrompt CE Debug/Overseer/continuity.sqlite
+```
+
+- Owner: typed app adapters (`DelegationScopeStore`, `AgentSessionOversightIntentStore`, and
+  `WorktreeOwnershipStore`) over `RepoPromptPersistence.OverseerContinuityStore`. The locations
+  above are overseer-only, not an all-app path migration. `OverseerContinuityRepository.production()`
+  is the sole path seam for the database and legacy input; both use the same profile directory.
+    That seam composes its directory through the shared app-profile policy, without
+  adding adapter-specific paths. Debug does not open the release legacy source or its lock.
+  Suppressed launches perform no file I/O.
+- Storage uses short SQLite `BEGIN IMMEDIATE` transactions, DELETE rollback journal,
+  `synchronous=EXTRA`, `fullfsync=ON`, and foreign keys. Effective settings are checked on open;
+  an Apple version string is not evidence of the upstream WAL-reset fix. No lifetime flock remains.
+  The three adapters serialize short database access in-process; lock acquisition and SQLite busy
+  waiting are bounded. Schema creation rechecks the version inside its transaction.
+- Each transition writes only its rows and an operation-ID/digest/revision receipt atomically.
+  Scope creation is immutable; explicit revocation cascades permanently to descendants. Deleted
+  anchors and terminal scope identities are retained without a pruning cap. Link/worktree updates
+  compare their acknowledged row revision, so a stale owner cannot replace another owner's row.
+  Omission never means deletion. Receipt replay is idempotent and cannot repeat an effect.
+- Live explicit user approval/revocation applies in its current process immediately. Grants save
+  separately with bounded backoff. A scope revoke/deletion attempts its own synchronous transaction
+  before returning, never behind an unrelated grant. Only a committed receipt acknowledges durable
+  revocation. If that entire write fails, the local deny remains and the affected IDs are reported
+  as **unsettled**; no record exists to carry that unsaved decision across process death. The next
+  launch can recover only the last committed state, including a grant whose revoke never saved.
+  This limitation is not a durable-revoke acknowledgement or a blanket invalidation of other grants.
+  Quit settlement has a two-second deadline and reports unacknowledged transactions honestly.
+  Impossible row transitions are retained as failed diagnostics, not retried forever at the queue
+  head; independent rows can still save. `continuity_save_state` and the UI distinguish **saved**,
+  **pending**, **failed**, and explicitly **not_persisted**, with the cause and retry guidance.
+  A pending or failed change is not promised to survive a kill or reach another process. Storage
+  failure neither manufactures approval nor denies an approved task. Caller/target routing, scope
+  membership, expiry, and revocation checks remain mandatory.
+- Launch restores compatible saved grants under fresh generations without clean-shutdown gating.
+  Retry uses the same store/runtime after an open failure; restoration cannot replace newer live
+  decisions or reactivate locally deleted anchors. Generations, leases, pending cards, batch
+  confirmations, and live-only authority remain process-local.
+- Legacy `delegationScopes.json` (v1/v2), `agentSessionOversightLinks.json`, and
+  `delegationWorktreeOwnership.json` are **read-only sources**. Exact stable bytes and individual
+  accepted/rejected rows are archived with provenance in the destination. Unknown schema, malformed
+  data and invalid terminal history remain recoverable, never quarantined, rewritten, silently
+  dropped, or used as approval. Destination rows/terminal identities win. Valid same-profile legacy
+  rows migrate idempotently; release factories preserve existing links and worktree ownership.
+  Same-profile debug links and ownership also migrate. Historically mixed sources, when explicitly
+  supplied for recovery, and unknown scope authority are preserved for explicit recovery instead
+  of being silently promoted. The scope recovery card displays root descriptions
+  and requires a new explicit user approval, issuing new identities rather than reviving old IDs
+  or lifting attenuated grants. Other valid database rows restore normally; malformed entries stay
+  preserved and inactive with a diagnostic. Legacy bytes are read without opening or probing the
+  release lock. An unavailable legacy source cannot veto a new approval.
+
+### Organizational placement and delegated worktree ownership
+
+- **Session placement.** `AgentSession` carries `organizationalParentID` and `delegationScopeID`,
+  additive and decoded with `decodeIfPresent`, **without** a serialization-version bump (still 9): a
+  bump would make this build rewrite every older session file on load and would not stop an older
+  build from dropping the fields on its own re-save. An older file decodes with no explicit
+  placement and falls back to spawn provenance (`parentSessionID`, then
+  `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement. The index entry and live tab are
+  updated synchronously; only the placement-only file rewrite of a session with no live tab is
+  queued, serialized per session in the order placements were applied. A hydrate prefers the
+  index's placement over the file's so it cannot revert.
+- **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
+  fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
+  a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
+  `history` scan until rebuilt, changing external `history` output. A record missing the fields
+  falls back to spawn provenance, and placement only exists after this build writes it.
+- **Worktree ownership.** `WorktreeOwnershipStore` records one transactional continuity row per
+  worktree, including creator/scope/time and release marks. Current provenance remains usable while
+  saving retries; tool results report `ownership_continuity_save_state` separately. It never
+  authorizes or removes a worktree. Release records are not arbitrarily pruned; an explicit rebind
+  is a new revision-checked transition, not a stale snapshot replacement.
+
+## Sidebar groups on compose tabs
+
+`ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
+beside `pinnedOrder`:
+
+- `sidebarGroup`: the tab's sidebar group label (trimmed, at most 64 characters, one line); absent
+  means ungrouped.
+- `sidebarGroupOrder`: the group's position among the workspace's groups, mirrored on every tab in
+  that group (`reorder_groups` rewrites the mirror on each).
+
+Both are encoded only when present and decoded leniently: an absent or malformed value decodes as
+ungrouped, so older files load unchanged and no workspace schema bump or migration is needed. Older
+builds ignore the keys. Stashed (archived) tabs keep their group, so unarchiving restores it.
 
 ## Non-goals and migration notes
 

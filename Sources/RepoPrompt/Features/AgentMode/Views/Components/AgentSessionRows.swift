@@ -21,11 +21,11 @@ func agentSessionRowOversightMarkIsInteractive(role _: AgentSessionOversightRole
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
-    /// Fb mark model: the row's own group slot when it oversees, plus its overseers in
-    /// link-creation order. Drives the inline eye mark; `.none` renders nothing.
+    /// Role model: the row's own group slot when it oversees, plus its overseers in
+    /// link-creation order. Drives the inline role mark; `.none` renders nothing.
     var oversightRole = AgentSessionOversightRole.none
     /// Overseer-creator provenance for the tooltip's `Created by:` segment. Live links still own
-    /// the mark's colour; this never paints a separate origin mark.
+    /// the mark's role; this never paints a separate origin mark.
     var creatorSessionID: UUID?
     var creatorDisplayName: String?
     /// Revalidates and navigates to the lane's creator for the `Open creator "{name}"` item.
@@ -98,14 +98,14 @@ struct AgentSessionRow: View {
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkReference
     ) async -> AgentSidebarOversightActionOutcome)?
-    /// General exact-endpoint Add for the inverse direction (this row as observer). Unlike
-    /// `onAddSidebarOversight` it may create the row's *first* outbound link.
-    var onAddOutboundOversight: (@MainActor (
-        DomainAgentSessionLinkEndpointIdentity,
-        DomainAgentSessionLinkEndpointIdentity
+    /// General exact-endpoint Add for a chosen observer → target pair. Unlike
+    /// `onAddSidebarOversight` it may create the observer's *first* outbound link.
+    var onAddOversightLink: (@MainActor (
+        _ observer: DomainAgentSessionLinkEndpointIdentity,
+        _ target: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome)?
     /// Read-only pasted-ID resolution for the row's Session-ID sheets. Inbound resolves the
-    /// prospective overseer (existing-overseer rule); outbound resolves the prospective target.
+    /// prospective overseer (any eligible session); outbound resolves the prospective target.
     var resolveOverseerSessionIDCandidate: (@MainActor (
         String
     ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
@@ -144,12 +144,21 @@ struct AgentSessionRow: View {
     /// captured when the menu item was chosen.
     @State private var oversightSessionIDSheet: OversightIDSheetRequest?
 
-    private struct OversightIDSheetRequest: Identifiable {
+    struct OversightIDSheetRequest: Identifiable {
         enum Direction {
             /// The pasted ID names the prospective overseer of this row.
             case chooseOverseer
             /// The pasted ID names the prospective target for this row.
             case chooseTarget
+
+            /// Orders the row and the pasted peer as observer → target for this sheet, so the
+            /// confirmation labels and the submitted endpoints cannot disagree.
+            func ordering<Party>(row: Party, peer: Party) -> (observer: Party, target: Party) {
+                switch self {
+                case .chooseOverseer: (observer: peer, target: row)
+                case .chooseTarget: (observer: row, target: peer)
+                }
+            }
         }
 
         let direction: Direction
@@ -202,6 +211,16 @@ struct AgentSessionRow: View {
             && resolveSidebarOversightSummary?() == nil
     }
 
+    /// Fallback reason for a session-ID row whose menu resolved nil. A live bound endpoint
+    /// means the chat is open in this window and the bridge simply has not installed the
+    /// catalog yet, so reopening the menu can help; no bound endpoint means the chat is not
+    /// open here, and opening it is what installs the binding.
+    private var sidebarOversightMenuUnavailableFallback: String {
+        resolveSidebarOversightTargetEndpoint?() != nil
+            ? AgentOversightUICopy.oversightMenuUnavailableMessage
+            : AgentOversightUICopy.oversightMenuOpenChatMessage
+    }
+
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
         if allowsDirectMutations { prepareSidebarOversightMenu?() }
         let menu = presentableSidebarOversightMenu
@@ -211,7 +230,7 @@ struct AgentSessionRow: View {
            onAddSidebarOversight != nil,
            onStopSidebarOversight != nil
         {
-            unavailableReason = AgentOversightUICopy.oversightMenuUnavailableMessage
+            unavailableReason = sidebarOversightMenuUnavailableFallback
         }
         return ContextMenuSnapshot(
             isInteractionEnabled: isInteractionEnabled,
@@ -262,8 +281,8 @@ struct AgentSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
-    private var oversightMarkFontSize: CGFloat {
-        fontPreset.scaledClamped(10, min: 9, max: 12)
+    private var oversightMarkSize: CGFloat {
+        fontPreset.scaledClamped(16, min: 14, max: 18)
     }
 
     private var chipHorizontalPadding: CGFloat {
@@ -388,7 +407,7 @@ struct AgentSessionRow: View {
                     if allowsDirectMutations { prepareSidebarOversightMenu?() }
                     guard let menu = presentableSidebarOversightMenu else {
                         let reason = sidebarOversightUnavailableReason
-                            ?? AgentOversightUICopy.oversightMenuUnavailableMessage
+                            ?? sidebarOversightMenuUnavailableFallback
                         return .submenu(item.title, accessibilityValue: reason, items: [.message(reason)])
                     }
                     return sidebarOversightMenuItems(menu).first { $0.title == item.title } ?? item
@@ -505,7 +524,7 @@ struct AgentSessionRow: View {
 
     /// Inverse-direction Add: this row becomes the observer of the chosen target. Uses the general
     /// exact-endpoint Add so a row can acquire its *first* outbound link — the inbound menu's
-    /// existing-overseer precondition does not apply to this direction.
+    /// existing-overseer precondition applies only to that menu's own picks.
     private func addOutboundOversight(
         _ option: AgentSidebarOversightMenuProps.TargetOption,
         menu: AgentSidebarOversightMenuProps
@@ -521,7 +540,7 @@ struct AgentSessionRow: View {
               current.availableTargets.contains(where: {
                   $0.peerEndpoint == option.peerEndpoint
               }),
-              let onAddOutboundOversight
+              let onAddOversightLink
         else {
             sidebarOversightBusyKeys.remove(key)
             setSynchronousSidebarOversightFailure(
@@ -544,7 +563,7 @@ struct AgentSessionRow: View {
                 sidebarOversightBusyKeys.remove(key)
                 return
             }
-            let outcome = await onAddOutboundOversight(
+            let outcome = await onAddOversightLink(
                 menu.targetEndpoint,
                 option.peerEndpoint
             )
@@ -675,32 +694,21 @@ struct AgentSessionRow: View {
         guard resolveSidebarOversightTargetEndpoint?() == request.rowEndpoint else {
             return .failed(AgentOversightUICopy.staleSelectionMessage)
         }
-        let confirmed: Bool
-        let outcome: AgentSidebarOversightActionOutcome
-        switch direction {
-        case .chooseOverseer:
-            confirmed = await AgentOversightLinkConfirmation.confirm(
-                observerLabel: peer.displayName,
-                targetLabel: request.rowDisplayName,
-                windowID: request.rowEndpoint.windowID
-            )
-            guard confirmed else { return .cancelled }
-            guard let onAddSidebarOversight else {
-                return .failed(AgentOversightUICopy.staleSelectionMessage)
-            }
-            outcome = await onAddSidebarOversight(peer.endpoint, request.rowEndpoint)
-        case .chooseTarget:
-            confirmed = await AgentOversightLinkConfirmation.confirm(
-                observerLabel: request.rowDisplayName,
-                targetLabel: peer.displayName,
-                windowID: request.rowEndpoint.windowID
-            )
-            guard confirmed else { return .cancelled }
-            guard let onAddOutboundOversight else {
-                return .failed(AgentOversightUICopy.staleSelectionMessage)
-            }
-            outcome = await onAddOutboundOversight(request.rowEndpoint, peer.endpoint)
+        // Both directions submit through the general Add: a pasted overseer need not hold an
+        // outbound link yet (the Link-overseer menu's existing-overseer precondition applies
+        // only to its own picks). `ordering` keeps the confirmation labels and the submitted
+        // endpoints in the same observer → target order.
+        guard let onAddOversightLink else {
+            return .failed(AgentOversightUICopy.staleSelectionMessage)
         }
+        let labels = direction.ordering(row: request.rowDisplayName, peer: peer.displayName)
+        let endpoints = direction.ordering(row: request.rowEndpoint, peer: peer.endpoint)
+        guard await AgentOversightLinkConfirmation.confirm(
+            observerLabel: labels.observer,
+            targetLabel: labels.target,
+            windowID: request.rowEndpoint.windowID
+        ) else { return .cancelled }
+        let outcome = await onAddOversightLink(endpoints.observer, endpoints.target)
         switch outcome {
         case .changed, .alreadyInRequestedState:
             return .succeeded
@@ -856,7 +864,7 @@ struct AgentSessionRow: View {
         _ = onSelectionGesture(.toggle)
     }
 
-    // MARK: - Oversight role mark (Fb iconography)
+    // MARK: - Oversight role mark
 
     /// The mark's combined tooltip/VoiceOver line — `Overseeing: … · Overseen by: … · Created
     /// by: …`, segments omitted when empty. Only called for rows carrying a role, so at least one
@@ -872,10 +880,9 @@ struct AgentSessionRow: View {
         )
     }
 
-    /// The always-visible role mark, drawn inline just before the title. One mark per row:
-    /// `eye.fill` in the row's own group colour when it oversees, `eye` in its first overseer's
-    /// group colour when it is overseen, and a two-tone `eye.circle.fill` when both apply. Several
-    /// overseers keep the first overseer's colour (link-creation order) plus a count superscript.
+    /// The always-visible role mark, drawn inline just before the title: an amber hub for an
+    /// overseer, a grey worker for an overseen session, and both glyphs when both roles apply.
+    /// Several overseers retain a count superscript.
     /// When mutations are allowed, clicking opens the Oversee-by lane menu — the same menu model
     /// as the hover affordance and the context submenu. Otherwise it stays a passive state marker
     /// so it can never offer a mutation the row forbids.
@@ -886,8 +893,8 @@ struct AgentSessionRow: View {
         interactive: Bool
     ) -> some View {
         if interactive, let summary {
-            // A menu label image template-renders, which would flatten the palette
-            // colours (and the two-tone/count colours) to the control tint — and to white on
+            // A menu label image template-renders, which would flatten the role
+            // colours to the control tint — and to white on
             // selected rows. The coloured glyph therefore stays ordinary content underneath a
             // clear-label StableMenuButton that owns the same hit target; the glyph itself
             // never hit-tests. The AppKit menu also survives the SwiftUI invalidations that
@@ -913,39 +920,28 @@ struct AgentSessionRow: View {
             // click menu's sections carry the same information for sighted users.
             oversightMarkGlyph
                 .fixedSize()
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel(tooltip)
         }
     }
 
-    @ViewBuilder
     private var oversightMarkGlyph: some View {
-        let ownColor = oversightRole.ownOverseerSlot.map { AgentOversightPalette.color(for: $0) }
-        let overseerColor = oversightRole.overseers.first
-            .map { AgentOversightPalette.color(for: $0.slot) }
         HStack(spacing: 1) {
-            switch (ownColor, overseerColor) {
-            case let (.some(own), .some(overseer)):
-                // Both roles: the eye keeps this row's own group colour, the ring its overseer's.
-                Image(systemName: AgentOversightUICopy.dualRoleMarkIcon)
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(own, overseer)
-            case let (.some(own), .none):
-                Image(systemName: AgentOversightUICopy.overseerMarkIcon)
-                    .foregroundStyle(own)
-            case let (.none, .some(overseer)):
-                Image(systemName: AgentOversightUICopy.overseenMarkIcon)
-                    .foregroundStyle(overseer)
-            case (.none, .none):
-                EmptyView()
+            if oversightRole.isOverseer {
+                AgentOversightRoleIcon(role: .overseer, size: oversightMarkSize)
+                    .foregroundStyle(AgentOversightRoleStyle.overseer)
+            }
+            if oversightRole.isOverseen {
+                AgentOversightRoleIcon(role: .worker, size: oversightMarkSize)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
             if oversightRole.overseers.count > 1 {
                 Text("\(oversightRole.overseers.count)")
                     .font(.system(size: 7, weight: .bold))
                     .baselineOffset(4)
-                    .foregroundStyle(overseerColor ?? .secondary)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
         }
-        .font(.system(size: oversightMarkFontSize, weight: .semibold))
     }
 
     @ViewBuilder
@@ -967,6 +963,9 @@ struct AgentSessionRow: View {
     }
 
     var body: some View {
+        #if DEBUG
+            let _ = AgentSidebarRowRenderProbe.onSessionRowBody?(title)
+        #endif
         let sidebarOversightSummary = resolveSidebarOversightSummary?()
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {

@@ -62,12 +62,18 @@ struct ContentRootShellView: View {
 
             // MCP Client Approval Overlay
             if let clientID = viewModel.state.mcpServer.pendingClientID,
+               let generation = viewModel.state.mcpServer.pendingApprovalGeneration,
                viewModel.state.mcpServer.isApprovalOverlayVisible
             {
-                MCPApprovalOverlayView(clientID: clientID)
-                    .environmentObject(viewModel.state.mcpServer)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    .zIndex(1000)
+                MCPApprovalOverlayView(
+                    clientID: clientID,
+                    generation: generation,
+                    executablePath: viewModel.state.mcpServer.pendingApprovalExecutablePath
+                )
+                .id(generation)
+                .environmentObject(viewModel.state.mcpServer)
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                .zIndex(1000)
             }
 
             // Workspace Operation Approval Overlay

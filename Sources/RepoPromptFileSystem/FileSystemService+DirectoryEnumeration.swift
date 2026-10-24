@@ -447,7 +447,9 @@ extension FileSystemService {
     /// Rebuilds the service's canonical path snapshot after bounded incremental
     /// recovery attempts fail. Existing files are marked modified so downstream
     /// content and codemap caches cannot survive an ambiguous recovery interval.
-    package func reconcileEntireTreeAfterRecoveryFailure() async throws -> [FileSystemDelta] {
+    package func reconcileEntireTreeAfterRecoveryFailure(
+        publishedBaseline: [String: Bool]? = nil
+    ) async throws -> [FileSystemDelta] {
         let actualItems = try await gatherPathsUsingEnumerator(
             rootURL: rootURL,
             skipSymlinks: skipSymlinks,
@@ -460,12 +462,20 @@ extension FileSystemService {
             let eligibility = await catalogRegularFileEligibility(relativePath: relativePath)
             if case .ineligible(.ignored) = eligibility {
                 reconciledItems[relativePath] = false
+                // Removing an ignored parent recursively removes the explicitly managed
+                // file in the Store too. Retain its existing ancestor chain with the file.
+                var parent = (relativePath as NSString).deletingLastPathComponent
+                while !parent.isEmpty, parent != "." {
+                    reconciledItems[parent] = true
+                    parent = (parent as NSString).deletingLastPathComponent
+                }
             }
         }
         var remainingItems = reconciledItems
         var removedItems: [(path: String, wasDirectory: Bool)] = []
         var retainedFiles: [String] = []
-        for previous in visitedItems {
+        let previousItems = publishedBaseline.map { AnySequence($0) } ?? AnySequence(visitedItems)
+        for previous in previousItems {
             if let currentType = reconciledItems[previous.key], currentType == previous.value {
                 remainingItems.removeValue(forKey: previous.key)
                 if !currentType {

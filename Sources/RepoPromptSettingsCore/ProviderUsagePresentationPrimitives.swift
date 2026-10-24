@@ -29,6 +29,10 @@ package enum ProviderUsageSourceState: Equatable {
 package struct AgentUsageLimitsPillPresentation: Equatable {
     package let label: String
     package let ringFraction: Double?
+    /// Position of the short-window (e.g. 5-hour) bead on the same track, 0...1.
+    package let sessionFraction: Double?
+    /// The short window is near (>= 80%) or at its limit; the bead turns warm.
+    package let sessionIsHot: Bool
     package let isReached: Bool
     /// Not current: stale, reset-passed, unavailable, or updating. The pill dims in place.
     package let isDimmed: Bool
@@ -41,6 +45,9 @@ package struct AgentUsageLimitsPillPresentation: Equatable {
             resetAt: state.resetAt,
             providerName: providerName,
             now: now,
+            shortWindowPercent: state.shortWindowPercent,
+            shortWindowIsReached: state.shortWindowIsReached,
+            shortWindowResetAt: state.shortWindowResetAt,
             freshness: state.freshness,
             observedAt: state.observedAt,
             isUpdating: state.isUpdating,
@@ -58,6 +65,9 @@ package struct AgentUsageLimitsPillPresentation: Equatable {
         resetAt: Date?,
         providerName: String,
         now: Date,
+        shortWindowPercent: Int? = nil,
+        shortWindowIsReached: Bool = false,
+        shortWindowResetAt: Date? = nil,
         freshness: ProviderQuotaIndicatorState.Freshness = .fresh,
         observedAt: Date? = nil,
         isUpdating: Bool = false,
@@ -72,6 +82,15 @@ package struct AgentUsageLimitsPillPresentation: Equatable {
         if isReached { parts.append("\(providerName) plan limit reached") }
         else if let usedPercent { parts.append("\(providerName) plan usage: \(usedPercent)% used") }
         if let resetAt, resetAt > now { parts.append("resets \(ProviderQuotaPresenter.resetText(resetAt, now: now))") }
+        if shortWindowIsReached {
+            parts.append("5-hour limit reached")
+        } else if let shortWindowPercent {
+            var session = "5-hour: \(shortWindowPercent)%"
+            if let shortWindowResetAt, shortWindowResetAt > now {
+                session += ", resets \(ProviderQuotaPresenter.resetText(shortWindowResetAt, now: now))"
+            }
+            parts.append(session)
+        }
         if refreshFailed { parts.append("Couldn't refresh") }
         switch freshness {
         case .stale:
@@ -85,6 +104,8 @@ package struct AgentUsageLimitsPillPresentation: Equatable {
         self.init(
             label: isReached ? "Limit" : usedPercent.map { "\($0)%" } ?? "",
             ringFraction: usedPercent.map { min(max(Double($0), 0), 100) / 100 },
+            sessionFraction: shortWindowIsReached ? 1 : shortWindowPercent.map { min(max(Double($0), 0), 100) / 100 },
+            sessionIsHot: shortWindowIsReached || (shortWindowPercent ?? 0) >= 80,
             isReached: isReached,
             isDimmed: freshness != .fresh || isUpdating,
             tooltip: parts.joined(separator: " · ")
@@ -95,12 +116,14 @@ package struct AgentUsageLimitsPillPresentation: Equatable {
     private init(unavailableFor providerName: String, isUpdating: Bool) {
         var parts = ["\(providerName) plan usage unavailable — sign in or reconnect in Settings"]
         if isUpdating { parts.append("updating…") }
-        self.init(label: "—", ringFraction: nil, isReached: false, isDimmed: true, tooltip: parts.joined(separator: " · "))
+        self.init(label: "—", ringFraction: nil, sessionFraction: nil, sessionIsHot: false, isReached: false, isDimmed: true, tooltip: parts.joined(separator: " · "))
     }
 
-    private init(label: String, ringFraction: Double?, isReached: Bool, isDimmed: Bool, tooltip: String) {
+    private init(label: String, ringFraction: Double?, sessionFraction: Double?, sessionIsHot: Bool, isReached: Bool, isDimmed: Bool, tooltip: String) {
         self.label = label
         self.ringFraction = ringFraction
+        self.sessionFraction = sessionFraction
+        self.sessionIsHot = sessionIsHot
         self.isReached = isReached
         self.isDimmed = isDimmed
         self.tooltip = tooltip

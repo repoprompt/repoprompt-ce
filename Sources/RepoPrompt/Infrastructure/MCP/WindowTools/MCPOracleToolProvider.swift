@@ -8,9 +8,23 @@ import RepoPromptDomainRuntime
 final class MCPOracleToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .oracle
 
-    static let askOracleImageUsageDescription = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
+    static let oracleImageUsageDescription = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. Limits: \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
 
-    static let askOracleImagesArgumentDescription = "Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` inside a loaded workspace root (including screenshots saved under a workspace root) or the exact path of an image the user attached to this agent session, and may include transient `title`. Unsupported transports, remote URLs, sibling attachments, and arbitrary paths outside loaded roots are rejected. Max \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
+    static let oracleImagesArgumentDescription = "Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` inside a loaded workspace root (including screenshots saved under a workspace root) or the exact path of an image the user attached to this agent session, and may include transient `title`. Unsupported transports, remote URLs, sibling attachments, and arbitrary paths outside loaded roots are rejected. Max \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit."
+
+    private static var oracleImagesSchema: JSONSchema {
+        .array(
+            description: oracleImagesArgumentDescription,
+            items: .object(
+                properties: [
+                    "path": .string(description: "Canonical absolute path inside a currently loaded workspace root, or the exact path of an image attached to this agent session"),
+                    "title": .string(description: "Optional transient image title", maxLength: 200)
+                ],
+                required: ["path"]
+            ),
+            maxItems: OracleImageAttachmentLimits.production.maxCount
+        )
+    }
 
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
@@ -64,7 +78,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab. Omit `chat_id` or set `new_chat=true` to start; otherwise `chat_id` continues. The optional `model` override changes only the primary model of a new conversation.
 
-            \(Self.askOracleImageUsageDescription)
+            \(Self.oracleImageUsageDescription)
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -92,17 +106,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional primary-model override for a new conversation; rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
-                    "images": .array(
-                        description: Self.askOracleImagesArgumentDescription,
-                        items: .object(
-                            properties: [
-                                "path": .string(description: "Canonical absolute path inside a currently loaded workspace root, or the exact path of an image attached to this agent session"),
-                                "title": .string(description: "Optional transient image title", maxLength: 200)
-                            ],
-                            required: ["path"]
-                        ),
-                        maxItems: OracleImageAttachmentLimits.production.maxCount
-                    ),
+                    "images": Self.oracleImagesSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )
@@ -123,6 +127,8 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start. With Model Presets exposed, an exact preset UUID or name is resolved before raw-model interpretation and supplies the complete roster and mapped Chat Preset. An available raw model replaces only the configured primary and retains configured additional Oracles.
             Use `oracle_utils` for passive helpers like models and sessions.
+
+            \(Self.oracleImageUsageDescription)
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -150,6 +156,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional exposed Model Preset name/UUID or available raw primary-model override for an explicit new_chat=true start. Exact preset identity wins a collision; a raw model retains configured additional Oracles. Rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
+                    "images": Self.oracleImagesSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )

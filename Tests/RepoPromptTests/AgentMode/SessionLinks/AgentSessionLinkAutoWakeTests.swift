@@ -51,6 +51,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     override func tearDown() {
         for viewModel in retained {
             for session in viewModel.sessions.values {
+                session.oversight.retireSnoozeState()
                 session.oversight.retirePeriodicScheduling()
                 session.oversight.pendingAutoWake?.task?.cancel()
             }
@@ -449,7 +450,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             runID: XCTUnwrap(fixture.session.runID), runAttemptID: UUID()
         )
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: "continue safely", idempotencyKey: "parked-wake", owner: owner)
+        _ = state.reserve(note: "continue safely", idempotencyKey: "parked-wake", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.compactTurnSucceeded = true
         state.active?.phase = .parked
         fixture.session.selfCompactState = state
@@ -586,7 +587,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 14 supersedes"))
         XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
@@ -2376,6 +2377,53 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNotNil(fixture.session.oversight.pendingAutoWake)
     }
 
+    /// This cancellation test owns wake scheduling; positive exact-Read/frontier and physical
+    /// waiting-resume coverage uses the shared real-authority fixture in the adapter suite.
+    func testLocalInputCancelledWaitingAutoWakeDuringReadProofDoesNotResumeOrConsume() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let gate = TestReleaseFence(name: "waiting Auto-wake optional Read cancellation")
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { baseline in
+            .init(fragment: baseline.fragment + "\n<user_input>must not escape</user_input>", markupDeltaBytes: 43, requirements: [])
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+            await gate.enterAndWait()
+            return false
+        }
+        let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        defer { gate.release()
+            let continuation = fixture.session.instructionContinuation
+            fixture.session.instructionContinuation = nil
+            fixture.session.instructionWaitID = nil
+            continuation?.resume(throwing: CancellationError())
+            waiting.cancel()
+        }
+        try await AsyncTestWait.waitUntil("waiting continuation installed before wake") {
+            await MainActor.run { fixture.session.instructionContinuation != nil }
+        }
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let entered = await gate.waitUntilEntered()
+        guard entered else { return XCTFail("waiting Auto-wake never entered optional Read proof") }
+        let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let task = try XCTUnwrap(wake.task)
+        let snapshot = fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+        task.cancel()
+        gate.release()
+        await task.value
+        XCTAssertNotNil(fixture.session.instructionContinuation)
+        XCTAssertFalse(fixture.session.items.contains { $0.id == wake.wakeID && $0.kind == .system })
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake?.attemptedFingerprint)
+        XCTAssertNotEqual(fixture.session.oversight.pendingAutoWake?.physicalOutcome, .accepted)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID], snapshot)
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let continuation = fixture.session.instructionContinuation
+        fixture.session.instructionContinuation = nil
+        fixture.session.instructionWaitID = nil
+        continuation?.resume(throwing: CancellationError())
+        _ = try? await waiting.value
+    }
+
     /// Drives the real waiting-instruction continuation from suspension through lane acceptance.
     /// The returned origin, user-activity timestamp, and transcript authorship are the observable
     /// contract that distinguishes this from an ordinary user answer.
@@ -3854,9 +3902,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    /// Many records, one task: a re-arm replaces its predecessor, and the cancelled token can never
-    /// expire the replacement's records.
-    func testOneNearestDeadlineTaskSurvivesExtensionAndAStaleTokenCannotExpireItsReplacement() async throws {
+    /// Many records, one task: even a cancelled predecessor resumed normally cannot re-arm or
+    /// expire the replacement's records. This exercises cancellation, not token-only invalidation.
+    func testOneNearestDeadlineTaskSurvivesExtensionAndACancelledDeadlineCannotRearmItsReplacement() async throws {
         let fixture = try makeFixture()
         let clock = installSnoozeClock(fixture)
         try publishInventory(fixture, revision: 1)
@@ -3879,20 +3927,36 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         _ = try requireSnoozeSuccess(
             mutateSnooze(fixture, endpoint: endpoint, laneIndex: 1, command: .set(durationSeconds: 1200))
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1, "two records still own exactly one deadline task")
+        let firstDeadline = clock.instant.advanced(by: .seconds(600))
+        // Cancellation reaps clock sleepers asynchronously; a yield budget is not a drain.
+        try await AsyncTestWait.waitUntil("two records to share only the nearest deadline") {
+            await MainActor.run { clock.pendingDeadlines == [firstDeadline] }
+        }
         let firstToken = try XCTUnwrap(fixture.session.oversight.snoozeTaskToken)
+        let firstTask = try XCTUnwrap(fixture.session.oversight.snoozeDeadlineTask)
+        let resumedBeforeExtension = clock.resumedSleepCount
+        let replacementDeadline = clock.instant.advanced(by: .seconds(1200))
+        let extendedDeadline = clock.instant.advanced(by: .seconds(3600))
 
-        // Extending past the other record's deadline re-arms on the new nearest deadline.
+        // No suspension between cancellation and firing: the old sleeper resumes successfully
+        // before its asynchronous cancellation cleanup can reap it.
         _ = try requireSnoozeSuccess(
             mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 3600))
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1)
-        XCTAssertNotEqual(fixture.session.oversight.snoozeTaskToken, firstToken)
-
+        let replacementToken = try XCTUnwrap(fixture.session.oversight.snoozeTaskToken)
+        XCTAssertNotEqual(replacementToken, firstToken)
         clock.advance(seconds: 600)
-        await settleSnoozeTasks()
+        XCTAssertEqual(clock.resumedSleepCount, resumedBeforeExtension + 1, "the superseded sleeper actually resumed")
+        await firstTask.value
+
+        try await AsyncTestWait.waitUntil("the replacement deadline and cancelled sleepers to settle") {
+            await MainActor.run { clock.pendingDeadlines == [replacementDeadline] }
+        }
+        XCTAssertEqual(
+            fixture.session.oversight.snoozeTaskToken,
+            replacementToken,
+            "the completed cancelled task cannot re-arm the replacement"
+        )
         XCTAssertEqual(
             fixture.session.oversight.autoWakeSnoozes.count,
             2,
@@ -3901,7 +3965,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         clock.advance(seconds: 600)
         try await AsyncTestWait.waitUntil("the surviving deadline to expire only the due record") {
-            await MainActor.run { fixture.session.oversight.autoWakeSnoozes.count == 1 }
+            await MainActor.run {
+                fixture.session.oversight.autoWakeSnoozes.count == 1
+                    && clock.pendingDeadlines == [extendedDeadline]
+            }
         }
         XCTAssertNotNil(
             fixture.session.oversight.autoWakeSnoozes[AgentSessionLinkAutoWakeSnoozeKey(
@@ -3932,8 +3999,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.oversight.pendingAutoWake,
             "routine content inside the interval reserves nothing"
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1, "the shared deadline carries the interval")
+        let intervalDeadline = clock.instant.advanced(by: .seconds(300))
+        try await AsyncTestWait.waitUntil("only the shared deadline to carry the interval") {
+            await MainActor.run { clock.pendingDeadlines == [intervalDeadline] }
+        }
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.entries.count,
             1,
@@ -4501,7 +4570,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.oversight.retirePeriodicScheduling()
         }
         fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { bridge.isPeriodicWakeObserverLive(for: $0) }
-        let failed = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let failed = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         registry.didFailDurableDeletion(failed)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
         _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
@@ -4516,7 +4585,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             _ = await gate.requirement()
             await cleanup?(sessionID)
         }
-        let token = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let token = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
         await gate.waitUntilEntered()
         // Assert the contested state, so an unrelated inventory withdrawal cannot make this pass.
@@ -4752,6 +4821,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let session = AgentTabSession(tabID: fixture.tabID)
             session.hasLoadedPersistedState = true
             session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertNil(session.operationAdmissionFailureMessage)
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
             session.selectedAgent = .claudeCode
             session.providerSessionID = "missing-original-session"
@@ -5043,10 +5114,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         session.oversight.autoWakeOnUpdates = false
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Wake admission begins with a restored session, not an unfinished fresh creation.
+        // Keep the proof attached to this binding; competing-writer fixtures remain unready.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNil(session.operationAdmissionFailureMessage)
         let fixture = Fixture(
             viewModel: viewModel,
             session: session,

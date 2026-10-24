@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
@@ -130,6 +131,8 @@ extension AgentModeViewModel {
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
+        // Discovery state is pane presentation input (§4.2); it grants no session-link authority.
+        syncTranscriptUIState()
         return AgentSessionLinkDiscoveryEpoch(
             windowID: windowID,
             workspaceID: workspaceID,
@@ -163,6 +166,7 @@ extension AgentModeViewModel {
             return
         }
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
+        syncTranscriptUIState()
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.discovery",
@@ -326,7 +330,9 @@ extension AgentModeViewModel {
             // rather than travelling on the candidate as authoritative.
             restorationReadiness: session.qualifiedRestorationReadiness,
             isDeletionInProgress: AgentSessionDeletionRegistry.shared
-                .isDeletionInProgress(sessionID: sessionID)
+                .isDeletionInProgress(sessionID: sessionID),
+            parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID
         )
     }
 
@@ -1180,8 +1186,9 @@ extension AgentModeViewModel {
     }
 
     /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
-    /// overseer for this row). The bridge enforces the Oversee-by rule: the pasted session must
-    /// already hold an outbound link.
+    /// overseer for this row). The pasted session may be any eligible session — the menu list
+    /// still offers existing overseers only, but a pasted ID may name a session that has not
+    /// overseen anything yet.
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
@@ -1302,6 +1309,7 @@ extension AgentModeViewModel {
             periodicIdleWakeEnabled: overlaid.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: overlaid.periodicIdleWakeIntervalSeconds,
             pendingUpdates: overlaid.pendingUpdates,
+            overseerBootstrapState: overlaid.overseerBootstrapState,
             persistence: overlaid.persistence
         )
     }
@@ -1322,6 +1330,9 @@ extension AgentModeViewModel {
             .filter { tabID, session in sessions[tabID] == nil && session.activeAgentSessionID != nil }
             .map(\.key)
         guard !closedTabIDs.isEmpty else { return }
+        // sessions.removeValue/removeAll have already committed in this didSet. Retire the
+        // presentation census before pruning can repaint rows or bindingEnded can suspend.
+        AgentSessionLinkRuntimeBridge.shared.noteCandidateReadinessChanged()
         agentSessionLinkPruneProjections()
         for tabID in closedTabIDs {
             AgentSessionLinkInvalidationSink.bindingEnded(
@@ -1377,7 +1388,7 @@ extension AgentModeViewModel {
         }
         return AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: identity?.persistentBindingGeneration != nil,
-            hasLoadedPersistedState: session.hasLoadedPersistedState,
+            hasLoadedPersistedState: session.hasLoadedPersistedState && session.permitsBoundOperationAndSave,
             isChildSession: session.parentSessionID != nil,
             isMCPControlled: session.mcpControlContext != nil,
             isMCPOriginated: session.isMCPOriginated,
@@ -1429,6 +1440,7 @@ extension AgentModeViewModel {
         var props = Self.monitorPillProps(
             sessionID: sessionID,
             published: published,
+            currentEndpoint: endpoint,
             eligibility: agentSessionLinkEligibilityInput(for: session, tabID: tabID),
             roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
@@ -1444,6 +1456,7 @@ extension AgentModeViewModel {
                 for: endpoint,
                 outbound: props.outbound
             )
+            props.overseerBootstrapState = agentSessionLinkBootstrapState(for: endpoint)
         }
         return props
     }
@@ -1456,11 +1469,13 @@ extension AgentModeViewModel {
     /// published while it was still loading (for example during a full refresh caused by some other
     /// session's link) would otherwise keep "Load this thread before adding sessions to oversee." forever. The
     /// stored props remain authoritative for outbound/inbound rows and notices.
+    /// `currentEndpoint` addresses only the synthesized fallback; published props retain their endpoint.
     /// `nonisolated` because it is a pure function of its arguments: it touches no view-model state,
     /// which is what makes the stale-eligibility behaviour testable without building a view model.
     nonisolated static func monitorPillProps(
         sessionID: UUID,
         published: AgentMonitorPillProps?,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
         eligibility: AgentSessionLinkEndpointEligibility.Input,
         roleAllowsOutboundMonitoring: Bool,
         persistence: AgentSessionOversightPersistencePresentation = .noDurableLayer
@@ -1472,6 +1487,7 @@ extension AgentModeViewModel {
         guard let published else {
             return AgentMonitorPillProps(
                 sessionID: sessionID,
+                endpoint: currentEndpoint,
                 outbound: [],
                 inbound: [],
                 recentNotices: [],
@@ -1694,5 +1710,54 @@ extension AgentModeViewModel {
             return redacted.isEmpty ? nil : redacted
         }
         return nil
+    }
+}
+
+// MARK: - Read-only external resident status
+
+extension AgentModeViewModel {
+    /// Counts only the exact observer's existing published rows. The caller supplies the live
+    /// authority result and re-proves endpoint identity after its actor hop; this never refreshes.
+    func mcpResidentLaneStateCounts(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        hasOutboundLinks: Bool
+    ) throws -> (idle: Int, running: Int, awaitingUser: Int, unavailable: Int) {
+        let notReady = MCPError.invalidParams(
+            "Live status is not ready for this session binding. Retry agent_run.poll."
+        )
+        guard agentSessionLinkPromptInventoryHoldsByEndpoint[endpoint] == nil else { throw notReady }
+        guard hasOutboundLinks else {
+            // A grant can finish committing after the authority read but before this MainActor pass.
+            // Its current published inventory must not be flattened into a zero-lane answer.
+            if let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
+               published.endpoint == endpoint, !published.inventory.isEmpty
+            {
+                throw notReady
+            }
+            return (0, 0, 0, 0)
+        }
+        guard let props = monitorPillPropsByEndpoint[endpoint], props.endpoint == endpoint,
+              let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
+              published.endpoint == endpoint
+        else { throw notReady }
+        let references = published.inventory.items.compactMap(\.reference)
+        let rows = props.outbound
+        guard references.count == published.inventory.items.count,
+              !rows.isEmpty,
+              Set(references) == Set(rows.map {
+                  DomainAgentSessionLinkReference(linkID: $0.linkID, generation: $0.generation)
+              }),
+              rows.count == references.count
+        else { throw notReady }
+        var counts = (idle: 0, running: 0, awaitingUser: 0, unavailable: 0)
+        for row in rows {
+            switch row.status {
+            case .idle: counts.idle += 1
+            case .running: counts.running += 1
+            case .awaitingUser: counts.awaitingUser += 1
+            case .unavailable: counts.unavailable += 1
+            }
+        }
+        return counts
     }
 }

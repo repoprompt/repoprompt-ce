@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptShared
 
 package protocol GlobalSettingsFileStoring {
     var fileURL: URL { get }
@@ -60,7 +61,7 @@ package enum GlobalSettingsPersistenceBlockReason: Equatable {
 /// Schema identity is `(schemaLineage, schemaVersion)`, not `schemaVersion` alone.
 /// See `docs/architecture/settings-persistence.md` before changing the preservation rules.
 package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
-    package static let appSupportDirectoryName = "RepoPrompt CE"
+    package static let appSupportDirectoryName = MCPFilesystemIdentity.current.applicationStateDirectoryName
     package static let settingsDirectoryName = "Settings"
     package static let filename = "globalSettings.json"
     private static let unitTestSettingsDirectory = FileManager.default.temporaryDirectory
@@ -923,6 +924,7 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     private func ensureSettingsDirectoryExists() throws {
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         try fileManager.createDirectory(
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -936,9 +938,11 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     private func supersedeExistingFileToBackup(label: String, removeOriginal: Bool = true) -> URL? {
         guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         do {
+            try AppProfileLocations.current.validateMetadataFile(fileURL)
             let backupDirectory = fileURL
                 .deletingLastPathComponent()
                 .appendingPathComponent("Backups", isDirectory: true)
+            try AppProfileLocations.current.validateMetadataFile(backupDirectory)
             try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
 
             let stamp = Self.backupTimestamp(for: now())
@@ -1054,6 +1058,7 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         let backupDirectory = fileURL
             .deletingLastPathComponent()
             .appendingPathComponent("Backups", isDirectory: true)
+        try AppProfileLocations.current.validateMetadataFile(backupDirectory)
         try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
 
         let stamp = Self.backupTimestamp(for: now())

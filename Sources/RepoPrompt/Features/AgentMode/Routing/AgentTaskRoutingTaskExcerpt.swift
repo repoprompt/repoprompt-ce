@@ -1,15 +1,17 @@
 import Foundation
 
-/// A bounded view of a long task for Jev classification, not the task sent to the agent.
+/// A bounded, masked view of a long task for finite-choice classification, not the task sent to the agent.
 /// Masking is best effort; user-authored prose can still contain sensitive information.
 enum AgentTaskRoutingTaskExcerpt {
+    static let maximumCharacters = 4000
+    static let maximumUTF8Bytes = 16 * 1024
     private static let segmentCharacters = 1200
     private static let segmentUTF8Bytes = 7000
 
     static func make(from text: String) -> String {
         let task = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard task.count > AgentTaskRoutingEnvelopeBuilder.maximumCharacters
-            || task.utf8.count > AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes
+        guard task.count > maximumCharacters
+            || task.utf8.count > maximumUTF8Bytes
         else { return task }
 
         let opening = AutoEffortTaskSummary.make(from: completePrefix(of: task))

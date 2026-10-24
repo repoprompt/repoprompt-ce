@@ -1,0 +1,430 @@
+import Foundation
+import RepoPromptDomainRuntime
+
+/// One synchronous view of presented identities and every physical claim touching them. This is
+/// request-local evidence, never a cache or authority retained across an await or mutation.
+@MainActor
+enum AgentSessionCarrierResolver {
+    weak static var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
+
+    /// Evidence for projecting an already acknowledged workspace group-order edit. Only the exact
+    /// before/after rank may differ; every other carrier and placement conflict remains visible.
+    struct AcknowledgedGroupOrder {
+        let workspaceID: UUID
+        let tabID: UUID
+        let group: String
+        let before: Int?
+        let after: Int?
+    }
+
+    struct Observation {
+        let window: WindowState
+        let workspaceID: UUID
+        let workspaceName: String
+        let sessionID: UUID
+        let tab: ComposeTabState
+        let stashedTabID: UUID?
+        let entry: AgentSessionIndexEntry?
+        let hasCurrentMetadataOwner: Bool
+    }
+
+    struct MetadataObservation {
+        let window: WindowState
+        let workspaceID: UUID
+        let entry: AgentSessionIndexEntry
+    }
+
+    struct RuntimeOwner {
+        let location: Observation
+        let session: AgentTabSession
+        let binding: AgentSessionRestorationBindingToken
+
+        func matches(_ other: Self) -> Bool {
+            location.window === other.location.window && session === other.session
+                && location.workspaceID == other.location.workspaceID
+                && location.tab.id == other.location.tab.id && binding == other.binding
+        }
+    }
+
+    struct Snapshot {
+        var rows: [Observation] = []
+        var ambiguousSessionIDs: Set<UUID> = []
+        var placementConflictSessionIDs: Set<UUID> = []
+        var metadata: [UUID: [MetadataObservation]] = [:]
+        var uniqueLocations: [UUID: Observation] = [:]
+        /// Equal replicas are readable, but no synchronous canonical write owner is established.
+        var replicatedSessionIDs: Set<UUID> = []
+        /// One exact bound payload owner; agreeing presentation replicas remain replicated.
+        var uniqueRuntimeOwners: [UUID: RuntimeOwner] = [:]
+        /// Liveness states from the same per-window binding census that proved `uniqueRuntimeOwners`,
+        /// so a caller needing both never builds a second census in the same synchronous read.
+        var runtimeStatesByWindow: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
+        var claimedWorkspaceIDs: [UUID: Set<UUID>] = [:]
+        var sessionIDs: Set<UUID> = []
+        var bindingClaimDescriptions: [UUID: Set<String>] = [:]
+        fileprivate var fences: [WindowFence] = []
+
+        func bindingConflictDetail(for sessionID: UUID) -> String? {
+            guard ambiguousSessionIDs.contains(sessionID) else { return nil }
+            let claims = bindingClaimDescriptions[sessionID, default: []].sorted()
+            guard !claims.isEmpty else { return "More than one physical or runtime binding claims this session." }
+            let suffix = claims.count > 8 ? "; plus \(claims.count - 8) additional claims" : ""
+            return "More than one physical or runtime binding claims this session. Competing carriers: "
+                + claims.prefix(8).joined(separator: "; ") + suffix
+        }
+
+        func affectedWorkspaceIDs(for sessionID: UUID) -> Set<UUID> {
+            Set(metadata[sessionID, default: []].map(\.workspaceID))
+                .union(claimedWorkspaceIDs[sessionID] ?? [])
+        }
+
+        @MainActor
+        func isCurrent() -> Bool {
+            fences.allSatisfy { fence in
+                let store = fence.window.agentModeViewModel.sessionIndexStore
+                return !fence.window.isClosing
+                    && fence.window.workspaceManager.activeWorkspaceID == fence.workspaceID
+                    && store.sessionIndexOwner == fence.owner
+                    && store.latestSessionIndexOwner == fence.latestOwner
+            }
+        }
+    }
+
+    fileprivate struct WindowFence {
+        let window: WindowState
+        let workspaceID: UUID?
+        let owner: AgentModeViewModel.SessionIndexOwner?
+        let latestOwner: AgentModeViewModel.SessionIndexOwner?
+    }
+
+    private struct PhysicalKey: Hashable {
+        let workspaceID: UUID
+        let tabID: UUID
+        let stashedTabID: UUID?
+    }
+
+    private struct LiveAddress: Hashable {
+        let workspaceID: UUID?
+        let tabID: UUID
+    }
+
+    private struct Placement: Equatable {
+        let workspaceID: UUID
+        let parentSessionID: UUID?
+        let createdByOverseerSessionID: UUID?
+        let organizationalParentID: UUID?
+        let delegationScopeID: UUID?
+
+        init(_ observation: MetadataObservation) {
+            workspaceID = observation.workspaceID
+            parentSessionID = observation.entry.parentSessionID
+            createdByOverseerSessionID = observation.entry.createdByOverseerSessionID
+            organizationalParentID = observation.entry.organizationalParentID
+            delegationScopeID = observation.entry.delegationScopeID
+        }
+    }
+
+    private struct Presentation: Equatable {
+        let name: String
+        let workspaceName: String?
+        let isPinned: Bool
+        let pinnedOrder: Int?
+        let group: String?
+        var groupOrder: Int?
+
+        init(_ tab: ComposeTabState, workspaceName: String?) {
+            name = tab.name
+            self.workspaceName = workspaceName
+            isPinned = tab.isPinned
+            pinnedOrder = tab.pinnedOrder
+            group = tab.sidebarGroup
+            groupOrder = tab.sidebarGroupOrder
+        }
+    }
+
+    private struct PhysicalEvidence {
+        let key: PhysicalKey
+        let presentation: Presentation
+        var sourceWindows: Set<ObjectIdentifier>
+    }
+
+    private struct WindowCapture {
+        let window: WindowState
+        let workspace: WorkspaceModel?
+        let entries: [UUID: AgentSessionIndexEntry]
+        let hasCurrentOwner: Bool
+        let directCarriers: [WorkspaceManagerViewModel.SessionCarrier]
+    }
+
+    static func capture(
+        windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil,
+        acknowledgedGroupOrders: [UUID: AcknowledgedGroupOrder] = [:],
+        includeRuntimeOwners: Bool = false
+    ) -> Snapshot {
+        var seenWindows: Set<ObjectIdentifier> = []
+        let runtimeWindows = windows.filter { !$0.isClosing && seenWindows.insert(ObjectIdentifier($0)).inserted }
+        // Prepared runtimes borrow a saved carrier; they are not a second physical/UI claim.
+        // Their exact saved witness is joined below only after real carrier conflicts are checked.
+        let windows = runtimeWindows.filter { !$0.isPreparedSessionOwner }
+        // A census intentionally enumerates owners. Point reads never enumerate dictionary keys,
+        // unrelated workspaces, or unrelated live sessions to discover their candidate identities.
+        let ids: Set<UUID>
+        if let requestedIDs {
+            ids = requestedIDs
+        } else {
+            var discovered: Set<UUID> = []
+            for window in windows {
+                discovered.formUnion(window.agentModeViewModel.ownerValidatedSessionIndex.keys)
+                for session in window.agentModeViewModel.sessions.values {
+                    if let id = session.activeAgentSessionID { discovered.insert(id) }
+                }
+                // Inactive-only sessions are not loaded census members. Their claims are still
+                // discovered below through the exact identity/address closure of loaded members.
+                if let workspace = window.workspaceManager.activeWorkspace {
+                    for tab in workspace.composeTabs {
+                        if let id = tab.activeAgentSessionID { discovered.insert(id) }
+                    }
+                    for stash in workspace.stashedTabs {
+                        if let id = stash.tab.activeAgentSessionID { discovered.insert(id) }
+                    }
+                }
+            }
+            ids = discovered
+        }
+
+        var snapshot = Snapshot()
+        var captures: [WindowCapture] = []
+        var tabIDs: Set<UUID> = []
+        var liveAddresses: [UUID: Set<LiveAddress>] = [:]
+        var identitiesByTabID: [UUID: Set<UUID>] = [:]
+        var claimDescriptionsByTabID: [UUID: Set<String>] = [:]
+        for window in windows {
+            let manager = window.workspaceManager
+            let workspace = manager.activeWorkspace
+            let vm = window.agentModeViewModel
+            let store = vm.sessionIndexStore
+            let owner = store.sessionIndexOwner
+            let validOwner = owner.map { $0.workspaceID == workspace?.id && store.isOwnerCurrent($0) } ?? false
+            snapshot.fences.append(WindowFence(
+                window: window, workspaceID: workspace?.id, owner: owner, latestOwner: store.latestSessionIndexOwner
+            ))
+            let ownerEntries = validOwner ? store.ownerValidatedSessionIndex : [:]
+            var entries: [UUID: AgentSessionIndexEntry] = [:]
+            for id in ids {
+                if let entry = ownerEntries[id], let workspace {
+                    entries[id] = entry
+                    tabIDs.insert(entry.tabID)
+                    snapshot.metadata[id, default: []].append(MetadataObservation(window: window, workspaceID: workspace.id, entry: entry))
+                    snapshot.sessionIDs.insert(id)
+                }
+                let liveTabIDs = vm.liveSessionTabIDs(for: id)
+                tabIDs.formUnion(liveTabIDs)
+                for tabID in liveTabIDs {
+                    // Re-read the live object after the maintained reverse lookup.
+                    guard vm.sessions[tabID]?.activeAgentSessionID == id else { continue }
+                    identitiesByTabID[tabID, default: []].insert(id)
+                    snapshot.sessionIDs.insert(id)
+                    liveAddresses[id, default: []].insert(LiveAddress(workspaceID: workspace?.id, tabID: tabID))
+                    snapshot.bindingClaimDescriptions[id, default: []].insert(
+                        "live window \(window.windowID), workspace \(workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                    )
+                }
+            }
+            let direct = manager.sessionCarriers(sessionIDs: ids)
+            tabIDs.formUnion(direct.map(\.tab.id))
+            captures.append(WindowCapture(
+                window: window, workspace: workspace, entries: entries, hasCurrentOwner: validOwner,
+                directCarriers: direct
+            ))
+        }
+
+        // Read competing live identities at every discovered address, even when the physical
+        // carrier there belongs to an inactive workspace or another requested identity.
+        for capture in captures {
+            for tabID in tabIDs {
+                if let id = capture.window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID {
+                    identitiesByTabID[tabID, default: []].insert(id)
+                    claimDescriptionsByTabID[tabID, default: []].insert(
+                        "live window \(capture.window.windowID), workspace \(capture.workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                    )
+                }
+            }
+        }
+
+        let activeWorkspaceIDs = Set(captures.compactMap { $0.workspace?.id })
+        var physical: [UUID: PhysicalEvidence] = [:]
+        var physicalKeys: [UUID: Set<PhysicalKey>] = [:]
+        for capture in captures {
+            let window = capture.window
+            let vm = window.agentModeViewModel
+            let activeWorkspaceID = capture.workspace?.id
+            // Address closure spans windows as well as workspaces: a requested identity cannot
+            // ignore another owner's explicit claim on the address through which it will mutate.
+            // Capture is synchronous: reuse this manager's direct physical rows within this
+            // request, retaining every duplicate. This is not a cache across awaits or mutations.
+            let additionalCarriers = window.workspaceManager.sessionCarriers(
+                sessionIDs: [], tabIDs: tabIDs, excludingSessionIDs: ids
+            )
+            for carrier in capture.directCarriers + additionalCarriers {
+                let tab = carrier.tab
+                let isActiveWorkspace = carrier.workspaceID == activeWorkspaceID
+                // Another window's inactive catalog copy is not a second physical owner of a
+                // currently open workspace. Its stale title or active/archive projection must
+                // not poison the real owner's next read or undo. Other workspace identities
+                // still contribute conflict evidence through the indexed address closure.
+                if !isActiveWorkspace, activeWorkspaceIDs.contains(carrier.workspaceID) { continue }
+                let key = PhysicalKey(workspaceID: carrier.workspaceID, tabID: tab.id, stashedTabID: carrier.stashedTabID)
+                var claims: Set<UUID> = []
+                if let persistedID = tab.activeAgentSessionID { claims.insert(persistedID) }
+                let effectiveID: UUID?
+                if isActiveWorkspace {
+                    if carrier.stashedTabID == nil {
+                        effectiveID = vm.authoritativeSessionID(for: tab)
+                            ?? (capture.hasCurrentOwner ? vm.preferredActiveSidebarEntry(
+                                for: tab.id, tabName: tab.name, workspaceID: carrier.workspaceID
+                            )?.id : nil)
+                        if let liveID = vm.sessions[tab.id]?.activeAgentSessionID { claims.insert(liveID) }
+                    } else {
+                        effectiveID = tab.activeAgentSessionID
+                            ?? (capture.hasCurrentOwner ? vm.preferredSidebarEntry(for: tab.id, tabName: tab.name)?.id : nil)
+                    }
+                    if let effectiveID { claims.insert(effectiveID) }
+                } else {
+                    // An inactive workspace contributes persisted conflict evidence only. Its
+                    // tab UUID does not authorize borrowing the active workspace's live/fallback ID.
+                    effectiveID = nil
+                }
+                identitiesByTabID[tab.id, default: []].formUnion(claims)
+                let workspaceName = window.workspaceManager.workspace(withID: carrier.workspaceID)?.name
+                let description = "window \(window.windowID), workspace '\(workspaceName ?? "Unknown")' (\(carrier.workspaceID)), "
+                    + "\(carrier.stashedTabID == nil ? "compose" : "stashed") tab \(tab.id)"
+                claimDescriptionsByTabID[tab.id, default: []].insert(description)
+                for id in claims where ids.contains(id) {
+                    snapshot.bindingClaimDescriptions[id, default: []].insert(description)
+                    snapshot.sessionIDs.insert(id)
+                    snapshot.claimedWorkspaceIDs[id, default: []].insert(carrier.workspaceID)
+                    physicalKeys[id, default: []].insert(key)
+                    var presentation = Presentation(tab, workspaceName: workspaceName)
+                    if let acknowledged = acknowledgedGroupOrders[id] {
+                        guard carrier.workspaceID == acknowledged.workspaceID, tab.id == acknowledged.tabID,
+                              carrier.stashedTabID == nil, tab.sidebarGroup == acknowledged.group,
+                              tab.sidebarGroupOrder == acknowledged.before || tab.sidebarGroupOrder == acknowledged.after
+                        else {
+                            snapshot.ambiguousSessionIDs.insert(id)
+                            continue
+                        }
+                        presentation.groupOrder = acknowledged.after
+                    }
+                    let sourceWindow = ObjectIdentifier(window)
+                    if var existing = physical[id] {
+                        if existing.key != key || existing.presentation != presentation || !existing.sourceWindows.insert(sourceWindow).inserted {
+                            snapshot.ambiguousSessionIDs.insert(id)
+                        }
+                        physical[id] = existing
+                    } else {
+                        physical[id] = PhysicalEvidence(key: key, presentation: presentation, sourceWindows: [sourceWindow])
+                    }
+                }
+                // A historical candidate that loses fallback selection stays metadata-only.
+                guard let effectiveID, ids.contains(effectiveID), let workspace = capture.workspace else { continue }
+                snapshot.rows.append(Observation(
+                    window: window, workspaceID: workspace.id, workspaceName: workspace.name,
+                    sessionID: effectiveID, tab: tab, stashedTabID: carrier.stashedTabID,
+                    entry: capture.entries[effectiveID], hasCurrentMetadataOwner: capture.hasCurrentOwner
+                ))
+            }
+        }
+        for (tabID, claims) in identitiesByTabID where claims.count > 1 {
+            let affected = claims.intersection(ids)
+            snapshot.ambiguousSessionIDs.formUnion(affected)
+            for id in affected {
+                snapshot.bindingClaimDescriptions[id, default: []].formUnion(claimDescriptionsByTabID[tabID] ?? [])
+            }
+        }
+        for (id, addresses) in liveAddresses {
+            // Keep an ownerless live address too: lack of a workspace must not erase a second
+            // binding. A singleton orphan remains metadata-only and supplies no mutation location.
+            let keys = physicalKeys[id] ?? []
+            let hasUnmatchedAddress = !keys.isEmpty && addresses.contains { address in
+                !keys.contains { key in
+                    key.workspaceID == address.workspaceID && key.tabID == address.tabID && key.stashedTabID == nil
+                }
+            }
+            if addresses.count > 1 || hasUnmatchedAddress { snapshot.ambiguousSessionIDs.insert(id) }
+        }
+        for (id, observations) in snapshot.metadata {
+            guard let first = observations.first else { continue }
+            let placement = Placement(first)
+            let hasMetadataConflict = observations.contains { Placement($0) != placement }
+            let hasCarrierConflict = snapshot.claimedWorkspaceIDs[id]?.contains { $0 != placement.workspaceID } == true
+            if hasMetadataConflict || hasCarrierConflict {
+                snapshot.placementConflictSessionIDs.insert(id)
+                snapshot.ambiguousSessionIDs.insert(id)
+            }
+        }
+        for row in snapshot.rows where !snapshot.ambiguousSessionIDs.contains(row.sessionID) {
+            if snapshot.uniqueLocations[row.sessionID] == nil {
+                snapshot.uniqueLocations[row.sessionID] = row
+            } else {
+                snapshot.replicatedSessionIDs.insert(row.sessionID)
+            }
+        }
+        var result = preparedSessionRuntimes?.addingPreparedRuntimeCarriers(
+            to: snapshot, sessionIDs: requestedIDs, windowIDs: Set(windows.map(\.windowID))
+        ) ?? snapshot
+        if includeRuntimeOwners {
+            var owners = runtimeWindows
+            for row in result.rows where seenWindows.insert(ObjectIdentifier(row.window)).inserted {
+                owners.append(row.window)
+            }
+            let ownerIDs = requestedIDs ?? result.sessionIDs
+            // One binding census per window serves both the runtime owners and liveness states.
+            let censuses = owners.map { ($0, $0.agentModeViewModel.authoritativeLiveSessionCensus(for: ownerIDs)) }
+            result.uniqueRuntimeOwners = runtimeOwners(in: result, censuses: censuses)
+            result.runtimeStatesByWindow = Dictionary(
+                censuses.map { (ObjectIdentifier($0.0), $0.1.states) }, uniquingKeysWith: { first, _ in first }
+            )
+        }
+        return result
+    }
+
+    private static func runtimeOwners(
+        in snapshot: Snapshot,
+        censuses: [(window: WindowState, census: AgentModeViewModel.AuthoritativeLiveSessionCensus)]
+    ) -> [UUID: RuntimeOwner] {
+        var candidates: [UUID: (Observation, AgentTabSession)] = [:]
+        var conflicts = snapshot.ambiguousSessionIDs
+        for (window, census) in censuses {
+            for (id, result) in census.sessions {
+                switch result {
+                case .failure:
+                    conflicts.insert(id)
+                case .success(nil):
+                    break
+                case let .success(session?):
+                    guard let row = snapshot.rows.first(where: {
+                        $0.sessionID == id && $0.window === window && $0.stashedTabID == nil
+                            && $0.tab.id == session.tabID && $0.hasCurrentMetadataOwner
+                            && $0.entry?.id == id && $0.entry?.tabID == session.tabID
+                            && window.workspaceManager.activeWorkspaceID == $0.workspaceID
+                    }) else {
+                        conflicts.insert(id)
+                        continue
+                    }
+                    if let existing = candidates[id], existing.1 !== session || existing.0.window !== window {
+                        conflicts.insert(id)
+                    } else {
+                        candidates[id] = (row, session)
+                    }
+                }
+            }
+        }
+        return candidates.reduce(into: [:]) { owners, candidate in
+            let (id, (row, session)) = candidate
+            guard !conflicts.contains(id), session.permitsBoundOperationAndSave,
+                  let binding = session.currentRestorationBindingToken,
+                  binding.bindingIdentity.sessionID == id, binding.bindingIdentity.tabID == row.tab.id else { return }
+            owners[id] = RuntimeOwner(location: row, session: session, binding: binding)
+        }
+    }
+}

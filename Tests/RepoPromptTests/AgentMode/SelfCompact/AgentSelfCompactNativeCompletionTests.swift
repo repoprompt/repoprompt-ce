@@ -14,6 +14,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         var ownerIsCurrent = true
         var pendingSleeps: [CheckedContinuation<Void, Never>] = []
         var slept: [Duration] = []
+        var instant = ContinuousClock.now
         let owner = AgentSelfCompactOwner(
             windowID: 1, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
             persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1,
@@ -23,7 +24,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         let compactAttemptID = UUID()
 
         func arm(support: AgentSessionLinkCompactSupport = .claudeCode, note: String = "alpha\nβeta") -> UUID {
-            _ = state.reserve(note: note, idempotencyKey: "key", owner: owner)
+            _ = state.reserve(note: note, idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.admittedSupport = support
             state.active?.phase = .dispatchingCompact
             state.active?.compactProviderConversation = "provider-conversation"
@@ -59,7 +60,8 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                     await withCheckedContinuation { continuation in
                         self.pendingSleeps.append(continuation)
                     }
-                }
+                },
+                now: { self.instant }
             )
         }
 
@@ -87,6 +89,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         }
 
         func advanceDeadline() {
+            instant = instant.advanced(by: .seconds(300))
             let sleepers = pendingSleeps
             pendingSleeps.removeAll()
             sleepers.forEach { $0.resume() }
@@ -111,7 +114,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         for error in definitive {
             XCTAssertTrue(error.definitivelyRejectsInput)
             var state = AgentSelfCompactState()
-            _ = state.reserve(note: "recover", idempotencyKey: "key")
+            _ = state.reserve(note: "recover", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             state.active?.phase = .dispatchingNote
             let dispatchID = try AgentSelfCompactionDispatchID(requestID: XCTUnwrap(state.active?.id), stage: .note)
             XCTAssertTrue(state.noteWillAttempt(dispatchID))
@@ -269,8 +272,8 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
         XCTAssertEqual(fake.dispatchCount, 1)
-        XCTAssertEqual(fake.state.reserve(note: "alpha\nβeta", idempotencyKey: "key", owner: fake.owner), .duplicate(id))
-        guard case .scheduled = fake.state.reserve(note: "next note", idempotencyKey: "next-key", owner: fake.owner) else {
+        XCTAssertEqual(fake.state.reserve(note: "alpha\nβeta", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner), .duplicate(id))
+        guard case .scheduled = fake.state.reserve(note: "next note", idempotencyKey: "next-key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner) else {
             return XCTFail("A settled transport failure must not block a new compaction request")
         }
     }
@@ -295,45 +298,370 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         }
     }
 
-    func testDeadlineParksTheNoteUnverifiedAndLateCompletionNeverSendsIt() async {
+    func testDeadlineLateNativeConfirmationSendsVerifiedNoteOnce() async {
+        for support in [AgentSessionLinkCompactSupport.claudeCode, .codex] {
+            let fake = Fake()
+            let id = fake.arm(support: support)
+            let coordinator = fake.coordinator()
+            await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+            defer {
+                coordinator.cancelRuntimeWork()
+                fake.advanceDeadline()
+            }
+            // Codex supplies compact-kind success at the provider event boundary.
+            if support == .codex { fake.state.active?.compactTurnSucceeded = true }
+            let revision = fake.completeRevision(status: .completed)
+            coordinator.compactTurnSettled(
+                revision: revision, publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            coordinator.compactTurnSettled(
+                revision: revision, publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            await drain()
+            XCTAssertEqual(fake.dispatchCount, 1, "support \(support)")
+            XCTAssertEqual(fake.providerBoundTexts, [AgentSelfCompactNoteEnvelope.frame("alpha\nβeta")])
+            XCTAssertNil(fake.state.active)
+            XCTAssertEqual(fake.state.latest?.requestID, id)
+            XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
+            XCTAssertEqual(fake.state.latest?.completionVerified, true)
+            XCTAssertEqual(fake.state.latest?.noteDelivery, .accepted)
+        }
+    }
+
+    func testDeadlineLateConfirmationReparksWhenStandaloneStartIsRejected() async {
         let fake = Fake()
+        fake.shouldStartNote = false
         let id = fake.arm()
         let coordinator = fake.coordinator()
-        XCTAssertTrue(coordinator.bindCompact(
-            .init(requestID: id, stage: .compact),
-            runID: fake.compactRunID,
-            runAttemptID: fake.compactAttemptID
-        ))
-        await drain()
-        XCTAssertEqual(fake.slept, [.seconds(300)])
-        fake.advanceDeadline()
-        await drain()
-        // The continuation survives a slow native compaction, exactly like an unverified ACP turn.
-        XCTAssertNil(fake.state.latest)
-        XCTAssertEqual(fake.state.active?.phase, .parked)
-        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
-        XCTAssertEqual(fake.state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
-        XCTAssertEqual(fake.state.status?.outcome, .completionUnverified)
-        XCTAssertEqual(fake.state.status?.noteDelivery, .parked)
-        XCTAssertFalse(fake.state.blocksOverseerDelivery)
-        XCTAssertFalse(fake.state.blocksManagedStop)
-
+        await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
         coordinator.compactTurnSettled(
             revision: fake.completeRevision(status: .completed),
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
         await drain()
-        XCTAssertEqual(fake.dispatchCount, 0, "a late command terminal never manufactures a prompt")
+        XCTAssertEqual(fake.dispatchCount, 1)
         XCTAssertEqual(fake.state.active?.phase, .parked)
-
-        // Only the next ordinary send consumes it, once, still reporting unverified completion.
+        XCTAssertNil(fake.state.active?.acpCompletionUnverified)
+        XCTAssertEqual(fake.state.active?.compactTurnSucceeded, true)
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 1, "a duplicate terminal cannot retry a rejected note start")
         let noteID = AgentSelfCompactionDispatchID(requestID: id, stage: .note)
         XCTAssertTrue(fake.state.noteWillAttempt(noteID))
         XCTAssertTrue(fake.state.noteAccepted(noteID))
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(fake.state.latest?.completionVerified, true)
+    }
+
+    func testOrdinaryInputWinsBeforeLateConfirmationAndConsumesOnlyOnce() async {
+        let fake = Fake()
+        let id = fake.arm()
+        let coordinator = fake.coordinator()
+        await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+        coordinator.supersedeForOrdinaryInput()
+        // Accepted input wins even before its provider transport starts.
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        let noteID = AgentSelfCompactionDispatchID(requestID: id, stage: .note)
+        XCTAssertTrue(fake.state.noteWillAttempt(noteID))
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        XCTAssertTrue(fake.state.noteAccepted(noteID))
+        XCTAssertFalse(fake.state.noteAccepted(noteID))
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
         XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
         XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
         XCTAssertEqual(fake.state.latest?.completionVerified, false)
-        XCTAssertNil(fake.state.active)
+    }
+
+    func testLateConfirmationRejectsWrongRunAttemptPublicationAndOwner() async {
+        let fake = Fake()
+        let id = fake.arm()
+        let coordinator = fake.coordinator()
+        await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed, runAttemptID: UUID()),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        fake.state.active?.compactRunID = UUID()
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        fake.state.active?.compactRunID = fake.compactRunID
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .rejected(reason: "test rejection"), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        fake.ownerIsCurrent = false // The app's endpoint fence covers unlink, close, and rebinding.
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.latest?.outcome, .cancelled)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .notSent)
+    }
+
+    func testOldRuntimeBindingCannotConfirmANewerParkedRequest() async {
+        let fake = Fake()
+        let id = fake.arm()
+        let coordinator = fake.coordinator()
+        await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+        fake.state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        _ = fake.state.reserve(note: "new request", idempotencyKey: "new", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner)
+        fake.state.active?.phase = .parked
+        fake.state.active?.acpCompletionUnverified = true
+        fake.state.active?.compactRunID = fake.compactRunID
+        fake.state.active?.compactRunAttemptID = fake.compactAttemptID
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.active?.note, "new request")
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        coordinator.cancelRuntimeWork()
+    }
+
+    func testReplacedCoordinatorCannotResumeParkedNote() async {
+        let fake = Fake()
+        let id = fake.arm()
+        let original = fake.coordinator()
+        let session = AgentTabSession(tabID: fake.owner.tabID)
+        session.selfCompactNativeCompletion = original
+        await parkAtDeadline(fake, coordinator: original, requestID: id)
+        let replacement = fake.coordinator()
+        session.selfCompactNativeCompletion = replacement
+        for coordinator in [original, replacement] {
+            coordinator.compactTurnSettled(
+                revision: fake.completeRevision(status: .completed),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+        }
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        session.selfCompactNativeCompletion = nil
+    }
+
+    func testNonverifyingLatePublicationsPreserveCarryAndRevokeConfirmation() async {
+        for support in [AgentSessionLinkCompactSupport.claudeCode, .acpAdvertisedCommand] {
+            for publication in nonverifyingPublications() {
+                let fake = Fake()
+                let id = fake.arm(support: support)
+                let coordinator = fake.coordinator()
+                await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+                primeParkedACPCompletionIfNeeded(fake, coordinator: coordinator)
+                coordinator.compactTurnSettled(
+                    revision: fake.completeRevision(status: .completed),
+                    publication: publication, teardownSettled: { true }
+                )
+                await assertRevokedConfirmationKeepsOneShotCarry(fake, coordinator: coordinator, requestID: id)
+            }
+        }
+    }
+
+    func testFailedOrCancelledLateTerminalPreservesCarryAndRevokesConfirmation() async {
+        for support in [AgentSessionLinkCompactSupport.claudeCode, .acpAdvertisedCommand] {
+            for status in [AgentSessionRunState.failed, .cancelled] {
+                let fake = Fake()
+                let id = fake.arm(support: support)
+                let coordinator = fake.coordinator()
+                await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+                primeParkedACPCompletionIfNeeded(fake, coordinator: coordinator)
+                coordinator.compactTurnSettled(
+                    revision: fake.completeRevision(status: status),
+                    publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+                )
+                await assertRevokedConfirmationKeepsOneShotCarry(fake, coordinator: coordinator, requestID: id)
+            }
+        }
+    }
+
+    func testUnprovenLateCodexCompletionPreservesCarryAndRevokesConfirmation() async {
+        let fake = Fake()
+        let id = fake.arm(support: .codex)
+        let coordinator = fake.coordinator()
+        await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await assertRevokedConfirmationKeepsOneShotCarry(fake, coordinator: coordinator, requestID: id)
+    }
+
+    func testRejectedLatePublicationAllowsAuthoritativeRetry() async {
+        for support in [AgentSessionLinkCompactSupport.claudeCode, .acpAdvertisedCommand] {
+            let fake = Fake()
+            let id = fake.arm(support: support)
+            let coordinator = fake.coordinator()
+            await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+            primeParkedACPCompletionIfNeeded(fake, coordinator: coordinator)
+            coordinator.compactTurnSettled(
+                revision: fake.completeRevision(status: .completed),
+                publication: .rejected(reason: "retry commit"), teardownSettled: { true }
+            )
+            XCTAssertEqual(fake.state.active?.phase, .parked)
+            coordinator.compactTurnSettled(
+                revision: fake.completeRevision(status: .completed),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }, vouchedTokenCount: 40
+            )
+            await drain()
+            XCTAssertEqual(fake.dispatchCount, 1)
+            XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
+            XCTAssertEqual(fake.state.latest?.completionVerified, true)
+            coordinator.cancelRuntimeWork()
+        }
+    }
+
+    func testOwnerLossStillCancelsParkedCarryOnNonverifyingPublication() async {
+        for publication in nonverifyingPublications() + [.rejected(reason: "retry commit")] {
+            let fake = Fake()
+            let id = fake.arm()
+            let coordinator = fake.coordinator()
+            await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
+            fake.ownerIsCurrent = false
+            coordinator.compactTurnSettled(
+                revision: fake.completeRevision(status: .completed),
+                publication: publication, teardownSettled: { true }
+            )
+            XCTAssertNil(fake.state.active)
+            XCTAssertNil(fake.state.parkedNote)
+            XCTAssertEqual(fake.state.latest?.outcome, .cancelled)
+            XCTAssertEqual(fake.state.latest?.noteDelivery, .notSent)
+            await drain()
+            XCTAssertEqual(fake.dispatchCount, 0)
+            coordinator.cancelRuntimeWork()
+        }
+    }
+
+    func testNonverifyingPublicationBeforeDeadlineStillSettlesRecovery() async {
+        for publication in nonverifyingPublications() {
+            let fake = Fake()
+            let id = fake.arm()
+            let coordinator = fake.coordinator()
+            XCTAssertTrue(coordinator.bindCompact(
+                .init(requestID: id, stage: .compact),
+                runID: fake.compactRunID, runAttemptID: fake.compactAttemptID
+            ))
+            await drain()
+            coordinator.compactTurnSettled(
+                revision: fake.completeRevision(status: .completed),
+                publication: publication, teardownSettled: { true }
+            )
+            XCTAssertNil(fake.state.active)
+            XCTAssertNil(fake.state.parkedNote)
+            XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
+            XCTAssertEqual(fake.state.latest?.noteDelivery, .notSent)
+            XCTAssertEqual(fake.state.latest?.recoveryNote, "alpha\nβeta")
+            XCTAssertEqual(fake.dispatchCount, 0)
+            coordinator.cancelRuntimeWork()
+            fake.advanceDeadline()
+        }
+    }
+
+    private func nonverifyingPublications() -> [AgentRunTerminalPublicationResult] {
+        [
+            .stale,
+            .accepted(successorEpoch: .init(
+                sessionID: UUID(), activationID: UUID(), registrationGeneration: 1,
+                id: UUID(), ordinal: 2, continuityGeneration: 1, transitionKind: .relatedFollowUp
+            ))
+        ]
+    }
+
+    private func primeParkedACPCompletionIfNeeded(
+        _ fake: Fake,
+        coordinator: AgentSelfCompactNativeCompletionCoordinator
+    ) {
+        guard fake.state.active?.admittedSupport == .acpAdvertisedCommand else { return }
+        fake.state.active?.usedTokensBeforeCompact = 100
+        // A completed ACP turn without a vouch keeps the parked note and a live usage callback.
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }, assistantOrToolRowCount: 0
+        )
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+    }
+
+    private func assertRevokedConfirmationKeepsOneShotCarry(
+        _ fake: Fake,
+        coordinator: AgentSelfCompactNativeCompletionCoordinator,
+        requestID: UUID
+    ) async {
+        defer { coordinator.cancelRuntimeWork() }
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        XCTAssertEqual(fake.state.active?.noteDispatchStarted, false)
+        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
+        XCTAssertNil(fake.state.latest)
+        // Both a later authoritative terminal and a naturally delivered ACP vouch must be inert.
+        fake.state.active?.compactTurnSucceeded = true
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }, vouchedTokenCount: 40
+        )
+        coordinator.noteVouchedContextCount(40)
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+        guard let carry = fake.state.parkedNote else { return XCTFail("Non-verifying signals must retain the carry") }
+        XCTAssertEqual(carry.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
+        XCTAssertEqual(carry.dispatchID.requestID, requestID)
+        XCTAssertTrue(fake.state.noteWillAttempt(carry.dispatchID))
+        XCTAssertTrue(fake.state.noteAccepted(carry.dispatchID))
+        XCTAssertFalse(fake.state.noteAccepted(carry.dispatchID))
+        XCTAssertEqual(fake.state.latest?.outcome, .completionUnverified)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(fake.state.latest?.completionVerified, false)
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }, vouchedTokenCount: 40
+        )
+        coordinator.noteVouchedContextCount(40)
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 0)
+    }
+
+    private func parkAtDeadline(
+        _ fake: Fake,
+        coordinator: AgentSelfCompactNativeCompletionCoordinator,
+        requestID: UUID
+    ) async {
+        XCTAssertTrue(coordinator.bindCompact(
+            .init(requestID: requestID, stage: .compact),
+            runID: fake.compactRunID, runAttemptID: fake.compactAttemptID
+        ))
+        await drain()
+        XCTAssertEqual(fake.slept, [.seconds(300)])
+        fake.advanceDeadline()
+        await drain()
+        XCTAssertNil(fake.state.latest)
+        XCTAssertEqual(fake.state.active?.phase, .parked)
+        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
+        XCTAssertEqual(fake.state.parkedNote?.frame, AgentSelfCompactNoteEnvelope.frame("alpha\nβeta"))
+        XCTAssertFalse(fake.state.blocksOverseerDelivery)
+        XCTAssertFalse(fake.state.blocksManagedStop)
+        XCTAssertEqual(fake.dispatchCount, 0)
     }
 
     func testDeadlineAfterOwnerLossStillCancelsInsteadOfParking() async {
@@ -423,7 +751,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                 "Context compaction was requested by this session.",
                 "Scheduled self-compaction was cancelled before it reached the provider.",
                 "Self-compaction could not start. The continuation note was retained for recovery.",
-                "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
+                "Compaction is not confirmed yet. The session resumes when it is, or with your next message.",
                 "A continuation note from before compaction was restored to this session."
             ]
         )

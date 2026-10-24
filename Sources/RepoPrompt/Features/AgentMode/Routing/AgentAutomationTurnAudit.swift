@@ -48,6 +48,15 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
         }
     }
 
+    struct Reprompt: Codable, Equatable {
+        enum Outcome: String, Codable { case approved, sentOriginal, bypassed }
+        enum JudgedText: String, Codable { case approved, originalFallback }
+        enum Speculation: String, Codable { case none, reused, discardedEdited, discardedStale }
+        var outcome: Outcome
+        var automationJudgedText: JudgedText?
+        var routerSpeculation: Speculation = .none
+    }
+
     enum CodexDelivery: String, Codable {
         case start
         case steer
@@ -74,6 +83,8 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
     var providerTurnAccepted = false
     /// Codex's last observed delivery path. A queued fallback is local durability, not provider acceptance.
     var codexDelivery: CodexDelivery?
+    /// Optional and content-free, so historical audit records decode unchanged.
+    var reprompt: Reprompt?
 
     mutating func recordCodexQueuedFallback() {
         codexDelivery = .queuedFallback

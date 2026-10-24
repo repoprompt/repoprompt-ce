@@ -4,6 +4,64 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class OpenCodeACPModelDiscoveryTests: XCTestCase {
+    private struct RefreshClient: OpenCodeACPModelDiscoveryClient {
+        let result: ACPDiscoveredSessionModels?
+        let failure: (any Error)?
+
+        func discoverModels(workspacePath _: String?, modelRaw _: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
+            if let failure { throw failure }
+            guard let result else { return nil }
+            return OpenCodeACPModelDiscoveryResult(catalog: result, parameterState: nil)
+        }
+    }
+
+    func testRefreshOutcomesDistinguishChangedUnchangedEmptyAndFailure() async {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        let coldEmpty = OpenCodeACPModelPollingService(
+            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil)
+        )
+        let coldEmptyOutcome = await coldEmpty.refreshNow(workspacePath: nil)
+        XCTAssertEqual(coldEmptyOutcome, .noModelsAdvertised)
+        await coldEmpty.shutdown()
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+
+        let catalog = ACPDiscoveredSessionModels(
+            options: [.init(rawValue: "future-opencode", displayName: "Future", description: nil, isPlaceholderDefault: false, isProviderDefault: true)],
+            currentModelRaw: "future-opencode"
+        )
+        let service = OpenCodeACPModelPollingService(client: RefreshClient(result: catalog, failure: nil))
+        let first = await service.refreshNow(workspacePath: nil)
+        let second = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(first, .updated)
+        XCTAssertEqual(second, .unchanged)
+        await service.shutdown()
+
+        let empty = OpenCodeACPModelPollingService(
+            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil)
+        )
+        let emptyOutcome = await empty.refreshNow(workspacePath: nil)
+        XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.currentSnapshot(for: .openCode)?.options.map(\.rawValue),
+            ["future-opencode"],
+            "empty discovery must retain the last known good registry catalog"
+        )
+        await empty.shutdown()
+
+        let noResult = OpenCodeACPModelPollingService(client: RefreshClient(result: nil, failure: nil))
+        let noResultOutcome = await noResult.refreshNow(workspacePath: nil)
+        XCTAssertEqual(noResultOutcome, .failed)
+        await noResult.shutdown()
+
+        let failed = OpenCodeACPModelPollingService(
+            client: RefreshClient(result: nil, failure: AIProviderError.invalidConfiguration(detail: "offline"))
+        )
+        let failedOutcome = await failed.refreshNow(workspacePath: nil)
+        XCTAssertEqual(failedOutcome, .failed)
+        await failed.shutdown()
+    }
+
     /// The bootstrap catalog must reflect the REAL OpenCode exchange (live capture
     /// 2026-09-15): `session/new` advertises only the `model` and `mode` selectors — NO
     /// `effort`. Effort appears only after a model set, so a catalog-only pass has empty

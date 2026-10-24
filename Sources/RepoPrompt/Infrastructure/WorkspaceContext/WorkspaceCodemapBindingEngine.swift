@@ -786,6 +786,10 @@ actor WorkspaceCodemapBindingEngine {
         private var debugLastManifestFailureByRootEpoch: [
             WorkspaceCodemapRootEpoch: WorkspaceCodemapManifestFailureDiagnostic
         ] = [:]
+        private let debugManifestWriterEngineID = UUID()
+        private var debugManifestWriterLiveTaskCount = 0
+        private var debugManifestWriterAccountingComplete = true
+        private var debugManifestWriterTasks: [UUID: CodemapManifestWriterTaskSnapshot] = [:]
         private var debugManifestMeasurementsByRootEpoch: [
             WorkspaceCodemapRootEpoch: [
                 WorkspaceCodemapManifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementAggregate
@@ -2436,6 +2440,81 @@ actor WorkspaceCodemapBindingEngine {
             (
                 debugManifestFailureCountsByRootEpoch[rootEpoch] ?? [:],
                 debugLastManifestFailureByRootEpoch[rootEpoch]
+            )
+        }
+
+        /// Metadata stays independent of manifestWriters until the exact task returns.
+        private func debugManifestWriterStarted(writerID: UUID, namespace: CodeMapRootManifestNamespace) {
+            let (next, overflow) = debugManifestWriterLiveTaskCount.addingReportingOverflow(1)
+            debugManifestWriterAccountingComplete = debugManifestWriterAccountingComplete && !overflow
+            debugManifestWriterLiveTaskCount = overflow ? .max : next
+            guard debugManifestWriterTasks.count < 64 else { return }
+            let now = uptimeNanoseconds()
+            debugManifestWriterTasks[writerID] = CodemapManifestWriterTaskSnapshot(
+                writerID: writerID, namespaceDigest: namespace.storageDigestHex,
+                rootEpoch: nil, batchID: nil, origin: nil, phase: "scheduled",
+                taskStartedUptimeNanoseconds: now, batchStartedUptimeNanoseconds: nil,
+                phaseStartedUptimeNanoseconds: now
+            )
+        }
+
+        private func debugManifestWriterEnded(writerID: UUID) {
+            if debugManifestWriterLiveTaskCount > 0 {
+                debugManifestWriterLiveTaskCount -= 1
+            } else {
+                debugManifestWriterAccountingComplete = false
+            }
+            debugManifestWriterTasks.removeValue(forKey: writerID)
+        }
+
+        private func debugManifestWriterPhase(
+            writerID: UUID, phase: String, batch: ManifestMutationBatch? = nil
+        ) {
+            guard var task = debugManifestWriterTasks[writerID] else { return }
+            let now = uptimeNanoseconds()
+            task.phase = phase
+            task.phaseStartedUptimeNanoseconds = now
+            if let batch {
+                task.rootEpoch = batch.workKey.scope.rootEpoch
+                task.batchID = batch.id
+                task.batchStartedUptimeNanoseconds = now
+                switch batch.proof {
+                case .session: task.origin = "session"
+                case .graphIndex(_, _, .pageCheckpoint): task.origin = "graph_page"
+                case .graphIndex(_, _, .enumerationSeal): task.origin = "graph_seal"
+                }
+            } else if phase == "checking_enabled" {
+                task.rootEpoch = nil
+                task.batchID = nil
+                task.origin = nil
+                task.batchStartedUptimeNanoseconds = nil
+            }
+            debugManifestWriterTasks[writerID] = task
+        }
+
+        func debugManifestWriterActivity(rootEpoch: WorkspaceCodemapRootEpoch) -> CodemapManifestWriterActivitySnapshot {
+            // Read at most 32 namespace states, never queued items or the blocked manifest store.
+            let queues = manifestWriters.prefix(32).map { namespace, writer in
+                CodemapManifestWriterQueueSnapshot(
+                    namespaceDigest: namespace.storageDigestHex,
+                    queuedItemCount: writer.queuedWork.count,
+                    deferredTailItemCount: writer.deferredWork.count,
+                    deferredHeadWaitingItemCount: writer.deferredHeadBatch?.id != writer.inFlightBatch?.id
+                        ? writer.deferredHeadBatch?.items.count ?? 0 : 0,
+                    inFlightItemCount: writer.inFlightBatch?.items.count ?? 0,
+                    retryPending: writer.retryTask != nil
+                )
+            }
+            let complete = debugManifestWriterAccountingComplete &&
+                debugManifestWriterTasks.count <= debugManifestWriterLiveTaskCount
+            return CodemapManifestWriterActivitySnapshot(
+                engineInstanceID: debugManifestWriterEngineID, rootEpoch: rootEpoch,
+                sampledUptimeNanoseconds: uptimeNanoseconds(), liveTaskCount: debugManifestWriterLiveTaskCount,
+                namespaceCount: manifestWriters.count, accountingComplete: complete,
+                quiescenceConfirmed: complete && debugManifestWriterLiveTaskCount == 0 && manifestWriters.isEmpty,
+                omittedLiveTaskCount: max(0, debugManifestWriterLiveTaskCount - debugManifestWriterTasks.count),
+                tasks: Array(debugManifestWriterTasks.values), namespaces: queues,
+                omittedNamespaceCount: manifestWriters.count - queues.count
             )
         }
 
@@ -8530,6 +8609,9 @@ actor WorkspaceCodemapBindingEngine {
         guard !manifestPublicationDisabled, !isShuttingDown else { return }
         let writerID = UUID()
         state.writerID = writerID
+        #if DEBUG
+            debugManifestWriterStarted(writerID: writerID, namespace: namespace)
+        #endif
         state.task = Task {
             await self.runManifestWriter(namespace: namespace, writerID: writerID)
         }
@@ -8615,7 +8697,13 @@ actor WorkspaceCodemapBindingEngine {
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
     ) async {
+        #if DEBUG
+            defer { debugManifestWriterEnded(writerID: writerID) }
+        #endif
         while !Task.isCancelled {
+            #if DEBUG
+                debugManifestWriterPhase(writerID: writerID, phase: "checking_enabled")
+            #endif
             guard await manifestPublicationIsEnabled() else {
                 // The setting read suspends. A cancelled predecessor must not tear down an
                 // OFF-era replacement that now owns this namespace.
@@ -8648,6 +8736,9 @@ actor WorkspaceCodemapBindingEngine {
                     debugDeferredRetry = dequeued.isDeferredRetry
                 #endif
                 writer.inFlightBatch = batch
+                #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "validating", batch: batch)
+                #endif
                 manifestWriters[namespace] = writer
                 if dequeued.isDeferredRetry {
                     incrementCounter(\.manifestWriteRetries)
@@ -8766,6 +8857,9 @@ actor WorkspaceCodemapBindingEngine {
                     discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                     continue
                 }
+                #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "claiming_authority")
+                #endif
                 let claimedWriterAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
                     namespace: namespace,
                     authority: gitPipeline.authority,
@@ -8797,6 +8891,7 @@ actor WorkspaceCodemapBindingEngine {
                     await hooks.beforeManifestStoreWrite(scope.rootEpoch)
                 #endif
                 #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "awaiting_publication")
                     let debugContext = DebugManifestStoreAttemptContext(
                         rootEpoch: scope.rootEpoch,
                         proof: batch.proof,
@@ -8826,6 +8921,7 @@ actor WorkspaceCodemapBindingEngine {
                     )
                 #endif
                 #if DEBUG
+                    debugManifestWriterPhase(writerID: writerID, phase: "completing")
                     manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
                     if case let .graphIndex(_, _, origin) = batch.proof {
                         switch origin {
