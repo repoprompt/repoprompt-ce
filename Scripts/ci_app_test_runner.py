@@ -573,6 +573,7 @@ def run_local_tests(
     direct_command: Callable[..., tuple[str, ...] | None] = direct_xctest_command,
     scratch_path: Path | None = None,
     build_args: Sequence[str] = (),
+    jobs: int | None = None,
 ) -> int:
     """Build the package tests, then run the selection in a sandbox.
 
@@ -582,7 +583,7 @@ def run_local_tests(
     if build_args and scratch_path is None:
         print("::error::extra build arguments require a separate scratch path")
         return 2
-    swiftpm_args = (*scratch_path_args(scratch_path), *build_args)
+    swiftpm_args = (*scratch_path_args(scratch_path), *build_args, *(("--jobs", str(jobs)) if jobs else ()))
     # Consume conductor's private receipt before any SwiftPM subprocess: manifest
     # caching keys on the environment, so a unique attempt path must not reach it.
     receipt = os.environ.pop("REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT", None)
@@ -679,6 +680,7 @@ def run_module_tests(
     xctest_binary: Optional[Callable[[], tuple[str, ...]]] = None,
     testing_helper: Optional[Callable[[str], Path | None]] = None,
     testing_environment: Optional[Callable[[Mapping[str, str]], dict[str, str] | None]] = None,
+    jobs: int | None = None,
 ) -> int:
     """Build only one test target's dependency closure and run its bundle directly.
 
@@ -708,7 +710,10 @@ def run_module_tests(
               "from SwiftPM's; use a plain name or alternation, or run without --module")
         return 2
     environment = dict(os.environ)
-    status = executor(module_build_command(swift_binary, module), cwd, environment)
+    command = module_build_command(swift_binary, module)
+    if jobs is not None:
+        command += ("--jobs", str(jobs))
+    status = executor(command, cwd, environment)
     if status != 0:
         return status
     bundle = bundle_locator(swift_binary, cwd, module)
@@ -894,6 +899,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--test-product")
     parser.add_argument("--module", help="Build and run only this test target (Swift Build engine)")
     parser.add_argument("--swift-binary", default="swift")
+    parser.add_argument("--jobs", type=int, help="Positive SwiftPM worker limit for local builds")
     parser.add_argument("--cwd", type=Path, default=None)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
@@ -903,6 +909,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Measurement builds: extra SwiftPM build argument (use --build-arg=VALUE); requires --scratch-path",
     )
     args = parser.parse_args(argv)
+    if args.jobs is not None and (args.jobs < 1 or not args.local):
+        parser.error("--jobs requires --local and a positive integer")
     if args.local and args.skip_build:
         parser.error("--local cannot be combined with --skip-build")
     if args.local and (args.shard_count != 1 or args.shard_index != 1):
@@ -923,13 +931,13 @@ def main(argv: Sequence[str]) -> int:
     if args.local and args.module:
         return run_module_tests(
             swift_binary=args.swift_binary, cwd=args.cwd,
-            module=args.module, test_filter=args.test_filter,
+            module=args.module, test_filter=args.test_filter, jobs=args.jobs,
         )
     if args.local:
         return run_local_tests(
             swift_binary=args.swift_binary, cwd=args.cwd,
             test_filter=args.test_filter, test_product=args.test_product,
-            scratch_path=args.scratch_path, build_args=tuple(args.build_args),
+            scratch_path=args.scratch_path, build_args=tuple(args.build_args), jobs=args.jobs,
         )
     prebuilt_bin_path = None
     if args.skip_build:
