@@ -22,6 +22,52 @@ import ci_app_test_runner as runner  # noqa: E402
 import modularization_ci_artifact as artifact  # noqa: E402
 import swift_imports  # noqa: E402
 
+_REAL_INHERITED_STORAGE_READER = runner.read_inherited_storage_preference
+
+
+def setUpModule() -> None:
+    # Pure self-tests never read the machine's real defaults; the reader has dedicated fakes below.
+    runner.read_inherited_storage_preference = lambda *args, **kwargs: None
+
+
+def tearDownModule() -> None:
+    runner.read_inherited_storage_preference = _REAL_INHERITED_STORAGE_READER
+
+
+class InheritedStoragePreferenceTests(unittest.TestCase):
+    """The pre-run storage preference is read, never written, and handed to the test process."""
+
+    @staticmethod
+    def fake_defaults(returncode: int, stdout: str):
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
+        return run, calls
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS defaults only")
+    def test_reader_only_reads_the_preference(self) -> None:
+        run, calls = self.fake_defaults(0, "/var/folders/x/T/old-run/Workspaces\n")
+        self.assertEqual(_REAL_INHERITED_STORAGE_READER(run=run), "/var/folders/x/T/old-run/Workspaces")
+        self.assertEqual([call[1] for call in calls], ["read"], "never writes or deletes defaults")
+        run, _ = self.fake_defaults(1, "")
+        self.assertIsNone(_REAL_INHERITED_STORAGE_READER(run=run))
+
+    def test_suite_environment_hands_the_inherited_value_to_the_test_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: "/var/folders/x/T/old-run/Workspaces",
+            )
+            self.assertEqual(environment[runner.INHERITED_STORAGE_PREFERENCE_ENV], "/var/folders/x/T/old-run/Workspaces")
+            cleared = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: None,
+            )
+            self.assertNotIn(runner.INHERITED_STORAGE_PREFERENCE_ENV, cleared)
+
 
 class InterpreterCompatibilityTests(unittest.TestCase):
     def test_script_help_runs_with_current_interpreter(self) -> None:
@@ -806,27 +852,32 @@ class TestExecutionTests(unittest.TestCase):
                 self.assertTrue(Path(first[key]).is_dir(), key)
                 self.assertNotEqual(first[key], inherited[key])
 
-    def test_runner_stops_on_first_failure(self) -> None:
+    def test_runner_attempts_each_isolated_suite_once_and_preserves_first_failure(self) -> None:
         calls: list[tuple[str, ...]] = []
+        statuses = iter([9, 3, 0])
 
         def executor(command, _cwd, _environment) -> int:
             calls.append(tuple(command))
-            return 9
+            return next(statuses)
 
+        output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             result = runner.run_selected_suites(
-                ("RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests"),
+                ("RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests"),
                 swift_binary="swift",
                 cwd=None,
                 bundle_selection=self.empty_bundle_selection(),
                 sandbox_root=Path(directory),
                 executor=executor,
-                output=io.StringIO(),
+                output=output,
             )
 
         self.assertEqual(result, 9)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][-1], "RepoPromptTests.FirstTests")
+        self.assertEqual([call[-1] for call in calls], [
+            "RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests",
+        ])
+        self.assertIn('2 of 3 suites failed', output.getvalue())
+        self.assertEqual(output.getvalue().count('::endgroup::'), 3)
 
 if __name__ == "__main__":
     unittest.main()

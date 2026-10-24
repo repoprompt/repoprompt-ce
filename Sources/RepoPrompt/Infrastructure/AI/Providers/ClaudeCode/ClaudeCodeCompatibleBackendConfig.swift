@@ -113,6 +113,7 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     var auth: Auth
     var modelBehavior: ModelBehavior
     var updatedAt: Date?
+    var httpCredentialConsentEndpoint: String? = nil
 
     var normalizedDisplayName: String {
         let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -121,16 +122,7 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     }
 
     var normalizedBaseURL: String? {
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let components = URLComponents(string: trimmed),
-              let scheme = components.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              components.host?.isEmpty == false
-        else {
-            return nil
-        }
-        return trimmed
+        ProviderEndpointConsent.endpointIdentity(baseURL)
     }
 
     var normalized: ClaudeCodeCompatibleBackendConfig {

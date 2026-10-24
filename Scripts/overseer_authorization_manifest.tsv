@@ -1,0 +1,3 @@
+# Overseer permission-gate consultations outside OverseerAuthorizationEngine (path<TAB>gate<TAB>count).
+# Empty by design: every permission decision is made inside OverseerAuthorizationEngine*.swift; callers
+# use its semantic decisions. A new row is a deliberate, reviewed delegation of one gate decision.

@@ -31,7 +31,13 @@ extension AgentModeViewModel {
             runAttemptID: runAttemptID
         )
         var state = session.selfCompactState
-        let reservation = state.reserve(note: note, idempotencyKey: idempotencyKey, owner: owner)
+        let reservation = state.reserve(
+            note: note, idempotencyKey: idempotencyKey,
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(
+                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
+            ),
+            owner: owner
+        )
         if case .scheduled = reservation {
             guard support == .codex || support == .claudeCode || support == .acpAdvertisedCommand else {
                 return nil
@@ -78,7 +84,12 @@ extension AgentModeViewModel {
         else { return .unavailable }
 
         var candidate = session.selfCompactState
-        let reservation = candidate.reserve(note: note, idempotencyKey: idempotencyKey)
+        let reservation = candidate.reserve(
+            note: note, idempotencyKey: idempotencyKey,
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(
+                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
+            )
+        )
         if let answer = agentSelfCompactUnscheduledAdmission(reservation, session: session, endpoint: endpoint) {
             return answer
         }
@@ -180,8 +191,14 @@ extension AgentModeViewModel {
             return .blocked(reason: "idempotency_conflict")
         case .alreadyPending:
             return .blocked(reason: "compact_already_pending")
+        case let .invalidNote(.tooLong(byteCount, maximum)):
+            // Reservation and this projection are synchronous; report the same window basis.
+            let limit = AgentSessionSelfCompactNotePolicy.noteLimit(
+                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
+            )
+            return .noteTooLong(byteCount: byteCount, maximum: maximum, basis: limit.basis)
         case .invalidNote, .invalidIdempotencyKey:
-            return .blocked(reason: "busy") // Service validation rejects these before admission.
+            return .blocked(reason: "busy") // Service content/key validation rejects these before admission.
         case .scheduled:
             return nil
         }

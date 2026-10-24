@@ -104,7 +104,8 @@ struct CursorACPAgentProvider: ACPAgentProvider {
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
             cleanupArtifact: cleanupArtifact,
-            expectedExecutableIdentity: resolvedLaunch.executableIdentity
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity,
+            explicitEnvironmentKeys: Set(environment.keys)
         )
     }
 

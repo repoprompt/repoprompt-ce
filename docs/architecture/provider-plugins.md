@@ -99,6 +99,38 @@ When the provider package is later moved to its own repository, the plan is:
 
 The remote-by-default policy avoids breaking checkouts that do not have a sibling clone, while still giving contributors a low-friction local edit workflow.
 
+## Optional provider environment filtering
+
+Settings → Agent Mode → Overview exposes a name-only opt-in mitigation. By default the
+withhold and pass-through lists are empty: existing native authentication, dynamic backend
+selection, and toolchain environment behavior are unchanged. No backend is inferred from
+an optional model string.
+
+- **Withhold ambient names** applies globally to new app-managed provider processes,
+  including ACP sessions, native Claude/Codex, CLI probes, and headless launches.
+- **Pass-through exceptions** let a specific provider retain selected withheld ambient
+  names. Names are exact and case-sensitive POSIX identifiers; values and wildcards are
+  not accepted. Only names are persisted, and credential values are not inspected or logged.
+- Filtering runs after ambient/login-shell reconstruction. Explicit app-owned launch
+  additions and per-invocation overrides retain their existing precedence. Copied ambient
+  snapshots are not treated as explicit credentials. Dynamic-loader and caller-declared
+  sanitizer removals still win, even over explicit overrides or pass-through exceptions.
+- Changes apply on the next covered provider process launch, not to already-running
+  sessions. Interactive user terminals and generic tool runners do not opt into this policy.
+  Synchronous installation/provisioning runtime-identity checks and provider-managed
+  subprocesses remain outside this app-managed policy; it is not a global process filter.
+
+This is **partial, opt-in mitigation**, not closed least privilege or credential-file
+sandboxing. Users must choose the names relevant to their environment; withholding a
+required name can break authentication or provider tools. A same-user child can still
+access credential files, native settings, shell profiles, and other capabilities. Provider
+configuration can independently supply credentials. The policy deliberately does not
+attempt to resolve every native backend/auth contract or constrain dynamic model changes.
+
+The settings live as optional fields in the existing raw-preserving global Agent Mode
+settings document. Unknown sibling fields and unknown provider exception entries survive
+edits; leaving the feature unconfigured emits no new filtering fields.
+
 ## Core vs plugin ownership
 
 | Concern | Owner |
@@ -231,6 +263,16 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - Full access is a launch flag (`grok agent --always-approve --no-leader stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
 - Auth: RPCE never sends ACP `authenticate`. Grok checks a model key (`api_key`/`env_key`), then a configured auth-provider branch, then an eligible session token, then `XAI_API_KEY`, subject to `[auth] preferred_method` and `disable_api_key_auth`. The auth-provider branch does not fall through when its cached token is absent. RPCE reads a stored key from the existing `.grokAPI` keychain account at provider construction and passes it as the launch-environment `XAI_API_KEY`. Credential order is source-only at Grok 1.0.45 (`2bdd1d6a`), not live-tested.
 - MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
+
+#### Grok Agent Mode permission levels
+
+**Provenance:** Grok permission behavior below is based on Grok 1.0.45 source (`2bdd1d6a`), not observed live. Behavior on later releases has not been verified.
+
+- **Default launch intent:** Direct Default, agents launched through MCP under Safe Managed (including top-level sessions), and Custom/Inherit settings resolving to Default use the managed Grok profile. RepoPrompt sends `_meta.yoloMode: false` and `_meta.autoMode: false` on both `session/new` and `session/load`, then `_x.ai/yolo_mode_changed {auto_mode: false}` after opening the session and before prompting.
+- **Mode state is not permission rules:** These overrides turn Grok's always-approve and auto modes off; they do not clear its compiled permission rules or prior grants. An applicable Claude Code `permissions.defaultMode` of `bypassPermissions` can generate a broad allow rule for many requests, including MCP requests and shell commands subject to Grok's confirmation floor. `acceptEdits` can generate an allow rule for edit tools such as `write`, based on the request's final Edit classification—not every file-changing tool. Native `apply_patch` and MCP requests are not Edit-classified in this source. When Grok resolves an allow internally, it sends no ACP `session/request_permission` to RepoPrompt.
+- **Limits still apply:** Grok's deny rules and other safeguards still apply. Ask rules, protected edit targets, hook-forced confirmation and the shell confirmation floor can restrict these allowances. A Grok requirements lock can suppress the synthetic `bypassPermissions` allow rule, but not the `acceptEdits` Edit allow rule. Default and Safe Managed are not a guarantee that every file write prompts RepoPrompt or stays confined to the workspace.
+- **Configuration scope:** When Grok's Claude-settings fallback is active, home `~/.claude/settings.json` and `settings.local.json` apply regardless of project-folder trust; project `.claude` settings require Grok's trust gate to allow them. A managed `defaultMode` takes precedence over user/project modes. Grok's `[claude_compat] imported` marker skips that fallback; it does not erase native or previously imported rules. RepoPrompt's `GROK_CLAUDE_MCPS_ENABLED=0` override (below) affects only imported Claude Code MCP servers, not these permission settings. These disclosures are conditional, not a report of the active configuration.
+- **Loaded and discovery sessions:** A successful cold `session/load` in a new Grok process uses the same permission-rule resolution path as `session/new`. Context Builder discovery also uses the managed mode overrides; its headless bridge can decline only permission requests that reach RepoPrompt.
 
 #### Current Grok MCP launch policy
 

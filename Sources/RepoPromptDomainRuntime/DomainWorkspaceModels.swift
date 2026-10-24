@@ -218,6 +218,29 @@ package enum DomainExactRootSelection: Equatable {
     case changed
 }
 
+/// Exact registered-workspace routing facts, independent of session/delegation authority.
+package enum DomainWorkspaceReadSelector: Equatable, Sendable {
+    case id(UUID)
+    case exactName(String)
+}
+
+package struct DomainWorkspaceReadLocation: Equatable, Sendable {
+    package let runtimeID: UUID
+    package let lifecycleGeneration: UInt64
+    package let locationGeneration: UInt64
+    package let workspaceID: UUID
+    package let name: String
+    package let directory: URL
+}
+
+package enum DomainWorkspaceLocationSelection: Equatable, Sendable {
+    case matched(DomainWorkspaceReadLocation)
+    case ambiguous
+    case unavailable
+    case notReady
+    case notRegistered
+}
+
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool

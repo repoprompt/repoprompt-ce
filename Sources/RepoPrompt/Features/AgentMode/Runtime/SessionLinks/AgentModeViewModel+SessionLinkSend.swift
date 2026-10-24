@@ -33,6 +33,7 @@ extension AgentModeViewModel {
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
+            restorationReadiness: session.qualifiedRestorationReadiness,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,
             endpointMatchesGrant: endpointMatchesGrant,
@@ -212,26 +213,76 @@ extension AgentModeViewModel {
             includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
                 .showBuiltInWorkflowCleanupGuidance()
         )
+        return await persistAndStartNoncomposerTurn(
+            session: liveSession,
+            tabID: candidate.tabID,
+            workspaceID: workspaceID,
+            claim: claim,
+            displayText: request.message,
+            providerMessage: providerMessage,
+            workflow: request.workflow,
+            attribution: request.attribution,
+            stopFence: stopFence
+        ) {
+            let dispatchLiveness = liveness()
+            guard self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
+                  dispatchLiveness.permitsDelivery,
+                  self.composerSubmitClaimIsCurrent(claim),
+                  stopFence.permitsStart(of: liveSession),
+                  self.workspaceManager?.activeWorkspace?.id == candidate.workspaceID
+            else { return false }
+            return AgentSessionLinkDeliveryReadiness.failure(
+                snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                    session: liveSession,
+                    endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
+                    isClosing: dispatchLiveness.targetWindowIsClosing,
+                    ignoresComposerSubmissionInFlight: true
+                )
+            ) == nil
+        }
+    }
+
+    /// Persistence and direct start only. The caller owns authority, readiness and the empty
+    /// composer claim, and re-proves them after the flush. No link or MCP authority is acquired here.
+    func persistAndStartNoncomposerTurn(
+        session liveSession: TabSession,
+        tabID: UUID,
+        workspaceID: UUID,
+        claim: AgentComposerSubmitClaim,
+        displayText: String,
+        providerMessage: String,
+        workflow: AgentWorkflowDefinition?,
+        attribution: AgentCrossSessionAttribution?,
+        stopFence: AgentRunStartStopFence,
+        dispatchIsCurrent: @MainActor () -> Bool
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        // Every noncomposer caller shares this pre-row fence. A completed but failed restoration
+        // must never become a replacement transcript merely because it reached an idle runtime.
+        guard liveSession.permitsBoundOperationAndSave else {
+            releaseComposerSubmitClaim(claim)
+            let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
+            return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
+        }
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
-            request.message,
+            displayText,
             sequenceIndex: liveSession.nextSequenceIndex,
             // Badges the one-shot workflow the sender attached to *this* message through the row's
             // existing metadata, so the standard pill renders beside the attribution badge with no
             // new UI. It records what this turn ran under; it is not, and never becomes, the
             // target's composer selection.
-            workflow: request.workflow,
-            crossSessionAttribution: request.attribution
+            workflow: workflow,
+            crossSessionAttribution: attribution
         )
         let anchorRollback = recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
         liveSession.appendItem(userItem)
         updateBindingsFromSession(liveSession)
-        requestUIRefresh(tabID: candidate.tabID, urgent: true)
+        requestUIRefresh(tabID: tabID, urgent: true)
 
-        if case .failure = await flushSaveRequired(for: candidate.tabID, workspaceID: workspaceID) {
-            agentSessionLinkRollbackStagedRow(
+        if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
+            rollbackNoncomposerStagedRow(
                 itemID: userItem.id,
-                tabID: candidate.tabID,
+                tabID: tabID,
                 session: liveSession,
                 anchorRollback: anchorRollback
             )
@@ -240,7 +291,7 @@ extension AgentModeViewModel {
             // rather than leaving it to a scheduled save: releasing the idempotency key for a fresh
             // retry while a committed row might survive is exactly how one logical send becomes two
             // transcript rows.
-            if case .failure = await flushSaveRequired(for: candidate.tabID, workspaceID: workspaceID) {
+            if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
                 releaseComposerSubmitClaim(claim)
                 return .blocked(.persistenceIndeterminate)
             }
@@ -248,12 +299,22 @@ extension AgentModeViewModel {
             return .blocked(.persistenceFailed)
         }
 
-        // Past this point the message is durably the target's. Every later failure reports a
-        // delivery state rather than rolling back, so a retry with the same key can never deliver
-        // the row twice.
-        let acceptedAt = Date()
+        return await startPersistedNoncomposerTurn(
+            session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
+            acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
+            dispatchIsCurrent: dispatchIsCurrent
+        )
+    }
+
+    /// Retry dispatch of an already accepted row without appending or saving the input again.
+    /// The caller still owns an empty composer claim and the exact identity/Stop/readiness fence.
+    func startPersistedNoncomposerTurn(
+        session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
+        savedItemID: UUID, acceptedAt: Date, providerMessage: String,
+        stopFence: AgentRunStartStopFence, dispatchIsCurrent: @MainActor () -> Bool
+    ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
-            targetItemID: userItem.id,
+            targetItemID: savedItemID,
             acceptedAt: acceptedAt,
             deliveryState: .persisted,
             resultingRunState: liveSession.runState.rawValue
@@ -275,24 +336,7 @@ extension AgentModeViewModel {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        let dispatchLiveness = liveness()
-        guard agentSessionLinkLiveSession(matching: candidate) === liveSession,
-              dispatchLiveness.permitsDelivery,
-              composerSubmitClaimIsCurrent(claim),
-              stopFence.permitsStart(of: liveSession),
-              workspaceManager?.activeWorkspace?.id == candidate.workspaceID
-        else {
-            releaseComposerSubmitClaim(claim)
-            return .delivered(persistedOnly)
-        }
-        if AgentSessionLinkDeliveryReadiness.failure(
-            snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
-                session: liveSession,
-                endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
-                isClosing: dispatchLiveness.targetWindowIsClosing,
-                ignoresComposerSubmissionInFlight: true
-            )
-        ) != nil {
+        guard liveSession.permitsBoundOperationAndSave, dispatchIsCurrent() else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -315,17 +359,17 @@ extension AgentModeViewModel {
             : providerMessage
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
-        if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+        if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
             var dispatchedRow = liveSession.items[index]
             dispatchedRow.dispatchedProviderText = dispatchedProviderMessage
             liveSession.replaceItem(at: index, with: dispatchedRow)
-            scheduleSave(for: candidate.tabID)
+            scheduleSave(for: tabID)
         }
         // The run service's `nil` return is "not a Codex native send", not "started", so the
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
         let startRecorder = AgentRunStartOutcomeRecorder()
         _ = await startAgentRun(
-            tabID: candidate.tabID,
+            tabID: tabID,
             initialMessage: dispatchedProviderMessage,
             directStartOptions: AgentDirectRunStartOptions(
                 ignoresPendingHandoff: true, stopFence: stopFence
@@ -335,16 +379,16 @@ extension AgentModeViewModel {
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {
             agentSessionLinkClearWaitingOnAfterAcceptedTurn(liveSession)
-        } else if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
+        } else if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
             var undispatchedRow = liveSession.items[index]
             undispatchedRow.dispatchedProviderText = nil
             liveSession.replaceItem(at: index, with: undispatchedRow)
-            scheduleSave(for: candidate.tabID)
+            scheduleSave(for: tabID)
         }
 
-        let resultingRunState = sessions[candidate.tabID]?.runState ?? liveSession.runState
+        let resultingRunState = sessions[tabID]?.runState ?? liveSession.runState
         return .delivered(AgentSessionLinkSendDelivery(
-            targetItemID: userItem.id,
+            targetItemID: savedItemID,
             acceptedAt: acceptedAt,
             deliveryState: startRecorder.outcome.didStart ? .runStarted : .runStartFailed,
             resultingRunState: resultingRunState.rawValue
@@ -375,7 +419,7 @@ extension AgentModeViewModel {
     /// A save is scheduled afterwards so the on-disk copy converges even if the failed flush had
     /// already written the row. The caller must additionally *confirm* that removal durably before it
     /// treats the send as undelivered; a scheduled save alone cannot prove a committed row is gone.
-    private func agentSessionLinkRollbackStagedRow(
+    private func rollbackNoncomposerStagedRow(
         itemID: UUID,
         tabID: UUID,
         session: TabSession,

@@ -161,12 +161,13 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
     }
 
     private func makeCandidate(windowID: Int, displayName: String) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: UUID(),
-            tabID: UUID(),
-            sessionID: UUID(),
-            persistentBindingGeneration: UUID(),
+            tabID: binding.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -177,7 +178,11 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: displayName,
             providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/main"
+            locationLabel: "worktree/main",
+            restorationReadiness: .authoritative(
+                AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1),
+                .persistedPayloadApplied
+            )
         )
     }
 
@@ -285,7 +290,8 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: fixture.observer.displayName,
             providerDisplayName: fixture.observer.providerDisplayName,
-            locationLabel: fixture.observer.locationLabel
+            locationLabel: fixture.observer.locationLabel,
+            restorationReadiness: fixture.observer.restorationReadiness
         )
         XCTAssertEqual(
             captured.domainEndpoint,
@@ -304,11 +310,11 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
 
     // MARK: - Deletion fence
 
-    func testDeletionReporterPhasesPreserveIntentOnFailureAndTombstoneOnCommit() async {
+    func testDeletionReporterPhasesPreserveIntentOnFailureAndTombstoneOnCommit() async throws {
         let registry = AgentSessionDeletionRegistry.shared
         let sessionID = UUID()
 
-        let failing = registry.beginDurableDeletion(sessionID: sessionID)
+        let failing = try registry.beginDurableDeletion(sessionID: sessionID)
         XCTAssertTrue(registry.isDeletionInProgress(sessionID: sessionID))
         XCTAssertTrue(registry.blocksNewOversight(sessionID: sessionID))
         XCTAssertFalse(registry.isPermanentlyDeleted(sessionID: sessionID))
@@ -316,23 +322,23 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         registry.didFailDurableDeletion(failing)
         XCTAssertFalse(registry.blocksNewOversight(sessionID: sessionID), "A failed attempt deleted nothing.")
 
-        let committing = registry.beginDurableDeletion(sessionID: sessionID)
+        let committing = try registry.beginDurableDeletion(sessionID: sessionID)
         await registry.didCommitDurableDeletion(committing)
         XCTAssertEqual(registry.state(forSessionID: sessionID), .committed)
 
         // A stale failure report from a superseded attempt must not reopen a committed tombstone,
         // and a later begin must not downgrade it either.
         registry.didFailDurableDeletion(failing)
-        _ = registry.beginDurableDeletion(sessionID: sessionID)
+        _ = try registry.beginDurableDeletion(sessionID: sessionID)
         XCTAssertEqual(registry.state(forSessionID: sessionID), .committed)
         XCTAssertFalse(registry.isDeletionInProgress(sessionID: sessionID))
     }
 
-    func testOverlappingDeletionFailureKeepsTheRemainingAttemptTransientlyBlocked() {
+    func testOverlappingDeletionFailureKeepsTheRemainingAttemptTransientlyBlocked() throws {
         let registry = AgentSessionDeletionRegistry.shared
         let sessionID = UUID()
-        let first = registry.beginDurableDeletion(sessionID: sessionID)
-        let second = registry.beginDurableDeletion(sessionID: sessionID)
+        let first = try registry.beginDurableDeletion(sessionID: sessionID)
+        let second = try registry.beginDurableDeletion(sessionID: sessionID)
 
         registry.didFailDurableDeletion(second)
 
@@ -344,9 +350,64 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         XCTAssertFalse(registry.blocksNewOversight(sessionID: sessionID))
     }
 
-    func testAddIsRefusedWhileTheTargetsDeletionIsInProgress() async {
+    func testTerminationFreezeWithoutPendingDeletionRejectsNewDeletionAdmission() {
+        let registry = AgentSessionDeletionRegistry.shared
+        let sessionID = UUID()
+
+        XCTAssertTrue(registry.freezeNewDeletionAdmissionForTermination())
+        XCTAssertThrowsError(try registry.beginDurableDeletion(sessionID: sessionID)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertNil(registry.state(forSessionID: sessionID))
+    }
+
+    func testTerminationFreezeWithActiveDeletionVetoesCleanSeal() throws {
+        let registry = AgentSessionDeletionRegistry.shared
+        let sessionID = UUID()
+        let attempt = try registry.beginDurableDeletion(sessionID: sessionID)
+
+        XCTAssertFalse(registry.freezeNewDeletionAdmissionForTermination())
+        XCTAssertTrue(registry.isDeletionInProgress(sessionID: sessionID))
+        registry.didFailDurableDeletion(attempt)
+        XCTAssertFalse(registry.freezeNewDeletionAdmissionForTermination(), "The first uncertain freeze cannot become clean later")
+        XCTAssertThrowsError(try registry.beginDurableDeletion(sessionID: UUID())) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testTerminationFreezeCountsOverlappingAndRepeatedDeletionOfCommittedSession() async throws {
+        let registry = AgentSessionDeletionRegistry.shared
+        for startsAfterCommit in [false, true] {
+            registry.test_reset()
+            let sessionID = UUID()
+            let first = try registry.beginDurableDeletion(sessionID: sessionID)
+            let remaining: AgentSessionDeletionRegistry.AttemptToken
+            if startsAfterCommit {
+                await registry.didCommitDurableDeletion(first)
+                remaining = try registry.beginDurableDeletion(sessionID: sessionID)
+            } else {
+                remaining = try registry.beginDurableDeletion(sessionID: sessionID)
+                await registry.didCommitDurableDeletion(first)
+            }
+
+            XCTAssertEqual(registry.state(forSessionID: sessionID), .committed)
+            XCTAssertFalse(
+                registry.freezeNewDeletionAdmissionForTermination(),
+                "The remaining physical deletion must count even though its session is already committed"
+            )
+            if startsAfterCommit {
+                await registry.didCommitDurableDeletion(remaining)
+            } else {
+                registry.didFailDurableDeletion(remaining)
+            }
+            XCTAssertEqual(registry.state(forSessionID: sessionID), .committed)
+            XCTAssertFalse(registry.freezeNewDeletionAdmissionForTermination())
+        }
+    }
+
+    func testAddIsRefusedWhileTheTargetsDeletionIsInProgress() async throws {
         let fixture = makeFixture()
-        _ = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: fixture.target.sessionID)
+        _ = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: fixture.target.sessionID)
 
         let outcome = await add(fixture)
 
@@ -360,7 +421,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
         let storedBefore = await fixture.store.token(for: fixture.pair)
         let tokenBefore = try XCTUnwrap(storedBefore)
-        let attempt = AgentSessionDeletionRegistry.shared
+        let attempt = try AgentSessionDeletionRegistry.shared
             .beginDurableDeletion(sessionID: fixture.target.sessionID)
 
         let denied = await fixture.bridge.authorizeTarget(
@@ -386,7 +447,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         XCTAssertEqual(tokenAfterFailure, tokenBefore)
     }
 
-    func testDeletionCommitAfterActivationCannotReportOrLeaveAEstablishedGrant() async {
+    func testDeletionCommitAfterActivationCannotReportOrLeaveAEstablishedGrant() async throws {
         let fixture = makeFixture()
         fixture.bridge.attach(host: fixture.host)
         let fence = TestReleaseFence(name: "post-activation deletion fence")
@@ -397,7 +458,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
 
         let addTask = Task { @MainActor in await add(fixture) }
         await fence.waitUntilEntered()
-        let attempt = AgentSessionDeletionRegistry.shared
+        let attempt = try AgentSessionDeletionRegistry.shared
             .beginDurableDeletion(sessionID: fixture.target.sessionID)
         await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(attempt)
         fence.release()
@@ -410,13 +471,13 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         XCTAssertNil(tokenAfterCommit)
     }
 
-    func testACommittedDeletionRevokesTheGrantAndRemovesEverySavedRowTouchingIt() async {
+    func testACommittedDeletionRevokesTheGrantAndRemovesEverySavedRowTouchingIt() async throws {
         let fixture = makeFixture()
         // The commit observer is installed by `attach`, which also needs a host.
         fixture.bridge.attach(host: fixture.host)
         guard case .added = await add(fixture) else { return XCTFail("Expected the link to be added") }
 
-        let attempt = AgentSessionDeletionRegistry.shared
+        let attempt = try AgentSessionDeletionRegistry.shared
             .beginDurableDeletion(sessionID: fixture.target.sessionID)
         await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(attempt)
 
@@ -510,10 +571,9 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             self.seconds = seconds
         }
 
-        func write(_ data: Data, to url: URL) throws {
+        func check() throws {
             began.signal()
             Thread.sleep(forTimeInterval: seconds)
-            try data.write(to: url, options: .atomic)
         }
 
         /// Resolves once the store actor is genuinely blocked, so the assertion below is about the
@@ -539,7 +599,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: .enabled,
-            writer: { data, url in try blocker.write(data, to: url) }
+            beforeCommit: { try blocker.check() }
         )
         let fixture = makeFixture()
         fixture.bridge.installIntentStore(store)
@@ -562,5 +622,6 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             "Quitting must never await a stuck store operation, in any shutdown phase."
         )
         _ = await occupier.value
+        await store.serializationBarrier() // Finish the detached fixture write before removing its temp store.
     }
 }

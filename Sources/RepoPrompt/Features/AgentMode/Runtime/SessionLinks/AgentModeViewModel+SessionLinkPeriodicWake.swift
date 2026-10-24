@@ -25,7 +25,7 @@ extension AgentModeViewModel {
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.oversight.periodicIdleWakeEnabled,
-              session.hasLoadedPersistedState, !session.bindingTransitionInProgress,
+              session.permitsBoundOperationAndSave,
               agentSessionLinkPeriodicObserverIsLive(endpoint),
               let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
               published.endpoint == endpoint, !published.inventory.isEmpty
@@ -39,7 +39,7 @@ extension AgentModeViewModel {
 
     /// Excludes this producer's own active run and composer claim.
     func agentSessionLinkPeriodicPreparationIsUnblocked(_ session: TabSession) -> Bool {
-        !session.terminalCommitInProgress && !session.bindingTransitionInProgress
+        session.permitsBoundOperationAndSave && !session.terminalCommitInProgress
             && !session.isChangingExecutionLocation && !session.isPreparingInitialWorktree
             && !session.selfCompactState.blocksAutomaticWake
             && session.pendingInstructions.isEmpty && session.pendingACPSteeringInstructions.isEmpty

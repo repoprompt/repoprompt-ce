@@ -36,6 +36,12 @@ enum FileSystemAppIntegration {
             repositoryRootValidator: { root in
                 guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: root) else { return false }
                 return layout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL == root
+            },
+            repositoryExcludeURL: { root in
+                guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: root),
+                      layout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL == root
+                else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+                return layout.commonDir.appendingPathComponent("info/exclude")
             }
         )
     }

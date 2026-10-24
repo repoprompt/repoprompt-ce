@@ -143,8 +143,12 @@ enum GitReadSafety {
         // Put safety flags after the builder's options, but before its path
         // or end-of-options separator. A later --textconv/--ext-diff must not undo this fence.
         let insertionIndex = result[(index + 1)...].firstIndex { $0 == "--" || $0 == "--end-of-options" } ?? result.endIndex
-        let existingOptions = Set(result[(index + 1) ..< insertionIndex])
-        result.insert(contentsOf: options.filter { !existingOptions.contains($0) }, at: insertionIndex)
+        // Presence alone is insufficient: an earlier disabling option can be
+        // overridden by a later enabling option. Keep the safety options last,
+        // while recognizing our own suffix so repeated fencing is idempotent.
+        if !result[(index + 1) ..< insertionIndex].suffix(options.count).elementsEqual(options) {
+            result.insert(contentsOf: options, at: insertionIndex)
+        }
         if Array(result.prefix(configurationArguments.count)) == configurationArguments { return result }
         return configurationArguments + result
     }

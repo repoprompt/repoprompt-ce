@@ -77,17 +77,17 @@ final class AgentSelfCompactStateTests: XCTestCase {
     }
 
     func testNotePolicyIsByteBoundedAndPreservesBody() {
-        let exact = String(repeating: "x", count: 8192)
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: exact), .valid(byteCount: 8192))
+        let exact = String(repeating: "x", count: 65536)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: exact, maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .valid(byteCount: 65536))
         XCTAssertEqual(
-            AgentSessionSelfCompactNotePolicy.validation(of: exact + "x"),
-            .tooLong(byteCount: 8193, maximum: 8192)
+            AgentSessionSelfCompactNotePolicy.validation(of: exact + "x", maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes),
+            .tooLong(byteCount: 65537, maximum: 65536)
         )
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: " \t\r\n "), .empty)
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\u{0000}b"), .invalidScalar)
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\u{0085}b"), .invalidScalar)
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\t\r\nb"), .valid(byteCount: 5))
-        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: String(repeating: "😀", count: 2048)), .valid(byteCount: 8192))
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: " \t\r\n ", maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .empty)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\u{0000}b", maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .invalidScalar)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\u{0085}b", maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .invalidScalar)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: "a\t\r\nb", maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .valid(byteCount: 5))
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.validation(of: String(repeating: "😀", count: 16384), maximum: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .valid(byteCount: 65536))
 
         let body = "  /compact\r\nKeep  two spaces\t😀  "
         let expected = SHA256.hash(data: Data(("agent_self.compact/v1\n" + body).utf8))
@@ -96,28 +96,154 @@ final class AgentSelfCompactStateTests: XCTestCase {
         XCTAssertNotEqual(AgentSessionSelfCompactNotePolicy.digest(of: body), AgentSessionSelfCompactNotePolicy.digest(of: body.trimmingCharacters(in: .whitespacesAndNewlines)))
     }
 
+    func testNoteLimitUsesLiteralWindowShareWithoutFloorOrOverflow() {
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: 200_000), 80000)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: nil), 65536)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: 10000), 4000)
+        XCTAssertEqual(AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: 20483), 8193)
+        XCTAssertEqual(
+            AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: Int.max),
+            3_689_348_814_741_910_322
+        )
+    }
+
+    func testNoteLimitAndErrorBasisShareFallbackPredicate() {
+        for window in [nil, 0, -1] {
+            let limit = AgentSessionSelfCompactNotePolicy.noteLimit(windowTokens: window)
+            XCTAssertEqual(limit.maximumUTF8Bytes, AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+            XCTAssertEqual(limit.basis, "unknown context window fallback")
+        }
+        let known = AgentSessionSelfCompactNotePolicy.noteLimit(windowTokens: 1000)
+        XCTAssertEqual(known.maximumUTF8Bytes, 400)
+        XCTAssertEqual(known.basis, "10% of context window at 4 UTF-8 bytes/token")
+    }
+
+    func testRetainedRetryDeduplicatesBeforeCurrentAdmissionByteLimit() throws {
+        let note = String(repeating: "x", count: 8880)
+        for originalLimit in [80000, AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes] {
+            for settled in [false, true] {
+                var state = AgentSelfCompactState()
+                let first = try XCTUnwrap(state.reserve(
+                    note: note, idempotencyKey: "retry", maximumNoteUTF8Bytes: originalLimit
+                ).scheduledAttempt)
+                if settled { state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false) }
+                XCTAssertEqual(state.reserve(note: note, idempotencyKey: "retry", maximumNoteUTF8Bytes: 400), .duplicate(first.id))
+                XCTAssertEqual(state.reserve(note: note + "x", idempotencyKey: "retry", maximumNoteUTF8Bytes: 400), .conflict)
+                XCTAssertEqual(
+                    state.reserve(note: note, idempotencyKey: "new", maximumNoteUTF8Bytes: 400),
+                    .invalidNote(.tooLong(byteCount: 8880, maximum: 400))
+                )
+                XCTAssertEqual(state.reserve(note: " \t\n", idempotencyKey: "retry", maximumNoteUTF8Bytes: 400), .invalidNote(.empty))
+                XCTAssertEqual(state.reserve(note: "a\u{0000}b", idempotencyKey: "retry", maximumNoteUTF8Bytes: 400), .invalidNote(.invalidScalar))
+                XCTAssertEqual(state.reserve(note: note, idempotencyKey: "", maximumNoteUTF8Bytes: 400), .invalidIdempotencyKey)
+            }
+        }
+    }
+
+    func testReservationUsesExplicitSessionAndFallbackLimits() throws {
+        let maximum = AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(windowTokens: 200_000)
+        let note = String(repeating: "x", count: maximum)
+        var known = AgentSelfCompactState()
+        let attempt = try XCTUnwrap(known.reserve(
+            note: note, idempotencyKey: "known", maximumNoteUTF8Bytes: maximum
+        ).scheduledAttempt)
+        XCTAssertEqual(attempt.note, note)
+        XCTAssertEqual(known.reserve(
+            note: note + "x", idempotencyKey: "over", maximumNoteUTF8Bytes: maximum
+        ), .invalidNote(.tooLong(byteCount: 80001, maximum: 80000)))
+
+        var unknown = AgentSelfCompactState()
+        let fallback = String(repeating: "x", count: 65536)
+        XCTAssertNotNil(unknown.reserve(note: fallback, idempotencyKey: "unknown", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
+        XCTAssertEqual(
+            unknown.reserve(note: fallback + "x", idempotencyKey: "over", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes),
+            .invalidNote(.tooLong(byteCount: 65537, maximum: 65536))
+        )
+        var small = AgentSelfCompactState()
+        XCTAssertEqual(
+            small.reserve(note: String(repeating: "x", count: 4001), idempotencyKey: "small", maximumNoteUTF8Bytes: 4000),
+            .invalidNote(.tooLong(byteCount: 4001, maximum: 4000))
+        )
+    }
+
+    func testPersistedLargeNotesKeepIntegrityWithoutAdmissionByteCap() throws {
+        let note = String(repeating: "😀", count: 20000)
+        var state = AgentSelfCompactState()
+        let attempt = try XCTUnwrap(state.reserve(
+            note: note, idempotencyKey: "large", maximumNoteUTF8Bytes: 80000
+        ).scheduledAttempt)
+        XCTAssertTrue(attempt.isValid)
+        let active = try JSONDecoder().decode(AgentSelfCompactState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(active.active?.note, note)
+
+        var session = AgentSession(name: "Large note", autoEditEnabled: true)
+        session.selfCompactState = state
+        let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(session))
+        XCTAssertFalse(restored.selfCompactPersistenceWarning)
+        XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, note)
+        XCTAssertNil(restored.selfCompactState?.active)
+
+        state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        XCTAssertTrue(try XCTUnwrap(state.latest).isValid)
+        let settled = try JSONDecoder().decode(AgentSelfCompactState.self, from: JSONEncoder().encode(state))
+        XCTAssertEqual(settled.latest?.recoveryNote, note)
+
+        // Removing the decode byte cap must not relax content or digest integrity.
+        for invalidNote in ["", " \t\n", "a\u{0000}b", "a\u{0085}b"] {
+            let invalid = AgentSelfCompactAttempt(idempotencyKey: "invalid", note: invalidNote)
+            XCTAssertFalse(invalid.isValid)
+            XCTAssertFalse(AgentSelfCompactSettlement.recoveryRequired(from: invalid).isValid)
+        }
+        for record in [AgentSelfCompactState(active: attempt), state] {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
+            let key = record.active == nil ? "latest" : "active"
+            var fields = try XCTUnwrap(object[key] as? [String: Any])
+            fields["noteDigest"] = String(repeating: "0", count: 64)
+            object[key] = fields
+            XCTAssertThrowsError(try JSONDecoder().decode(
+                AgentSelfCompactState.self, from: JSONSerialization.data(withJSONObject: object)
+            ))
+        }
+    }
+
+    func testActiveRequestTakesPrecedenceOverLatestSettlementRetry() throws {
+        let maximum = AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes
+        var state = AgentSelfCompactState()
+        let first = try XCTUnwrap(state.reserve(note: "A", idempotencyKey: "A", maximumNoteUTF8Bytes: maximum).scheduledAttempt)
+        state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        let second = try XCTUnwrap(state.reserve(note: "B", idempotencyKey: "B", maximumNoteUTF8Bytes: maximum).scheduledAttempt)
+        XCTAssertEqual(state.reserve(note: "A", idempotencyKey: "A", maximumNoteUTF8Bytes: maximum), .alreadyPending)
+        XCTAssertEqual(state.reserve(note: "changed A", idempotencyKey: "A", maximumNoteUTF8Bytes: maximum), .alreadyPending)
+        XCTAssertEqual(
+            state.reserve(note: String(repeating: "x", count: maximum + 1), idempotencyKey: "A", maximumNoteUTF8Bytes: maximum),
+            .invalidNote(.tooLong(byteCount: maximum + 1, maximum: maximum))
+        )
+        XCTAssertEqual(state.active?.id, second.id)
+        XCTAssertEqual(state.latest?.requestID, first.id)
+    }
+
     func testActiveAndLatestIdempotencyHorizon() throws {
         var state = AgentSelfCompactState()
-        let first = try XCTUnwrap(state.reserve(note: "first", idempotencyKey: "same").scheduledAttempt)
-        XCTAssertEqual(state.reserve(note: "first", idempotencyKey: "same"), .duplicate(first.id))
-        XCTAssertEqual(state.reserve(note: "changed", idempotencyKey: "same"), .conflict)
-        XCTAssertEqual(state.reserve(note: "second", idempotencyKey: "other"), .alreadyPending)
+        let first = try XCTUnwrap(state.reserve(note: "first", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
+        XCTAssertEqual(state.reserve(note: "first", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .duplicate(first.id))
+        XCTAssertEqual(state.reserve(note: "changed", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .conflict)
+        XCTAssertEqual(state.reserve(note: "second", idempotencyKey: "other", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .alreadyPending)
         state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
         XCTAssertNil(state.active)
-        XCTAssertEqual(state.reserve(note: "first", idempotencyKey: "same"), .duplicate(first.id))
-        XCTAssertEqual(state.reserve(note: "changed", idempotencyKey: "same"), .conflict)
-        let second = try XCTUnwrap(state.reserve(note: "second", idempotencyKey: "other").scheduledAttempt)
+        XCTAssertEqual(state.reserve(note: "first", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .duplicate(first.id))
+        XCTAssertEqual(state.reserve(note: "changed", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .conflict)
+        let second = try XCTUnwrap(state.reserve(note: "second", idempotencyKey: "other", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
         XCTAssertNotEqual(second.id, first.id)
         state.settle(.failed, noteDelivery: .notSent, completionVerified: false)
         // The contract intentionally retains only the active and latest keys.
-        XCTAssertNotNil(state.reserve(note: "first", idempotencyKey: "same").scheduledAttempt)
+        XCTAssertNotNil(state.reserve(note: "first", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
     }
 
     func testColdDecodeConvertsEveryRestoredPhaseIncludingParkedToNonExecutingRecovery() throws {
         for phase in AgentSelfCompactAttempt.Phase.allCases {
             var session = AgentSession(name: "Cold", autoEditEnabled: true)
             var state = AgentSelfCompactState()
-            let attempt = try XCTUnwrap(state.reserve(note: "verbatim\n  note", idempotencyKey: "key").scheduledAttempt)
+            let attempt = try XCTUnwrap(state.reserve(note: "verbatim\n  note", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
             state.active?.phase = phase
             if phase == .dispatchingNote { state.active?.noteDispatchStarted = true }
             session.selfCompactState = state
@@ -138,7 +264,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
     func testColdRestoreTreatsUnsavedDispatchMarkerAsDeliveryUnknown() throws {
         var session = AgentSession(name: "Prepared", autoEditEnabled: true)
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: "recover", idempotencyKey: "prepared")
+        _ = state.reserve(note: "recover", idempotencyKey: "prepared", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .dispatchingNote
         state.active?.noteDispatchStarted = false
         session.selfCompactState = state
@@ -160,7 +286,8 @@ final class AgentSelfCompactStateTests: XCTestCase {
             var session = AgentSession(name: "Parked \(provider.rawValue)", autoEditEnabled: true)
             var state = AgentSelfCompactState()
             let attempt = try XCTUnwrap(state.reserve(
-                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)"
+                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)",
+                maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes
             ).scheduledAttempt)
             state.active?.admittedSupport = provider
             state.active?.phase = .parked
@@ -180,7 +307,8 @@ final class AgentSelfCompactStateTests: XCTestCase {
             XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "recover once")
             var retry = try XCTUnwrap(restored.selfCompactState)
             XCTAssertEqual(retry.reserve(
-                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)"
+                note: "recover once", idempotencyKey: "parked-\(provider.rawValue)",
+                maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes
             ), .duplicate(attempt.id))
         }
     }
@@ -190,8 +318,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
         for malformed in [
             "{\"unknown\":true}",
             "{\"version\":99,\"active\":{}}",
-            "{\"version\":1,\"active\":{\"note\":42,\"phase\":\"scheduled\"}}",
-            "{\"version\":1,\"active\":{\"note\":\"\(String(repeating: "x", count: 8193))\",\"phase\":\"parked\"}}"
+            "{\"version\":1,\"active\":{\"note\":42,\"phase\":\"scheduled\"}}"
         ] {
             var object = try XCTUnwrap(JSONSerialization.jsonObject(with: base) as? [String: Any])
             object["selfCompactState"] = try JSONSerialization.jsonObject(with: Data(malformed.utf8))
@@ -206,7 +333,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
     func testColdRestorePreservesUnknownNoteDeliveryWithoutRetry() throws {
         var session = AgentSession(name: "Ambiguous", autoEditEnabled: true)
         var state = AgentSelfCompactState()
-        let attempt = try XCTUnwrap(state.reserve(note: "exact body", idempotencyKey: "same").scheduledAttempt)
+        let attempt = try XCTUnwrap(state.reserve(note: "exact body", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
         state.active?.phase = .dispatchingNote
         state.active?.noteDispatchStarted = true
         session.selfCompactState = state
@@ -217,7 +344,7 @@ final class AgentSelfCompactStateTests: XCTestCase {
         XCTAssertEqual(restored.selfCompactState?.latest?.noteDelivery, .deliveryUnknown)
         XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "exact body")
         var retry = try XCTUnwrap(restored.selfCompactState)
-        XCTAssertEqual(retry.reserve(note: "exact body", idempotencyKey: "same"), .duplicate(attempt.id))
+        XCTAssertEqual(retry.reserve(note: "exact body", idempotencyKey: "same", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .duplicate(attempt.id))
     }
 
     func testMalformedRecordIsBackedUpBeforeRepair() async throws {
@@ -247,12 +374,12 @@ final class AgentSelfCompactStateTests: XCTestCase {
     }
 
     func testRepeatedMaximumSizeRetryHasBoundedCost() throws {
-        let note = String(repeating: "😀", count: 2048)
+        let note = String(repeating: "😀", count: 16384)
         var state = AgentSelfCompactState()
-        let first = try XCTUnwrap(state.reserve(note: note, idempotencyKey: "retry").scheduledAttempt)
+        let first = try XCTUnwrap(state.reserve(note: note, idempotencyKey: "retry", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes).scheduledAttempt)
         let start = ProcessInfo.processInfo.systemUptime
         for _ in 0 ..< 1000 {
-            XCTAssertEqual(state.reserve(note: note, idempotencyKey: "retry"), .duplicate(first.id))
+            XCTAssertEqual(state.reserve(note: note, idempotencyKey: "retry", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes), .duplicate(first.id))
         }
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 5)
         XCTAssertEqual(state.active?.note, note)

@@ -1,7 +1,9 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptPersistence
 
-// Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
+// Durable oversight intents: directed relationships and, for derived exact-target links, the
+// user-consent scope they depend on. This reference can restrict restoration, never invent authority.
 //
 // Owns the Codable document, the persistence mode, the runtime token that fences one load/mutate
 // attempt, and the load/mutation contracts. `AgentSessionOversightLaunchCoordinator` replays these
@@ -23,6 +25,23 @@ import RepoPromptInstrumentation
 struct AgentSessionOversightIntent: Codable, Hashable {
     let observerSessionID: UUID
     let targetSessionID: UUID
+    let sourceScopeID: UUID?
+
+    init(observerSessionID: UUID, targetSessionID: UUID, sourceScopeID: UUID? = nil) {
+        self.observerSessionID = observerSessionID
+        self.targetSessionID = targetSessionID
+        self.sourceScopeID = sourceScopeID
+    }
+
+    /// The relationship is the row key. Consent provenance is immutable payload, not another pair.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.observerSessionID == rhs.observerSessionID && lhs.targetSessionID == rhs.targetSessionID
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(observerSessionID)
+        hasher.combine(targetSessionID)
+    }
 
     /// A session can never oversee itself, so such a row is invalid by construction rather than
     /// merely unsatisfiable. Filtered on load and refused on insert.
@@ -176,12 +195,11 @@ struct AgentSessionOversightIntentCurrentAttempt: Equatable {
 
 /// Exact before/after report for one attempted mutation.
 ///
-/// Blocked and write-failed mutations leave tokens, revision, and disk untouched, so a caller can
-/// always distinguish "the intent is durable" from "the action reported success but nothing was
-/// written".
+/// `outcome` describes the live intent decision; `saveState` describes continuity separately.
+/// Only an acknowledged SQLite commit is durable, never the mere existence of a live token.
 struct AgentSessionOversightIntentMutationReceipt: Equatable {
     enum Outcome: String, Equatable {
-        /// Disk and memory changed.
+        /// The live intent changed; inspect saveState for its separate continuity result.
         case applied
         /// The requested state was already true. No write, no revision change, token preserved.
         case unchanged
@@ -209,8 +227,12 @@ struct AgentSessionOversightIntentMutationReceipt: Equatable {
     /// committed before/after changes.
     var attemptedCurrentByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentCurrentAttempt] = [:]
 
+    var operationID: UUID?
+    var saveState: String = "saved"
+    var saveError: String?
+
     var isDurable: Bool {
-        outcome == .applied || outcome == .unchanged
+        (outcome == .applied || outcome == .unchanged) && saveState == "saved"
     }
 
     /// The token this pair holds after the mutation, when the mutation left one.
@@ -221,99 +243,75 @@ struct AgentSessionOversightIntentMutationReceipt: Equatable {
 
 // MARK: - Store
 
-/// Atomic, versioned store for durable oversight intent.
-///
-/// One actor serializes every operation. Each mutation encodes, atomically replaces the file, and
-/// commits its in-memory set/revision/tokens with **no suspension point between disk replacement
-/// and memory commit** — so a cancelled caller can never leave the two disagreeing.
-///
-/// Beside `windowSessions.json`:
-/// `~/Library/Application Support/RepoPrompt CE/agentSessionOversightLinks.json`
+/// Process-local intent tokens and an asynchronous transactional continuity outbox.
+/// Live user changes install before saving. A pending/failed save never masquerades as a durable
+/// receipt; exact tokens and assertion generations still fence stale cleanup and reassertion.
 actor AgentSessionOversightIntentStore {
     static let filename = "agentSessionOversightLinks.json"
     static let backupsDirectoryName = "Backups"
-    /// Defensive guards. Exceeding either preserves the file and blocks mutation; the store never
-    /// salvages partially, silently truncates, or evicts rows.
     static let maxFileByteCount = 16 * 1024 * 1024
     static let maxDecodedRowCount = 65536
-    private static let maxQuarantineAttempts = 4
-
-    private let restorePerfRecorder: any WorkspaceRestorePerfRecording
-    private let fileURL: URL
-    private let backupsDirectoryURL: URL
     private let mode: AgentSessionOversightPersistenceMode
-    /// Instance copies of the defensive guards. Production always uses the static defaults; the
-    /// injection point exists so the preserve-and-block behaviour at each limit can be proved without
-    /// materializing 65,536 rows or a 16 MiB document in a unit test.
-    private let maxFileByteCount: Int
-    private let maxDecodedRowCount: Int
-    private let fileManager: FileManager
-    private let writer: @Sendable (Data, URL) throws -> Void
-    private let now: @Sendable () -> Date
-    private let makeUUID: @Sendable () -> UUID
-    private let storeProcessGeneration: UUID
-
-    private var didLoad = false
-    /// How this launch's one and only read classified the file. Retained so a later caller is told
-    /// the *settled* answer — a quarantine or a missing file is a fact about this launch that the
-    /// presentation surface still has to be able to report after Add or Stop has also loaded.
-    private var settledSource: AgentSessionOversightIntentReadyLoad.Source?
-    private var blockReason: AgentSessionOversightPersistenceBlockReason?
+    private let repository: OverseerContinuityRepository
+    private let beforeCommit: @Sendable () throws -> Void
+    private let processGeneration: UUID
     private var tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken] = [:]
-    /// How many times each pair has been *asserted* in this process. Monotonic and never reset, not
-    /// even by a removal.
-    ///
-    /// The durable token deliberately survives a re-add — an existing row keeps its identity so an
-    /// explicit Add of a launch-loaded pair joins it instead of superseding it — which is exactly why
-    /// the token alone cannot tell "the intent my revocation belonged to" apart from "the intent the
-    /// user reasserted while I was suspended on an authority hop". This counter can, and it is
-    /// compared inside the actor, so no assertion can slip between a caller's check and its write.
-    private var assertionGenerationByPair: [AgentSessionOversightIntent: UInt64] = [:]
+    private var assertions: [AgentSessionOversightIntent: UInt64] = [:]
+    private var savedRevisions: [AgentSessionOversightIntent: Int64] = [:]
+    private var localDecisions: Set<AgentSessionOversightIntent> = []
     private var storeRevision: UInt64 = 0
+    private var didLoad = false
+    private var lastFailure: String?
+    private var recoveryWarning: String?
+    private var rejectedOperations: [UUID: String] = [:]
+    private struct Pending {
+        let id: UUID
+        let transitions: [AgentSessionOversightIntentTokenTransition]
+        var mutations: [OverseerContinuityMutation]?
+        var needsBaseline = false
+    }
+
+    private var pending: [Pending] = []
+    private var saving: Task<Void, Never>?
+    private var retry: Task<Void, Never>?
+    private var retryDelay: UInt64 = 1
 
     init(
         fileURL: URL,
-        backupsDirectoryURL: URL,
+        backupsDirectoryURL _: URL,
         mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default,
-        writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
-            try data.write(to: url, options: .atomic)
-        },
-        now: @escaping @Sendable () -> Date = Date.init,
-        makeUUID: @escaping @Sendable () -> UUID = UUID.init,
+        fileManager _: FileManager = .default,
+        beforeCommit: @escaping @Sendable () throws -> Void = {},
+        now _: @escaping @Sendable () -> Date = { Date() },
+        makeUUID _: @escaping @Sendable () -> UUID = { UUID() },
         storeProcessGeneration: UUID = UUID(),
-        maxFileByteCount: Int = AgentSessionOversightIntentStore.maxFileByteCount,
-        maxDecodedRowCount: Int = AgentSessionOversightIntentStore.maxDecodedRowCount,
-        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+        maxFileByteCount _: Int = maxFileByteCount,
+        maxDecodedRowCount _: Int = maxDecodedRowCount,
+        restorePerfRecorder _: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+        databaseURL: URL? = nil,
+        profile: String = "temporary-overseer",
+        legacyPolicy: OverseerLegacyPolicy = .sameProfile
     ) {
-        self.restorePerfRecorder = restorePerfRecorder
-        self.fileURL = fileURL
-        self.backupsDirectoryURL = backupsDirectoryURL
         self.mode = mode
-        self.maxFileByteCount = maxFileByteCount
-        self.maxDecodedRowCount = maxDecodedRowCount
-        self.fileManager = fileManager
-        self.writer = writer
-        self.now = now
-        self.makeUUID = makeUUID
-        self.storeProcessGeneration = storeProcessGeneration
+        self.beforeCommit = beforeCommit
+        processGeneration = storeProcessGeneration
+        repository = OverseerContinuityRepository(databaseURL: databaseURL ?? fileURL.deletingLastPathComponent().appendingPathComponent("Overseer/continuity.sqlite"), profile: profile, legacyURL: fileURL, kind: .link, mode: mode, legacyPolicy: legacyPolicy)
     }
 
-    /// Production location, beside `windowSessions.json`.
     static func production(
         mode: AgentSessionOversightPersistenceMode,
         fileManager: FileManager = .default,
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) -> AgentSessionOversightIntentStore {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        return AgentSessionOversightIntentStore(
-            fileURL: base.appendingPathComponent(filename),
-            backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),
+        let locations = OverseerContinuityRepository.production(fileManager: fileManager)
+        return .init(
+            fileURL: locations.legacyDirectory.appendingPathComponent(filename),
+            backupsDirectoryURL: locations.legacyDirectory,
             mode: mode,
-            fileManager: fileManager,
-            restorePerfRecorder: restorePerfRecorder
+            restorePerfRecorder: restorePerfRecorder,
+            databaseURL: locations.databaseURL,
+            profile: locations.profile,
+            legacyPolicy: locations.legacyFactsPolicy
         )
     }
 
@@ -321,301 +319,246 @@ actor AgentSessionOversightIntentStore {
         mode
     }
 
-    // MARK: - Load
-
-    /// Reads the file once for this launch and classifies the result.
-    ///
-    /// Repeat calls report the settled state rather than re-reading: the launch coordinator, an
-    /// explicit Add, and a presentation refresh must all observe the same classification.
-    func loadForLaunch() -> AgentSessionOversightIntentLoadResult {
-        let result = performLoadForLaunch()
-        #if DEBUG
-            logLaunchClassificationOnce(result)
-        #endif
-        return result
+    var diagnostic: String? {
+        lastFailure ?? rejectedOperations.values.sorted().first ?? recoveryWarning ?? repository.diagnostic
     }
 
-    private func performLoadForLaunch() -> AgentSessionOversightIntentLoadResult {
+    var saveState: String {
+        guard mode.performsProductionFileIO else { return "not_persisted" }
+        return lastFailure != nil || !rejectedOperations.isEmpty ? "failed" : !pending.isEmpty ? "pending" : "saved"
+    }
+
+    func loadForLaunch() async -> AgentSessionOversightIntentLoadResult {
         guard mode.performsProductionFileIO else { return .suppressed }
-        if didLoad {
-            if let blockReason { return .blocked(blockReason) }
-            return .ready(readyLoad(source: settledSource ?? .loaded))
-        }
-        didLoad = true
-
-        let data: Data
-        switch readFile() {
-        case .missing:
-            return .ready(readyLoad(source: .missing))
-        case let .blocked(reason):
-            blockReason = reason
-            return .blocked(reason)
-        case let .data(value):
-            data = value
-        }
-
-        let decoder = JSONDecoder()
-        guard let header = try? decoder.decode(AgentSessionOversightIntentDocumentHeader.self, from: data) else {
-            // Malformed but nominally ours: preserve the bytes intact, then start empty/writable.
-            return quarantineAndStartEmpty()
-        }
-        guard header.version <= AgentSessionOversightIntentDocument.currentVersion else {
-            let reason = AgentSessionOversightPersistenceBlockReason.unsupportedFutureSchema(
-                onDiskVersion: header.version,
-                supportedVersion: AgentSessionOversightIntentDocument.currentVersion
-            )
-            blockReason = reason
-            return .blocked(reason)
-        }
-        guard let document = try? decoder.decode(AgentSessionOversightIntentDocument.self, from: data) else {
-            return quarantineAndStartEmpty()
-        }
-        guard document.links.count <= maxDecodedRowCount else {
-            let reason = AgentSessionOversightPersistenceBlockReason.tooManyRows(rowCount: document.links.count)
-            blockReason = reason
-            return .blocked(reason)
-        }
-
-        // Normalization is in-memory only: a load never writes. Self-pairs are dropped because they
-        // can never be granted, and duplicates collapse onto one token.
-        for pair in document.links where !pair.isSelfPair {
-            guard tokenByPair[pair] == nil else { continue }
-            tokenByPair[pair] = mintToken(for: pair)
-        }
-        return .ready(readyLoad(source: .loaded))
-    }
-
-    private enum FileRead {
-        case missing
-        case data(Data)
-        case blocked(AgentSessionOversightPersistenceBlockReason)
-    }
-
-    private func readFile() -> FileRead {
-        guard fileManager.fileExists(atPath: fileURL.path) else { return .missing }
-        if let size = (try? fileManager.attributesOfItem(atPath: fileURL.path))?[.size] as? NSNumber,
-           size.intValue > maxFileByteCount
-        {
-            return .blocked(.fileTooLarge(byteCount: size.intValue))
-        }
-        guard let data = try? Data(contentsOf: fileURL) else { return .blocked(.unreadable) }
-        guard data.count <= maxFileByteCount else {
-            return .blocked(.fileTooLarge(byteCount: data.count))
-        }
-        return .data(data)
-    }
-
-    /// Moves the intact source aside with no-replace semantics, then starts empty and writable.
-    ///
-    /// A collision retries under a fresh UUID rather than overwriting an earlier backup. If the file
-    /// cannot be moved at all it is preserved where it is and mutation stays blocked, because
-    /// starting empty over an unreadable file we could not back up would silently destroy the user's
-    /// saved links on the next write.
-    private func quarantineAndStartEmpty() -> AgentSessionOversightIntentLoadResult {
-        try? fileManager.createDirectory(at: backupsDirectoryURL, withIntermediateDirectories: true)
-        let stamp = Self.utcStamp(now())
-        for _ in 0 ..< Self.maxQuarantineAttempts {
-            let destination = backupsDirectoryURL.appendingPathComponent(
-                "agentSessionOversightLinks.corrupt.\(stamp).\(makeUUID().uuidString).json"
-            )
-            guard !fileManager.fileExists(atPath: destination.path) else { continue }
+        if !didLoad {
             do {
-                try fileManager.moveItem(at: fileURL, to: destination)
-                return .ready(readyLoad(source: .quarantined))
+                let repository = repository
+                let rows = try await Task.detached { try repository.load() }.value
+                var invalidIDs: [String] = []
+                let validated = rows.compactMap { row -> (OverseerContinuityRow, AgentSessionOversightIntent)? in
+                    do {
+                        let pair = try JSONDecoder().decode(AgentSessionOversightIntent.self, from: row.payload)
+                        guard row.id == pair.continuityID, !pair.isSelfPair,
+                              row.ownerID == pair.observerSessionID.uuidString, row.anchorID == pair.targetSessionID.uuidString else { throw OverseerContinuityError.invalidRecord }
+                        return (row, pair)
+                    } catch {
+                        invalidIDs.append(row.id)
+                        return nil
+                    }
+                }
+                recoveryWarning = invalidIDs.isEmpty ? nil : "Invalid link entries remain preserved and inactive for recovery: \(invalidIDs.joined(separator: ", ")). Other valid rows restore normally."
+                for (row, pair) in validated {
+                    savedRevisions[pair] = max(savedRevisions[pair] ?? 0, row.revision)
+                    if !localDecisions.contains(pair) {
+                        if !row.terminal { tokenByPair[pair] = mint(pair) }
+                    }
+                }
+                didLoad = true
+                lastFailure = nil
             } catch {
-                guard !fileManager.fileExists(atPath: fileURL.path) else { continue }
-                break
+                lastFailure = "Link continuity could not open (\(error)). Current explicit links remain usable in this process; saved links were preserved and saving will retry."
+                scheduleRetry()
+                return .blocked(.unreadable)
             }
         }
-        blockReason = .unreadable
-        return .blocked(.unreadable)
+        return .ready(.init(source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair))
     }
 
-    private func readyLoad(source: AgentSessionOversightIntentReadyLoad.Source) -> AgentSessionOversightIntentReadyLoad {
-        settledSource = source
-        return AgentSessionOversightIntentReadyLoad(
-            source: source,
-            storeRevision: storeRevision,
-            tokenByPair: tokenByPair
-        )
-    }
-
-    /// Filename-safe UTC stamp. Built per call rather than from a cached formatter: `DateFormatter`
-    /// is not `Sendable`, and quarantine is a once-per-launch path where allocation is irrelevant.
-    private static func utcStamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        return formatter.string(from: date)
-    }
-
-    // MARK: - Mutation
-
-    /// Idempotent insert. An already-present pair keeps its token and writes nothing, so a manual
-    /// Add of a launch-loaded pair joins the existing token instead of superseding it.
-    func insert(_ pair: AgentSessionOversightIntent) -> AgentSessionOversightIntentMutationReceipt {
-        logged("insert", performInsert(pair))
-    }
-
-    private func performInsert(_ pair: AgentSessionOversightIntent) -> AgentSessionOversightIntentMutationReceipt {
-        guard mutationIsAdmitted, !pair.isSelfPair else { return blockedReceipt() }
-        if let existing = tokenByPair[pair] {
-            // An idempotent insert writes nothing and bumps no store revision, but it *is* a fresh
-            // assertion of the pair: it is the moment a user reasserts a relationship some suspended
-            // lifecycle owner is still about to clean up under the very same token.
-            let generation = bumpAssertionGeneration(for: pair)
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .unchanged,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [.init(pair: pair, before: existing, after: existing)],
-                wroteFile: false,
-                assertionGeneration: generation
-            )
+    func insert(_ pair: AgentSessionOversightIntent) async -> AgentSessionOversightIntentMutationReceipt {
+        guard !pair.isSelfPair else { return receipt(.blocked, before: storeRevision, transitions: []) }
+        let before = storeRevision
+        let old = tokenByPair[pair]
+        let sourceChanged = old.map { $0.pair.sourceScopeID != pair.sourceScopeID } ?? false
+        storeRevision &+= 1
+        let token = sourceChanged ? mint(pair) : old ?? mint(pair)
+        if sourceChanged { tokenByPair.removeValue(forKey: pair) }
+        tokenByPair[pair] = token
+        localDecisions.insert(pair)
+        assertions[pair, default: 0] &+= 1
+        let transitions = [AgentSessionOversightIntentTokenTransition(pair: pair, before: old, after: token)]
+        // A same-token reassertion changes only the process-local assertion fence. It must not
+        // rewrite a saved row or generate save notifications on every reconciliation pass.
+        let operation = old == nil || sourceChanged ? UUID() : nil
+        if let operation {
+            pending.append(.init(id: operation, transitions: transitions))
+            startSaving()
         }
-        var replacement = tokenByPair
-        replacement[pair] = mintToken(for: pair, revision: storeRevision &+ 1)
-        var receipt = commit(
-            pairs: Set(replacement.keys),
-            revisionBefore: storeRevision,
-            transitions: [.init(pair: pair, before: nil, after: replacement[pair])],
-            apply: { [self] in
-                tokenByPair = replacement
-            }
-        )
-        // Only a committed insert counts as an assertion: a refused one asserted nothing.
-        if receipt.outcome == .applied {
-            receipt.assertionGeneration = bumpAssertionGeneration(for: pair)
-        }
-        return receipt
+        var value = receipt(operation != nil ? .applied : .unchanged, before: before, transitions: transitions)
+        value.assertionGeneration = assertions[pair]
+        value.operationID = operation
+        return value
     }
 
-    /// Monotonic per pair, and never cleared — including by removal.
-    ///
-    /// Resetting on removal would let a remove/re-add cycle land back on a generation some stale
-    /// owner is still holding, which is the exact comparison this counter exists to fail.
-    private func bumpAssertionGeneration(for pair: AgentSessionOversightIntent) -> UInt64 {
-        let next = (assertionGenerationByPair[pair] ?? 0) &+ 1
-        assertionGenerationByPair[pair] = next
-        return next
-    }
-
-    /// The pair's current assertion generation. Launch-loaded rows start at zero: they were restored,
-    /// not asserted by anyone in this process.
-    func assertionGeneration(for pair: AgentSessionOversightIntent) -> UInt64 {
-        assertionGenerationByPair[pair] ?? 0
-    }
-
-    /// Expected-token removal. This is the **only** removal a compensation, lifecycle cleanup, or
-    /// notice may use: a stale token can never delete the intent a newer re-add reasserted.
-    ///
-    /// - Parameter assertedAt: the pair's assertion generation the caller last owned, or `nil` for a
-    ///   caller that owns the pair lane for the whole removal and therefore cannot be raced. A stale
-    ///   generation reports `.tokenMismatch` and writes nothing — the token is deliberately *not*
-    ///   enough on its own, because an idempotent re-add reuses it.
     func remove(
         _ pair: AgentSessionOversightIntent,
         ifCurrent token: AgentSessionOversightIntentToken,
         assertedAt generation: UInt64? = nil
+    ) async -> AgentSessionOversightIntentMutationReceipt {
+        let before = storeRevision
+        guard let current = tokenByPair[pair] else { return receipt(.absent, before: before, transitions: []) }
+        guard current == token, generation.map({ $0 == assertions[pair, default: 0] }) ?? true else {
+            return receipt(.tokenMismatch, before: before, transitions: [.init(pair: pair, before: current, after: current)])
+        }
+        tokenByPair.removeValue(forKey: pair)
+        localDecisions.insert(pair)
+        storeRevision &+= 1
+        let transitions = [AgentSessionOversightIntentTokenTransition(pair: pair, before: current, after: nil)]
+        let operation = UUID()
+        pending.append(.init(id: operation, transitions: transitions))
+        startSaving()
+        var value = receipt(.applied, before: before, transitions: transitions)
+        value.operationID = operation
+        return value
+    }
+
+    func removeAll(containing sessionID: UUID) async -> AgentSessionOversightIntentMutationReceipt {
+        let before = storeRevision
+        let transitions = tokenByPair.filter { $0.key.touches(sessionID: sessionID) }.map { AgentSessionOversightIntentTokenTransition(pair: $0.key, before: $0.value, after: nil) }
+        guard !transitions.isEmpty else { return receipt(.unchanged, before: before, transitions: []) }
+        for transition in transitions {
+            tokenByPair.removeValue(forKey: transition.pair)
+            localDecisions.insert(transition.pair)
+        }
+        storeRevision &+= 1
+        let operation = UUID()
+        pending.append(.init(id: operation, transitions: transitions))
+        startSaving()
+        var value = receipt(.applied, before: before, transitions: transitions)
+        value.operationID = operation
+        return value
+    }
+
+    private func receipt(
+        _ outcome: AgentSessionOversightIntentMutationReceipt.Outcome,
+        before: UInt64,
+        transitions: [AgentSessionOversightIntentTokenTransition]
     ) -> AgentSessionOversightIntentMutationReceipt {
-        logged("remove", performRemove(pair, ifCurrent: token, assertedAt: generation))
-    }
-
-    private func performRemove(
-        _ pair: AgentSessionOversightIntent,
-        ifCurrent token: AgentSessionOversightIntentToken,
-        assertedAt generation: UInt64?
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        guard mutationIsAdmitted else { return blockedReceipt() }
-        guard let current = tokenByPair[pair] else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .absent,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [],
-                wroteFile: false,
-                assertionGeneration: assertionGeneration(for: pair)
-            )
-        }
-        let currentGeneration = assertionGeneration(for: pair)
-        guard current == token, generation.map({ $0 == currentGeneration }) ?? true else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .tokenMismatch,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [.init(pair: pair, before: current, after: current)],
-                wroteFile: false,
-                assertionGeneration: currentGeneration
-            )
-        }
-        var remaining = tokenByPair
-        remaining.removeValue(forKey: pair)
-        return commit(
-            pairs: Set(remaining.keys),
-            revisionBefore: storeRevision,
-            transitions: [.init(pair: pair, before: current, after: nil)],
-            apply: { [self] in
-                tokenByPair = remaining
-            }
-        )
-    }
-
-    /// Removes every intent touching one session. Used only when the session itself is known to be
-    /// gone process-wide (a committed deletion), never for tab teardown or rebinding.
-    func removeAll(containing sessionID: UUID) -> AgentSessionOversightIntentMutationReceipt {
-        logged("remove_all", performRemoveAll(containing: sessionID))
-    }
-
-    private func performRemoveAll(containing sessionID: UUID) -> AgentSessionOversightIntentMutationReceipt {
-        let matches = tokenByPair.filter { $0.key.touches(sessionID: sessionID) }
-        // Captured in the same actor turn as the attempted mutation. A caller cannot safely perform a
-        // separate pre-read: a row inserted between that hop and this one would be covered by neither
-        // the failed write nor its retry bookkeeping.
-        let attempted = Dictionary(uniqueKeysWithValues: matches.map { pair, token in
-            (
-                pair,
-                AgentSessionOversightIntentCurrentAttempt(
-                    token: token,
-                    assertionGeneration: assertionGeneration(for: pair)
-                )
-            )
-        })
-        guard mutationIsAdmitted else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .blocked,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [],
-                wroteFile: false,
-                attemptedCurrentByPair: attempted
-            )
-        }
-        guard !matches.isEmpty else {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .unchanged,
-                storeRevisionBefore: storeRevision,
-                storeRevisionAfter: storeRevision,
-                transitions: [],
-                wroteFile: false
-            )
-        }
-        var remaining = tokenByPair
-        for pair in matches.keys {
-            remaining.removeValue(forKey: pair)
-        }
-        let transitions = matches
-            .map { AgentSessionOversightIntentTokenTransition(pair: $0.key, before: $0.value, after: nil) }
-            .sorted { AgentSessionOversightIntent.canonicallyOrdered($0.pair, $1.pair) }
-        return commit(
-            pairs: Set(remaining.keys),
-            revisionBefore: storeRevision,
+        var receipt = AgentSessionOversightIntentMutationReceipt(
+            outcome: outcome,
+            storeRevisionBefore: before,
+            storeRevisionAfter: storeRevision,
             transitions: transitions,
-            attemptedCurrentByPair: attempted,
-            apply: { [self] in
-                tokenByPair = remaining
-            }
+            wroteFile: false
         )
+        receipt.saveState = saveState
+        receipt.saveError = diagnostic
+        return receipt
+    }
+
+    private func startSaving() {
+        guard mode.performsProductionFileIO, saving == nil, !pending.isEmpty else { return }
+        postContinuityChange()
+        saving = Task { [weak self] in
+            guard let self else { return }
+            await drain()
+        }
+    }
+
+    private func flushAttempt() async {
+        startSaving()
+        await saving?.value
+    }
+
+    private func postContinuityChange() {
+        Task { @MainActor in NotificationCenter.default.post(name: .agentOverseerContinuityDidChange, object: nil) }
+    }
+
+    private func drain() async {
+        // Load/reconcile continuity off the live Add path, before capturing row revisions.
+        if !didLoad { _ = await loadForLaunch() }
+        defer { saving = nil
+            postContinuityChange()
+        }
+        while !pending.isEmpty {
+            do {
+                if pending[0].needsBaseline, didLoad {
+                    let operation = pending[0].id, database = repository.database
+                    let prior = try await Task.detached { try database.receipt(operationID: operation) }.value
+                    // A failed first open had no base revision. Reconcile only after proving that
+                    // this operation did not commit; a lost acknowledgement must replay verbatim.
+                    if prior == nil { pending[0].mutations = nil }
+                    pending[0].needsBaseline = false
+                }
+                let mutations: [OverseerContinuityMutation]
+                if let captured = pending[0].mutations { mutations = captured }
+                else {
+                    mutations = try pending[0].transitions.map { transition in
+                        let pair = transition.pair
+                        let expected = savedRevisions[pair]
+                        if transition.after != nil {
+                            return try .put(.init(
+                                kind: .link,
+                                id: pair.continuityID,
+                                ownerID: pair.observerSessionID.uuidString,
+                                anchorID: pair.targetSessionID.uuidString,
+                                payload: JSONEncoder().encode(pair)
+                            ), expectedRevision: expected)
+                        }
+                        if let expected { return .remove(kind: .link, id: pair.continuityID, expectedRevision: expected) }
+                        // A remove before any successful save still records a terminal row.
+                        return try .put(.init(
+                            kind: .link,
+                            id: pair.continuityID,
+                            ownerID: pair.observerSessionID.uuidString,
+                            anchorID: pair.targetSessionID.uuidString,
+                            payload: JSONEncoder().encode(pair),
+                            terminal: true
+                        ), expectedRevision: nil)
+                    }
+                    pending[0].mutations = mutations
+                    pending[0].needsBaseline = !didLoad
+                }
+                let operation = pending[0].id, repository = repository, hook = beforeCommit
+                let committed = try await Task.detached {
+                    try hook()
+                    return try repository.commit(operationID: operation, mutations: mutations, origin: "live-link-owner")
+                }.value
+                for transition in pending[0].transitions {
+                    savedRevisions[transition.pair] = max(savedRevisions[transition.pair] ?? 0, committed.revision)
+                }
+                pending.removeFirst()
+                lastFailure = nil
+                retryDelay = 1
+            } catch {
+                if let transition = error as? OverseerContinuityError, transition.isPermanentTransitionFailure {
+                    let failed = pending.removeFirst()
+                    rejectedOperations[failed.id] = "Link continuity operation \(failed.id) was rejected (\(transition)); it was not saved and will not be retried automatically. Inspect the conflicting/deleted saved identity before making a fresh link decision. Other saves continue."
+                    lastFailure = nil
+                    continue
+                }
+                lastFailure = "Link continuity save failed (\(error)). The live link decision still applies; it is not durably saved or shared. Saving will retry."
+                scheduleRetry()
+                break
+            }
+        }
+    }
+
+    private func scheduleRetry() {
+        guard retry == nil, mode.performsProductionFileIO else { return }
+        let delay = retryDelay
+        retryDelay = min(30, delay * 2)
+        retry = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay * 1_000_000_000) } catch { return }
+            await self?.retrySaving()
+        }
+    }
+
+    func retrySaving() async {
+        retry = nil
+        if !didLoad { _ = await loadForLaunch() }
+        await flushAttempt()
+    }
+
+    private func mint(_ pair: AgentSessionOversightIntent) -> AgentSessionOversightIntentToken {
+        .init(storeProcessGeneration: processGeneration, pair: pair, pairRevision: storeRevision)
+    }
+
+    func assertionGeneration(for pair: AgentSessionOversightIntent) -> UInt64 {
+        assertions[pair, default: 0]
+    }
+
+    func allIntents() -> [AgentSessionOversightIntent] {
+        tokenByPair.keys.sorted(by: AgentSessionOversightIntent.canonicallyOrdered)
     }
 
     func isCurrent(_ token: AgentSessionOversightIntentToken) -> Bool {
@@ -630,152 +573,7 @@ actor AgentSessionOversightIntentStore {
         storeRevision
     }
 
-    /// Confirms that every store operation registered before this call has crossed the actor
-    /// boundary. Writes are write-through, so this is a linearization point, not a flush.
-    func serializationBarrier() {}
-
-    // MARK: - Diagnostics
-
-    /// Debug-only, opt-in instrumentation shared with window/workspace restore.
-    ///
-    /// Everything emitted here is an enum-like outcome label or a count. Pairs, session identifiers,
-    /// names, and the file/backup paths are deliberately absent: knowing *that* a launch quarantined
-    /// its manifest or *that* a removal hit a stale token is the whole diagnostic value, and the
-    /// identities would only add a privacy liability to a log this surface otherwise never writes to.
-    private func logged(
-        _ operation: String,
-        _ receipt: AgentSessionOversightIntentMutationReceipt
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        #if DEBUG
-            restorePerfRecorder.event(
-                "oversight.store.receipt",
-                fields: [
-                    "op": operation,
-                    "outcome": receipt.outcome.rawValue,
-                    "wroteFile": receipt.wroteFile ? "1" : "0",
-                    "revision": String(receipt.storeRevisionAfter),
-                    "transitions": String(receipt.transitions.count)
-                ]
-            )
-        #endif
-        return receipt
-    }
-
-    #if DEBUG
-        /// The launch classification is reported once even though `loadForLaunch()` is called by the
-        /// coordinator, by Add, and by Stop: it is one fact about this launch, not one per caller.
-        private var didLogLaunchClassification = false
-
-        private func logLaunchClassificationOnce(_ result: AgentSessionOversightIntentLoadResult) {
-            guard !didLogLaunchClassification else { return }
-            didLogLaunchClassification = true
-            switch result {
-            case .suppressed:
-                restorePerfRecorder.event("oversight.store.load", fields: ["result": "suppressed"])
-            case let .blocked(reason):
-                restorePerfRecorder.event(
-                    "oversight.store.load",
-                    fields: ["result": "blocked", "reason": reason.diagnosticLabel]
-                )
-            case let .ready(load):
-                restorePerfRecorder.event(
-                    "oversight.store.load",
-                    fields: ["result": load.source.rawValue, "pairs": String(load.tokenByPair.count)]
-                )
-            }
-        }
-    #endif
-
-    // MARK: - Commit
-
-    private var mutationIsAdmitted: Bool {
-        mode.performsProductionFileIO && didLoad && blockReason == nil
-    }
-
-    private func blockedReceipt(
-        attemptedCurrentByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentCurrentAttempt] = [:]
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        AgentSessionOversightIntentMutationReceipt(
-            outcome: .blocked,
-            storeRevisionBefore: storeRevision,
-            storeRevisionAfter: storeRevision,
-            transitions: [],
-            wroteFile: false,
-            attemptedCurrentByPair: attemptedCurrentByPair
-        )
-    }
-
-    /// Encode → atomic replace → in-memory commit, with nothing suspendable in between.
-    ///
-    /// `apply` runs only after the replacement succeeded, and this whole method is synchronous
-    /// inside the actor, so a cancelled caller cannot observe (or produce) a disk/memory split.
-    /// - Parameter attemptedCurrentByPair: atomic current-row snapshot returned only if the write is
-    ///   blocked or fails, so committed-deletion cleanup can queue exact retries without another hop.
-    private func commit(
-        pairs: Set<AgentSessionOversightIntent>,
-        revisionBefore: UInt64,
-        transitions: [AgentSessionOversightIntentTokenTransition],
-        attemptedCurrentByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentCurrentAttempt] = [:],
-        apply: () -> Void
-    ) -> AgentSessionOversightIntentMutationReceipt {
-        // The defensive guards are load-time *and* mutation-time. Checking them only on load would
-        // let a manifest sitting exactly at a limit accept one more row, write successfully, and then
-        // block itself on the next launch — the file would be preserved, but every saved link in it
-        // would become unchangeable because of a write this process reported as a success.
-        guard pairs.count <= maxDecodedRowCount else {
-            return blockedReceipt(attemptedCurrentByPair: attemptedCurrentByPair)
-        }
-        let document = AgentSessionOversightIntentDocument(
-            links: pairs.sorted(by: AgentSessionOversightIntent.canonicallyOrdered)
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        do {
-            let data = try encoder.encode(document)
-            // Measured on the exact bytes that would be written, before the replacement: preserving
-            // the old file and refusing is the contract, never a partial salvage or an eviction.
-            guard data.count <= maxFileByteCount else {
-                return blockedReceipt(attemptedCurrentByPair: attemptedCurrentByPair)
-            }
-            // The container is created here rather than borrowed from whichever other component
-            // happened to run first: this store bootstraps independently of window-session restore,
-            // so on a first launch its atomic replace would otherwise fail with "no such directory"
-            // and report a spurious save failure for an Add that had nothing wrong with it. Reached
-            // only through `mutationIsAdmitted`, so a suppressed launch still creates nothing.
-            try? fileManager.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try writer(data, fileURL)
-        } catch {
-            return AgentSessionOversightIntentMutationReceipt(
-                outcome: .writeFailed,
-                storeRevisionBefore: revisionBefore,
-                storeRevisionAfter: revisionBefore,
-                transitions: [],
-                wroteFile: false,
-                attemptedCurrentByPair: attemptedCurrentByPair
-            )
-        }
-        apply()
-        storeRevision = revisionBefore &+ 1
-        return AgentSessionOversightIntentMutationReceipt(
-            outcome: .applied,
-            storeRevisionBefore: revisionBefore,
-            storeRevisionAfter: storeRevision,
-            transitions: transitions,
-            wroteFile: true
-        )
-    }
-
-    private func mintToken(
-        for pair: AgentSessionOversightIntent,
-        revision: UInt64? = nil
-    ) -> AgentSessionOversightIntentToken {
-        AgentSessionOversightIntentToken(
-            storeProcessGeneration: storeProcessGeneration,
-            pair: pair,
-            pairRevision: revision ?? storeRevision
-        )
+    func serializationBarrier() async {
+        await saving?.value
     }
 }

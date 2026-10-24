@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "historyAdmissionFloorBuild": null,
+  "historyAdmissionFloorCommit": null,
+  "historyUIFloorBuild": null,
+  "historyEnabledSinceTag": null,
+  "bootstrapEvidenceFile": null,
+  "bootstrapEvidenceSha256": null,
+  "retention": {
+    "schemaLifetime": 1,
+    "owner": null,
+    "reviewedEvidence": null
+  }
+}

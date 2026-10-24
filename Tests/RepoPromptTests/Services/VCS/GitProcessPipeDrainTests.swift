@@ -88,6 +88,10 @@ final class GitProcessPipeDrainTests: XCTestCase {
             XCTAssertLessThan(try XCTUnwrap(show.firstIndex(of: "--no-textconv")), try XCTUnwrap(show.firstIndex(of: "--end-of-options")))
             XCTAssertEqual(GitReadSafety.arguments(show), show)
             XCTAssertTrue(show.contains("core.hooksPath=/dev/null"))
+            let conflicting = GitReadSafety.arguments(["diff", "--no-ext-diff", "--ext-diff", "--no-textconv", "--textconv", "HEAD", "--", "file"])
+            let separator = try XCTUnwrap(conflicting.firstIndex(of: "--"))
+            XCTAssertEqual(Array(conflicting[..<separator].suffix(3)), ["--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"])
+            XCTAssertEqual(GitReadSafety.arguments(conflicting), conflicting)
         }
 
         func testDriverScopeParserFailsClosedWithoutDiscardingUserOnlyDrivers() throws {
@@ -196,11 +200,20 @@ final class GitProcessPipeDrainTests: XCTestCase {
                 let partial = try await service.runGitDataForTesting(["status", "--porcelain"], at: repo)
                 XCTAssertEqual(partial.2, 0)
                 XCTAssertTrue(partial.0.isEmpty, "the fenced low-level view alone is partial, not authoritative")
-                do {
-                    _ = try await service.getWorkingStatus(at: repo)
-                    XCTFail("Submodule dirtiness must not be reported clean")
-                } catch {
-                    XCTAssertTrue(error.localizedDescription.contains("status is incomplete"))
+                for inspection in ["workingStatus", "uncommittedFiles", "statusPorcelain", "changedFiles", "worktreeComparison", "fingerprint"] {
+                    do {
+                        switch inspection {
+                        case "workingStatus": _ = try await service.getWorkingStatus(at: repo)
+                        case "uncommittedFiles": _ = try await service.getUncommittedFiles(at: repo)
+                        case "statusPorcelain": _ = try await service.getStatusPorcelainZ(at: repo)
+                        case "changedFiles": _ = try await service.getChangedFilesStats(relativeTo: .head, at: repo)
+                        case "worktreeComparison": _ = try await service.getChangedFilesStats(compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, at: repo)
+                        default: _ = try await service.getStatusFingerprint(at: repo)
+                        }
+                        XCTFail("Submodule dirtiness must not be reported clean: \(inspection)")
+                    } catch {
+                        XCTAssertTrue(error.localizedDescription.contains("status is incomplete"), "\(inspection): \(error)")
+                    }
                 }
                 do {
                     _ = try await service.inspectWorktreeMerge(.init(source: source, target: target))
@@ -210,6 +223,22 @@ final class GitProcessPipeDrainTests: XCTestCase {
                 }
                 XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "child fsmonitor must not run")
                 try fixture.runGit(["config", "--unset", "core.fsmonitor"], at: child)
+            }
+            // Git's index may contain arbitrary pathname bytes, even on a
+            // filesystem that cannot materialize them. They must not hide the
+            // gitlink by making the entire index listing fail UTF-8 decoding.
+            let blob = try fixture.headBlobOID(for: "parent.txt", at: repo)
+            var entry = Data("100644 \(blob)\tinvalid-".utf8)
+            entry.append(contentsOf: [0xFF, 0])
+            let (_, _, updateExit) = try await service.runGitDataForTesting(["update-index", "-z", "--index-info"], at: repo, stdin: entry)
+            XCTAssertEqual(updateExit, 0)
+            let (rawIndex, _, _) = try await service.runGitDataForTesting(["ls-files", "--stage", "-z"], at: repo)
+            XCTAssertNil(String(data: rawIndex, encoding: .utf8), "positive control for undecodable index path")
+            do {
+                _ = try await service.getWorkingStatus(at: repo)
+                XCTFail("Non-UTF-8 paths must not hide a tracked submodule")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("status is incomplete"))
             }
         }
 
@@ -337,7 +366,7 @@ final class GitProcessPipeDrainTests: XCTestCase {
             try fixture.runGit(["config", "diff.inspection.textconv", shellCommand(script.path)], at: repo)
             try fixture.write("after\n", to: "file.txt", at: repo)
             let service = GitService()
-            for arguments in [["diff", "HEAD"], ["log", "-p", "-1"], ["show", "HEAD"], ["blame", "file.txt"]] {
+            for arguments in [["diff", "HEAD"], ["log", "-p", "-1"], ["show", "HEAD"], ["blame", "file.txt"], ["diff", "--no-textconv", "--textconv", "HEAD"], ["log", "--no-textconv", "--textconv", "-p", "-1"]] {
                 _ = try fixture.runGit(arguments, at: repo)
                 XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control: \(arguments[0])")
                 try FileManager.default.removeItem(at: marker)
@@ -356,9 +385,14 @@ final class GitProcessPipeDrainTests: XCTestCase {
             _ = try fixture.runGit(["diff", "HEAD"], at: repo)
             XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control")
             try FileManager.default.removeItem(at: marker)
-            let (_, _, exitCode) = try await GitService().runGitDataForTesting(["diff", "HEAD"], at: repo)
-            XCTAssertEqual(exitCode, 0)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            let service = GitService()
+            for arguments in [["diff", "HEAD"], ["diff", "--no-ext-diff", "--ext-diff", "HEAD"]] {
+                let (_, _, exitCode) = try await service.runGitDataForTesting(arguments, at: repo)
+                XCTAssertEqual(exitCode, 0)
+                let (_, _, spoolCode, _) = try await service.runGitSpoolingForTesting(arguments, at: repo)
+                XCTAssertEqual(spoolCode, 0)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
         }
 
         func testRepositoryFilterFailsClosedIncludingAnIncludedConfiguration() async throws {
