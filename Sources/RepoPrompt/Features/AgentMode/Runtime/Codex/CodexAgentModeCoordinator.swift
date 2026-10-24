@@ -4469,6 +4469,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         stopCodexToolTracking(for: session)
     }
 
+    /// Keep the missing-rollout replacement phase even when no binding response arrives.
+    private struct CodexFreshStartFallbackFailure: LocalizedError {
+        let underlyingError: Error
+
+        var errorDescription: String? {
+            underlyingError.localizedDescription
+        }
+    }
+
     private func startCodexNativeSession(
         controller: (any CodexSessionControlling)?,
         existingRef: CodexNativeSessionController.SessionRef?,
@@ -4508,18 +4517,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             logCodex("[AgentModeVM][CodexReconnect] resume failed due to missing rollout path; retrying with a fresh thread start")
             guard await beforeStart?() ?? true else { throw CancellationError() }
-            let ref = try await controller.startOrResume(
-                existing: nil,
-                baseInstructions: baseInstructions,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                serviceTier: serviceTier
-            )
-            return CodexNativeSessionStartResult(
-                sessionRef: ref,
-                fallbackReason: .missingRollout,
-                disposition: .resumeFellBackToFresh
-            )
+            do {
+                let ref = try await controller.startOrResume(
+                    existing: nil,
+                    baseInstructions: baseInstructions,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    serviceTier: serviceTier
+                )
+                return CodexNativeSessionStartResult(
+                    sessionRef: ref,
+                    fallbackReason: .missingRollout,
+                    disposition: .resumeFellBackToFresh
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CodexFreshStartFallbackFailure(underlyingError: error)
+            }
         }
     }
 
@@ -7525,7 +7540,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     }
                 }
             }
-            let attemptedResume = Self.isCodexResumeAttempt(existingRef)
+            let freshStartFallbackFailure = effectiveError as? CodexFreshStartFallbackFailure
+            if let freshStartFallbackFailure {
+                effectiveError = freshStartFallbackFailure.underlyingError
+            }
+            let attemptedResume = freshStartFallbackFailure == nil && Self.isCodexResumeAttempt(existingRef)
             let isOversizedResume = attemptedResume
                 && CodexAppServerClient.isStdoutFrameBudgetExceededError(effectiveError)
             let isControlPlaneTimeout = !isOversizedResume && CodexAppServerClient.isTimeoutError(effectiveError)
@@ -7558,12 +7577,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 if attemptedResume, isControlPlaneTimeout {
                     session.codexNativeStartupDisposition = .resumeTimedOut
                 }
-                var errorItem = AgentChatItem.error(
-                    attemptedResume && isControlPlaneTimeout
-                        ? Self.resumeTimeoutFailureMessage(error: effectiveError, consecutiveTimeouts: resumeTimeoutCount ?? 1)
-                        : "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)",
-                    sequenceIndex: session.nextSequenceIndex
-                )
+                let failureMessage: String
+                if attemptedResume, isControlPlaneTimeout {
+                    failureMessage = Self.resumeTimeoutFailureMessage(error: effectiveError, consecutiveTimeouts: resumeTimeoutCount ?? 1)
+                } else if freshStartFallbackFailure != nil, isControlPlaneTimeout {
+                    let detail: String = if case let CodexAppServerClient.ClientError.requestFailed(failure) = effectiveError {
+                        "\(failure.method): \(effectiveError.localizedDescription)"
+                    } else {
+                        effectiveError.localizedDescription
+                    }
+                    failureMessage = "Codex native start failed: \(String(detail.prefix(120))). The fresh-thread start outcome is unconfirmed; a new thread may have been created. The original conversation was retained and no user turn was sent."
+                } else {
+                    failureMessage = "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(effectiveError.localizedDescription)"
+                }
+                var errorItem = AgentChatItem.error(failureMessage, sequenceIndex: session.nextSequenceIndex)
                 if attemptedResume, isControlPlaneTimeout {
                     errorItem.recoveryDiagnostic = AgentTranscriptRecoveryDiagnostic(
                         id: errorItem.id, timestamp: errorItem.timestamp, sequenceIndex: errorItem.sequenceIndex,

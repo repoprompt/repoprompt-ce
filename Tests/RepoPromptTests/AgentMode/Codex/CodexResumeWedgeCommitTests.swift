@@ -1771,6 +1771,63 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await successor.cancelAndCleanup()
     }
 
+    func testMissingRolloutFreshStartTimeoutPreservesTupleWithoutStoppedResumeClaim() async {
+        let fixture = makeFixture([[.missingRollout, .startTimeout]], shouldManageCodexTooling: false)
+        var notifications: [String?] = []
+        var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
+        fixture.session.appendItem(.user("continue the task"))
+        let barrier = AgentRunTerminalCommitBarrier()
+        let makeBinding: (AgentTabSession) -> AgentRunTerminalSessionBinding = { owned in
+            AgentRunTerminalSessionBinding(
+                tabID: owned.tabID, lifecycle: owned.runLifecycle,
+                hooks: .init(
+                    flushPendingAssistantDelta: {}, finalizeStreamingItems: {}, finalizePendingToolCalls: { _ in },
+                    finalizeNonCodexTurnUsage: {}, cancelPendingInteractions: { _ in }, finalizeAttachments: { _, _ in },
+                    setAgentRunInactive: {}, prepareTerminalPublication: {},
+                    makeTerminalPublicationEnvelope: { _, _, _, _ in nil }, updateBindings: {},
+                    notifyAgentTurnComplete: {}, notifyAgentTurnFailed: { notifications.append($0) }, scheduleSave: {},
+                    publishTerminalCommit: { revision, _ in
+                        reasons.append(revision.failureReason)
+                        return .accepted(successorEpoch: nil)
+                    }, startFollowUpRun: { _ in }
+                ),
+                validatesOwnership: { owned.isCurrentRunAttemptForCurrentBinding($0, expectedRunID: $1) },
+                providerDrainGeneration: { owned.providerTerminalDrainGeneration },
+                terminalTurnID: { owned.items.last(where: { $0.kind == .user })?.id },
+                queuedFollowUp: { nil }, setFollowUpPending: { _ in }, removeFirstQueuedFollowUp: { nil },
+                appendError: { owned.appendItem(.error($0, sequenceIndex: owned.nextSequenceIndex)) },
+                finishActiveState: { ownership, state, source in
+                    owned.runState = state
+                    _ = owned.endRunAttempt(ifCurrent: ownership, source: source)
+                }, retainProcessRunIdentity: { _, _ in }, sourceItemsRevision: { owned.sourceItemsRevision },
+                assistantDeltaFlushGeneration: { owned.assistantDeltaFlushGeneration },
+                latestFailureText: { AgentTranscriptIO.latestErrorText(from: owned.transcript, latestTurnOnly: true) }
+            )
+        }
+        fixture.coordinator.installTerminalCommitBarrier(barrier, terminalSessionBinder: makeBinding)
+        guard case let .failed(message) = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session, text: "continue the task", attachments: []
+        ) else { return XCTFail("An unconfirmed fresh start must reject the send") }
+        assertOldTuple(fixture.session)
+        XCTAssertTrue(message.contains("thread/start: Request timed out after 120.0s"))
+        XCTAssertTrue(message.contains("a new thread may have been created"))
+        XCTAssertTrue(message.contains("original conversation was retained and no user turn was sent"))
+        XCTAssertFalse(message.contains("No new thread was started"))
+        XCTAssertFalse(message.contains("Codex native resume failed"))
+        XCTAssertEqual(fixture.session.items.filter { $0.kind == .error }.map(\.text), [message])
+        XCTAssertEqual(notifications, [message])
+        XCTAssertEqual(reasons.count, 1)
+        XCTAssertFalse(reasons.contains { $0 == .resumeTimedOut })
+        XCTAssertNil(fixture.session.items.last?.recoveryDiagnostic)
+        XCTAssertNil(fixture.session.codexNativeStartupDisposition)
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID, nil])
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        XCTAssertTrue(fixture.session.codexNeedsReconnect)
+        XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
+    }
+
     func testRoutingSuccessCommitsFreshFallbackExactlyOnce() async throws {
         let fixture = makeFixture([[.missingRollout, .success("ready-fresh-thread")]])
         let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
@@ -2095,6 +2152,7 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     enum Response {
         case timeout
         case initializationTimeout
+        case startTimeout
         case discoveryFailure
         case policyRequiredResume
         case routedThenResumeFailure(TestReleaseFence)
@@ -2224,6 +2282,11 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         case .initializationTimeout:
             throw CodexAppServerClient.ClientError.requestFailed(.init(
                 method: "initialize", code: nil, message: "Request timed out after 30.0s", data: nil
+            ))
+        case .startTimeout:
+            // Model the actual fresh binding request, not a resume failure with a nil input.
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "thread/start", code: nil, message: "Request timed out after 120.0s", data: nil
             ))
         case .timeout:
             throw CodexAppServerClient.ClientError.requestFailed(.init(
