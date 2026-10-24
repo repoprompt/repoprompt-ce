@@ -14701,26 +14701,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    /// Determine if an item should be shown in the transcript
-    /// Hides ask_user / request_user_input tool calls when question UI is active to prevent duplicate UI.
-    private func shouldDisplayInTranscript(_ item: AgentChatItem, session: TabSession) -> Bool {
-        let include = AgentTranscriptIO.shouldIncludeLegacyItem(
-            item,
-            policy: .liveSession(hidePendingQuestionToolCall: session.hasPendingQuestionUI)
-        )
-        if !include {
-            let reason = if AgentToolTrackingSupport.shouldHideToolFromTranscript(item.toolName) {
-                "hidden-tool"
-            } else if item.kind == .toolCall, isAskUserToolName(item.toolName), session.hasPendingQuestionUI {
-                "pending-question-card"
-            } else {
-                "policy"
-            }
-            Self.logCodexDebug("[AgentModeVM][CodexUI] transcriptFilter drop kind=\(item.kind) tool=\(item.toolName ?? "nil") reason=\(reason)")
-        }
-        return include
-    }
-
     private func scheduleDerivedTranscriptRefresh(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason,
@@ -15959,18 +15939,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             to: session,
             isColdLoad: isColdLoad
         )
-    }
-
-    /// Check if tool name is an ask-user variant.
-    private func isAskUserToolName(_ name: String?) -> Bool {
-        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return false
-        }
-        if MCPIntegrationHelper.isRepoPromptAskUserToolName(trimmed) {
-            return true
-        }
-        let lowered = trimmed.lowercased()
-        return lowered == "request_user_input" || lowered == "requestuserinput" || lowered.hasSuffix(".requestuserinput")
     }
 
     func resolvedSessionDisplayName(for tabID: UUID) -> String {
