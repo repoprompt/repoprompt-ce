@@ -79,6 +79,44 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testConfiguredCustomWindowAcceptsFreshOccupancyAfterCompaction() {
+        let restore = installTemporaryCustomSlotMapping()
+        defer { restore() }
+        var config = ClaudeCodeCompatibleBackendStore.shared.config(for: .custom)
+        config.contextWindowTokens = 262_144
+        ClaudeCodeCompatibleBackendStore.shared.saveConfig(config)
+
+        for hasPriorUsage in [true, false] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .customClaudeCompatible
+            session.selectedModelRaw = "sonnet"
+            let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
+                AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            })
+            if hasPriorUsage {
+                _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+                XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+                XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000)
+            }
+
+            estimator.ingestSystemSignal("Context compacted", session: session)
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, hasPriorUsage ? 262_144 : nil)
+            XCTAssertNil(session.codexContextUsage?.lastTotalTokens)
+            XCTAssertEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+
+            if hasPriorUsage {
+                _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+            } else {
+                XCTAssertTrue(estimator.finalizeTurn(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, session: session))
+                XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 250_000)
+            }
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+            XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000, "Fresh occupancy above the default 200K must remain valid; prior usage: \(hasPriorUsage)")
+            XCTAssertNotEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+        }
+    }
+
+    @MainActor
     func testNativeSDKToolInputApprovalRoundTripPreservesMCPTypesAndStrictInventoryLimits() throws {
         let cases: [(literal: String, value: Value, acceptedLimit: Int?)] = [
             ("0", .int(0), nil), ("1", .int(1), 1), ("2", .int(2), 2),
