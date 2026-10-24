@@ -1,8 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
 
-extension WorkspaceRootNamespaceManifestIdentity: @unchecked Sendable {}
 extension GitTargetEvidenceAuthorityIdentity: @unchecked Sendable {}
 
 enum WorkspaceRootTargetSeedPlanDisposition: UInt8, Equatable {

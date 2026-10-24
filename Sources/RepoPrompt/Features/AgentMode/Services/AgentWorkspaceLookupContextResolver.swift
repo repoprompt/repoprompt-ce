@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 enum AgentSessionWorktreeBindingState: Equatable {
     case notApplicable
@@ -45,8 +46,13 @@ struct AgentWorkspaceLookupContextSource: Equatable {
         )
     }
 
+    /// Canonical routed contexts have authority without an Agent binding identity.
+    var authorityIdentity: AgentWorkspaceLookupContextIdentity? {
+        activeAgentSessionID == nil ? nil : identity
+    }
+
     static func worktreeBindingFingerprint(_ bindings: [AgentSessionWorktreeBinding]) -> String {
-        worktreeBindingFingerprint(.hydrated(bindings))
+        WorkspaceSessionBindingFingerprint.make(bindings)
     }
 
     static func worktreeBindingFingerprint(_ state: AgentSessionWorktreeBindingState) -> String {
@@ -58,20 +64,7 @@ struct AgentWorkspaceLookupContextSource: Equatable {
         case .unavailable:
             "unavailable"
         case let .hydrated(bindings):
-            bindings
-                .map { binding in
-                    [
-                        binding.repositoryID,
-                        binding.repoKey,
-                        StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath),
-                        binding.worktreeID,
-                        StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath),
-                        binding.branch ?? "",
-                        binding.head ?? ""
-                    ].joined(separator: "\u{1F}")
-                }
-                .sorted()
-                .joined(separator: "\u{1E}")
+            WorkspaceSessionBindingFingerprint.make(bindings)
         }
     }
 }
@@ -136,22 +129,68 @@ enum AgentWorkspaceLookupContextResolver {
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
     ) async throws -> WorkspaceLookupContext {
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        return try await requiredLookupContext(
+            source: source,
+            visibleRoots: visibleRoots,
+            store: store
+        )
+    }
+
+    static func requiredLookupContext(
+        source: AgentWorkspaceLookupContextSource,
+        visibleRoots: [WorkspaceRootRef],
+        store: WorkspaceFileContextStore
+    ) async throws -> WorkspaceLookupContext {
+        let capturedCanonicalRoots = Set(visibleRoots)
+        guard await Set(store.rootRefs(scope: .visibleWorkspace)) == capturedCanonicalRoots else {
+            throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
+        }
         guard let sessionID = source.activeAgentSessionID else {
-            return .visibleWorkspace
+            return WorkspaceLookupContext(
+                rootScope: .validatedSessionBoundWorkspace(
+                    canonicalRoots: capturedCanonicalRoots,
+                    physicalRoots: []
+                ),
+                bindingProjection: nil
+            )
         }
         guard case let .hydrated(bindings) = source.worktreeBindingState else {
             throw AgentWorkspaceLookupContextResolutionError.unknownBindingState
         }
         guard !bindings.isEmpty else {
-            return .visibleWorkspace
+            return WorkspaceLookupContext(
+                rootScope: .validatedSessionBoundWorkspace(
+                    canonicalRoots: capturedCanonicalRoots,
+                    physicalRoots: []
+                ),
+                bindingProjection: nil
+            )
         }
 
-        let visibleRootPaths = await Set(store.rootRefs(scope: .visibleWorkspace).map(\.standardizedFullPath))
+        for root in visibleRoots {
+            guard let currentRoot = await store.exactRootRef(
+                path: root.standardizedFullPath,
+                kind: .primaryWorkspace
+            ), currentRoot == root else {
+                throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
+            }
+        }
+        let visibleRootPaths = Set(visibleRoots.map(\.standardizedFullPath))
         let logicalRootPaths = Set(bindings.compactMap {
             AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.logicalRootPath)
         })
+        let bindingsMapDistinctLogicalRootsToWorktrees = bindings.allSatisfy { binding in
+            guard let logicalRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.logicalRootPath
+            ), let worktreeRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.worktreeRootPath
+            ) else { return false }
+            return logicalRootPath != worktreeRootPath
+        }
         guard logicalRootPaths.count == bindings.count,
-              logicalRootPaths.isSubset(of: visibleRootPaths)
+              logicalRootPaths.isSubset(of: visibleRootPaths),
+              bindingsMapDistinctLogicalRootsToWorktrees
         else {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }
@@ -163,7 +202,12 @@ enum AgentWorkspaceLookupContextResolver {
         }
         let cacheKey = CacheKey(storeID: ObjectIdentifier(store), identity: source.identity)
         if let cached = projectionCache.context(for: cacheKey) {
-            if await canReuseAuthoritativeLookupContext(cached, source: source, store: store) {
+            if await canReuseAuthoritativeLookupContext(
+                cached,
+                source: source,
+                visibleRoots: visibleRoots,
+                store: store
+            ) {
                 return cached
             }
             projectionCache.removeValue(for: cacheKey)
@@ -171,7 +215,8 @@ enum AgentWorkspaceLookupContextResolver {
 
         guard let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: sessionID,
-            bindings: bindings
+            bindings: bindings,
+            visibleRoots: visibleRoots
         ),
             !projection.isEmpty,
             projection.isFullyMaterialized
@@ -193,6 +238,7 @@ enum AgentWorkspaceLookupContextResolver {
     static func canReuseAuthoritativeLookupContext(
         _ lookupContext: WorkspaceLookupContext,
         source: AgentWorkspaceLookupContextSource,
+        visibleRoots suppliedVisibleRoots: [WorkspaceRootRef]? = nil,
         store: WorkspaceFileContextStore
     ) async -> Bool {
         guard !Task.isCancelled,
@@ -215,12 +261,19 @@ enum AgentWorkspaceLookupContextResolver {
             return false
         }
 
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let visibleRoots = if let suppliedVisibleRoots {
+            suppliedVisibleRoots
+        } else {
+            await store.rootRefs(scope: .visibleWorkspace)
+        }
         guard !Task.isCancelled else { return false }
         let visibleRootIDsByPath = Dictionary(
             visibleRoots.map { ($0.standardizedFullPath, $0.id) },
             uniquingKeysWith: { first, _ in first }
         )
+        guard Set(projection.visibleLogicalRootRefs) == Set(visibleRoots) else {
+            return false
+        }
         guard projection.logicalRootRefs.allSatisfy({ visibleRootIDsByPath[$0.standardizedFullPath] == $0.id }) else {
             return false
         }
@@ -249,20 +302,20 @@ enum AgentWorkspaceLookupContextResolver {
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
     ) async -> WorkspaceLookupContext {
-        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
         var fields: [String: String] = [
             "activeAgentSessionID": AgentSelectedFilesDiagnostics.shortID(source.activeAgentSessionID),
             "bindingState": String(describing: source.worktreeBindingState),
             "bindingCount": String(source.worktreeBindings.count),
             "bindingFingerprint": String(source.identity.worktreeBindingFingerprint.prefix(16))
         ]
-        AgentSelectedFilesDiagnostics.event("lookupResolver.lookupContext.start", fields: fields)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event("lookupResolver.lookupContext.start", fields: fields)
         guard let sessionID = source.activeAgentSessionID,
               case let .hydrated(bindings) = source.worktreeBindingState,
               !bindings.isEmpty
         else {
             fields["result"] = "visibleWorkspace"
-            AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+            AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
             return WorkspaceLookupContext.visibleWorkspace
         }
 
@@ -272,7 +325,7 @@ enum AgentWorkspaceLookupContextResolver {
                 fields["result"] = "cachedProjection"
                 fields["physicalRoots"] = String(cached.bindingProjection?.physicalRootRefs.count ?? 0)
                 fields["fullyMaterialized"] = String(cached.bindingProjection?.isFullyMaterialized ?? false)
-                AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+                AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
                 return cached
             }
             projectionCache.removeValue(for: cacheKey)
@@ -285,29 +338,17 @@ enum AgentWorkspaceLookupContextResolver {
             !projection.isEmpty
         else {
             fields["result"] = "visibleWorkspace"
-            AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+            AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
             return WorkspaceLookupContext.visibleWorkspace
         }
         fields["result"] = "projection"
         fields["physicalRoots"] = String(projection.physicalRootRefs.count)
         fields["fullyMaterialized"] = String(projection.isFullyMaterialized)
-        AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
         let context = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
         projectionCache.store(context, for: cacheKey)
         return context
     }
 }
 
-enum AgentWorkspaceLookupContextResolutionError: LocalizedError {
-    case unavailableProjection
-    case unknownBindingState
-
-    var errorDescription: String? {
-        switch self {
-        case .unavailableProjection:
-            "The Agent session worktree projection is unavailable. The operation stopped rather than falling back to the canonical checkout."
-        case .unknownBindingState:
-            "The Agent session worktree bindings are not hydrated or are unavailable. The operation stopped rather than falling back to the canonical checkout."
-        }
-    }
-}
+typealias AgentWorkspaceLookupContextResolutionError = WorkspaceLookupContextResolutionError

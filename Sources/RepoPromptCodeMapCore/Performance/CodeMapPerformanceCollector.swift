@@ -1,0 +1,285 @@
+import Foundation
+
+package struct CodeMapPerfOptions: Sendable {
+    package let enabled: Bool
+    package let signposts: Bool
+    package let collectCounters: Bool
+
+    package static let disabled = CodeMapPerfOptions(enabled: false, signposts: false, collectCounters: false)
+    package static let countersOnly = CodeMapPerfOptions(enabled: true, signposts: false, collectCounters: true)
+    package static let full = CodeMapPerfOptions(enabled: true, signposts: true, collectCounters: true)
+
+    package init(enabled: Bool, signposts: Bool, collectCounters: Bool) {
+        self.enabled = enabled
+        self.signposts = signposts
+        self.collectCounters = collectCounters
+    }
+}
+
+package final class CodeMapPerformanceCollector {
+    // Builder boundary. Populated only when an invocation-local collector is supplied.
+    package var builderTotalDuration: TimeInterval = 0
+    package var builderGeneratorDuration: TimeInterval = 0
+
+    // Syntax parse/query stages. These values are populated only when the app
+    // supplies this invocation-local collector.
+    package var syntaxTotalDuration: TimeInterval = 0
+    package var syntaxLanguageLookupDuration: TimeInterval = 0
+    package var syntaxOversizeGuardDuration: TimeInterval = 0
+    package var syntaxParserCreateDuration: TimeInterval = 0
+    package var syntaxSetLanguageDuration: TimeInterval = 0
+    package var syntaxParseDuration: TimeInterval = 0
+    package var syntaxCodeMapQueryLookupDuration: TimeInterval = 0
+    package var syntaxQueryExecuteDuration: TimeInterval = 0
+    package var syntaxCaptureMaterializationDuration: TimeInterval = 0
+    package var syntaxCaptureNameCountingDuration: TimeInterval = 0
+    package var syntaxCalls = 0
+    package var syntaxUnsupported = 0
+    package var syntaxOversized = 0
+    package var syntaxParseNilTree = 0
+    package var syntaxParseNilRoot = 0
+    package var syntaxParserCreates = 0
+    package var syntaxQueryExecutes = 0
+    package var syntaxCaptures = 0
+    package var syntaxCaptureCountsByName: [String: Int] = [:]
+    package let collectsCaptureNames: Bool
+    package var syntaxCodeMapQuerySuccessfulLookups = 0
+
+    // Capture index construction and lookup complexity.
+    package var captureIndexInputCaptureCount = 0
+    package var captureIndexBucketCount = 0
+    package var captureIndexFirstContainedLookupCount = 0
+    package var captureIndexFirstContainedCandidateVisits = 0
+    package var captureIndexAllContainedLookupCount = 0
+    package var captureIndexAllContainedCandidateVisits = 0
+    package var captureIndexSmallestContainingLookupCount = 0
+    package var captureIndexSmallestContainingCandidateVisits = 0
+    package var captureIndexMaximumCandidateVisits = 0
+
+    // Swift context construction and declaration volume.
+    package var swiftTypeNameMappingDuration: TimeInterval = 0
+    package var swiftProtocolNameMappingDuration: TimeInterval = 0
+    package var swiftBoundaryConstructionDuration: TimeInterval = 0
+    package var swiftFunctionCaptureAssemblyDuration: TimeInterval = 0
+    package var swiftTypeDeclarationCount = 0
+    package var swiftProtocolDeclarationCount = 0
+    package var swiftTopLevelFunctionCount = 0
+    package var swiftMethodFunctionCount = 0
+    package var swiftProtocolMethodCount = 0
+    package var swiftParameterNodeCount = 0
+    package var swiftPropertyDeclarationCount = 0
+    package var swiftProtocolPropertyDeclarationCount = 0
+    package var swiftPropertyIdentifierCount = 0
+    package var swiftTypeBoundaryCount = 0
+
+    // Capture loop
+    package var capturesProcessed = 0
+    package var swiftStrategyHandled = 0
+    package var tsStrategyHandled = 0
+    package var fallbackHandled = 0
+    package var captureLoopLineAdvanceCount = 0
+    package var captureLoopSwiftStrategyCount = 0
+    package var captureLoopTSStrategyCount = 0
+    package var captureLoopInterfaceHeuristicCount = 0
+    package var captureLoopImportExportCount = 0
+    package var captureLoopTypeAliasCount = 0
+    package var captureLoopEnumMacroCount = 0
+    package var captureLoopFunctionCount = 0
+    package var captureLoopVariableCount = 0
+    package var captureLoopSkippedCount = 0
+    package var captureLoopUnclassifiedCount = 0
+    package var swiftStrategyFunctionSignatureCount = 0
+    package var swiftSignatureNormalizationASCIINoOpCount = 0
+    package var swiftSignatureNormalizationASCIIRewriteCount = 0
+    package var swiftSignatureNormalizationUnicodeFallbackCount = 0
+    package var swiftSignatureNormalizationInputUTF8ByteCount = 0
+    package var swiftSignatureNormalizationOutputUTF8ByteCount = 0
+    package var swiftStrategyFunctionNameLookupCount = 0
+    package var swiftStrategyParameterExtractionCount = 0
+    package var swiftParameterTypeDirectCaptureCount = 0
+    package var swiftParameterTypeFallbackParserCount = 0
+    package var swiftParameterTypeASCIIFastPathCount = 0
+    package var swiftParameterTypeUnicodeLegacyFallbackCount = 0
+    package var swiftParameterTypeInputUTF8ByteCount = 0
+    package var swiftStrategyReturnTypeExtractionCount = 0
+    package var swiftStrategyPropertyDeclarationCount = 0
+    package var swiftStrategyPropertyTypeExtractionCount = 0
+    package var swiftPropertyTypeResolutionCount = 0
+    package var swiftPropertyTypeASCIIDirectTypeCount = 0
+    package var swiftPropertyTypeASCIIDirectNilCount = 0
+    package var swiftPropertyTypeLegacyFallbackCount = 0
+    package var swiftPropertyTypeUnicodeLegacyFallbackCount = 0
+    package var swiftPropertyTypeASCIIIneligibleFallbackCount = 0
+    package var swiftPropertyTypeInputUTF8ByteCount = 0
+    package var swiftStrategyEnclosingTypeLookupCount = 0
+    package var swiftStrategyModelInsertionCount = 0
+    package var swiftStrategyContextOnlyCount = 0
+    package var swiftStrategyHandledFunctionCount = 0
+    package var swiftStrategyHandledPropertyCount = 0
+    package var swiftSignatureCodeUnitVisits = 0
+    package var swiftNestedFunctionContainmentLookupCount = 0
+    package var swiftNestedFunctionContainmentCandidateVisits = 0
+    package var swiftEnclosingTypeCandidateVisits = 0
+    package var swiftFunctionDuplicateCheckCount = 0
+    package var swiftFunctionDuplicateCandidateVisits = 0
+    package var swiftPropertyDuplicateCheckCount = 0
+    package var swiftPropertyDuplicateCandidateVisits = 0
+    package var fallbackFunctionDeclarationCount = 0
+    package var fallbackFunctionJSTSSignatureCount = 0
+    package var fallbackFunctionNameExtractionCount = 0
+    package var fallbackFunctionLTEParseCount = 0
+    package var fallbackFunctionTSFastPathCount = 0
+    package var fallbackFunctionReferencedTypesCount = 0
+    package var fallbackFunctionRoutingCount = 0
+    package var fallbackFunctionModelInsertionCount = 0
+    package var fallbackFunctionSkippedCount = 0
+    package var fallbackFunctionLightweightCount = 0
+    package var fallbackFunctionHeavyweightCount = 0
+    package var fallbackFunctionGlobalInsertCount = 0
+    package var fallbackFunctionMethodInsertCount = 0
+    package var fallbackFunctionInterfaceInsertCount = 0
+
+    // Declaration capture + JS/TS signature extraction
+    package var captureDeclarationCalls = 0
+    package var jstsSignatureCallsFunctionLike = 0
+    package var jstsSignatureCallsStatementLike = 0
+    package var jstsNormalizationASCIINoOpCount = 0
+    package var jstsNormalizationASCIIRewriteCount = 0
+    package var jstsNormalizationUnicodeFallbackCount = 0
+
+    // LanguageTypeExtractor
+    package var lteMatchAnyFunctionCalls = 0
+    package var lteMatchAnyVariableCalls = 0
+    package var tsConstructorMatches = 0
+    package var tsAccessorMatches = 0
+    package var tsClassMethodMatches = 0
+    package var tsClassArrowMatches = 0
+    package var tsClassArrowNoParensMatches = 0
+    package var tsArrowFunctionMatches = 0
+    package var tsArrowFunctionParamsReturnMatches = 0
+    package var tsxConstructorMatches = 0
+    package var tsxAccessorMatches = 0
+    package var tsxClassMethodMatches = 0
+    package var tsxClassArrowMatches = 0
+    package var tsxClassArrowNoParensMatches = 0
+    package var tsxArrowFunctionMatches = 0
+    package var tsxArrowFunctionParamsReturnMatches = 0
+    package var swiftReturnTypeFastPathHits = 0
+    package var tsDuplicateFunctionVariableSuppressions = 0
+    package var tsReturnTypeFastPathHits = 0
+    package var tsTypeAnnotationFastPathHits = 0
+    package var tsTypeAliasRhsFastPathHits = 0
+
+    // TypeCleaner
+    package var typeCleanerExtractCalls = 0
+    package var typeCleanerCacheHits = 0
+    package var typeCleanerCacheMisses = 0
+    package var typeCleanerSwiftCalls = 0
+    package var typeCleanerTSCalls = 0
+    package var typeCleanerTSXCalls = 0
+    package var typeCleanerJSCalls = 0
+    package var typeCleanerOtherLanguageCalls = 0
+    package var typeCleanerPrecleanCount = 0
+    package var typeCleanerTSLogicCount = 0
+    package var typeCleanerNonTSLogicCount = 0
+    package var typeCleanerTSObjectLiteralCount = 0
+    package var typeCleanerFilterCount = 0
+    package var typeCleanerDedupCount = 0
+    package var referencedTypesRawInsertions = 0
+    package var referencedTypesPrefilterSkips = 0
+    package var referencedTypesSwiftDedupEligibleCount = 0
+    package var referencedTypesSwiftFirstSeenCount = 0
+    package var referencedTypesSwiftDuplicateSkipCount = 0
+    package var referencedTypesSwiftDuplicateSkippedUTF8ByteCount = 0
+    package var referencedTypesEmptyResults = 0
+    package var referencedTypesOutputTypeCount = 0
+    package var referencedTypesUniqueCount = 0
+
+    // Extraction memo
+    package var extractionMemoJSTSHits = 0
+    package var extractionMemoJSTSMisses = 0
+    package var extractionMemoFunctionHits = 0
+    package var extractionMemoFunctionMisses = 0
+    package var extractionMemoFunctionParsedHits = 0
+    package var extractionMemoFunctionParsedMisses = 0
+    package var extractionMemoVariableHits = 0
+    package var extractionMemoVariableMisses = 0
+    package var extractionMemoTSFastPathHits = 0
+    package var extractionMemoTSFastPathMisses = 0
+
+    // Durations
+    package var captureIndexDuration: TimeInterval = 0
+    package var swiftContextDuration: TimeInterval = 0
+    package var tsContextDuration: TimeInterval = 0
+    package var captureLoopDuration: TimeInterval = 0
+    package var captureLoopLineAdvanceDuration: TimeInterval = 0
+    package var captureLoopSwiftStrategyDuration: TimeInterval = 0
+    package var captureLoopTSStrategyDuration: TimeInterval = 0
+    package var captureLoopInterfaceHeuristicDuration: TimeInterval = 0
+    package var captureLoopImportExportDuration: TimeInterval = 0
+    package var captureLoopTypeAliasDuration: TimeInterval = 0
+    package var captureLoopEnumMacroDuration: TimeInterval = 0
+    package var captureLoopFunctionDuration: TimeInterval = 0
+    package var captureLoopVariableDuration: TimeInterval = 0
+    package var captureLoopSkippedDuration: TimeInterval = 0
+    package var captureLoopUnclassifiedDuration: TimeInterval = 0
+    package var swiftStrategyFunctionSignatureDuration: TimeInterval = 0
+    package var swiftSignatureEndScanDuration: TimeInterval = 0
+    package var swiftSignatureNormalizationDuration: TimeInterval = 0
+    package var swiftStrategyFunctionNameLookupDuration: TimeInterval = 0
+    package var swiftStrategyParameterExtractionDuration: TimeInterval = 0
+    package var swiftParameterTypeResolutionDuration: TimeInterval = 0
+    package var swiftParameterTypeLegacyFallbackDuration: TimeInterval = 0
+    package var swiftStrategyReturnTypeExtractionDuration: TimeInterval = 0
+    package var swiftStrategyPropertyDeclarationDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationLookupDuration: TimeInterval = 0
+    package var swiftPropertyDeclarationSubstringDuration: TimeInterval = 0
+    package var swiftPropertyInitializerStripDuration: TimeInterval = 0
+    package var swiftStrategyPropertyTypeExtractionDuration: TimeInterval = 0
+    package var swiftPropertyTypeResolutionDuration: TimeInterval = 0
+    package var swiftPropertyTypeASCIIFastPathDuration: TimeInterval = 0
+    package var swiftPropertyTypeLegacyFallbackDuration: TimeInterval = 0
+    package var swiftStrategyEnclosingTypeLookupDuration: TimeInterval = 0
+    package var swiftStrategyModelInsertionDuration: TimeInterval = 0
+    package var swiftStrategyContextOnlyDuration: TimeInterval = 0
+    package var fallbackFunctionDeclarationDuration: TimeInterval = 0
+    package var fallbackFunctionJSTSSignatureDuration: TimeInterval = 0
+    package var fallbackFunctionNameExtractionDuration: TimeInterval = 0
+    package var fallbackFunctionLTEParseDuration: TimeInterval = 0
+    package var fallbackFunctionTSFastPathDuration: TimeInterval = 0
+    package var fallbackFunctionReferencedTypesDuration: TimeInterval = 0
+    package var fallbackFunctionRoutingDuration: TimeInterval = 0
+    package var fallbackFunctionModelInsertionDuration: TimeInterval = 0
+    package var fallbackFunctionSkippedDuration: TimeInterval = 0
+    package var captureDeclarationDuration: TimeInterval = 0
+    package var jstsSignatureDuration: TimeInterval = 0
+    package var jstsNormalizationASCIIFastPathDuration: TimeInterval = 0
+    package var jstsNormalizationLegacyFallbackDuration: TimeInterval = 0
+    package var languageTypeExtractorFunctionDuration: TimeInterval = 0
+    package var languageTypeExtractorVariableDuration: TimeInterval = 0
+    package var typeCleanerDuration: TimeInterval = 0
+    package var typeCleanerSwiftDuration: TimeInterval = 0
+    package var typeCleanerTSDuration: TimeInterval = 0
+    package var typeCleanerTSXDuration: TimeInterval = 0
+    package var typeCleanerJSDuration: TimeInterval = 0
+    package var typeCleanerOtherLanguageDuration: TimeInterval = 0
+    package var typeCleanerPrecleanDuration: TimeInterval = 0
+    package var typeCleanerTSLogicDuration: TimeInterval = 0
+    package var typeCleanerNonTSLogicDuration: TimeInterval = 0
+    package var typeCleanerTSObjectLiteralDuration: TimeInterval = 0
+    package var typeCleanerFilterDuration: TimeInterval = 0
+    package var typeCleanerDedupDuration: TimeInterval = 0
+    package var referencedTypesSwiftRawTypeDedupDuration: TimeInterval = 0
+    package var referencedTypesFinalizeDuration: TimeInterval = 0
+    package var artifactFinalizationDuration: TimeInterval = 0
+    package var artifactMeaningfulContentCheckDuration: TimeInterval = 0
+    package var fileAPIInitDuration: TimeInterval = 0
+    package var artifactFinalClassCount = 0
+    package var artifactFinalInterfaceCount = 0
+    package var artifactFinalFunctionCount = 0
+    package var artifactFinalGlobalVariableCount = 0
+
+    package init(collectsCaptureNames: Bool = false) {
+        self.collectsCaptureNames = collectsCaptureNames
+    }
+}

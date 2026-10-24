@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 actor WorkspaceRootReusableSnapshotCoordinator {
     enum CurrentnessValidation: Equatable {
@@ -178,8 +180,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             // the shared watermark and prevents conditional admission.
             let discoveryToken = try await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.discoveryObservation)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.discoveryObservation)
                     defer { span?.end() }
                 #endif
                 return try await authority.retainMetadataObservation(for: layout)
@@ -195,9 +197,9 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .discoveryAuthorityCapture
             let discovery = try await {
                 #if DEBUG
-                    let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+                    let recorder = WorkspacePreparationInstrumentation.currentRecorder
                     recorder?.increment(.authorityCaptures)
-                    let span = recorder?.begin(.discoveryAuthorityCapture)
+                    let span = recorder?.beginPhase(.discoveryAuthorityCapture)
                     defer { span?.end() }
                 #endif
                 return try await gitService.workspaceAuthoritySnapshot(
@@ -220,8 +222,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .replacementObservation
             let observation = try await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.replacementObservation)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.replacementObservation)
                     defer { span?.end() }
                 #endif
                 return try await authority.retainMetadataObservation(
@@ -256,8 +258,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .collection
             let collectionResult = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.collectionFence)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.collectionFence)
                     defer { span?.end() }
                 #endif
                 return await authority.beginCollection(scopeKey: scope)
@@ -280,9 +282,9 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .capturedAuthority
             let captured = try await {
                 #if DEBUG
-                    let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+                    let recorder = WorkspacePreparationInstrumentation.currentRecorder
                     recorder?.increment(.authorityCaptures)
-                    let span = recorder?.begin(.capturedAuthorityCapture)
+                    let span = recorder?.beginPhase(.capturedAuthorityCapture)
                     defer { span?.end() }
                 #endif
                 return try await gitService.workspaceAuthoritySnapshot(
@@ -307,8 +309,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             }
             let observationIsCurrent = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.capturedObservationValidation)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.capturedObservationValidation)
                     defer { span?.end() }
                 #endif
                 return await authority.metadataObservationIsCurrent(
@@ -335,8 +337,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .treeInventory
             let treeSpool = try await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.treeInventorySpool)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.treeInventorySpool)
                     defer { span?.end() }
                 #endif
                 return try await gitService.spoolLoadedRootTreeInventory(
@@ -357,8 +359,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             do {
                 inventoryManifest = try await {
                     #if DEBUG
-                        let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                            .begin(.catalogManifestBuild)
+                        let span = WorkspacePreparationInstrumentation.currentRecorder?
+                            .beginPhase(.catalogManifestBuild)
                         defer { span?.end() }
                     #endif
                     return try await Self.buildInventoryManifest(
@@ -381,8 +383,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             let lease: GitWorkspaceAuthorityLease
             let installResult = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.authorityInstall)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.authorityInstall)
                     defer { span?.end() }
                 #endif
                 return await authority.install(captured.snapshot, capturedUsing: captureToken)
@@ -403,8 +405,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             }
             let snapshot = {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.snapshotMaterialization)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.snapshotMaterialization)
                     defer { span?.end() }
                 #endif
                 return WorkspaceRootReusableSnapshot.make(
@@ -420,8 +422,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .admissionPreparation
             let preparedAdmission = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.admissionPrepare)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.admissionPrepare)
                     defer { span?.end() }
                 #endif
                 return await authority.prepareReusableSnapshotAdmission(
@@ -454,8 +456,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             }
             let preparedAdmissionIsCurrent = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.preparedAdmissionCurrentness)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.preparedAdmissionCurrentness)
                     defer { span?.end() }
                 #endif
                 return await authority.preparedReusableSnapshotAdmissionIsCurrent(prepared)
@@ -477,8 +479,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             activeStage = .admissionCommit
             let committedAdmission = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.admissionCommit)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.admissionCommit)
                     defer { span?.end() }
                 #endif
                 return await authority.admitPreparedReusableSnapshot(prepared)
@@ -501,8 +503,8 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             }
             let committedAdmissionIsCurrent = await {
                 #if DEBUG
-                    let span = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .begin(.committedAdmissionCurrentness)
+                    let span = WorkspacePreparationInstrumentation.currentRecorder?
+                        .beginPhase(.committedAdmissionCurrentness)
                     defer { span?.end() }
                 #endif
                 return await authority.reusableSnapshotAdmissionIsCurrent(receipt)

@@ -1,213 +1,56 @@
 import Foundation
+import RepoPromptInstrumentation
+import RepoPromptShared
+import RepoPromptVCS
 #if DEBUG
     import CryptoKit
 #endif
 
-enum WorktreeStartupServingControl: Equatable {
-    case automatic
-    case forceFullCrawl
+struct AppWorktreeStartupPhaseEventSink: WorktreeStartupPhaseEventSink {
+    func record(_ event: WorktreeStartupPhaseEvent) {
+        WorktreeStartupInstrumentation.record(
+            event.phase,
+            context: event.context,
+            route: event.route,
+            fallback: event.fallback
+        )
+    }
 }
 
-struct WorktreeStartupFeatureFlags: Equatable {
-    static let observeDefaultsKey = "observeDiffSeededWorktreeStartup"
-    static let serveDefaultsKey = "serveDiffSeededWorktreeStartup"
-
-    let observeDiffSeededWorktreeStartup: Bool
-    let serveDiffSeededWorktreeStartup: Bool
-
-    init(
-        observeDiffSeededWorktreeStartup: Bool = false,
-        serveDiffSeededWorktreeStartup: Bool = false
-    ) {
-        self.observeDiffSeededWorktreeStartup = observeDiffSeededWorktreeStartup
-        // Serving can never be active without observation authority.
-        self.serveDiffSeededWorktreeStartup = serveDiffSeededWorktreeStartup
-            && observeDiffSeededWorktreeStartup
-    }
-
+extension WorktreeStartupFeatureFlags {
     static func current(defaults: UserDefaults = .standard) -> Self {
         #if DEBUG
-            // Diff-seeded worktree startup is always on. In DEBUG we still honor optional
-            // UserDefaults kill switches so we can force the legacy full-crawl path for
-            // benchmarks/troubleshooting; an absent key means enabled.
             return Self(
                 observeDiffSeededWorktreeStartup: defaults.object(forKey: observeDefaultsKey) as? Bool ?? true,
                 serveDiffSeededWorktreeStartup: defaults.object(forKey: serveDefaultsKey) as? Bool ?? true
             )
         #else
-            // Hardcoded on in release: there is no production preference to disable diff-seeded
-            // worktree startup. The kill switches above exist only for DEBUG diagnostics.
-            return Self(
-                observeDiffSeededWorktreeStartup: true,
-                serveDiffSeededWorktreeStartup: true
-            )
+            return .standaloneOperationalDefault()
         #endif
     }
 }
 
-struct WorktreeStartupContext: Equatable {
-    let agentSessionID: UUID
-    let correlationID: UUID
-    let flags: WorktreeStartupFeatureFlags
-    let servingControl: WorktreeStartupServingControl
-
+extension WorktreeStartupContext {
     init(
         agentSessionID: UUID,
         correlationID: UUID = UUID(),
         flags: WorktreeStartupFeatureFlags = .current(),
         servingControl: WorktreeStartupServingControl = .automatic
     ) {
-        self.agentSessionID = agentSessionID
-        self.correlationID = correlationID
-        self.flags = flags
-        self.servingControl = servingControl
+        self.init(
+            rawAgentSessionID: agentSessionID,
+            correlationID: correlationID,
+            flags: flags,
+            servingControl: servingControl
+        )
     }
-}
-
-enum WorkspaceRootStartupRoute: String, Equatable {
-    case fullCrawl
-    case diffSeedObservation
-    case diffSeedServing
-}
-
-enum WorkspaceRootSeedFallbackReason: String, Equatable {
-    case noReceipt
-    case expiredReceipt
-    case unsupportedDestination
-    case baseUnavailable
-    case baseEvicted
-    case compatibilityMismatch
-    case authorityChanging
-    case authorityUnstable
-    case gitTimeout
-    case gitError
-    case gitMalformedOutput
-    case gitCappedOutput
-    case gitResourceUnavailable
-    case gitEvidenceCorrupt
-    case namespaceEvidenceCorrupt
-    case targetEvidenceIncoherent
-    case evidenceResourceUnavailable
-    case evidenceIOFailure
-    case evidenceWaitDeadlineExceeded
-    case witnessGap
-    case witnessDrop
-    case witnessOverflow
-    case includeCopyFailure
-    case unknownCopiedPath
-    case changedIgnoreAuthority
-    case conflictOrUnmergedIndex
-    case assumeUnchangedIndexEntry
-    case sparseCheckout
-    case submoduleOrNestedRepository
-    case symlinkOrSpecialTopology
-    case unexplainedFilesystemEntry
-    case projectedSearchMismatch
-    case ownerSuperseded
-    case serviceIngressGenerationChanged
-    case watcherRecoveryUncertain
-    case watcherActivationFailure
-    case watcherDrop
-    case watcherOverflow
-    case pendingIngressSequenceGap
-    case seededShardPreparationFailure
-    case cancellation
-}
-
-enum WorktreeStartupPhase: String, Equatable {
-    case agentRunStarted
-    case worktreePreparationStarted
-    case bindingTransitionStarted
-    case rootLoadStarted
-    case shadowVerified
-    case seedWatcherAttached
-    case seedReplayFenced
-    case seedReadyForCommit
-    case seedPublished
-    case seedFallback
-    case rootReady
-    case providerStart
-    #if DEBUG
-        case firstBenchmarkSearchStarted
-        case firstBenchmarkSearchCompleted
-        case firstBenchmarkReadStarted
-        case firstBenchmarkReadCompleted
-        case firstBenchmarkCodemapStarted
-        case firstBenchmarkCodemapCompleted
-        case warmBenchmarkCodemapStarted
-        case warmBenchmarkCodemapCompleted
-        case passiveBenchmarkTreeStarted
-        case passiveBenchmarkTreeCompleted
-        case benchmarkSelectionStarted
-        case benchmarkSelectionCompleted
-    #endif
-    case failed
-}
-
-enum GitProcessCommandFamily: String, Equatable {
-    case treeResolution
-    case treeInventory
-    case treeDelta
-    case indexManifest
-    case status
-    case authorityMetadata
-    case codemapAuthority
-    case repositoryRead
-    case mutation
 }
 
 #if DEBUG
     enum WorktreeStartupPreparationInstrumentation {
-        enum Phase: String, CaseIterable, Equatable {
-            case scopeResolution = "scope_resolution"
-            case setFlagsTotal = "set_flags_total"
-            case loadedRootIngressFence = "loaded_root_ingress_fence"
-            case loadedRootPolicySnapshot = "loaded_root_policy_snapshot"
-            case discoveryObservation = "discovery_observation"
-            case discoveryAuthorityCapture = "discovery_authority_capture"
-            case replacementObservation = "replacement_observation"
-            case collectionFence = "collection_fence"
-            case capturedAuthorityCapture = "captured_authority_capture"
-            case capturedObservationValidation = "captured_observation_validation"
-            case authorityMetadataGit = "authority_metadata_git"
-            case prefixControlCacheLookup = "prefix_control_cache_lookup"
-            case prefixControlScan = "prefix_control_scan"
-            case prefixControlCacheAdmit = "prefix_control_cache_admit"
-            case treeInventorySpool = "tree_inventory_spool"
-            case catalogManifestBuild = "catalog_manifest_build"
-            case authorityInstall = "authority_install"
-            case snapshotMaterialization = "snapshot_materialization"
-            case admissionPrepare = "admission_prepare"
-            case preparedAdmissionCurrentness = "prepared_admission_currentness"
-            case admissionCommit = "admission_commit"
-            case committedAdmissionCurrentness = "committed_admission_currentness"
-            case finalLoadedRootCurrentness = "final_loaded_root_currentness"
-        }
+        typealias Phase = WorkspacePreparationPhase
 
-        enum Counter: String, CaseIterable, Equatable {
-            case authorityCaptures = "authority_captures"
-            case gitCommandCount = "git_command_count"
-            case gitQueueMicroseconds = "git_queue_us"
-            case gitDurationMicroseconds = "git_duration_us"
-            case prefixCacheHits = "prefix_cache_hits"
-            case prefixCacheMisses = "prefix_cache_misses"
-            case prefixCacheInvalidations = "prefix_cache_invalidations"
-            case prefixCacheAdmissions = "prefix_cache_admissions"
-            case prefixCacheEvictions = "prefix_cache_evictions"
-            case prefixCacheBypasses = "prefix_cache_bypasses"
-            case prefixCacheCoalesces = "prefix_cache_coalesces"
-            case prefixScanCount = "prefix_scan_count"
-            case enumeratedCandidates = "enumerated_candidates"
-            case enumeratedDirectories = "enumerated_directories"
-            case explicitlyPrunedDirectories = "explicitly_pruned_directories"
-            case controlRecordCount = "control_record_count"
-            case treeRecords = "tree_records"
-            case treeSpoolBytes = "tree_spool_bytes"
-            case inventoryRecords = "inventory_records"
-            case catalogBatches = "catalog_batches"
-            case catalogRegularPaths = "catalog_regular_paths"
-            case snapshotSearchablePaths = "snapshot_searchable_paths"
-        }
+        typealias Counter = WorkspacePreparationCounter
 
         enum Reason: String, CaseIterable, Equatable {
             case absent
@@ -532,11 +375,7 @@ enum WorktreeStartupInstrumentation {
             case failed
         }
 
-        enum ReceiptMatchState: String, Equatable {
-            case notEvaluated
-            case match
-            case mismatch
-        }
+        typealias ReceiptMatchState = WorkspaceReceiptMatchState
 
         enum ReceiptCreationOutcome: String, Equatable {
             case receiptEmitted
@@ -545,11 +384,7 @@ enum WorktreeStartupInstrumentation {
             case cancelled
         }
 
-        enum ReceiptFinalObservation: Equatable {
-            case eligible
-            case disabled
-            case fallback(WorkspaceRootSeedFallbackReason)
-        }
+        typealias ReceiptFinalObservation = WorkspaceReceiptFinalObservation
 
         enum ReceiptTerminalStage: String, Equatable {
             case creation
@@ -648,29 +483,9 @@ enum WorktreeStartupInstrumentation {
             init() {}
         }
 
-        struct ReceiptProjectionDecision: Equatable {
-            var suppliedHintCount = 0
-            var matchedHintCount = 0
-            var allHintKeysMatchedBindings: Bool?
-            var validationFallback: WorkspaceRootSeedFallbackReason?
+        typealias ReceiptProjectionDecision = WorkspaceReceiptProjectionDecision
 
-            init() {}
-        }
-
-        struct ReceiptConsumptionDecision: Equatable {
-            var ownerGenerationMatch: ReceiptMatchState = .notEvaluated
-            var hintSessionMatch: ReceiptMatchState = .notEvaluated
-            var hintCorrelationMatch: ReceiptMatchState = .notEvaluated
-            var hintOwnerMatch: ReceiptMatchState = .notEvaluated
-            var ownershipReused: Bool?
-            var initialHintObservation: ReceiptFinalObservation?
-            var pendingSeededPreparationResult: ReceiptFinalObservation?
-            var fullCrawlPerformed: Bool?
-            var finalObservation: ReceiptFinalObservation?
-            var selectedRoute: WorkspaceRootStartupRoute?
-
-            init() {}
-        }
+        typealias ReceiptConsumptionDecision = WorkspaceReceiptConsumptionDecision
 
         struct ReceiptDecision: Equatable {
             let correlationID: UUID
@@ -700,32 +515,16 @@ enum WorktreeStartupInstrumentation {
             fileprivate(set) var contradictory = false
         }
 
-        struct BenchmarkMetricTag: Hashable {
-            let correlationID: UUID
-            let contextID: UUID
-            let agentSessionID: UUID
-            let logicalRootID: UUID
-            let repositoryID: String
-            let destinationID: String
-        }
+        typealias BenchmarkMetricTag = WorkspaceBenchmarkMetricTag
 
         enum BenchmarkMetricAttribution: String, Equatable {
             case unavailable
             case exact
         }
 
-        enum BenchmarkPlannerPhase: String, CaseIterable {
-            case targetNamespace
-            case treeEvidence
-            case indexEvidence
-            case statusEvidence
-            case reconcile
-        }
+        typealias BenchmarkPlannerPhase = WorkspaceBenchmarkPlannerPhase
 
-        enum BenchmarkMarkerPublicationSource: String, Equatable {
-            case publishedUpdate
-            case warmReplay
-        }
+        typealias BenchmarkMarkerPublicationSource = WorkspaceBenchmarkMarkerPublicationSource
 
         struct BenchmarkPhaseMetric: Equatable {
             var count = 0
@@ -767,7 +566,11 @@ enum WorktreeStartupInstrumentation {
             var markerPublications: [BenchmarkMarkerPublication] = []
         }
 
-        @TaskLocal static var currentBenchmarkMetricTag: BenchmarkMetricTag?
+        // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+        static let currentBenchmarkMetricTagTaskLocal = BoxedTaskLocal<BenchmarkMetricTag?>(nil)
+        static var currentBenchmarkMetricTag: BenchmarkMetricTag? {
+            currentBenchmarkMetricTagTaskLocal.get()
+        }
     #endif
 
     struct Event: Equatable {
@@ -900,6 +703,8 @@ enum WorktreeStartupInstrumentation {
         private static var storedDeltaCompatibilityEvaluations: [DeltaCompatibilityEvaluationRecord] = []
         private static var deltaCompatibilityEvaluationEvictionCount = 0
         private static var benchmarkMetricsByTag: [BenchmarkMetricTag: BenchmarkMetricSnapshot] = [:]
+        private static var eventObserversForTesting: [UUID: @Sendable (Event, UInt64) -> Void] = [:]
+        private static var eventObservationSequence: UInt64 = 0
     #endif
 
     static func record(
@@ -909,25 +714,38 @@ enum WorktreeStartupInstrumentation {
         fallback: WorkspaceRootSeedFallbackReason? = nil
     ) {
         lock.lock()
-        defer { lock.unlock() }
+        let event = Event(
+            phase: phase,
+            context: context,
+            route: route,
+            fallback: fallback
+        )
         if events.count == maximumEventCount {
             events.removeFirst()
             #if DEBUG
                 eventEvictionCount = incremented(eventEvictionCount)
             #endif
         }
-        events.append(Event(
-            phase: phase,
-            context: context,
-            route: route,
-            fallback: fallback
-        ))
+        events.append(event)
         if let route {
             routeCounts[route, default: 0] += 1
         }
         if let fallback {
             fallbackCounts[fallback, default: 0] += 1
         }
+        #if DEBUG
+            eventObservationSequence = eventObservationSequence == .max
+                ? .max
+                : eventObservationSequence + 1
+            let observationSequence = eventObservationSequence
+            let observers = Array(eventObserversForTesting.values)
+        #endif
+        lock.unlock()
+        #if DEBUG
+            for observer in observers {
+                observer(event, observationSequence)
+            }
+        #endif
     }
 
     static func recordGitCommand(
@@ -1512,6 +1330,22 @@ enum WorktreeStartupInstrumentation {
     }
 
     #if DEBUG
+        static func addEventObserverForTesting(
+            _ observer: @escaping @Sendable (Event, UInt64) -> Void
+        ) -> UUID {
+            let token = UUID()
+            lock.lock()
+            eventObserversForTesting[token] = observer
+            lock.unlock()
+            return token
+        }
+
+        static func removeEventObserverForTesting(_ token: UUID) {
+            lock.lock()
+            eventObserversForTesting.removeValue(forKey: token)
+            lock.unlock()
+        }
+
         static func resetForTesting() {
             lock.lock()
             events.removeAll(keepingCapacity: true)
@@ -1531,3 +1365,130 @@ enum WorktreeStartupInstrumentation {
         }
     #endif
 }
+
+struct AppWorkspaceStartupEventRecorder: WorkspaceStartupEventRecording {
+    #if DEBUG
+        var currentBenchmarkMetricTag: WorkspaceBenchmarkMetricTag? {
+            WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+        }
+    #endif
+
+    func record(_ event: WorkspaceStartupDiagnosticEvent) {
+        switch event {
+        case let .phase(phase):
+            WorktreeStartupInstrumentation.record(
+                phase.phase,
+                context: phase.context,
+                route: phase.route,
+                fallback: phase.fallback
+            )
+        case let .inventoryComparison(matched):
+            WorktreeStartupInstrumentation.recordInventoryComparison(matched: matched)
+        case let .shadowFallback(reason):
+            WorktreeStartupInstrumentation.recordShadowFallback(reason)
+        case let .projectedSearchComparison(matched, baseEntryCount, overlayEntryCount, tombstoneCount):
+            WorktreeStartupInstrumentation.recordProjectedSearchComparison(
+                matched: matched,
+                baseEntryCount: baseEntryCount,
+                overlayEntryCount: overlayEntryCount,
+                tombstoneCount: tombstoneCount
+            )
+        case let .seedReceiptJournalCut(present):
+            WorktreeStartupInstrumentation.recordSeedReceiptJournalCut(present: present)
+        case let .seedReplay(acceptedPayloadCount, acceptedEventCount, initializationWatermarkDelta, serviceSequenceDelta, changedPathCount):
+            WorktreeStartupInstrumentation.recordSeedReplay(
+                acceptedPayloadCount: acceptedPayloadCount,
+                acceptedEventCount: acceptedEventCount,
+                initializationWatermarkDelta: initializationWatermarkDelta,
+                serviceSequenceDelta: serviceSequenceDelta,
+                changedPathCount: changedPathCount
+            )
+        case let .seedMetadataRevalidation(used):
+            WorktreeStartupInstrumentation.recordSeedMetadataRevalidation(used: used)
+        case let .seedProjectedPreparation(baseEntryCount, overlayEntryCount, tombstoneCount):
+            WorktreeStartupInstrumentation.recordSeedProjectedPreparation(
+                baseEntryCount: baseEntryCount,
+                overlayEntryCount: overlayEntryCount,
+                tombstoneCount: tombstoneCount
+            )
+        case .seedFullCrawlFallback:
+            WorktreeStartupInstrumentation.recordSeedFullCrawlFallback()
+        #if DEBUG
+            case let .receiptProjection(correlationID, decision, terminal):
+                WorktreeStartupInstrumentation.recordReceiptProjectionDecision(
+                    correlationID: correlationID,
+                    decision: decision,
+                    terminal: terminal
+                )
+            case let .receiptConsumption(correlationID, decision, terminal):
+                WorktreeStartupInstrumentation.recordReceiptConsumptionDecision(
+                    correlationID: correlationID,
+                    decision: decision,
+                    terminal: terminal
+                )
+            case let .deltaCompatibility(correlationID, evaluation, policyCanonicalizationComparison, exactSnapshotLookupReached, exactSnapshotLookupPassed, targetAuthorityComparisonReached, targetAuthorityComparisonPassed, currentSearchABIReached, currentSearchABIMatched, catalogPolicyComparisonReached, catalogPolicyMatched, terminalFallback):
+                WorktreeStartupInstrumentation.recordDeltaCompatibilityEvaluation(
+                    correlationID: correlationID,
+                    evaluation: evaluation,
+                    policyCanonicalizationComparison: policyCanonicalizationComparison,
+                    exactSnapshotLookupReached: exactSnapshotLookupReached,
+                    exactSnapshotLookupPassed: exactSnapshotLookupPassed,
+                    targetAuthorityComparisonReached: targetAuthorityComparisonReached,
+                    targetAuthorityComparisonPassed: targetAuthorityComparisonPassed,
+                    currentSearchABIReached: currentSearchABIReached,
+                    currentSearchABIMatched: currentSearchABIMatched,
+                    catalogPolicyComparisonReached: catalogPolicyComparisonReached,
+                    catalogPolicyMatched: catalogPolicyMatched,
+                    terminalFallback: terminalFallback
+                )
+            case let .benchmarkPlannerPhase(tag, phase, durationMicroseconds, itemCount):
+                WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                    tag: tag,
+                    phase: phase,
+                    durationMicroseconds: durationMicroseconds,
+                    itemCount: itemCount
+                )
+            case let .benchmarkPassiveTree(tag, durationMicroseconds):
+                WorktreeStartupInstrumentation.recordBenchmarkPassiveTree(tag: tag, durationMicroseconds: durationMicroseconds)
+            case let .benchmarkFilesystemWork(tag, durationMicroseconds, itemCount):
+                WorktreeStartupInstrumentation.recordBenchmarkFilesystemWork(
+                    tag: tag,
+                    durationMicroseconds: durationMicroseconds,
+                    itemCount: itemCount
+                )
+            case let .benchmarkCodemapWork(tag, durations, buildPerformed, exactlyAttributed):
+                WorktreeStartupInstrumentation.recordBenchmarkCodemapWork(
+                    tag: tag,
+                    durations: durations,
+                    buildPerformed: buildPerformed,
+                    exactlyAttributed: exactlyAttributed
+                )
+            case let .benchmarkMarkerPublication(tag, rootID, rootLifetimeID, revision, effectiveChangeCount, source):
+                WorktreeStartupInstrumentation.recordBenchmarkMarkerPublication(
+                    tag: tag,
+                    rootID: rootID,
+                    rootLifetimeID: rootLifetimeID,
+                    revision: revision,
+                    effectiveChangeCount: effectiveChangeCount,
+                    source: source
+                )
+        #endif
+        }
+    }
+}
+
+#if DEBUG
+    extension WorktreeStartupPreparationInstrumentation.Span: WorkspacePreparationSpan {}
+
+    extension WorktreeStartupPreparationInstrumentation.Recorder: WorkspacePreparationRecording {
+        func beginPhase(_ phase: WorkspacePreparationPhase) -> any WorkspacePreparationSpan {
+            begin(phase)
+        }
+    }
+
+    struct AppWorkspacePreparationRecorderProvider: WorkspacePreparationRecorderProviding {
+        func currentRecorder() -> (any WorkspacePreparationRecording)? {
+            WorktreeStartupPreparationInstrumentation.currentRecorder
+        }
+    }
+#endif

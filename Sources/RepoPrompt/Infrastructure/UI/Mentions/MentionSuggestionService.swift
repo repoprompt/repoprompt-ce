@@ -1,5 +1,7 @@
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 
 /// Supplies folder / file suggestions for "@" mentions.
 /// All public APIs are @MainActor because they touch Swift-UI view models.

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 enum FrozenVisibleGitCheckoutKind: Equatable, Hashable {
     case canonical

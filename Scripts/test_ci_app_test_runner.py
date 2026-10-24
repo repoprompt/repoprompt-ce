@@ -1,1670 +1,883 @@
 #!/usr/bin/env python3
-"""Unit tests for the hosted CI app-test runner."""
+"""Pure self-tests for the CI app-test runner."""
 
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import os
+import tarfile
+import subprocess
+import sys
 import tempfile
-import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import ci_app_test_runner
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import ci_app_test_runner as runner  # noqa: E402
+import modularization_ci_artifact as artifact  # noqa: E402
+import swift_imports  # noqa: E402
+
+_REAL_INHERITED_STORAGE_READER = runner.read_inherited_storage_preference
 
 
-class FakeProcess:
-    next_pid = 1000
-
-    def __init__(self, lines: list[str] | None = None, *, returncode: int | None = None) -> None:
-        self.lines = lines or []
-        self.returncode = returncode
-        self.pid = FakeProcess.next_pid
-        FakeProcess.next_pid += 1
-        self.stdout = iter(self.lines)
-        self.kill_called = False
-        self.wait_called = False
-
-    def poll(self) -> int | None:
-        return self.returncode
-
-    def wait(self, timeout: float | None = None) -> int:
-        self.wait_called = True
-        if self.returncode is None:
-            deadline = None if timeout is None else time.monotonic() + timeout
-            while self.returncode is None:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("fake process did not exit")
-                time.sleep(0.001)
-        return self.returncode
-
-    def kill(self) -> None:
-        self.kill_called = True
-        self.returncode = -9
+def setUpModule() -> None:
+    # Pure self-tests never read the machine's real defaults; the reader has dedicated fakes below.
+    runner.read_inherited_storage_preference = lambda *args, **kwargs: None
 
 
-class CIAppTestRunnerTests(unittest.TestCase):
-    def write_policy(self, directory: Path, groups: dict[str, dict[str, str]] | None = None) -> Path:
-        path = directory / "policy.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "default_mode": "parallel_eligible",
-                    "groups": groups
-                    or {
-                        "WindowStatesManager": {
-                            "lane": "app_window_state",
-                            "reason": "shared windows",
-                        },
-                    },
-                }
-            ),
-            encoding="utf-8",
+def tearDownModule() -> None:
+    runner.read_inherited_storage_preference = _REAL_INHERITED_STORAGE_READER
+
+
+class InheritedStoragePreferenceTests(unittest.TestCase):
+    """The pre-run storage preference is read, never written, and handed to the test process."""
+
+    @staticmethod
+    def fake_defaults(returncode: int, stdout: str):
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
+        return run, calls
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS defaults only")
+    def test_reader_only_reads_the_preference(self) -> None:
+        run, calls = self.fake_defaults(0, "/var/folders/x/T/old-run/Workspaces\n")
+        self.assertEqual(_REAL_INHERITED_STORAGE_READER(run=run), "/var/folders/x/T/old-run/Workspaces")
+        self.assertEqual([call[1] for call in calls], ["read"], "never writes or deletes defaults")
+        run, _ = self.fake_defaults(1, "")
+        self.assertIsNone(_REAL_INHERITED_STORAGE_READER(run=run))
+
+    def test_suite_environment_hands_the_inherited_value_to_the_test_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: "/var/folders/x/T/old-run/Workspaces",
+            )
+            self.assertEqual(environment[runner.INHERITED_STORAGE_PREFERENCE_ENV], "/var/folders/x/T/old-run/Workspaces")
+            cleared = runner.isolated_suite_environment(
+                Path(directory), "local", {runner.INHERITED_STORAGE_PREFERENCE_ENV: "stale-parent-value"},
+                inherited_storage_preference=lambda: None,
+            )
+            self.assertNotIn(runner.INHERITED_STORAGE_PREFERENCE_ENV, cleared)
+
+
+class InterpreterCompatibilityTests(unittest.TestCase):
+    def test_script_help_runs_with_current_interpreter(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT_DIR / "ci_app_test_runner.py"), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
         )
-        return path
 
-    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
-        path = directory / "ledger.tsv"
-        columns = [
-            "method_id",
-            "target",
-            "file",
-            "suite",
-            "method",
-            "domain",
-            "primary_contract_id",
-            "secondary_contract_tags",
-            "validation_class",
-            "layer",
-            "execution_tier",
-            "scenario_count",
-            "fixture_ids",
-            "observable_oracle",
-            "failure_risk",
-            "runtime_seconds",
-            "resource_cost_tags",
-            "shared_state_tags",
-            "lifecycle_owner",
-            "current_disposition",
-            "replacement_method_id",
-            "preserved_scenario_delta",
-            "notes",
-        ]
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            handle.write("\t".join(columns) + "\n")
-            for row in rows:
-                values = {column: "" for column in columns}
-                values.update(row)
-                handle.write("\t".join(values[column] for column in columns) + "\n")
-        return path
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Run deterministic RepoPrompt CE XCTest suites.", result.stdout)
 
-    def stop_fake_process(self, stopped: list[FakeProcess]):
-        def stop(process: FakeProcess) -> None:
-            stopped.append(process)
-            process.returncode = -15
 
-        return stop
+class HostedShardTests(unittest.TestCase):
+    def test_list_uses_skip_build_for_transferred_artifact(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout='RepoPromptTests.ExampleTests/testOne\n')
+        with mock.patch.object(runner.subprocess, 'run', return_value=completed) as run:
+            found = runner.list_suite_methods('swift', Path('/checkout'), skip_build=True)
+        self.assertEqual(found, {'RepoPromptTests.ExampleTests': ('RepoPromptTests.ExampleTests/testOne',)})
+        self.assertEqual(run.call_args.args[0], ['swift', 'test', 'list', '--skip-build'])
 
-    def test_parse_suites_returns_unique_sorted_suite_names(self) -> None:
+
+class TransferredBuildTests(unittest.TestCase):
+    def test_archive_contains_only_runnable_products_and_gate_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            copy = Path(temporary) / 'copy'
+            app = source / 'Sources/RepoPrompt/App'
+            app.mkdir(parents=True)
+            (app / 'Main.swift').write_text('struct Main {}\n')
+            test_source = source / 'Tests/RepoPromptTests/ExampleTests.swift'
+            test_source.parent.mkdir(parents=True)
+            test_source.write_text('import XCTest\n')
+            metadata = source / '.build/modularization'
+            metadata.mkdir(parents=True)
+            digest = hashlib.sha256((app / 'Main.swift').read_bytes()).hexdigest()
+            for name in ('app-source-sha256.json', 'index-check.json'):
+                (metadata / name).write_text(json.dumps({'source_sha256': {'App/Main.swift': digest}}))
+            (metadata / 'ci-test-list.txt').write_text('RepoPromptTests.ExampleTests/testOne\n')
+            (source / 'Package.swift').write_text('// fixture manifest')
+            (metadata / 'test-targets.json').write_text(json.dumps({
+                'targets': ['RepoPromptTests'],
+                'package_sha256': hashlib.sha256((source / 'Package.swift').read_bytes()).hexdigest(),
+            }))
+            (metadata / 'test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(test_source.read_bytes()).hexdigest()}}))
+            products = source / '.build/out/Products/Debug'
+            bundle = products / 'RepoPromptTests.xctest'
+            bundle.mkdir(parents=True)
+            (bundle / 'test-binary').write_bytes(b'test')
+            (bundle / 'alias').symlink_to('test-binary')
+            resource = products / 'Example.bundle'
+            resource.mkdir()
+            (resource / 'resource').write_bytes(b'data')
+            (products / 'unused.o').write_bytes(b'object')
+            for excluded in ('ModuleCache', 'RepoPromptApp.build', 'index/store'):
+                item = products / excluded
+                item.mkdir(parents=True)
+                (item / 'payload').write_bytes(b'intermediate')
+            checkout = source / '.build/checkouts/example'
+            checkout.mkdir(parents=True)
+            (checkout / 'source.swift').write_text('not transferred')
+            archive = Path(temporary) / 'build.tar.gz'
+            artifact.pack(source, archive)
+            copy.mkdir()
+            (copy / 'Package.swift').write_text('// fixture manifest')
+            (copy / 'Sources/RepoPrompt/App').mkdir(parents=True)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            copied_test = copy / 'Tests/RepoPromptTests/ExampleTests.swift'
+            copied_test.parent.mkdir(parents=True)
+            copied_test.write_text('import XCTest\n')
+            with tarfile.open(archive, 'r:gz') as stream:
+                self.assertFalse(any('ModuleCache' in member.name or
+                                     'RepoPromptApp.build' in member.name or
+                                     'index/store' in member.name for member in stream.getmembers()))
+                stream.extractall(copy, filter='data')
+            self.assertTrue((copy / '.build/out/Products/Debug/RepoPromptTests.xctest/alias').is_symlink())
+            self.assertFalse((copy / '.build/out/Products/Debug/unused.o').exists())
+            self.assertFalse((copy / '.build/checkouts').exists())
+            self.assertIsNone(runner.verify_transferred_build(copy))
+            copied_test.write_text('import Testing\n')
+            self.assertIn('test sources do not match', runner.verify_transferred_build(copy))
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            self.assertIn('cannot run Swift Testing', runner.verify_transferred_build(copy))
+            copied_test.write_text('import XCTest\n')
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            discovered = runner.discover_test_bundles('swift', copy, prebuilt_bin_path=artifact.validate(copy))
+            self.assertIn('RepoPromptTests', discovered)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Other {}\n')
+            self.assertIn('do not match', runner.verify_transferred_build(copy))
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            (copy / '.build/modularization/index-check.json').unlink()
+            self.assertIn('metadata missing', runner.verify_transferred_build(copy))
+            (metadata / 'index-check.json').unlink()
+            with self.assertRaises(ValueError):
+                artifact.pack(source, archive)
+
+
+class LocalExecutionTests(unittest.TestCase):
+    def test_conductor_routes_root_tests_through_sandbox_runner(self) -> None:
+        import conductor
+
+        root = SCRIPT_DIR.parent
+        argv, lanes, cwd, _, _ = conductor.OperationRegistry(root).prepare({
+            "operation": "test",
+            "args": {"filter": "WorkspaceRootRemovalTests/testCaseOnlyMissIsANoOp", "testProduct": "RepoPromptPackageTests"},
+        })
+        self.assertEqual(argv, [
+            sys.executable, str(SCRIPT_DIR / "ci_app_test_runner.py"), "--local",
+            "--test-product", "RepoPromptPackageTests",
+            "--filter", "WorkspaceRootRemovalTests/testCaseOnlyMissIsANoOp",
+        ])
+        self.assertEqual(lanes, ["build"])
+        self.assertEqual(cwd, root)
+
+    def test_job_ticket_reaches_only_the_operation_runner(self) -> None:
+        import conductor
+
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        internal = registry._internal_argv("swift_build_all", {})
+        self.assertTrue(conductor.argv_is_operation_runner(internal))
+        test_argv, _, _, _, _ = registry.prepare({"operation": "test", "args": {"filter": "X"}})
+        self.assertFalse(conductor.argv_is_operation_runner(test_argv))
+        self.assertFalse(conductor.argv_is_operation_runner(["swift", "build", "--product", "RepoPrompt"]))
+
+        environ = {conductor.CONDUCTOR_JOB_TICKET_ENV: "ticket-1", "PATH": "/usr/bin"}
+        self.assertEqual(conductor.capture_job_ticket(environ), "ticket-1")
+        self.assertEqual(conductor.current_job_ticket(), "ticket-1")
+        self.assertEqual(environ, {"PATH": "/usr/bin"})
+
+    def test_local_build_then_sandboxed_execution_preserves_selection_and_exit(self) -> None:
+        calls = []
+        sandbox = None
+
+        def execute(command, cwd, environment):
+            nonlocal sandbox
+            calls.append(tuple(command))
+            self.assertEqual(cwd, SCRIPT_DIR.parent)
+            if len(calls) == 1:
+                self.assertEqual(dict(environment), {"PATH": "/usr/bin"})
+                return 0
+            sandbox = Path(environment["REPOPROMPT_TEST_SANDBOX_ROOT"])
+            self.assertTrue((sandbox / runner.SANDBOX_MARKER_NAME).is_file())
+            self.assertEqual(Path(environment["HOME"]), sandbox / "home")
+            self.assertEqual(environment["CFFIXED_USER_HOME"], environment["HOME"])
+            self.assertEqual(Path(environment["TMPDIR"]), sandbox / "tmp")
+            self.assertEqual(environment["PATH"], "/usr/bin")
+            return 17
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin"}, clear=True):
+            result = runner.run_local_tests(
+                swift_binary="swift", cwd=SCRIPT_DIR.parent,
+                test_filter="Suite/testMethod", test_product="RepoPromptPackageTests",
+                executor=execute,
+            )
+        self.assertEqual(result, 17)
+        self.assertEqual(calls, [
+            ("swift", "build", "--build-tests"),
+            ("swift", "test", "--skip-build", "--test-product", "RepoPromptPackageTests", "--filter", "Suite/testMethod"),
+        ])
+        self.assertIsNotNone(sandbox)
+        self.assertFalse(sandbox.exists())
+
+    def test_measurement_scratch_and_build_args_reach_build_discovery_and_fallback(self) -> None:
+        executor = mock.Mock(return_value=0)
+        seen = {}
+
+        def direct(**kwargs):
+            seen.update(kwargs)
+            return None
+
+        scratch = Path("/r/.build/measure/x")
+        runner.run_local_tests(
+            swift_binary="swift", cwd=None, test_filter="S", executor=executor, direct_command=direct,
+            scratch_path=scratch, build_args=("-Xlinker", "-no_deduplicate"),
+        )
+        swiftpm = ("--scratch-path", str(scratch), "-Xlinker", "-no_deduplicate")
+        self.assertEqual(executor.call_args_list[0].args[0], ("swift", "build", "--build-tests", *swiftpm))
+        self.assertEqual(seen["scratch_path"], scratch)
+        self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", *swiftpm, "--filter", "S"))
+
+    def test_measurement_build_args_require_scratch_path(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, executor=executor, build_args=("-Xlinker", "-x"),
+            ), 2)
+        executor.assert_not_called()
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            for argv in (
+                ["--local", "--build-arg=-Xlinker"],
+                ["--local", "--module", "XTests", "--scratch-path", "/s"],
+                ["--scratch-path", "/s"],
+            ):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    runner.parse_args(argv)
+        parsed = runner.parse_args(["--local", "--scratch-path", "/s", "--build-arg=-Xswiftc", "--build-arg=-v"])
+        self.assertEqual(parsed.build_args, ["-Xswiftc", "-v"])
+
+    def test_discovery_uses_the_measurement_scratch_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.CompletedProcess([], 0, stdout=f"{tmp}\n")
+            with mock.patch.object(runner.subprocess, "run", return_value=completed) as run:
+                runner.discover_test_bundles("swift", None, Path("/s"))
+                runner.discover_test_bundles("swift", None)
+        self.assertEqual(run.call_args_list[0].args[0], ["swift", "build", "--scratch-path", "/s", "--show-bin-path"])
+        self.assertEqual(run.call_args_list[1].args[0], ["swift", "build", "--show-bin-path"])
+
+    def test_local_build_failure_does_not_launch_tests(self) -> None:
+        executor = mock.Mock(return_value=9)
+        self.assertEqual(runner.run_local_tests(
+            swift_binary="swift", cwd=None, executor=executor,
+        ), 9)
+        executor.assert_called_once()
+
+
+class DirectXCTestExecutionTests(unittest.TestCase):
+    LISTED = [
+        "RepoPromptTests.AlphaTests/testOne",
+        "RepoPromptTests.AlphaTests/testTwo",
+        "RepoPromptTests.BetaTests/testOne",
+        "RepoPromptRegexCoreTests.RegexTests/testMatch",
+    ]
+
+    def test_flatten_listed_tests_matches_swiftpm_specifiers(self) -> None:
+        document = {"name": "All Tests", "tests": [{"name": "RepoPromptCEPackageTests.xctest", "tests": [
+            {"name": "RepoPromptTests.AlphaTests", "tests": [{"name": "testTwo"}, {"name": "testOne"}]},
+            {"name": "RepoPromptTests.EmptyTests", "tests": []},
+        ]}]}
+        self.assertEqual(runner.flatten_listed_tests(document), [
+            "RepoPromptTests.AlphaTests/testOne", "RepoPromptTests.AlphaTests/testTwo",
+        ])
+
+    def test_flatten_ignores_bundles_containing_only_empty_suites(self) -> None:
+        document = {"name": "All Tests", "tests": [{"name": "Pkg.xctest", "tests": [
+            {"name": "M.EmptyA", "tests": []},
+            {"name": "M.EmptyB", "tests": []},
+        ]}]}
+        self.assertEqual(runner.flatten_listed_tests(document), [])
+
+    def test_select_specifiers_uses_regex_search_and_collapses_whole_suites(self) -> None:
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "AlphaTests"), ["RepoPromptTests.AlphaTests"])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "testOne"), [
+            "RepoPromptTests.AlphaTests/testOne", "RepoPromptTests.BetaTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "RepoPromptRegexCoreTests"), [
+            "RepoPromptRegexCoreTests.RegexTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "Alpha|Regex"), [
+            "RepoPromptRegexCoreTests.RegexTests", "RepoPromptTests.AlphaTests",
+        ])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, None), ["All"])
+        self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "Nope"), [])
+        self.assertIsNone(runner.select_xctest_specifiers(self.LISTED, "(unclosed"))
+
+    def direct(self, root: Path, **overrides):
+        options = dict(
+            swift_binary="swift", cwd=root, test_filter="AlphaTests", environment={"HOME": "/sandbox"},
+            lister=lambda bundle, env: list(self.LISTED),
+            bundle_discovery=lambda swift, cwd: {"RepoPromptCEPackageTests": Path("/b/RepoPromptCEPackageTests.xctest")},
+            xctest_binary=lambda: ("/x/xctest",),
+        )
+        options.update(overrides)
+        return runner.direct_xctest_command(**options)
+
+    def test_direct_command_runs_bundle_with_selectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.direct(Path(tmp)), (
+                "/x/xctest", "-XCTest", "RepoPromptTests.AlphaTests", "/b/RepoPromptCEPackageTests.xctest",
+            ))
+            self.assertEqual(self.direct(Path(tmp), test_filter="Nope"), ())
+
+    def test_direct_command_falls_back_when_equivalence_is_not_guaranteed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(self.direct(root, bundle_discovery=lambda swift, cwd: {}))
+            self.assertIsNone(self.direct(root, lister=lambda bundle, env: None))
+            self.assertIsNone(self.direct(root, test_filter="(bad"))
+            tests = root / "Tests" / "NewTests"
+            tests.mkdir(parents=True)
+            (tests / "SwiftTestingTests.swift").write_text("import Testing\n@Test func works() {}\n")
+            self.assertIsNone(self.direct(root))
+
+    def test_run_local_tests_uses_direct_command_in_sandbox(self) -> None:
+        calls = []
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), environment.get("HOME")))
+            return 0
+
+        def direct(**kwargs):
+            self.assertIn("rpce-local-tests-", kwargs["environment"]["HOME"])
+            return ("/x/xctest", "-XCTest", "S", "/b.xctest")
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True):
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, test_filter="S", executor=execute, direct_command=direct,
+            ), 0)
+        self.assertEqual(calls[0], (("swift", "build", "--build-tests"), "/real"))
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "S", "/b.xctest"))
+        self.assertIn("rpce-local-tests-", calls[1][1])
+
+    def test_run_local_tests_reports_no_match_without_launching(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, test_filter="Nope", executor=executor,
+                direct_command=lambda **kwargs: (),
+            ), 0)
+        executor.assert_called_once()
+        self.assertIn("No matching test cases were run", stdout.getvalue())
+
+    def test_run_local_tests_falls_back_to_swiftpm(self) -> None:
+        executor = mock.Mock(return_value=0)
+        runner.run_local_tests(
+            swift_binary="swift", cwd=None, test_filter="S", executor=executor,
+            direct_command=lambda **kwargs: None,
+        )
+        self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", "--filter", "S"))
+
+
+class ModuleExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for module in ("RepoPromptMCPCoreTests", "XTests", "MixedTests", "OtherTests"):
+            (self.root / "Tests" / module).mkdir(parents=True)
+            (self.root / "Tests" / module / "A.swift").write_text("import XCTest\n")
+        (self.root / "Tests" / "MixedTests" / "B.swift").write_text("@testable import Lib\nimport Testing\n")
+
+    def run_mixed(self, *, statuses, listed=("MixedTests.XCSuite/testA",), test_filter="Suite", **overrides):
+        calls = []
+        results = list(statuses)
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), dict(environment)))
+            return results.pop(0)
+
+        options = dict(
+            swift_binary="swift", cwd=self.root, module="MixedTests", test_filter=test_filter, executor=execute,
+            bundle_locator=lambda swift, cwd, module: Path("/b/MixedTests.xctest"),
+            lister=lambda bundle, env: list(listed),
+            xctest_binary=lambda: ("/x/xctest",),
+            testing_helper=lambda swift: Path("/tc/swiftpm-testing-helper"),
+            testing_environment=lambda env: {**env, "DYLD_FRAMEWORK_PATH": "/dev/Frameworks"},
+        )
+        options.update(overrides)
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            return runner.run_module_tests(**options), calls
+
+    def test_module_run_builds_only_its_product_and_runs_bundle(self) -> None:
+        calls = []
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), environment.get("HOME")))
+            return 0
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True):
+            result = runner.run_module_tests(
+                swift_binary="swift", cwd=self.root, module="RepoPromptMCPCoreTests", test_filter="CLIMode",
+                executor=execute,
+                bundle_locator=lambda swift, cwd, module: Path("/b/RepoPromptMCPCoreTests.xctest"),
+                lister=lambda bundle, env: ["RepoPromptMCPCoreTests.CLIModeParsingTests/testA"],
+                xctest_binary=lambda: ("/x/xctest",),
+                testing_helper=lambda swift: self.fail("XCTest-only targets must not look up Swift Testing"),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], (("swift", "build", "--build-system", "swiftbuild", "--scratch-path",
+                                     ".build/swiftbuild", "--product", "RepoPromptMCPCoreTests"), "/real"))
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "RepoPromptMCPCoreTests.CLIModeParsingTests",
+                                       "/b/RepoPromptMCPCoreTests.xctest"))
+        self.assertIn("rpce-module-tests-", calls[1][1])
+
+    def test_module_run_rejects_non_test_targets_and_missing_bundles(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="RepoPromptApp",
+                                                     executor=executor), 2)
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="MissingTests",
+                                                     executor=executor), 2)
+            executor.assert_not_called()
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=self.root, module="XTests",
+                                                     executor=executor,
+                                                     bundle_locator=lambda *a: None), 2)
+
+    def test_module_run_executes_swift_testing_like_swiftpm(self) -> None:
+        result, calls = self.run_mixed(statuses=[0, 0, 0])
+        self.assertEqual(result, 0)
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "MixedTests.XCSuite", "/b/MixedTests.xctest"))
+        binary = "/b/MixedTests.xctest/Contents/MacOS/MixedTests"
+        self.assertEqual(calls[2][0], (
+            "/tc/swiftpm-testing-helper", "--test-bundle-path", binary, "--build-system", "swiftbuild",
+            "--filter", "Suite", binary, "--testing-library", "swift-testing",
+        ))
+        self.assertIn("rpce-module-tests-", calls[2][1]["HOME"])
+        self.assertEqual(calls[2][1]["DYLD_FRAMEWORK_PATH"], "/dev/Frameworks")
+        self.assertEqual(calls[1][1]["SWIFT_TESTING_ENABLED"], "0", "xctest must not also host Swift Testing")
+        self.assertNotIn("SWIFT_TESTING_ENABLED", calls[2][1])
+
+    def test_module_run_swift_testing_exit_codes_match_swift_test(self) -> None:
+        self.assertEqual(self.run_mixed(statuses=[0, 0, runner.SWIFT_TESTING_NO_TESTS_EXIT])[0], 0)
+        self.assertEqual(self.run_mixed(statuses=[0, 0, 1])[0], 1)
+        result, calls = self.run_mixed(statuses=[0, 1, 0])
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 3, "Swift Testing still runs after an XCTest failure")
+
+    def test_module_run_without_xctest_matches_runs_only_swift_testing(self) -> None:
+        result, calls = self.run_mixed(statuses=[0, 0], listed=("MixedTests.Other/testA",))
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])
+        result, calls = self.run_mixed(statuses=[0, 0], test_filter=None, listed=())
+        self.assertEqual(calls[1][0][-5:], ("--build-system", "swiftbuild",
+                                            "/b/MixedTests.xctest/Contents/MacOS/MixedTests",
+                                            "--testing-library", "swift-testing"))
+
+    def test_qualified_swift_testing_only_target_runs_failing_test(self) -> None:
+        (self.root / "Tests" / "MixedTests" / "B.swift").write_text(
+            "internal import Testing\n@Test func fails() { #expect(false) }\n"
+        )
+        for prefix in ("internal", "public", "@_exported"):
+            self.assertIn('Testing', swift_imports.imported_modules(f"{prefix} import Testing\n"))
+        result, calls = self.run_mixed(statuses=[0, 1], listed=(), test_filter=None)
+        self.assertEqual(result, 1)
+        self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])
+
+    def test_module_run_fails_closed_when_swift_testing_cannot_run_equivalently(self) -> None:
+        result, calls = self.run_mixed(statuses=[], testing_helper=lambda swift: None)
+        self.assertEqual((result, calls), (2, []))
+        result, calls = self.run_mixed(statuses=[0, 0], testing_environment=lambda env: None)
+        self.assertEqual(result, 2)
+        self.assertEqual(len(calls), 2)
+        result, calls = self.run_mixed(statuses=[], test_filter=r"Suite\d")
+        self.assertEqual((result, calls), (2, []))
+
+    def test_swift_testing_detection_is_scoped_to_the_module_and_shared_with_the_aggregate_path(self) -> None:
+        self.assertTrue(runner.sources_import_swift_testing(self.root / "Tests" / "MixedTests"))
+        self.assertFalse(runner.sources_import_swift_testing(self.root / "Tests" / "OtherTests"))
+        self.assertFalse(runner.sources_import_swift_testing(self.root / "Tests" / "MissingTests"))
+        self.assertTrue(runner.package_uses_swift_testing(self.root))
+        with mock.patch.object(runner, "sources_import_swift_testing", return_value=False) as shared:
+            self.assertFalse(runner.package_uses_swift_testing(self.root))
+        shared.assert_called_once_with(self.root / "Tests")
+
+    def test_portable_filters(self) -> None:
+        for portable in ("RepoPromptDomainRuntimeTests", "Alpha|Beta", "^Mod\\.Suite/test(One|Two)$",
+                         "test[A-Z]x", "a.*b+c?", "inSuite\\(\\)"):
+            self.assertTrue(runner.is_portable_filter(portable), portable)
+        for unportable in ("\\d", "\\QA\\E", "(?i)abc", "(?=a)", "a{2}", "[[a]]", "[a&&b]", "[a--b]", "[]a]",
+                           "[^]a]", "(unclosed", "[open", "trailing\\"):
+            self.assertFalse(runner.is_portable_filter(unportable), unportable)
+        self.assertIsNone(runner.select_xctest_specifiers(["M.S/testA"], "test\\w"))
+
+    def test_developer_library_environment_prepends_platform_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as platform:
+            (Path(platform) / "Developer").mkdir()
+            completed = subprocess.CompletedProcess([], 0, stdout=f"{platform}\n")
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                environment = runner.developer_library_environment({"HOME": "/h", "DYLD_LIBRARY_PATH": "/mine"})
+        developer = f"{platform}/Developer"
+        self.assertEqual(environment["DYLD_FRAMEWORK_PATH"],
+                         f"{developer}/Library/Frameworks:{developer}/Library/PrivateFrameworks")
+        self.assertEqual(environment["DYLD_LIBRARY_PATH"], f"{developer}/usr/lib:/mine")
+        self.assertEqual(environment["HOME"], "/h")
+        with mock.patch.object(runner.subprocess, "run", side_effect=OSError):
+            self.assertIsNone(runner.developer_library_environment({}))
+
+    def test_conductor_forwards_module_and_skips_build_cache(self) -> None:
+        import conductor
+
+        argv, lanes, _, _, _ = conductor.OperationRegistry(SCRIPT_DIR.parent).prepare({
+            "operation": "test", "args": {"module": "RepoPromptMCPCoreTests", "filter": "X"},
+        })
+        self.assertEqual(argv[2:], ["--local", "--module", "RepoPromptMCPCoreTests", "--filter", "X"])
+        self.assertEqual(lanes, ["build"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"module": "RepoPromptMCPCoreTests"}))
+        self.assertTrue(conductor.BuildCacheManager.eligible("test", {}))
+
+    def test_conductor_measurement_builds_use_a_separate_scratch_path(self) -> None:
+        import conductor
+
+        root = SCRIPT_DIR.parent
+        registry = conductor.OperationRegistry(root)
+        scratch = str(root / ".build" / "measure" / "p05")
+        argv, lanes, _, _, _ = registry.prepare({"operation": "swift-build", "args": {
+            "product": "RepoPrompt", "scratch": "p05",
+            "swiftcFlags": ["-Xfrontend", "-warn-long-function-bodies=200"], "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv, [
+            "swift", "build", "--product", "RepoPrompt", "--scratch-path", scratch,
+            "-Xswiftc", "-Xfrontend", "-Xswiftc", "-warn-long-function-bodies=200", "-Xlinker", "-no_deduplicate",
+        ])
+        self.assertEqual(lanes, ["build"])
+        argv, _, _, _, _ = registry.prepare({"operation": "test", "args": {
+            "filter": "X", "scratch": "p05", "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv[2:], [
+            "--local", "--scratch-path", scratch, "--build-arg=-Xlinker", "--build-arg=-no_deduplicate", "--filter", "X",
+        ])
+        plain, _, _, _, _ = registry.prepare({"operation": "swift-build", "args": {"product": "RepoPrompt"}})
+        self.assertEqual(plain, ["swift", "build", "--product", "RepoPrompt"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("swift-build", {"product": "RepoPrompt", "scratch": "p05"}))
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"scratch": "p05"}))
+
+    def test_conductor_rejects_unsafe_measurement_requests(self) -> None:
+        import conductor
+
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        rejected = (
+            ("swift-build", {"product": "RepoPrompt", "swiftcFlags": ["-v"]}),
+            ("test", {"linkerFlags": ["-no_deduplicate"]}),
+            ("swift-build", {"product": "all", "scratch": "p05"}),
+            ("test", {"module": "RepoPromptMCPCoreTests", "scratch": "p05"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "../escape"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "a/b"}),
+        )
+        for operation, args in rejected:
+            with self.subTest(operation=operation, args=args), self.assertRaises(conductor.ConductorError):
+                registry.prepare({"operation": operation, "args": args})
+
+    def test_seed_sanitizing_drops_measurement_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "measure" / "p05").mkdir(parents=True)
+            (build / "measure" / "p05" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "measure").exists())
+            self.assertTrue((build / "debug").is_dir())
+
+    def test_seed_sanitizing_drops_module_test_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "swiftbuild" / "arm64-apple-macosx").mkdir(parents=True)
+            (build / "swiftbuild" / "arm64-apple-macosx" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "swiftbuild").exists())
+            self.assertTrue((build / "debug").is_dir())
+
+
+class TestDiscoveryTests(unittest.TestCase):
+    def test_parse_suite_methods_deduplicates_and_sorts(self) -> None:
         output = "\n".join(
             [
-                "RepoPromptTests.B/testTwo",
-                "RepoPromptTests.A/testOne",
-                "RepoPromptTests.B/testThree",
-                "noise without slash",
-                "",
+                "RepoPromptTests.SecondTests/testB",
+                "noise",
+                "RepoPromptTests.FirstTests/testZ",
+                "RepoPromptTests.FirstTests/testA",
+                "RepoPromptTests.FirstTests/testA",
             ]
         )
 
         self.assertEqual(
-            ci_app_test_runner.parse_suites(output),
-            ["RepoPromptTests.A", "RepoPromptTests.B"],
-        )
-
-    def test_serial_group_policy_accepts_valid_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = self.write_policy(Path(temp))
-
-            policy = ci_app_test_runner.load_serial_group_policy(path)
-
-        self.assertEqual(policy["WindowStatesManager"].lane, "app_window_state")
-
-    def test_serial_group_policy_rejects_unknown_version(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "policy.json"
-            path.write_text(
-                json.dumps({"version": 99, "default_mode": "parallel_eligible", "groups": {}}),
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "unsupported serial group policy version"):
-                ci_app_test_runner.load_serial_group_policy(path)
-
-    def test_serial_group_policy_rejects_malformed_group(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "policy.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "default_mode": "parallel_eligible",
-                        "groups": {"WindowStatesManager": {"lane": "app_window_state"}},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "must define a non-empty reason"):
-                ci_app_test_runner.load_serial_group_policy(path)
-
-    def test_ledger_aggregation_classifies_suites_by_serial_policy_tags(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.A/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "runtime_seconds": "1.5",
-                        "shared_state_tags": "WindowStatesManager;GlobalSettingsStore",
-                        "resource_cost_tags": "temp_directory;git_subprocess",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.A/testTwo",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testTwo",
-                        "execution_tier": "diagnostic",
-                        "runtime_seconds": "2.0",
-                        "shared_state_tags": "WindowStatesManager",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.B/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.B",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "runtime_seconds": "0.5",
-                        "resource_cost_tags": "UserDefaults.standard",
-                    },
-                ],
-            )
-            policy = self.write_policy(
-                root,
-                {
-                    "WindowStatesManager": {
-                        "lane": "app_window_state",
-                        "reason": "shared windows",
-                    },
-                    "UserDefaults.standard": {
-                        "lane": "user_defaults",
-                        "reason": "shared defaults",
-                    },
-                },
-            )
-
-            plan = ci_app_test_runner.build_suite_plan(
-                ["RepoPromptTests.B", "RepoPromptTests.A"],
-                ledger_suites=ci_app_test_runner.read_ledger_suites(ledger),
-                serial_policy=ci_app_test_runner.load_serial_group_policy(policy),
-            )
-
-        self.assertEqual(
-            [suite.suite for suite in plan.pinned_serial],
-            ["RepoPromptTests.A", "RepoPromptTests.B"],
-        )
-        self.assertEqual([suite.suite for suite in plan.parallel_eligible], [])
-        self.assertEqual(plan.pinned_serial[0].estimated_runtime_seconds, 3.5)
-        self.assertTrue(plan.pinned_serial[0].heavy_tier_present)
-        self.assertEqual(plan.pinned_serial[1].matched_serial_tags, ("UserDefaults.standard",))
-
-    def test_main_print_suite_plan_json_emits_stable_groups(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.Pinned/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.Pinned",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "shared_state_tags": "WindowStatesManager",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.Free/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.Free",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--strict-ledger",
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(output.getvalue())
-        self.assertEqual(
-            [suite["suite"] for suite in payload["pinned_serial"]],
-            ["RepoPromptTests.Pinned"],
-        )
-        self.assertEqual(
-            [suite["suite"] for suite in payload["parallel_eligible"]],
-            ["RepoPromptTests.Free"],
-        )
-
-    def test_main_print_suite_plan_json_rejects_missing_suite_when_strict(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--strict-ledger",
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(
-            output.getvalue().strip(),
-            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
-        )
-
-    def test_main_print_suite_plan_json_rejects_missing_suite_with_parallel_workers(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--workers",
-                        "2",
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(
-            output.getvalue().strip(),
-            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
-        )
-
-    def test_main_print_suite_plan_json_preserves_non_strict_missing_suite_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(output.getvalue())
-        unknown = next(
-            suite
-            for suite in payload["parallel_eligible"]
-            if suite["suite"] == "RepoPromptTests.Unknown"
-        )
-        self.assertEqual(unknown["method_count"], 0)
-        self.assertEqual(unknown["classification"], "parallel_eligible")
-
-    def test_main_reports_missing_ledger_file(self) -> None:
-        output = io.StringIO()
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
-            mock.patch("sys.stdout", output),
-        ):
-            policy = self.write_policy(Path(temp))
-            exit_code = ci_app_test_runner.main(
-                [
-                    "--ledger",
-                    str(Path(temp) / "missing.tsv"),
-                    "--serial-group-policy",
-                    str(policy),
-                    "--print-suite-plan-json",
-                ]
-            )
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("ledger file does not exist", output.getvalue())
-
-    def test_main_reports_missing_serial_group_policy_file(self) -> None:
-        output = io.StringIO()
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
-            mock.patch("sys.stdout", output),
-        ):
-            ledger = self.write_ledger(
-                Path(temp),
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.A/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                    },
-                ],
-            )
-            exit_code = ci_app_test_runner.main(
-                [
-                    "--ledger",
-                    str(ledger),
-                    "--serial-group-policy",
-                    str(Path(temp) / "missing.json"),
-                    "--print-suite-plan-json",
-                ]
-            )
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("serial group policy file does not exist", output.getvalue())
-
-    def test_xctest_failure_detection_matches_xctest_issue_lines_only(self) -> None:
-        self.assertTrue(
-            ci_app_test_runner.is_xctest_failure_line(
-                "/tmp/File.swift:10: error: -[RepoPromptTests.S testExample] : XCTAssert failed\n"
-            )
-        )
-        self.assertTrue(
-            ci_app_test_runner.is_xctest_failure_line(
-                "/tmp/File.swift:10:2: error: -[RepoPromptTests.S testExample] : XCTAssert failed\n"
-            )
-        )
-        self.assertFalse(
-            ci_app_test_runner.is_xctest_failure_line(
-                "2026-06-29T12:00:00Z error com.repoprompt ordinary application log\n"
-            )
-        )
-
-    def test_started_test_parser_tracks_last_xctest_method(self) -> None:
-        self.assertEqual(
-            ci_app_test_runner.parse_started_test(
-                "Test Case '-[RepoPromptTests.S testExample]' started.\n"
-            ),
-            "RepoPromptTests.S testExample",
-        )
-        self.assertIsNone(ci_app_test_runner.parse_started_test("Test Suite started.\n"))
-
-    def test_cleanup_groups_never_include_runner_process_group(self) -> None:
-        original_getpgrp = ci_app_test_runner.os.getpgrp
-        original_getpgid = ci_app_test_runner.os.getpgid
-        try:
-            ci_app_test_runner.os.getpgrp = lambda: 42
-            ci_app_test_runner.os.getpgid = lambda _: 42
-            self.assertEqual(
-                ci_app_test_runner.process_groups_for_cleanup(1000, {42, 84}),
-                {84},
-            )
-
-            ci_app_test_runner.os.getpgid = lambda _: 77
-            self.assertEqual(
-                ci_app_test_runner.process_groups_for_cleanup(1000, {42, 84}),
-                {77, 84},
-            )
-        finally:
-            ci_app_test_runner.os.getpgrp = original_getpgrp
-            ci_app_test_runner.os.getpgid = original_getpgid
-
-    def test_fail_fast_stops_after_first_xctest_issue(self) -> None:
-        stopped: list[FakeProcess] = []
-        output = io.StringIO()
-        fake = FakeProcess(
-            [
-                "Test Case '-[RepoPromptTests.S testExample]' started.\n",
-                "/tmp/File.swift:10: error: -[RepoPromptTests.S testExample] : XCTAssert failed\n",
-                "line that would have appeared before a hang\n",
-            ]
-        )
-
-        result = ci_app_test_runner.run_suite(
-            "RepoPromptTests.S",
-            timeout_seconds=1.0,
-            silent_timeout_retries=0,
-            process_factory=lambda suite: fake,
-            stop_process_tree_func=self.stop_fake_process(stopped),
-            output=output,
-            poll_interval_seconds=0.001,
-        )
-
-        self.assertEqual(result.state, "failed")
-        self.assertEqual(result.exit_code, 1)
-        self.assertEqual(result.last_started_test, "RepoPromptTests.S testExample")
-        self.assertIn("XCTAssert failed", result.first_failure_line or "")
-        self.assertEqual(stopped, [fake])
-
-    def test_nonzero_process_exit_returns_process_status(self) -> None:
-        result = ci_app_test_runner.run_suite(
-            "RepoPromptTests.S",
-            timeout_seconds=1.0,
-            silent_timeout_retries=0,
-            process_factory=lambda suite: FakeProcess(returncode=7),
-            stop_process_tree_func=self.stop_fake_process([]),
-            output=io.StringIO(),
-            poll_interval_seconds=0.001,
-        )
-
-        self.assertEqual(result.state, "failed")
-        self.assertEqual(result.exit_code, 7)
-        self.assertIsNone(result.first_failure_line)
-
-    def test_timeout_with_output_does_not_retry(self) -> None:
-        attempts: list[FakeProcess] = []
-        stopped: list[FakeProcess] = []
-
-        def factory(_: str) -> FakeProcess:
-            process = FakeProcess(["some XCTest output\n"])
-            attempts.append(process)
-            return process
-
-        result = ci_app_test_runner.run_suite(
-            "RepoPromptTests.S",
-            timeout_seconds=0.02,
-            silent_timeout_retries=1,
-            process_factory=factory,
-            stop_process_tree_func=self.stop_fake_process(stopped),
-            output=io.StringIO(),
-            poll_interval_seconds=0.001,
-        )
-
-        self.assertEqual(result.state, "timed_out")
-        self.assertEqual(result.exit_code, ci_app_test_runner.TIMEOUT_EXIT_CODE)
-        self.assertTrue(result.output_seen)
-        self.assertEqual(result.attempts, 1)
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(stopped, attempts)
-
-    def test_silent_timeout_retries_once_and_can_pass(self) -> None:
-        attempts = [FakeProcess([]), FakeProcess(returncode=0)]
-        stopped: list[FakeProcess] = []
-
-        result = ci_app_test_runner.run_suite(
-            "RepoPromptTests.S",
-            timeout_seconds=0.02,
-            silent_timeout_retries=1,
-            process_factory=lambda suite: attempts.pop(0),
-            stop_process_tree_func=self.stop_fake_process(stopped),
-            output=io.StringIO(),
-            poll_interval_seconds=0.001,
-        )
-
-        self.assertEqual(result.state, "passed")
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual(result.attempts, 2)
-        self.assertEqual(len(stopped), 1)
-
-    def test_silent_startup_timeout_kills_before_full_suite_timeout(self) -> None:
-        attempts = [FakeProcess([]), FakeProcess(returncode=0)]
-        stopped: list[FakeProcess] = []
-
-        start = time.monotonic()
-        result = ci_app_test_runner.run_suite(
-            "RepoPromptTests.S",
-            timeout_seconds=2.0,
-            silent_timeout_retries=1,
-            process_factory=lambda suite: attempts.pop(0),
-            stop_process_tree_func=self.stop_fake_process(stopped),
-            output=io.StringIO(),
-            poll_interval_seconds=0.001,
-            silent_startup_seconds=0.02,
-        )
-        elapsed = time.monotonic() - start
-
-        self.assertEqual(result.state, "passed")
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual(result.attempts, 2)
-        self.assertEqual(len(stopped), 1)
-        # The silent startup timeout (0.02s) must fire well before the full suite
-        # timeout (2.0s); otherwise the retry would not happen until the whole budget
-        # elapsed.
-        self.assertLess(elapsed, 1.0)
-
-    def test_cancellation_event_stops_running_suite_process(self) -> None:
-        stopped: list[FakeProcess] = []
-        cancellation = threading.Event()
-        process = FakeProcess(["Test Case '-[RepoPromptTests.S testExample]' started.\n"])
-        timer = threading.Timer(0.02, cancellation.set)
-        timer.start()
-        try:
-            result = ci_app_test_runner.run_suite(
-                "RepoPromptTests.S",
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                process_factory=lambda suite: process,
-                stop_process_tree_func=self.stop_fake_process(stopped),
-                output=io.StringIO(),
-                poll_interval_seconds=0.001,
-                cancellation_event=cancellation,
-            )
-        finally:
-            timer.cancel()
-
-        self.assertEqual(result.state, "cancelled")
-        self.assertEqual(result.exit_code, 130)
-        self.assertEqual(stopped, [process])
-
-    def test_discover_test_bundle_finds_xctest_in_bin_path(self) -> None:
-        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            if "build" in args and "--show-bin-path" in args:
-                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
-            raise AssertionError(f"unexpected call: {args}")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
-                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
-                    fake_bin_dir / "RepoPromptCEPackageTests.xctest",
-                ]):
-                    bundle = ci_app_test_runner.discover_test_bundle("swift", None)
-
-        self.assertEqual(bundle, fake_bin_dir / "RepoPromptCEPackageTests.xctest")
-
-    def test_discover_test_bundle_returns_none_when_bin_path_missing(self) -> None:
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            return FakeCompletedProcess("/nonexistent/path\n")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=False):
-                bundle = ci_app_test_runner.discover_test_bundle("swift", None)
-
-        self.assertIsNone(bundle)
-
-    def test_discover_test_bundle_returns_none_on_swift_failure(self) -> None:
-        import subprocess as sp
-
-        def fake_run(args, **kwargs):
-            raise sp.CalledProcessError(returncode=1, cmd=args)
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            bundle = ci_app_test_runner.discover_test_bundle("swift", None)
-
-        self.assertIsNone(bundle)
-
-    def test_discover_test_bundles_returns_map_by_test_target_name(self) -> None:
-        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            if "build" in args and "--show-bin-path" in args:
-                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
-            raise AssertionError(f"unexpected call: {args}")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
-                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
-                    fake_bin_dir / "RepoPromptTests.xctest",
-                    fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
-                ]):
-                    bundles = ci_app_test_runner.discover_test_bundles("swift", None)
-
-        self.assertEqual(
-            bundles,
+            runner.parse_suite_methods(output),
             {
-                "RepoPromptTests": fake_bin_dir / "RepoPromptTests.xctest",
-                "RepoPromptWorkspaceTests": fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
+                "RepoPromptTests.FirstTests": (
+                    "RepoPromptTests.FirstTests/testA",
+                    "RepoPromptTests.FirstTests/testZ",
+                ),
+                "RepoPromptTests.SecondTests": (
+                    "RepoPromptTests.SecondTests/testB",
+                ),
             },
         )
 
-    def test_bundle_for_suite_selects_matching_test_target(self) -> None:
-        bundles = {
-            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
-            "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
+    def test_invalid_shard_arguments_are_rejected(self) -> None:
+        invalid_arguments = ((0, 1), (2, 0), (2, 3))
+        for shard_count, shard_index in invalid_arguments:
+            with self.subTest(
+                shard_count=shard_count,
+                shard_index=shard_index,
+            ):
+                with self.assertRaises(ValueError):
+                    runner.validate_shard_args(shard_count, shard_index)
+
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            runner.assign_suites_to_shards({}, 0)
+
+    def test_lpt_sharding_is_deterministic_balanced_and_exhaustive(self) -> None:
+        counts = {
+            "RepoPromptTests.A": 8,
+            "RepoPromptTests.B": 7,
+            "RepoPromptTests.C": 4,
+            "RepoPromptTests.D": 3,
+            "RepoPromptTests.E": 2,
         }
 
-        self.assertEqual(
-            ci_app_test_runner.bundle_for_suite("RepoPromptWorkspaceTests.WorkspaceTests", bundles),
-            Path("/fake/RepoPromptWorkspaceTests.xctest"),
-        )
-        self.assertIsNone(ci_app_test_runner.bundle_for_suite("MissingTarget.Tests", bundles))
+        shards, loads = runner.assign_suites_to_shards(counts, 2)
 
-    def test_target_bundles_for_suites_ignores_stale_bundles_when_targets_covered(self) -> None:
-        bundles = {
-            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
-            "RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest"),
-            "StaleTests": Path("/fake/StaleTests.xctest"),
-        }
-
+        self.assertEqual(loads, (13, 11))
+        self.assertLessEqual(max(loads) - min(loads), 2)
+        self.assertEqual(set(shards[0] + shards[1]), set(counts))
         self.assertEqual(
-            ci_app_test_runner.target_bundles_for_suites(
-                bundles,
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-            ),
-            {"RepoPromptTests": Path("/fake/RepoPromptTests.xctest")},
+            runner.assign_suites_to_shards(dict(reversed(counts.items())), 2),
+            (shards, loads),
         )
 
-    def test_package_test_bundle_selects_unambiguous_combined_swiftpm_bundle(self) -> None:
-        bundle = Path("/fake/RepoPromptCEPackageTests.xctest")
-        self.assertEqual(
-            ci_app_test_runner.package_test_bundle({
-                "RepoPromptCEPackageTests": bundle,
-                "StaleTests": Path("/fake/StaleTests.xctest"),
-            }),
-            bundle,
-        )
-        self.assertIsNone(ci_app_test_runner.package_test_bundle({
-            "OnePackageTests": Path("/fake/OnePackageTests.xctest"),
-            "TwoPackageTests": Path("/fake/TwoPackageTests.xctest"),
-        }))
-
-    def test_create_suite_process_uses_xctest_when_bundle_provided(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        bundle = Path("/fake/Tests.xctest")
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_process(
-                "RepoPromptTests.S",
-                swift_binary="swift",
-                cwd=None,
-                test_bundle=bundle,
-                xctest_binary=["/usr/bin/xctest"],
+class TestBundleResolutionTests(unittest.TestCase):
+    def test_discover_test_bundles_parses_show_bin_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bin_path = Path(directory)
+            first = bin_path / "RepoPromptTests.xctest"
+            second = bin_path / "RepoPromptCodeMapCoreTests.xctest"
+            first.mkdir()
+            second.mkdir()
+            completed = subprocess.CompletedProcess(
+                args=["swift", "build", "--show-bin-path"],
+                returncode=0,
+                stdout=f"{bin_path}\n",
+                stderr="",
             )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                discovered = runner.discover_test_bundles("swift", None)
 
-        self.assertEqual(len(captured_args), 1)
-        self.assertEqual(captured_args[0], ["/usr/bin/xctest", "-XCTest", "RepoPromptTests.S", str(bundle)])
-
-    def test_create_suite_process_xctest_fallback_uses_xcrun_xctest_prefix(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        bundle = Path("/fake/Tests.xctest")
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_process(
-                "RepoPromptTests.S",
-                swift_binary="swift",
-                cwd=None,
-                test_bundle=bundle,
-                xctest_binary=["xcrun", "xctest"],
-            )
-
-        self.assertEqual(len(captured_args), 1)
         self.assertEqual(
-            captured_args[0],
-            ["xcrun", "xctest", "-XCTest", "RepoPromptTests.S", str(bundle)],
-        )
-
-    def test_xctest_binary_path_returns_resolved_path_as_single_element_list(self) -> None:
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        with mock.patch.object(
-            ci_app_test_runner.subprocess,
-            "run",
-            return_value=FakeCompletedProcess("/usr/bin/xctest\n"),
-        ):
-            result = ci_app_test_runner.xctest_binary_path()
-
-        self.assertEqual(result, ["/usr/bin/xctest"])
-
-    def test_xctest_binary_path_falls_back_to_xcrun_xctest_prefix(self) -> None:
-        import subprocess as sp
-
-        def fake_run(args, **kwargs):
-            raise sp.CalledProcessError(returncode=1, cmd=args)
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            result = ci_app_test_runner.xctest_binary_path()
-
-        self.assertEqual(result, ["xcrun", "xctest"])
-
-    def test_discover_test_bundle_fails_when_multiple_bundles_found(self) -> None:
-        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            if "build" in args and "--show-bin-path" in args:
-                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
-            raise AssertionError(f"unexpected call: {args}")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
-                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
-                    fake_bin_dir / "RepoPromptCEPackageTests.xctest",
-                    fake_bin_dir / "OtherTests.xctest",
-                ]):
-                    with self.assertRaises(ValueError):
-                        ci_app_test_runner.discover_test_bundle("swift", None)
-
-    def test_discover_test_bundle_selects_exact_requested_bundle_name(self) -> None:
-        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            if "build" in args and "--show-bin-path" in args:
-                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
-            raise AssertionError(f"unexpected call: {args}")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
-                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
-                    fake_bin_dir / "RepoPromptTests.xctest",
-                    fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
-                ]):
-                    bundle = ci_app_test_runner.discover_test_bundle(
-                        "swift",
-                        None,
-                        "RepoPromptWorkspaceTests",
-                    )
-
-        self.assertEqual(bundle, fake_bin_dir / "RepoPromptWorkspaceTests.xctest")
-
-    def test_discover_test_bundle_returns_none_when_requested_bundle_missing(self) -> None:
-        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = 0
-
-        def fake_run(args, **kwargs):
-            if "build" in args and "--show-bin-path" in args:
-                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
-            raise AssertionError(f"unexpected call: {args}")
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
-            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
-                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
-                    fake_bin_dir / "RepoPromptTests.xctest",
-                ]):
-                    bundle = ci_app_test_runner.discover_test_bundle(
-                        "swift",
-                        None,
-                        "RepoPromptWorkspaceTests.xctest",
-                    )
-
-        self.assertIsNone(bundle)
-
-    def test_run_all_suites_uses_bundle_matching_each_suite_target(self) -> None:
-        selected: list[tuple[str, Path | None]] = []
-
-        def fake_create_suite_process(suite, **kwargs):
-            selected.append((suite, kwargs["test_bundle"]))
-            return FakeProcess(returncode=0)
-
-        output = io.StringIO()
-        with mock.patch.object(
-            ci_app_test_runner,
-            "create_suite_process",
-            side_effect=fake_create_suite_process,
-        ):
-            exit_code = ci_app_test_runner.run_all_suites(
-                [
-                    "RepoPromptTests.ModelPickerStringOrderingTests",
-                    "RepoPromptWorkspaceTests.WorkspaceCodemapBindingEngineTests",
-                ],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                test_bundles={
-                    "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
-                    "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
-                },
-                xctest_binary=["/usr/bin/xctest"],
-            )
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            selected,
-            [
-                ("RepoPromptTests.ModelPickerStringOrderingTests", Path("/fake/RepoPromptTests.xctest")),
-                (
-                    "RepoPromptWorkspaceTests.WorkspaceCodemapBindingEngineTests",
-                    Path("/fake/RepoPromptWorkspaceTests.xctest"),
-                ),
-            ],
-        )
-        self.assertIn("Using xcrun xctest bundles by suite target", output.getvalue())
-
-    def test_run_all_suites_fails_when_bundle_map_lacks_suite_target(self) -> None:
-        output = io.StringIO()
-        exit_code = ci_app_test_runner.run_all_suites(
-            ["UnknownTarget.SomeTests"],
-            timeout_seconds=1.0,
-            silent_timeout_retries=0,
-            swift_binary="swift",
-            cwd=None,
-            output=output,
-            test_bundles={
-                "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+            discovered,
+            {
+                "RepoPromptCodeMapCoreTests": second,
+                "RepoPromptTests": first,
             },
-            xctest_binary=["/usr/bin/xctest"],
         )
 
-        self.assertEqual(exit_code, 1)
-        self.assertIn("No XCTest bundle found for suite target UnknownTarget", output.getvalue())
-
-    def test_workers_one_preserves_current_serial_execution_order(self) -> None:
-        calls: list[str] = []
-
-        def fake_run_suite(suite, **kwargs):
-            calls.append(suite)
-            return ci_app_test_runner.SuiteRunResult(
-                suite=suite,
-                state="passed",
-                exit_code=0,
-                elapsed_seconds=0.1,
-                output_seen=True,
-                first_failure_line=None,
-                last_started_test=None,
-                timed_out_after_seconds=None,
-                attempts=1,
-            )
-
-        output = io.StringIO()
-        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.B", "RepoPromptTests.A"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                workers=1,
-            )
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(calls, ["RepoPromptTests.A", "RepoPromptTests.B"])
-
-    def test_workers_never_schedule_pinned_suites_in_worker_pool(self) -> None:
-        pinned = ci_app_test_runner.PlannedSuite(
-            suite="RepoPromptTests.Pinned",
-            classification="pinned_serial",
-            serial_lanes=("app_window_state",),
-            matched_serial_tags=("WindowStatesManager",),
-            shared_state_tags=("WindowStatesManager",),
-            resource_cost_tags=(),
-            execution_tiers=("routine",),
-            estimated_runtime_seconds=1.0,
-            method_count=1,
-            heavy_tier_present=False,
-        )
-        eligible = ci_app_test_runner.PlannedSuite(
-            suite="RepoPromptTests.Free",
-            classification="parallel_eligible",
-            serial_lanes=(),
-            matched_serial_tags=(),
-            shared_state_tags=(),
-            resource_cost_tags=(),
-            execution_tiers=("routine",),
-            estimated_runtime_seconds=1.0,
-            method_count=1,
-            heavy_tier_present=False,
-        )
-        buffered_calls: list[str] = []
-        direct_calls: list[str] = []
-
-        def fake_buffered(group, **kwargs):
-            buffered_calls.append(group.label)
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state="passed",
-                    exit_code=0,
-                    elapsed_seconds=0.2,
-                    output_seen=True,
-                    first_failure_line=None,
-                    last_started_test=None,
-                    timed_out_after_seconds=None,
-                    attempts=1,
-                ),
-                f"{group.label} buffered\n",
-            )
-
-        def fake_direct(group, **kwargs):
-            direct_calls.append(group.label)
-            return ci_app_test_runner.SuiteRunResult(
-                suite=group.label,
-                state="passed",
-                exit_code=0,
-                elapsed_seconds=0.1,
-                output_seen=True,
-                first_failure_line=None,
-                last_started_test=None,
-                timed_out_after_seconds=None,
-                attempts=1,
-            )
-
-        with (
-            mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered),
-            mock.patch.object(
-                ci_app_test_runner,
-                "run_suite_group_and_report",
-                side_effect=fake_direct,
-            ),
-        ):
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan((eligible, pinned)),
-                workers=2,
-            )
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(direct_calls, ["RepoPromptTests.Pinned"])
-        self.assertEqual(buffered_calls, ["RepoPromptTests.Free"])
-
-    def test_parallel_fail_fast_stops_submitting_new_eligible_work(self) -> None:
-        suites = [
-            ci_app_test_runner.PlannedSuite(
-                suite=name,
-                classification="parallel_eligible",
-                serial_lanes=(),
-                matched_serial_tags=(),
-                shared_state_tags=(),
-                resource_cost_tags=(),
-                execution_tiers=("routine",),
-                estimated_runtime_seconds=1.0,
-                method_count=1,
-                heavy_tier_present=False,
-            )
-            for name in ["RepoPromptTests.AFail", "RepoPromptTests.BNotSubmitted", "RepoPromptTests.CAlsoNotSubmitted"]
-        ]
-        calls: list[str] = []
-
-        def fake_buffered(group, **kwargs):
-            calls.append(group.label)
-            state = "failed" if group.label == "RepoPromptTests.AFail" else "passed"
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state=state,
-                    exit_code=7 if state == "failed" else 0,
-                    elapsed_seconds=0.1,
-                    output_seen=True,
-                    first_failure_line=None,
-                    last_started_test=None,
-                    timed_out_after_seconds=None,
-                    attempts=1,
-                ),
-                f"{group.label} {state}\n",
-            )
-
-        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
-            exit_code = ci_app_test_runner.run_all_suites(
-                [suite.suite for suite in suites],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
-                workers=1 + 1,
-            )
-
-        self.assertEqual(exit_code, 7)
-        self.assertIn("RepoPromptTests.AFail", calls)
-        self.assertNotIn("RepoPromptTests.CAlsoNotSubmitted", calls)
-
-    def test_parallel_fail_fast_ignores_cancelled_peers_for_first_failure(self) -> None:
-        """Cancelled worker results must not steal first_failure / exit code.
-
-        When workers>1, peers observe the cancellation event and return
-        state=cancelled with exit 130. Those results can land in the same
-        futures batch as the real failure and sort first by group label.
-        Attribution must stay with the non-cancelled failure.
-        """
-        suites = [
-            ci_app_test_runner.PlannedSuite(
-                suite=name,
-                classification="parallel_eligible",
-                serial_lanes=(),
-                matched_serial_tags=(),
-                shared_state_tags=(),
-                resource_cost_tags=(),
-                execution_tiers=("routine",),
-                estimated_runtime_seconds=1.0,
-                method_count=1,
-                heavy_tier_present=False,
-            )
-            for name in ["RepoPromptTests.APeer", "RepoPromptTests.ZFail"]
-        ]
-
-        def fake_buffered(group, **kwargs):
-            if group.label == "RepoPromptTests.ZFail":
-                return (
-                    ci_app_test_runner.SuiteRunResult(
-                        suite=group.label,
-                        state="failed",
-                        exit_code=7,
-                        elapsed_seconds=0.1,
-                        output_seen=True,
-                        first_failure_line="XCTAssert failed: real failure",
-                        last_started_test=None,
-                        timed_out_after_seconds=None,
-                        attempts=1,
-                    ),
-                    f"{group.label} failed\n",
-                )
-            # Peer cancelled due to fail-fast; label sorts before ZFail.
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state="cancelled",
-                    exit_code=130,
-                    elapsed_seconds=0.05,
-                    output_seen=True,
-                    first_failure_line=None,
-                    last_started_test=None,
-                    timed_out_after_seconds=None,
-                    attempts=1,
-                ),
-                f"{group.label} cancelled\n",
-            )
-
-        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
-            exit_code = ci_app_test_runner.run_all_suites(
-                [suite.suite for suite in suites],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
-                workers=2,
-            )
-
-        self.assertEqual(exit_code, 7)
-
-    def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_process(
-                "RepoPromptTests.S",
-                swift_binary="swift",
-                cwd=None,
-            )
-
-        self.assertEqual(len(captured_args), 1)
-        self.assertEqual(captured_args[0], ["swift", "test", "--skip-build", "--filter", "RepoPromptTests.S"])
-
-    def test_main_routes_discovered_multiple_bundles_without_explicit_name(self) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_run_all_suites(suites, **kwargs):
-            captured["suites"] = list(suites)
-            captured["test_bundle"] = kwargs["test_bundle"]
-            captured["test_bundles"] = kwargs["test_bundles"]
-            captured["xctest_binary"] = kwargs["xctest_binary"]
-            return 0
-
-        bundles = {
-            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
-            "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
+    def test_unique_package_bundle_is_preferred(self) -> None:
+        package_bundle = Path("/tmp/RepoPromptPackageTests.xctest")
+        discovered = {
+            "RepoPromptPackageTests": package_bundle,
+            "RepoPromptTests": Path("/tmp/RepoPromptTests.xctest"),
         }
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
-            ),
-            mock.patch.object(ci_app_test_runner, "discover_test_bundles", return_value=bundles),
-            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
-            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
+        with mock.patch.object(
+            runner,
+            "discover_test_bundles",
+            return_value=discovered,
+        ), mock.patch.object(
+            runner,
+            "xctest_binary_path",
+            return_value=("/usr/bin/xctest",),
         ):
-            exit_code = ci_app_test_runner.main([])
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"])
-        self.assertIsNone(captured["test_bundle"])
-        self.assertEqual(captured["test_bundles"], bundles)
-        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
-
-    def test_main_prefers_combined_package_bundle_when_cache_contains_stale_bundle(self) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_run_all_suites(suites, **kwargs):
-            captured["suites"] = list(suites)
-            captured["test_bundle"] = kwargs["test_bundle"]
-            captured["test_bundles"] = kwargs["test_bundles"]
-            captured["xctest_binary"] = kwargs["xctest_binary"]
-            return 0
-
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
-            ),
-            mock.patch.object(
-                ci_app_test_runner,
-                "discover_test_bundles",
-                return_value={
-                    "RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest"),
-                    "RepoPromptTests": Path("/fake/stale/RepoPromptTests.xctest"),
-                    "RepoPromptWorkspaceTests": Path("/fake/stale/RepoPromptWorkspaceTests.xctest"),
-                    "StaleTests": Path("/fake/StaleTests.xctest"),
-                },
-            ),
-            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
-            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
-        ):
-            exit_code = ci_app_test_runner.main([])
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"])
-        self.assertEqual(
-            captured["test_bundle"], Path("/fake/RepoPromptCEPackageTests.xctest")
-        )
-        self.assertIsNone(captured["test_bundles"])
-        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
-
-    def test_main_uses_single_discovered_bundle_for_all_suite_targets(self) -> None:
-        # SwiftPM emits one combined ``<PackageName>PackageTests.xctest`` bundle
-        # whose name does not match any individual test target, so a single
-        # discovered bundle must be used for every suite regardless of name.
-        captured: dict[str, object] = {}
-
-        def fake_run_all_suites(suites, **kwargs):
-            captured["suites"] = list(suites)
-            captured["test_bundle"] = kwargs["test_bundle"]
-            captured["test_bundles"] = kwargs["test_bundles"]
-            captured["xctest_binary"] = kwargs["xctest_binary"]
-            return 0
-
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
-            ),
-            mock.patch.object(
-                ci_app_test_runner,
-                "discover_test_bundles",
-                return_value={"RepoPromptCEPackageTests": Path("/fake/RepoPromptCEPackageTests.xctest")},
-            ),
-            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
-            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
-        ):
-            exit_code = ci_app_test_runner.main([])
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"]
-        )
-        self.assertEqual(
-            captured["test_bundle"], Path("/fake/RepoPromptCEPackageTests.xctest")
-        )
-        self.assertIsNone(captured["test_bundles"])
-        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
-
-    def test_main_rejects_bundle_name_when_list_contains_other_targets(self) -> None:
-        output = io.StringIO()
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
-            ),
-            mock.patch("sys.stdout", output),
-        ):
-            exit_code = ci_app_test_runner.main(["--test-bundle-name", "RepoPromptTests"])
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("cannot run suites from other targets", output.getvalue())
-
-    def test_main_rejects_missing_explicit_bundle_name(self) -> None:
-        output = io.StringIO()
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptWorkspaceTests.A"],
-            ),
-            mock.patch.object(ci_app_test_runner, "discover_test_bundle", return_value=None),
-            mock.patch.object(ci_app_test_runner, "run_all_suites") as run_all_suites,
-            mock.patch("sys.stdout", output),
-        ):
-            exit_code = ci_app_test_runner.main(["--test-bundle-name", "RepoPromptWorkspaceTests"])
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("did not match any built XCTest bundle", output.getvalue())
-        run_all_suites.assert_not_called()
-
-    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
-        header = [
-            "method_id",
-            "target",
-            "file",
-            "suite",
-            "method",
-            "domain",
-            "primary_contract_id",
-            "secondary_contract_tags",
-            "validation_class",
-            "layer",
-            "execution_tier",
-            "scenario_count",
-            "fixture_ids",
-            "observable_oracle",
-            "failure_risk",
-            "runtime_seconds",
-            "resource_cost_tags",
-            "shared_state_tags",
-            "lifecycle_owner",
-            "current_disposition",
-            "replacement_method_id",
-            "preserved_scenario_delta",
-            "notes",
-        ]
-        path = directory / "ledger.tsv"
-        lines = ["\t".join(header)]
-        for row in rows:
-            complete = {key: "" for key in header}
-            complete.update(
-                {
-                    "method_id": f"root/{row['suite']}/{row['method']}",
-                    "target": "root",
-                    "file": "Tests/Fake.swift",
-                    "domain": "Root",
-                    "primary_contract_id": "contract",
-                    "validation_class": "unit",
-                    "layer": "root_swiftpm",
-                    "execution_tier": "fast",
-                    "scenario_count": "1",
-                    "observable_oracle": "oracle",
-                    "failure_risk": "low",
-                    "lifecycle_owner": "owner",
-                    "current_disposition": "retain",
-                    "preserved_scenario_delta": "0",
-                }
-            )
-            complete.update(row)
-            lines.append("\t".join(complete[key] for key in header))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
-
-    def test_plan_selected_suites_uses_runtime_balanced_shard_and_slow_first(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Slow", "method": "testOne", "runtime_seconds": "10.0"},
-                {"suite": "RepoPromptTests.Medium", "method": "testOne", "runtime_seconds": "6.0"},
-                {"suite": "RepoPromptTests.Fast", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            selected, plan = ci_app_test_runner.plan_selected_suites(
-                ["RepoPromptTests.Fast", "RepoPromptTests.Medium", "RepoPromptTests.Slow"],
-                ledger=ledger,
-                shard_count=2,
-                shard_index=2,
-                strict_ledger=True,
-                slow_first=True,
-                batch_max_seconds=5.0,
-                require_runtime_for_batching=True,
+            selection = runner.resolve_bundle_selection(
+                swift_binary="swift",
+                cwd=None,
+                suites=("RepoPromptTests.ParserTests",),
             )
 
-        self.assertIsNotNone(plan)
-        self.assertEqual(
-            [entry.suite for entry in selected],
-            ["RepoPromptTests.Medium", "RepoPromptTests.Fast"],
-        )
+        self.assertEqual(selection.package_bundle, package_bundle)
+        self.assertEqual(selection.target_bundles, {})
 
-    def test_strict_ledger_rejects_missing_discovered_suite(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            with self.assertRaisesRegex(ValueError, "missing discovered suites"):
-                ci_app_test_runner.plan_selected_suites(
-                    ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                    ledger=ledger,
-                    shard_count=1,
-                    shard_index=1,
-                    strict_ledger=True,
-                    slow_first=False,
-                    batch_max_seconds=5.0,
-                    require_runtime_for_batching=True,
+    def test_target_bundle_resolution_and_missing_target_diagnostic(self) -> None:
+        root_bundle = Path("/tmp/RepoPromptTests.xctest")
+        discovered = {
+            "RepoPromptTests": root_bundle,
+            "RepoPromptCodeMapCoreTests": Path(
+                "/tmp/RepoPromptCodeMapCoreTests.xctest"
+            ),
+        }
+        with mock.patch.object(
+            runner,
+            "discover_test_bundles",
+            return_value=discovered,
+        ), mock.patch.object(
+            runner,
+            "xctest_binary_path",
+            return_value=("/usr/bin/xctest",),
+        ):
+            selection = runner.resolve_bundle_selection(
+                swift_binary="swift",
+                cwd=None,
+                suites=("RepoPromptTests.ParserTests",),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                r"missing XCTest bundles for selected targets: \['MissingTests'\]",
+            ):
+                runner.resolve_bundle_selection(
+                    swift_binary="swift",
+                    cwd=None,
+                    suites=("MissingTests.ParserTests",),
                 )
 
-    def test_workers_greater_than_one_enables_strict_ledger(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            output = io.StringIO()
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                workers=2,
-                ledger=ledger,
-                strict_ledger=False,
-            )
-
-        self.assertEqual(exit_code, 1)
-        text = output.getvalue()
-        self.assertIn("enables --strict-ledger", text)
-        self.assertIn("missing discovered suites", text)
-
-    def test_non_strict_ledger_includes_missing_discovered_suite_with_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            selected, plan = ci_app_test_runner.plan_selected_suites(
-                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ledger=ledger,
-                shard_count=1,
-                shard_index=1,
-                strict_ledger=False,
-                slow_first=False,
-                batch_max_seconds=5.0,
-                require_runtime_for_batching=True,
-            )
-
-        self.assertIsNotNone(plan)
         self.assertEqual(
-            [entry.suite for entry in selected],
-            ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+            selection.target_bundles,
+            {"RepoPromptTests": root_bundle},
         )
-        missing = next(entry for entry in selected if entry.suite == "RepoPromptTests.Unknown")
-        self.assertEqual(missing.estimated_seconds, 1.0)
-        self.assertFalse(missing.batch_eligible)
 
-    def test_batch_suite_entries_groups_only_adjacent_eligible_same_bundle(self) -> None:
-        entries = [
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.B", 1.5, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.C", 1.0, False),
-            ci_app_test_runner.SuitePlanEntry("OtherTests.D", 1.0, True),
-        ]
-        groups = ci_app_test_runner.batch_suite_entries(
-            entries,
-            batch_fast_suites=True,
-            batch_max_suites=4,
-            batch_max_seconds=5.0,
-            bundle_selector=lambda suite: (
-                Path("/fake/RepoPromptTests.xctest")
-                if suite.startswith("RepoPrompt")
-                else Path("/fake/OtherTests.xctest")
+    def test_command_construction_uses_xctest_or_swift_fallback(self) -> None:
+        xctest_selection = runner.BundleSelection(
+            None,
+            {"RepoPromptTests": Path("/tmp/RepoPromptTests.xctest")},
+            ("/usr/bin/xctest",),
+        )
+        self.assertEqual(
+            runner.command_for_suite(
+                "RepoPromptTests.ParserContractTests",
+                swift_binary="swift",
+                bundle_selection=xctest_selection,
             ),
-        )
-
-        self.assertEqual(
-            [group.suites for group in groups],
-            [
-                ("RepoPromptTests.A", "RepoPromptTests.B"),
-                ("RepoPromptTests.C",),
-                ("OtherTests.D",),
-            ],
-        )
-
-    def test_create_suite_group_process_uses_single_comma_separated_xctest_filter_for_batch(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        bundle = Path("/fake/Tests.xctest")
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_group_process(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                swift_binary="swift",
-                cwd=None,
-                test_bundle=bundle,
-                xctest_binary=["/usr/bin/xctest"],
-            )
-
-        self.assertEqual(
-            captured_args[0],
-            [
+            (
                 "/usr/bin/xctest",
                 "-XCTest",
-                "RepoPromptTests.A,RepoPromptTests.B",
-                str(bundle),
-            ],
+                "RepoPromptTests.ParserContractTests",
+                "/tmp/RepoPromptTests.xctest",
+            ),
         )
 
-    def test_run_all_suites_batches_multiple_xctest_filters_through_one_process(self) -> None:
-        launched: list[tuple[tuple[str, ...], Path | None]] = []
-
-        def fake_create_suite_group_process(suites, **kwargs):
-            launched.append((tuple(suites), kwargs["test_bundle"]))
-            return FakeProcess([
-                "Test Case '-[RepoPromptTests.A testOne]' started.\n",
-                "Test Case '-[RepoPromptTests.B testOne]' started.\n",
-            ], returncode=0)
-
-        entries = [
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.B", 1.0, True),
-        ]
-        output = io.StringIO()
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "plan_selected_suites",
-                return_value=(entries, None),
-            ),
-            mock.patch.object(
-                ci_app_test_runner,
-                "create_suite_group_process",
-                side_effect=fake_create_suite_group_process,
-            ),
-        ):
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                test_bundle=Path("/fake/RepoPromptCEPackageTests.xctest"),
-                xctest_binary=["/usr/bin/xctest"],
-                batch_fast_suites=True,
-                batch_max_suites=4,
-                batch_max_seconds=5.0,
-            )
-
-        self.assertEqual(exit_code, 0)
         self.assertEqual(
-            launched,
-            [(("RepoPromptTests.A", "RepoPromptTests.B"), Path("/fake/RepoPromptCEPackageTests.xctest"))],
-        )
-        self.assertIn("::group::RepoPromptTests.A+RepoPromptTests.B", output.getvalue())
-        self.assertIn("RepoPromptTests.B testOne", output.getvalue())
-
-    def test_suite_filter_regex_matches_swiftpm_suite_method_identifiers(self) -> None:
-        pattern = ci_app_test_runner.suite_filter_regex(["RepoPromptTests.A", "RepoPromptTests.B"])
-
-        self.assertRegex("RepoPromptTests.A/testOne", pattern)
-        self.assertRegex("RepoPromptTests.B/testTwo", pattern)
-        self.assertRegex("RepoPromptTests.A", pattern)
-        self.assertNotRegex("RepoPromptTests.Ab/testOne", pattern)
-        self.assertNotRegex("OtherTests.A/testOne", pattern)
-
-    def test_create_suite_group_process_uses_suite_prefix_swift_filter_without_bundle(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_group_process(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                swift_binary="swift",
-                cwd=None,
-            )
-
-        self.assertEqual(
-            captured_args[0],
-            [
-                "swift",
+            runner.command_for_suite(
+                "RepoPromptTests.ParserContractTests",
+                swift_binary="custom-swift",
+                bundle_selection=runner.BundleSelection(None, {}, None),
+            ),
+            (
+                "custom-swift",
                 "test",
                 "--skip-build",
                 "--filter",
-                "^(?:RepoPromptTests\\.A|RepoPromptTests\\.B)(/|$)",
-            ],
+                "RepoPromptTests.ParserContractTests",
+            ),
         )
 
+
+class TestExecutionTests(unittest.TestCase):
+    def empty_bundle_selection(self) -> runner.BundleSelection:
+        return runner.BundleSelection(None, {}, None)
+
+    def test_suite_environment_preserves_inherited_values_and_replaces_state(self) -> None:
+        inherited = {
+            "PATH": "/usr/bin",
+            "CUSTOM_TOKEN": "preserved",
+            "HOME": "/old/home",
+            "CFFIXED_USER_HOME": "/old/fixed-home",
+            "TMPDIR": "/old/tmpdir",
+            "TMP": "/old/tmp",
+            "TEMP": "/old/temp",
+            "XDG_CONFIG_HOME": "/old/config",
+            "XDG_CACHE_HOME": "/old/cache",
+            "XDG_DATA_HOME": "/old/data",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = runner.isolated_suite_environment(
+                root,
+                "RepoPromptTests.FirstTests",
+                inherited,
+            )
+            second = runner.isolated_suite_environment(
+                root,
+                "RepoPromptTests.SecondTests",
+                inherited,
+            )
+
+            self.assertNotEqual(first["HOME"], second["HOME"])
+            self.assertEqual(first["HOME"], first["CFFIXED_USER_HOME"])
+            self.assertEqual(first["TMPDIR"], first["TMP"])
+            self.assertEqual(first["TMPDIR"], first["TEMP"])
+            self.assertEqual(first["PATH"], "/usr/bin")
+            self.assertEqual(first["CUSTOM_TOKEN"], "preserved")
+            sandbox = Path(first["REPOPROMPT_TEST_SANDBOX_ROOT"])
+            self.assertTrue((sandbox / runner.SANDBOX_MARKER_NAME).is_file())
+            self.assertEqual(Path(first["HOME"]), sandbox / "home")
+            self.assertEqual(Path(first["TMPDIR"]), sandbox / "tmp")
+            self.assertEqual(Path(first["TMP"]), sandbox / "tmp")
+            self.assertEqual(Path(first["TEMP"]), sandbox / "tmp")
+            for key in (
+                "HOME",
+                "TMPDIR",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+            ):
+                self.assertTrue(Path(first[key]).is_dir(), key)
+                self.assertNotEqual(first[key], inherited[key])
+
+    def test_runner_attempts_each_isolated_suite_once_and_preserves_first_failure(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        statuses = iter([9, 3, 0])
+
+        def executor(command, _cwd, _environment) -> int:
+            calls.append(tuple(command))
+            return next(statuses)
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            result = runner.run_selected_suites(
+                ("RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests"),
+                swift_binary="swift",
+                cwd=None,
+                bundle_selection=self.empty_bundle_selection(),
+                sandbox_root=Path(directory),
+                executor=executor,
+                output=output,
+            )
+
+        self.assertEqual(result, 9)
+        self.assertEqual([call[-1] for call in calls], [
+            "RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests",
+        ])
+        self.assertIn('2 of 3 suites failed', output.getvalue())
+        self.assertEqual(output.getvalue().count('::endgroup::'), 3)
 
 if __name__ == "__main__":
     unittest.main()

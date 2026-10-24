@@ -9,6 +9,8 @@ import Cocoa
 import Foundation
 import MachO
 import os.lock
+import RepoPromptC
+import RepoPromptProcess
 
 /// This class handles application security by monitoring the environment
 /// for potential tampering or unauthorized access.
@@ -187,7 +189,7 @@ class ApplicationSecurity {
     /// Prevent external attachment - uses ptrace to deny debugger attachment
     private func preventExternalAttachment() {
         #if !DEBUG
-            ptrace(PT_DENY_ATTACH, 0, nil, 0)
+            _ = repo_deny_debugger_attachment()
         #endif
     }
 

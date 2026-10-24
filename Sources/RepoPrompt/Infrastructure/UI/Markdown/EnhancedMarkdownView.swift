@@ -488,8 +488,10 @@ struct AttributedTextView: NSViewRepresentable {
                     wasFirstResponder: wasFirstResponder
                 )
             textView.textStorage?.setAttributedString(attributedString)
-            textView.setSelectedRange(previousSelection)
-            textView.clampSelectionToCurrentString(scrollToVisible: shouldScrollSelectionToVisible)
+            textView.restoreSelectionCandidate(
+                previousSelection,
+                scrollToVisible: shouldScrollSelectionToVisible
+            )
             // Bump content version so the next sizeThatFits performs a real measurement.
             textView.incrementContentVersion()
             textView.needsDisplay = true
@@ -499,6 +501,12 @@ struct AttributedTextView: NSViewRepresentable {
         textView.isEditable = isEditable
         textView.isSelectable = allowsTextSelection
         textView.delegate = context.coordinator
+        // Keep text-checking disabled on every update to guard re-renders.
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
         if textView.layoutManager?.allowsNonContiguousLayout != false {
             textView.layoutManager?.allowsNonContiguousLayout = false
         }
@@ -563,6 +571,14 @@ struct AttributedTextView: NSViewRepresentable {
         // width used by sizeThatFits and cause a layout oscillation loop.
         textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.lineFragmentPadding = 0
+        // Disable all text-checking features to prevent NSTextCheckingController
+        // from initialising synchronously on the main thread when large attributed
+        // strings are set, which would cause app hangs of 2+ seconds.
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
         textView.textStorage?.setAttributedString(attributedString)
         textView.layoutManager?.allowsNonContiguousLayout = false
     }

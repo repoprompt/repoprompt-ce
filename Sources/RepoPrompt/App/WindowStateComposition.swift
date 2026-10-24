@@ -1,4 +1,47 @@
+import Combine
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptPersistence
+import RepoPromptSettingsCore
+
+extension CodeMapArtifactRuntime {
+    static let processWideProvider: CodeMapArtifactRuntimeProvider = {
+        let identity = WorkspaceContextFilesystemIdentity.identity
+        return makeProcessWideProvider(
+            identity: identity,
+            applicationSupportRootURL: identity.applicationSupportRootURL(),
+            postSuccessfulInitialization: {
+                #if !DEBUG
+                    CodeMapV6CacheDeletionScheduler.schedule()
+                #endif
+            },
+            globalCodeMapsDisabled: {
+                await MainActor.run { GlobalSettingsStore.shared.globalCodeMapsDisabled() }
+            },
+            bindingEngineDidInitialize: { engine in
+                Task { @MainActor in
+                    CodeMapGlobalDisableObservation.processWide = CodeMapGlobalDisableObservation(engine: engine)
+                    await engine.refreshGlobalCodeMapsDisabled()
+                }
+            }
+        )
+    }()
+}
+
+/// Production composition retains settings observation; isolated runtimes have no user-settings dependency.
+@MainActor
+final class CodeMapGlobalDisableObservation {
+    static var processWide: CodeMapGlobalDisableObservation?
+    private var subscription: AnyCancellable?
+
+    init(engine: WorkspaceCodemapBindingEngine) {
+        subscription = GlobalSettingsStore.shared.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak engine] _ in
+                Task { await engine?.refreshGlobalCodeMapsDisabled() }
+            }
+    }
+}
 
 @MainActor
 struct WindowStateComposition {
@@ -10,6 +53,7 @@ struct WindowStateComposition {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -21,40 +65,77 @@ struct WindowStateComposition {
     let aiQueriesService: AIQueriesService
     let chatDataService: ChatDataService
     let workspaceManager: WorkspaceManagerViewModel
+    let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
 }
 
 @MainActor
 enum WindowStateCompositionFactory {
+    typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        settingsStore: GlobalSettingsStore = .shared,
+        domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
+        keyManager injectedKeyManager: KeyManager? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
+        sessionRuntimeWorkspace: WorkspaceModel? = nil,
+        borrowedAPISettingsViewModel: APISettingsViewModel? = nil
     ) -> WindowStateComposition {
+        WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
+        WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
+        #if DEBUG
+            WorkspacePreparationInstrumentation.install(AppWorkspacePreparationRecorderProvider())
+            WorkspaceRootLoadFieldHooks.install(AppWorkspaceRootLoadFieldProvider())
+            WorkspaceApplyEditsRebaseProbeHooks.install(AppWorkspaceApplyEditsRebaseProbeRecorder())
+        #endif
+        let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                enableCatalogShardShadowValidation: false
+                startupFeatureFlags: .current(),
+                enableCatalogShardShadowValidation: false,
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
             )
         #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore()
+            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
+                startupFeatureFlags: .current(),
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
         let workspaceSearchService = WorkspaceSearchService()
-        let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        let workspaceFilesViewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: workspaceFileContextStore,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+        )
+        if injectedWorkspaceFileContextStore == nil {
+            workspaceFilesViewModel.bindNonGitCodeMapsSetting(settingsStore)
+            workspaceFilesViewModel.bindGlobalCodeMapsSetting(settingsStore)
+        }
 
         // 2) AI queries
-        let keyManager = KeyManager()
+        let keyManager = injectedKeyManager ?? KeyManager()
         let aiQueriesService = aiQueriesServiceFactory?(keyManager)
             ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
-        let apiSettingsViewModel = APISettingsViewModel(
+        let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: loadStoredAPISettingsDataOnInit,
@@ -62,7 +143,7 @@ enum WindowStateCompositionFactory {
         )
 
         // 5) Settings Manager (per-window overlay)
-        let settingsManager = WindowSettingsManager(windowID: windowID)
+        let settingsManager = WindowSettingsManager(windowID: windowID, store: settingsStore)
 
         // 6) Prompt
         let promptManager = PromptViewModel(
@@ -70,16 +151,47 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            storedPromptPersistence: storedPromptPersistence,
+            // The borrowed API owner is already live. A second prompt's startup refresh reloads
+            // stored connection flags over it; it must not reset the canonical live connection.
+            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 7) Create the workspace manager
+        // 7) Create the workspace manager with construction-time runtime persistence ownership.
+        // A nonvisual runtime shares MCP routing, but never owns or projects the visible workspace
+        // document. Its one-carrier snapshot is read-only placement, not a second workspace writer.
+        let domainWorkspaceClient = sessionRuntimeWorkspace == nil ? domainRuntime.map {
+            DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID, metadataPathPolicy: $0.configuration.metadataPathPolicy)
+        } : nil
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
+            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
             workspaceSearchService: workspaceSearchService,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
+        let routerSettingsViewModel = RouterSettingsViewModel(
+            settingsStore: settingsStore,
+            runtime: modelRouterRuntime,
+            apiSettingsViewModel: apiSettingsViewModel,
+            workspaceManager: workspaceManager
+        )
+        let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
+            DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
+        }
+        if let bridge = domainWorkspacePresentationBridge {
+            // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.
+            workspaceManager.installDomainCatalogRefresh(
+                request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge] in await bridge?.refreshForAgentAdmission() ?? false }
+            )
+        }
+        domainWorkspacePresentationBridge?.start()
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
             store: workspaceFileContextStore
@@ -94,13 +206,15 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             promptViewModel: promptManager,
             workspaceManager: workspaceManager,
-            chatData: chatDataService
+            chatData: chatDataService,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
 
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
         let mcpServer = MCPServerViewModel(
             service: sharedMCPService,
+            perfRecorder: AppAgentModePerfRecorder(),
             promptVM: promptManager,
             oracleVM: oracleViewModel,
             workspaceManager: workspaceManager,
@@ -132,6 +246,10 @@ enum WindowStateCompositionFactory {
                     workspaceManager: workspaceManager
                 )
             },
+            domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
+            domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
+            domainReadRuntimeIdentity: domainRuntime?.identity,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
         let closeCoordinator = WindowCloseCoordinator()
@@ -142,21 +260,30 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
+            settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 13) Agent mode (for minimal agent UI)
-        let agentModeViewModel = AgentModeViewModel(
+        let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
             windowID: windowID,
             promptManager: promptManager,
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore
+            applyEditsApprovalStore: applyEditsApprovalStore,
+            modelRouterSettingsStore: settingsStore,
+            modelRouterRuntime: modelRouterRuntime,
+            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+            perfRecorder: AppAgentModePerfRecorder()
         )
-        workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak agentModeViewModel] sessionID in
-            agentModeViewModel?.worktreeBindings(forAgentSessionID: sessionID) ?? []
+        agentModeViewModel.repromptService = .live(keyManager: keyManager)
+        agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
+        workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
+            agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
@@ -204,6 +331,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 agentChatStressHarness: agentChatStressHarness,
@@ -212,7 +340,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #else
             return WindowStateComposition(
@@ -224,6 +353,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 mcpServer: mcpServer,
@@ -231,7 +361,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #endif
     }

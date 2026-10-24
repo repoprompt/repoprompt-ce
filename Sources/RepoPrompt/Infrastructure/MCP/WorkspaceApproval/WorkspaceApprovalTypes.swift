@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  WorkspaceApprovalTypes.swift
 //  RepoPrompt
@@ -250,5 +252,21 @@ extension WorkspaceApprovalClientPolicy: Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(clientID)
         hasher.combine(allowedOperations)
+    }
+}
+
+// MARK: - Presentation Scope
+
+/// Decides which windows may present a pending workspace approval.
+///
+/// A request that names a target window is presented only by that window, so an
+/// authorization prompt never appears over unrelated work. An untargeted request
+/// (`nil`) keeps the historical app-wide behaviour, which is also the fallback the
+/// manager uses when a target window is no longer live — a request must never
+/// become unanswerable.
+public enum WorkspaceApprovalPresentationPolicy {
+    public static func shouldPresent(targetWindowID: Int?, inWindowID: Int) -> Bool {
+        guard let targetWindowID else { return true }
+        return targetWindowID == inWindowID
     }
 }

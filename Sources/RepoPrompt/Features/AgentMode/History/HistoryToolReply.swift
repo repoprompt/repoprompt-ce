@@ -35,6 +35,7 @@ struct HistoryListSessionsReply: Codable, Equatable {
         let lastActivityAt: String
         let activeDurationSeconds: Int
         let turnCount: Int
+        let projectedItemCount: Int
         let toolCallCount: Int
         let filesTouched: [String]
         let filesTouchedCount: Int
@@ -51,6 +52,7 @@ struct HistoryListSessionsReply: Codable, Equatable {
             case lastActivityAt = "last_activity_at"
             case activeDurationSeconds = "active_duration_seconds"
             case turnCount = "turn_count"
+            case projectedItemCount = "projected_item_count"
             case toolCallCount = "tool_call_count"
             case filesTouched = "files_touched"
             case filesTouchedCount = "files_touched_count"
@@ -68,6 +70,7 @@ struct HistoryListSessionsReply: Codable, Equatable {
             lastActivityAt: String,
             activeDurationSeconds: Int,
             turnCount: Int,
+            projectedItemCount: Int,
             toolCallCount: Int,
             filesTouched: [String],
             filesTouchedCount: Int? = nil,
@@ -83,6 +86,7 @@ struct HistoryListSessionsReply: Codable, Equatable {
             self.lastActivityAt = lastActivityAt
             self.activeDurationSeconds = activeDurationSeconds
             self.turnCount = turnCount
+            self.projectedItemCount = projectedItemCount
             self.toolCallCount = toolCallCount
             self.filesTouched = filesTouched
             self.filesTouchedCount = filesTouchedCount ?? filesTouched.count
@@ -265,6 +269,52 @@ struct HistoryTimeReply: Codable, Equatable {
 // MARK: - get_session
 
 struct HistoryGetSessionReply: Codable, Equatable {
+    struct TokenUsageDTO: Codable, Equatable {
+        let runID: String?
+        let turnID: String?
+        let inputTokens: Int
+        let outputTokens: Int
+        let contextUsedTokens: Int?
+        let estimatedUserInputTokens: Int
+        let estimatedToolInputTokens: Int
+        let estimatedToolOutputTokens: Int
+        let timestamp: String
+
+        private enum CodingKeys: String, CodingKey {
+            case runID = "run_id"
+            case turnID = "turn_id"
+            case inputTokens = "input_tokens"
+            case outputTokens = "output_tokens"
+            case contextUsedTokens = "context_used_tokens"
+            case estimatedUserInputTokens = "estimated_user_input_tokens"
+            case estimatedToolInputTokens = "estimated_tool_input_tokens"
+            case estimatedToolOutputTokens = "estimated_tool_output_tokens"
+            case timestamp
+        }
+    }
+
+    struct TokenUsageSummaryDTO: Codable, Equatable {
+        let providerInputTokens: Int
+        let providerOutputTokens: Int
+        let estimatedToolInputTokens: Int
+        let estimatedToolOutputTokens: Int
+        let attributedRunCount: Int
+        let unattributedUsageCount: Int
+        let codexLastContextTokens: Int?
+        let codexTotalTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case providerInputTokens = "provider_input_tokens"
+            case providerOutputTokens = "provider_output_tokens"
+            case estimatedToolInputTokens = "estimated_tool_input_tokens"
+            case estimatedToolOutputTokens = "estimated_tool_output_tokens"
+            case attributedRunCount = "attributed_run_count"
+            case unattributedUsageCount = "unattributed_usage_count"
+            case codexLastContextTokens = "codex_last_context_tokens"
+            case codexTotalTokens = "codex_total_tokens"
+        }
+    }
+
     struct EntryDTO: Codable, Equatable {
         let role: String
         let timestamp: String?
@@ -284,6 +334,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
         let startedAt: String
         let requestText: String?
         let toolCallSummary: String?
+        let runIDs: [String]
+        let tokenUsage: [TokenUsageDTO]
         let entries: [EntryDTO]
         let truncated: Bool
         let entriesOmitted: Int?
@@ -293,6 +345,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
             case startedAt = "started_at"
             case requestText = "request_text"
             case toolCallSummary = "tool_call_summary"
+            case runIDs = "run_ids"
+            case tokenUsage = "token_usage"
             case entries
             case truncated
             case entriesOmitted = "entries_omitted"
@@ -303,6 +357,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
             startedAt: String,
             requestText: String?,
             toolCallSummary: String?,
+            runIDs: [String] = [],
+            tokenUsage: [TokenUsageDTO] = [],
             entries: [EntryDTO],
             truncated: Bool,
             entriesOmitted: Int? = nil
@@ -311,6 +367,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
             self.startedAt = startedAt
             self.requestText = requestText
             self.toolCallSummary = toolCallSummary
+            self.runIDs = runIDs
+            self.tokenUsage = tokenUsage
             self.entries = entries
             self.truncated = truncated
             self.entriesOmitted = entriesOmitted
@@ -326,6 +384,7 @@ struct HistoryGetSessionReply: Codable, Equatable {
     let truncated: Bool
     let scanTruncated: Bool?
     let scanDiagnostics: [HistoryScanDiagnostic]?
+    let tokenUsageSummary: TokenUsageSummaryDTO
     let turns: [TurnDTO]
 
     private enum CodingKeys: String, CodingKey {
@@ -338,6 +397,7 @@ struct HistoryGetSessionReply: Codable, Equatable {
         case truncated
         case scanTruncated = "scan_truncated"
         case scanDiagnostics = "scan_diagnostics"
+        case tokenUsageSummary = "token_usage_summary"
         case turns
     }
 }

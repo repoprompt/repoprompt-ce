@@ -152,7 +152,7 @@ package enum WorkspaceAliasResolver {
     }
 }
 
-package enum PathResolutionIssue: Equatable {
+package enum PathResolutionIssue: Error, Equatable {
     case emptyInput
     case invalidPathCharacters(input: String, reason: String)
     case ambiguousAlias(alias: String, matchingRoots: [WorkspaceRootRef])
@@ -161,6 +161,77 @@ package enum PathResolutionIssue: Equatable {
     case destinationOutsideSourceRoot(input: String, sourceRoot: WorkspaceRootRef)
     case unsupportedPseudoAbsoluteAlias(input: String)
     case unresolved(input: String)
+}
+
+package enum WorkspaceExactFileInput: Equatable, Sendable {
+    case absolute(String)
+    case explicitRoot(alias: String, relativePath: String)
+    case relative(String)
+
+    package static func parse(_ rawInput: String) throws -> WorkspaceExactFileInput {
+        guard !rawInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PathResolutionIssue.emptyInput
+        }
+        guard !StandardizedPath.containsNUL(rawInput) else {
+            throw PathResolutionIssue.invalidPathCharacters(input: rawInput, reason: "NUL bytes are not allowed")
+        }
+        if rawInput.hasPrefix("/") {
+            return .absolute(StandardizedPath.absolute(rawInput))
+        }
+
+        let explicitComponents = rawInput.components(separatedBy: "//")
+        guard explicitComponents.count <= 2 else {
+            throw PathResolutionIssue.invalidPathCharacters(
+                input: rawInput,
+                reason: "exactly one root qualifier boundary ('//') is allowed"
+            )
+        }
+        if explicitComponents.count == 2 {
+            let rawAlias = explicitComponents[0]
+            let rawRelativePath = explicitComponents[1]
+            guard !rawAlias.hasSuffix("/"), !rawRelativePath.hasPrefix("/") else {
+                throw PathResolutionIssue.invalidPathCharacters(
+                    input: rawInput,
+                    reason: "the root qualifier boundary must contain exactly two slashes"
+                )
+            }
+            let alias = try safeRelativeComponent(rawAlias, role: "root alias", rawInput: rawInput)
+            let relativePath = try safeRelativeComponent(rawRelativePath, role: "relative path", rawInput: rawInput)
+            return .explicitRoot(alias: alias, relativePath: relativePath)
+        }
+
+        if rawInput.hasPrefix("~/") {
+            return .absolute(StandardizedPath.absolute((rawInput as NSString).expandingTildeInPath))
+        }
+        return .relative(try safeRelativeComponent(rawInput, role: "relative path", rawInput: rawInput))
+    }
+
+    package var renderedPath: String {
+        switch self {
+        case let .absolute(path), let .relative(path):
+            return path
+        case let .explicitRoot(alias, relativePath):
+            return "\(alias)//\(relativePath)"
+        }
+    }
+
+    private static func safeRelativeComponent(
+        _ value: String,
+        role: String,
+        rawInput: String
+    ) throws -> String {
+        guard !value.isEmpty else {
+            throw PathResolutionIssue.invalidPathCharacters(input: rawInput, reason: "the \(role) is empty")
+        }
+        let standardized = StandardizedPath.relative(value)
+        guard !standardized.isEmpty else {
+            throw PathResolutionIssue.invalidPathCharacters(input: rawInput, reason: "the \(role) is empty")
+        }
+        guard standardized != "..", !standardized.hasPrefix("../") else {
+            throw PathResolutionIssue.invalidPathCharacters(input: rawInput, reason: "the \(role) escapes the workspace root")
+        }
+        return standardized
+    }
 }
 
 package enum PathResolutionIssueRenderer {
@@ -174,8 +245,14 @@ package enum PathResolutionIssueRenderer {
             let rendered = matchingRoots.map(\.renderedLabel).joined(separator: "; ")
             return "Ambiguous root alias '\(alias)'. It matches multiple loaded roots: \(rendered). Use an absolute path or rename roots so aliases are unique."
         case let .ambiguousRootMatch(input, candidateRoots):
-            let rendered = candidateRoots.map(\.renderedLabel).joined(separator: "; ")
-            return "Path '\(input)' matches multiple workspace roots: \(rendered). Use a root-prefixed or absolute path to disambiguate."
+            let aliases = ClientPathFormatter.exactRootAliases(visibleRoots: candidateRoots)
+            let rendered = candidateRoots.map { root in
+                guard let alias = aliases[root.id] else {
+                    preconditionFailure("Ambiguous root candidate must have an exact alias")
+                }
+                return "\(alias)//<relative-path> (\(root.renderedLabel))"
+            }.joined(separator: "; ")
+            return "Path '\(input)' matches multiple workspace roots: \(rendered). Use '<root-alias>//<relative-path>' or an absolute path to disambiguate."
         case let .pathOutsideWorkspace(input, visibleRoots):
             let rendered = visibleRoots.map(\.renderedLabel).joined(separator: "; ")
             return "The requested path '\(input)' is not inside any loaded folder. Loaded roots: \(rendered)."
@@ -223,6 +300,24 @@ package enum ClientPathFormatter {
             }
         }
         return root.name
+    }
+
+    package static func exactRootAliases(visibleRoots: [WorkspaceRootRef]) -> [UUID: String] {
+        Dictionary(uniqueKeysWithValues: visibleRoots.map { root in
+            let alias = "root@\(root.id.uuidString.lowercased())"
+            return (root.id, alias)
+        })
+    }
+
+    package static func explicitWorkspaceFilePath(
+        root: WorkspaceRootRef,
+        relativePath: String,
+        visibleRoots: [WorkspaceRootRef]
+    ) -> String {
+        guard let alias = exactRootAliases(visibleRoots: visibleRoots)[root.id] else {
+            preconditionFailure("Explicit workspace path root must be part of the visible namespace")
+        }
+        return "\(alias)//\(StandardizedPath.relative(relativePath))"
     }
 
     private static func pathComponents(for standardizedPath: String) -> [String] {

@@ -16,6 +16,15 @@ struct ContentViewToolbarContent: ToolbarContent {
             agentChatTitleItem
         }
 
+        #if DEBUG
+            if #available(macOS 26.0, *) {
+                debugBuildBadgeItem
+                    .sharedBackgroundVisibility(.hidden)
+            } else {
+                debugBuildBadgeItem
+            }
+        #endif
+
         // Recommendation wizard button
         ToolbarItem(placement: .automatic) {
             if let wizardVM = recommendationWizardViewModel {
@@ -36,6 +45,15 @@ struct ContentViewToolbarContent: ToolbarContent {
             UpdateAvailableToolbarPill(sparkleManager: SparkleUpdaterManager.shared)
         }
     }
+
+    #if DEBUG
+        @ToolbarContentBuilder
+        private var debugBuildBadgeItem: some ToolbarContent {
+            ToolbarItem(placement: .navigation) {
+                DebugBuildToolbarBadge()
+            }
+        }
+    #endif
 
     @ToolbarContentBuilder
     private var agentChatTitleItem: some ToolbarContent {

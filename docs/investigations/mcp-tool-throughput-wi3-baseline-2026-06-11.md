@@ -78,8 +78,8 @@ Always-readable external files use the same counters across their detached I/O p
 Passed on 2026-06-11:
 
 - `make dev-swift-build PRODUCT=RepoPrompt`
-- `make dev-test FILTER=GitCommandWorkCountDiagnosticsTests`
-- `make dev-test FILTER=WorkspaceFileContextStoreTests`
+- historical Git command work-count diagnostic run (the timing-sensitive XCTest was removed during cleanup)
+- historical workspace-context suite run (the timing-sensitive XCTest suite was removed during cleanup)
 - `make dev-test FILTER=MCPReadSearchLatencyDiagnosticsGuardTests`
 - `make dev-lint`
 

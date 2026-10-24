@@ -6,212 +6,152 @@ import XCTest
 #endif
 
 final class SentryTelemetryPrivacyTests: XCTestCase {
-    func testSerializedEventScrubsTypedStacktracesMechanismsDebugImagesAndDist() throws {
+    func testSerializedCrashEventScrubsTypedDataAndPreservesSymbolication() throws {
         #if REPOPROMPT_SENTRY_ENABLED
-            let event = makeTypedEvent(level: .error, mechanismType: "NSError")
-            let payload = try scrubAndSerialize(event)
-
-            assertSensitiveFixtureIsAbsent(payload.eventJSON, envelopeData: payload.envelopeData)
-            XCTAssertNil(payload.eventJSON["dist"])
-            XCTAssertTrue(payload.envelopeString.contains("DEBUG-ID-ALICE"))
-            XCTAssertTrue(payload.envelopeString.contains("0x0000000100000000"))
-            let eventStrings = stringValues(in: payload.eventJSON)
-            XCTAssertTrue(eventStrings.contains("/System/Library/Frameworks/AppKit.framework/AppKit"))
-            XCTAssertFalse(eventStrings.contains { $0.contains("private-plugin.bundle") })
-        #else
-            throw XCTSkip("Requires REPOPROMPT_ENABLE_SENTRY=1")
-        #endif
-    }
-
-    func testSerializedCrashShapedEventRemovesPathsAndPreservesSymbolication() throws {
-        #if REPOPROMPT_SENTRY_ENABLED
-            let event = makeTypedEvent(level: .fatal, mechanismType: "signal")
-            event.exceptions?.first?.mechanism?.handled = false
-            let payload = try scrubAndSerialize(event)
-
-            assertSensitiveFixtureIsAbsent(payload.eventJSON, envelopeData: payload.envelopeData)
-            XCTAssertNil(payload.eventJSON["dist"])
-            XCTAssertTrue(payload.envelopeString.contains("DEBUG-ID-ALICE"))
-            XCTAssertTrue(payload.envelopeString.contains("0x0000000100001234"))
-        #else
-            throw XCTSkip("Requires REPOPROMPT_ENABLE_SENTRY=1")
-        #endif
-    }
-
-    func testSerializedHangShapedEventRemovesPathsAndPreservesSymbolication() throws {
-        #if REPOPROMPT_SENTRY_ENABLED
-            let event = makeTypedEvent(level: .error, mechanismType: "AppHang")
-            event.exceptions?.first?.type = "AppHangNonFullyBlocking"
-            event.exceptions?.first?.value = "App hanging while reading /Users/alice/customer-project"
-            event.exceptions?.first?.stacktrace?.snapshot = true
-            let payload = try scrubAndSerialize(event)
-
-            assertSensitiveFixtureIsAbsent(payload.eventJSON, envelopeData: payload.envelopeData)
-            XCTAssertNil(payload.eventJSON["dist"])
-            XCTAssertTrue(payload.envelopeString.contains("DEBUG-ID-ALICE"))
-            XCTAssertTrue(payload.envelopeString.contains("AppHang"))
-        #else
-            throw XCTSkip("Requires REPOPROMPT_ENABLE_SENTRY=1")
-        #endif
-    }
-}
-
-#if REPOPROMPT_SENTRY_ENABLED
-    private extension SentryTelemetryPrivacyTests {
-        struct SerializedPayload {
-            let eventJSON: [String: Any]
-            let envelopeData: Data
-            let envelopeString: String
-        }
-
-        func makeTypedEvent(level: SentryLevel, mechanismType: String) -> Event {
-            let sensitiveFrame = Frame()
-            sensitiveFrame.fileName = "/Users/alice/customer-project/PrivateSource.swift"
-            sensitiveFrame.package = "/Users/alice/Library/Application Support/private-plugin.bundle"
-            sensitiveFrame.function = "load token=fixture-secret"
-            sensitiveFrame.module = "customer module /Users/alice/customer-project"
-            sensitiveFrame.instructionAddress = "0x0000000100001234"
-            sensitiveFrame.imageAddress = "0x0000000100000000"
-            sensitiveFrame.contextLine = "let token = fixture-secret // /Users/alice/customer-project"
-            sensitiveFrame.preContext = ["authorization: Bearer fixture-secret"]
-            sensitiveFrame.postContext = ["connect 192.168.1.42"]
-            sensitiveFrame.vars = [
-                "workspace": "/Users/alice/customer-project",
-                "authorization": "Bearer fixture-secret"
-            ]
-
+            let frame = Frame()
+            frame.fileName = "/Users/privacy-user-sentinel/project/Private.swift"
+            frame.package = "/Users/privacy-user-sentinel/private-plugin.bundle"
+            frame.function = "load token=payload-secret-sentinel"
+            frame.instructionAddress = "0x0000000100001234"
+            frame.imageAddress = "0x0000000100000000"
+            frame.contextLine = "authorization: Bearer payload-secret-sentinel"
+            frame.vars = ["password": "payload-secret-sentinel", "safe_code": 42]
             let systemFrame = Frame()
             systemFrame.package = "/System/Library/Frameworks/AppKit.framework/AppKit"
-            systemFrame.function = "NSApplicationMain"
-            systemFrame.instructionAddress = "0x0000000180001234"
-            systemFrame.imageAddress = "0x0000000180000000"
-
-            let stacktrace = SentryStacktrace(
-                frames: [sensitiveFrame, systemFrame],
-                registers: [
-                    "pc": "0x0000000100001234",
-                    "note": "/Users/alice/customer-project token=fixture-secret"
-                ]
-            )
-
+            let stacktrace = SentryStacktrace(frames: [frame, systemFrame], registers: ["pc": "0x0000000100001234"])
             let thread = SentryThread(threadId: NSNumber(value: 1))
-            thread.name = "worker /Users/alice/customer-project"
-            thread.current = true
-            thread.crashed = level == .fatal ? true : nil
+            thread.name = "worker /Users/privacy-user-sentinel/project"
+            thread.crashed = true
             thread.stacktrace = stacktrace
-
-            let exception = Exception(
-                value: "failure at /Users/alice/customer-project",
-                type: "PrivateError token=fixture-secret"
-            )
-            exception.module = "/Users/alice/customer-project/PrivateModule"
+            let exception = Exception(value: "failure token=payload-secret-sentinel at 192.0.2.42", type: "CrashFixture")
             exception.stacktrace = stacktrace
-
-            let mechanism = Mechanism(type: mechanismType)
-            mechanism.desc = "authorization: Bearer fixture-secret at /Users/alice/customer-project"
-            mechanism.helpLink = "file:///Users/alice/customer-project/private-help.html"
-            mechanism.data = [
-                "workspace": "/Users/alice/customer-project",
-                "password": "fixture-secret",
-                "safe_code": 42
-            ]
-            let mechanismContext = MechanismContext()
-            mechanismContext.signal = [
-                "name": "SIGABRT",
-                "detail": "/Users/alice/customer-project"
-            ]
-            mechanismContext.machException = [
-                "name": "EXC_CRASH",
-                "detail": "token=fixture-secret"
-            ]
-            mechanism.meta = mechanismContext
+            let mechanism = Mechanism(type: "signal")
+            mechanism.handled = false
+            mechanism.desc = "failure /Users/privacy-user-sentinel/project"
+            mechanism.helpLink = "file:///Users/privacy-user-sentinel/private-help.html"
+            mechanism.data = ["token": "payload-secret-sentinel", "safe_code": 42]
+            let meta = MechanismContext()
+            meta.signal = ["name": "SIGABRT", "detail": "token=payload-secret-sentinel"]
+            mechanism.meta = meta
             exception.mechanism = mechanism
-
-            let debugMeta = DebugMeta()
-            debugMeta.debugID = "DEBUG-ID-ALICE"
-            debugMeta.type = "macho"
-            debugMeta.imageAddress = "0x0000000100000000"
-            debugMeta.imageVmAddress = "0x0000000100000000"
-            debugMeta.imageSize = NSNumber(value: 4096)
-            debugMeta.codeFile = "/Users/alice/Library/Application Support/private-plugin.bundle"
-
-            let event = Event(level: level)
-            event.dist = "restored-build-number"
+            let image = DebugMeta()
+            image.type = "macho"
+            image.debugID = "01234567-89AB-CDEF-0123-456789ABCDEF"
+            image.imageAddress = "0x0000000100000000"
+            image.imageSize = NSNumber(value: 4096)
+            image.codeFile = "/Users/privacy-user-sentinel/private-plugin.bundle"
+            let event = Event(level: .fatal)
+            event.timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+            event.dist = "distribution-sentinel"
             event.stacktrace = stacktrace
             event.threads = [thread]
             event.exceptions = [exception]
-            event.debugMeta = [debugMeta]
-            event.extra = [
-                "workspace": "/Users/alice/customer-project",
-                "token": "fixture-secret"
-            ]
-            return event
-        }
+            event.debugMeta = [image]
 
-        func scrubAndSerialize(_ event: Event) throws -> SerializedPayload {
-            let scrubbed = try XCTUnwrap(SentryTelemetryBootstrap.scrubEventForTesting(event))
-            let eventJSON = scrubbed.serialize()
-            _ = try JSONSerialization.data(withJSONObject: eventJSON)
-
-            let item = SentryEnvelopeItem(event: scrubbed)
-            let envelope = SentryEnvelope(id: scrubbed.eventId, items: [item])
-            let envelopeData = try XCTUnwrap(SentrySerializationSwift.data(with: envelope))
-            let envelopeString = try XCTUnwrap(String(data: envelopeData, encoding: .utf8))
-            return SerializedPayload(
-                eventJSON: eventJSON,
-                envelopeData: envelopeData,
-                envelopeString: envelopeString
-            )
-        }
-
-        func assertSensitiveFixtureIsAbsent(
-            _ eventJSON: [String: Any],
-            envelopeData: Data,
-            file: StaticString = #filePath,
-            line: UInt = #line
-        ) {
-            let serialized = String(decoding: envelopeData, as: UTF8.self)
-            let eventStrings = stringValues(in: eventJSON)
-            XCTAssertFalse(
-                eventStrings.contains { $0.contains("/Users/alice") },
-                file: file,
-                line: line
-            )
-            for forbiddenPath in ["/Users/alice", #"\/Users\/alice"#] {
-                XCTAssertFalse(serialized.contains(forbiddenPath), forbiddenPath, file: file, line: line)
-            }
-            for forbidden in [
-                "fixture-secret",
-                "192.168.1.42",
-                "restored-build-number"
-            ] {
-                XCTAssertFalse(serialized.contains(forbidden), forbidden, file: file, line: line)
-            }
-            XCTAssertFalse(containsKey("dist", in: eventJSON), file: file, line: line)
-        }
-
-        func stringValues(in value: Any) -> [String] {
-            if let string = value as? String {
-                return [string]
-            }
-            if let dictionary = value as? [String: Any] {
-                return dictionary.values.flatMap { stringValues(in: $0) }
-            }
-            if let array = value as? [Any] {
-                return array.flatMap { stringValues(in: $0) }
-            }
-            return []
-        }
-
-        func containsKey(_ key: String, in value: Any) -> Bool {
-            if let dictionary = value as? [String: Any] {
-                return dictionary.keys.contains(key) ||
-                    dictionary.values.contains { containsKey(key, in: $0) }
-            }
-            if let array = value as? [Any] {
-                return array.contains { containsKey(key, in: $0) }
-            }
-            return false
-        }
+            let payload = try scrubAndSerialize(event, forbidden: [
+                "privacy-user-sentinel", "private-plugin.bundle", "payload-secret-sentinel", "192.0.2.42", "distribution-sentinel"
+            ])
+            XCTAssertNil(payload["dist"])
+            let serializedStack = try XCTUnwrap(payload["stacktrace"] as? [String: Any])
+            let frames = try XCTUnwrap(serializedStack["frames"] as? [[String: Any]])
+            XCTAssertEqual(frames.count, 2)
+            let firstFrame = try XCTUnwrap(frames.first)
+            XCTAssertNil(firstFrame["filename"])
+            XCTAssertNil(firstFrame["package"])
+            XCTAssertEqual(firstFrame["instruction_addr"] as? String, "0x0000000100001234")
+            XCTAssertEqual(firstFrame["image_addr"] as? String, "0x0000000100000000")
+            XCTAssertEqual(frames.last?["package"] as? String, "/System/Library/Frameworks/AppKit.framework/AppKit")
+            let threads = try XCTUnwrap(payload["threads"] as? [String: Any])
+            let threadValues = try XCTUnwrap(threads["values"] as? [[String: Any]])
+            XCTAssertEqual(threadValues.first?["crashed"] as? Bool, true)
+            let exceptions = try XCTUnwrap(payload["exception"] as? [String: Any])
+            let exceptionValues = try XCTUnwrap(exceptions["values"] as? [[String: Any]])
+            XCTAssertEqual(exceptionValues.first?["type"] as? String, "CrashFixture")
+            let serializedMechanism = try XCTUnwrap(exceptionValues.first?["mechanism"] as? [String: Any])
+            XCTAssertEqual(serializedMechanism["handled"] as? Bool, false)
+            XCTAssertEqual(serializedMechanism["data"] as? [String: Int], ["safe_code": 42])
+            let debugMeta = try XCTUnwrap(payload["debug_meta"] as? [String: Any])
+            let images = try XCTUnwrap(debugMeta["images"] as? [[String: Any]])
+            let firstImage = try XCTUnwrap(images.first)
+            XCTAssertNil(firstImage["code_file"])
+            XCTAssertEqual(firstImage["debug_id"] as? String, "01234567-89AB-CDEF-0123-456789ABCDEF")
+            XCTAssertEqual(firstImage["image_addr"] as? String, "0x0000000100000000")
+            XCTAssertEqual(firstImage["image_size"] as? Int, 4096)
+        #else
+            try skipWithoutSentry()
+        #endif
     }
-#endif
+
+    func testSerializedEventRemovesIdentifiersAndNestedPayloadsWithoutDroppingSafeDiagnostics() throws {
+        #if REPOPROMPT_SENTRY_ENABLED
+            let event = Event(level: .error)
+            event.timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+            event.user = User(userId: "user-identity-sentinel")
+            let request = SentryRequest()
+            request.url = "https://example.invalid/request-sentinel"
+            event.request = request
+            event.serverName = "server-identity-sentinel"
+            event.message = SentryMessage(formatted: "token=payload-secret-sentinel at /Users/privacy-user-sentinel/project")
+            event.message?.params = ["authorization: Bearer payload-secret-sentinel"]
+            event.tags = ["authorization": "payload-secret-sentinel", "safe_tag": "startup"]
+            event.context = [
+                "device": ["name": "device-identity-sentinel", "arch": "arm64"],
+                "geo": ["city": "geo-identity-sentinel"],
+                "runtime": ["name": "macOS"]
+            ]
+            event.extra = ["nested": [["headers": ["Authorization": "payload-secret-sentinel"], "safe_code": 42]]]
+            let breadcrumb = Breadcrumb(level: .info, category: "app.lifecycle")
+            breadcrumb.message = "connect 192.0.2.42 token=payload-secret-sentinel"
+            breadcrumb.data = ["body": "body-sentinel", "action": "app_initialized"]
+            event.breadcrumbs = [breadcrumb]
+
+            let payload = try scrubAndSerialize(event, forbidden: [
+                "user-identity-sentinel", "request-sentinel", "server-identity-sentinel", "payload-secret-sentinel",
+                "privacy-user-sentinel", "device-identity-sentinel", "geo-identity-sentinel", "body-sentinel", "192.0.2.42"
+            ])
+            for key in ["user", "request", "server_name"] {
+                XCTAssertNil(payload[key], key)
+            }
+            XCTAssertEqual(payload["tags"] as? [String: String], ["safe_tag": "startup"])
+            let contexts = try XCTUnwrap(payload["contexts"] as? [String: Any])
+            XCTAssertNil(contexts["geo"])
+            XCTAssertEqual(contexts["device"] as? [String: String], ["arch": "arm64"])
+            XCTAssertEqual(contexts["runtime"] as? [String: String], ["name": "macOS"])
+            let extra = try XCTUnwrap(payload["extra"] as? [String: Any])
+            let nested = try XCTUnwrap(extra["nested"] as? [[String: Int]])
+            XCTAssertEqual(nested, [["safe_code": 42]])
+            let breadcrumbs = try XCTUnwrap(payload["breadcrumbs"] as? [[String: Any]])
+            XCTAssertEqual(breadcrumbs.first?["data"] as? [String: String], ["action": "app_initialized"])
+        #else
+            try skipWithoutSentry()
+        #endif
+    }
+
+    #if REPOPROMPT_SENTRY_ENABLED
+        /// Inspect SDK envelope-item bytes, not merely the scrubber's in-memory properties.
+        private func scrubAndSerialize(_ event: Event, forbidden: [String]) throws -> [String: Any] {
+            let rawData = try XCTUnwrap(SentryEnvelopeItem(event: event).data)
+            let raw = String(decoding: rawData, as: UTF8.self)
+            for sentinel in forbidden {
+                // Countercheck: bypassing the scrub boundary must expose every fixture sentinel.
+                XCTAssertTrue(raw.contains(sentinel), "Fixture did not serialize \(sentinel)")
+            }
+            let scrubbed = try XCTUnwrap(SentryTelemetryBootstrap.scrubEventForTesting(event))
+            let data = try XCTUnwrap(SentryEnvelopeItem(event: scrubbed).data)
+            let serialized = String(decoding: data, as: UTF8.self)
+            for sentinel in forbidden {
+                XCTAssertFalse(serialized.contains(sentinel), "Serialized event leaked \(sentinel)")
+            }
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+    #else
+        private func skipWithoutSentry() throws {
+            // A requested Sentry lane must fail rather than silently pass with only skips.
+            if ProcessInfo.processInfo.environment["REPOPROMPT_ENABLE_SENTRY"] == "1" {
+                XCTFail("Sentry-enabled validation did not compile REPOPROMPT_SENTRY_ENABLED")
+                return
+            }
+            throw XCTSkip("Requires REPOPROMPT_ENABLE_SENTRY=1")
+        }
+    #endif
+}

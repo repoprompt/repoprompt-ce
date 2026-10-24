@@ -98,6 +98,7 @@ actor MCPRoutingWaiter {
     }
 
     private struct WaitState {
+        let generation = UUID()
         var continuations: [WaitingContinuation] = []
         var connectionObservationContinuations: [ConnectionObservationContinuation] = []
         var expiryTask: Task<Void, Never>?
@@ -114,6 +115,15 @@ actor MCPRoutingWaiter {
             waitersByRunID[runID] = WaitState()
             log.debug("register: runID=\(runID.uuidString)")
         }
+    }
+
+    /// Ownership token for signals that may outlive cleanup and re-registration of a run.
+    func generation(runID: UUID) -> UUID? {
+        waitersByRunID[runID]?.generation
+    }
+
+    func currentTerminalOutcome(runID: UUID) -> MCPRoutingWaitOutcome? {
+        waitersByRunID[runID]?.terminalOutcome
     }
 
     /// Legacy compatibility API. Observation deliberately does not extend this absolute deadline.
@@ -288,8 +298,9 @@ actor MCPRoutingWaiter {
     /// Records only the first exact run-owned policy match. Duplicate/replacement connections
     /// never restart grace, including after a recoverable route rollback.
     @discardableResult
-    func notifyConnectionObserved(runID: UUID) async -> Bool {
+    func notifyConnectionObserved(runID: UUID, generation: UUID? = nil) async -> Bool {
         guard var state = waitersByRunID[runID],
+              generation == nil || generation == state.generation,
               state.terminalOutcome == nil,
               state.firstConnectionObservation == nil
         else { return false }
@@ -326,8 +337,10 @@ actor MCPRoutingWaiter {
         waitersByRunID[runID]?.firstConnectionObservation != nil
     }
 
-    func notifyRouted(runID: UUID) async {
-        guard await resolve(runID: runID, outcome: .routed) else { return }
+    /// Nil retains legacy unqualified signaling. Asynchronous policy applications must
+    /// capture a generation and skip publication entirely when no waiter was registered.
+    func notifyRouted(runID: UUID, generation: UUID? = nil) async {
+        guard await resolve(runID: runID, outcome: .routed, generation: generation) else { return }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: runID,
@@ -337,8 +350,8 @@ actor MCPRoutingWaiter {
         #endif
     }
 
-    func notifyFailed(runID: UUID) async {
-        guard await resolve(runID: runID, outcome: .failed(.signalled)) else { return }
+    func notifyFailed(runID: UUID, generation: UUID? = nil) async {
+        guard await resolve(runID: runID, outcome: .failed(.signalled), generation: generation) else { return }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: runID,
@@ -351,8 +364,10 @@ actor MCPRoutingWaiter {
     // MARK: - Internal
 
     @discardableResult
-    private func resolve(runID: UUID, outcome: MCPRoutingWaitOutcome) async -> Bool {
-        guard var state = waitersByRunID[runID], state.terminalOutcome == nil else { return false }
+    private func resolve(runID: UUID, outcome: MCPRoutingWaitOutcome, generation: UUID? = nil) async -> Bool {
+        guard var state = waitersByRunID[runID],
+              generation == nil || generation == state.generation,
+              state.terminalOutcome == nil else { return false }
         state.terminalOutcome = outcome
         state.expiryTask = scheduleExpiry(runID: runID)
 
@@ -491,6 +506,10 @@ extension MCPRoutingWaiter {
         await shared.register(runID: runID)
     }
 
+    static func currentTerminalOutcome(runID: UUID) async -> MCPRoutingWaitOutcome? {
+        await shared.currentTerminalOutcome(runID: runID)
+    }
+
     static func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
         await shared.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
     }
@@ -524,20 +543,24 @@ extension MCPRoutingWaiter {
     }
 
     @discardableResult
-    static func notifyConnectionObserved(runID: UUID) async -> Bool {
-        await shared.notifyConnectionObserved(runID: runID)
+    static func notifyConnectionObserved(runID: UUID, generation: UUID? = nil) async -> Bool {
+        await shared.notifyConnectionObserved(runID: runID, generation: generation)
+    }
+
+    static func generation(runID: UUID) async -> UUID? {
+        await shared.generation(runID: runID)
     }
 
     static func connectionWasObserved(runID: UUID) async -> Bool {
         await shared.connectionWasObserved(runID: runID)
     }
 
-    static func notifyRouted(runID: UUID) async {
-        await shared.notifyRouted(runID: runID)
+    static func notifyRouted(runID: UUID, generation: UUID? = nil) async {
+        await shared.notifyRouted(runID: runID, generation: generation)
     }
 
-    static func notifyFailed(runID: UUID) async {
-        await shared.notifyFailed(runID: runID)
+    static func notifyFailed(runID: UUID, generation: UUID? = nil) async {
+        await shared.notifyFailed(runID: runID, generation: generation)
     }
 
     static func cleanup(runID: UUID) async {
@@ -560,9 +583,9 @@ extension MCPRoutingWaiter {
         }
     }
 
-    nonisolated static func signalFailed(_ runID: UUID) {
+    nonisolated static func signalFailed(_ runID: UUID, generation: UUID? = nil) {
         Task.detached(priority: .utility) {
-            await shared.notifyFailed(runID: runID)
+            await shared.notifyFailed(runID: runID, generation: generation)
         }
     }
 }

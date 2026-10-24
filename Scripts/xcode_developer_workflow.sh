@@ -72,7 +72,7 @@ case "$ACTION" in
         else
             ./conductor build
         fi
-        [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/RepoPrompt ]] || fail "packaged RepoPrompt executable is missing"
+        [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/RepoPromptDebug ]] || fail "packaged RepoPrompt debug executable is missing"
         [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/repoprompt-mcp ]] || fail "embedded repoprompt-mcp is missing"
         ;;
     mcp)

@@ -6,8 +6,21 @@ final class AgentCodexModelRegistry {
     private let lock = NSLock()
     private var liveModels: [CodexAppServerClient.RemoteModel] = []
     private var liveModelSignature: [CodexDynamicModelRecord] = []
+    private enum DynamicOptionsInput: Equatable {
+        case remote([CodexAppServerClient.RemoteModel])
+        case stored([CodexDynamicModelRecord])
+    }
 
-    private init() {}
+    private struct DynamicOptionsCacheEntry {
+        let input: DynamicOptionsInput
+        let options: [AgentModelOption]
+    }
+
+    /// Preferred, live, and persisted model lists can differ. Keep a few exact
+    /// input snapshots rather than treating the most recent sort as universal.
+    private var cachedDynamicOptions: [DynamicOptionsCacheEntry] = []
+
+    init() {}
 
     @discardableResult
     func updateLiveModels(_ models: [CodexAppServerClient.RemoteModel]) -> Bool {
@@ -23,6 +36,7 @@ final class AgentCodexModelRegistry {
         lock.unlock()
 
         guard didChange else { return false }
+        AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
         CodexDynamicModelStore.save(normalized)
         return true
     }
@@ -44,10 +58,10 @@ final class AgentCodexModelRegistry {
                     staticOptions: staticOptions
                 )
             }
-            let cachedOptions = CodexDynamicModelStore.modelOptions()
-            if !cachedOptions.isEmpty {
+            let cachedRecords = CodexDynamicModelStore.load()
+            if !cachedRecords.isEmpty {
                 return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: cachedOptions),
+                    dynamicOptions: codexDynamicOptions(from: cachedRecords),
                     staticOptions: staticOptions
                 )
             }
@@ -62,10 +76,10 @@ final class AgentCodexModelRegistry {
             )
         }
 
-        let cachedOptions = CodexDynamicModelStore.modelOptions()
-        if !cachedOptions.isEmpty {
+        let cachedRecords = CodexDynamicModelStore.load()
+        if !cachedRecords.isEmpty {
             return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: cachedOptions),
+                dynamicOptions: codexDynamicOptions(from: cachedRecords),
                 staticOptions: staticOptions
             )
         }
@@ -110,7 +124,15 @@ final class AgentCodexModelRegistry {
                 isPlaceholderDefault: false,
                 isProviderDefault: false,
                 supportedReasoningEfforts: specifier.reasoningEffort == nil ? option.supportedReasoningEfforts : [],
-                defaultReasoningEffort: specifier.reasoningEffort == nil ? option.defaultReasoningEffort : nil
+                supportedReasoningEffortRawValues: specifier.reasoningEffort == nil ? option.supportedReasoningEffortRawValues : [],
+                defaultReasoningEffort: specifier.reasoningEffort == nil ? option.defaultReasoningEffort : nil,
+                defaultReasoningEffortRawValue: specifier.reasoningEffort == nil ? option.defaultReasoningEffortRawValue : nil,
+                effortVariant: specifier.reasoningEffort.flatMap { effort in
+                    CodexServiceTierVariantCatalog.fastVariantID(
+                        baseModelID: baseModel,
+                        reasoningEffort: nil
+                    ).map { AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort) }
+                }
             ))
         }
 
@@ -137,7 +159,45 @@ final class AgentCodexModelRegistry {
     private func codexDynamicOptions(
         from models: [CodexAppServerClient.RemoteModel]
     ) -> [AgentModelOption] {
-        codexDynamicOptions(from: CodexDynamicModelMapper.options(from: models))
+        cachedOptions(for: .remote(models)) {
+            CodexDynamicModelMapper.options(from: models)
+        }
+    }
+
+    private func codexDynamicOptions(
+        from records: [CodexDynamicModelRecord]
+    ) -> [AgentModelOption] {
+        cachedOptions(for: .stored(records)) {
+            CodexDynamicModelMapper.options(from: records)
+        }
+    }
+
+    private func cachedOptions(
+        for input: DynamicOptionsInput,
+        makeDynamicOptions: () -> [CodexDynamicModelOption]
+    ) -> [AgentModelOption] {
+        lock.lock()
+        if let cached = cachedDynamicOptions.first(where: { $0.input == input }) {
+            lock.unlock()
+            return cached.options
+        }
+        lock.unlock()
+
+        // Sorting may be expensive; do it outside the registry lock. A concurrent
+        // miss can duplicate work, but an older result cannot overwrite a newer
+        // catalog because each entry retains the input that produced it.
+        let result = codexDynamicOptions(from: makeDynamicOptions())
+
+        lock.lock()
+        if !cachedDynamicOptions.contains(where: { $0.input == input }) {
+            cachedDynamicOptions.insert(DynamicOptionsCacheEntry(input: input, options: result), at: 0)
+            if cachedDynamicOptions.count > 3 {
+                cachedDynamicOptions.removeLast()
+            }
+        }
+        lock.unlock()
+
+        return result
     }
 
     private func codexDynamicOptions(
@@ -159,7 +219,13 @@ final class AgentCodexModelRegistry {
                 displayName: model.displayName,
                 description: model.description,
                 isPlaceholderDefault: false,
-                isProviderDefault: model.isDefault
+                isProviderDefault: model.isDefault,
+                supportedReasoningEffortRawValues: model.supportedReasoningEffortRawValues,
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                defaultReasoningEffortRawValue: model.defaultReasoningEffortRawValue,
+                effortVariant: model.reasoningEffort.map {
+                    AgentModelEffortVariant(baseModelRaw: model.baseID, reasoningEffort: $0)
+                }
             )
         }
         options.append(contentsOf: mapped)
@@ -183,10 +249,12 @@ final class AgentCodexModelRegistry {
 
     private func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
         let keys = Set(options.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
+        // Mirrors CodexAIModelCatalog: GPT-6.1 Sol and GPT-6 Luna back the role defaults.
         let requiredKeyGroups: [[String]] = [
-            ["gpt-5.6-sol-low", "gpt-5.6-low"],
-            ["gpt-5.6-sol-medium", "gpt-5.6-medium"],
-            ["gpt-5.6-sol-high", "gpt-5.6-high"],
+            ["gpt-6.1-sol-low"],
+            ["gpt-6.1-sol-medium"],
+            ["gpt-6.1-sol-high"],
+            ["gpt-6-luna-low"],
             ["gpt-5.3-codex"]
         ]
         return requiredKeyGroups.contains { group in
@@ -239,7 +307,8 @@ final class AgentCodexModelRegistry {
                         description: $0.description
                     )
                 },
-                defaultReasoningEffort: record.defaultReasoningEffort
+                defaultReasoningEffort: record.defaultReasoningEffort,
+                serviceTiers: record.serviceTiers
             )
         }
     }

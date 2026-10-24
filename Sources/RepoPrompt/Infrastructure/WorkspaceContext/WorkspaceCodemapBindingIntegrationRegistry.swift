@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 enum WorkspaceCodemapBindingIntegrationRoutingError: Error, Equatable {
     case routeUnavailable(WorkspaceCodemapRootEpoch)
@@ -57,14 +59,14 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
     nonisolated func makeBindingCatalogClient() -> WorkspaceCodemapBindingCatalogClient {
         WorkspaceCodemapBindingCatalogClient { [self] rootEpoch, relativePath in
             await resolveManifestBinding(rootEpoch: rootEpoch, relativePath: relativePath)
-        } readProjectionCatalogPage: { [self] request in
-            await readProjectionCatalogPage(request)
-        } revalidateProjectionCatalogToken: { [self] rootEpoch, token in
-            await revalidateProjectionCatalogToken(rootEpoch: rootEpoch, token: token)
-        } publishProjection: { [self] snapshot in
-            await publishProjection(snapshot)
+        } readGraphIndexCatalogPage: { [self] request in
+            await readGraphIndexCatalogPage(request)
+        } revalidateGraphIndexCatalogToken: { [self] rootEpoch, token in
+            await revalidateGraphIndexCatalogToken(rootEpoch: rootEpoch, token: token)
         } publishMarkerReadiness: { [self] update in
             await publishMarkerReadiness(update)
+        } reportRootAuthorityInvalidated: { [self] registration in
+            await reportRootAuthorityInvalidated(registration: registration)
         }
     }
 
@@ -132,13 +134,13 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
         return result
     }
 
-    private func readProjectionCatalogPage(
-        _ request: WorkspaceCodemapProjectionCatalogPageRequest
-    ) async -> WorkspaceCodemapProjectionCatalogPageDisposition {
+    private func readGraphIndexCatalogPage(
+        _ request: WorkspaceCodemapGraphIndexCatalogPageRequest
+    ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition {
         guard let (token, catalogClient) = currentCatalogRoute(for: request.rootEpoch) else {
             return .unavailable(.rootNotCurrent)
         }
-        let result = await catalogClient.readProjectionCatalogPage(request)
+        let result = await catalogClient.readGraphIndexCatalogPage(request)
         guard isCurrent(token: token) else { return .stale }
         if case let .page(page) = result {
             guard page.token.rootEpoch == request.rootEpoch else { return .stale }
@@ -146,33 +148,16 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
         return result
     }
 
-    private func revalidateProjectionCatalogToken(
+    private func revalidateGraphIndexCatalogToken(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        token catalogToken: WorkspaceCodemapProjectionCatalogToken
-    ) async -> WorkspaceCodemapProjectionCatalogTokenDisposition {
+        token catalogToken: WorkspaceCodemapGraphIndexCatalogToken
+    ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition {
         guard catalogToken.rootEpoch == rootEpoch else { return .stale }
         guard let (token, catalogClient) = currentCatalogRoute(for: rootEpoch) else {
             return .unavailable(.rootNotCurrent)
         }
-        let result = await catalogClient.revalidateProjectionCatalogToken(rootEpoch, catalogToken)
+        let result = await catalogClient.revalidateGraphIndexCatalogToken(rootEpoch, catalogToken)
         guard isCurrent(token: token) else { return .stale }
-        return result
-    }
-
-    private func publishProjection(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
-        let rootEpoch: WorkspaceCodemapRootEpoch = switch snapshot {
-        case let .segment(segment):
-            segment.generation.rootEpoch
-        case let .seal(proof):
-            proof.generation.rootEpoch
-        }
-        guard let (token, catalogClient) = currentCatalogRoute(for: rootEpoch) else {
-            return .superseded
-        }
-        let result = await catalogClient.publishProjection(snapshot)
-        guard isCurrent(token: token) else { return .superseded }
         return result
     }
 
@@ -185,6 +170,18 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
         let accepted = await catalogClient.publishMarkerReadiness(update)
         guard isCurrent(token: token) else { return false }
         return accepted
+    }
+
+    private func reportRootAuthorityInvalidated(
+        registration: WorkspaceCodemapBindingRootRegistration
+    ) async {
+        // A detached route means the session that would act on this notification is already gone,
+        // so the notification is dropped rather than delivered to a replaced session. A route that
+        // was re-registered for the same root epoch still receives it, which is why the report
+        // names its originating registration and the recipient rejects a foreign one.
+        let rootEpoch = registration.capabilityRequest.rootEpoch
+        guard let (_, catalogClient) = currentCatalogRoute(for: rootEpoch) else { return }
+        await catalogClient.reportRootAuthorityInvalidated(registration)
     }
 
     private func currentSourceRoute(

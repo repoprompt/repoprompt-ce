@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptSettingsCore
 import SwiftUI
 
 private struct MCPToolbarVisualState: Equatable {
@@ -96,16 +97,11 @@ struct MCPServerToggleView: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            HStack(spacing: 6) {
-                Image(systemName: "server.rack")
-                    .imageScale(.medium)
-                    .foregroundColor(buttonIconColor)
-                Text("MCP Server")
-            }
+            Label("MCP Server", systemImage: "server.rack")
+                .labelStyle(.iconOnly)
+                .imageScale(.medium)
+                .foregroundColor(buttonIconColor)
         }
-        .buttonStyle(CustomButtonStyle())
-        .padding(.leading, 8)
-        .padding(.trailing, 8)
         .hoverTooltip(toolbarStateObserver.visualState.helpText, .bottom)
         .accessibilityHint(toolbarStateObserver.visualState.helpText)
         .popover(isPresented: $showPopover, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
@@ -627,7 +623,10 @@ struct MCPServerPopoverContent: View {
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: promptViewModel.cursorContextBuilderMenuItems(options: promptViewModel.contextBuilderModelOptions(for: agent)))
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: promptViewModel.contextBuilderModelOptions(for: agent),
                 selectedAgent: promptViewModel.contextBuilderAgent,
@@ -681,7 +680,7 @@ struct MCPServerPopoverContent: View {
                             if result.success {
                                 showMCPFeedback(result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
                             } else {
-                                showMCPFeedback("Codex config failed", isError: true)
+                                showMCPFeedback(result.errorMessage ?? "Codex config failed", isError: true)
                             }
                         }
                         Button("OpenCode") {
@@ -863,7 +862,7 @@ struct MCPServerPopoverContent: View {
                     }
 
                     Section {
-                        Text("Codex CLI (~/.codex/prompts)")
+                        Text("RepoPrompt Codex (isolated prompts)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

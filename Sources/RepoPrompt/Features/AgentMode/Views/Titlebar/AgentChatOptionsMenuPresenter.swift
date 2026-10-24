@@ -1,21 +1,86 @@
 import AppKit
 
 struct AgentChatOptionsMenuTarget: Equatable {
+    let windowID: Int
     let workspaceID: UUID
     let tabID: UUID
     let agentSessionID: UUID
     let tabName: String
 }
 
+enum AgentSessionHandoffPrompt {
+    private static func quotedSingleLineTitle(_ title: String) -> String {
+        let reflected = String(reflecting: title)
+        var rendered = ""
+        rendered.reserveCapacity(reflected.utf8.count)
+        for scalar in reflected.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .lineSeparator, .paragraphSeparator:
+                rendered += "\\u{\(String(scalar.value, radix: 16, uppercase: true))}"
+            default:
+                rendered.unicodeScalars.append(scalar)
+            }
+        }
+        return rendered
+    }
+
+    static func render(
+        target: AgentChatOptionsMenuTarget,
+        cliCommandName: String,
+        instructions: String = ""
+    ) -> String {
+        let prompt = """
+        Use RepoPrompt CE to continue this exact Agent Mode session.
+
+        Session title: \(quotedSingleLineTitle(target.tabName))
+        Window ID: \(target.windowID)
+        Workspace ID: \(target.workspaceID.uuidString)
+        Context ID (compose tab): \(target.tabID.uuidString)
+        Agent session ID: \(target.agentSessionID.uuidString)
+
+        MCP:
+        1. Call `bind_context` with `{"op":"bind","window_id":\(target.windowID),"context_id":"\(target.tabID.uuidString)"}`.
+        2. Call `agent_manage` with `{"op":"extract_handoff","session_id":"\(target.agentSessionID.uuidString)"}`.
+        3. Consume the returned `<forked_session>` XML before continuing.
+
+        CLI equivalent (`\(cliCommandName)`):
+        `\(cliCommandName) -w \(target.windowID) --context-id \(target.tabID.uuidString) -c agent_manage -j '{"op":"extract_handoff","session_id":"\(target.agentSessionID.uuidString)"}'`
+        """
+        guard !instructions.isEmpty else {
+            return prompt
+        }
+        return prompt + "\n\nAdditional instructions:\n" + instructions
+    }
+}
+
 struct AgentChatOptionsMenuSnapshot: Equatable {
     let target: AgentChatOptionsMenuTarget
     let isPinned: Bool
+    /// Generation-bearing capture for Copy Session ID.
+    ///
+    /// `AgentChatOptionsMenuTarget` compares tab name and session ID but carries no binding
+    /// generations, so a tab that rebinds to the *same* session ID between menu open and click would
+    /// still validate. Carrying the exact incarnation here closes that gap. `nil` means the current
+    /// session is not an eligible oversight endpoint and the item is not offered.
+    let copySessionIDTarget: AgentSessionCopyIDTarget?
+
+    init(
+        target: AgentChatOptionsMenuTarget,
+        isPinned: Bool,
+        copySessionIDTarget: AgentSessionCopyIDTarget? = nil
+    ) {
+        self.target = target
+        self.isPinned = isPinned
+        self.copySessionIDTarget = copySessionIDTarget
+    }
 }
 
 struct AgentChatOptionsMenuActions {
     let togglePin: (AgentChatOptionsMenuTarget) -> Void
     let rename: (AgentChatOptionsMenuTarget) -> Void
     let stash: (AgentChatOptionsMenuTarget) -> Void
+    let copyHandoffPrompt: (AgentChatOptionsMenuTarget) -> Void
+    let copySessionID: (AgentSessionCopyIDTarget) -> Void
     let delete: (AgentChatOptionsMenuTarget) -> Void
 }
 
@@ -50,23 +115,35 @@ enum AgentChatOptionsMenuPresenter {
         let menu = NSMenu(title: "Chat Options")
         menu.autoenablesItems = false
         menu.addItem(AgentChatOptionsMenuItem(
-            title: snapshot.isPinned ? "Unpin Chat" : "Pin Chat",
+            title: snapshot.isPinned ? "Unpin" : "Pin",
             symbolName: snapshot.isPinned ? "pin.slash" : "pin",
             handler: { actions.togglePin(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
-            title: "Rename Chat…",
+            title: "Rename",
             symbolName: "pencil",
             handler: { actions.rename(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
-            title: "Stash Chat",
+            title: "Stash",
             symbolName: "tray.and.arrow.down",
             handler: { actions.stash(target) }
         ))
+        menu.addItem(AgentChatOptionsMenuItem(
+            title: "Handoff",
+            symbolName: "arrow.right.doc.on.clipboard",
+            handler: { actions.copyHandoffPrompt(target) }
+        ))
+        if let copySessionIDTarget = snapshot.copySessionIDTarget {
+            menu.addItem(AgentChatOptionsMenuItem(
+                title: "Copy Session ID",
+                symbolName: "doc.on.doc",
+                handler: { actions.copySessionID(copySessionIDTarget) }
+            ))
+        }
         menu.addItem(.separator())
         menu.addItem(AgentChatOptionsMenuItem(
-            title: "Delete Chat…",
+            title: "Delete",
             symbolName: "trash",
             handler: { actions.delete(target) }
         ))

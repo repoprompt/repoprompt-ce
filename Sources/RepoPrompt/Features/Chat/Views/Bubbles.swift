@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  Bubbles.swift
 //  RepoPrompt
@@ -282,6 +284,7 @@ struct MessageBubble: View {
     let message: AIChatMessage
     @ObservedObject var viewModel: OracleViewModel
     let isLatestMessage: Bool
+    let actionPolicy: ChatTranscriptActionPolicy
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     // Flags for hover states
@@ -381,7 +384,12 @@ struct MessageBubble: View {
                     }
                 } else {
                     // Normal view mode
-                    CollapsibleUserMessage(text: message.content)
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if !message.imageAttachments.isEmpty {
+                            ImageAttachmentStrip(attachments: message.imageAttachments)
+                        }
+                        CollapsibleUserMessage(text: message.content)
+                    }
                 }
             }
             .padding(12)
@@ -391,43 +399,44 @@ struct MessageBubble: View {
             // Buttons below the bubble
             HStack { // Outer container to align trailing without forcing inner to expand
                 HStack(spacing: 8) {
-                    // Token indicator for user messages - always render to prevent layout shifts
-                    Group {
-                        if let inTok = message.promptTokens,
-                           let outTok = message.completionTokens
-                        {
-                            TokenUsageIndicator(inputTokens: inTok, outputTokens: outTok, modelName: nil)
-                        } else {
-                            // Invisible placeholder with same height to maintain stable layout
-                            Color.clear
-                                .frame(width: 0, height: 20)
+                    if actionPolicy.showsTokenUsage {
+                        // Token indicator for user messages - always render to prevent layout shifts
+                        Group {
+                            if let inTok = message.promptTokens,
+                               let outTok = message.completionTokens
+                            {
+                                TokenUsageIndicator(inputTokens: inTok, outputTokens: outTok, modelName: nil)
+                            } else {
+                                // Invisible placeholder with same height to maintain stable layout
+                                Color.clear
+                                    .frame(width: 0, height: 20)
+                            }
                         }
                     }
 
-                    // Always show copy for user messages
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: true,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
                     )
 
-                    // Edit button for user messages
-                    EditButtonOverlay(
-                        isHoveringEdit: $isHoveringEdit,
-                        isEditingMessage: $isEditingMessage,
-                        editedText: $editedText,
-                        messageContent: message.content,
-                        isDisabled: viewModel.isSessionStreaming(viewModel.currentSessionID)
-                    )
+                    if actionPolicy.allowsMutatingActions {
+                        EditButtonOverlay(
+                            isHoveringEdit: $isHoveringEdit,
+                            isEditingMessage: $isEditingMessage,
+                            editedText: $editedText,
+                            messageContent: message.content,
+                            isDisabled: viewModel.isSessionStreaming(viewModel.currentSessionID)
+                        )
 
-                    DeleteButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringDelete: $isHoveringDelete,
-                        showingConfirmation: $showingDeleteConfirmation
-                    )
+                        DeleteButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringDelete: $isHoveringDelete,
+                            showingConfirmation: $showingDeleteConfirmation
+                        )
+                    }
                 }
                 .padding(.vertical, 4)
                 .padding(.horizontal, 8)
@@ -473,30 +482,32 @@ struct MessageBubble: View {
                 HStack(spacing: 8) {
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: message.isFinalized,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
                     )
 
-                    ForkButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringFork: $isHoveringFork
-                    )
+                    if actionPolicy.allowsMutatingActions {
+                        ForkButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringFork: $isHoveringFork
+                        )
 
-                    DeleteButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringDelete: $isHoveringDelete,
-                        showingConfirmation: $showingDeleteConfirmation
-                    )
+                        DeleteButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringDelete: $isHoveringDelete,
+                            showingConfirmation: $showingDeleteConfirmation
+                        )
 
-                    if message.selectedFileCount > 0 {
-                        FileSelectionIndicator(message: message, viewModel: viewModel)
+                        if message.selectedFileCount > 0 {
+                            FileSelectionIndicator(message: message, viewModel: viewModel)
+                        }
                     }
 
-                    if let inTok = message.promptTokens,
+                    if actionPolicy.showsTokenUsage,
+                       let inTok = message.promptTokens,
                        let outTok = message.completionTokens
                     {
                         TokenUsageIndicator(
@@ -524,7 +535,7 @@ struct MessageBubble: View {
 /// Add the new ForkButtonOverlay struct
 private struct ForkButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringFork: Bool
 
     var body: some View {
@@ -544,6 +555,34 @@ private struct ForkButtonOverlay: View {
             }
         }
         .hoverTooltip("Fork chat from this message")
+    }
+}
+
+/// Ordered, bounded previews of this user message's image attachments.
+private struct ImageAttachmentStrip: View {
+    let attachments: [AIChatImageAttachment]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(attachments) { attachment in
+                    Group {
+                        if let image = NSImage(data: attachment.thumbnailData) {
+                            Image(nsImage: image)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        } else {
+                            Image(systemName: "photo")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(width: 48, height: 48)
+                    .clipped()
+                    .cornerRadius(8)
+                    .hoverTooltip("Attached image")
+                }
+            }
+        }
     }
 }
 
@@ -590,7 +629,7 @@ private struct EditButtonOverlay: View {
 
 private struct DeleteButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringDelete: Bool
     @Binding var showingConfirmation: Bool
     @Environment(\.colorScheme) private var colorScheme
@@ -647,7 +686,6 @@ private struct DeleteButtonOverlay: View {
 
 private struct CopyButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
     let showCopyButton: Bool
     @Binding var isHoveringCopy: Bool
     @Binding var showingDeleteConfirmation: Bool
@@ -799,20 +837,19 @@ private struct MessageBubbleContent: View {
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
+    @ViewBuilder
     private var reasoningButtonIfNeeded: some View {
         // Always render container to prevent layout shifts.
-        Group {
-            if shouldShowReasoningButton {
-                let binding = viewModel.bindingForReasoningContent(of: message.id)
-                ReasoningButton(
-                    reasoningContent: binding,
-                    isStreaming: isStreamingWithEmptyContent,
-                    externalUpdateTick: viewModel.reasoningUpdateTick
-                )
-            } else {
-                Color.clear
-                    .frame(width: 0, height: 0)
-            }
+        if shouldShowReasoningButton {
+            let binding = viewModel.bindingForReasoningContent(of: message.id)
+            ReasoningButton(
+                reasoningContent: binding,
+                isStreaming: isStreamingWithEmptyContent,
+                externalUpdateTick: viewModel.reasoningUpdateTick
+            )
+        } else {
+            Color.clear
+                .frame(width: 0, height: 0)
         }
     }
 
@@ -829,7 +866,7 @@ private struct MessageBubbleContent: View {
     }
 
     private var shouldShowCollapsedAssistantView: Bool {
-        !message.isUser && !isLatestMessage && message.content.lineEquivalentCount > 10
+        !message.isUser && !isLatestMessage && message.content.exceedsLineEquivalentLimit(10)
     }
 
     private var assistantPreview: String {
@@ -906,13 +943,15 @@ private struct MessageBubbleContent: View {
 }
 
 private extension String {
-    var lineEquivalentCount: Int {
-        guard !isEmpty else { return 0 }
-        return split(separator: "\n", omittingEmptySubsequences: false).count
+    /// Whether the text has more than `limit` line equivalents. Bounded: splitting stops
+    /// after `limit` separators, so the returned count saturates at `limit + 1`.
+    func exceedsLineEquivalentLimit(_ limit: Int) -> Bool {
+        guard !isEmpty else { return false }
+        return split(separator: "\n", maxSplits: limit, omittingEmptySubsequences: false).count > limit
     }
 
     func firstLineEquivalents(_ limit: Int) -> String {
-        split(separator: "\n", omittingEmptySubsequences: false)
+        split(separator: "\n", maxSplits: limit, omittingEmptySubsequences: false)
             .prefix(limit)
             .joined(separator: "\n")
     }

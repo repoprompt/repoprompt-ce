@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Pure static helper for path matching logic without UI dependencies
 enum PathMatcher {

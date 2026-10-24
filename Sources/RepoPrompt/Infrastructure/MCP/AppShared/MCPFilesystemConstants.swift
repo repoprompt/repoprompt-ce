@@ -66,11 +66,7 @@ func mcpRoutingDebugLog(_ message: @autoclosure () -> String) {
 }
 
 enum MCPFilesystemConstants {
-    #if DEBUG
-        static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
-    #else
-        static let identity = MCPFilesystemIdentity.repoPromptCE(.release)
-    #endif
+    static let identity = WorkspaceContextFilesystemIdentity.identity
 
     static var socketDirName: String {
         identity.socketDirectoryName

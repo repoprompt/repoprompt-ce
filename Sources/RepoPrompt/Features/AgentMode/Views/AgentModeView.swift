@@ -1,4 +1,6 @@
 import Combine
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
 import SwiftUI
 
 /// Agent Mode view - a chat-style interface for long-running agent interactions
@@ -38,6 +40,17 @@ struct AgentModeView: View {
             rootChanges: windowState.workspaceFilesViewModel.rootShellProjectionsChangedPublisher,
             gitContextLookup: { promptManager.gitViewModel.gitWorktreeContext(forStandardizedRootPath: $0) },
             gitContextChanges: promptManager.gitViewModel.gitWorktreeContextChanges,
+            codemapStatusLookup: { windowState.workspaceFilesViewModel.codemapRootStatus(rootID: $0) },
+            codemapStatusChanges: windowState.workspaceFilesViewModel.codemapRootStatusesChangedPublisher,
+            setCodemapSuspended: { rootID, suspended in
+                await windowState.workspaceFilesViewModel.setCodemapGenerationSuspended(
+                    rootID: rootID,
+                    suspended: suspended
+                )
+            },
+            retryCodemapGraphIndex: { rootID in
+                await windowState.workspaceFilesViewModel.prioritizeCodemapGraphIndexNow(rootID: rootID)
+            },
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))
@@ -152,8 +165,17 @@ struct AgentModeView: View {
         }
     }
 
-    private func codexManagedLoginAction(openURL: @MainActor @escaping (URL) -> Void) async throws -> Bool {
-        try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+    private var codexManagedLoginAction: CodexManagedLoginAction {
+        CodexManagedLoginAction(
+            browser: { openURL in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+            },
+            deviceCode: { presentDeviceCode in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptDeviceCodeLogin(
+                    presentDeviceCode: presentDeviceCode
+                )
+            }
+        )
     }
 }
 
@@ -165,6 +187,7 @@ struct AgentModeChatDetailView: View {
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let isContextBuilderQuestionPresented: Bool
     let oracleViewModel: OracleViewModel
@@ -1533,10 +1556,6 @@ struct AgentModeChatDetailView: View {
         transcriptPresentation.isCompressedHistoryRevealed && canRevealCompressedHistory
     }
 
-    private var hasTranscriptContent: Bool {
-        !transcriptPresentation.visibleRows.isEmpty || transcriptPresentation.archivedHistoryState.hasArchivedHistory
-    }
-
     private var dynamicSummaryLockTargetTurnID: UUID? {
         transcriptPresentation.metadata.dynamicSummaryLockTargetTurnID
     }
@@ -1831,6 +1850,10 @@ struct AgentModeChatDetailView: View {
         runInteractionSnapshot.pendingApproval?.id
     }
 
+    private var pendingCodexHookReviewID: UUID? {
+        runInteractionSnapshot.pendingCodexHookReview?.id
+    }
+
     private var pendingMCPElicitationID: UUID? {
         runInteractionSnapshot.pendingMCPElicitationRequest?.id
     }
@@ -1840,11 +1863,17 @@ struct AgentModeChatDetailView: View {
     }
 
     private var isInteractionBlockerVisible: Bool {
-        pendingApprovalID != nil || pendingMCPElicitationID != nil || pendingApplyEditsReviewID != nil
+        pendingCodexHookReviewID != nil
+            || pendingApprovalID != nil
+            || pendingMCPElicitationID != nil
+            || pendingApplyEditsReviewID != nil
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            if let currentTabID, let session = agentModeVM.sessions[currentTabID] {
+                AgentSessionRestorationRecoveryView(session: session, viewModel: agentModeVM)
+            }
             // Main content area with floating input bar
             ZStack(alignment: .bottom) {
                 // Background layer: scroll view + fixed spacer for the base bar
@@ -1859,6 +1888,7 @@ struct AgentModeChatDetailView: View {
                     agentModeVM: agentModeVM,
                     composerUI: agentModeVM.ui.composer,
                     statusPillsUI: agentModeVM.ui.statusPills,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     oracleViewModel: oracleViewModel,
                     promptManager: promptManager,
                     workspaceSearchService: workspaceSearchService,
@@ -2066,6 +2096,11 @@ struct AgentModeChatDetailView: View {
                     } else {
                         restorePinnedBottomAfterBlockerIfNeeded(proxy: proxy)
                     }
+                }
+                .onReceive(agentModeVM.notificationAttention.revealRequests) { tabID in
+                    // A notification click routed here: pending cards render at the live bottom.
+                    guard tabID == currentTabID else { return }
+                    pinToLiveBottom()
                 }
                 #if DEBUG
                 .onReceive(NotificationCenter.default.publisher(for: AgentChatStressHarness.forceDetachRequestedNotification)) { notification in
@@ -2349,7 +2384,7 @@ struct AgentModeChatDetailView: View {
             .frame(
                 maxWidth: .infinity,
                 minHeight: viewportHeight,
-                alignment: hasTranscriptContent ? .topLeading : .center
+                alignment: transcriptSnapshot.panePresentation == .transcript ? .topLeading : .center
             )
         #if DEBUG
             .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
@@ -2371,13 +2406,54 @@ struct AgentModeChatDetailView: View {
         if shouldShowStreamingHistoryIndicator {
             streamingHistoryIndicator
         }
-        if !hasTranscriptContent {
-            emptyStateView
-        } else {
+        switch transcriptSnapshot.panePresentation {
+        case .transcript:
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
+        case .welcome:
+            emptyStateView
+        case .restoring:
+            restoringPaneView
+        case let .unavailable(reason, retry):
+            unavailablePaneView(reason: reason, retry: retry)
+        case .runningOrWaiting:
+            // The existing run indicator and interaction cards below present current run facts; show
+            // fallback copy only when neither is visible.
+            if let fallback = AgentTranscriptPanePresentation.runningOrWaitingFallback(
+                isWaitingForInput: isRunWaitingForInput,
+                isRunIndicatorVisible: shouldShowRunningIndicator,
+                isInteractionCardVisible: hasVisibleRunInteractionCard
+            ) {
+                Text(fallback)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
         }
+        AgentRepromptQuestionsView(viewModel: agentModeVM, store: agentModeVM.repromptUIStore, tabID: currentTabID)
         runningIndicatorSlot
-        if let review = runInteractionSnapshot.pendingApplyEditsReview {
+        DelegationApprovalSlot(
+            windowID: windowID,
+            tabID: currentTabID,
+            sessionID: currentTabID.flatMap { agentModeVM.sessions[$0]?.activeAgentSessionID },
+            runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
+        )
+        if let request = runInteractionSnapshot.pendingCodexHookReview {
+            CodexHookReviewCard(
+                request: request,
+                isStrictModeEnabled: {
+                    agentModeVM.isCodexHookApprovalStrictModeEnabled()
+                },
+                onDecision: { decision in
+                    guard let tabID = currentTabID else { return }
+                    try await agentModeVM.submitCodexHookReviewDecision(
+                        tabID: tabID,
+                        requestID: request.id,
+                        decision: decision
+                    )
+                }
+            )
+            .id("pendingCodexHookReview")
+            .transition(.opacity)
+        } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
             AgentApplyEditsReviewCard(
                 review: review,
                 onAccept: {
@@ -2424,12 +2500,20 @@ struct AgentModeChatDetailView: View {
         } else if let approval = runInteractionSnapshot.pendingApproval {
             AgentApprovalCard(
                 request: approval,
+                allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onDecision: { decision in
                     guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApprovalDecision(tabID: tabID, decision: decision)
+                    agentModeVM.submitApprovalDecision(tabID: tabID, requestID: approval.id, decision: decision)
                 }
             )
             .id("pendingApproval")
+            .transition(.opacity)
+        } else if let request = runInteractionSnapshot.pendingPermissionsRequest {
+            AgentPermissionsApprovalCard(request: request, onDecision: { decision in
+                guard let tabID = currentTabID else { return }
+                agentModeVM.submitPermissionsDecision(tabID: tabID, requestID: request.id, decision: decision)
+            })
+            .id("pendingPermissions")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingMCPElicitationRequest {
             AgentMCPElicitationCard(
@@ -2445,6 +2529,7 @@ struct AgentModeChatDetailView: View {
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
+                allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
@@ -2658,12 +2743,17 @@ struct AgentModeChatDetailView: View {
             .accessibilityIdentifier("agentTranscript.groupedHistory")
         default:
             VStack(alignment: .leading, spacing: 8) {
+                let transcript = transcriptSnapshot
+                let runInteraction = runInteractionSnapshot
+                let lockTargetID = transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
                 ForEach(block.rows) { item in
                     transcriptRowView(
                         item: item,
                         block: block,
                         renderContext: renderContext,
-                        autoExpandEnabled: toolCardAutoExpandEnabled(for: block)
+                        autoExpandEnabled: toolCardAutoExpandEnabled(for: block, lockTargetID: lockTargetID),
+                        transcript: transcript,
+                        runInteraction: runInteraction
                     )
                 }
             }
@@ -2676,16 +2766,17 @@ struct AgentModeChatDetailView: View {
     /// Only shows for current-turn items in non-archived, full-retention blocks during an active run.
     private func showRunScopedToolCancel(
         for item: AgentChatItem,
-        in block: AgentTranscriptRenderBlock
+        in block: AgentTranscriptRenderBlock,
+        runInteraction: AgentRunInteractionUISnapshot
     ) -> Bool {
-        guard runInteractionSnapshot.runState == .running,
-              runInteractionSnapshot.activeRunID != nil,
+        guard runInteraction.runState == .running,
+              runInteraction.activeRunID != nil,
               !block.isArchived,
               block.retentionTier == .full,
               item.kind == .toolCall
         else { return false }
         // Only show cancel for items after the latest user message in this turn
-        if let latestUserSeqIndex = runInteractionSnapshot.latestUserSequenceIndex,
+        if let latestUserSeqIndex = runInteraction.latestUserSequenceIndex,
            item.sequenceIndex > latestUserSeqIndex
         {
             return true
@@ -2694,8 +2785,8 @@ struct AgentModeChatDetailView: View {
     }
 
     /// Stable cancel closure for the active run, captured at render time.
-    private var cancelActiveToolsAction: (() -> Void)? {
-        guard let runID = runInteractionSnapshot.activeRunID else { return nil }
+    private func cancelActiveToolsAction(runInteraction: AgentRunInteractionUISnapshot) -> (() -> Void)? {
+        guard let runID = runInteraction.activeRunID else { return nil }
         return { [weak agentModeVM] in
             agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel")
         }
@@ -2705,11 +2796,13 @@ struct AgentModeChatDetailView: View {
         item: AgentChatItem,
         block: AgentTranscriptRenderBlock,
         renderContext: TranscriptRenderContext,
-        autoExpandEnabled: Bool
+        autoExpandEnabled: Bool,
+        transcript: AgentTranscriptUISnapshot,
+        runInteraction: AgentRunInteractionUISnapshot
     ) -> some View {
-        let showCancel = showRunScopedToolCancel(for: item, in: block)
-        let cancelAction = showCancel ? cancelActiveToolsAction : nil
-        let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        let showCancel = showRunScopedToolCancel(for: item, in: block, runInteraction: runInteraction)
+        let cancelAction = showCancel ? cancelActiveToolsAction(runInteraction: runInteraction) : nil
+        let ownerTabID = transcript.presentation.tabID ?? transcript.currentTabID ?? currentTabID
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         return AgentMessageBubble(
             item: item,
@@ -2732,9 +2825,9 @@ struct AgentModeChatDetailView: View {
                 cancelActiveToolsAction: cancelAction
             ),
             promptManager: promptManager,
-            handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
+            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation
+            rawToolResultPayloadRenderRevision: transcript.presentation
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
@@ -2743,13 +2836,13 @@ struct AgentModeChatDetailView: View {
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
         .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
-        .environment(\.agentLiveBashExecutionByItemID, transcriptSnapshot.activeBashLiveExecutionByItemID)
+        .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
         .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
         .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
     }
 
-    private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock) -> Bool {
-        block.turnID != dynamicSummaryLockTargetTurnID
+    private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock, lockTargetID: UUID?) -> Bool {
+        block.turnID != lockTargetID
             && !block.isArchived
             && block.retentionTier == .full
             && block.kind != .activityCluster
@@ -2758,8 +2851,8 @@ struct AgentModeChatDetailView: View {
 
     /// Per-item auto-expand policy that allows bash to auto-expand inside grouped/cluster blocks
     /// while keeping other tools collapsed in those contexts.
-    private func toolCardAutoExpandEnabled(for item: AgentChatItem, in block: AgentTranscriptRenderBlock) -> Bool {
-        guard block.turnID != dynamicSummaryLockTargetTurnID, !block.isArchived, block.retentionTier == .full else {
+    private func toolCardAutoExpandEnabled(for item: AgentChatItem, in block: AgentTranscriptRenderBlock, lockTargetID: UUID?) -> Bool {
+        guard block.turnID != lockTargetID, !block.isArchived, block.retentionTier == .full else {
             return false
         }
         if block.kind == .activityCluster || block.kind == .groupedHistory {
@@ -2938,29 +3031,40 @@ struct AgentModeChatDetailView: View {
     }
 
     private func expandedClusterContent(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let transcript = transcriptSnapshot
+        let runInteraction = runInteractionSnapshot
+        let lockTargetID = transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
+        return VStack(alignment: .leading, spacing: 6) {
             ForEach(block.rows) { item in
                 transcriptRowView(
                     item: item,
                     block: block,
                     renderContext: renderContext,
-                    autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block)
+                    autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block, lockTargetID: lockTargetID),
+                    transcript: transcript,
+                    runInteraction: runInteraction
                 )
             }
         }
     }
 
     private func expandedGroupedContent(sections: [AgentTranscriptGroupedSection], renderContext: TranscriptRenderContext) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let transcript = transcriptSnapshot
+        let runInteraction = runInteractionSnapshot
+        let lockTargetID = transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
+        return VStack(alignment: .leading, spacing: 8) {
             ForEach(sections) { section in
-                groupedHistorySectionView(section: section, renderContext: renderContext)
+                groupedHistorySectionView(section: section, renderContext: renderContext, transcript: transcript, runInteraction: runInteraction, lockTargetID: lockTargetID)
             }
         }
     }
 
     private func groupedHistorySectionView(
         section: AgentTranscriptGroupedSection,
-        renderContext: TranscriptRenderContext
+        renderContext: TranscriptRenderContext,
+        transcript: AgentTranscriptUISnapshot,
+        runInteraction: AgentRunInteractionUISnapshot,
+        lockTargetID: UUID?
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             // Section header — compact inline
@@ -3003,7 +3107,9 @@ struct AgentModeChatDetailView: View {
                             item: item,
                             block: childBlock,
                             renderContext: renderContext,
-                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock)
+                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock, lockTargetID: lockTargetID),
+                            transcript: transcript,
+                            runInteraction: runInteraction
                         )
                     }
                 }
@@ -3200,12 +3306,12 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Handoff
 
-    private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig {
+    private func handoffConfig(for itemID: UUID, runInteraction: AgentRunInteractionUISnapshot) -> AgentHandoffConfig {
         AgentHandoffConfig(
             itemID: itemID,
-            defaultDestinationAgent: runInteractionSnapshot.selectedAgent,
-            defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
+            defaultDestinationAgent: runInteraction.selectedAgent,
+            defaultModelRaw: runInteraction.selectedModelRaw,
+            defaultReasoningEffortRaw: runInteraction.selectedReasoningEffortRaw,
             availableAgentsProvider: { [weak agentModeVM] in
                 agentModeVM?.availableAgents ?? []
             },
@@ -3242,6 +3348,26 @@ struct AgentModeChatDetailView: View {
 
     private var shouldShowRunningIndicator: Bool {
         runInteractionSnapshot.isAgentBusy && runInteractionSnapshot.runState == .running
+    }
+
+    private var isRunWaitingForInput: Bool {
+        switch runInteractionSnapshot.runState {
+        case .waitingForUser, .waitingForQuestion, .waitingForApproval: true
+        default: false
+        }
+    }
+
+    /// Mirrors the interaction-card chain in `messageRowsContent`.
+    private var hasVisibleRunInteractionCard: Bool {
+        let snapshot = runInteractionSnapshot
+        return snapshot.pendingCodexHookReview != nil
+            || snapshot.pendingApplyEditsReview != nil
+            || snapshot.pendingWorktreeMergeReview != nil
+            || snapshot.pendingApproval != nil
+            || snapshot.pendingMCPElicitationRequest != nil
+            || snapshot.pendingUserInputRequest != nil
+            || snapshot.pendingAskUser != nil
+            || snapshot.activeWorktreeMergeConflict != nil
     }
 
     private var runningIndicatorSlot: some View {
@@ -5869,6 +5995,34 @@ struct AgentModeChatDetailView: View {
         ]
     }
 
+    private var restoringPaneView: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Restoring conversation…")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func unavailablePaneView(
+        reason: AgentTranscriptPanePresentation.UnavailableReason,
+        retry: AgentTranscriptRetryTarget?
+    ) -> some View {
+        VStack(spacing: 10) {
+            Text(reason.message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            if let retry {
+                Button("Retry") {
+                    _ = agentModeVM.retryTranscriptRestoration(retry)
+                }
+            }
+        }
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 20) {
             HStack(spacing: 10) {
@@ -5923,6 +6077,7 @@ struct AgentModeChatDetailView: View {
 }
 
 private struct AgentRunningElapsedText: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let startedAt: Date
     let isLive: Bool
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -5934,7 +6089,7 @@ private struct AgentRunningElapsedText: View {
         if isLive {
             TimelineView(.periodic(from: .now, by: 1)) { timeline in
                 #if DEBUG
-                    let _ = AgentModePerfDiagnostics.increment("timeline.runningIndicator.tick")
+                    let _ = perfRecorder.increment("timeline.runningIndicator.tick")
                 #endif
                 elapsedText(now: timeline.date)
             }
@@ -5958,5 +6113,56 @@ private struct AgentRunningElapsedText: View {
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         return "\(minutes)m \(String(format: "%02d", seconds))s"
+    }
+}
+
+/// A failed restore must remain visible and recoverable without overwriting its original identity.
+private struct AgentSessionRestorationRecoveryView: View {
+    @ObservedObject var session: AgentTabSession
+    let viewModel: AgentModeViewModel
+
+    var body: some View {
+        if let failure = session.qualifiedRestorationReadiness.terminalFailure {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(
+                    failure == .missingPayload
+                        ? "This session's saved conversation is unavailable. Its identity has been preserved."
+                        : "This session could not be restored. Its saved data has not been replaced."
+                )
+                .font(.callout)
+                Spacer(minLength: 8)
+                Button("Retry Loading") {
+                    let expectedSession = session
+                    Task { await viewModel.retrySessionRestoration(tabID: expectedSession.tabID, expectedSession: expectedSession) }
+                }
+                Button("New Session") {
+                    Task { await viewModel.createAndActivateSessionTab() }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        } else if let creation = session.creationState {
+            HStack(spacing: 12) {
+                switch creation.phase {
+                case .preparing:
+                    Text("This new session is being prepared.").font(.callout)
+                case .readyToPersist:
+                    Text("This prepared session has not been saved yet.").font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Retry Saving") {
+                        guard let handle = viewModel.captureSessionCreationRetry(for: session) else { return }
+                        Task { await viewModel.retrySessionInitialSave(handle) }
+                    }
+                case let .failedBeforeConfiguration(message):
+                    Text(message).font(.callout)
+                    Spacer(minLength: 8)
+                    Button("New Session") {
+                        Task { await viewModel.createAndActivateSessionTab() }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        }
     }
 }

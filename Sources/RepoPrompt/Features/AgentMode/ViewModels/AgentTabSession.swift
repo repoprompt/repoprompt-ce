@@ -1,0 +1,3150 @@
+import Combine
+import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+
+// MARK: - Agent Tab Session
+
+/// Per-tab session state for agent mode.
+///
+/// Extracted from `AgentModeViewModel` nesting so Agent Mode runtime contracts can
+/// name the session type without the view-model namespace. This remains the single
+/// session authority; `AgentModeViewModel.TabSession` is a source-compatibility
+/// alias to exactly this class.
+@MainActor
+final class AgentTabSession: ObservableObject {
+    let tabID: UUID
+    let perfRecorder: any AgentModePerfRecording
+    private var suppressSourceItemsChanged = false
+
+    /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
+    /// but it only retains the mutable full-detail working turns; older compacted
+    /// history lives in `transcript` and should not be rehydrated back into this array.
+    @Published var items: [AgentChatItem] = [] {
+        didSet {
+            guard !suppressSourceItemsChanged else { return }
+            repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
+            rebuildSourceItemDerivedState()
+            invalidateLocalInputStructure()
+            onSourceItemsChanged?(self, .structural)
+        }
+    }
+
+    var localInputIndex = AgentSessionLinkRetainedLocalInputIndex()
+    var localInputCanonicalCommitPending = false
+    private var localComposerCandidates: [UUID: LocalComposerCandidate] = [:]
+
+    struct LocalComposerCandidate {
+        let itemID: UUID
+        let fence: AgentRunStartStopFence
+        var position: Int?
+    }
+
+    /// Identity-only ingress token. No raw draft or provider-formatted text is retained here.
+    func registerLocalComposerCandidate(itemID: UUID, at position: Int) -> UUID {
+        let token = UUID()
+        assert(items.indices.contains(position) && items[position].id == itemID)
+        localComposerCandidates[token] = LocalComposerCandidate(itemID: itemID, fence: AgentRunStartStopFence(session: self), position: position)
+        return token
+    }
+
+    enum LocalComposerDisposition { case retained, rolledBack }
+
+    @discardableResult
+    func settleLocalComposerOrigin(_ token: UUID?, disposition: LocalComposerDisposition) -> Bool {
+        guard let token, let candidate = localComposerCandidates.removeValue(forKey: token),
+              disposition == .retained,
+              candidate.fence.binding == persistentSessionBindingIdentity else { return false }
+        if let position = candidate.position {
+            guard items.indices.contains(position), items[position].id == candidate.itemID,
+                  items[position].kind == .user, items[position].crossSessionAttribution == nil,
+                  !items[position].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            // Provenance changes neither activity timestamps nor lifecycle observations.
+            suppressSourceItemsChanged = true
+            items[position].userInputOrigin = .localComposer
+            suppressSourceItemsChanged = false
+            localInputIndex.settle(items[position], at: position)
+            finishIncrementalSourceItemsMutation(.replace(index: position, previousKind: .user, currentKind: .user))
+        } else {
+            // Only a still-owned producer token may settle an exact canonical request that left
+            // the mutable suffix during retention. Typed history copies without a token cannot
+            // allocate an event. Genuine history replacement/binding changes retire these tokens.
+            guard !localInputCanonicalCommitPending,
+                  let turnIndex = transcript.turns.firstIndex(where: { $0.request?.id == candidate.itemID }),
+                  var request = transcript.turns[turnIndex].request,
+                  request.crossSessionAttribution == nil,
+                  !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            request.userInputOrigin = .localComposer
+            transcript.turns[turnIndex].request = request
+            localInputIndex.settle(request.toItem(), at: nil)
+            // Entry ruled out other pending work; the index has synchronously projected the
+            // exact provenance mutation that transcript.didSet just marked pending.
+            localInputCanonicalCommitPending = false
+            finishIncrementalSourceItemsMutation(.structural)
+        }
+        isDirty = true
+        return true
+    }
+
+    /// Preserve only exact identities through retention's working-list replacement. Content and
+    /// true canonical absence are reconciled by the existing canonical seed, not this suffix.
+    private func reconcileLocalInputWorkingPositions(_ newItems: [AgentChatItem]) {
+        let tracked = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        var positions: [UUID: Int] = [:]
+        for (position, item) in newItems.enumerated() where tracked.contains(item.id) {
+            positions[item.id] = position
+        }
+        localInputIndex.reconcileWorkingPositions(positions)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            candidate.position = positions[candidate.itemID]
+            localComposerCandidates[token] = candidate
+        }
+    }
+
+    /// A committed batch is not a structural rebuild: tracked items the batch removed are
+    /// per-record deletions by identity, still-present tracked items reconcile content and
+    /// position, and a candidate whose row the batch removed is retired so a later settle
+    /// cannot resurrect it through the canonical-only path.
+    private func reconcileLocalInputBatchDiff(from previousItems: [AgentChatItem], to newItems: [AgentChatItem]) {
+        let trackedIDs = Set(localInputIndex.records.map(\.itemID)).union(localComposerCandidates.values.map(\.itemID))
+        guard !trackedIDs.isEmpty else { return }
+        var newItemsByID: [UUID: AgentChatItem] = [:]
+        for item in newItems where trackedIDs.contains(item.id) {
+            newItemsByID[item.id] = item
+        }
+        var removedTrackedIDs: Set<UUID> = []
+        var previousItemsByID: [UUID: AgentChatItem] = [:]
+        for item in previousItems where trackedIDs.contains(item.id) {
+            previousItemsByID[item.id] = item
+            if newItemsByID[item.id] == nil { removedTrackedIDs.insert(item.id) }
+        }
+        if !removedTrackedIDs.isEmpty {
+            localInputIndex.markDeleted(removedTrackedIDs)
+            // A removed row also retires an unsettled candidate for it: the producer's row is
+            // gone, so a late settle must not allocate an ordinal through the canonical path.
+            localComposerCandidates = localComposerCandidates.filter { !removedTrackedIDs.contains($0.value.itemID) }
+        }
+        reconcileLocalInputWorkingPositions(newItems)
+        for record in localInputIndex.records where !record.isDeleted {
+            guard let position = record.sourcePosition, let item = newItemsByID[record.itemID] else { continue }
+            // Unchanged rows skip re-projection: relies on `AgentChatItem.==` covering every
+            // field `Content.project` reads (kind, userInputOrigin, crossSessionAttribution, text).
+            if previousItemsByID[record.itemID] == item { continue }
+            localInputIndex.replace(item, at: position)
+        }
+    }
+
+    func installLocalInputSeed(_ seed: AgentSessionLinkRetainedLocalInputIndex.Seed) {
+        localInputIndex.install(seed)
+        localInputCanonicalCommitPending = false
+    }
+
+    #if DEBUG
+        var test_unsettledLocalComposerCandidateCount: Int {
+            localComposerCandidates.count
+        }
+    #endif
+
+    private func invalidateLocalInputStructure() {
+        localComposerCandidates.removeAll()
+        localInputIndex.invalidateStructure()
+    }
+
+    var transcript: AgentTranscript = .empty {
+        didSet { localInputCanonicalCommitPending = true }
+    }
+
+    var baseTranscriptProjection: AgentTranscriptProjection = .empty
+    var fullTranscriptProjection: AgentTranscriptProjection = .empty
+    var workingTranscriptProjection: AgentTranscriptProjection = .empty
+    var transcriptProjection: AgentTranscriptProjection = .empty
+    var turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
+    var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty
+    var isCompressedHistoryRevealed: Bool = false
+    var isTranscriptWindowExpanded: Bool = false
+    var transcriptProjectionProtection: AgentTranscriptProjectionProtection = .none
+    var transcriptCanonicalVisibleRowCount: Int = 0
+    var transcriptProjectionCounts: AgentTranscriptProjectionCounts = .zero
+    var transcriptAnalyticsSnapshot: AgentTranscriptAnalyticsSnapshot = .init()
+    var transcriptPerformanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty
+    var ephemeralToolResultPayloadByItemID: [UUID: String] = [:]
+    var ephemeralToolResultPayloadRevisionByItemID: [UUID: Int] = [:]
+    private(set) var liveItemIDs: Set<UUID> = []
+    private var toolCorrelationIndexes = ToolCorrelationIndexes()
+    private var nextEphemeralToolResultPayloadRevision: Int = 1
+    var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
+    var onSourceItemsChanged: ((AgentTabSession, AgentModeViewModel.SourceItemsMutation) -> Void)?
+    var onRunStateChanged: ((AgentTabSession) -> Void)?
+    /// Activation went set → cleared/replaced. Fired synchronously from `oversight.didSet`; never
+    /// for nil → nil or nil → set.
+    var onOverseerActivationRetired: ((AgentTabSession, AgentSessionOverseerActivation) -> Void)?
+    /// `bindingTransitionInProgress` went true → false (success, failure, or abandoned-then-finished).
+    /// Presentation only.
+    var onBindingTransitionSettled: ((AgentTabSession) -> Void)?
+    #if DEBUG
+        private(set) var test_incrementalRetentionCompactionCount = 0
+        private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
+    #endif
+
+    /// Run state
+    @Published var runState: AgentSessionRunState = .idle {
+        didSet {
+            guard runState != oldValue else { return }
+            noteMonitorObservationInputsChanged()
+            onRunStateChanged?(self)
+        }
+    }
+
+    @Published var runningStatusText: String? = nil
+    /// Ephemeral cancellation generation and managed-stop gate; never persisted.
+    var stopState = AgentRunStopState() {
+        didSet {
+            if oldValue.cancellationGeneration != stopState.cancellationGeneration
+                || oldValue.activeManagedStopID != stopState.activeManagedStopID
+            {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    var activeAgentRunStartedAt: Date?
+
+    /// Last Auto Effort service choice submitted for this tab, plus a transient in-flight indication.
+    /// Neither changes the user's manual model/effort selection or persisted session state.
+    var autoEffortFeedback: AutoEffortTurnFeedback?
+    var autoEffortJudgmentID: UUID?
+
+    struct DeferredActiveAgentRunTimerRollback {
+        let originalStartedAt: Date?
+    }
+
+    var deferredActiveAgentRunTimerRollback: DeferredActiveAgentRunTimerRollback?
+
+    enum RunningStatusSource: Equatable {
+        case transport
+        case reasoning
+        case reconnect
+    }
+
+    struct CodexReasoningSegmentState {
+        var summaryMarkdown: String = ""
+        var bodyMarkdown: String = ""
+        var transcriptItemID: UUID?
+        var statusTitle: String?
+    }
+
+    struct AgentTurnRuntimeAnchor: Equatable {
+        let userItemID: UUID
+        let userSequenceIndex: Int
+        let startedAt: Date
+    }
+
+    var runningStatusSource: RunningStatusSource?
+    var nativeControlProgressID: UUID?
+    var claudeReasoningStatusBuffer: String = ""
+    var claudeReasoningStatusPendingText: String?
+    var claudeReasoningStatusFlushTask: Task<Void, Never>?
+    var codexReasoningSegmentsByKey: [String: CodexReasoningSegmentState] = [:]
+    var pendingTurnRuntimeAnchors: [AgentTurnRuntimeAnchor] = []
+    var agentMessageRuntimeFootersByItemID: [UUID: AgentMessageRuntimeFooter] = [:]
+
+    /// Tracks whether this session already contains a real user turn.
+    /// Provider selection may still remain temporarily editable for a handoff destination
+    /// until its first destination-side send succeeds.
+    var hasSentFirstMessage: Bool = false
+
+    var deservesProviderVisibleBranchSwitchNote: Bool {
+        runState.isActive || providerSessionID != nil || !items.isEmpty || hasSentFirstMessage
+    }
+
+    /// Ephemeral location intent for a new manual thread. It is consumed on first send
+    /// and intentionally never persisted as session state.
+    var pendingInitialStartLocation: AgentModeViewModel.InitialStartLocation = .local
+    var composerSubmissionToken = UUID()
+    var activeComposerSubmitAttempt: AgentComposerSubmitAttempt? {
+        didSet {
+            // Only the in-flight transition matters to an observer; attempt-internal churn does
+            // not change what an overseeing caller can see.
+            if (oldValue == nil) != (activeComposerSubmitAttempt == nil) {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    var isComposerSubmissionInFlight: Bool {
+        activeComposerSubmitAttempt != nil
+    }
+
+    /// These gate delivery readiness and published `idle_for_send`, so wake observers when either
+    /// non-published transition changes.
+    private var initialWorktreePreparationInProgress = false
+    var isPreparingInitialWorktree: Bool {
+        get { initialWorktreePreparationInProgress || pendingHandoff.executionLocationFailure != nil }
+        set {
+            let wasPreparing = isPreparingInitialWorktree
+            initialWorktreePreparationInProgress = newValue
+            if wasPreparing != isPreparingInitialWorktree {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    var isChangingExecutionLocation: Bool = false {
+        didSet {
+            if oldValue != isChangingExecutionLocation {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// Set while Handoff installs inherited worktree bindings on a never-activated destination.
+    /// Debounced autosaves stay disarmed so the first durable record cannot be the provisional,
+    /// unbound state; Handoff performs the destination's first save explicitly afterwards.
+    var isInstallingHandoffWorktreeBindings = false
+
+    var worktreeBindingTransitionInProgress: Bool = false
+
+    /// Runtime-only: an execution-worktree change this session requested for itself from its own
+    /// live turn, applied at that turn's completed terminal boundary and then continued
+    /// automatically. Owned by `AgentModeViewModel+SelfWorktreeRelocation`.
+    var pendingSelfWorktreeRelocation: AgentSelfWorktreeRelocation? {
+        didSet {
+            if oldValue != pendingSelfWorktreeRelocation {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// Wait/question state
+    @Published var waitingPrompt: String? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingAskUser: AgentAskUserPendingState? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingApproval: AgentApprovalRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingCodexHookReview: AgentCodexHookReviewRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var codexHookReviewContinuation: CheckedContinuation<Void, Error>?
+    var codexHookGateCoalescedContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    var codexHookGateGeneration: UInt64 = 0
+    var codexHookGateAttemptToken: UUID? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var codexHookGateDispatchOwnerToken: UUID?
+    var codexHookGateInventoryFingerprint: String?
+    @Published var codexHookGateAudit: AgentCodexHookGateAudit?
+    var codexHookGateBindingMemo: CodexHookGateBindingIdentity?
+    var codexHookGateActiveBinding: CodexHookGateBindingIdentity?
+    @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    /// Explicit change channel for oversight inputs that are not `@Published`.
+    /// A non-replaying subject avoids perturbing unrelated session observers.
+    let monitorObservationSignal = PassthroughSubject<Void, Never>()
+
+    /// Every change channel that can move this session's send/wake readiness.
+    ///
+    /// The merged set is explicit and includes both review publishers. Non-`@Published` readiness
+    /// inputs reach it through `monitorObservationSignal`, which is the only way terminal-commit,
+    /// follow-up/steering/composer-queue, binding-transition, and hydration changes can wake an
+    /// observer.
+    ///
+    /// Owned here, beside the state it reports on, and shared by both readers: the cross-window
+    /// oversight observation and the auto-wake coordinator's settlement wait. Two copies of this list
+    /// would be two chances to forget a blocker — and the auto-wake copy forgetting one means an
+    /// attempt parks forever waiting for an event that is never published.
+    var monitorReadinessChangePublisher: AnyPublisher<Void, Never> {
+        Publishers.MergeMany([
+            $runState.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $items.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $waitingPrompt.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingAskUser.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingUserInputRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingApproval.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingPermissionsRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingMCPElicitationRequest.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingApplyEditsReview.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            $pendingWorktreeMergeReview.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            monitorObservationSignal.eraseToAnyPublisher()
+        ])
+        .eraseToAnyPublisher()
+    }
+
+    /// Every oversight-subsystem value this exact incarnation owns: durable Auto-wake selection, the
+    /// one reserved automatic follow-up, failure suppression, per-lane snooze policy, and the
+    /// target-declared waiting context. `AgentSessionOversightState` documents each field's
+    /// lifetime; this is the subsystem's single mutation surface on the session.
+    ///
+    /// Only two transitions reach the observation signal, because only they change what an
+    /// overseeing caller can see: the reserved wake appearing or clearing, and snooze *content*
+    /// changing. Snooze task/token churn and the durable selection pair publish nothing here — the
+    /// selection surfaces republish through their own authoritative refresh.
+    var oversight = AgentSessionOversightState() {
+        didSet {
+            if let retired = oldValue.overseerActivation, retired != oversight.overseerActivation {
+                onOverseerActivationRetired?(self, retired)
+            }
+            if oldValue.hasPendingAutoWake != oversight.hasPendingAutoWake
+                || oldValue.autoWakeSnoozes != oversight.autoWakeSnoozes
+            {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    func noteMonitorObservationInputsChanged() {
+        invalidatePeriodicIdleSpanIfLocallyBlocked()
+        monitorObservationSignal.send(())
+    }
+
+    func invalidatePeriodicIdleSpanIfLocallyBlocked() {
+        guard oversight.periodicIdleSince != nil,
+              !AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
+        oversight.invalidatePeriodicIdleSpan()
+    }
+
+    var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
+    var queuedMCPElicitationRequests: [AgentMCPElicitationRequest] = []
+    var transcriptViewportState: AgentTranscriptViewportState = .liveBottom
+    var transcriptAutoFollowArmingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState = .armed
+    var askUserContinuation: CheckedContinuation<AgentAskUserResponse, Error>?
+    var askUserTimeoutTask: Task<Void, Never>?
+    var pendingAskUserTimeoutGeneration: UInt64 = 0
+    var hasPendingQuestionUI: Bool {
+        pendingAskUser != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
+    }
+
+    var applyEditsApprovalSubscriptionID: UUID?
+    var applyEditsApprovalSubscriptionTask: Task<Void, Never>?
+    var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
+    var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    /// External MCP control attachment. Its presence and effective task label determine whether this
+    /// exact session may act as an oversight observer.
+    var mcpControlContext: AgentModeViewModel.AgentMCPControlContext? {
+        didSet {
+            if mcpControlContext != nil { oversight.overseerActivation = nil }
+            guard oldValue?.taskLabelKind != mcpControlContext?.taskLabelKind
+                || (oldValue == nil) != (mcpControlContext == nil)
+            else {
+                return
+            }
+            AgentSessionLinkCandidateReadinessSignal.didChange()
+        }
+    }
+
+    var mcpStateObservationCancellable: AnyCancellable?
+    var mcpControlCleanupTask: Task<Void, Never>?
+    var mcpControlActivationGeneration: UInt64 = 0
+    private(set) var codexComputerUseOwnershipTransitionHolds: Set<UUID> = []
+    var codexComputerUseRevocationDepth = 0
+
+    /// A scoped eligibility fence, not link authority. Independent ownership transitions cannot
+    /// release each other's hold, and a rebound endpoint still releases its captured session.
+    func holdCodexComputerUseAdmission() -> @MainActor () -> Void {
+        let token = UUID()
+        codexComputerUseOwnershipTransitionHolds.insert(token)
+        return { [weak self] in self?.codexComputerUseOwnershipTransitionHolds.remove(token) }
+    }
+
+    var mcpFollowUpRunPendingUpdatedAt: Date?
+    var mcpFollowUpRunPending: Bool = false {
+        didSet {
+            if oldValue != mcpFollowUpRunPending {
+                mcpFollowUpRunPendingUpdatedAt = Date()
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    var isMCPInstructionDispatchInProgress: Bool = false
+    /// Whether this session was originally created by an MCP client.
+    var isMCPOriginated: Bool = false {
+        didSet {
+            if isMCPOriginated { oversight.overseerActivation = nil }
+            if oldValue != isMCPOriginated { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
+    /// Lifetime classification for sessions created, controlled, parented, or pending activation through MCP.
+    /// A nonzero activation generation remains authoritative after live control is released.
+    var isMCPRelated: Bool {
+        parentSessionID != nil
+            || mcpControlContext != nil
+            || isMCPOriginated
+            || mcpControlActivationGeneration != 0
+    }
+
+    /// Persisted logical-root to worktree bindings for this Agent session.
+    var worktreeBindings: [AgentSessionWorktreeBinding] = []
+    /// Persisted resumable worktree-merge operations for this Agent session.
+    var worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
+    /// Permission profile for the current session. Set to `.mcpSafeDefaults`
+    /// when MCP control is active, `.userConfigured` otherwise.
+    var permissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
+
+    typealias PendingInstruction = AgentRunPendingInstruction
+
+    /// An ACP fallback handed to the scheduled-start task but not yet accepted by a provider.
+    /// Stop owns every queued local recovery payload until that start is accepted or withdrawn.
+    struct ScheduledACPFollowUp {
+        struct QueuedInstruction {
+            let instruction: PendingInstruction
+            let stopFence: AgentRunStartStopFence
+        }
+
+        let id: UUID
+        let instruction: PendingInstruction
+        let stopFence: AgentRunStartStopFence
+        var queuedInstructions: [QueuedInstruction] = []
+    }
+
+    var scheduledACPFollowUp: ScheduledACPFollowUp?
+
+    /// Instruction queue for when user sends while agent is not waiting (shared across all runners)
+    var pendingInstructions: [PendingInstruction] = [] {
+        didSet {
+            if oldValue.count != pendingInstructions.count {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    let codexSteerAckTracker = CodexSteerAckTracker()
+
+    /// Claude-only steering queue — carries draft text for restoration on cancel/failure
+    struct ClaudeSteeringInstruction: Equatable, Identifiable {
+        let id: UUID
+        /// The Claude run this steering message was queued against.
+        let targetRunID: UUID?
+        /// The Claude runner attempt this steering message was queued against.
+        let targetRunAttemptID: UUID?
+        /// The text we actually send to the provider (may include workflow wrapping, etc.)
+        let providerText: String
+        let attachments: [AgentImageAttachment]
+        let taggedFileAttachments: [AgentTaggedFileAttachment]
+        /// The original user-typed text to restore into the composer on failure/cancel.
+        let draftText: String
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        let optimisticUserItemID: UUID?
+        let createdAt: Date
+        /// Claude turn completions protected by this accepted steering instruction.
+        var supersedingProtectedTurnIDs: Set<UUID> = []
+        var skipsSlashExpansion = false
+    }
+
+    var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
+        didSet {
+            if oldValue.count != pendingClaudeSteeringInstructions.count {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
+    var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
+    /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
+    var claudeSteeringFlushTask: Task<Void, Never>?
+
+    /// ACP steering queue — carries text accepted for serialized live steering.
+    struct ACPSteeringManagedContext {
+        let sink: AgentSessionLinkManagedSteerSink
+        let attributedItemID: UUID
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let attribution: AgentCrossSessionAttribution?
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            endpoint: DomainAgentSessionLinkEndpointIdentity,
+            attribution: AgentCrossSessionAttribution?
+        ) {
+            self.sink = sink
+            self.attributedItemID = attributedItemID
+            self.endpoint = endpoint
+            self.attribution = attribution
+        }
+
+        init(
+            sink: AgentSessionLinkManagedSteerSink,
+            attributedItemID: UUID,
+            candidate: AgentSessionLinkEndpointCandidate,
+            attribution: AgentCrossSessionAttribution
+        ) {
+            self.init(
+                sink: sink, attributedItemID: attributedItemID,
+                endpoint: candidate.domainEndpoint, attribution: attribution
+            )
+        }
+    }
+
+    struct ACPSteeringInstruction: Identifiable {
+        let id: UUID
+        /// The ACP process run this steering message was queued against.
+        let targetRunID: UUID?
+        /// The ACP runner attempt this steering message was queued against.
+        let targetRunAttemptID: UUID?
+        /// The steering text we actually send to the provider (may include workflow wrapping, etc.)
+        let providerText: String
+        /// The active ACP prompt's user text when this steering was queued. Some
+        /// providers drop the cancelled prompt from provider history, so the flush
+        /// re-bundles this with `providerText` after session/cancel.
+        let interruptedPromptProviderText: String?
+        let attachments: [AgentImageAttachment]
+        let taggedFileAttachments: [AgentTaggedFileAttachment]
+        /// The original user-typed text to restore into the composer on failure/cancel.
+        let draftText: String
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        let optimisticUserItemID: UUID?
+        let createdAt: Date
+        var managed: ACPSteeringManagedContext?
+        var skipsSlashExpansion = false
+    }
+
+    /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.
+    /// A queued-follow-up receipt is already settled and no longer lives in this steering queue.
+    func settlePendingManagedACPSteeringAsNotAccepted() {
+        for instruction in pendingACPSteeringInstructions {
+            guard let managed = instruction.managed else { continue }
+            let candidate = managed.endpoint
+            if tabID == candidate.tabID,
+               activeAgentSessionID == candidate.sessionID,
+               persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration,
+               bindingTransitionGeneration == candidate.bindingTransitionGeneration,
+               let index = items.firstIndex(where: {
+                   $0.id == managed.attributedItemID
+                       && $0.crossSessionAttribution == managed.attribution
+               })
+            {
+                _ = removeItem(at: index)
+            }
+            managed.sink.resolve(.notAccepted(
+                message: "The ACP steer was withdrawn before the provider accepted it."
+            ))
+        }
+    }
+
+    var pendingACPSteeringInstructions: [ACPSteeringInstruction] = [] {
+        didSet {
+            if oldValue.count != pendingACPSteeringInstructions.count {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
+    var acpSteeringFlushTask: Task<Void, Never>?
+    /// Identifies the owner so a cancelled old flush cannot clear a successor task on unwind.
+    var acpSteeringFlushID: UUID?
+
+    /// Number of upcoming turnCompleted events that should be treated as intermediate
+    /// because we successfully queued a follow-up prompt during the same run.
+    var pendingSupersedingTurnCompletionsUpdatedAt: Date?
+    var pendingSupersedingTurnCompletions: Int = 0 {
+        didSet {
+            if oldValue != pendingSupersedingTurnCompletions {
+                pendingSupersedingTurnCompletionsUpdatedAt = Date()
+            }
+        }
+    }
+
+    struct CodexPendingAuthRetryTurn: Equatable {
+        /// Undecorated provider text, exactly as every other Codex buffer stores it.
+        var text: String
+        var images: [AgentImageAttachment]
+        var model: String?
+        var reasoningEffort: String?
+        var serviceTier: String?
+        var attachmentReservationID: UUID?
+        var expectedTurnID: String?
+        var auditTurnID: UUID?
+        var autoEffortApplied = false
+        var retryAttempted: Bool = false
+        /// Final monitoring identity composed for the original physical dispatch, if any.
+        var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
+        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
+        /// Accepted oversight claim from the original dispatch, retained so managed-auth replay can
+        /// attach the byte-equivalent supplement without acknowledging it twice.
+        var monitoringClaim: AgentSessionLinkOutboundPromptClaim?
+    }
+
+    enum CodexTurnKind: String {
+        case user
+        case compact
+        case review
+        case unknown
+    }
+
+    struct CodexHookGateBindingIdentity: Equatable {
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
+    }
+
+    struct CodexAuthoritativeTurnIdentity: Equatable {
+        let threadID: String
+        let turnID: String
+        let turnKind: CodexTurnKind
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
+        let runID: UUID?
+        let runAttemptID: UUID
+    }
+
+    struct CodexAnonymousTurnLiveness: Equatable {
+        let threadID: String
+        let turnKind: CodexTurnKind
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
+        let runID: UUID?
+        let runAttemptID: UUID
+    }
+
+    enum CodexFallbackOrigin: Equatable {
+        case manual
+        case mcp(attemptID: UUID)
+
+        var isMCP: Bool {
+            switch self {
+            case .mcp:
+                true
+            case .manual:
+                false
+            }
+        }
+    }
+
+    @MainActor
+    final class CodexDispatchSerialGate {
+        private var nextTicket: UInt64 = 0
+        private var servingTicket: UInt64 = 0
+        private var cancelledTickets: Set<UInt64> = []
+        private var waiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+
+        func issueTicket() -> UInt64 {
+            defer { nextTicket &+= 1 }
+            return nextTicket
+        }
+
+        func awaitTurn(_ ticket: UInt64) async -> Bool {
+            if cancelledTickets.remove(ticket) != nil {
+                advancePastCancelledTickets()
+                return false
+            }
+            if ticket == servingTicket {
+                return true
+            }
+            return await withCheckedContinuation { continuation in
+                waiters[ticket] = continuation
+            }
+        }
+
+        func finish(_ ticket: UInt64) {
+            guard ticket == servingTicket else { return }
+            servingTicket &+= 1
+            advancePastCancelledTickets()
+            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
+        }
+
+        func cancel(_ ticket: UInt64) {
+            if let waiter = waiters.removeValue(forKey: ticket) {
+                waiter.resume(returning: false)
+            }
+            cancelledTickets.insert(ticket)
+            guard ticket == servingTicket else { return }
+            advancePastCancelledTickets()
+            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
+        }
+
+        private func advancePastCancelledTickets() {
+            while cancelledTickets.remove(servingTicket) != nil {
+                servingTicket &+= 1
+            }
+        }
+    }
+
+    enum CodexFallbackReason: Equatable {
+        case activeWithoutAuthoritativeIdentity
+        case staleAuthoritativeIdentity
+        case nonSteerableTurn(kind: CodexTurnKind)
+        case noActiveTurn(failure: CodexAppServerClient.RequestFailure)
+        case expectedTurnMismatch(
+            expectedTurnID: String,
+            actualTurnID: String?,
+            failure: CodexAppServerClient.RequestFailure
+        )
+        case activeTurnNotSteerable(
+            turnKind: String?,
+            failure: CodexAppServerClient.RequestFailure
+        )
+    }
+
+    struct CodexFallbackSubmissionContext: Equatable {
+        let queueID: UUID
+        let providerText: String
+        let images: [AgentImageAttachment]
+        let taggedFileAttachments: [AgentTaggedFileAttachment]
+        let draftText: String
+        let optimisticUserItemID: UUID?
+        let origin: CodexFallbackOrigin
+        let dispatchTicket: UInt64?
+        var stopFence: AgentRunStartStopFence?
+        /// Explicit composer provenance; absent/internal contexts never inherit companion access.
+        var isLocalUserInput: Bool = false
+    }
+
+    struct CodexFallbackBlockingTurn: Equatable {
+        let threadID: String
+        let turnID: String
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
+        let runID: UUID?
+        let runAttemptID: UUID
+    }
+
+    struct CodexPendingSteerLifecycleReconciliation: Equatable {
+        let priorIdentity: CodexAuthoritativeTurnIdentity
+        let acceptedDispatchTurnID: String
+    }
+
+    enum CodexFallbackQueueState: Equatable {
+        case queued
+        case eligibleForSuccessor(completedTurnID: String)
+        case dispatching
+        case awaitingLifecycleStart
+        case lifecycleStarted
+    }
+
+    struct CodexFallbackQueueEntry: Equatable, Identifiable {
+        let id: UUID
+        let providerText: String
+        let images: [AgentImageAttachment]
+        let taggedFileAttachments: [AgentTaggedFileAttachment]
+        let model: String?
+        let reasoningEffort: String?
+        let serviceTier: String?
+        var autoEffortApplied = false
+        let attachmentReservationID: UUID?
+        let optimisticUserItemID: UUID?
+        let draftText: String
+        let origin: CodexFallbackOrigin
+        let fallbackReason: CodexFallbackReason
+        let originThreadID: String
+        let originControllerInstanceID: ObjectIdentifier
+        let originControllerGeneration: UUID
+        let originRunID: UUID
+        let originRunAttemptID: UUID
+        var blockingTurn: CodexFallbackBlockingTurn?
+        var state: CodexFallbackQueueState
+        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
+        var stopFence: AgentRunStartStopFence?
+    }
+
+    var codexPendingTurnKind: CodexTurnKind?
+    var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn?
+    var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity?
+    var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
+    var codexRoutingObservedTurnID: String?
+    var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
+    var codexFallbackQueue: [CodexFallbackQueueEntry] = [] {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var codexFallbackDispatchInFlight: CodexFallbackQueueEntry? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    /// Bridges queued follow-ups to a hook-gate owner's turn for as long as that turn has no
+    /// settled identity of its own. Whichever of the accepted `turn/start` receipt or the
+    /// lifecycle start arrives first supplies the value — they race, and the queue has to be
+    /// bound by then either way. It is transient by design: the turn's terminal event either
+    /// upgrades it to the identity-derived blocker or resolves the queue outright.
+    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn?
+    var codexFallbackPumpTask: Task<Void, Never>? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var codexFallbackSuccessorRetryTask: Task<Void, Never>?
+    let codexDispatchSerialGate = CodexDispatchSerialGate()
+
+    /// Instruction steering coordination state
+    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var instructionTimeoutTask: Task<Void, Never>?
+    var instructionWaitID: UUID?
+
+    /// Agent run — transient run-attempt lifecycle/settlement state is owned by
+    /// the extracted `AgentRunAttemptLifecycle` facade. Run identity is
+    /// read-only here; mutation happens only through the named operations
+    /// below (`installRunID`, `clearRunID(ifCurrent:)`) or the
+    /// host-authoritative `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
+    let runLifecycle = AgentRunAttemptLifecycle()
+
+    var runID: UUID? {
+        runLifecycle.currentRunID
+    }
+
+    /// Installs the provider process run identity for a starting or resumed
+    /// run. The installing path owns the identity until it is cleared.
+    func installRunID(_ runID: UUID) {
+        runLifecycle.installRunID(runID)
+    }
+
+    /// Clears the run ID only when it still matches the caller's run, so a
+    /// stale cleanup cannot clear a successor run's identity.
+    @discardableResult
+    func clearRunID(ifCurrent runID: UUID) -> Bool {
+        runLifecycle.clearRunID(ifCurrent: runID)
+    }
+
+    var activeRunOwnership: AgentRunOwnership? {
+        runLifecycle.activeOwnership
+    }
+
+    var activeRunAttemptID: UUID? {
+        activeRunOwnership?.attemptID
+    }
+
+    /// Acceptance installs this before provider branching. It only forwards an observational wake.
+    var observerWaitRelease: (runID: UUID?, attemptID: UUID?, task: Task<Void, Never>)?
+
+    func awaitObserverWaitRelease(runID: UUID, runAttemptID: UUID?) async throws {
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+        while let release = observerWaitRelease,
+              release.runID == runID, release.attemptID == runAttemptID
+        {
+            await release.task.value
+            try Task.checkCancellation()
+            guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+            // Input accepted during this suspension installs a newer forwarding barrier.
+            if observerWaitRelease?.task == release.task { break }
+        }
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+    }
+
+    var activeRunLiveness: AgentRunLivenessSnapshot? {
+        runLifecycle.liveness
+    }
+
+    var provider: HeadlessAgentProvider?
+    var agentTask: Task<Void, Never>? {
+        didSet {
+            // Latch the actual producer synchronously, while its exact composer admission is held.
+            // ACP may install this after cancellation during awaited startup: the tombstone still
+            // owns that exact composer claim. Sampling after start could capture a rebound user's task.
+            guard let agentTask, var attempt = oversight.pendingAutoWake,
+                  attempt.isPeriodic,
+                  attempt.phase == .preparingDispatch || attempt.phase == .cancelledBeforeDispatch,
+                  attempt.periodicProducerTask == nil,
+                  let submissionID = attempt.periodicComposerAttemptID,
+                  activeComposerSubmitAttempt?.id == submissionID else { return }
+            attempt.periodicProducerTask = agentTask
+            oversight.pendingAutoWake = attempt
+        }
+    }
+
+    // Settings (per-tab)
+
+    var selectedAgent: AgentProviderKind = .claudeCode {
+        didSet {
+            // Usage recorded under another provider must never be reported as this provider's load.
+            if selectedAgent != oldValue {
+                selectedClaudeEffortRaw = nil
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            }
+        }
+    }
+
+    var selectedModelRaw: String = AgentModel.defaultModel.rawValue {
+        didSet {
+            // A different model can have a different window; wait for its own report.
+            if selectedModelRaw != oldValue {
+                if selectedAgent.usesClaudeTooling,
+                   let effort = ClaudeModelSpecifier(raw: selectedModelRaw).explicitEffortLevel
+                {
+                    selectedClaudeEffortRaw = effort.rawValue
+                }
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            }
+        }
+    }
+
+    var selectedReasoningEffortRaw: String?
+    /// Session-owned Claude effort; shared preferences only seed a missing selection.
+    var selectedClaudeEffortRaw: String?
+    var persistedReasoningEffortRaw: String? {
+        selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
+    }
+
+    private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
+    private var nextACPModelParameterSelectionRevision: UInt64 = 0
+    var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
+        didSet {
+            let oldByIdentity = Self.acpModelParameterSelectionsByIdentity(oldValue)
+            let newByIdentity = Self.acpModelParameterSelectionsByIdentity(acpModelParameterSelections)
+            for identity in Set(oldByIdentity.keys).union(newByIdentity.keys)
+                where oldByIdentity[identity] != newByIdentity[identity]
+            {
+                advanceACPModelParameterSelectionRevision(for: identity)
+            }
+        }
+    }
+
+    var autoEditEnabled: Bool = true
+    /// Volatile ownership for an accepted explicit write. This is intentionally
+    /// separate from durable selections so stale asynchronous rollbacks cannot
+    /// overwrite a newer selection, including a normalized no-op write.
+    func recordAcceptedACPModelParameterWrite(_ selections: [ACPModelParameterSelection]) {
+        for selection in ACPModelParameterSelection.normalized(selections) {
+            advanceACPModelParameterSelectionRevision(for: selection.identity)
+        }
+    }
+
+    func acpModelParameterSelectionRevision(for identity: ACPModelParameterIdentity) -> UInt64 {
+        acpModelParameterSelectionRevisionByIdentity[identity] ?? 0
+    }
+
+    private func advanceACPModelParameterSelectionRevision(for identity: ACPModelParameterIdentity) {
+        nextACPModelParameterSelectionRevision &+= 1
+        acpModelParameterSelectionRevisionByIdentity[identity] = nextACPModelParameterSelectionRevision
+    }
+
+    private static func acpModelParameterSelectionsByIdentity(
+        _ selections: [ACPModelParameterSelection]
+    ) -> [ACPModelParameterIdentity: ACPModelParameterSelection] {
+        selections.reduce(into: [ACPModelParameterIdentity: ACPModelParameterSelection]()) { result, selection in
+            result[selection.identity] = selection
+        }
+    }
+
+    var selectedModel: AgentModel {
+        get { AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel }
+        set { selectedModelRaw = newValue.rawValue }
+    }
+
+    /// Draft text for input field
+    var draftText: String = "" {
+        didSet {
+            guard draftText != oldValue else { return }
+            draftMutationGeneration &+= 1
+        }
+    }
+
+    private(set) var draftMutationGeneration: UInt64 = 0
+
+    /// Selected workflow template for next message
+    var selectedWorkflow: AgentWorkflowDefinition?
+    var userWorkflowSelectionMutationGeneration: UInt64 = 0
+
+    // Pending image attachments for the next user turn
+    @Published var pendingImageAttachments: [AgentImageAttachment] = []
+    @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
+    var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
+    var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
+
+    /// Provider session ID for resumption (e.g., Claude CLI session_id)
+    var providerSessionID: String?
+
+    var providerCleanupHandle: ProviderConversationCleanupHandle?
+    var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
+    var automationTurnAudit: [AgentAutomationTurnAudit] = []
+
+    func updateAutomationAudit(
+        turnID: UUID,
+        _ update: (inout AgentAutomationTurnAudit) -> Void
+    ) {
+        guard let index = automationTurnAudit.lastIndex(where: { $0.turnID == turnID }) else { return }
+        update(&automationTurnAudit[index])
+        isDirty = true
+    }
+
+    func appendAutomationAudit(_ record: AgentAutomationTurnAudit) {
+        automationTurnAudit.append(record)
+        automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
+        isDirty = true
+    }
+
+    var pendingNonCodexUserInputTokenQueue: [Int] = []
+    var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
+
+    // Codex native session identifiers and metadata
+    var codexConversationID: String?
+    var codexRolloutPath: String?
+    var codexModel: String?
+    var codexReasoningEffort: String?
+    @Published var codexContextUsage: AgentContextUsage? = nil
+    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil {
+        didSet {
+            if contextUsageSnapshot == nil {
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            } else if contextUsageSnapshot?.used == nil {
+                // No stored count is left for a vouch to describe.
+                vouchedContextCount = nil
+            }
+        }
+    }
+
+    var contextCompactedAt: Date? {
+        didSet {
+            // A compaction invalidates the count; the window is unchanged.
+            if contextCompactedAt != oldValue { vouchedContextCount = nil }
+        }
+    }
+
+    /// A context figure and the provider whose own live usage report produced it.
+    struct ContextUsageVouch: Equatable {
+        let agent: AgentProviderKind
+        let tokens: Int
+    }
+
+    /// The context count and window the selected provider's own live usage reports produced, for
+    /// session-link oversight only (the context ring is unaffected). A stored figure is reported only
+    /// while it equals its vouch, so any later write with a different value invalidates it. A provider
+    /// change clears both, a compaction clears the count, and clearing the usage clears both. Not
+    /// persisted, so restored figures are never reported as current load.
+    private(set) var vouchedContextCount: ContextUsageVouch? {
+        didSet {
+            contextCountVouchRevision &+= 1
+            if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
+            noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
+            selfCompactNativeCompletion?.noteVouchedContextCount(vouchedContextCount?.tokens)
+        }
+    }
+
+    private(set) var vouchedContextWindow: ContextUsageVouch? {
+        didSet { noteContextVouchTransition(from: oldValue, to: vouchedContextWindow) }
+    }
+
+    /// How the report that vouched the count obtained it: `exact` for a reported occupancy count,
+    /// `bestEffort` for a prompt-count fallback. Estimators may relabel the stored snapshot later
+    /// without changing its figures (Claude's end-of-turn rebuild marks it `bestEffort`; a window-only
+    /// ACP update does too), so oversight reports how the vouched figure was produced instead.
+    private(set) var vouchedContextCountConfidence: ContextUsageSnapshotConfidence?
+
+    private var contextVouchSignalBatchDepth = 0
+    private var contextVouchSignalPending = false
+
+    /// A vouch appearing or disappearing changes what oversight exports even when no other
+    /// observation input moved (a model switch or compaction on an idle target withdraws one; a report
+    /// that re-confirms an unchanged stored figure establishes one), so it republishes the snapshot.
+    /// A vouch moving from one figure to another rides the report that wrote the figure.
+    ///
+    /// Invariant: every path that moves a vouch between figures does so while applying the report that
+    /// wrote the new figure into `contextUsageSnapshot`, so presence changes (and label changes, see
+    /// `noteLiveContextUsageReport`) are the only vouch-only changes to the export.
+    private func noteContextVouchTransition(from oldValue: ContextUsageVouch?, to newValue: ContextUsageVouch?) {
+        guard (oldValue == nil) != (newValue == nil) else { return }
+        noteContextExportChangedWithoutSnapshotWrite()
+    }
+
+    private func noteContextExportChangedWithoutSnapshotWrite() {
+        if contextVouchSignalBatchDepth > 0 {
+            contextVouchSignalPending = true
+        } else {
+            noteMonitorObservationInputsChanged()
+        }
+    }
+
+    /// Withdraws the count vouch (the stored figure stays in the ring) and re-evaluates the window
+    /// vouch against `modelContextWindow`, republishing at most once for both.
+    func withdrawContextCountVouch(notingWindow modelContextWindow: Int?) {
+        batchingContextVouchSignals {
+            vouchedContextCount = nil
+            noteLiveContextUsageReport(contextUsedTokens: nil, promptTokens: nil, modelContextWindow: modelContextWindow)
+        }
+    }
+
+    /// Applies several vouch changes and republishes at most once, after all of them.
+    private func batchingContextVouchSignals(_ changes: () -> Void) {
+        contextVouchSignalBatchDepth += 1
+        changes()
+        contextVouchSignalBatchDepth -= 1
+        guard contextVouchSignalBatchDepth == 0, contextVouchSignalPending else { return }
+        contextVouchSignalPending = false
+        noteMonitorObservationInputsChanged()
+    }
+
+    /// The model epoch an ACP `usage_update` occupancy report belongs to, marked for the current
+    /// turn only. Consumed at turn finalization and cleared when a turn begins; kept on the session
+    /// so it can never outlive or be inherited across session objects.
+    struct ContextOccupancyEpoch: Equatable {
+        let agent: AgentProviderKind
+        let modelRaw: String
+    }
+
+    var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
+
+    /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
+    /// a restore can prove no report touched the count since it was withdrawn.
+    private var contextCountVouchRevision: UInt64 = 0
+
+    /// A count vouch withdrawn at a compaction dispatch, with the revision the withdrawal produced.
+    struct WithdrawnContextCountVouch {
+        let vouch: ContextUsageVouch?
+        fileprivate let confidence: ContextUsageSnapshotConfidence?
+        fileprivate let revision: UInt64
+    }
+
+    /// True while an overseer-requested compaction turn runs on a runtime without a verified
+    /// compaction signal (ACP). Its billed prompt count describes the pre-compaction context, so
+    /// only an occupancy report may vouch for a count until the turn ends.
+    private(set) var contextCountVouchAwaitsOccupancyReport = false
+
+    /// Dispatching a compaction invalidates the count (the window is unchanged) and holds off
+    /// billed-count vouching for the rest of that turn. Returns the withdrawn vouch so a dispatch
+    /// that is refused before anything is sent can put it back.
+    @discardableResult
+    func beginCompactionContextCountSuspension() -> WithdrawnContextCountVouch {
+        let withdrawn = vouchedContextCount
+        let withdrawnConfidence = vouchedContextCountConfidence
+        vouchedContextCount = nil
+        contextCountVouchAwaitsOccupancyReport = true
+        return WithdrawnContextCountVouch(
+            vouch: withdrawn,
+            confidence: withdrawnConfidence,
+            revision: contextCountVouchRevision
+        )
+    }
+
+    func endCompactionContextCountSuspension() {
+        contextCountVouchAwaitsOccupancyReport = false
+    }
+
+    /// When an ACP compaction that ended its turn instantly (fire-and-forget) stops being protected.
+    ///
+    /// Until then the provider may still be compacting in the background, where the session's next
+    /// prompt cancels the work. Delivery readiness, the published `idle_for_send`, and every
+    /// automatic wake treat the session as not idle for the whole span, so a parked `when_sendable`
+    /// send, another overseer, or an Auto-wake cannot start that cancelling turn. The session's own
+    /// user is never held. Every transition — including expiry — publishes an observation change,
+    /// which is what lets parked work resume the moment the hold lifts.
+    private(set) var acpBackgroundCompactionSettlesAt: Date? {
+        didSet {
+            if oldValue != acpBackgroundCompactionSettlesAt {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    private var acpBackgroundCompactionSettleTask: Task<Void, Never>?
+
+    /// True while a fire-and-forget ACP compaction may still be running in the provider's background.
+    var isSettlingACPBackgroundCompaction: Bool {
+        guard let deadline = acpBackgroundCompactionSettlesAt else { return false }
+        return deadline > Date()
+    }
+
+    /// Holds automatic and overseer deliveries off this session for `duration`, then lifts the hold
+    /// and publishes the change. A newer hold replaces an older one.
+    func beginACPBackgroundCompactionSettle(duration: TimeInterval) {
+        acpBackgroundCompactionSettleTask?.cancel()
+        let deadline = Date().addingTimeInterval(max(0, duration))
+        acpBackgroundCompactionSettlesAt = deadline
+        acpBackgroundCompactionSettleTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled,
+                  let self,
+                  acpBackgroundCompactionSettlesAt == deadline
+            else { return }
+            acpBackgroundCompactionSettleTask = nil
+            acpBackgroundCompactionSettlesAt = nil
+        }
+    }
+
+    /// Lifts the hold early: a new turn already started (and would have cancelled any background
+    /// compaction), so holding further protects nothing.
+    func endACPBackgroundCompactionSettle() {
+        acpBackgroundCompactionSettleTask?.cancel()
+        acpBackgroundCompactionSettleTask = nil
+        acpBackgroundCompactionSettlesAt = nil
+    }
+
+    /// Restores a vouch withdrawn by a compaction that never reached the provider, but only if no
+    /// usage report has vouched for or withdrawn the count since, and it still describes the stored
+    /// count for the same provider.
+    func restoreContextCountVouchAfterUnsentCompaction(_ withdrawn: WithdrawnContextCountVouch) {
+        guard let vouch = withdrawn.vouch,
+              contextCountVouchRevision == withdrawn.revision,
+              vouchedContextCount == nil,
+              vouch.agent == selectedAgent,
+              contextUsageSnapshot?.used == vouch.tokens
+        else { return }
+        vouchedContextCount = vouch
+        vouchedContextCountConfidence = withdrawn.confidence
+    }
+
+    /// Records which figures a live usage report from the selected provider vouches for. The report's
+    /// context count (or, only when it carried none, its prompt count) vouches for the stored count
+    /// only if they match; a conflicting count (for example one the estimator rejected and replaced
+    /// with a carried-forward or smaller fallback value) withdraws the vouch. The window works the
+    /// same way. Reports without a positive count or window (output-only usage) change nothing, so a
+    /// reported zero stays unvouched, matching the estimators' "zero means absent" convention.
+    func noteLiveContextUsageReport(contextUsedTokens: Int?, promptTokens: Int?, modelContextWindow: Int?) {
+        let reportsOccupancy = (contextUsedTokens ?? 0) > 0
+        let reportedCount = reportsOccupancy ? contextUsedTokens : promptTokens
+        batchingContextVouchSignals {
+            if let reportedCount, reportedCount > 0 {
+                if contextUsageSnapshot?.used == reportedCount {
+                    let previousLabel = vouchedContextCount == nil ? nil : vouchedContextCountConfidence
+                    vouchedContextCount = ContextUsageVouch(agent: selectedAgent, tokens: reportedCount)
+                    vouchedContextCountConfidence = reportsOccupancy ? .exact : .bestEffort
+                    // The same figure re-vouched by a different kind of report changes only its label.
+                    if let previousLabel, previousLabel != vouchedContextCountConfidence {
+                        noteContextExportChangedWithoutSnapshotWrite()
+                    }
+                } else {
+                    vouchedContextCount = nil
+                }
+            }
+            if let window = modelContextWindow, window > 0 {
+                vouchedContextWindow = contextUsageSnapshot?.window == window
+                    ? ContextUsageVouch(agent: selectedAgent, tokens: window)
+                    : nil
+            }
+        }
+    }
+
+    var codexNeedsReconnect: Bool = false
+    var codexNativeStartupDisposition: AgentModeViewModel.CodexNativeStartupDisposition?
+    var codexResumeTimeoutState: AgentModeViewModel.CodexResumeTimeoutState = .init()
+    // Like resume timeout accounting, this is session-scoped. A changed reference can resume;
+    // repeated attempts against the same oversized reference must not spawn another process.
+    var codexOversizedResumeTarget: AgentModeViewModel.CodexOversizedResumeTarget?
+    var codexToolPreferencesGeneration: Int = 0
+    var codexController: (any CodexSessionControlling)? {
+        didSet {
+            let oldIdentity = oldValue.map { ObjectIdentifier($0) }
+            let newIdentity = codexController.map { ObjectIdentifier($0) }
+            guard oldIdentity != newIdentity else { return }
+            resetCodexHookGateBinding()
+            codexControllerGeneration = UUID()
+            codexAuthoritativeActiveTurn = nil
+            codexAnonymousActiveTurn = nil
+            codexRoutingObservedTurnID = nil
+            // A replaced controller can never deliver the lifecycle of a turn the previous
+            // one accepted, so a surviving blocker would gate the fallback pump on an event
+            // that is never coming. Disposition of the entries themselves belongs to the
+            // coordinator, which retires the queue with the controller.
+            codexFallbackHookGateOwnerBlocker = nil
+        }
+    }
+
+    private(set) var codexControllerGeneration = UUID()
+    /// The open session-link catalog-repair cycle, if any: the controller generation a stuck
+    /// catalog projection was observed against.
+    ///
+    /// `nil` is no cycle. Otherwise `cycle.state(currentControllerGeneration:)` says whether this
+    /// cycle's single controller replacement is still owed or was already spent by an unrelated
+    /// reconnect; see `AgentSessionLinkCodexCatalogRepair.Cycle` for why a generation rather than a
+    /// Boolean is what makes that distinction expressible.
+    ///
+    /// Only five paths write `nil`, and all of them mean the cycle is over rather than spent: an
+    /// exact current positive catalog, exact outbound loss, a provider switch away from `.codexExec`,
+    /// the tool being disabled before the cycle was spent, and the stranded-run recovery that
+    /// retires a run whose consuming reconnect left no controller behind. It must never be cleared
+    /// from `codexController.didSet` or generic controller teardown.
+    ///
+    /// Never persisted: it describes a live process-local controller generation.
+    var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
+    /// The permission profile the current Codex controller was created with.
+    /// Used to detect when MCP control changes require controller recycling.
+    var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?
+    /// The task label kind the current Codex controller was created with.
+    /// Used to detect when role-specific native tool overrides require controller recycling.
+    var codexControllerTaskLabelKind: AgentModelCatalog.TaskLabelKind?
+    /// The launch/execution directory pair the current Codex controller was created with.
+    /// Controller replacement key: the provider is recycled when either directory changes,
+    /// e.g. when a session worktree binding moves the execution cwd.
+    var codexControllerWorkspacePaths: CodexRuntimeWorkspacePaths?
+    struct CodexControllerFeatureState: Equatable {
+        var computerUseEnabled: Bool
+        var goalSupportEnabled: Bool
+        var reasoningSummariesEnabled: Bool
+        var memoriesEnabled: Bool
+        var capabilities: CodexCapabilitySettings = .disabled
+    }
+
+    // In-memory authority for this chat, never written to AgentSession persistence. Runtime
+    // reconnects and ownership transitions may reuse it; session shutdown and explicit off revoke it.
+    var codexComputerUseArmingRequestID: UUID?
+    var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?
+    var codexControllerFeatureState: CodexControllerFeatureState?
+    var isCodexComputerUseArmed: Bool {
+        pendingCodexComputerUseActivation != nil
+    }
+
+    var claudeController: (any NativeAgentRuntimeControlling)?
+    var acpController: ACPAgentSessionController?
+
+    var codexEventTask: Task<Void, Never>?
+    var codexEventTaskRunID: UUID?
+    var codexLastEventAt: Date?
+    var codexWatchdogState: AgentModeViewModel.CodexWatchdogState = .init()
+    var codexNativeToolLiveness: AgentModeViewModel.CodexNativeToolLivenessState = .init()
+    /// Turn IDs started during the current run attempt, used to filter stale turnCompleted events.
+    var claudeExpectedTurnIDs: Set<UUID> = []
+    var hasReconciledPersistedCodexCommandStatus: Bool = false
+    var activeReasoningItemID: UUID?
+    var reasoningItemIDsByGroupID: [String: UUID] = [:]
+    var pendingAssistantDelta: String = ""
+    var pendingCodexAssistantScope: CodexNativeSessionController.ItemScope?
+    var codexAssistantRowIDByScope: [CodexNativeSessionController.ItemScope: UUID] = [:]
+    var assistantDeltaFlushTask: Task<Void, Never>?
+    var assistantDeltaTaskGeneration: UInt64 = 0
+    var assistantDeltaFlushGeneration: UInt64 = 0
+    var providerTerminalDrainGeneration: UInt64 {
+        runLifecycle.providerTerminalDrainGeneration
+    }
+
+    func bumpProviderTerminalDrainGeneration() {
+        runLifecycle.bumpProviderTerminalDrainGeneration()
+    }
+
+    var terminalCommitInProgress: Bool {
+        runLifecycle.terminalCommitInProgress
+    }
+
+    var lastTerminalCommitRevision: AgentRunTerminalCommitRevision? {
+        runLifecycle.lastTerminalCommitRevision
+    }
+
+    var lastTerminalPublicationResult: AgentRunTerminalPublicationResult? {
+        runLifecycle.lastTerminalPublicationResult
+    }
+
+    var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
+        runLifecycle.terminalResources
+    }
+
+    /// Handoff payload (injected into provider-facing text on first user send).
+    /// Cleared only after the provider accepts the turn.
+    var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
+        didSet {
+            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    /// Session-owned self-compaction state. No restored attempt is executable.
+    var selfCompactState = AgentSelfCompactState() {
+        didSet {
+            if oldValue != selfCompactState { isDirty = true }
+            noteMonitorObservationInputsChanged()
+        }
+    }
+
+    var selfCompactPersistenceWarning = false
+
+    /// Runtime-only fence: a same-key MCP retry cannot claim a scheduled receipt until the
+    /// original reservation's required save has completed.
+    var selfCompactAdmissionPendingID: UUID?
+
+    /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
+    /// A restored attempt has no executable fence and cannot resume dispatch.
+    var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
+
+    @MainActor
+    func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard selfCompactDispatchIsCurrent?() != false else {
+            selfCompactNativeCompletion?.cancelUnattemptedNoteIfOwnerLost(dispatchID)
+            return false
+        }
+        return true
+    }
+
+    /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
+    var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator? {
+        didSet {
+            if oldValue !== selfCompactNativeCompletion { oldValue?.cancelRuntimeWork() }
+        }
+    }
+
+    /// Transcript item IDs present when an ACP self-compact command was issued. Rows added after
+    /// this set are the command turn. Not persisted.
+    var selfCompactACPCommandItemIDs: Set<UUID>?
+
+    var isProviderSelectionLocked: Bool {
+        hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
+    }
+
+    // Persistence
+    /// Synchronous derived-index maintenance for the window owning this live object.
+    var persistentSessionBindingDidChange: (() -> Void)?
+    private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
+    var activeAgentSessionID: UUID? {
+        persistentSessionBindingIdentity?.sessionID
+    }
+
+    private(set) var bindingTransitionGeneration: UInt64 = 0
+    private(set) var bindingTransitionInProgress: Bool = false {
+        didSet {
+            if oldValue != bindingTransitionInProgress {
+                noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
+                if !bindingTransitionInProgress { onBindingTransitionSettled?(self) }
+            }
+        }
+    }
+
+    private(set) var persistenceMutationGeneration: UInt64 = 0
+    var saveRequestGeneration: UInt64 = 0
+    var parentSessionID: UUID? {
+        didSet {
+            if parentSessionID != nil { oversight.overseerActivation = nil }
+            if (oldValue == nil) != (parentSessionID == nil) { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
+    var createdByOverseerSessionID: UUID? {
+        didSet {
+            if createdByOverseerSessionID != nil { oversight.overseerActivation = nil }
+        }
+    }
+
+    /// Mutable organizational placement (see `AgentSession.organizationalParentID`).
+    var organizationalParentID: UUID?
+    var delegationScopeID: UUID?
+
+    var hasLoadedPersistedState: Bool = false {
+        didSet {
+            if oldValue != hasLoadedPersistedState {
+                noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
+            }
+        }
+    }
+
+    func clearAgentSessionLinkWaitingOnAfterAcceptedTurn() {
+        guard oversight.waitingOn != nil else { return }
+        oversight.waitingOn = nil
+        monitorObservationSignal.send(())
+    }
+
+    private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
+    private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
+    /// Binding-qualified hydration proof for automatic oversight restoration.
+    private(set) var restorationReadiness: AgentSessionRestorationReadiness = .unbound {
+        willSet {
+            if newValue != restorationReadiness { objectWillChange.send() }
+        }
+        didSet {
+            if oldValue != restorationReadiness {
+                noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
+            }
+        }
+    }
+
+    var persistedLoadTask: Task<Void, Never>?
+    var lastActivityAt: Date = .init()
+    var lastUserMessageAt: Date?
+    var lastCommandOutputSaveAt: Date?
+    var saveDebounceTask: Task<Void, Never>?
+    var isDirty: Bool = false {
+        didSet {
+            if isDirty {
+                persistenceMutationGeneration &+= 1
+            }
+        }
+    }
+
+    var sourceItemsRevision: Int = 0
+    var pendingSourceItemsMutationSummary: AgentModeViewModel.PendingSourceItemsMutationSummary?
+    var pendingDerivedTranscriptRefreshReason: AgentModeViewModel.DerivedTranscriptRefreshReason?
+    var derivedTranscriptRefreshTask: Task<Void, Never>?
+    var derivedTranscriptRefreshGeneration: UInt64 = 0
+    var derivedTranscriptSyncState: AgentModeViewModel.DerivedTranscriptSyncState?
+    var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
+    var pendingCommandRunningFlushTask: Task<Void, Never>?
+    var pendingCommandRunningFlushUsesLiveOutputDelay: Bool = false
+    var bashLiveExecutionByKey: [String: AgentModeViewModel.BashLiveExecutionState] = [:]
+    var bashLiveExecutionKeyByTranscriptItemID: [UUID: String] = [:]
+
+    /// Sequence tracking
+    var nextSequenceIndex: Int = 0
+
+    var bashLiveExecutionByTranscriptItemID: [UUID: AgentModeViewModel.BashLiveExecutionState] {
+        var result: [UUID: AgentModeViewModel.BashLiveExecutionState] = [:]
+        for (itemID, key) in bashLiveExecutionKeyByTranscriptItemID {
+            guard let state = bashLiveExecutionByKey[key] else { continue }
+            result[itemID] = state
+        }
+        return result
+    }
+
+    init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
+        self.tabID = tabID
+        self.perfRecorder = perfRecorder
+        // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
+        // oversight change channel from that authority.
+        runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
+            self?.noteMonitorObservationInputsChanged()
+        }
+    }
+
+    deinit {
+        applyEditsApprovalSubscriptionTask?.cancel()
+        oversight.snoozeDeadlineTask?.cancel()
+        oversight.periodicDeadlineTask?.cancel()
+    }
+
+    /// Cancels all ephemeral runtime tasks and clears transient state on this
+    /// session. Called by both `prepareSessionForWindowClose` and
+    /// `prepareWorkspaceSwitchSessionDiscard` before the VM performs
+    /// async teardown (provider dispose, coordinator shutdown, MCP cleanup).
+    ///
+    /// This method is purely synchronous and touches only AgentTabSession-owned
+    /// state. VM-owned interactions (cancelPendingQuestion, approval,
+    /// instruction, applyEditsReview, MCP control, run cancellation) remain
+    /// on the VM and are called separately by each teardown path.
+    func cancelEphemeralRuntimeState() {
+        selfCompactNativeCompletion?.cancelRuntimeWork()
+        selfCompactNativeCompletion = nil
+        // Without its worker, an active request could never settle and would hold overseer delivery,
+        // Auto-wake, and managed Stop until relaunch. Settle or park it before the worker is gone.
+        var selfCompact = selfCompactState
+        if selfCompact.releaseForRuntimeTeardown() {
+            selfCompactState = selfCompact
+        }
+        selfCompactACPCommandItemIDs = nil
+        derivedTranscriptRefreshTask?.cancel()
+        derivedTranscriptRefreshTask = nil
+        pendingDerivedTranscriptRefreshReason = nil
+        pendingCommandRunningFlushTask?.cancel()
+        pendingCommandRunningFlushTask = nil
+        pendingCommandRunningByKey.removeAll()
+        claudeSteeringFlushTask?.cancel()
+        claudeSteeringFlushTask = nil
+        acpSteeringFlushTask?.cancel()
+        acpSteeringFlushTask = nil
+        acpSteeringFlushID = nil
+        clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        assistantDeltaFlushTask?.cancel()
+        assistantDeltaFlushTask = nil
+        pendingAssistantDelta = ""
+        agentTask?.cancel()
+        agentTask = nil
+        if hasActiveCodexHookGateOperation {
+            resetCodexHookGateBinding()
+        }
+        codexEventTask?.cancel()
+        codexEventTask = nil
+        codexEventTaskRunID = nil
+        applyEditsApprovalSubscriptionTask?.cancel()
+        applyEditsApprovalSubscriptionTask = nil
+        applyEditsApprovalSubscriptionID = nil
+        oversight.retireSnoozeState()
+        oversight.retirePeriodicScheduling()
+    }
+
+    var hasPendingCodexHookReviewRequest: Bool {
+        pendingCodexHookReview != nil
+    }
+
+    var hasPendingCodexHookReviewWait: Bool {
+        hasPendingCodexHookReviewRequest || codexHookReviewContinuation != nil
+    }
+
+    var hasActiveCodexHookGateOperation: Bool {
+        hasPendingCodexHookReviewWait
+            || codexHookGateAttemptToken != nil
+            || codexHookGateDispatchOwnerToken != nil
+            || !codexHookGateCoalescedContinuations.isEmpty
+    }
+
+    func finishCodexHookGateOwnerDispatch(
+        token: UUID,
+        succeeded: Bool
+    ) {
+        guard codexHookGateDispatchOwnerToken == token else { return }
+        codexHookGateDispatchOwnerToken = nil
+        codexHookGateActiveBinding = nil
+        let continuations = Array(codexHookGateCoalescedContinuations.values)
+        codexHookGateCoalescedContinuations.removeAll()
+        for continuation in continuations {
+            if succeeded {
+                continuation.resume()
+            } else {
+                continuation.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func cancelCodexHookGateCoalescedWaiter(_ waiterID: UUID) {
+        codexHookGateCoalescedContinuations.removeValue(forKey: waiterID)?
+            .resume(throwing: CancellationError())
+    }
+
+    @discardableResult
+    func cancelCodexHookReview() -> Bool {
+        let continuation = codexHookReviewContinuation
+        let coalescedContinuations = Array(codexHookGateCoalescedContinuations.values)
+        guard hasActiveCodexHookGateOperation else { return false }
+        codexHookReviewContinuation = nil
+        codexHookGateCoalescedContinuations.removeAll()
+        pendingCodexHookReview = nil
+        codexHookGateAttemptToken = nil
+        codexHookGateDispatchOwnerToken = nil
+        continuation?.resume(throwing: CancellationError())
+        for continuation in coalescedContinuations {
+            continuation.resume(throwing: CancellationError())
+        }
+        return true
+    }
+
+    func resetCodexHookGateBinding() {
+        _ = cancelCodexHookReview()
+        codexHookGateInventoryFingerprint = nil
+        codexHookGateActiveBinding = nil
+        codexHookGateBindingMemo = nil
+        codexHookGateAudit = nil
+    }
+
+    @discardableResult
+    func beginPersistentBindingTransition() -> UInt64 {
+        invalidateLocalInputStructure()
+        oversight.overseerActivation = nil
+        // Clear the outgoing proof before the generation moves so it cannot be observed under the
+        // incoming incarnation.
+        restorationReadiness = .unbound
+        bindingTransitionGeneration &+= 1
+        bindingTransitionInProgress = true
+        // Terminal commit revisions are scoped to the binding captured by
+        // their run ownership. A rebind must not carry that runtime-only
+        // classification or publication result into another session.
+        runLifecycle.invalidateTerminalRevisionForBindingTransition()
+        authoritativeHydratedBinding = nil
+        authoritativeHydratedBindingTransitionGeneration = nil
+        return bindingTransitionGeneration
+    }
+
+    func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
+        precondition(binding == nil || binding?.tabID == tabID)
+        if persistentSessionBindingIdentity != binding {
+            invalidateLocalInputStructure()
+            oversight.overseerActivation = nil
+        }
+        persistentSessionBindingIdentity = binding
+        persistentSessionBindingDidChange?()
+        bindingTransitionInProgress = false
+        restorationReadiness = currentRestorationBindingToken.map { .pending($0) } ?? .unbound
+    }
+
+    var currentRestorationBindingToken: AgentSessionRestorationBindingToken? {
+        guard let persistentSessionBindingIdentity else { return nil }
+        return AgentSessionRestorationBindingToken(
+            bindingIdentity: persistentSessionBindingIdentity,
+            bindingTransitionGeneration: bindingTransitionGeneration
+        )
+    }
+
+    var qualifiedRestorationReadiness: AgentSessionRestorationReadiness {
+        guard let current = currentRestorationBindingToken else { return .unbound }
+        guard restorationReadiness.bindingToken == current else { return .pending(current) }
+        return restorationReadiness
+    }
+
+    /// Only a fully restored or configured-and-saved binding admits ordinary operations and saves.
+    var permitsBoundOperationAndSave: Bool {
+        !bindingTransitionInProgress && qualifiedRestorationReadiness.permitsBoundOperationAndSave
+    }
+
+    var restorationAdmissionFailureMessage: String? {
+        guard !bindingTransitionInProgress else { return "Wait for this session to finish loading." }
+        return qualifiedRestorationReadiness.operationAdmissionFailureMessage
+    }
+
+    /// Persisted handoff recovery remains its own blocker after payload restoration succeeds.
+    var operationAdmissionFailureMessage: String? {
+        restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
+    }
+
+    var creationState: AgentSessionRestorationReadiness.CreationState? {
+        qualifiedRestorationReadiness.creationState
+    }
+
+    var creationConfigurationStamp: Data? {
+        guard let state = creationState,
+              case let .readyToPersist(configurationStamp) = state.phase else { return nil }
+        return configurationStamp
+    }
+
+    /// Consume actual allocation provenance before exposing a new session to other operations.
+    @discardableResult
+    func acceptFreshCreation(
+        _ claim: AgentSessionCreationClaim,
+        workspaceID: UUID
+    ) -> AgentSessionCreationHandle? {
+        guard let token = claim.consume(for: self, workspaceID: workspaceID) else { return nil }
+        restorationReadiness = .creating(token, .init(
+            workspaceID: workspaceID, ownerID: claim.ownerID, phase: .preparing
+        ))
+        hasLoadedPersistedState = true
+        isDirty = true
+        let handle = AgentSessionCreationHandle(
+            workspaceID: workspaceID, session: self, bindingToken: token,
+            ownerID: claim.ownerID, expectedConfigurationStamp: nil
+        )
+        claim.creationHandle = handle
+        return handle
+    }
+
+    func creationHandleIsCurrent(_ handle: AgentSessionCreationHandle) -> Bool {
+        guard handle.session === self, !bindingTransitionInProgress,
+              currentRestorationBindingToken == handle.bindingToken,
+              let state = creationState,
+              state.workspaceID == handle.workspaceID, state.ownerID == handle.ownerID else { return false }
+        if let expected = handle.expectedConfigurationStamp {
+            return creationConfigurationStamp == expected
+        }
+        return true
+    }
+
+    @discardableResult
+    func markCreationReady(_ handle: AgentSessionCreationHandle, configurationStamp: Data) -> Bool {
+        guard creationHandleIsCurrent(handle), let state = creationState else { return false }
+        switch state.phase {
+        case .preparing:
+            restorationReadiness = .creating(handle.bindingToken, .init(
+                workspaceID: state.workspaceID, ownerID: state.ownerID,
+                phase: .readyToPersist(configurationStamp: configurationStamp)
+            ))
+            return true
+        case let .readyToPersist(existing):
+            return existing == configurationStamp
+        case .failedBeforeConfiguration:
+            return false
+        }
+    }
+
+    /// The saver supplies the stamp of its actual payload after its exact commit fence succeeds.
+    @discardableResult
+    func acknowledgeConfiguredCreationSave(
+        _ handle: AgentSessionCreationHandle,
+        configurationStamp: Data
+    ) -> Bool {
+        guard creationHandleIsCurrent(handle), creationConfigurationStamp == configurationStamp else { return false }
+        restorationReadiness = .authoritative(handle.bindingToken, .freshBindingDurablyCreated)
+        return true
+    }
+
+    func failCreationPreparation(_ handle: AgentSessionCreationHandle, message: String) {
+        guard creationHandleIsCurrent(handle), let state = creationState,
+              case .preparing = state.phase else { return }
+        restorationReadiness = .creating(handle.bindingToken, .init(
+            workspaceID: state.workspaceID, ownerID: state.ownerID,
+            phase: .failedBeforeConfiguration(message)
+        ))
+    }
+
+    /// A retry captures existing ready provenance; it cannot mint or reconstruct preparation.
+    func captureCreationRetryHandle() -> AgentSessionCreationHandle? {
+        guard !bindingTransitionInProgress,
+              let token = currentRestorationBindingToken, let state = creationState,
+              case let .readyToPersist(configurationStamp) = state.phase else { return nil }
+        return AgentSessionCreationHandle(
+            workspaceID: state.workspaceID, session: self, bindingToken: token,
+            ownerID: state.ownerID, expectedConfigurationStamp: configurationStamp
+        )
+    }
+
+    func recordRestorationAuthoritative(_ source: AgentSessionRestorationReadiness.Source) {
+        // Fresh authority requires the owner's configured payload stamp, never a generic save.
+        guard source == .persistedPayloadApplied, !qualifiedRestorationReadiness.isCreating,
+              let current = currentRestorationBindingToken else { return }
+        restorationReadiness = .authoritative(current, source)
+    }
+
+    /// Remap an earned proof only across the single refused transition that invalidated it.
+    /// The view model additionally checks runtime-map ownership and the workspace carrier.
+    func restoreReadinessAfterRefusedTransition(
+        _ previousReadiness: AgentSessionRestorationReadiness,
+        expectedTransition: AgentModeViewModel.PersistentBindingTransitionToken
+    ) {
+        guard !bindingTransitionInProgress,
+              persistentBindingTransitionToken() == expectedTransition,
+              restorationReadiness == .unbound,
+              case let .authoritative(previous, source) = previousReadiness,
+              let current = currentRestorationBindingToken,
+              previous.bindingIdentity == current.bindingIdentity,
+              previous.bindingTransitionGeneration &+ 1 == current.bindingTransitionGeneration
+        else { return }
+        restorationReadiness = .authoritative(current, source)
+        markCurrentBindingHydrated()
+    }
+
+    func recordRestorationAuthoritativeIfNeeded(_ source: AgentSessionRestorationReadiness.Source) {
+        guard !qualifiedRestorationReadiness.isAuthoritative else { return }
+        recordRestorationAuthoritative(source)
+    }
+
+    func recordRestorationTerminal(_ failure: AgentSessionRestorationReadiness.Failure) {
+        guard !qualifiedRestorationReadiness.isCreating,
+              let current = currentRestorationBindingToken else { return }
+        restorationReadiness = .terminal(current, failure)
+    }
+
+    func finishPersistentBindingTransition(generation: UInt64) {
+        guard bindingTransitionGeneration == generation else { return }
+        bindingTransitionInProgress = false
+    }
+
+    func markCurrentBindingHydrated() {
+        guard hasLoadedPersistedState, !bindingTransitionInProgress else { return }
+        authoritativeHydratedBinding = persistentSessionBindingIdentity
+        authoritativeHydratedBindingTransitionGeneration = bindingTransitionGeneration
+    }
+
+    func clearCurrentBindingHydration() {
+        authoritativeHydratedBinding = nil
+        authoritativeHydratedBindingTransitionGeneration = nil
+    }
+
+    var hasBindingBlockingInteraction: Bool {
+        waitingPrompt != nil
+            || instructionContinuation != nil
+            || pendingAskUser != nil
+            || pendingUserInputRequest != nil
+            || pendingApproval != nil
+            || hasActiveCodexHookGateOperation
+            || pendingPermissionsRequest != nil
+            || pendingMCPElicitationRequest != nil
+            || pendingApplyEditsReview != nil
+            || pendingWorktreeMergeReview != nil
+            || !queuedUserInputRequests.isEmpty
+            || !queuedMCPElicitationRequests.isEmpty
+    }
+
+    func persistentBindingTransitionToken() -> AgentModeViewModel.PersistentBindingTransitionToken {
+        AgentModeViewModel.PersistentBindingTransitionToken(
+            tabID: tabID,
+            sessionIdentity: ObjectIdentifier(self),
+            binding: persistentSessionBindingIdentity,
+            transitionGeneration: bindingTransitionGeneration,
+            sourceItemsRevision: sourceItemsRevision
+        )
+    }
+
+    #if DEBUG
+        func testInstallPersistentSessionBinding(sessionID: UUID?) {
+            _ = beginPersistentBindingTransition()
+            installPersistentSessionBinding(
+                sessionID.map { AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: $0) }
+            )
+        }
+    #endif
+
+    func installRunAttemptTerminalResources(
+        ownership: AgentRunOwnership,
+        prepare: @escaping AgentRunAttemptTerminalResources.Prepare
+    ) {
+        runLifecycle.installTerminalResources(ownership: ownership, prepare: prepare)
+    }
+
+    func claimRunAttemptTerminalTeardown(
+        ownership: AgentRunOwnership,
+        terminalState: AgentSessionRunState
+    ) -> AgentRunAttemptTerminalResources.Teardown? {
+        runLifecycle.claimTerminalTeardown(ownership: ownership, terminalState: terminalState)
+    }
+
+    @discardableResult
+    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+        // Host-specific responsibilities stay here: Codex routing resets and
+        // exactly-once MCP prepared-epoch consumption. The neutral attempt
+        // initialization (terminal-state reset + tracker begin) is delegated
+        // to the facade, which preserves the installed run ID.
+        codexAuthoritativeActiveTurn = nil
+        codexAnonymousActiveTurn = nil
+        codexRoutingObservedTurnID = nil
+        codexPendingSteerLifecycleReconciliation = nil
+        var turnEpoch: AgentRunTurnEpoch?
+        if var context = mcpControlContext {
+            turnEpoch = context.preparedEpoch ?? context.currentEpoch
+            if context.preparedEpoch != nil {
+                context.preparedEpoch = nil
+                mcpControlContext = context
+            }
+        }
+        let ownership = runLifecycle.beginAttempt(
+            context: .init(
+                tabID: tabID,
+                persistentSessionID: activeAgentSessionID,
+                persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
+                bindingTransitionGeneration: bindingTransitionGeneration,
+                turnEpoch: turnEpoch
+            ),
+            attemptID: attemptID
+        )
+        #if DEBUG
+            perfRecorder.increment("run.lifecycle.attempt.started")
+            perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
+            perfRecorder.event(
+                "run.lifecycle.attemptStarted",
+                tabID: tabID,
+                fields: [
+                    "source": source,
+                    "attemptID": perfRecorder.shortID(ownership.attemptID),
+                    "bindingGeneration": perfRecorder.shortID(ownership.binding.generation),
+                    "persistentBindingGeneration": perfRecorder.shortID(ownership.binding.persistentBindingGeneration),
+                    "bindingTransitionGeneration": String(ownership.binding.bindingTransitionGeneration),
+                    "persistentSessionID": perfRecorder.shortID(ownership.binding.persistentSessionID)
+                ]
+            )
+        #endif
+        return ownership
+    }
+
+    func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+        runLifecycle.isCurrentAttempt(ownership, expectedRunID: expectedRunID)
+    }
+
+    func isCurrentRunAttemptForCurrentBinding(
+        _ ownership: AgentRunOwnership,
+        expectedRunID: UUID? = nil
+    ) -> Bool {
+        guard isCurrentRunAttempt(ownership, expectedRunID: expectedRunID) else { return false }
+        return ownership.binding.tabID == tabID
+            && ownership.binding.persistentSessionID == activeAgentSessionID
+            && ownership.binding.persistentBindingGeneration == persistentSessionBindingIdentity?.generation
+            && ownership.binding.bindingTransitionGeneration == bindingTransitionGeneration
+            && !bindingTransitionInProgress
+    }
+
+    @discardableResult
+    func recordRunProgress(
+        ownership: AgentRunOwnership,
+        kind: AgentRunLivenessSignalKind,
+        stage: AgentRunLifecycleStage,
+        retryIntent: AgentRunRetryIntent = .none,
+        timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> AgentRunProgressAcceptance {
+        let result = runLifecycle.recordProgress(
+            ownership: ownership,
+            kind: kind,
+            stage: stage,
+            retryIntent: retryIntent,
+            timestampUptimeNanoseconds: timestampUptimeNanoseconds
+        )
+        recordRunProgressDiagnostic(result, kind: kind, stage: stage)
+        return result
+    }
+
+    @discardableResult
+    func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
+        let result = runLifecycle.acceptProgress(signal)
+        recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
+        return result
+    }
+
+    @discardableResult
+    func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+        guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        recordRunAttemptEnded(ownership, source: source)
+        return true
+    }
+
+    @discardableResult
+    func endCurrentRunAttempt(source: String) -> Bool {
+        guard let ownership = activeRunOwnership else { return false }
+        guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        recordRunAttemptEnded(ownership, source: source)
+        return true
+    }
+
+    @discardableResult
+    func endRunAttempt(ifCurrentAttemptID attemptID: UUID, source: String) -> Bool {
+        guard let ownership = activeRunOwnership, ownership.attemptID == attemptID else { return false }
+        return endRunAttempt(ifCurrent: ownership, source: source)
+    }
+
+    private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
+        #if DEBUG
+            perfRecorder.increment("run.lifecycle.attempt.ended")
+            perfRecorder.increment("run.lifecycle.attempt.ended.source.\(source)")
+            perfRecorder.event(
+                "run.lifecycle.attemptEnded",
+                tabID: tabID,
+                fields: [
+                    "source": source,
+                    "attemptID": perfRecorder.shortID(ownership.attemptID)
+                ]
+            )
+        #endif
+    }
+
+    private func recordRunProgressDiagnostic(
+        _ result: AgentRunProgressAcceptance,
+        kind: AgentRunLivenessSignalKind,
+        stage: AgentRunLifecycleStage
+    ) {
+        #if DEBUG
+            switch result {
+            case .accepted:
+                if kind == .stageTransition {
+                    perfRecorder.increment("run.lifecycle.stage.\(stage.rawValue)", tabID: tabID)
+                }
+            case let .rejected(reason):
+                perfRecorder.increment("run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                perfRecorder.event(
+                    "run.lifecycle.progressRejected",
+                    tabID: tabID,
+                    fields: ["reason": reason.rawValue, "kind": kind.rawValue, "stage": stage.rawValue]
+                )
+            }
+        #endif
+    }
+
+    @discardableResult
+    func setRunningStatus(_ text: String?, source: RunningStatusSource?) -> Bool {
+        let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = (normalized?.isEmpty == false) ? normalized : nil
+        let normalizedSource = value == nil ? nil : source
+        guard runningStatusText != value || runningStatusSource != normalizedSource else { return false }
+        runningStatusText = value
+        runningStatusSource = normalizedSource
+        return true
+    }
+
+    @discardableResult
+    func clearClaudeReasoningStatus(clearDisplayedStatus: Bool = true) -> Bool {
+        claudeReasoningStatusBuffer = ""
+        claudeReasoningStatusPendingText = nil
+        claudeReasoningStatusFlushTask?.cancel()
+        claudeReasoningStatusFlushTask = nil
+        guard clearDisplayedStatus, runningStatusSource == .reasoning else { return false }
+        return setRunningStatus(nil, source: nil)
+    }
+
+    var shouldSurfaceInteractionsInUI: Bool {
+        true
+    }
+
+    var uiWaitingPrompt: String? {
+        shouldSurfaceInteractionsInUI ? waitingPrompt : nil
+    }
+
+    var uiPendingAskUser: AgentAskUserPendingState? {
+        shouldSurfaceInteractionsInUI ? pendingAskUser : nil
+    }
+
+    var uiPendingUserInputRequest: AgentRequestUserInputRequest? {
+        shouldSurfaceInteractionsInUI ? pendingUserInputRequest : nil
+    }
+
+    var uiPendingApproval: AgentApprovalRequest? {
+        shouldSurfaceInteractionsInUI ? pendingApproval : nil
+    }
+
+    var uiPendingCodexHookReview: AgentCodexHookReviewRequest? {
+        shouldSurfaceInteractionsInUI ? pendingCodexHookReview : nil
+    }
+
+    var uiPendingPermissionsRequest: AgentPermissionsRequest? {
+        shouldSurfaceInteractionsInUI ? pendingPermissionsRequest : nil
+    }
+
+    var uiPendingMCPElicitationRequest: AgentMCPElicitationRequest? {
+        shouldSurfaceInteractionsInUI ? pendingMCPElicitationRequest : nil
+    }
+
+    var uiPendingApplyEditsReview: PendingApplyEditsReview? {
+        shouldSurfaceInteractionsInUI ? pendingApplyEditsReview : nil
+    }
+
+    var uiPendingWorktreeMergeReview: PendingWorktreeMergeReview? {
+        shouldSurfaceInteractionsInUI ? pendingWorktreeMergeReview : nil
+    }
+
+    struct ToolCorrelationScanResult {
+        let indices: [Int]
+        let scannedItemCount: Int
+
+        var lastIndex: Int? {
+            indices.last
+        }
+    }
+
+    private enum ToolCorrelationBoundary: Equatable {
+        case start
+        case after(itemID: UUID, sequenceIndex: Int)
+    }
+
+    private struct ToolCorrelationIndexes: Equatable {
+        var activeTurnBoundary: ToolCorrelationBoundary = .start
+        var activeTurnStartIndex: Int = 0
+        var itemIndicesByInvocationID: [UUID: Set<Int>] = [:]
+        var itemIndicesBySignature: [String: Set<Int>] = [:]
+        var pendingCallIndicesBySignature: [String: Set<Int>] = [:]
+        var nilInvocationItemIndicesByName: [String: Set<Int>] = [:]
+    }
+
+    static func normalizedToolCorrelationName(_ toolName: String?) -> String {
+        let normalized = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName ?? "")
+        if !normalized.isEmpty {
+            return normalized
+        }
+        return toolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
+
+    static func canonicalToolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
+        let normalizedToolName = normalizedToolCorrelationName(toolName)
+        let normalizedArgs: String = {
+            guard let raw = argsJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+                  let data = raw.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  JSONSerialization.isValidJSONObject(object),
+                  let canonicalData = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                  let canonical = String(data: canonicalData, encoding: .utf8)
+            else {
+                return argsJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
+            return canonical
+        }()
+        return "\(normalizedToolName)|\(normalizedArgs)"
+    }
+
+    func indexedToolItemIndices(invocationID: UUID) -> [Int] {
+        sortedValidToolItemIndices(toolCorrelationIndexes.itemIndicesByInvocationID[invocationID] ?? [])
+    }
+
+    func indexedToolItemIndices(signature: String, pendingCallsOnly: Bool = false) -> [Int] {
+        let indices = pendingCallsOnly
+            ? toolCorrelationIndexes.pendingCallIndicesBySignature[signature] ?? []
+            : toolCorrelationIndexes.itemIndicesBySignature[signature] ?? []
+        return sortedValidToolItemIndices(indices)
+    }
+
+    func indexedNilInvocationToolItemIndices(normalizedToolName: String) -> [Int] {
+        sortedValidToolItemIndices(
+            toolCorrelationIndexes.nilInvocationItemIndicesByName[normalizedToolName] ?? []
+        )
+    }
+
+    func activeTurnToolItemIndices(
+        where predicate: (AgentChatItem) -> Bool
+    ) -> ToolCorrelationScanResult {
+        var matches: [Int] = []
+        var scannedItemCount = 0
+        guard toolCorrelationIndexes.activeTurnStartIndex < items.endIndex else {
+            return ToolCorrelationScanResult(indices: [], scannedItemCount: 0)
+        }
+        for index in stride(
+            from: items.index(before: items.endIndex),
+            through: toolCorrelationIndexes.activeTurnStartIndex,
+            by: -1
+        ) {
+            scannedItemCount += 1
+            if predicate(items[index]) {
+                matches.append(index)
+            }
+        }
+        matches.reverse()
+        return ToolCorrelationScanResult(indices: matches, scannedItemCount: scannedItemCount)
+    }
+
+    private func sortedValidToolItemIndices(_ indices: Set<Int>) -> [Int] {
+        indices.lazy
+            .filter { index in
+                self.items.indices.contains(index)
+                    && index >= self.toolCorrelationIndexes.activeTurnStartIndex
+                    && Self.isToolCorrelationItem(self.items[index])
+            }
+            .sorted()
+    }
+
+    private static func isToolCorrelationItem(_ item: AgentChatItem) -> Bool {
+        item.kind == .toolCall || item.kind == .toolResult
+    }
+
+    private func syncNextSequenceIndexFromItems() {
+        let maxSequenceIndex = items.map(\.sequenceIndex).max() ?? -1
+        nextSequenceIndex = max(nextSequenceIndex, maxSequenceIndex + 1)
+    }
+
+    private enum SourceItemsDispatch {
+        case silent
+        case notify(AgentModeViewModel.SourceItemsMutation)
+    }
+
+    private enum SourceItemPayloadUpdate {
+        case rebuildFromSource
+        case preserveSurvivingPayloads
+        case preserveUnchangedRows
+    }
+
+    /// How a committed source-items change treats the retained local-input index's identity.
+    private enum LocalInputIdentityDisposition {
+        /// A genuine structural replacement: rotate the epoch; the canonical reseed owns all
+        /// reconciliation and observers re-baseline rather than re-disclose history.
+        case invalidate
+        /// Working-suffix pruning is not canonical deletion: tracked identities survive and only
+        /// their positions reconcile.
+        case positionsOnly
+        /// A bounded working-list batch, diffed against the current `items` (the pre-commit
+        /// array): tracked items the batch removed mark their record deleted and retire any
+        /// unsettled candidate, still-present tracked items reconcile content and position.
+        /// Both reconciling dispositions invalidate instead when source-ID repair rekeys.
+        case batchDiff
+    }
+
+    private func commitSourceItems(
+        _ newItems: [AgentChatItem],
+        dispatch: SourceItemsDispatch,
+        payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
+        localInputIdentity: LocalInputIdentityDisposition = .invalidate,
+        diagnosticContext: String
+    ) {
+        let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        let repairedItems = repair.items
+        let previousItemsByID: [UUID: AgentChatItem]? = if case .preserveUnchangedRows = payloadUpdate {
+            Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        } else {
+            nil
+        }
+        switch localInputIdentity {
+        case .invalidate:
+            invalidateLocalInputStructure()
+        case .positionsOnly:
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change; positions cannot be trusted.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputWorkingPositions(repairedItems)
+            }
+        case .batchDiff:
+            if repair.didRepair {
+                // Rekeyed item IDs are a genuine identity change, not an in-place batch edit.
+                invalidateLocalInputStructure()
+            } else {
+                reconcileLocalInputBatchDiff(from: items, to: repairedItems)
+            }
+        }
+        suppressSourceItemsChanged = true
+        items = repairedItems
+        suppressSourceItemsChanged = false
+        rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if let previousItemsByID {
+            // Unchanged summary rows cannot reconstruct their retained raw result. Re-inspect
+            // only changed/new rows, after ID repair and live-ID pruning, before notifying.
+            for item in items where previousItemsByID[item.id] != item {
+                refreshEphemeralPayload(for: item)
+            }
+        }
+        sourceItemsRevision &+= 1
+        derivedTranscriptSyncState = nil
+        if case let .notify(mutation) = dispatch {
+            onSourceItemsChanged?(self, mutation)
+        }
+    }
+
+    private func repairedSourceItems(
+        _ candidateItems: [AgentChatItem],
+        diagnosticContext: String
+    ) -> AgentSourceItemIDRepair.Result {
+        let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+        assert(repair.didRepair == (repair.items != candidateItems))
+        if repair.didRepair {
+            AgentSourceItemIDRepair.logDiagnostics(
+                repair.diagnostics,
+                context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
+            )
+        }
+        return repair
+    }
+
+    @discardableResult
+    private func repairStoredSourceItemsIfNeeded(diagnosticContext: String) -> Bool {
+        let repair = repairedSourceItems(items, diagnosticContext: diagnosticContext)
+        guard repair.didRepair else { return false }
+        suppressSourceItemsChanged = true
+        items = repair.items
+        suppressSourceItemsChanged = false
+        return true
+    }
+
+    @discardableResult
+    private func commitRepairedSourceItemsIfNeeded(
+        _ candidateItems: [AgentChatItem],
+        diagnosticContext: String
+    ) -> Bool {
+        let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
+        guard repair.didRepair else { return false }
+        AgentSourceItemIDRepair.logDiagnostics(
+            repair.diagnostics,
+            context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
+        )
+        commitSourceItems(
+            repair.items,
+            dispatch: .notify(.structural),
+            payloadUpdate: .preserveUnchangedRows,
+            diagnosticContext: "\(diagnosticContext).commit"
+        )
+        return true
+    }
+
+    private func rebuildSourceItemDerivedState(payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource) {
+        repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
+        syncNextSequenceIndexFromItems()
+        liveItemIDs = Set(items.map(\.id))
+        switch payloadUpdate {
+        case .rebuildFromSource:
+            #if DEBUG
+                test_fullRetentionPayloadMapScannedItemCount += items.count
+            #endif
+            replaceEphemeralToolResultPayloadMap(
+                AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
+                    from: items,
+                    diagnosticContext: "tab_session tab_id=\(tabID.uuidString) rebuildSourceItemDerivedState"
+                ),
+                liveItemIDs: liveItemIDs
+            )
+        case .preserveSurvivingPayloads, .preserveUnchangedRows:
+            replaceEphemeralToolResultPayloadMap(ephemeralToolResultPayloadByItemID, liveItemIDs: liveItemIDs)
+        }
+        rebuildToolCorrelationIndexes()
+        assertSourceItemDerivedStateIsConsistent()
+    }
+
+    private func rebuildToolCorrelationIndexes() {
+        let activeTurnBoundaryOverride = runState.isActive ? toolCorrelationIndexes.activeTurnBoundary : nil
+        toolCorrelationIndexes = Self.makeToolCorrelationIndexes(
+            for: items,
+            activeTurnBoundaryOverride: activeTurnBoundaryOverride
+        )
+    }
+
+    private static func makeToolCorrelationIndexes(
+        for items: [AgentChatItem],
+        activeTurnBoundaryOverride: ToolCorrelationBoundary? = nil
+    ) -> ToolCorrelationIndexes {
+        var indexes = ToolCorrelationIndexes()
+        let boundary: ToolCorrelationBoundary = if let activeTurnBoundaryOverride {
+            activeTurnBoundaryOverride
+        } else if let lastUserIndex = items.lastIndex(where: { $0.kind == .user }) {
+            .after(
+                itemID: items[lastUserIndex].id,
+                sequenceIndex: items[lastUserIndex].sequenceIndex
+            )
+        } else {
+            .start
+        }
+        indexes.activeTurnBoundary = boundary
+        indexes.activeTurnStartIndex = resolvedToolCorrelationStartIndex(for: items, boundary: boundary)
+        guard indexes.activeTurnStartIndex < items.endIndex else { return indexes }
+        for index in indexes.activeTurnStartIndex ..< items.endIndex {
+            addToolCorrelationItem(items[index], at: index, to: &indexes)
+        }
+        return indexes
+    }
+
+    private static func resolvedToolCorrelationStartIndex(
+        for items: [AgentChatItem],
+        boundary: ToolCorrelationBoundary
+    ) -> Int {
+        switch boundary {
+        case .start:
+            return items.startIndex
+        case let .after(itemID, sequenceIndex):
+            if let anchorIndex = items.firstIndex(where: { $0.id == itemID }) {
+                return items.index(after: anchorIndex)
+            }
+            return items.firstIndex(where: { $0.sequenceIndex > sequenceIndex }) ?? items.endIndex
+        }
+    }
+
+    private static func addToolCorrelationItem(
+        _ item: AgentChatItem,
+        at index: Int,
+        to indexes: inout ToolCorrelationIndexes
+    ) {
+        guard isToolCorrelationItem(item), index >= indexes.activeTurnStartIndex else { return }
+        if let invocationID = item.toolInvocationID {
+            indexes.itemIndicesByInvocationID[invocationID, default: []].insert(index)
+        }
+        let signature = canonicalToolInvocationSignature(
+            toolName: item.toolName,
+            argsJSON: item.toolArgsJSON
+        )
+        indexes.itemIndicesBySignature[signature, default: []].insert(index)
+        if item.kind == .toolCall {
+            indexes.pendingCallIndicesBySignature[signature, default: []].insert(index)
+        }
+        if item.toolInvocationID == nil {
+            let normalizedName = normalizedToolCorrelationName(item.toolName)
+            indexes.nilInvocationItemIndicesByName[normalizedName, default: []].insert(index)
+        }
+    }
+
+    private static func removeToolCorrelationItem(
+        _ item: AgentChatItem,
+        at index: Int,
+        from indexes: inout ToolCorrelationIndexes
+    ) {
+        guard isToolCorrelationItem(item), index >= indexes.activeTurnStartIndex else { return }
+        if let invocationID = item.toolInvocationID {
+            remove(index, from: &indexes.itemIndicesByInvocationID, key: invocationID)
+        }
+        let signature = canonicalToolInvocationSignature(
+            toolName: item.toolName,
+            argsJSON: item.toolArgsJSON
+        )
+        remove(index, from: &indexes.itemIndicesBySignature, key: signature)
+        if item.kind == .toolCall {
+            remove(index, from: &indexes.pendingCallIndicesBySignature, key: signature)
+        }
+        if item.toolInvocationID == nil {
+            let normalizedName = normalizedToolCorrelationName(item.toolName)
+            remove(index, from: &indexes.nilInvocationItemIndicesByName, key: normalizedName)
+        }
+    }
+
+    private static func remove<Key: Hashable>(
+        _ index: Int,
+        from map: inout [Key: Set<Int>],
+        key: Key
+    ) {
+        guard var indices = map[key] else { return }
+        indices.remove(index)
+        map[key] = indices.isEmpty ? nil : indices
+    }
+
+    private func updateToolCorrelationIndexes(
+        previousItem: AgentChatItem,
+        updatedItem: AgentChatItem,
+        at index: Int
+    ) {
+        guard previousItem.kind != .user, updatedItem.kind != .user else {
+            rebuildToolCorrelationIndexes()
+            return
+        }
+        Self.removeToolCorrelationItem(previousItem, at: index, from: &toolCorrelationIndexes)
+        Self.addToolCorrelationItem(updatedItem, at: index, to: &toolCorrelationIndexes)
+    }
+
+    private func appendToolCorrelationIndexes(for item: AgentChatItem, at index: Int) {
+        if item.kind == .user {
+            guard !runState.isActive else { return }
+            toolCorrelationIndexes = ToolCorrelationIndexes(
+                activeTurnBoundary: .after(itemID: item.id, sequenceIndex: item.sequenceIndex),
+                activeTurnStartIndex: index + 1
+            )
+            return
+        }
+        Self.addToolCorrelationItem(item, at: index, to: &toolCorrelationIndexes)
+    }
+
+    private func reconcileIncrementalEphemeralPayload(
+        previousItem: AgentChatItem?,
+        updatedItem: AgentChatItem?
+    ) {
+        if let previousItem, previousItem.id != updatedItem?.id {
+            liveItemIDs.remove(previousItem.id)
+            setEphemeralToolResultPayload(nil, for: previousItem.id)
+        }
+        guard let updatedItem else { return }
+        liveItemIDs.insert(updatedItem.id)
+        refreshEphemeralPayload(for: updatedItem)
+    }
+
+    private func refreshEphemeralPayload(for item: AgentChatItem) {
+        if let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item) {
+            setEphemeralToolResultPayload(retainedPayload, for: item.id)
+        } else {
+            setEphemeralToolResultPayload(nil, for: item.id)
+        }
+    }
+
+    func replaceEphemeralToolResultPayloadMap(_ payloadByItemID: [UUID: String], liveItemIDs: Set<UUID>) {
+        let filteredPayloadByItemID = payloadByItemID.filter { itemID, payload in
+            liveItemIDs.contains(itemID) && !payload.isEmpty
+        }
+        let previousPayloadByItemID = ephemeralToolResultPayloadByItemID
+        ephemeralToolResultPayloadByItemID = filteredPayloadByItemID
+        for itemID in Set(previousPayloadByItemID.keys).union(filteredPayloadByItemID.keys) {
+            guard previousPayloadByItemID[itemID] != filteredPayloadByItemID[itemID] else { continue }
+            if filteredPayloadByItemID[itemID] != nil {
+                ephemeralToolResultPayloadRevisionByItemID[itemID] = consumeNextEphemeralToolResultPayloadRevision()
+            } else {
+                ephemeralToolResultPayloadRevisionByItemID.removeValue(forKey: itemID)
+            }
+        }
+        pruneEphemeralToolResultPayloadRevisions(liveItemIDs: liveItemIDs)
+    }
+
+    private func setEphemeralToolResultPayload(_ payload: String?, for itemID: UUID) {
+        let retainedPayload = payload.flatMap { $0.isEmpty ? nil : $0 }
+        let previousPayload = ephemeralToolResultPayloadByItemID[itemID]
+        guard previousPayload != retainedPayload else { return }
+        if let retainedPayload {
+            ephemeralToolResultPayloadByItemID[itemID] = retainedPayload
+            ephemeralToolResultPayloadRevisionByItemID[itemID] = consumeNextEphemeralToolResultPayloadRevision()
+        } else {
+            ephemeralToolResultPayloadByItemID.removeValue(forKey: itemID)
+            ephemeralToolResultPayloadRevisionByItemID.removeValue(forKey: itemID)
+        }
+    }
+
+    private func consumeNextEphemeralToolResultPayloadRevision() -> Int {
+        let revision = nextEphemeralToolResultPayloadRevision
+        nextEphemeralToolResultPayloadRevision &+= 1
+        return revision
+    }
+
+    private func pruneEphemeralToolResultPayloadRevisions(liveItemIDs: Set<UUID>) {
+        ephemeralToolResultPayloadRevisionByItemID = ephemeralToolResultPayloadRevisionByItemID.filter {
+            liveItemIDs.contains($0.key) && ephemeralToolResultPayloadByItemID[$0.key] != nil
+        }
+    }
+
+    private func finishIncrementalSourceItemsMutation(
+        _ mutation: AgentModeViewModel.SourceItemsMutation
+    ) {
+        switch mutation {
+        case let .replace(index, _, _), let .mutate(index, _):
+            if items.indices.contains(index) { localInputIndex.replace(items[index], at: index) }
+        default: break
+        }
+        sourceItemsRevision &+= 1
+        derivedTranscriptSyncState = nil
+        onSourceItemsChanged?(self, mutation)
+    }
+
+    #if DEBUG
+        func testAssertSourceItemDerivedStateIsConsistent() {
+            assertSourceItemDerivedStateIsConsistent()
+        }
+    #endif
+
+    private func assertSourceItemDerivedStateIsConsistent(
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) {
+        #if DEBUG
+            assert(liveItemIDs == Set(items.map(\.id)), "live item ID index desynchronized", file: file, line: line)
+            assert(items.count == liveItemIDs.count, "duplicate live item IDs detected", file: file, line: line)
+            assert(
+                ephemeralToolResultPayloadByItemID.keys.allSatisfy { liveItemIDs.contains($0) },
+                "ephemeral payload map contains non-live item IDs",
+                file: file,
+                line: line
+            )
+            assert(
+                toolCorrelationIndexes == Self.makeToolCorrelationIndexes(
+                    for: items,
+                    activeTurnBoundaryOverride: runState.isActive ? toolCorrelationIndexes.activeTurnBoundary : nil
+                ),
+                "tool correlation index desynchronized",
+                file: file,
+                line: line
+            )
+        #endif
+    }
+
+    @discardableResult
+    func mutateItemsBatch(
+        mutation: AgentModeViewModel.SourceItemsMutation = .structural,
+        touchActivity: Bool = true,
+        _ body: (inout [AgentChatItem]) -> Void
+    ) -> Bool {
+        let previousItems = items
+        var updatedItems = previousItems
+        body(&updatedItems)
+        guard updatedItems != previousItems else { return false }
+        commitSourceItems(
+            updatedItems,
+            dispatch: .notify(mutation),
+            payloadUpdate: .preserveUnchangedRows,
+            localInputIdentity: .batchDiff,
+            diagnosticContext: "mutateItemsBatch"
+        )
+        if touchActivity {
+            lastActivityAt = Date()
+        }
+        isDirty = true
+        return true
+    }
+
+    enum SilentItemReplacementReason: String {
+        case persistedSessionHydration
+        case pendingToolFinalizationRepair
+        case retentionCompaction
+        case codexCommandStatusReconciliation
+        case routeActivation
+        case clearedChat
+        case stressHarnessReset
+        case testOverride
+    }
+
+    func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
+        let payloadUpdate: SourceItemPayloadUpdate = switch reason {
+        case .retentionCompaction:
+            .preserveSurvivingPayloads
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .preserveUnchangedRows
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .rebuildFromSource
+        }
+        setItemsSilently(items, reason: reason, payloadUpdate: payloadUpdate)
+    }
+
+    /// Reconcile compacted source items without re-inspecting payloads that the session already owns.
+    /// Unlike hydration or ordinary replacement, surviving payloads and their revisions stay intact.
+    /// Pruning uses repaired live IDs; a rekeyed duplicate never inherits another item's raw payload.
+    func setItemsSilentlyForRetentionCompaction(_ items: [AgentChatItem]) {
+        setItemsSilently(items, reason: .retentionCompaction)
+    }
+
+    /// Repair pending rows without discarding payloads owned by unchanged completed cards.
+    /// Changed results are re-inspected so a terminal fallback cannot retain stale running output.
+    func setItemsSilentlyForPendingToolFinalizationRepair(_ items: [AgentChatItem]) {
+        setItemsSilently(items, reason: .pendingToolFinalizationRepair)
+    }
+
+    private func setItemsSilently(
+        _ items: [AgentChatItem],
+        reason: SilentItemReplacementReason,
+        payloadUpdate: SourceItemPayloadUpdate
+    ) {
+        #if DEBUG
+            if AgentTranscriptDebugInstrumentation.isEnabled {
+                AgentTranscriptDebugInstrumentation.emitSessionItemsReplacement(.init(
+                    reason: reason.rawValue,
+                    previousItemCount: self.items.count,
+                    newItemCount: items.count,
+                    isEqual: self.items == items,
+                    previousSignature: AgentTranscriptDebugInstrumentation.itemIdentitySignature(self.items),
+                    newSignature: AgentTranscriptDebugInstrumentation.itemIdentitySignature(items)
+                ))
+            }
+        #endif
+        // `pendingToolFinalizationRepair` and `codexCommandStatusReconciliation` commit a mutated
+        // copy of the working list — in-place repairs that must not cost tracked inputs their
+        // epoch. Hydration, activation, clears and test overrides stay structural.
+        let localInputIdentity: LocalInputIdentityDisposition = switch reason {
+        case .retentionCompaction:
+            .positionsOnly
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .batchDiff
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .invalidate
+        }
+        commitSourceItems(
+            items,
+            dispatch: .silent,
+            payloadUpdate: payloadUpdate,
+            localInputIdentity: localInputIdentity,
+            diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
+        )
+        pendingSourceItemsMutationSummary = nil
+        pendingDerivedTranscriptRefreshReason = nil
+        derivedTranscriptRefreshGeneration &+= 1
+        derivedTranscriptRefreshTask?.cancel()
+        derivedTranscriptRefreshTask = nil
+    }
+
+    @discardableResult
+    func replaceItemSilentlyForRetentionCompaction(
+        at index: Int,
+        with compactedItem: AgentChatItem,
+        retainedRawPayload: String
+    ) -> Bool {
+        guard items.indices.contains(index) else { return false }
+        let previousItem = items[index]
+        guard previousItem.id == compactedItem.id,
+              previousItem != compactedItem,
+              ephemeralToolResultPayloadByItemID[previousItem.id] == retainedRawPayload
+        else {
+            return false
+        }
+
+        suppressSourceItemsChanged = true
+        items[index] = compactedItem
+        suppressSourceItemsChanged = false
+        nextSequenceIndex = max(nextSequenceIndex, compactedItem.sequenceIndex + 1)
+        updateToolCorrelationIndexes(
+            previousItem: previousItem,
+            updatedItem: compactedItem,
+            at: index
+        )
+        sourceItemsRevision &+= 1
+        derivedTranscriptSyncState = nil
+        #if DEBUG
+            test_incrementalRetentionCompactionCount += 1
+        #endif
+        assertSourceItemDerivedStateIsConsistent()
+        return true
+    }
+
+    /// Compact any summary-only tool-result items in place and align
+    /// `ephemeralToolResultPayloadByItemID` with the resulting live items.
+    ///
+    /// Used by captured-transcript apply paths so that when a stale captured
+    /// presentation cannot be layered on top of newer live source items the
+    /// live `toolResultJSON` is still reduced to its sanitized form (where
+    /// policy requires it), the payload map only contains entries keyed by
+    /// live item IDs, and stale payload entries for removed items are
+    /// pruned. Mirrors the ephemeral-payload invariants that normal
+    /// `AgentTabSession` mutation helpers preserve via `reconcileEphemeralPayloadMap`.
+    func compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap() {
+        if repairStoredSourceItemsIfNeeded(diagnosticContext: "compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap") {
+            rebuildSourceItemDerivedState()
+        }
+        var alignedItems: [AgentChatItem] = []
+        alignedItems.reserveCapacity(items.count)
+        var alignedMap: [UUID: String] = [:]
+        var itemsDidMutate = false
+        for item in items {
+            guard
+                item.kind == .toolResult,
+                let sanitized = AgentToolResultPersistencePolicy.sanitizedToolResult(for: item),
+                sanitized.shouldRetainEphemeralRawPayload
+            else {
+                alignedItems.append(item)
+                continue
+            }
+            let freshRetainedPayload: String? = {
+                let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let persisted = sanitized.resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !raw.isEmpty,
+                      raw != persisted,
+                      !AgentTranscriptToolNormalizer.isSummaryOnly(raw: raw)
+                else {
+                    return nil
+                }
+                return raw
+            }()
+            let existingRetainedPayload: String? = {
+                let payload = ephemeralToolResultPayloadByItemID[item.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !payload.isEmpty else { return nil }
+                return payload
+            }()
+            var compactedItem = item
+            if compactedItem.toolResultJSON != sanitized.resultJSON {
+                compactedItem.toolResultJSON = sanitized.resultJSON
+                itemsDidMutate = true
+            }
+            if compactedItem.text != sanitized.text {
+                compactedItem.text = sanitized.text
+                itemsDidMutate = true
+            }
+            if compactedItem.toolIsError != sanitized.toolIsError {
+                compactedItem.toolIsError = sanitized.toolIsError
+                itemsDidMutate = true
+            }
+            alignedItems.append(compactedItem)
+            if let retainedPayload = freshRetainedPayload ?? existingRetainedPayload {
+                alignedMap[compactedItem.id] = retainedPayload
+            }
+        }
+        if itemsDidMutate {
+            sourceItemsRevision &+= 1
+            derivedTranscriptSyncState = nil
+            suppressSourceItemsChanged = true
+            items = alignedItems
+            suppressSourceItemsChanged = false
+            syncNextSequenceIndexFromItems()
+            liveItemIDs = Set(alignedItems.map(\.id))
+            rebuildToolCorrelationIndexes()
+        }
+        replaceEphemeralToolResultPayloadMap(alignedMap, liveItemIDs: liveItemIDs)
+        assertSourceItemDerivedStateIsConsistent()
+    }
+
+    func clearDerivedTranscriptCaches() {
+        transcript = .empty
+        baseTranscriptProjection = .empty
+        fullTranscriptProjection = .empty
+        workingTranscriptProjection = .empty
+        transcriptProjection = .empty
+        turnProjectionCaches = [:]
+        archivedTranscriptSnapshot = .empty
+        isCompressedHistoryRevealed = false
+        transcriptProjectionProtection = .none
+        transcriptCanonicalVisibleRowCount = 0
+        transcriptProjectionCounts = .zero
+        transcriptAnalyticsSnapshot = .init()
+        transcriptPerformanceSnapshot = .empty
+        rawToolResultPayloadRenderRevisionByItemID = [:]
+        derivedTranscriptSyncState = nil
+    }
+
+    func replaceItems(_ items: [AgentChatItem]) {
+        setItemsSilently(items, reason: .testOverride)
+        pendingTurnRuntimeAnchors.removeAll()
+        agentMessageRuntimeFootersByItemID.removeAll()
+        deferredActiveAgentRunTimerRollback = nil
+        pendingSourceItemsMutationSummary = nil
+        onSourceItemsChanged?(self, .replaceAll)
+        lastActivityAt = Date()
+        isDirty = true
+    }
+
+    func appendItem(_ item: AgentChatItem) {
+        var newItem = item
+        newItem.sequenceIndex = nextSequenceIndex
+        nextSequenceIndex += 1
+        let candidateItems = items + [newItem]
+        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem") {
+            if newItem.kind == .user {
+                hasSentFirstMessage = true
+                lastUserMessageAt = newItem.timestamp
+            }
+            lastActivityAt = Date()
+            isDirty = true
+            return
+        }
+        let appendedIndex = items.count
+        suppressSourceItemsChanged = true
+        items.append(newItem)
+        suppressSourceItemsChanged = false
+        reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
+        appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
+        finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind))
+        if newItem.kind == .user {
+            hasSentFirstMessage = true
+            lastUserMessageAt = newItem.timestamp
+        }
+        lastActivityAt = Date()
+        isDirty = true
+    }
+
+    func replaceItem(at index: Int, with updatedItem: AgentChatItem) {
+        guard items.indices.contains(index) else { return }
+        let previousItem = items[index]
+        guard updatedItem != previousItem else { return }
+        var candidateItems = items
+        candidateItems[index] = updatedItem
+        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
+            lastActivityAt = Date()
+            isDirty = true
+            return
+        }
+        suppressSourceItemsChanged = true
+        items[index] = updatedItem
+        suppressSourceItemsChanged = false
+        nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+        reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+        finishIncrementalSourceItemsMutation(
+            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+        )
+        lastActivityAt = Date()
+        isDirty = true
+    }
+
+    func mutateItem(at index: Int, _ mutate: (inout AgentChatItem) -> Void) {
+        guard items.indices.contains(index) else { return }
+        let previousItem = items[index]
+        var updatedItem = previousItem
+        mutate(&updatedItem)
+        guard updatedItem != previousItem else { return }
+        var candidateItems = items
+        candidateItems[index] = updatedItem
+        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
+            lastActivityAt = Date()
+            isDirty = true
+            return
+        }
+        suppressSourceItemsChanged = true
+        items[index] = updatedItem
+        suppressSourceItemsChanged = false
+        nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+        reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+        finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+        lastActivityAt = Date()
+        isDirty = true
+    }
+
+    @discardableResult
+    func removeItem(at index: Int) -> AgentChatItem? {
+        guard items.indices.contains(index) else { return nil }
+        let removed = items[index]
+        localInputIndex.remove(at: index, itemID: removed.id)
+        for token in Array(localComposerCandidates.keys) {
+            guard var candidate = localComposerCandidates[token] else { continue }
+            if candidate.itemID == removed.id { localComposerCandidates.removeValue(forKey: token) }
+            else if let position = candidate.position, position > index {
+                candidate.position = position - 1
+                localComposerCandidates[token] = candidate
+            }
+        }
+        suppressSourceItemsChanged = true
+        items.remove(at: index)
+        suppressSourceItemsChanged = false
+        // A rolled-back optimistic user turn never became a retained local submission.
+        // Keep provider-accepted evidence if a later UI cleanup removes its bubble.
+        automationTurnAudit.removeAll { $0.turnID == removed.id && !$0.providerTurnAccepted }
+        reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
+        rebuildToolCorrelationIndexes()
+        finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))
+        lastActivityAt = Date()
+        isDirty = true
+        return removed
+    }
+
+    func updateLastItem(_ mutate: (inout AgentChatItem) -> Void) {
+        guard !items.isEmpty else { return }
+        let index = items.count - 1
+        let previousItem = items[index]
+        var updatedItem = previousItem
+        mutate(&updatedItem)
+        guard updatedItem != previousItem else { return }
+        var candidateItems = items
+        candidateItems[index] = updatedItem
+        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
+            lastActivityAt = Date()
+            isDirty = true
+            return
+        }
+        suppressSourceItemsChanged = true
+        items[index] = updatedItem
+        suppressSourceItemsChanged = false
+        nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+        reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+        finishIncrementalSourceItemsMutation(
+            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+        )
+        lastActivityAt = Date()
+        isDirty = true
+    }
+
+    func bashLiveExecution(for transcriptItemID: UUID) -> AgentModeViewModel.BashLiveExecutionState? {
+        guard let key = bashLiveExecutionKeyByTranscriptItemID[transcriptItemID] else { return nil }
+        return bashLiveExecutionByKey[key]
+    }
+
+    func setBashLiveExecution(_ state: AgentModeViewModel.BashLiveExecutionState) {
+        bashLiveExecutionByKey[state.executionKey] = state
+        bashLiveExecutionKeyByTranscriptItemID[state.transcriptItemID] = state.executionKey
+        lastActivityAt = Date()
+    }
+
+    @discardableResult
+    func removeBashLiveExecution(forKey key: String) -> AgentModeViewModel.BashLiveExecutionState? {
+        guard let removed = bashLiveExecutionByKey.removeValue(forKey: key) else { return nil }
+        bashLiveExecutionKeyByTranscriptItemID.removeValue(forKey: removed.transcriptItemID)
+        lastActivityAt = Date()
+        return removed
+    }
+
+    @discardableResult
+    func removeBashLiveExecution(forTranscriptItemID transcriptItemID: UUID) -> AgentModeViewModel.BashLiveExecutionState? {
+        guard let key = bashLiveExecutionKeyByTranscriptItemID[transcriptItemID] else { return nil }
+        return removeBashLiveExecution(forKey: key)
+    }
+
+    func clearBashLiveExecutions() {
+        guard !bashLiveExecutionByKey.isEmpty || !bashLiveExecutionKeyByTranscriptItemID.isEmpty else { return }
+        bashLiveExecutionByKey.removeAll()
+        bashLiveExecutionKeyByTranscriptItemID.removeAll()
+        lastActivityAt = Date()
+    }
+}
+
+/// A captured creation owner. Construction stays with allocation consumption or an exact ready retry.
+struct AgentSessionCreationHandle: Equatable {
+    let workspaceID: UUID
+    let session: AgentTabSession
+    let bindingToken: AgentSessionRestorationBindingToken
+    let ownerID: UUID
+    let expectedConfigurationStamp: Data?
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspaceID == rhs.workspaceID
+            && lhs.session === rhs.session
+            && lhs.bindingToken == rhs.bindingToken
+            && lhs.ownerID == rhs.ownerID
+            && lhs.expectedConfigurationStamp == rhs.expectedConfigurationStamp
+    }
+
+    fileprivate init(
+        workspaceID: UUID,
+        session: AgentTabSession,
+        bindingToken: AgentSessionRestorationBindingToken,
+        ownerID: UUID,
+        expectedConfigurationStamp: Data?
+    ) {
+        self.workspaceID = workspaceID
+        self.session = session
+        self.bindingToken = bindingToken
+        self.ownerID = ownerID
+        self.expectedConfigurationStamp = expectedConfigurationStamp
+    }
+}
+
+/// A single-use proof from the owner that actually allocates the new session and creation owner IDs.
+@MainActor
+final class AgentSessionCreationClaim {
+    let workspaceID: UUID
+    let sessionID = UUID()
+    let ownerID = UUID()
+    fileprivate(set) var creationHandle: AgentSessionCreationHandle?
+    private var wasConsumed = false
+
+    init(workspaceID: UUID) {
+        self.workspaceID = workspaceID
+    }
+
+    fileprivate func consume(
+        for session: AgentTabSession,
+        workspaceID currentWorkspaceID: UUID
+    ) -> AgentSessionRestorationBindingToken? {
+        guard !wasConsumed else { return nil }
+        wasConsumed = true
+        guard workspaceID == currentWorkspaceID, !session.bindingTransitionInProgress,
+              let token = session.currentRestorationBindingToken,
+              token.bindingIdentity.sessionID == sessionID,
+              token.bindingIdentity.tabID == session.tabID,
+              session.qualifiedRestorationReadiness == .pending(token) else { return nil }
+        return token
+    }
+}
+
+extension AgentModeViewModel {
+    /// Source-compatibility alias for the extracted per-tab session type.
+    typealias TabSession = AgentTabSession
+}

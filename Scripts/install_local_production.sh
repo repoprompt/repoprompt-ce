@@ -16,6 +16,7 @@ LOCAL_SIGNING_IDENTITY_REGISTRY_PATH="${LOCAL_SIGNING_IDENTITY_REGISTRY_PATH:-$H
 LOCAL_SIGNING_IDENTITY_SHA256="${LOCAL_SIGNING_IDENTITY_SHA256:-}"
 ROTATE_LOCAL_SIGNING_IDENTITY="${ROTATE_LOCAL_SIGNING_IDENTITY:-0}"
 LOCAL_SIGNING_IDENTITY_TOOL="$ROOT_DIR/Scripts/local_signing_identity.py"
+FULL_XCODE_RESOLVER="$ROOT_DIR/Scripts/resolve_full_xcode_developer_dir.sh"
 TMP_DIR=""
 STAGED_DIR=""
 STAGED_APP=""
@@ -204,6 +205,11 @@ for command in codesign ditto openssl plutil python3 security shasum swift; do
     require_command "$command"
 done
 [[ -f "$LOCAL_SIGNING_IDENTITY_TOOL" ]] || fail "Missing local signing identity tool: $LOCAL_SIGNING_IDENTITY_TOOL"
+[[ -x "$FULL_XCODE_RESOLVER" ]] || fail "Missing full-Xcode resolver: $FULL_XCODE_RESOLVER"
+
+DEVELOPER_DIR="$("$FULL_XCODE_RESOLVER")"
+export DEVELOPER_DIR
+printf 'Local production Xcode developer directory: %s\n' "$DEVELOPER_DIR"
 
 LOGIN_KEYCHAIN="$(security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
 [[ -n "$LOGIN_KEYCHAIN" && -f "$LOGIN_KEYCHAIN" ]] || fail "Could not resolve the user's default login keychain."
@@ -279,8 +285,7 @@ LOCAL_SELF_SIGNED_RELEASE=1 \
     SIGN_IDENTITY="$SIGN_IDENTITY" \
     "$ROOT_DIR/Scripts/package_app.sh" release
 
-BUILD_DIR="$(swift build -c release --show-bin-path)"
-SOURCE_APP="$BUILD_DIR/$APP_NAME.app"
+SOURCE_APP="$ROOT_DIR/.build/release/$APP_NAME.app"
 [[ -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $SOURCE_APP"
 [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-self-signed" ]] ||
     fail "Packaged app is missing the local self-signed signing-mode marker."

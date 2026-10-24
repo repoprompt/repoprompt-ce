@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_BUNDLE="${1:-}"
 LAYOUT_LABEL="${2:-Required SwiftPM resource bundle layout}"
+EXECUTABLE_NAME="${3:-}"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -11,13 +12,15 @@ fail() {
 
 [[ -n "$APP_BUNDLE" ]] || fail "Usage: $0 <app-bundle> [label]"
 
-python3 - "$APP_BUNDLE" "$LAYOUT_LABEL" <<'PYTHON'
+python3 - "$APP_BUNDLE" "$LAYOUT_LABEL" "$EXECUTABLE_NAME" <<'PYTHON'
+import plistlib
 import stat
 import sys
 from pathlib import Path
 
 app = Path(sys.argv[1])
 label = sys.argv[2]
+executable_name = sys.argv[3]
 required_bundles = ["KeyboardShortcuts_KeyboardShortcuts.bundle"]
 patch_marker = b"RepoPromptKeyboardShortcutsResourceLookupV1"
 
@@ -57,7 +60,14 @@ for bundle_name in required_bundles:
     require_regular_file(bundle / "Contents" / "Info.plist")
     require_regular_file(bundle / "Contents" / "Resources" / "en.lproj" / "Localizable.strings")
 
-executable = app / "Contents" / "MacOS" / "RepoPrompt"
+if not executable_name:
+    info_plist = app / "Contents" / "Info.plist"
+    require_regular_file(info_plist)
+    with info_plist.open("rb") as source:
+        executable_name = plistlib.load(source).get("CFBundleExecutable")
+if not isinstance(executable_name, str) or not executable_name or Path(executable_name).name != executable_name:
+    fail(f"invalid packaged executable name: {executable_name!r}")
+executable = app / "Contents" / "MacOS" / executable_name
 require_regular_file(executable)
 if patch_marker not in executable.read_bytes():
     fail(f"packaged RepoPrompt executable is missing KeyboardShortcuts resource lookup patch marker: {patch_marker.decode()}")

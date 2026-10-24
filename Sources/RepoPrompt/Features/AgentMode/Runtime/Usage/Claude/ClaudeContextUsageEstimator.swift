@@ -17,7 +17,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     @discardableResult
     func enqueueUserTurnEstimate(
         messageForProvider: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Int {
         let estimate = max(0, tokenEstimator(messageForProvider))
         session.pendingNonCodexUserInputTokenQueue.append(estimate)
@@ -27,7 +27,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     @discardableResult
     func replaceNextQueuedUserTurnEstimate(
         messageForProvider: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Int? {
         guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
         let estimate = max(0, tokenEstimator(messageForProvider))
@@ -35,12 +35,12 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         return estimate
     }
 
-    func dequeueQueuedUserTurnEstimate(session: AgentModeViewModel.TabSession) -> Int? {
+    func dequeueQueuedUserTurnEstimate(session: AgentTabSession) -> Int? {
         guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
         return session.pendingNonCodexUserInputTokenQueue.removeFirst()
     }
 
-    func beginTurn(session: AgentModeViewModel.TabSession, initialMessage: String) {
+    func beginTurn(session: AgentTabSession, initialMessage: String) {
         let userTokens = dequeueQueuedUserTurnEstimate(session: session) ?? tokenEstimate(for: initialMessage)
         session.activeNonCodexTurnTokenAccumulator = AgentModeViewModel.NonCodexTurnTokenAccumulator(
             estimatedUserInputTokens: max(0, userTokens),
@@ -52,7 +52,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         }
     }
 
-    func addUserInputTokens(_ tokens: Int, session: AgentModeViewModel.TabSession) {
+    func addUserInputTokens(_ tokens: Int, session: AgentTabSession) {
         guard tokens > 0 else { return }
         var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentModeViewModel.NonCodexTurnTokenAccumulator()
         accumulator.estimatedUserInputTokens += tokens
@@ -60,7 +60,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         session.isDirty = true
     }
 
-    func addToolInputPayload(_ payload: String?, session: AgentModeViewModel.TabSession) {
+    func addToolInputPayload(_ payload: String?, session: AgentTabSession) {
         let tokens = tokenEstimate(for: payload)
         guard tokens > 0 else { return }
         var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentModeViewModel.NonCodexTurnTokenAccumulator()
@@ -69,7 +69,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         session.isDirty = true
     }
 
-    func addToolOutputPayload(_ payload: String?, session: AgentModeViewModel.TabSession) {
+    func addToolOutputPayload(_ payload: String?, session: AgentTabSession) {
         let tokens = tokenEstimate(for: payload)
         guard tokens > 0 else { return }
         var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentModeViewModel.NonCodexTurnTokenAccumulator()
@@ -84,7 +84,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         completionTokens _: Int?,
         contextUsedTokens: Int?,
         modelContextWindow: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot? {
         let prompt = max(0, promptTokens ?? 0)
         let existing = session.codexContextUsage
@@ -106,7 +106,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             if contextUsed > 0 {
                 return contextUsed
             }
-            if prompt > 0 {
+            // A billed prompt count cannot resolve an unknown post-compaction occupancy.
+            if prompt > 0, !awaitsPostCompactionUsage(session: session) {
                 return prompt
             }
             return nil
@@ -117,7 +118,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
             lastTotalTokens: resolvedUsed,
-            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
+            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens,
+            awaitingPostCompactionUsage: contextUsed > 0 ? nil : existing?.awaitingPostCompactionUsage
         )
         return updateSnapshot(
             from: session.codexContextUsage,
@@ -131,7 +133,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     func ingestTurnFinalizationSignal(
         contextUsedTokens: Int?,
         modelContextWindow: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
         let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
@@ -145,7 +147,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
             lastTotalTokens: resolvedUsed,
-            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
+            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens,
+            awaitingPostCompactionUsage: resolvedContextUsed > 0 ? nil : existing?.awaitingPostCompactionUsage
         )
         return updateSnapshot(
             from: session.codexContextUsage,
@@ -155,7 +158,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
     }
 
-    func ingestStatusSignal(_ statusText: String?, session: AgentModeViewModel.TabSession) {
+    func ingestStatusSignal(_ statusText: String?, session: AgentTabSession) {
         guard let statusText = statusText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !statusText.isEmpty
         else { return }
@@ -170,13 +173,32 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
     }
 
-    func ingestSystemSignal(_ systemText: String?, session: AgentModeViewModel.TabSession) {
+    func ingestSystemSignal(_ systemText: String?, session: AgentTabSession) {
         guard let systemText = systemText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !systemText.isEmpty
         else { return }
         let normalized = systemText.lowercased()
-        guard normalized.contains("context compacted") else { return }
+        guard normalized.hasPrefix("context compacted") else { return }
         session.contextCompactedAt = Date()
+        // compact_boundary reports pre_tokens, not the size of the compacted context.
+        // Invalidate both ring fallbacks and this turn's pre-boundary observation while
+        // retaining the model window and all historical billing/usage records.
+        session.codexContextUsage = AgentContextUsage(
+            modelContextWindow: session.codexContextUsage?.modelContextWindow,
+            lastTotalTokens: nil,
+            totalTotalTokens: nil,
+            awaitingPostCompactionUsage: true
+        )
+        // Persist the fence immediately: /compact can end without any billable turn usage.
+        session.providerTokenUsageByTurn.append(AgentTokenUsagePersist(
+            runID: session.runID,
+            turnID: session.transcript.turns.last?.id,
+            promptTokens: 0,
+            completionTokens: 0,
+            contextCompacted: true
+        ))
+        session.activeNonCodexTurnTokenAccumulator?.observedContextUsedTokens = nil
+        session.isDirty = true
         _ = updateSnapshot(
             from: session.codexContextUsage,
             source: .compactionSignal,
@@ -190,7 +212,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         promptTokens: Int?,
         completionTokens: Int?,
         contextUsedTokens: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         let prompt = max(0, promptTokens ?? 0)
         let completion = max(0, completionTokens ?? 0)
@@ -210,7 +232,9 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             || resolvedContextUsed > 0
 
         guard hasUsage else {
-            if !session.providerTokenUsageByTurn.isEmpty, session.codexContextUsage == nil {
+            if !session.providerTokenUsageByTurn.isEmpty,
+               session.codexContextUsage == nil
+            {
                 session.codexContextUsage = contextUsageBuilder(
                     session.providerTokenUsageByTurn,
                     nil
@@ -232,6 +256,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let accumulatorContextUsed = accumulator?.observedContextUsedTokens ?? 0
         let persistedContextUsed = resolvedContextUsed > 0 ? resolvedContextUsed : (accumulatorContextUsed > 0 ? accumulatorContextUsed : 0)
         let usage = AgentTokenUsagePersist(
+            runID: session.runID,
+            turnID: session.transcript.turns.last?.id,
             promptTokens: prompt,
             completionTokens: completion,
             contextUsedTokens: persistedContextUsed > 0 ? persistedContextUsed : nil,
@@ -245,6 +271,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         // preserve the existing codexContextUsage which may have been set by
         // ingestUsageSignal with actual data.
         let existingUsage = session.codexContextUsage
+        // The persisted compaction fence stops the builder from reaching pre-boundary
+        // occupancy. Rebuilding is safe even on later turns without a new measurement.
         let rebuilt = contextUsageBuilder(
             session.providerTokenUsageByTurn,
             existingUsage?.modelContextWindow
@@ -260,6 +288,10 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         )
         session.isDirty = true
         return true
+    }
+
+    private func awaitsPostCompactionUsage(session: AgentTabSession) -> Bool {
+        session.codexContextUsage?.awaitingPostCompactionUsage == true
     }
 
     private func normalizedContextUsedTokens(
@@ -279,7 +311,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         from usage: AgentContextUsage?,
         source: ContextUsageSnapshotSource,
         confidence: ContextUsageSnapshotConfidence,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot? {
         let next = ContextUsageSnapshot.fromAgentContextUsage(
             usage,

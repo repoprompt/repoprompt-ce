@@ -2,41 +2,202 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
+import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 @MainActor
-final class MCPFileToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .files
+final class MCPFileToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .files
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    typealias Dependencies = (
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    )
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    private let dependencies: Dependencies
+
+    private struct ReadAuthority {
+        let metadata: MCPRequestMetadata
+        let frozen: MCPFrozenFileToolAuthority
+        let dependencies: Dependencies
+        let isRunlessOneShotHint: Bool
+
+        var lookupContext: WorkspaceLookupContext {
+            frozen.lookupContext
+        }
+    }
+
+    init(runtime: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (context: context, selection: selection, files: files)
     }
 
     func buildTools() -> [Tool] {
-        [
-            fileActionsTool(),
-            getCodeStructureTool(),
-            getFileTreeTool(),
-            readFileTool(),
-            fileSearchTool()
-        ]
+        [fileActionsTool()]
+    }
+
+    func executeDomainRead(
+        toolName: String,
+        context _: DomainReadInvocationContext,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        args: [String: Value],
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> Value {
+        do {
+            let authority = try await readAuthority(appContext)
+            return switch toolName {
+            case MCPWindowToolName.getCodeStructure:
+                try await executeGetCodeStructure(args: args, authority: authority)
+            case MCPWindowToolName.getFileTree:
+                try await executeGetFileTree(args: args, authority: authority)
+            case MCPWindowToolName.readFile:
+                try await executeReadFile(args: args, authority: authority, sideEffects: sideEffects)
+            case MCPWindowToolName.search:
+                try await executeFileSearchToolValue(args: args, authority: authority, sideEffects: sideEffects)
+            default:
+                throw MCPError.invalidParams("Unsupported file read tool: \(toolName)")
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as MCPFileToolAuthorityFailure {
+            return try Self.authorityFailureValue(toolName: toolName, args: args, failure: failure)
+        }
+    }
+
+    private func readAuthority(
+        _ appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+    ) async throws -> ReadAuthority {
+        if let appContext {
+            guard let frozen = appContext.frozenFileToolAuthority else {
+                throw MCPFileToolAuthorityFailure.unavailable
+            }
+            let authority = ReadAuthority(
+                metadata: appContext.metadata,
+                frozen: frozen,
+                dependencies: appContext.fileToolDependencies,
+                isRunlessOneShotHint: appContext.resolvedTabContext.isRunlessOneShotHint
+            )
+            try await validate(authority)
+            return authority
+        }
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let route = try await dependencies.context.resolveTabContextSnapshot(
+            metadata,
+            "file_tool_lookup_scope"
+        )
+        let frozen = try await dependencies.selection.requiredFileToolLookupContext(metadata)
+        return ReadAuthority(
+            metadata: metadata,
+            frozen: frozen,
+            dependencies: dependencies,
+            isRunlessOneShotHint: route.isRunlessOneShotHint
+        )
+    }
+
+    private func validate(_ authority: ReadAuthority) async throws {
+        guard let workspaceManager = authority.dependencies.context.workspaceManager else {
+            throw MCPFileToolAuthorityFailure.unavailable
+        }
+        try await authority.frozen.validate(
+            workspaceManager: workspaceManager,
+            store: authority.dependencies.context.promptVM.workspaceFileContextStore
+        )
+    }
+
+    nonisolated static func authorityFailureValue(
+        toolName: String,
+        args: [String: Value],
+        failure: MCPFileToolAuthorityFailure
+    ) throws -> Value {
+        let message = failure.localizedDescription
+        let retryAfter = MCPFileToolAuthorityFailure.retryAfterMilliseconds
+        switch toolName {
+        case MCPWindowToolName.search:
+            return try Value(ToolResultDTOs.SearchResultDTO(
+                totalMatches: 0,
+                totalFiles: 0,
+                contentMatches: 0,
+                pathMatches: 0,
+                limitHit: false,
+                perFileCounts: [],
+                pathMatchLines: [],
+                contentMatchGroups: [],
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter,
+                suggestion: "Retry after workspace restoration settles or bind the intended context again."
+            ))
+        case MCPWindowToolName.readFile:
+            let path = args["path"]?.stringValue ?? ""
+            return try Value(ToolResultDTOs.ReadFileReply(
+                content: "",
+                totalLines: 0,
+                firstLine: 0,
+                lastLine: 0,
+                message: message,
+                displayPath: path,
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter
+            ))
+        case MCPWindowToolName.getFileTree:
+            return try Value(ToolResultDTOs.FileTreeDTO(
+                rootsCount: 0,
+                usesLegend: false,
+                tree: message,
+                note: "Workspace authority unavailable",
+                wasTruncated: false,
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter
+            ))
+        case MCPWindowToolName.getCodeStructure:
+            let size = args["size"]?.stringValue.flatMap(WorkspaceCodemapGraphOutputSize.init(rawValue:)) ?? .medium
+            let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
+                code: failure.errorCode,
+                phase: "workspace_authority",
+                path: nil,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter,
+                attempted: nil,
+                limit: nil,
+                message: message
+            )
+            return try Value(ToolResultDTOs.CodeStructureReplyDTO(
+                status: .unavailable,
+                size: size,
+                roots: [],
+                files: [],
+                summary: .init(seeds: 0, nodes: 0, edges: 0, files: 0, tokens: 0),
+                issues: [issue],
+                retry: .init(retryable: failure.retryable, retryAfterMilliseconds: retryAfter),
+                worktreeScope: nil
+            ))
+        default:
+            throw failure
+        }
     }
 
     private func withActiveWorktreeStartupBenchmarkTag<T>(
+        lookupContext: WorkspaceLookupContext,
         _ operation: () async throws -> T
     ) async rethrows -> T {
         #if DEBUG
-            let metadata = await dependencies.captureRequestMetadata()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
             let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
                 WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
                     agentSessionID: $0
                 )
             }
-            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag
+            return try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal
                 .withValue(tag, operation: operation)
         #else
             return try await operation()
@@ -98,7 +259,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
             let reply: ToolResultDTOs.FileActionReply
             do {
-                let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)
+                let acknowledgement = try await dependencies.files.performFileAction(action, path, content, newPath, ifExists, operationID)
                 reply = ToolResultDTOs.FileActionReply(
                     status: "ok",
                     action: action,
@@ -124,367 +285,256 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func getCodeStructureTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.getCodeStructure,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Return current, root-scoped code structure from content-addressed codemaps.
-
-            Scopes:
-            - paths: Analyze explicit files/directories. paths is required.
-            - selected: Analyze the authoritative current selection. paths is forbidden.
-
-            Relationship expansion:
-            - Omit expand for seed-only output.
-            - referenced_definitions: follow definitions referenced by each seed.
-            - referrers: follow resident files that reference definitions in each seed.
-            - both: traverse both root-local directions.
-            - Cold relationship discovery waits for exact current coverage within the server's fixed 10-second deadline.
-
-            Limits:
-            - max_files (1...200, default 10)
-            - max_edges (1...10000, default 500)
-            - max_codemap_tokens (256...20000, default 6000)
-
-            Results report literal ready, budget, busy, timeout, unavailable, or stale status
-            with stable issue codes. Readiness pressure never returns partial structure.
-            Cancellation remains an MCP cancellation.
-            Per-file paths are logical paths; traversal cannot cross a root epoch.
-
-            Examples:
-            - Seed only: {"scope":"paths","paths":["src/auth/"]}
-            - Selected with referrers: {"scope":"selected","expand":{"direction":"referrers","max_depth":1}}
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "scope": .string(
-                        description: "Required seed source",
-                        enum: ["paths", "selected"]
-                    ),
-                    "paths": .array(
-                        description: "One to 256 file or directory paths when scope='paths'",
-                        items: .string(description: "File or directory path")
-                    ),
-                    "expand": .object(
-                        properties: [
-                            "direction": .string(
-                                description: "Root-local relationship direction",
-                                enum: ["referenced_definitions", "referrers", "both"]
-                            ),
-                            "max_depth": .integer(
-                                description: "Maximum graph hops (1...4, default 1)"
-                            )
-                        ],
-                        required: ["direction"]
-                    ),
-                    "limits": .object(
-                        properties: [
-                            "max_files": .integer(description: "Maximum emitted seed plus related files"),
-                            "max_edges": .integer(description: "Maximum root-local graph edges examined"),
-                            "max_codemap_tokens": .integer(description: "Strict codemap-content token budget")
-                        ],
-                        required: []
-                    )
-                ],
-                required: ["scope"]
-            )
-        ) { [self] _, args in
-            try await withActiveWorktreeStartupBenchmarkTag {
-                try await MCPToolWorkCountDiagnostics.withGitInvocation(
-                    operation: MCPWindowToolName.getCodeStructure
-                ) {
-                    try Task.checkCancellation()
-                    let allowedRootKeys: Set = ["scope", "paths", "expand", "limits"]
-                    guard Set(args.keys).isSubset(of: allowedRootKeys) else {
-                        throw MCPError.invalidParams("unknown get_code_structure parameter")
-                    }
-                    guard let scope = args["scope"]?.stringValue?.lowercased(),
-                          scope == "paths" || scope == "selected"
-                    else {
-                        throw MCPError.invalidParams("scope must be 'paths' or 'selected'")
-                    }
-
-                    let direction: WorkspaceCodemapStructureTraversalDirection?
-                    let maximumDepth: Int
-                    if let expandValue = args["expand"] {
-                        guard let expand = expandValue.objectValue else {
-                            throw MCPError.invalidParams("expand must be an object")
-                        }
-                        guard Set(expand.keys).isSubset(of: ["direction", "max_depth"]) else {
-                            throw MCPError.invalidParams("unknown expand parameter")
-                        }
-                        guard let rawDirection = expand["direction"]?.stringValue else {
-                            throw MCPError.invalidParams("expand.direction is required")
-                        }
-                        direction = switch rawDirection {
-                        case "referenced_definitions": .referencedDefinitions
-                        case "referrers": .referrers
-                        case "both": .both
-                        default: throw MCPError.invalidParams("invalid expand.direction")
-                        }
-                        maximumDepth = expand["max_depth"]?.intValue ?? 1
-                        guard (1 ... 4).contains(maximumDepth) else {
-                            throw MCPError.invalidParams("expand.max_depth must be between 1 and 4")
-                        }
-                    } else {
-                        direction = nil
-                        maximumDepth = 0
-                    }
-
-                    let limits: [String: Value]
-                    if let limitsValue = args["limits"] {
-                        guard let object = limitsValue.objectValue else {
-                            throw MCPError.invalidParams("limits must be an object")
-                        }
-                        guard Set(object.keys).isSubset(
-                            of: ["max_files", "max_edges", "max_codemap_tokens"]
-                        ) else {
-                            throw MCPError.invalidParams("unknown limits parameter")
-                        }
-                        limits = object
-                    } else {
-                        limits = [:]
-                    }
-                    let maximumFiles = limits["max_files"]?.intValue ?? 10
-                    let maximumEdges = limits["max_edges"]?.intValue ?? 500
-                    let maximumCodemapTokens = limits["max_codemap_tokens"]?.intValue ?? 6000
-                    guard (1 ... 200).contains(maximumFiles) else {
-                        throw MCPError.invalidParams("limits.max_files must be between 1 and 200")
-                    }
-                    guard (1 ... 10000).contains(maximumEdges) else {
-                        throw MCPError.invalidParams("limits.max_edges must be between 1 and 10000")
-                    }
-                    guard (256 ... 20000).contains(maximumCodemapTokens) else {
-                        throw MCPError.invalidParams("limits.max_codemap_tokens must be between 256 and 20000")
-                    }
-                    let request = MCPServerViewModel.CodeStructureRequest(
-                        direction: direction,
-                        maximumDepth: maximumDepth,
-                        maximumFiles: maximumFiles,
-                        maximumEdges: maximumEdges,
-                        maximumCodemapTokens: maximumCodemapTokens
-                    )
-
-                    await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
-                    let metadata = await dependencies.captureRequestMetadata()
-                    try Task.checkCancellation()
-                    let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                    try Task.checkCancellation()
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(
-                        rootScope: lookupContext.rootScope
-                    )
-                    try Task.checkCancellation()
-
-                    let files: [WorkspaceFileRecord]
-                    switch scope {
-                    case "selected":
-                        guard args["paths"] == nil else {
-                            throw MCPError.invalidParams("paths is forbidden when scope='selected'")
-                        }
-                        guard await dependencies.drainReadFileAutoSelection(
-                            metadata,
-                            .canonicalSelection
-                        ) == .completed else {
-                            throw CancellationError()
-                        }
-                        files = try await dependencies.resolveSelectedFilesForCodeStructure(
-                            metadata,
-                            lookupContext,
-                            MCPServerViewModel.codeStructureSeedLimit(for: request)
-                        )
-                    case "paths":
-                        guard let rawPaths = args["paths"]?.arrayValue else {
-                            throw MCPError.invalidParams("paths is required when scope='paths'")
-                        }
-                        guard !rawPaths.isEmpty, rawPaths.count <= 256,
-                              rawPaths.allSatisfy({ $0.stringValue != nil })
-                        else {
-                            throw MCPError.invalidParams("paths must contain one to 256 strings")
-                        }
-                        let translated = lookupContext.translateInputPaths(
-                            rawPaths.compactMap(\.stringValue)
-                        )
-                        for path in translated {
-                            try Task.checkCancellation()
-                            if let issue = await dependencies.promptVM.workspaceFileContextStore
-                                .exactPathResolutionIssue(
-                                    for: path,
-                                    kind: .either,
-                                    rootScope: lookupContext.rootScope
-                                )
-                            {
-                                throw MCPError.invalidParams(
-                                    PathResolutionIssueRenderer.message(for: issue)
-                                )
-                            }
-                        }
-                        files = try await dependencies.resolveFilesForCodeStructure(
-                            translated,
-                            lookupContext.rootScope,
-                            MCPServerViewModel.codeStructureSeedLimit(for: request)
-                        )
-                    default:
-                        throw MCPError.invalidParams("invalid scope")
-                    }
-                    try Task.checkCancellation()
-                    let reply = try await dependencies.buildCodeStructureDTO(
-                        files,
-                        request,
-                        true,
-                        lookupContext
-                    )
-                    try Task.checkCancellation()
-                    return try Value(reply)
+    private func executeGetCodeStructure(
+        args: [String: Value],
+        authority: ReadAuthority
+    ) async throws -> Value {
+        let dependencies = authority.dependencies
+        return try await withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
+            try await MCPToolWorkCountDiagnostics.withGitInvocation(
+                operation: MCPWindowToolName.getCodeStructure
+            ) {
+                try Task.checkCancellation()
+                let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
+                guard Set(args.keys).isSubset(of: allowedKeys) else {
+                    throw MCPError.invalidParams("unknown get_code_structure parameter")
                 }
+
+                let direction: WorkspaceCodemapStructureTraversalDirection?
+                if let value = args["expand"] {
+                    guard let raw = value.stringValue else {
+                        throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
+                    }
+                    direction = switch raw {
+                    case "uses": .referencedDefinitions
+                    case "used_by": .referrers
+                    case "both": .both
+                    default: throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
+                    }
+                } else {
+                    direction = nil
+                }
+
+                let suppliedDepth: Int
+                if let value = args["depth"] {
+                    guard let depth = value.intValue else {
+                        throw MCPError.invalidParams("depth must be an integer")
+                    }
+                    suppliedDepth = depth
+                } else {
+                    suppliedDepth = 1
+                }
+                guard (1 ... 4).contains(suppliedDepth) else {
+                    throw MCPError.invalidParams("depth must be between 1 and 4")
+                }
+
+                let includesSignatures: Bool
+                if let value = args["signatures"] {
+                    guard let signatures = value.boolValue else {
+                        throw MCPError.invalidParams("signatures must be a boolean")
+                    }
+                    includesSignatures = signatures
+                } else {
+                    includesSignatures = true
+                }
+
+                let size: WorkspaceCodemapGraphOutputSize
+                if let value = args["size"] {
+                    guard let rawSize = value.stringValue,
+                          let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
+                    else {
+                        throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
+                    }
+                    size = parsedSize
+                } else {
+                    size = .medium
+                }
+                let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
+                    size: size,
+                    includesSignatures: includesSignatures
+                )
+                let request = MCPServerViewModel.CodeStructureRequest(
+                    direction: direction,
+                    maximumDepth: direction == nil ? 0 : suppliedDepth,
+                    includesSignatures: includesSignatures,
+                    size: size,
+                    budget: budget
+                )
+
+                await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
+                let metadata = authority.metadata
+                try Task.checkCancellation()
+                let lookupContext = authority.lookupContext
+                try Task.checkCancellation()
+                _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(
+                    rootScope: lookupContext.rootScope
+                )
+                try Task.checkCancellation()
+
+                let files: [WorkspaceFileRecord]
+                var requestedPaths: [String] = []
+                if let pathsValue = args["paths"] {
+                    guard let rawPaths = pathsValue.arrayValue,
+                          !rawPaths.isEmpty,
+                          rawPaths.count <= 256,
+                          rawPaths.allSatisfy({ $0.stringValue != nil })
+                    else {
+                        throw MCPError.invalidParams("paths must contain one to 256 strings")
+                    }
+                    let translated = lookupContext.translateInputPaths(rawPaths.compactMap(\.stringValue))
+                    requestedPaths = translated
+                    for path in translated {
+                        try Task.checkCancellation()
+                        if let issue = await dependencies.context.promptVM.workspaceFileContextStore
+                            .exactPathResolutionIssue(
+                                for: path,
+                                kind: .either,
+                                rootScope: lookupContext.rootScope
+                            )
+                        {
+                            throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+                        }
+                    }
+                    files = try await dependencies.files.resolveFilesForCodeStructure(
+                        translated,
+                        lookupContext.rootScope,
+                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                    )
+                } else {
+                    if !authority.isRunlessOneShotHint {
+                        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                            try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                        }
+                    }
+                    files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
+                        metadata,
+                        lookupContext,
+                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                    )
+                }
+                try Task.checkCancellation()
+                let reply = try await dependencies.files.buildCodeStructureDTO(
+                    files,
+                    request,
+                    true,
+                    requestedPaths,
+                    lookupContext
+                )
+                try Task.checkCancellation()
+                try await validate(authority)
+                return try Value(reply)
             }
         }
     }
 
-    private func getFileTreeTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.getFileTree,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Generate ASCII directory tree of the project.
-
-            **Types**:
-            - `files` (default): Directory tree with files
-            - `roots`: List loaded root folders only
-
-            **Modes** (for type="files"):
-            - `auto` (default): Full tree, auto-trims depth if too large (~10k token target)
-            - `full`: Complete tree (can be very large)
-            - `folders`: Directories only, no files
-            - `selected`: Only selected files and their parent directories
-
-            **Options**:
-            - `path`: Start from specific folder (modes/max_depth apply from there)
-            - `max_depth`: Limit depth (root=0, immediate children=1, etc.)
-
-            **Markers**: `*` = selected file, `+` = has codemap
-
-            **Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads use the bound worktree. Responses include `worktree_scope` when this remapping is active.
-
-            **Examples**:
-            - Auto tree: `{}`
-            - Folders only: `{"mode":"folders"}`
-            - Subtree: `{"path":"src/components","max_depth":2}`
-            - Selected files: `{"mode":"selected"}`
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "type": .string(description: "Tree type to generate (default: 'files')", enum: ["files", "roots"]),
-                    "mode": .string(description: "Filter mode (for 'files' type only, default: 'auto')", enum: ["auto", "full", "folders", "selected"]),
-                    "max_depth": .integer(description: "Maximum depth (root = 0)"),
-                    "path": .string(description: "Optional starting folder (absolute or relative) when type='files'. When provided, the tree is generated from this folder and 'mode' and 'max_depth' apply from that subtree.")
-                ],
-                required: []
-            )
-        ) { [self] _, args in
-            try await withActiveWorktreeStartupBenchmarkTag {
-                let type = args["type"]?.stringValue ?? "files"
-                switch type {
-                case "roots":
-                    let filePathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
-                    let metadata = await dependencies.captureRequestMetadata()
-                    let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-                    let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-                    let snapshot = await dependencies.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
-                        selection: StoredSelection(),
-                        request: WorkspaceFileTreeSnapshotRequest(mode: .full, filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false, showCodeMapMarkers: false, rootScope: lookupContext.rootScope),
-                        profile: .mcpRead
-                    )
-                    if snapshot.roots.isEmpty {
-                        let msg = await dependencies.workspaceContextMessage(MCPWindowToolName.getFileTree, nil)
-                        return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: 0, usesLegend: false, tree: msg, note: "No workspace loaded", wasTruncated: false, worktreeScope: worktreeScope))
+    private func executeGetFileTree(
+        args: [String: Value],
+        authority: ReadAuthority
+    ) async throws -> Value {
+        let dependencies = authority.dependencies
+        await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution)
+        return try await withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
+            let type = args["type"]?.stringValue ?? "files"
+            switch type {
+            case "roots":
+                let filePathDisplay = await MainActor.run { dependencies.context.promptVM.filePathDisplayOption }
+                let lookupContext = authority.lookupContext
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution, transition: .completed)
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait)
+                _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                try Task.checkCancellation()
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait, transition: .completed)
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction)
+                let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
+                let snapshot = await dependencies.context.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
+                    selection: StoredSelection(),
+                    request: WorkspaceFileTreeSnapshotRequest(mode: .full, filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false, showCodeMapMarkers: false, rootScope: lookupContext.rootScope),
+                    profile: .mcpRead
+                )
+                try await validate(authority)
+                if snapshot.roots.isEmpty {
+                    guard authority.frozen.rootCatalogSnapshot.isGenuinelyRootless else {
+                        throw MCPFileToolAuthorityFailure.mismatchedProjection
                     }
-                    let rootLines = snapshot.roots.map { root in
-                        lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: root.fullPath, display: .full) ?? root.fullPath
-                    }
-                    return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
-                case "files":
-                    let mode = args["mode"]?.stringValue ?? "auto"
-                    let maxDepth: Int?
-                    if let maxDepthArg = args["max_depth"] {
-                        guard let intVal = maxDepthArg.intValue else { throw MCPError.invalidParams("max_depth must be an integer") }
-                        maxDepth = intVal
-                    } else {
-                        maxDepth = nil
-                    }
-                    let metadata = await dependencies.captureRequestMetadata()
-                    let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-                    if mode.lowercased() == "selected" {
-                        guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                            throw CancellationError()
-                        }
-                    }
-                    let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-                    let resultAndRootCount = try await dependencies.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
+                    await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
                     return try Value(ToolResultDTOs.FileTreeDTO(
-                        rootsCount: resultAndRootCount.rootCount,
-                        usesLegend: resultAndRootCount.result.usesLegend,
-                        tree: resultAndRootCount.result.tree,
-                        note: resultAndRootCount.result.note,
-                        wasTruncated: resultAndRootCount.result.wasTruncated,
+                        rootsCount: 0,
+                        usesLegend: false,
+                        tree: "The resolved workspace has no configured roots.",
+                        note: "No roots configured",
+                        wasTruncated: false,
                         worktreeScope: worktreeScope
                     ))
-                default:
-                    throw MCPError.invalidParams("invalid type: \(type)")
                 }
+                let rootLines = snapshot.roots.map { root in
+                    lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: root.fullPath, display: .full) ?? root.fullPath
+                }
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
+                try await validate(authority)
+                return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
+            case "files":
+                let mode = args["mode"]?.stringValue ?? "auto"
+                let maxDepth: Int?
+                if let maxDepthArg = args["max_depth"] {
+                    guard let intVal = maxDepthArg.intValue else { throw MCPError.invalidParams("max_depth must be an integer") }
+                    maxDepth = intVal
+                } else {
+                    maxDepth = nil
+                }
+                let metadata = authority.metadata
+                let lookupContext = authority.lookupContext
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution, transition: .completed)
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait)
+                _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                try Task.checkCancellation()
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait, transition: .completed)
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction)
+                if mode.lowercased() == "selected" {
+                    if !authority.isRunlessOneShotHint {
+                        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                            try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                        }
+                    }
+                }
+                let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
+                let resultAndRootCount = try await dependencies.files.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
+                await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
+                try await validate(authority)
+                if resultAndRootCount.emptyReason == .rootProjectionEmpty,
+                   !authority.frozen.rootCatalogSnapshot.isGenuinelyRootless
+                {
+                    throw MCPFileToolAuthorityFailure.mismatchedProjection
+                }
+                return try Value(ToolResultDTOs.FileTreeDTO(
+                    rootsCount: resultAndRootCount.rootCount,
+                    usesLegend: resultAndRootCount.result.usesLegend,
+                    tree: resultAndRootCount.result.tree,
+                    note: resultAndRootCount.result.note,
+                    wasTruncated: resultAndRootCount.result.wasTruncated,
+                    worktreeScope: worktreeScope
+                ))
+            default:
+                throw MCPError.invalidParams("invalid type: \(type)")
             }
         }
     }
 
-    private func readFileTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.readFile,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Read file contents with optional line range.
-
-            **Parameters**:
-            - `path`: File path (required)
-            - `start_line`: 1-based line number, or negative for tail behavior
-            - `limit`: Number of lines (only with positive start_line)
-
-            **Behaviors**:
-            - No params: Entire file
-            - `start_line=10`: From line 10 to end
-            - `start_line=10, limit=20`: Lines 10-29
-            - `start_line=-10`: Last 10 lines (like `tail -10`)
-
-            **Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads use the bound worktree. Responses include `worktree_scope` when this remapping is active.
-
-            **Examples**:
-            - Full file: `{"path":"src/main.swift"}`
-            - Lines 50-100: `{"path":"file.swift","start_line":50,"limit":51}`
-            - Last 20 lines: `{"path":"file.swift","start_line":-20}`
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "path": .string(description: "File path"),
-                    "start_line": .integer(description: "Line to start from (1-based) or negative for tail behavior (-N reads last N lines)"),
-                    "limit": .integer(description: "Number of lines to read")
-                ],
-                required: ["path"]
-            )
-        ) { [self] _, args in
-            try await executeReadFile(args: args)
-        }
+    private func executeReadFile(
+        args: [String: Value],
+        authority: ReadAuthority,
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> Value {
+        try await executeReadFileBody(args: args, authority: authority, sideEffects: sideEffects)
     }
 
-    private func executeReadFile(args: [String: Value]) async throws -> Value {
-        try await executeReadFileBody(args: args)
-    }
-
-    private func executeReadFileBody(args: [String: Value]) async throws -> Value {
+    private func executeReadFileBody(
+        args: [String: Value],
+        authority: ReadAuthority,
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> Value {
+        let dependencies = authority.dependencies
         try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileRequestResolution)
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.providerTotal, providerTotalState) }
@@ -499,71 +549,109 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
             return (path, startLine1Based, limit)
         }
-        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
-            await dependencies.captureRequestMetadata()
+        let metadata = authority.metadata
+        try Task.checkCancellation()
+        let lookupContext = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
+            authority.lookupContext
         }
         try Task.checkCancellation()
-        let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
-            await dependencies.resolveFileToolLookupContext(metadata)
-        }
-        try Task.checkCancellation()
-        let (worktreeScope, resolvedPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
+        let (worktreeScope, translatedArtifactPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
             let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-            let resolvedPath = lookupContext.translateInputPath(path)
-            return (worktreeScope, resolvedPath)
+            return (worktreeScope, lookupContext.translateInputPath(path))
         }
-        try Task.checkCancellation()
-        var readResult: (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
+        let exactInput: WorkspaceExactFileInput
         do {
-            readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
-                if let artifact = try await dependencies.readSelectedAuthorizedGitArtifact(
+            exactInput = try WorkspaceExactFileInput.parse(path)
+        } catch let issue as PathResolutionIssue {
+            throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+        }
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileRequestResolution, transition: .completed)
+        try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileContentRead)
+        let unprojectedReadResult: MCPAppFileReadResult
+        do {
+            unprojectedReadResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
+                if let artifactReply = try await dependencies.files.readSelectedAuthorizedGitArtifact(
                     path,
-                    resolvedPath,
+                    translatedArtifactPath,
                     startLine1Based,
                     limit,
                     metadata,
                     lookupContext
                 ) {
-                    return artifact
+                    return .nonSelecting(reply: artifactReply)
                 }
-                return try await dependencies.readFile(
-                    resolvedPath,
+                return try await dependencies.files.readFile(
+                    exactInput,
                     startLine1Based,
                     limit,
-                    lookupContext.rootScope
+                    lookupContext
                 )
             }
         } catch WorkspaceAppliedIngressWaitError.timedOut {
+            await MCPToolExecutionHandlerPhaseContext.report(.readFileContentRead, transition: .completed)
             return try Value(Self.readFileFreshnessTimeoutDTO(
                 path: path,
                 worktreeScope: worktreeScope
             ))
         }
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileContentRead, transition: .completed)
         try Task.checkCancellation()
-        let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
-            lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
+        let unprojectedReply = switch unprojectedReadResult {
+        case let .workspace(reply, _), let .nonSelecting(reply): reply
         }
-        readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
+        let readResult: MCPAppFileReadResult = try await EditFlowPerf.measure(
+            EditFlowPerf.Stage.ReadFile.providerReplyProjection
+        ) {
             let reply = try await MCPReadFileToolProjection.projectReply(
-                readResult.reply,
-                displayPath: projectedDisplayPath,
+                unprojectedReply,
+                displayPath: unprojectedReply.displayPath,
                 worktreeScope: worktreeScope
             )
-            return (reply, readResult.shouldAutoSelect)
-        }
-        try Task.checkCancellation()
-        await EditFlowPerf.measure(
-            EditFlowPerf.Stage.ReadFile.providerAutoSelect,
-            EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
-        ) {
-            if readResult.shouldAutoSelect {
-                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, resolvedPath, metadata)
+            return switch unprojectedReadResult {
+            case let .workspace(_, absolutePhysicalPath):
+                .workspace(reply: reply, absolutePhysicalPath: absolutePhysicalPath)
+            case .nonSelecting:
+                .nonSelecting(reply: reply)
             }
         }
         try Task.checkCancellation()
+        let autoSelectOutcome = switch readResult {
+        case .workspace where !authority.isRunlessOneShotHint: "attempted"
+        case .workspace: "skipped"
+        case .nonSelecting: "skipped"
+        }
+        try await validate(authority)
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileAutoSelection)
+        try await EditFlowPerf.measure(
+            EditFlowPerf.Stage.ReadFile.providerAutoSelect,
+            EditFlowPerf.Dimensions(outcome: autoSelectOutcome)
+        ) {
+            if case let .workspace(reply, absolutePhysicalPath) = readResult,
+               !authority.isRunlessOneShotHint
+            {
+                try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    _ = try await applyReadFileSideEffect(
+                        reply: reply,
+                        requestedPath: path,
+                        absolutePhysicalPath: absolutePhysicalPath,
+                        metadata: metadata,
+                        authority: authority.frozen,
+                        files: dependencies.files
+                    )
+                }
+            }
+        }
+        await MCPToolExecutionHandlerPhaseContext.report(.readFileAutoSelection, transition: .completed)
+        try Task.checkCancellation()
+        let projectedReply = switch readResult {
+        case let .workspace(reply, _), let .nonSelecting(reply): reply
+        }
+        try await validate(authority)
         let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try await MCPProviderProjectionWorker.encode(
-                readResult.reply,
+                projectedReply,
                 toolName: MCPWindowToolName.readFile
             )
         }
@@ -590,79 +678,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         )
     }
 
-    private func fileSearchTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.search,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Search files by path pattern and/or content.
-
-            **Modes**:
-            - `auto` (default): Detects path vs content search from pattern
-            - `path`: Match file paths only (glob-style with regex=false, full regex otherwise)
-            - `content`: Search inside file contents
-            - `both`: Search paths and contents
-
-            **Matching** (regex auto-detected by default):
-            - Regex mode: Full regex support (groups, lookarounds, anchors)
-            - Literal mode (regex=false): Special chars matched literally, `*`/`?` wildcards for paths
-            - Tip: Set `regex=false` to force literal substring matching
-
-            **Key options**:
-            - `pattern`: Search term (required)
-            - `max_results`: Result limit (default: 50)
-            - `context_lines`: Lines before/after matches (alias: `-C`)
-            - `whole_word`: Match whole words only
-            - `count_only`: Return counts only, no content
-            - `filter.extensions`: Limit to extensions (e.g., [".swift"])
-            - `filter.paths`: Limit to paths/folders (can also be a loaded root name like 'RepoPrompt')
-            - `filter.exclude`: Skip matching patterns
-
-            **Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem searches use the bound worktree. Responses include `worktree_scope` when this remapping is active.
-
-            **Examples**:
-            - Literal: `{"pattern":"frame(minWidth:","regex":false}`
-            - Regex OR: `{"pattern":"performSearch|searchUsers"}`
-            - Find files: `{"pattern":"*.swift","mode":"path","regex":false}`
-            - With context: `{"pattern":"TODO","context_lines":2}`
-            - Scoped: `{"pattern":"auth","filter":{"paths":["src/auth/"]}}`
-
-            Response capped at ~50k chars; excess results omitted (count reported).
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "pattern": .string(description: "Search pattern"),
-                    "mode": .string(description: "Search scope: auto-detects if not specified", enum: ["auto", "path", "content", "both"]),
-                    "regex": .boolean(description: "Use regex matching (default: auto based on pattern)"),
-                    "filter": .object(
-                        description: "File filtering options (alias: use 'path' string parameter for single-file search)",
-                        properties: [
-                            "extensions": .array(description: "Only search files with these extensions", items: .string(description: "File extension like '.js' or '.swift'")),
-                            "exclude": .array(description: "Skip files/paths matching these patterns", items: .string(description: "Pattern like 'node_modules' or '*.log'")),
-                            "paths": .array(description: "Limit search to specific file or folder paths, or a loaded root name", items: .string(description: "Absolute path, relative path, or loaded root name (e.g., 'RepoPrompt')"))
-                        ]
-                    ),
-                    "path": .string(description: "Alias for filter.paths with a single file or folder path"),
-                    "max_results": .integer(description: "Maximum total results (default: 50)"),
-                    "count_only": .boolean(description: "Return only match count"),
-                    "context_lines": .integer(description: "Lines of context before/after matches (alias: -C)"),
-                    "whole_word": .boolean(description: "Match whole words only")
-                ],
-                required: ["pattern"]
-            )
-        ) { [self] _, args in
-            try await executeFileSearchToolValue(args: args)
-        }
-    }
-
-    private func executeFileSearchToolValue(args: [String: Value]) async throws -> Value {
+    private func executeFileSearchToolValue(
+        args: [String: Value],
+        authority: ReadAuthority,
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> Value {
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
         let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-        let reply = try await executeFileSearch(args: args)
+        let reply = try await executeFileSearch(
+            args: args,
+            authority: authority,
+            sideEffects: sideEffects
+        )
 
         try Task.checkCancellation()
+        try await validate(authority)
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
             try Value(reply)
         }
@@ -670,7 +701,12 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         return value
     }
 
-    private func executeFileSearch(args: [String: Value]) async throws -> ToolResultDTOs.SearchResultDTO {
+    private func executeFileSearch(
+        args: [String: Value],
+        authority: ReadAuthority,
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> ToolResultDTOs.SearchResultDTO {
+        let dependencies = authority.dependencies
         try Task.checkCancellation()
         let rawPattern = args["pattern"]?.stringValue ?? ""
         let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -700,15 +736,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
-            await dependencies.captureRequestMetadata()
-        }
+        let metadata = authority.metadata
         try Task.checkCancellation()
-        let lookupContext = await EditFlowPerf.measure(
+        let lookupContext = EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerLookupContextResolution,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
         ) {
-            await dependencies.resolveFileToolLookupContext(metadata)
+            authority.lookupContext
         }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
@@ -724,7 +758,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
                 EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
             ) {
-                try await dependencies.workspaceSearch(
+                try await dependencies.selection.workspaceSearch(
                     pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
                 )
             }
@@ -813,7 +847,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
             dtoBuildDimensions()
         ) {
-            await dependencies.promptVM.workspaceFileContextStore.displayRootRefsSnapshot()
+            await dependencies.context.promptVM.workspaceFileContextStore.displayRootRefsSnapshot()
         }
         try Task.checkCancellation()
         let visibleRootRefs = displayRootRefsSnapshot.visibleRoots
@@ -1015,20 +1049,64 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             )
         )
         try Task.checkCancellation()
-        await EditFlowPerf.measure(
+        try await validate(authority)
+        try await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
-            await dependencies.enqueueFileSearchAutoSelection(
-                mode,
-                contextLines,
-                reply,
-                autoSelectionResolvedPhysicalPaths,
-                metadata
-            )
+            if !authority.isRunlessOneShotHint {
+                try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    _ = try await applyFileSearchSideEffect(
+                        mode: mode,
+                        contextLines: contextLines,
+                        reply: reply,
+                        resolvedPhysicalPaths: autoSelectionResolvedPhysicalPaths,
+                        metadata: metadata,
+                        authority: authority.frozen,
+                        files: dependencies.files
+                    )
+                }
+            }
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
         return reply
+    }
+
+    private func applyReadFileSideEffect(
+        reply: ToolResultDTOs.ReadFileReply,
+        requestedPath: String,
+        absolutePhysicalPath: String,
+        metadata: MCPRequestMetadata,
+        authority: MCPFrozenFileToolAuthority,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    ) async throws -> Bool {
+        try await files.enqueueReadFileAutoSelection(
+            reply,
+            requestedPath,
+            absolutePhysicalPath,
+            metadata,
+            authority
+        )
+    }
+
+    private func applyFileSearchSideEffect(
+        mode: SearchMode,
+        contextLines: Int,
+        reply: ToolResultDTOs.SearchResultDTO,
+        resolvedPhysicalPaths: [String],
+        metadata: MCPRequestMetadata,
+        authority: MCPFrozenFileToolAuthority,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    ) async throws -> Bool {
+        try await files.enqueueFileSearchAutoSelection(
+            mode,
+            contextLines,
+            reply,
+            resolvedPhysicalPaths,
+            metadata,
+            authority
+        )
     }
 
     static func searchRetryableFailureDTO(

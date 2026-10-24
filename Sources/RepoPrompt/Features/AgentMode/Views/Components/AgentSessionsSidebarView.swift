@@ -1,8 +1,45 @@
+import Combine
+import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Sessions Sidebar
 
+@MainActor
+enum AgentSidebarCreatorNavigation {
+    nonisolated static func uniqueRoute(
+        for creatorSessionID: UUID,
+        candidates: [AgentSessionDeepLinkRoute]
+    ) -> AgentSessionDeepLinkRoute? {
+        let matches = candidates.filter { $0.sessionID == creatorSessionID }
+        guard let first = matches.first,
+              matches.allSatisfy({ $0.workspaceID == first.workspaceID && $0.tabID == first.tabID })
+        else { return nil }
+        return first
+    }
+
+    static func openIfAvailable(_ creatorSessionID: UUID) async {
+        let candidates = WindowStatesManager.shared.allWindows
+            .filter { !$0.isClosing }
+            .flatMap { window -> [AgentSessionDeepLinkRoute] in
+                AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
+                    .items.compactMap { item in
+                        guard item.sessionID == creatorSessionID else { return nil }
+                        return AgentSessionDeepLinkRoute(
+                            windowID: item.windowID,
+                            workspaceID: item.workspaceID,
+                            tabID: item.tabID,
+                            sessionID: creatorSessionID
+                        )
+                    }
+            }
+        guard let route = uniqueRoute(for: creatorSessionID, candidates: candidates) else { return }
+        _ = await AppDeepLinkRouter.shared.route(agentSession: route)
+    }
+}
+
 struct AgentModeSessionsSidebarView: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let rootsStore: AgentWorkspaceRootsSidebarStore
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
@@ -81,7 +118,7 @@ struct AgentModeSessionsSidebarView: View {
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
         VStack(spacing: 0) {
             // Search box at top
@@ -103,8 +140,10 @@ struct AgentModeSessionsSidebarView: View {
                 agentModeVM: agentModeVM,
                 sidebarUI: sidebarUI,
                 promptManager: promptManager,
-                currentTabID: currentTabID
+                currentTabID: currentTabID,
+                activeWorkspaceID: agentModeVM.workspaceManager?.activeWorkspaceID
             )
+            .equatable()
 
             // Always-visible workspace roots section at bottom
             AgentWorkspaceRootsSectionView(
@@ -193,8 +232,8 @@ struct AgentModeSessionsSidebarView: View {
     }
 
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsSidebar")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsSidebar")
         }
     #endif
 
@@ -250,13 +289,199 @@ struct AgentModeSessionsSidebarView: View {
 
 // MARK: - Sessions List
 
-struct AgentModeSessionsListView: View {
+private struct AgentSidebarSelectionRenderIdentity: Equatable {
+    let workspaceID: UUID?
+    let renderedOrder: [AgentSidebarSelectionIdentity]
+}
+
+/// Compact, evenly-sized pill used for the sidebar bulk-action row. Renders an
+/// SF Symbol plus the affected-chat count and matches the app's plain,
+/// `fontPreset`-scaled chip language rather than bordered system buttons.
+private struct BulkActionChipLabel: View {
+    let systemImage: String
+    let count: Int
+    var isDestructive = false
+    var isHovered = false
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+    private var fontPreset: FontScalePreset {
+        fontScale.preset
+    }
+
+    private var cornerRadius: CGFloat {
+        fontPreset.scaledClamped(8, max: 11)
+    }
+
+    private var horizontalPadding: CGFloat {
+        fontPreset.scaledClamped(6, max: 9)
+    }
+
+    private var verticalPadding: CGFloat {
+        fontPreset.scaledClamped(5, max: 7)
+    }
+
+    private var iconSize: CGFloat {
+        fontPreset.scaledClamped(11, max: 14)
+    }
+
+    private var fillColor: Color {
+        if isDestructive {
+            return Color.red.opacity(isHovered ? 0.22 : 0.12)
+        }
+        return Color(NSColor.labelColor).opacity(isHovered ? 0.14 : 0.07)
+    }
+
+    private var foreground: Color {
+        if isDestructive {
+            return .red
+        }
+        return isHovered ? Color(NSColor.labelColor) : .secondary
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .font(.system(size: iconSize, weight: .semibold))
+            Text("\(count)")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .background(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(fillColor)
+        )
+        .foregroundStyle(foreground)
+        .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+}
+
+private struct BulkActionChip: View {
+    let systemImage: String
+    let verb: String
+    let count: Int
+    var isDestructive = false
+    var tooltip: String?
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    private var accessibilityText: String {
+        "\(verb) \(count) \(count == 1 ? "chat" : "chats")"
+    }
+
+    var body: some View {
+        Button(action: action) {
+            BulkActionChipLabel(
+                systemImage: systemImage,
+                count: count,
+                isDestructive: isDestructive,
+                isHovered: isHovered
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .hoverTooltip(tooltip ?? verb)
+        .accessibilityLabel(accessibilityText)
+    }
+}
+
+struct AgentModeSessionsListView: View, Equatable {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
-    @ObservedObject var promptManager: PromptViewModel
+    /// Not observed: this list reads only `sidebarWorkspaceSnapshot`, mirrored below. Observing the
+    /// whole prompt view model re-rendered the list on every unrelated publish (prompt text, presets,
+    /// switching flags, dirty state), several times per session switch (#1373).
+    let promptManager: PromptViewModel
     let currentTabID: UUID?
+    /// Read in `body`; carried as an input so a workspace switch invalidates the equatable list.
+    let activeWorkspaceID: UUID?
+    @State private var workspaceSnapshot: PromptViewModel.SidebarWorkspaceSnapshot?
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
+    @State private var showingBulkDeleteConfirmation = false
+    @State private var sessionLinkProjectionRevision: UInt64 = 0
+    @State private var rowActions = AgentSidebarActiveRowActions()
+    /// Anchor for Today/Yesterday headers. The list is skipped by equality on quiet updates, so a
+    /// wall-clock read in `body` would keep yesterday's headers across a quiet midnight; the
+    /// calendar day-change notification refreshes this state and re-renders the headers.
+    @State private var dateSectionNow = AgentSidebarDayClock.now()
+
+    init(
+        agentModeVM: AgentModeViewModel,
+        sidebarUI: AgentSessionSidebarUIStore,
+        promptManager: PromptViewModel,
+        currentTabID: UUID?,
+        activeWorkspaceID: UUID?
+    ) {
+        self.agentModeVM = agentModeVM
+        self.sidebarUI = sidebarUI
+        self.promptManager = promptManager
+        self.currentTabID = currentTabID
+        self.activeWorkspaceID = activeWorkspaceID
+        _workspaceSnapshot = State(initialValue: promptManager.sidebarWorkspaceSnapshot)
+    }
+
+    /// The parent sidebar re-renders on any prompt or workspace publish; the list depends only on
+    /// these references and the selected tab, plus its own observed sidebar store.
+    static func == (lhs: AgentModeSessionsListView, rhs: AgentModeSessionsListView) -> Bool {
+        lhs.agentModeVM === rhs.agentModeVM
+            && lhs.sidebarUI === rhs.sidebarUI
+            && lhs.promptManager === rhs.promptManager
+            && lhs.currentTabID == rhs.currentTabID
+            && lhs.activeWorkspaceID == rhs.activeWorkspaceID
+    }
+
+    private func rowModel(
+        for session: AgentModeViewModel.SidebarSession,
+        workspaceID: UUID?,
+        selectionState: AgentSidebarSelectionState,
+        oversight: AgentSidebarRowOversightFacts
+    ) -> AgentSidebarActiveRowModel {
+        let identity = AgentSidebarSelectionIdentity.active(tabID: session.tabID)
+        let hasAgentSession = session.sessionID != nil
+        return AgentSidebarActiveRowModel(
+            session: session,
+            workspaceID: workspaceID,
+            isActive: session.tabID == currentTabID,
+            runState: hasAgentSession ? agentModeVM.runState(for: session.tabID) : .idle,
+            attentionRunState: hasAgentSession ? sidebarUI.snapshot.attentionRunStateByTabID[session.tabID] : nil,
+            oversight: oversight,
+            isSelected: selectionState.selectedIdentities.contains(identity),
+            showsSelectionPresentation: selectionState.showsSelectionPresentation,
+            isInteractionEnabled: !selectionState.isMutationInFlight,
+            commandProgressKind: selectionState.commandRowProgressOperation(
+                for: identity,
+                workspaceID: workspaceID
+            )?.kind
+        )
+    }
+
+    /// Session-link notifications are global; re-render only when a rendered row's facts changed.
+    /// Expanded archived rows derive creator labels from the same projections and are not tracked
+    /// as facts, so they keep the previous unconditional invalidation.
+    private func reconcileSessionLinkProjection() {
+        guard archivedSessionsExpanded || rowActions.renderedOversightFactsChanged() else { return }
+        sessionLinkProjectionRevision &+= 1
+    }
+
+    private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
+        guard let name = item.groupName else { return nil }
+        return AnyView(
+            AgentSidebarGroupSectionHeader(
+                title: name,
+                rowCount: item.groupRowCount,
+                isCollapsed: item.isGroupCollapsed,
+                isFirst: item.isFirstHeader,
+                onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
+            )
+            .disabled(!sidebarUI.snapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        )
+    }
+
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -294,249 +519,555 @@ struct AgentModeSessionsListView: View {
         fontPreset.scaledClamped(4, max: 6)
     }
 
-    private struct SidebarListSnapshot {
-        let filteredSessions: [AgentModeViewModel.SidebarSession]
-        let pagedSessions: [AgentModeViewModel.SidebarSession]
-        let effectiveVisibleSessionCount: Int
-        let archivedSessionTabsForHeader: [StashedTab]
-        let sortedArchivedSessionTabsForRows: [StashedTab]
-        let archivedDateInfoByStashedTabID: [UUID: AgentModeViewModel.SidebarSessionDateInfo]
-
-        var hasMoreSessions: Bool {
-            filteredSessions.count > effectiveVisibleSessionCount
-        }
-
-        var remainingSessionCount: Int {
-            max(0, filteredSessions.count - effectiveVisibleSessionCount)
-        }
+    private var bulkBarRowSpacing: CGFloat {
+        fontPreset.scaledClamped(8, max: 10)
     }
 
-    /// Session-first sidebar list. Sessions remain stable regardless of tab switching.
-    private var sidebarListSnapshot: SidebarListSnapshot {
-        #if DEBUG
-            let snapshotStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-        #endif
-        let sidebarSnapshot = sidebarUI.snapshot
-        let filteredSessions = agentModeVM.filteredSidebarSessions(
-            for: promptManager.currentComposeTabs,
-            currentTabID: currentTabID,
-            searchText: sidebarSnapshot.searchText,
-            diagnosticSource: "listSnapshot"
-        )
-        let effectiveVisibleSessionCount = agentModeVM.effectiveSidebarVisibleSessionCount(
-            filteredSessions: filteredSessions,
-            currentTabID: currentTabID,
-            visibleSessionCount: sidebarSnapshot.visibleSessionCount
-        )
-        let pagedSessions = agentModeVM.pagedSidebarSessions(
-            filteredSessions: filteredSessions,
-            currentTabID: currentTabID,
-            visibleSessionCount: effectiveVisibleSessionCount
-        )
-        let archivedSessionTabs = agentModeVM.archivedSessionTabsForSidebarSnapshot(
-            promptManager.currentStashedTabs,
-            searchText: sidebarSnapshot.searchText,
-            prepareSortedRows: archivedSessionsExpanded
-        )
-        let archivedSessionTabsForHeader = archivedSessionTabs.filteredTabs
-        let sortedArchivedSessionTabsForRows = archivedSessionTabs.sortedTabs
-        let snapshot = SidebarListSnapshot(
-            filteredSessions: filteredSessions,
-            pagedSessions: pagedSessions,
-            effectiveVisibleSessionCount: effectiveVisibleSessionCount,
-            archivedSessionTabsForHeader: archivedSessionTabsForHeader,
-            sortedArchivedSessionTabsForRows: sortedArchivedSessionTabsForRows,
-            archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID
-        )
-        #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
-                "sidebar.listSnapshot",
-                startMS: snapshotStartMS,
-                fields: [
-                    "archivedCount": String(archivedSessionTabsForHeader.count),
-                    "archivedFilteredCount": String(archivedSessionTabsForHeader.count),
-                    "archivedSortedCount": String(sortedArchivedSessionTabsForRows.count),
-                    "archivedSortedPrepared": String(archivedSessionsExpanded),
-                    "composeTabCount": String(promptManager.currentComposeTabs.count),
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "effectiveVisibleSessionCount": String(effectiveVisibleSessionCount),
-                    "filteredCount": String(filteredSessions.count),
-                    "pagedCount": String(pagedSessions.count),
-                    "searchActive": String(!sidebarSnapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
-                    "stashedTabCount": String(promptManager.currentStashedTabs.count)
-                ]
-            )
-        #endif
-        return snapshot
+    private var bulkChipSpacing: CGFloat {
+        fontPreset.scaledClamped(6, max: 8)
+    }
+
+    private var bulkBarInnerHorizontalPadding: CGFloat {
+        fontPreset.scaledClamped(10, max: 14)
+    }
+
+    private var bulkBarInnerVerticalPadding: CGFloat {
+        fontPreset.scaledClamped(8, max: 11)
+    }
+
+    private var bulkBarCornerRadius: CGFloat {
+        fontPreset.scaledClamped(12, max: 16)
     }
 
     var body: some View {
         #if DEBUG
-            let _ = Self.recordBodyMetric()
+            let _ = recordBodyMetric()
         #endif
-        let snapshot = sidebarListSnapshot
-        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
-        let firstActiveSectionID = activeSections.first?.id
-        ScrollView {
-            VStack(spacing: listRowSpacing) {
-                ForEach(activeSections) { section in
-                    AgentSidebarDateSectionHeader(
-                        title: section.bucket.title,
-                        isFirst: section.id == firstActiveSectionID
+        // The sidebar projection intentionally does not cache exact oversight facts. This revision is
+        // bumped only when a session-link notification changed a rendered row's facts; equatable rows
+        // then re-render just those rows without rebuilding row identity or row-local state.
+        let _ = sessionLinkProjectionRevision
+        let sidebarSnapshot = sidebarUI.snapshot
+        let activeWorkspaceSnapshot = workspaceSnapshot.flatMap { snapshot in
+            activeWorkspaceID == snapshot.workspaceID ? snapshot : nil
+        }
+        let snapshot = agentModeVM.sidebarListProjection(
+            workspaceID: activeWorkspaceSnapshot?.workspaceID,
+            composeTabs: activeWorkspaceSnapshot?.composeTabs ?? [],
+            stashedTabs: activeWorkspaceSnapshot?.stashedTabs ?? [],
+            currentTabID: currentTabID,
+            sidebarSnapshot: sidebarSnapshot,
+            archivedSessionsExpanded: archivedSessionsExpanded,
+            showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
+        )
+        let selectionRenderIdentity = AgentSidebarSelectionRenderIdentity(
+            workspaceID: snapshot.workspaceID,
+            renderedOrder: snapshot.renderedSelectionOrder
+        )
+        let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
+        let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+            for: snapshot.pagedSessions,
+            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+            searchText: sidebarUI.snapshot.searchText,
+            now: dateSectionNow,
+            perfRecorder: perfRecorder
+        )
+        #if DEBUG
+            let _ = AgentSidebarRowRenderProbe.onActiveRowsRendered?(renderedActiveRows)
+        #endif
+        let selectionState = sidebarUI.selectionState
+        let showsSelectionPresentation = selectionState.showsSelectionPresentation
+        let isInteractionEnabled = !selectionState.isMutationInFlight
+        let allowsDirectMutations = !showsSelectionPresentation && isInteractionEnabled
+        let archivedHeaderProgressOperation = selectionState.archivedHeaderCommandProgressOperation.flatMap {
+            $0.workspaceID == snapshot.workspaceID ? $0 : nil
+        }
+        let renderedProgressRowIdentities = snapshot.pagedSessions.map {
+            AgentSidebarSelectionIdentity.active(tabID: $0.tabID)
+        } + (archivedSessionsExpanded ? snapshot.pagedArchivedSessionTabsForRows.map {
+            AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
+        } : [])
+        let fallbackProgressOperation = selectionState.commandFallbackProgressOperation(
+            existingIdentities: snapshot.existingSelectionIdentities,
+            renderedIdentities: Set(renderedProgressRowIdentities),
+            workspaceID: snapshot.workspaceID
+        )
+        // Bind before resolving any facts: an unbound owner resolves `.none`, and a first render
+        // recorded with `.none` facts would stay stale behind row equality and the notification filter.
+        let _ = rowActions.bind(agentModeVM: agentModeVM, promptManager: promptManager)
+        let renderedRowSessions = renderedActiveRows.filter { !$0.hidesRow }.map(\.session)
+        let oversightFactsByTabID = Dictionary(
+            renderedRowSessions.map { ($0.tabID, rowActions.oversightFacts(for: $0)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        // Non-observed bookkeeping: rows skipped by equality read the current order from here.
+        let _ = rowActions.recordRender(
+            sessions: renderedRowSessions,
+            renderedSelectionOrder: snapshot.renderedSelectionOrder,
+            oversightFacts: oversightFactsByTabID
+        )
+        VStack(spacing: 4) {
+            if showsSelectionPresentation {
+                if let operation = selectionState.inFlightAction {
+                    inFlightBulkActionBar(selectionState: selectionState, operation: operation)
+                } else if let bulkTargets = agentModeVM.sidebarBulkMutationTargets(
+                    selection: selectionState.selectedIdentities,
+                    selectionWorkspaceID: selectionState.workspaceID,
+                    projection: snapshot,
+                    composeTabs: activeWorkspaceSnapshot?.composeTabs ?? [],
+                    stashedTabs: activeWorkspaceSnapshot?.stashedTabs ?? []
+                ) {
+                    bulkActionBar(
+                        selectionState: selectionState,
+                        targets: bulkTargets,
+                        renderedOrder: snapshot.renderedSelectionOrder
                     )
-
-                    ForEach(section.groups) { group in
-                        ForEach(group.rows, id: \.id) { session in
-                            AgentSessionRow(
-                                title: session.title,
-                                isActive: session.tabID == currentTabID,
-                                isPinned: session.isPinned,
-                                isMCPControlled: session.isMCPControlled,
-                                runState: agentModeVM.runState(for: session.tabID),
-                                isWaiting: agentModeVM.isTabWaiting(session.tabID),
-                                attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
-                                worktree: session.worktree,
-                                worktreeMergeAttention: session.worktreeMergeAttention,
-                                threadDepth: session.depth,
-                                hasThreadChildren: session.hasThreadChildren,
-                                isThreadCollapsed: session.isThreadCollapsed,
-                                hiddenThreadDescendantCount: session.hiddenThreadDescendantCount,
-                                hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
-                                onToggleThreadCollapse: session.hasThreadChildren
-                                    ? {
-                                        guard let key = session.threadKey else { return }
-                                        agentModeVM.toggleSidebarThreadCollapse(key)
-                                    }
-                                    : nil,
-                                onSelect: {
-                                    Task { await promptManager.switchComposeTab(session.tabID) }
-                                },
-                                onTogglePin: {
-                                    promptManager.toggleComposeTabPinned(session.tabID)
-                                },
-                                onStash: {
-                                    Task { await promptManager.stashTab(session.tabID) }
-                                },
-                                onDelete: {
-                                    #if DEBUG
-                                        agentModeVM.debugBeginSidebarDeleteRequest(
-                                            tabID: session.tabID,
-                                            source: "AgentSessionsSidebarView.rowDelete",
-                                            reason: "row_delete_confirmation"
-                                        )
-                                    #endif
-                                    Task { await promptManager.closeComposeTab(session.tabID) }
-                                },
-                                onRename: { newName in
-                                    agentModeVM.renameSession(tabID: session.tabID, to: newName)
-                                },
-                                onDismissAttention: {
-                                    agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)
-                                }
-                            )
+                }
+            } else if let notice = selectionState.notice {
+                bulkNotice(notice)
+                    .padding(.horizontal, listHorizontalPadding)
+                    .padding(.top, 4)
+            }
+            ScrollView {
+                VStack(spacing: listRowSpacing) {
+                    if snapshot.isOwnerPending {
+                        // Owner adoption unresolved: no outgoing rows or target headings (§5.3).
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Restoring conversations\u{2026}")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                .foregroundStyle(.secondary)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, listHorizontalPadding)
+                        .padding(.vertical, 6)
+                        .accessibilityElement(children: .combine)
                     }
-                }
-
-                if snapshot.hasMoreSessions {
-                    Button {
-                        agentModeVM.showMoreSidebarSessions()
-                    } label: {
-                        Text("Show more (\(snapshot.remainingSessionCount))")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    AgentSidebarKeyedRowList(
+                        items: renderedActiveRows,
+                        showsHeader: \.showsHeader,
+                        headerTitle: \.headerTitle,
+                        isFirstHeader: \.isFirstHeader,
+                        customHeader: groupSectionHeader,
+                        showsRow: { !$0.hidesRow }
+                    ) { item in
+                        AgentSidebarActiveRow(
+                            model: rowModel(
+                                for: item.session,
+                                workspaceID: snapshot.workspaceID,
+                                selectionState: selectionState,
+                                oversight: oversightFactsByTabID[item.session.tabID] ?? .none
+                            ),
+                            actions: rowActions
+                        )
+                        .equatable()
                     }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, showMoreHorizontalPadding)
-                    .padding(.vertical, showMoreVerticalPadding)
-                    .foregroundColor(.accentColor)
-                }
 
-                if !snapshot.archivedSessionTabsForHeader.isEmpty {
-                    Divider()
-                        .padding(.vertical, dividerVerticalPadding)
+                    if snapshot.hasMoreSessions {
+                        Button {
+                            agentModeVM.showMoreSidebarSessions()
+                        } label: {
+                            Text("Show more (\(snapshot.remainingSessionCount))")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, showMoreHorizontalPadding)
+                        .padding(.vertical, showMoreVerticalPadding)
+                        .foregroundColor(.accentColor)
+                    }
 
-                    VStack(spacing: listRowSpacing) {
-                        HStack(spacing: archivedHeaderSpacing) {
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    archivedSessionsExpanded.toggle()
-                                }
-                            } label: {
-                                HStack(spacing: archivedHeaderSpacing) {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: fontPreset.scaledClamped(11, max: 14), weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                        .rotationEffect(.degrees(archivedSessionsExpanded ? 90 : 0))
-                                        .animation(.easeInOut(duration: 0.15), value: archivedSessionsExpanded)
-                                    Image(systemName: "archivebox")
-                                        .font(.system(size: fontPreset.scaledClamped(13, max: 16)))
-                                        .foregroundStyle(.secondary)
-                                    Text("Archived Sessions")
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                    Text("\(snapshot.archivedSessionTabsForHeader.count)")
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                        .foregroundStyle(.tertiary)
-                                    Spacer()
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                    if !snapshot.archivedSessionTabsForHeader.isEmpty || archivedHeaderProgressOperation != nil {
+                        Divider()
+                            .padding(.vertical, dividerVerticalPadding)
 
-                            Button("Clear…") {
-                                showingClearArchivedConfirmation = true
-                            }
-                            .buttonStyle(.plain)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                            .popover(isPresented: $showingClearArchivedConfirmation, arrowEdge: .bottom) {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Text("Clear archived sessions?")
-                                        .font(.headline)
-                                    Text("This removes \(snapshot.archivedSessionTabsForHeader.count) archived sessions from stashed tabs.")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                    HStack {
+                        VStack(spacing: listRowSpacing) {
+                            let archivedCount = archivedHeaderProgressOperation?.targetCount
+                                ?? snapshot.archivedSessionTabsForHeader.count
+                            HStack(spacing: archivedHeaderSpacing) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        archivedSessionsExpanded.toggle()
+                                    }
+                                } label: {
+                                    HStack(spacing: archivedHeaderSpacing) {
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: fontPreset.scaledClamped(11, max: 14), weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                            .rotationEffect(.degrees(archivedSessionsExpanded ? 90 : 0))
+                                            .animation(.easeInOut(duration: 0.15), value: archivedSessionsExpanded)
+                                        Image(systemName: "archivebox")
+                                            .font(.system(size: fontPreset.scaledClamped(13, max: 16)))
+                                            .foregroundStyle(.secondary)
+                                        Text("Archived Sessions")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                        Text("\(archivedCount)")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                            .foregroundStyle(.tertiary)
                                         Spacer()
-                                        Button("Cancel") {
-                                            showingClearArchivedConfirmation = false
-                                        }
-                                        Button("Clear") {
-                                            showingClearArchivedConfirmation = false
-                                            Task {
-                                                await promptManager.deleteStashedTabs(withIDs: Set(snapshot.archivedSessionTabsForHeader.map(\.id)))
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                if archivedHeaderProgressOperation != nil {
+                                    HStack(spacing: 5) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Clearing…")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                                    }
+                                    .foregroundStyle(.tertiary)
+                                    .allowsHitTesting(false)
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel("Clearing archived sessions")
+                                } else {
+                                    Button("Clear…") {
+                                        showingClearArchivedConfirmation = true
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                                    .disabled(!allowsDirectMutations)
+                                    .popover(isPresented: $showingClearArchivedConfirmation, arrowEdge: .bottom) {
+                                        VStack(alignment: .leading, spacing: 12) {
+                                            Text("Clear archived sessions?")
+                                                .font(.headline)
+                                            Text("This permanently deletes \(snapshot.archivedSessionTabsForHeader.count) archived sessions. Related active and archived sub-agent chats may also be deleted.")
+                                                .font(.subheadline)
+                                                .foregroundStyle(.secondary)
+                                            HStack {
+                                                Spacer()
+                                                Button("Cancel") {
+                                                    showingClearArchivedConfirmation = false
+                                                }
+                                                Button("Clear") {
+                                                    showingClearArchivedConfirmation = false
+                                                    guard let workspaceID = snapshot.workspaceID,
+                                                          agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                                                    else { return }
+                                                    let archivedTargets = Set(snapshot.archivedSessionTabsForHeader.map {
+                                                        PromptViewModel.ArchivedTabMutationTarget(
+                                                            stashedTabID: $0.id,
+                                                            tabID: $0.tab.id
+                                                        )
+                                                    })
+                                                    guard !archivedTargets.isEmpty else { return }
+                                                    performBulkAction(
+                                                        .delete,
+                                                        origin: .command,
+                                                        commandProgressPlacement: .archivedHeader,
+                                                        targets: .init(
+                                                            workspaceID: workspaceID,
+                                                            activeDeleteTabIDs: [],
+                                                            archivedDeleteTargets: archivedTargets,
+                                                            stashTabIDs: [],
+                                                            pinTabIDs: [],
+                                                            unpinTabIDs: []
+                                                        )
+                                                    )
+                                                }
+                                                .keyboardShortcut(.defaultAction)
+                                                .disabled(!allowsDirectMutations)
                                             }
                                         }
-                                        .keyboardShortcut(.defaultAction)
+                                        .padding()
+                                        .frame(width: 300)
                                     }
                                 }
-                                .padding()
-                                .frame(width: 300)
                             }
-                        }
-                        .padding(.horizontal, archivedHeaderHorizontalPadding)
-                        .padding(.bottom, archivedHeaderBottomPadding)
+                            .padding(.horizontal, archivedHeaderHorizontalPadding)
+                            .padding(.bottom, archivedHeaderBottomPadding)
 
-                        if archivedSessionsExpanded {
-                            ArchivedSessionsPagedList(
-                                allTabs: snapshot.sortedArchivedSessionTabsForRows,
-                                isSearching: !sidebarUI.snapshot.searchText.isEmpty,
-                                dateInfoByStashedTabID: snapshot.archivedDateInfoByStashedTabID,
-                                agentModeVM: agentModeVM,
-                                promptManager: promptManager
-                            )
+                            if archivedSessionsExpanded {
+                                ArchivedSessionsList(
+                                    tabs: snapshot.pagedArchivedSessionTabsForRows,
+                                    hasMore: snapshot.hasMoreArchivedSessions,
+                                    remainingCount: snapshot.remainingArchivedSessionCount,
+                                    dateInfoByStashedTabID: snapshot.archivedDateInfoByStashedTabID,
+                                    sessionIDByStashedTabID: snapshot.archivedSessionIDByStashedTabID,
+                                    workspaceID: snapshot.workspaceID,
+                                    selectionState: selectionState,
+                                    renderedOrder: snapshot.renderedSelectionOrder,
+                                    agentModeVM: agentModeVM,
+                                    creatorDisplayNames: agentModeVM.sidebarCreatorDisplayNames,
+                                    dateSectionNow: dateSectionNow,
+                                    promptManager: promptManager
+                                )
+                            }
                         }
                     }
                 }
+                .padding(.horizontal, listHorizontalPadding)
             }
-            .padding(.horizontal, listHorizontalPadding)
+            .overlay(alignment: .topTrailing) {
+                if let fallbackProgressOperation {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 16, height: 16)
+                        .padding(6)
+                        .background(.regularMaterial, in: Circle())
+                        .padding(.top, 4)
+                        .padding(.trailing, listHorizontalPadding)
+                        .allowsHitTesting(false)
+                        .accessibilityLabel(fallbackProgressOperation.kind.rowProgressAccessibilityLabel)
+                }
+            }
+        }
+        .id(snapshot.workspaceID)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange,
+                object: agentModeVM
+            )
+            .receive(on: DispatchQueue.main)
+        ) { _ in
+            reconcileSessionLinkProjection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange).receive(on: DispatchQueue.main)) { _ in
+            reconcileSessionLinkProjection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged).receive(on: DispatchQueue.main)) { _ in
+            dateSectionNow = AgentSidebarDayClock.now()
+        }
+        .onReceive(promptManager.$sidebarWorkspaceSnapshot.removeDuplicates()) { next in
+            guard next != workspaceSnapshot else { return }
+            workspaceSnapshot = next
+        }
+        .task(id: activeWorkspaceID) {
+            showingClearArchivedConfirmation = false
+            showingBulkDeleteConfirmation = false
+        }
+        .task(id: selectionState.inFlightAction?.token) {
+            guard selectionState.inFlightAction != nil else { return }
+            showingClearArchivedConfirmation = false
+            showingBulkDeleteConfirmation = false
+        }
+        .task(id: defaultCollapseSeedKeys) {
+            agentModeVM.seedDefaultCollapsedSidebarThreads(defaultCollapseSeedKeys)
+        }
+        .task(id: selectionRenderIdentity) {
+            sidebarUI.reconcileSelection(
+                renderedOrder: selectionRenderIdentity.renderedOrder,
+                workspaceID: selectionRenderIdentity.workspaceID
+            )
+            if snapshot.renderedSelectionOrder.isEmpty {
+                showingBulkDeleteConfirmation = false
+            }
         }
     }
 
+    private func inFlightBulkActionBar(
+        selectionState: AgentSidebarSelectionState,
+        operation: AgentSidebarBulkActionOperation
+    ) -> some View {
+        let selectedCount = selectionState.selectedIdentities.count
+        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+            HStack(spacing: 8) {
+                Text("1 selected")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                Spacer(minLength: 8)
+                Text("Select All")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                Text("Cancel")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            }
+            HStack(spacing: bulkChipSpacing) {
+                BulkActionChipLabel(systemImage: "trash", count: operation.targetCount)
+            }
+        }
+        .hidden()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .overlay(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+                if selectedCount > 0 {
+                    Text("\(selectedCount) selected")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.isHeader)
+                } else {
+                    Text("1 selected")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .hidden()
+                        .accessibilityHidden(true)
+                }
+
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) \(operation.targetCount == 1 ? "chat" : "chats")…")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, bulkBarInnerHorizontalPadding)
+        .padding(.vertical, bulkBarInnerVerticalPadding)
+        .background(
+            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                .fill(Color(NSColor.systemGray).opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
+                )
+        )
+        .padding(.horizontal, listHorizontalPadding)
+        .padding(.top, 4)
+    }
+
+    private func bulkActionBar(
+        selectionState: AgentSidebarSelectionState,
+        targets: AgentModeViewModel.SidebarBulkMutationTargets,
+        renderedOrder: [AgentSidebarSelectionIdentity]
+    ) -> some View {
+        let selectedCount = selectionState.selectedIdentities.count
+        let deleteCount = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
+        let canSelectAll = selectedCount != renderedOrder.count
+        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+            HStack(spacing: 8) {
+                Text("\(selectedCount) selected")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                Button("Select All") {
+                    sidebarUI.selectAll(renderedOrder: renderedOrder, workspaceID: targets.workspaceID)
+                }
+                .buttonStyle(.plain)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                .foregroundStyle(canSelectAll ? Color.accentColor : Color.secondary.opacity(0.5))
+                .disabled(!canSelectAll)
+                Button("Cancel") { sidebarUI.clearSelection() }
+                    .buttonStyle(.plain)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            HStack(spacing: bulkChipSpacing) {
+                if !targets.pinTabIDs.isEmpty {
+                    BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
+                        performBulkAction(.pin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                    }
+                }
+                if !targets.unpinTabIDs.isEmpty {
+                    BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
+                        performBulkAction(.unpin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                    }
+                }
+                if !targets.stashTabIDs.isEmpty {
+                    BulkActionChip(
+                        systemImage: "tray.and.arrow.down",
+                        verb: "Stash",
+                        count: targets.stashTabIDs.count,
+                        tooltip: "Stash — related sub-agent chats may also be stashed"
+                    ) {
+                        performBulkAction(.stash, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                    }
+                }
+                BulkActionChip(
+                    systemImage: "trash",
+                    verb: "Delete",
+                    count: deleteCount,
+                    isDestructive: true
+                ) {
+                    showingBulkDeleteConfirmation = true
+                }
+                .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
+                    bulkDeleteConfirmation(targets: targets)
+                }
+            }
+
+            if let notice = selectionState.notice {
+                bulkNotice(notice)
+            }
+        }
+        .padding(.horizontal, bulkBarInnerHorizontalPadding)
+        .padding(.vertical, bulkBarInnerVerticalPadding)
+        .background(
+            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                .fill(Color(NSColor.systemGray).opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
+                )
+        )
+        .padding(.horizontal, listHorizontalPadding)
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private func bulkDeleteConfirmation(targets: AgentModeViewModel.SidebarBulkMutationTargets) -> some View {
+        let count = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Delete \(count) chats?").font(.headline)
+            Text("This permanently deletes \(targets.activeDeleteTabIDs.count) active chats and \(targets.archivedDeleteTargets.count) archived chats. Related sub-agent chats may also be removed. This cannot be undone.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { showingBulkDeleteConfirmation = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Delete", role: .destructive) {
+                    showingBulkDeleteConfirmation = false
+                    performBulkAction(.delete, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                }
+            }
+        }
+        .padding()
+        .frame(width: 340)
+    }
+
+    private func bulkNotice(_ notice: AgentSidebarBulkActionNotice) -> some View {
+        let presentation: (icon: String, color: Color, accessibilityPrefix: String) = switch notice.severity {
+        case .error:
+            ("exclamationmark.triangle.fill", .red, "Error")
+        case .warning:
+            ("exclamationmark.triangle", .orange, "Warning")
+        case .information:
+            ("info.circle", .secondary, "Information")
+        }
+        return HStack(alignment: .top, spacing: 6) {
+            Image(systemName: presentation.icon)
+                .font(.system(size: fontPreset.scaledClamped(11, max: 14)))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title).font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                Text(notice.message).font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(presentation.accessibilityPrefix): \(notice.title). \(notice.message)")
+            Spacer(minLength: 0)
+            Button { sidebarUI.dismissBulkActionNotice() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .font(.system(size: fontPreset.scaledClamped(10, max: 13)))
+                .accessibilityLabel("Dismiss action notice")
+        }
+        .foregroundStyle(presentation.color)
+    }
+
+    private func performBulkAction(
+        _ action: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin,
+        commandProgressPlacement: AgentSidebarCommandProgressPlacement?,
+        targets: AgentModeViewModel.SidebarBulkMutationTargets
+    ) {
+        rowActions.performBulkAction(
+            action,
+            origin: origin,
+            commandProgressPlacement: commandProgressPlacement,
+            targets: targets
+        )
+    }
+
     #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.agentSessionsList")
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsList")
         }
     #endif
 }
@@ -590,46 +1121,6 @@ private struct AgentSidebarDateSectionHeader: View {
     }
 }
 
-enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
-    case today
-    case yesterday
-    case previous
-
-    var id: Self {
-        self
-    }
-
-    var title: String {
-        switch self {
-        case .today:
-            "Today"
-        case .yesterday:
-            "Yesterday"
-        case .previous:
-            "Previous"
-        }
-    }
-
-    static func bucket(
-        for date: Date,
-        relativeTo now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> AgentSidebarDateSectionBucket {
-        let clampedDate = min(date, now)
-        let todayStart = calendar.startOfDay(for: now)
-        let dateStart = calendar.startOfDay(for: clampedDate)
-        if dateStart == todayStart {
-            return .today
-        }
-        if let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart),
-           calendar.isDate(dateStart, inSameDayAs: yesterdayStart)
-        {
-            return .yesterday
-        }
-        return .previous
-    }
-}
-
 struct AgentSidebarActiveDateGroup: Identifiable {
     let id: UUID
     let bucket: AgentSidebarDateSectionBucket
@@ -651,6 +1142,81 @@ struct AgentSidebarArchivedDateRow: Identifiable {
     }
 }
 
+/// One visible active row.
+///
+/// `id` is `SidebarSession.id`. The builder sets that to `ComposeTabState.id`
+/// and copies it when a snapshot rebuilds depth or thread metadata. It has to
+/// stay the same across those rebuilds, re-parenting, and metadata refreshes.
+/// A new id destroys the SwiftUI row and cancels an in-flight tap.
+struct AgentSidebarRenderedActiveRow: Identifiable {
+    let session: AgentModeViewModel.SidebarSession
+    let showsHeader: Bool
+    let isFirstHeader: Bool
+    let headerTitle: String
+    /// Set on the first row of a sidebar group section; its header is collapsible.
+    var groupName: String?
+    var isGroupCollapsed = false
+    var groupRowCount = 0
+    /// A collapsed group's first row carries only the header.
+    var hidesRow = false
+
+    var id: UUID {
+        session.id
+    }
+}
+
+/// One visible archived row.
+///
+/// `id` is `StashedTab.id`, assigned once when the tab is stashed and kept on
+/// the persisted stash record. A new id destroys the SwiftUI row and cancels
+/// an in-flight tap.
+struct AgentSidebarRenderedArchivedRow: Identifiable {
+    let row: AgentSidebarArchivedDateRow
+    let showsHeader: Bool
+    let isFirstHeader: Bool
+    let headerTitle: String
+
+    var id: UUID {
+        row.id
+    }
+}
+
+/// Clock for sidebar date headers. Tests substitute it to cross midnight deterministically.
+@MainActor
+enum AgentSidebarDayClock {
+    static var now: () -> Date = { Date() }
+}
+
+/// One `ForEach`, keyed by each row's own id. The active list, the archived
+/// list, and the click tests all use this view. A date-section or thread-group
+/// `ForEach` around these rows changes identity during a press and cancels the tap.
+struct AgentSidebarKeyedRowList<Item: Identifiable, Row: View>: View {
+    let items: [Item]
+    let showsHeader: (Item) -> Bool
+    let headerTitle: (Item) -> String
+    let isFirstHeader: (Item) -> Bool
+    /// Replaces the date header for an item (sidebar group sections).
+    var customHeader: ((Item) -> AnyView?)?
+    var showsRow: (Item) -> Bool = { _ in true }
+    @ViewBuilder let row: (Item) -> Row
+
+    var body: some View {
+        ForEach(items) { item in
+            if let header = customHeader?(item) {
+                header
+            } else if showsHeader(item) {
+                AgentSidebarDateSectionHeader(
+                    title: headerTitle(item),
+                    isFirst: isFirstHeader(item)
+                )
+            }
+            if showsRow(item) {
+                row(item)
+            }
+        }
+    }
+}
+
 struct AgentSidebarArchivedDateSection: Identifiable {
     let id: UUID
     let bucket: AgentSidebarDateSectionBucket
@@ -661,13 +1227,15 @@ enum AgentSidebarDateSectionBuilder {
     static func activeSections(
         for rows: [AgentModeViewModel.SidebarSession],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarActiveDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let groups = activeGroups(for: rows, now: now, calendar: calendar)
         var sections: [AgentSidebarActiveDateSection] = []
+        var ordinals: [AgentSidebarDateSectionBucket: Int] = [:]
         for group in groups {
             if let lastSection = sections.last, lastSection.bucket == group.bucket {
                 sections[sections.count - 1] = AgentSidebarActiveDateSection(
@@ -676,15 +1244,17 @@ enum AgentSidebarDateSectionBuilder {
                     groups: lastSection.groups + [group]
                 )
             } else {
+                let ordinal = ordinals[group.bucket, default: 0]
+                ordinals[group.bucket] = ordinal + 1
                 sections.append(AgentSidebarActiveDateSection(
-                    id: group.id,
+                    id: group.bucket.sectionID(ordinal: ordinal),
                     bucket: group.bucket,
                     groups: [group]
                 ))
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.active",
                 startMS: startMS,
                 fields: [
@@ -707,11 +1277,18 @@ enum AgentSidebarDateSectionBuilder {
 
         func flushCurrentRows() {
             guard let firstRow = currentRows.first else { return }
-            let date = currentRows
-                .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
-                .max() ?? firstRow.activityDate
-            let bucket = AgentSidebarDateSectionBucket.bucket(
-                for: date,
+            // Restoration rows carry captured buckets (freshest wins) so incremental live/index dates,
+            // or a midnight/calendar change, cannot relabel headings before release (§5.4).
+            let capturedBucket = currentRows
+                .compactMap(\.restorationDateBucket)
+                .min { lhs, rhs in
+                    let order = AgentSidebarDateSectionBucket.allCases
+                    return (order.firstIndex(of: lhs) ?? .max) < (order.firstIndex(of: rhs) ?? .max)
+                }
+            let bucket = capturedBucket ?? AgentSidebarDateSectionBucket.bucket(
+                for: currentRows
+                    .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
+                    .max() ?? firstRow.activityDate,
                 relativeTo: now,
                 calendar: calendar
             )
@@ -737,12 +1314,14 @@ enum AgentSidebarDateSectionBuilder {
         for tabs: [StashedTab],
         now: Date = Date(),
         calendar: Calendar = .current,
-        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo
+        dateInfo: (StashedTab) -> AgentModeViewModel.SidebarSessionDateInfo,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarArchivedDateSection] {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         var sections: [AgentSidebarArchivedDateSection] = []
+        var ordinals: [AgentSidebarDateSectionBucket: Int] = [:]
         for stashed in tabs {
             let info = dateInfo(stashed)
             let bucketDate = info.lastEngagementAt ?? info.activityDate ?? stashed.stashedAt
@@ -759,15 +1338,17 @@ enum AgentSidebarDateSectionBuilder {
                     rows: lastSection.rows + [row]
                 )
             } else {
+                let ordinal = ordinals[bucket, default: 0]
+                ordinals[bucket] = ordinal + 1
                 sections.append(AgentSidebarArchivedDateSection(
-                    id: stashed.id,
+                    id: bucket.sectionID(ordinal: ordinal),
                     bucket: bucket,
                     rows: [row]
                 ))
             }
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.dateSections.archived",
                 startMS: startMS,
                 fields: [
@@ -779,102 +1360,211 @@ enum AgentSidebarDateSectionBuilder {
         #endif
         return sections
     }
+
+    /// Each visible row is one list item, keyed by that row's id. A date-section
+    /// id or a thread-root group id both change while a press is in flight: a
+    /// running session sorts to the top, an earlier run of the same day
+    /// disappears, or a root becomes a child when parent metadata arrives.
+    /// Any of those destroyed the view under the pointer and cancelled the tap.
+    static func renderedActiveRows(
+        for sections: [AgentSidebarActiveDateSection]
+    ) -> [AgentSidebarRenderedActiveRow] {
+        var rendered: [AgentSidebarRenderedActiveRow] = []
+        var hasShownHeader = false
+        for section in sections {
+            var isFirstRowOfSection = true
+            for group in section.groups {
+                for session in group.rows {
+                    let showsHeader = isFirstRowOfSection
+                    rendered.append(AgentSidebarRenderedActiveRow(
+                        session: session,
+                        showsHeader: showsHeader,
+                        isFirstHeader: showsHeader && !hasShownHeader,
+                        headerTitle: section.bucket.title
+                    ))
+                    if showsHeader {
+                        hasShownHeader = true
+                        isFirstRowOfSection = false
+                    }
+                }
+            }
+        }
+        return rendered
+    }
+
+    static func renderedArchivedRows(
+        for sections: [AgentSidebarArchivedDateSection]
+    ) -> [AgentSidebarRenderedArchivedRow] {
+        var rendered: [AgentSidebarRenderedArchivedRow] = []
+        var hasShownHeader = false
+        for section in sections {
+            for (index, row) in section.rows.enumerated() {
+                let showsHeader = index == 0
+                rendered.append(AgentSidebarRenderedArchivedRow(
+                    row: row,
+                    showsHeader: showsHeader,
+                    isFirstHeader: showsHeader && !hasShownHeader,
+                    headerTitle: section.bucket.title
+                ))
+                if showsHeader {
+                    hasShownHeader = true
+                }
+            }
+        }
+        return rendered
+    }
 }
 
-// MARK: - Archived Sessions Paged List
+// MARK: - Archived Sessions List
 
-/// Paginated list of archived (stashed) agent sessions.
-/// Owns its own page count so the parent view doesn't recompute on every page tap.
-/// When `isSearching` is true, all matching tabs are shown without pagination.
-struct ArchivedSessionsPagedList: View {
-    let allTabs: [StashedTab]
-    let isSearching: Bool
+struct ArchivedSessionsList: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
+    let tabs: [StashedTab]
+    let hasMore: Bool
+    let remainingCount: Int
     let dateInfoByStashedTabID: [UUID: AgentModeViewModel.SidebarSessionDateInfo]
+    let sessionIDByStashedTabID: [UUID: UUID]
+    let workspaceID: UUID?
+    let selectionState: AgentSidebarSelectionState
+    let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
+    let creatorDisplayNames: [UUID: String]
+    /// Day anchor for Today/Yesterday buckets; owned by the list and refreshed at midnight.
+    let dateSectionNow: Date
     @ObservedObject var promptManager: PromptViewModel
-    @State private var visibleCount = 20
     @ObservedObject private var fontScale = FontScaleManager.shared
-    private static let pageSize = 20
+
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
-    private var rowSpacing: CGFloat {
-        fontPreset.scaledClamped(2, max: 3)
-    }
-
-    private var showMoreHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(10, max: 14)
-    }
-
-    private var showMoreVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 12)
-    }
-
-    private var topPadding: CGFloat {
-        fontPreset.scaledClamped(4, max: 6)
-    }
-
-    private var displayedTabs: ArraySlice<StashedTab> {
-        isSearching ? allTabs[...] : allTabs.prefix(visibleCount)
-    }
-
-    private var hasMore: Bool {
-        !isSearching && allTabs.count > visibleCount
+    private func deleteArchived(_ stashed: StashedTab) {
+        guard let workspaceID,
+              agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+        else { return }
+        let target = PromptViewModel.ArchivedTabMutationTarget(
+            stashedTabID: stashed.id,
+            tabID: stashed.tab.id
+        )
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: [],
+            archivedDeleteTargets: [target],
+            stashTabIDs: [],
+            pinTabIDs: [],
+            unpinTabIDs: []
+        )
+        Task {
+            await agentModeVM.performSidebarBulkAction(
+                .delete,
+                origin: .command,
+                commandProgressPlacement: .row,
+                targets: targets,
+                promptManager: promptManager
+            )
+        }
     }
 
     var body: some View {
-        #if DEBUG
-            let _ = Self.recordBodyMetric()
-        #endif
         let sections = AgentSidebarDateSectionBuilder.archivedSections(
-            for: Array(displayedTabs),
-            dateInfo: { stashed in
-                dateInfoByStashedTabID[stashed.id] ?? agentModeVM.archivedSessionDateInfo(for: stashed)
-            }
+            for: tabs,
+            now: dateSectionNow,
+            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) },
+            perfRecorder: perfRecorder
         )
-        let firstSectionID = sections.first?.id
-        VStack(spacing: rowSpacing) {
-            ForEach(sections) { section in
-                AgentSidebarDateSectionHeader(
-                    title: section.bucket.title,
-                    isFirst: section.id == firstSectionID
+        VStack(spacing: fontPreset.scaledClamped(2, max: 3)) {
+            AgentSidebarKeyedRowList(
+                items: AgentSidebarDateSectionBuilder.renderedArchivedRows(for: sections),
+                showsHeader: \.showsHeader,
+                headerTitle: \.headerTitle,
+                isFirstHeader: \.isFirstHeader
+            ) { item in
+                let stashed = item.row.stashed
+                let identity = AgentSidebarSelectionIdentity.archived(
+                    stashedTabID: stashed.id,
+                    tabID: stashed.tab.id
                 )
-
-                ForEach(section.rows) { row in
-                    let stashed = row.stashed
-                    AgentStashedSessionRow(
-                        stashed: stashed,
-                        onRestore: {
-                            Task { await promptManager.unstashTab(stashed.id) }
-                        },
-                        onDelete: {
-                            Task { await promptManager.deleteStashedTab(stashed.id) }
-                        }
+                let stashedSessionID = sessionIDByStashedTabID[stashed.id]
+                let creator = stashedSessionID.flatMap {
+                    agentModeVM.agentSidebarLaneCreator(
+                        tabID: stashed.tab.id,
+                        expectedSessionID: $0,
+                        names: creatorDisplayNames,
+                        archived: true
                     )
                 }
+                AgentStashedSessionRow(
+                    stashed: stashed,
+                    createdByLabel: creator?.label,
+                    onOpenCreator: {
+                        guard let stashedSessionID,
+                              let creatorSessionID = creator?.sessionID,
+                              agentModeVM.agentSessionLinkLaneCreatorSessionID(tabID: stashed.tab.id, expectedSessionID: stashedSessionID) == creatorSessionID
+                        else { return }
+                        Task { await AgentSidebarCreatorNavigation.openIfAvailable(creatorSessionID) }
+                    },
+                    isSelected: selectionState.selectedIdentities.contains(identity),
+                    showsSelectionPresentation: selectionState.showsSelectionPresentation,
+                    isInteractionEnabled: !selectionState.isMutationInFlight,
+                    commandProgressKind: selectionState.commandRowProgressOperation(
+                        for: identity,
+                        workspaceID: workspaceID
+                    )?.kind,
+                    onSelectionGesture: { gesture in
+                        agentModeVM.handleSidebarSelectionGesture(
+                            gesture,
+                            identity: identity,
+                            renderedOrder: renderedOrder,
+                            workspaceID: workspaceID
+                        )
+                    },
+                    onRestore: {
+                        Task {
+                            guard let workspaceID,
+                                  agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                            else { return }
+                            await promptManager.unstashTab(stashed.id)
+                        }
+                    },
+                    onDelete: { deleteArchived(stashed) },
+                    sessionIDCopyAction: .systemClipboard(
+                        sessionID: sessionIDByStashedTabID[stashed.id]
+                    ),
+                    metrics: AgentStashedSessionRowMetrics(fontPreset: fontPreset)
+                )
             }
-
             if hasMore {
                 Button {
-                    visibleCount += Self.pageSize
+                    agentModeVM.showMoreArchivedSidebarSessions()
                 } label: {
-                    Text("Show more (\(allTabs.count - visibleCount))")
+                    Text("Show more (\(remainingCount))")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, showMoreHorizontalPadding)
-                .padding(.vertical, showMoreVerticalPadding)
+                .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+                .padding(.vertical, fontPreset.scaledClamped(8, max: 12))
                 .foregroundColor(.accentColor)
             }
         }
-        .padding(.top, topPadding)
+        .padding(.top, fontPreset.scaledClamped(4, max: 6))
     }
+}
 
-    #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.archivedSessionsPagedList")
-        }
-    #endif
+// MARK: - Stashed Row Metrics
+
+extension AgentStashedSessionRowMetrics {
+    /// The sidebar owns the App-layer font managers; the row file itself stays free of them.
+    init(fontPreset: FontScalePreset) {
+        rowMinHeight = fontPreset.scaledClamped(30, min: 30, max: 40)
+        rowHorizontalPadding = fontPreset.scaledClamped(10, max: 14)
+        rowVerticalPadding = fontPreset.scaledClamped(6, max: 8)
+        rowCornerRadius = fontPreset.scaledClamped(16, max: 20)
+        rowSpacing = fontPreset.scaledClamped(8, max: 11)
+        titlePinSpacing = fontPreset.scaledClamped(6, max: 8)
+        titleVStackSpacing = fontPreset.scaledClamped(2, max: 3)
+        leadingIconSize = fontPreset.scaledClamped(12, max: 15)
+        pinIconSize = fontPreset.scaledClamped(10, max: 13)
+        titleFont = fontPreset.swiftUIFont(sizeAtNormal: 13)
+    }
 }

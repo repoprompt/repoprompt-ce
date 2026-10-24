@@ -1,6 +1,18 @@
 import Foundation
 import SwiftOpenAI
 
+func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProviderCompletionOutcome? {
+    guard let finishReason else { return nil }
+    switch finishReason {
+    case .string("stop"):
+        return .completed
+    case let .string(reason):
+        return .incomplete(reason: reason)
+    case let .int(reason):
+        return .incomplete(reason: String(reason))
+    }
+}
+
 class OpenAIProvider: AIProvider {
     // Instance-level cache
     private let cachedApiKey: String?
@@ -76,6 +88,9 @@ class OpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
         // Fallback: Let the API handle it by not setting a token limit.
@@ -115,6 +130,9 @@ class OpenAIProvider: AIProvider {
              .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             return true
         default:
@@ -171,6 +189,44 @@ class OpenAIProvider: AIProvider {
         return parameters
     }
 
+    static func isTransportActivityChunk(
+        hasChoice: Bool,
+        hasDelta: Bool,
+        content: String?,
+        reasoning: String?,
+        role: String?,
+        hasToolCalls: Bool,
+        hasFunctionCall: Bool,
+        refusal: String?,
+        hasFinishReason: Bool,
+        hasUsage: Bool
+    ) -> Bool {
+        let hasSemanticDelta = !(content?.isEmpty ?? true)
+            || !(reasoning?.isEmpty ?? true)
+            || role != nil
+            || hasToolCalls
+            || hasFunctionCall
+            || !(refusal?.isEmpty ?? true)
+        return hasChoice && hasDelta && !hasSemanticDelta && !hasFinishReason && !hasUsage
+    }
+
+    static func isTransportActivityChunk(_ result: ChatCompletionChunkObject) -> Bool {
+        let choice = result.choices?.first
+        let delta = choice?.delta
+        return isTransportActivityChunk(
+            hasChoice: choice != nil,
+            hasDelta: delta != nil,
+            content: delta?.content,
+            reasoning: delta?.reasoningContent,
+            role: delta?.role,
+            hasToolCalls: delta?.toolCalls != nil,
+            hasFunctionCall: delta?.functionCall != nil,
+            refusal: delta?.refusal,
+            hasFinishReason: choice?.finishReason != nil,
+            hasUsage: result.usage != nil
+        )
+    }
+
     func streamMessage(
         _ aiMessage: AIMessage,
         model: AIModel,
@@ -208,7 +264,12 @@ class OpenAIProvider: AIProvider {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: result.completionTokens))
-                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                switch result.completionOutcome {
+                case .completed:
+                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                case let .incomplete(reason):
+                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                }
                 continuation.finish()
             }
         }
@@ -264,13 +325,23 @@ class OpenAIProvider: AIProvider {
                 do {
                     var promptTokens: Int? = nil
                     var completionTokens: Int? = nil
+                    var observedCompletionOutcome: AIProviderCompletionOutcome?
 
                     for try await result in stream {
                         // Check cancellation to exit promptly when consumer stops reading
                         if Task.isCancelled { break }
 
-                        let content = result.choices?.first?.delta?.content ?? ""
-                        let reasoning = result.choices?.first?.delta?.reasoningContent ?? ""
+                        if Self.isTransportActivityChunk(result) {
+                            continuation.yield(
+                                AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)
+                            )
+                            continue
+                        }
+
+                        let choice = result.choices?.first
+                        let content = choice?.delta?.content ?? ""
+                        let reasoning = choice?.delta?.reasoningContent ?? ""
+                        let finishReason = choice?.finishReason
 
                         // Extract token usage from the final response chunk if available
                         if let usage = result.usage {
@@ -283,8 +354,18 @@ class OpenAIProvider: AIProvider {
                                 AIStreamResult(type: "content", text: content, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens)
                             )
                         }
+                        if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
+                            observedCompletionOutcome = completionOutcome
+                        }
                     }
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    switch observedCompletionOutcome {
+                    case .completed:
+                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    case let .incomplete(reason):
+                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                    case nil:
+                        break
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -313,11 +394,15 @@ class OpenAIProvider: AIProvider {
             // Assuming responseCreate exists in the service layer as per previous code.
             let response = try await service.responseCreate(parameters)
 
-            // Check response status and potential errors before extracting text
-            guard response.status == .completed else {
+            let completionOutcome: AIProviderCompletionOutcome
+            if response.status == .completed {
+                completionOutcome = .completed
+            } else if response.status == .incomplete {
+                completionOutcome = .incomplete(reason: response.incompleteDetails?.reason ?? "unknown")
+            } else {
                 let statusString = response.status?.rawValue ?? "unknown"
-                let errorDetail = response.error?.message ?? response.incompleteDetails?.reason ?? "Response status was '\(statusString)'"
-                throw AIProviderError.invalidResponse(detail: "Responses API call did not complete successfully. Status: \(statusString). Detail: \(errorDetail)")
+                let errorDetail = response.error?.message ?? "Response status was '\(statusString)'"
+                throw AIProviderError.invalidResponse(detail: "Responses API call failed. Status: \(statusString). Detail: \(errorDetail)")
             }
 
             // Extract text content using the convenience property
@@ -337,7 +422,8 @@ class OpenAIProvider: AIProvider {
             return AICompletionResult(
                 text: responseText,
                 promptTokens: promptTokens,
-                completionTokens: completionTokens
+                completionTokens: completionTokens,
+                completionOutcome: completionOutcome
             )
 
         } catch let error as APIError {
@@ -436,13 +522,17 @@ class OpenAIProvider: AIProvider {
         let promptTokens = response.usage?.promptTokens
         let completionTokens = response.usage?.completionTokens
 
-        let content = response.choices?.first?.message?.content ?? ""
+        let choice = response.choices?.first
+        let content = choice?.message?.content ?? ""
+        let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
+            ?? .incomplete(reason: "missing_finish_reason")
 
         // Return an AICompletionResult with content and token counts
         return AICompletionResult(
             text: content,
             promptTokens: promptTokens,
-            completionTokens: completionTokens
+            completionTokens: completionTokens,
+            completionOutcome: completionOutcome
         )
     }
 
@@ -482,6 +572,7 @@ class OpenAIProvider: AIProvider {
                 do {
                     var promptTokens: Int?
                     var completionTokens: Int?
+                    var observedCompletionOutcome: AIProviderCompletionOutcome?
 
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -513,6 +604,7 @@ class OpenAIProvider: AIProvider {
                                 )
                             }
                         case let .responseCompleted(completed):
+                            observedCompletionOutcome = .completed
                             if let usage = completed.response.usage {
                                 promptTokens = usage.inputTokens
                                 completionTokens = usage.outputTokens
@@ -521,8 +613,8 @@ class OpenAIProvider: AIProvider {
                             let message = failed.response.error?.message ?? "Responses API returned a failure."
                             throw AIProviderError.invalidResponse(detail: message)
                         case let .responseIncomplete(incomplete):
-                            let detail = incomplete.response.incompleteDetails?.reason ?? "Responses API marked the response as incomplete."
-                            throw AIProviderError.invalidResponse(detail: detail)
+                            let reason = incomplete.response.incompleteDetails?.reason ?? "unknown"
+                            observedCompletionOutcome = .incomplete(reason: reason)
                         case let .error(errorEvent):
                             throw APIError.requestFailed(description: errorEvent.prettyDescription)
                         default:
@@ -530,16 +622,31 @@ class OpenAIProvider: AIProvider {
                         }
                     }
 
-                    continuation.yield(
-                        AIStreamResult(
-                            type: "message_stop",
-                            text: nil,
-                            reasoning: nil,
-                            promptTokens: promptTokens,
-                            completionTokens: completionTokens,
-                            cost: nil
+                    switch observedCompletionOutcome {
+                    case .completed:
+                        continuation.yield(
+                            AIStreamResult(
+                                type: "message_stop",
+                                text: nil,
+                                reasoning: nil,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                cost: nil
+                            )
                         )
-                    )
+                    case let .incomplete(reason):
+                        continuation.yield(
+                            AIStreamResult(
+                                type: AIStreamResult.incompleteType,
+                                text: nil,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                stopReason: reason
+                            )
+                        )
+                    case nil:
+                        break
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -645,6 +752,22 @@ class OpenAIProvider: AIProvider {
         case .gpt54High: return (.gpt54, "high")
         case .gpt54Low: return (.gpt54, "low")
         case .gpt54: return (.gpt54, "medium")
+        // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
+        case .gpt61SolMax: return (.gpt61Sol, "max")
+        case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
+        case .gpt61SolHigh: return (.gpt61Sol, "high")
+        case .gpt61SolLow: return (.gpt61Sol, "low")
+        case .gpt61Sol: return (.gpt61Sol, "medium")
+        case .gpt6AstraMax: return (.gpt6Astra, "max")
+        case .gpt6AstraXHigh: return (.gpt6Astra, "xhigh")
+        case .gpt6AstraHigh: return (.gpt6Astra, "high")
+        case .gpt6AstraLow: return (.gpt6Astra, "low")
+        case .gpt6Astra: return (.gpt6Astra, "medium")
+        case .gpt6LunaXHigh: return (.gpt6Luna, "xhigh")
+        case .gpt6LunaHigh: return (.gpt6Luna, "high")
+        case .gpt6LunaLow: return (.gpt6Luna, "low")
+        case .gpt6Luna: return (.gpt6Luna, "medium")
+        case .gpt6Sol: return (.gpt6Sol, "medium")
         // ── gpt5-codex-max family (Responses API) ──
         case .gpt5CodexXHigh: return (.gpt5CodexMed, "xhigh")
         case .gpt5CodexHigh: return (.gpt5CodexMed, "high")
@@ -739,8 +862,8 @@ extension OpenAIProvider: ResponsesJobProvider {
 
                         // Check for terminal states
                         switch response.status {
-                        case .completed:
-                            // Extract the output text from the response
+                        case .completed, .incomplete:
+                            // Extract any available output before reporting the terminal outcome
                             var outputText = ""
                             var reasoningText = ""
                             for item in response.output {
@@ -786,14 +909,16 @@ extension OpenAIProvider: ResponsesJobProvider {
                                 )
                             }
 
+                            let didComplete = response.status == .completed
                             continuation.yield(
                                 AIStreamResult(
-                                    type: "message_stop",
+                                    type: didComplete ? "message_stop" : AIStreamResult.incompleteType,
                                     text: nil,
                                     reasoning: nil,
                                     promptTokens: response.usage?.inputTokens,
                                     completionTokens: response.usage?.outputTokens,
-                                    cost: nil
+                                    cost: nil,
+                                    stopReason: didComplete ? nil : response.incompleteDetails?.reason ?? "unknown"
                                 )
                             )
                             continuation.finish()
@@ -802,10 +927,6 @@ extension OpenAIProvider: ResponsesJobProvider {
                         case .failed:
                             let message = response.error?.message ?? "Background job failed."
                             throw AIProviderError.invalidResponse(detail: message)
-
-                        case .incomplete:
-                            let detail = response.incompleteDetails?.reason ?? "Background job incomplete."
-                            throw AIProviderError.invalidResponse(detail: detail)
 
                         case .cancelled:
                             throw AIProviderError.invalidResponse(detail: "Background job was cancelled.")

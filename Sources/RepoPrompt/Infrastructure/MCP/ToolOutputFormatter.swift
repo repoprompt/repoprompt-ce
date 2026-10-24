@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.
@@ -946,6 +948,8 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "session_admin":
+            return SessionAdminToolOutputFormatter.format(args: args, value: result)
         case "history":
             return formatHistory(args: args, value: result)
         default:
@@ -971,8 +975,9 @@ extension ToolOutputFormatter {
         }
 
         let op = args["op"]?.stringValue ?? "history"
-        let status = object["scan_truncated"]?.boolValue == true ? "⚠️" : statusIcon(success: true)
-        let lowerBoundSuffix = object["totals_are_lower_bounds"]?.boolValue == true ? " (lower bound)" : ""
+        let incomplete = isHistoryScanIncomplete(object)
+        let status = incomplete ? "⚠️" : statusIcon(success: true)
+        let lowerBoundSuffix = incomplete ? " (lower bound)" : ""
         var lines: [String] = []
         switch op {
         case "list_sessions":
@@ -980,7 +985,7 @@ extension ToolOutputFormatter {
             let sessions = object["sessions"]?.arrayValue ?? []
             lines.append("## History Sessions \(status)")
             lines.append("- **Total sessions**: \(total)\(lowerBoundSuffix) • **Returned**: \(sessions.count)")
-            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
                 lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
@@ -1007,7 +1012,7 @@ extension ToolOutputFormatter {
             let results = object["results"]?.arrayValue ?? []
             lines.append("## History Search \(status)")
             lines.append("- **Total matches**: \(total)\(lowerBoundSuffix) • **Returned**: \(results.count)")
-            if total == 0 { lines.append("- **Status**: No matching turns found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching turns found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results {
@@ -1031,7 +1036,7 @@ extension ToolOutputFormatter {
             let groups = object["groups"]?.arrayValue ?? []
             lines.append("## History Time \(status)")
             lines.append("- **Total sessions**: \(totalSessions)\(lowerBoundSuffix) • **Active duration**: \(totalDuration)s\(lowerBoundSuffix) • **Groups**: \(groups.count)")
-            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
+            if totalSessions == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups {
@@ -1067,6 +1072,17 @@ extension ToolOutputFormatter {
             lines.append("## History Session \(status)")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
+            if let usage = object["token_usage_summary"]?.objectValue {
+                let providerInput = usage["provider_input_tokens"]?.intValue ?? 0
+                let providerOutput = usage["provider_output_tokens"]?.intValue ?? 0
+                let codexTotal = usage["codex_total_tokens"]?.intValue
+                if providerInput > 0 || providerOutput > 0 || codexTotal != nil {
+                    var usageLine = "- **Provider tokens**: input \(providerInput), output \(providerOutput)"
+                    if let codexTotal { usageLine += ", Codex cumulative \(codexTotal)" }
+                    usageLine += " • attributed runs: \(usage["attributed_run_count"]?.intValue ?? 0)"
+                    lines.append(usageLine)
+                }
+            }
             if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
             if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1092,6 +1108,18 @@ extension ToolOutputFormatter {
                 }
                 if let toolSummary = nonEmpty(turn["tool_call_summary"]?.stringValue) {
                     lines.append("- **Tools**: \(toolSummary)")
+                }
+                let runIDs = turn["run_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                if !runIDs.isEmpty {
+                    lines.append("- **Run IDs**: \(runIDs.joined(separator: ", "))")
+                }
+                let tokenUsage = turn["token_usage"]?.arrayValue ?? []
+                for usageValue in tokenUsage {
+                    guard let usage = usageValue.objectValue else { continue }
+                    let input = usage["input_tokens"]?.intValue ?? 0
+                    let output = usage["output_tokens"]?.intValue ?? 0
+                    let run = nonEmpty(usage["run_id"]?.stringValue) ?? "unattributed"
+                    lines.append("- **Token usage** (`\(run)`): input \(input), output \(output)")
                 }
                 let entries = turn["entries"]?.arrayValue ?? []
                 for entryValue in entries {
@@ -1138,7 +1166,17 @@ extension ToolOutputFormatter {
         return max(1, min(value, 20000))
     }
 
+    private static func isHistoryScanIncomplete(_ object: [String: Value]) -> Bool {
+        object["scan_complete"]?.boolValue == false
+            || object["scan_truncated"]?.boolValue == true
+            || object["totals_are_lower_bounds"]?.boolValue == true
+            || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+    }
+
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if isHistoryScanIncomplete(object) {
+            lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
+        }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
             guard let diagnostic = value.objectValue,
@@ -1830,10 +1868,6 @@ extension ToolOutputFormatter {
             let flags: [String] = [binding.explicit == true ? "explicit" : nil, binding.runScoped == true ? "run-scoped" : nil].compactMap(\.self)
             let flagSuffix = flags.isEmpty ? "" : " • " + flags.joined(separator: ", ")
             return "Tab context \(tab) in \(window)\(workspace)\(flagSuffix)"
-        case "window":
-            let window = binding.windowID.map { "window \($0)" } ?? "unknown window"
-            let workspace = binding.workspaceName.map { " • workspace \($0)" } ?? ""
-            return "Window-only affinity to \(window)\(workspace)"
         default:
             return "Unbound"
         }
@@ -1934,7 +1968,7 @@ extension ToolOutputFormatter {
             out.append("")
             out.append("### Next Steps")
             out.append("- Use `bind_context` with `op=bind` and a `context_id` to bind a specific tab context.")
-            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to set window affinity.")
+            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to capture and bind that window's current tab context.")
             if let windows = dto.windows, windows.count > 1 {
                 out.append("- Use `window_id` filter on `op=list` to see all tabs in a specific window.")
             }
@@ -1946,54 +1980,28 @@ extension ToolOutputFormatter {
     static func formatReadFile(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
         let path = args["path"]?.stringValue ?? "(unknown)"
         let lang = languageTag(forPath: path)
+        // Failure markers take precedence over both decoded and projected content.
+        if case let .object(obj) = value,
+           let failureText = readFileFailureText(from: obj, requestedPath: path)
+        {
+            return [.text(failureText)]
+        }
         // Preferred DTO decoding
         if let dto = value.decode(ToolResultDTOs.ReadFileReply.self) {
-            let displayPath = dto.displayPath ?? path
-            if let errorCode = dto.errorCode, dto.retryable == true {
-                let text = readFileRetryableFailure(
-                    path: displayPath,
-                    error: dto.errorMessage ?? dto.message ?? "Read failed with a retryable workspace error.",
-                    errorCode: errorCode,
-                    retryAfterMilliseconds: dto.retryAfterMilliseconds,
-                    worktreeScope: dto.worktreeScope
-                )
-                return [.text(text)]
-            }
-            let text = readFile(
-                path: displayPath,
-                first: dto.firstLine,
-                last: dto.lastLine,
-                total: dto.totalLines,
-                language: lang,
-                message: dto.message,
-                content: dto.content,
-                worktreeScope: dto.worktreeScope
-            )
-            return [.text(text)]
+            return formatDecodedReadFileReply(dto, requestedPath: path, language: lang)
         }
         // Fallback: value is an object with expected keys but decode failed
         if case let .object(obj) = value {
-            let content = obj["content"]?.stringValue ?? ""
-            let total = obj["total_lines"]?.intValue
-                ?? Int(obj["total_lines"]?.stringValue ?? "")
-                ?? content.components(separatedBy: "\n").count
-            let first = obj["first_line"]?.intValue
-                ?? Int(obj["first_line"]?.stringValue ?? "")
-                ?? (content.isEmpty ? 0 : 1)
-            let last = obj["last_line"]?.intValue
-                ?? Int(obj["last_line"]?.stringValue ?? "")
-                ?? total
-            let message = obj["message"]?.stringValue
-            let text = readFile(
-                path: path,
-                first: first,
-                last: last,
-                total: total,
-                language: lang,
-                message: message,
-                content: content
-            )
-            return [.text(text)]
+            if let projected = projectedReadFileReply(from: obj, requestedPath: path) {
+                return formatDecodedReadFileReply(projected, requestedPath: path, language: lang)
+            }
+            return [.text(readFileUnreadableResult(
+                path: obj["display_path"]?.stringValue ?? path,
+                message: obj["error"]?.stringValue
+                    ?? obj["message"]?.stringValue
+                    ?? "The read_file result had missing file content or invalid line metadata.",
+                worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+            ))]
         }
         // Fallback: legacy string response (assume whole content)
         if let s = value.stringValue {
@@ -2011,6 +2019,135 @@ extension ToolOutputFormatter {
         }
         // Final fallback: present JSON
         return formatGeneric(value: value)
+    }
+
+    private static func formatDecodedReadFileReply(
+        _ dto: ToolResultDTOs.ReadFileReply,
+        requestedPath: String,
+        language: String
+    ) -> [MCP.Tool.Content] {
+        let displayPath = dto.displayPath ?? requestedPath
+        guard validReadFileRange(dto) else {
+            return [.text(readFileUnreadableResult(
+                path: displayPath,
+                message: "The read_file result had invalid line metadata.",
+                worktreeScope: dto.worktreeScope
+            ))]
+        }
+        let text = readFile(
+            path: displayPath,
+            first: dto.firstLine,
+            last: dto.lastLine,
+            total: dto.totalLines,
+            language: language,
+            message: dto.message,
+            content: dto.content,
+            worktreeScope: dto.worktreeScope
+        )
+        return [.text(text)]
+    }
+
+    /// Rebuilds a reply when JSON decode into `ReadFileReply` fails, for example because
+    /// line fields arrived as whole JSON numbers stored as `.double`.
+    ///
+    /// Content-only legacy objects may infer a range. Supplied line metadata must be
+    /// complete and integral; malformed metadata must not be replaced with success.
+    private static func projectedReadFileReply(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> ToolResultDTOs.ReadFileReply? {
+        guard let content = obj["content"]?.stringValue else { return nil }
+        let hasLineMetadata = ["first_line", "last_line", "total_lines"].contains { obj[$0] != nil }
+        let first: Int
+        let last: Int
+        let total: Int
+        if hasLineMetadata {
+            guard let parsedFirst = wholeNumberInt(obj["first_line"]),
+                  let parsedLast = wholeNumberInt(obj["last_line"]),
+                  let parsedTotal = wholeNumberInt(obj["total_lines"])
+            else { return nil }
+            first = parsedFirst
+            last = parsedLast
+            total = parsedTotal
+        } else {
+            guard !content.isEmpty else { return nil }
+            first = 1
+            total = content.components(separatedBy: "\n").count
+            last = total
+        }
+        return ToolResultDTOs.ReadFileReply(
+            content: content,
+            totalLines: total,
+            firstLine: first,
+            lastLine: last,
+            message: obj["message"]?.stringValue,
+            displayPath: obj["display_path"]?.stringValue ?? requestedPath,
+            worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) },
+            errorMessage: obj["error"]?.stringValue,
+            errorCode: obj["error_code"]?.stringValue,
+            retryable: obj["retryable"]?.boolValue,
+            retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"])
+        )
+    }
+
+    private static func validReadFileRange(_ dto: ToolResultDTOs.ReadFileReply) -> Bool {
+        guard dto.totalLines >= 0, dto.firstLine >= 0, dto.lastLine >= 0 else { return false }
+        if dto.totalLines == 0 {
+            return dto.content.isEmpty && dto.firstLine == 0 && dto.lastLine == 0
+        }
+        guard dto.firstLine > 0, dto.lastLine <= dto.totalLines else { return false }
+        if dto.lastLine >= dto.firstLine { return true }
+        // The provider supports limit=0 and start_line beyond EOF without an error.
+        return dto.content.isEmpty && dto.lastLine == min(dto.firstLine - 1, dto.totalLines)
+    }
+
+    private static func readFileFailureText(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> String? {
+        let hasError = ["error", "error_code"].contains { key in
+            guard let value = obj[key] else { return false }
+            if case .null = value { return false }
+            return true
+        }
+        guard hasError || obj["retryable"]?.boolValue == true else { return nil }
+        let path = obj["display_path"]?.stringValue ?? requestedPath
+        let message = obj["error"]?.stringValue ?? obj["message"]?.stringValue ?? "The read_file request failed."
+        let errorCode = obj["error_code"]?.stringValue
+        let scope = obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+        if obj["retryable"]?.boolValue == true, let errorCode, !errorCode.isEmpty {
+            return readFileRetryableFailure(
+                path: path,
+                error: message,
+                errorCode: errorCode,
+                retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"]),
+                worktreeScope: scope
+            )
+        }
+        return readFileUnreadableResult(
+            path: path,
+            message: message,
+            worktreeScope: scope,
+            errorCode: errorCode,
+            retryable: obj["retryable"]?.boolValue
+        )
+    }
+
+    /// Parses line counts from MCP `Value` ints, digit strings, or whole doubles.
+    /// Fractional doubles are rejected so a corrupt `1.5` cannot become a line number.
+    private static func wholeNumberInt(_ value: Value?) -> Int? {
+        guard let value else { return nil }
+        switch value {
+        case let .int(int):
+            return int
+        case let .string(string):
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let .double(double):
+            guard double.isFinite else { return nil }
+            return Int(exactly: double)
+        default:
+            return nil
+        }
     }
 
     private static func readFileRetryableFailure(
@@ -2036,6 +2173,24 @@ extension ToolOutputFormatter {
             out.append("- **Retry after**: \(retryAfterMilliseconds) ms")
         }
         out.append("- **Message**: \(error)")
+        out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
+        return out.joined(separator: "\n")
+    }
+
+    private static func readFileUnreadableResult(
+        path: String,
+        message: String,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?,
+        errorCode: String? = nil,
+        retryable: Bool? = nil
+    ) -> String {
+        var out: [String] = []
+        out.append("## File Read \(statusIcon(success: false))")
+        out.append("- **Path**: `\(path)`")
+        out.append("- **Status**: Unreadable tool result")
+        if let errorCode { out.append("- **Code**: \(errorCode)") }
+        if let retryable { out.append("- **Retryable**: \(retryable ? "yes" : "no")") }
+        out.append("- **Message**: \(message)")
         out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
         return out.joined(separator: "\n")
     }
@@ -2419,8 +2574,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        // Build main section using our existing helper
-        let text = chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
+            ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2504,7 +2659,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Ask Oracle ✅")
+            ?? askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2913,44 +3069,375 @@ extension ToolOutputFormatter {
         guard let dto = value.decode(ToolResultDTOs.CodeStructureReplyDTO.self) else {
             return formatGeneric(value: value)
         }
-        let icon = switch dto.status {
-        case "ready": "✅"
-        case "partial", "pending", "budget": "⚠️"
-        default: "❌"
+
+        let allIssues = dto.issues + dto.roots.flatMap(\.issues)
+        let externalEdgeCount = dto.roots.reduce(0) { count, root in
+            count + root.edges.count(where: { $0.from != $0.to })
         }
-        var out: [String] = [
-            "## Code Structure \(icon)",
-            "- **Status**: `\(dto.status)`",
-            "- **Files**: \(dto.summary.returnedFiles) (\(dto.summary.returnedSeeds) seeds, \(dto.summary.returnedRelated) related)",
-            "- **Codemap content tokens**: \(dto.summary.codemapContentTokens)",
-            "- **Examined edges**: \(dto.summary.examinedEdges)"
-        ]
-        out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
-        if !dto.issues.isEmpty {
-            out.append("")
-            out.append("### Issues")
-            for issue in dto.issues {
-                var detail = "- `\(issue.code)` (\(issue.phase)): \(issue.message)"
-                if let path = issue.path { detail += " [`\(path)`]" }
-                if let attempted = issue.attempted, let limit = issue.limit {
-                    detail += " (attempted \(attempted), limit \(limit))"
+        let relatedCount = dto.roots.reduce(0) { count, root in
+            count + root.nodes.count(where: { $0.seed != true })
+        }
+        let hasUsefulResult = dto.summary.nodes > 0 || dto.summary.files > 0
+        let resultSummary = codeStructureResultSummary(
+            dto: dto,
+            relatedCount: relatedCount,
+            externalEdgeCount: externalEdgeCount
+        )
+
+        if dto.status == .unavailable {
+            var out = ["## Code Structure ❌ unavailable — \(codeStructureUnavailableCause(issues: allIssues))"]
+            if let requested = allIssues.first(where: { $0.code == "path_not_found" })?.path {
+                out.append("- Requested: `\(requested)`")
+            }
+            out.append("- \(codeStructureUnavailableAction(issues: allIssues))")
+            if dto.worktreeScope != nil {
+                out.append("- Scope: session-bound worktree. Displayed paths use logical/canonical roots; codemap scans use the bound checkout.")
+            }
+            return [.text(out.joined(separator: "\n"))]
+        }
+
+        if dto.status == .pending, !hasUsefulResult {
+            let path = codeStructurePendingSeedPath(dto: dto, issues: allIssues)
+            var out = [
+                "## Code Structure ⏳ pending — `\(path)` is not in the code graph yet",
+                "- Retry shortly. If this persists, the file may be excluded or of an unsupported type."
+            ]
+            if dto.worktreeScope != nil {
+                if dto.roots.count == 1, let root = dto.roots.first {
+                    out.append(codeStructureRootDeclaration(root.root, scope: dto.worktreeScope))
+                } else {
+                    out.append("- Scope: session-bound worktree. Displayed paths use logical/canonical roots; codemap scans use the bound checkout.")
                 }
-                if issue.retryable { detail += " — retryable" }
-                out.append(detail)
+            }
+            return [.text(out.joined(separator: "\n"))]
+        }
+
+        let graphTruncated = dto.roots.contains { $0.truncated != nil }
+        var out: [String]
+        switch dto.status {
+        case .ok:
+            let suffix = hasUsefulResult ? " — \(resultSummary)" : ""
+            out = ["## Code Structure ✅\(suffix)"]
+        case .partial, .pending:
+            var title = "## Code Structure ⚠️ partial — a retry may return more relationships"
+            if graphTruncated {
+                title += "; \(codeStructureSizeAction(size: dto.size))"
+            }
+            out = [title]
+            if hasUsefulResult { out.append("- Result: \(resultSummary)") }
+        case .unavailable:
+            preconditionFailure("Unavailable replies return above")
+        }
+
+        if dto.roots.count == 1, let root = dto.roots.first {
+            out.append(codeStructureRootDeclaration(root.root, scope: dto.worktreeScope))
+        } else if !dto.roots.isEmpty {
+            let counts = Dictionary(grouping: dto.roots, by: \.status)
+                .map { "\($0.value.count) \($0.key.rawValue)" }
+                .sorted()
+                .joined(separator: ", ")
+            out.append("- Roots: \(dto.roots.count) (\(counts))")
+        }
+        if dto.worktreeScope != nil {
+            out.append("- Scope: session-bound worktree. Displayed paths use logical/canonical roots; codemap scans use the bound checkout.")
+        }
+
+        for root in dto.roots {
+            let rootFiles = dto.files.filter { codeStructurePath($0.path, belongsTo: root.root) }
+            let externalEdges = root.edges.filter { $0.from != $0.to }
+            let singleEdgeNeedsAttribution = externalEdges.count == 1
+                && (root.seeds.count > 1 || root.nodes.count > 2)
+            let shouldRenderGraph = rootFiles.isEmpty || externalEdges.count > 1
+                || externalEdges.contains(where: { $0.ambiguous == true })
+                || singleEdgeNeedsAttribution
+            if dto.roots.count > 1 {
+                out.append("")
+                out.append("### \(codeStructureRootDeclaration(root.root, scope: dto.worktreeScope, bullet: false))")
+            }
+            if shouldRenderGraph, !root.nodes.isEmpty || !externalEdges.isEmpty {
+                out.append("")
+                out.append(dto.roots.count == 1 ? "### Graph" : "#### Graph")
+                appendCodeStructureGraph(root: root, edges: externalEdges, to: &out)
+            }
+            let renderedPaths = Set(rootFiles.map(\.path))
+            let omittedSignatureNodes = root.nodes.filter { !renderedPaths.contains($0.path) }
+            let rootIssues = dto.issues + root.issues
+            let signatureOmissionReported = rootIssues.contains { $0.code.hasPrefix("signature_") }
+            if !rootFiles.isEmpty || signatureOmissionReported && !omittedSignatureNodes.isEmpty {
+                out.append("")
+                out.append(dto.roots.count == 1 ? "### Signatures" : "#### Signatures")
+                appendCodeStructureSignatures(root: root.root, files: rootFiles, to: &out)
+                if signatureOmissionReported, !omittedSignatureNodes.isEmpty {
+                    let shown = omittedSignatureNodes.prefix(3).map {
+                        "`\(codeStructureRelativePath($0.path, root: root.root))`"
+                    }.joined(separator: ", ")
+                    let remainder = omittedSignatureNodes.count > 3 ? " … +\(omittedSignatureNodes.count - 3) more" : ""
+                    var omission = "- Omitted (\(omittedSignatureNodes.count)): \(shown)\(remainder)"
+                    if rootIssues.contains(where: { $0.code == "signature_size_limit" }) {
+                        omission += " — \(codeStructureSizeAction(size: dto.size))"
+                    }
+                    out.append(omission)
+                }
             }
         }
-        if !dto.files.isEmpty {
+
+        let unmatchedFiles = dto.files.filter { file in
+            !dto.roots.contains(where: { codeStructurePath(file.path, belongsTo: $0.root) })
+        }
+        if !unmatchedFiles.isEmpty {
             out.append("")
-            out.append("### Files")
-            for file in dto.files {
-                let directions = file.reachedBy.isEmpty
-                    ? ""
-                    : ", reached by \(file.reachedBy.joined(separator: ", "))"
-                out.append("#### `\(file.path)` — \(file.role), depth \(file.depth)\(directions), \(file.tokens) tokens")
-                out.append("```text\n\(file.content)\n```")
-            }
+            out.append("### Signatures")
+            appendCodeStructureSignatures(root: nil, files: unmatchedFiles, to: &out)
+        }
+
+        let visibleIssues = allIssues.filter {
+            !codeStructureIssueIsPresentedElsewhere($0)
+        }
+        let hasDiagnostics = !visibleIssues.isEmpty || dto.roots.contains { root in
+            root.truncated != nil || hasUsefulResult && root.seeds.contains(where: { $0.state != .covered })
+        }
+        if hasDiagnostics {
+            out.append("")
+            out.append("### Diagnostics")
+            appendCodeStructureDiagnostics(dto: dto, visibleIssues: visibleIssues, to: &out)
         }
         return [.text(out.joined(separator: "\n"))]
+    }
+
+    private static func codeStructureResultSummary(
+        dto: ToolResultDTOs.CodeStructureReplyDTO,
+        relatedCount: Int,
+        externalEdgeCount: Int
+    ) -> String {
+        var summary = "\(dto.summary.seeds) seed\(dto.summary.seeds == 1 ? "" : "s")"
+        if relatedCount > 0 { summary += " + \(relatedCount) related" }
+        summary += " • \(externalEdgeCount) edge\(externalEdgeCount == 1 ? "" : "s")"
+        if dto.summary.files > 0 {
+            summary += " • signatures \(dto.summary.files) file\(dto.summary.files == 1 ? "" : "s"), \(dto.summary.tokens) tokens"
+        }
+        return summary
+    }
+
+    private static func codeStructurePendingSeedPath(
+        dto: ToolResultDTOs.CodeStructureReplyDTO,
+        issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
+    ) -> String {
+        for root in dto.roots {
+            if let seed = root.seeds.first(where: { $0.state != .covered }) {
+                return codeStructureRelativePath(seed.path, root: root.root)
+            }
+        }
+        if let issuePath = issues.compactMap(\.path).first {
+            if let root = dto.roots.first(where: { codeStructurePath(issuePath, belongsTo: $0.root) }) {
+                return codeStructureRelativePath(issuePath, root: root.root)
+            }
+            return issuePath
+        }
+        return "requested seed"
+    }
+
+    private static func codeStructureUnavailableCause(
+        issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
+    ) -> String {
+        if issues.contains(where: { $0.code == "path_not_found" }) {
+            return "no requested path resolved"
+        }
+        if issues.contains(where: { $0.code == "codemaps_disabled" }) {
+            return "codemap generation is disabled"
+        }
+        if issues.contains(where: { $0.code == "git_root_unavailable" }) {
+            return "requested root is unavailable"
+        }
+        return issues.first.map { codeStructureSentenceFragment($0.message) } ?? "code structure is unavailable"
+    }
+
+    private static func codeStructureUnavailableAction(
+        issues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO]
+    ) -> String {
+        if issues.contains(where: { $0.code == "path_not_found" }) {
+            return "Check spelling with get_file_tree, then retry root-relative or root-prefixed."
+        }
+        if issues.contains(where: { $0.code == "codemaps_disabled" }) {
+            return "Enable codemaps, then retry."
+        }
+        if issues.contains(where: { $0.code == "git_root_unavailable" }) {
+            return "Resolve the reported root issue, then retry."
+        }
+        return "Resolve the reported issue, then retry."
+    }
+
+    private static func codeStructureSizeAction(size: WorkspaceCodemapGraphOutputSize) -> String {
+        switch size {
+        case .small: "rerun with size: medium"
+        case .medium: "rerun with size: large"
+        case .large: "narrow paths or reduce depth; size is already large"
+        }
+    }
+
+    private static func appendCodeStructureGraph(
+        root: ToolResultDTOs.CodeStructureReplyDTO.RootDTO,
+        edges: [ToolResultDTOs.CodeStructureReplyDTO.EdgeDTO],
+        to output: inout [String]
+    ) {
+        let relativeNodes = root.nodes.map { codeStructureRelativePath($0.path, root: root.root) }
+        let relativeEdges = edges.flatMap {
+            [codeStructureRelativePath($0.from, root: root.root), codeStructureRelativePath($0.to, root: root.root)]
+        }
+        let base = codeStructureSharedBase(paths: relativeNodes + relativeEdges)
+        if let base { output.append("Base: `\(base)`") }
+
+        let outgoing = Dictionary(grouping: edges, by: \.from)
+        let connectedPaths = Set(edges.flatMap { [$0.from, $0.to] })
+        for node in root.nodes {
+            let source = codeStructureCompactPath(node.path, root: root.root, base: base)
+            if let nodeEdges = outgoing[node.path], !nodeEdges.isEmpty {
+                let role = node.seed == true ? " (seed)" : ""
+                output.append("- `\(source)`\(role) → uses:")
+                for edge in nodeEdges {
+                    let target = codeStructureCompactPath(edge.to, root: root.root, base: base)
+                    let symbols = edge.symbols.isEmpty ? "" : " — \(edge.symbols.joined(separator: ", "))"
+                    let ambiguous = edge.ambiguous == true ? " (ambiguous)" : ""
+                    output.append("  - `\(target)`\(symbols)\(ambiguous)")
+                }
+            } else if !connectedPaths.contains(node.path) {
+                let role = node.seed == true ? " (seed)" : ""
+                output.append("- `\(source)`\(role) — no relationships returned")
+            }
+        }
+    }
+
+    private static func appendCodeStructureSignatures(
+        root: String?,
+        files: [ToolResultDTOs.CodeStructureReplyDTO.FileDTO],
+        to output: inout [String]
+    ) {
+        let relativePaths = files.map { file in
+            root.map { codeStructureRelativePath(file.path, root: $0) } ?? file.path
+        }
+        let base = codeStructureSharedBase(paths: relativePaths)
+        if let base { output.append("Base: `\(base)`") }
+        for file in files {
+            let relativePath = root.map { codeStructureRelativePath(file.path, root: $0) } ?? file.path
+            let path = codeStructureStripBase(relativePath, base: base)
+            let role: String = if file.role == "seed" {
+                "seed"
+            } else if !file.reachedBy.isEmpty {
+                file.reachedBy.joined(separator: "/") + ", depth \(file.depth)"
+            } else {
+                "related, depth \(file.depth)"
+            }
+            output.append("#### `\(path)` — \(role) • \(file.tokens) tokens")
+            output.append("```text\n\(codeStructureSignatureContent(file.content, path: file.path))\n```")
+        }
+    }
+
+    private static func appendCodeStructureDiagnostics(
+        dto: ToolResultDTOs.CodeStructureReplyDTO,
+        visibleIssues: [ToolResultDTOs.CodeStructureReplyDTO.IssueDTO],
+        to output: inout [String]
+    ) {
+        let multipleRoots = dto.roots.count > 1
+        let hasUsefulResult = dto.summary.nodes > 0 || dto.summary.files > 0
+        for root in dto.roots {
+            let label = multipleRoots ? "`\(root.root)` " : ""
+            if hasUsefulResult {
+                for seed in root.seeds where seed.state != .covered {
+                    let path = codeStructureRelativePath(seed.path, root: root.root)
+                    output.append("- \(label)Seed `\(path)` returned nothing — excluded or unsupported type")
+                }
+            }
+            if let truncated = root.truncated {
+                output.append("- \(label)Truncated: \(truncated.droppedNodes) files dropped")
+            }
+        }
+
+        for issue in visibleIssues {
+            var detail = "- \(codeStructureSentenceFragment(issue.message))"
+            if let issuePath = issue.path {
+                let root = dto.roots.first(where: { codeStructurePath(issuePath, belongsTo: $0.root) })?.root
+                let path = root.map { codeStructureRelativePath(issuePath, root: $0) } ?? issuePath
+                detail += " [`\(path)`]"
+            }
+            output.append(detail)
+        }
+    }
+
+    private static func codeStructureIssueIsPresentedElsewhere(
+        _ issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
+    ) -> Bool {
+        switch issue.code {
+        case "codemaps_disabled", "empty_seeds", "git_root_unavailable", "graph_deadline",
+             "graph_indexing", "graph_revalidation_failed", "graph_revoked", "graph_size_limit",
+             "graph_unavailable", "path_not_found", "seed_excluded", "seed_fenced", "seed_not_indexed",
+             "seed_pending", "signature_pending", "signature_publication_stale", "signature_size_limit",
+             "signature_unavailable", "updates_pending", "watcher_gap_reconciling":
+            true
+        default:
+            false
+        }
+    }
+
+    private static func codeStructureSentenceFragment(_ message: String) -> String {
+        message.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".;")))
+    }
+
+    private static func codeStructureRootDeclaration(
+        _ root: String,
+        scope: ToolResultDTOs.WorktreeScopeDTO?,
+        bullet: Bool = true
+    ) -> String {
+        var declaration = "\(bullet ? "- Root " : "Root ")`\(root)` — paths below are root-relative"
+        if let mapping = scope?.rootMappings.first(where: { $0.logicalRootName == root }) {
+            var details = ["worktree `\(mapping.worktreeID)`"]
+            if let branch = nonEmpty(mapping.branch) { details.append("branch `\(branch)`") }
+            if let label = nonEmpty(mapping.label) { details.append("label `\(label)`") }
+            declaration += "; session-bound \(details.joined(separator: ", "))"
+        }
+        return declaration
+    }
+
+    private static func codeStructurePath(_ path: String, belongsTo root: String) -> Bool {
+        path == root || path.hasPrefix(root + "/")
+    }
+
+    private static func codeStructureRelativePath(_ path: String, root: String) -> String {
+        guard codeStructurePath(path, belongsTo: root) else { return path }
+        if path == root { return "." }
+        return String(path.dropFirst(root.count + 1))
+    }
+
+    private static func codeStructureCompactPath(_ path: String, root: String, base: String?) -> String {
+        codeStructureStripBase(codeStructureRelativePath(path, root: root), base: base)
+    }
+
+    private static func codeStructureStripBase(_ path: String, base: String?) -> String {
+        guard let base, path.hasPrefix(base) else { return path }
+        return String(path.dropFirst(base.count))
+    }
+
+    private static func codeStructureSharedBase(paths: [String]) -> String? {
+        let unique = Array(Set(paths)).sorted()
+        guard unique.count >= 2 else { return nil }
+        let components = unique.map { $0.split(separator: "/").map(String.init) }
+        guard let first = components.first else { return nil }
+        var prefix = Array(first.dropLast())
+        guard !prefix.isEmpty else { return nil }
+        for pathComponents in components.dropFirst() {
+            let directory = pathComponents.dropLast()
+            prefix = Array(zip(prefix, directory).prefix(while: { $0.0 == $0.1 }).map(\.0))
+            if prefix.isEmpty { return nil }
+        }
+        let base = prefix.joined(separator: "/") + "/"
+        let compacted = unique.map { codeStructureStripBase($0, base: base) }
+        guard Set(compacted).count == unique.count else { return nil }
+        let savedCharacters = base.count * unique.count - base.count - 9
+        return savedCharacters >= 40 ? base : nil
+    }
+
+    private static func codeStructureSignatureContent(_ content: String, path: String) -> String {
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.first.map(String.init) == "File: \(path)" else { return content }
+        return lines.dropFirst().joined(separator: "\n")
     }
 
     // (Removed) formatTokenStats – token stats are part of workspace_context
@@ -4011,17 +4498,25 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)\(heading)\n"))
-                let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
-                blocks.append(contentsOf: planBlocks)
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)\(heading)\n"))
+                    let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
+                    blocks.append(contentsOf: planBlocks)
+                }
             }
 
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)## Code Review\n"))
-                let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
-                blocks.append(contentsOf: reviewBlocks)
+                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)## Code Review\n"))
+                    let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
+                    blocks.append(contentsOf: reviewBlocks)
+                }
             }
 
             // Follow-up hint
@@ -4043,6 +4538,82 @@ extension ToolOutputFormatter {
             return blocks
         }
         return formatGeneric(value: value)
+    }
+
+    private static func formatOracleGroup(
+        value: Value,
+        heading: String
+    ) -> String? {
+        guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
+              let count = dto.oracleCount,
+              let results = dto.oracleResults,
+              count == results.count,
+              count > 1
+        else { return nil }
+
+        let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+        guard ordered.enumerated().allSatisfy({ offset, lane in
+            lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+        }) else { return nil }
+
+        var lines = [heading]
+        if let status = dto.status {
+            lines.append("- Oracle group status: \(status)")
+        }
+        if let groupID = dto.oracleGroupID {
+            lines.append("- Oracle group: `\(groupID)`")
+        }
+        let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
+            let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
+            case .completed: .completed
+            case .failed: .failed
+            case .cancelled: .cancelled
+            case nil: .unavailable
+            }
+            return OracleLaneMarkdownPayload.Lane(
+                laneIndex: lane.laneIndex,
+                chatID: lane.chatID,
+                providerID: lane.executionProfile?.providerID ?? lane.providerID,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+                status: status,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse,
+                errorCode: lane.error?.code,
+                errorMessage: lane.error?.message
+            )
+        })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
+            lines.append("")
+            lines.append(preamble)
+        }
+        let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
+        if !laneMarkdown.isEmpty {
+            lines.append("")
+            lines.append(laneMarkdown)
+        }
+        if let warnings = dto.warnings {
+            for warning in warnings {
+                lines.append("")
+                lines.append("Warning [\(warning.code)]: \(warning.message)")
+            }
+        }
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
+        }
+        // MCP clients may concatenate adjacent text blocks with no separator;
+        // end with a line break so the end marker stays on its own line.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
@@ -4108,7 +4679,7 @@ extension ToolOutputFormatter {
 
         switch dto.op.lowercased() {
         case "list":
-            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [])
+            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [], totalCount: dto.totalCount)
         case "show":
             if let worktree = dto.worktree ?? dto.worktrees?.first {
                 appendManageWorktreeDetails(&out, worktree: worktree)
@@ -4147,6 +4718,13 @@ extension ToolOutputFormatter {
         default:
             break
         }
+        if let pending = dto.pendingApplication {
+            out.append("")
+            out.append("### Pending Switch")
+            out.append("- **State**: \(pending.state) (applies after: \(pending.appliesAfter); continuation: \(pending.continuation))")
+            out.append("- **Relocation ID**: `\(pending.relocationID)`")
+            out.append("- \(pending.detail)")
+        }
 
         if let graph = dto.graph {
             out.append("")
@@ -4173,10 +4751,15 @@ extension ToolOutputFormatter {
 
     private static func appendManageWorktreeList(
         _ out: inout [String],
-        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO]
+        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO],
+        totalCount: Int?
     ) {
         out.append("")
-        out.append("### Worktrees (\(worktrees.count))")
+        if let totalCount, totalCount != worktrees.count {
+            out.append("### Worktrees (\(worktrees.count) of \(totalCount))")
+        } else {
+            out.append("### Worktrees (\(worktrees.count))")
+        }
         guard !worktrees.isEmpty else {
             out.append("_No worktrees found._")
             return
@@ -5336,8 +5919,9 @@ extension ToolOutputFormatter {
             lines.append("- Run ID: `\(runID)`")
         }
         lines.append(contentsOf: formattedAgentRunWorktreeLines(worktrees))
-        // Multi-wait metadata
+        // Wait metadata
         let waitMeta = object["wait"]?.objectValue
+        let steeringMessage = waitMeta?["steering_message"]?.stringValue
         if let waitMeta, waitMeta["mode"]?.stringValue == "any" {
             let waitResult = waitMeta["result"]?.stringValue ?? ""
             let waitedCount = waitMeta["waited_count"]?.intValue
@@ -5362,6 +5946,9 @@ extension ToolOutputFormatter {
                 lines.append("- Pending: \(pendingIDs.map { "`\($0)`" }.joined(separator: ", "))")
             }
         }
+        if let steeringMessage, !steeringMessage.isEmpty {
+            lines.append("\n**Steering message**\n\n\(steeringMessage)")
+        }
         if let agentName, !agentName.isEmpty {
             var agentLine = "- Agent: **\(agentName)**"
             if let model, !model.isEmpty {
@@ -5371,6 +5958,20 @@ extension ToolOutputFormatter {
                 agentLine += " · reasoning `\(reasoning)`"
             }
             lines.append(agentLine)
+            if let parameters = agent?["model_parameters"]?.arrayValue,
+               !parameters.isEmpty
+            {
+                let selected = parameters.compactMap { parameter -> String? in
+                    guard let selection = parameter.objectValue,
+                          let configID = selection["config_id"]?.stringValue,
+                          let value = selection["value"]?.stringValue
+                    else { return nil }
+                    return "`\(configID)=\(value)`"
+                }
+                if !selected.isEmpty {
+                    lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                }
+            }
         }
         if let interactionKind, !interactionKind.isEmpty {
             lines.append("- Interaction: **\(interactionKind)**")
@@ -5390,7 +5991,13 @@ extension ToolOutputFormatter {
             if supportsRespondGuidance {
                 let kindRaw = interaction?["kind"]?.stringValue ?? ""
                 lines.append("### How to respond")
-                lines.append("Use `agent_run` with `op=respond`, `session_id=\"\(sessionID)\"`, and `interaction_id=\"\(interactionID)\"`.")
+                if kindRaw == "approval" {
+                    lines.append(
+                        "- Copyable response: `agent_run op=respond session_id=\"\(sessionID)\" interaction_id=\"\(interactionID)\" response=\"accept\"`"
+                    )
+                } else {
+                    lines.append("Use `agent_run` with `op=respond`, `session_id=\"\(sessionID)\"`, and `interaction_id=\"\(interactionID)\"`.")
+                }
                 switch kindRaw {
                 case "instruction":
                     lines.append("- Provide `response=\"<your instruction text>\"`")
@@ -5404,13 +6011,18 @@ extension ToolOutputFormatter {
                     lines.append("- Provide `response=\"<answer>\"` or `response=\"skip\"` to skip.")
                 case "approval":
                     let options = interaction?["options"]?.arrayValue ?? []
-                    if !options.isEmpty {
-                        let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
-                        lines.append("- Allowed decisions: \(labels.map { "`\($0)`" }.joined(separator: ", "))")
-                    } else {
-                        lines.append("- Allowed decisions: `accept`, `accept_for_session`, `accept_with_amendment`, `decline`, `cancel`")
+                    let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
+                    let effectiveLabels = labels.isEmpty
+                        ? ["accept", "accept_for_session", "accept_with_amendment", "decline", "cancel"]
+                        : labels
+                    lines.append(
+                        "- Allowed response values: \(effectiveLabels.map { "`\($0)`" }.joined(separator: ", "))"
+                    )
+                    if effectiveLabels.contains("accept_with_amendment") {
+                        lines.append(
+                            "- For `response=\"accept_with_amendment\"`, also provide `amendment=\"<text>\"`."
+                        )
                     }
-                    lines.append("- For `accept_with_amendment`, also provide `amendment=\"<text>\"`.")
                 case "user_input":
                     let fields = interaction?["fields"]?.arrayValue ?? []
                     if fields.count == 1 {
@@ -5696,6 +6308,15 @@ extension ToolOutputFormatter {
         if let sessionID = object["session_id"]?.stringValue, !sessionID.isEmpty {
             lines.append("- Session: `\(sessionID)`")
         }
+        if rawOp == "set_session_pin", let pinned = object["pinned"]?.boolValue {
+            lines.append("- Pinned: **\(pinned ? "yes" : "no")**")
+            if let changed = object["changed"]?.boolValue {
+                lines.append("- Changed: \(changed ? "yes" : "no")")
+            }
+        }
+        if rawOp == "reorder_pinned_sessions", let ids = object["session_ids"]?.arrayValue {
+            lines.append("- Pinned order: \(ids.compactMap(\.stringValue).joined(separator: ", "))")
+        }
         if let workflowName = object["workflow_name"]?.stringValue, !workflowName.isEmpty {
             lines.append("- Workflow: `\(workflowName)`")
         }
@@ -5707,6 +6328,20 @@ extension ToolOutputFormatter {
                     agentLine += " · `\(model)`"
                 }
                 lines.append(agentLine)
+                if let parameters = agentObject["model_parameters"]?.arrayValue,
+                   !parameters.isEmpty
+                {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "`\(configID)=\(value)`"
+                    }
+                    if !selected.isEmpty {
+                        lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                    }
+                }
             }
         } else if let agent = object["agent"]?.stringValue, !agent.isEmpty {
             lines.append("- Agent: **\(agent)**")
@@ -5756,8 +6391,12 @@ extension ToolOutputFormatter {
                     // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
-                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
-                    let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
+                    // Devin effort IDs are grouped by their catalog family, not by suffix parsing.
+                    let devinEntry = agentPrefix == "devin:" ? DevinModelCatalog.current.entry(matching: afterColon) : nil
+                    let groupingEffort = devinEntry.map { $0.thinking?.choiceRaw }
+                        ?? agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    let base = devinEntry.map { $0.thinking == nil ? afterColon : $0.familyID }
+                        ?? agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
                     if let groupingEffort, seen.contains(familyKey) {
@@ -5770,7 +6409,7 @@ extension ToolOutputFormatter {
                     } else if let groupingEffort, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = agentListFamilyDisplayName(
+                        let baseName = devinEntry?.familyDisplayName ?? agentListFamilyDisplayName(
                             modelName,
                             modelID: afterColon,
                             groupingEffort: groupingEffort
@@ -5797,10 +6436,47 @@ extension ToolOutputFormatter {
                         lines.append("  `\(agentPrefix)\(family.base)-{\(effortList)}` — \(family.name)")
                     }
                 }
+                for model in models {
+                    guard let modelObject = model.objectValue,
+                          let modelID = modelObject["model_id"]?.stringValue,
+                          let parameters = modelObject["model_parameters"]?.arrayValue,
+                          !parameters.isEmpty
+                    else { continue }
+                    lines.append("  Parameters for `\(modelID)`:")
+                    for parameter in parameters {
+                        guard let parameterObject = parameter.objectValue,
+                              let configID = parameterObject["config_id"]?.stringValue,
+                              let parameterName = parameterObject["name"]?.stringValue,
+                              let choices = parameterObject["choices"]?.arrayValue
+                        else { continue }
+                        let choiceValues = choices.compactMap {
+                            $0.objectValue?["value"]?.stringValue
+                        }.joined(separator: "|")
+                        let current = parameterObject["current_value"]?.stringValue
+                        let currentSuffix = current.map { " (current: `\($0)`)" } ?? ""
+                        lines.append("    `\(configID)` — \(parameterName): `{\(choiceValues)}`\(currentSuffix)")
+                    }
+                }
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
-            lines.append("- Sessions: **\(sessions.count)**")
+            if let scope = object["scope"]?.stringValue {
+                lines.append("- Scope: `\(scope)` (not a workspace inventory)")
+            }
+            if let note = object["note"]?.stringValue {
+                lines.append("- Note: \(note)")
+            }
+            if object["scope"]?.stringValue == "spawned_by_caller" {
+                let matching = object["matching_child_count"]?.intValue ?? sessions.count
+                lines.append("- Matching child sessions: **\(matching)** · returned **\(sessions.count)**; workspace inventory not requested")
+                if let workspaceID = object["workspace_id"]?.stringValue {
+                    lines.append("- Current workspace: `\(workspaceID)`")
+                }
+            } else if object["scope"]?.stringValue == "unresolved_caller" {
+                lines.append("- Session discovery unavailable; no workspace count was determined")
+            } else {
+                lines.append("- Sessions: **\(sessions.count)**")
+            }
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }
                 let name = session["name"]?.stringValue ?? "Unnamed"
@@ -5813,6 +6489,19 @@ extension ToolOutputFormatter {
                 }
                 if !state.isEmpty { parts.append(state) }
                 if !agent.isEmpty { parts.append(agent) }
+                if rawOp == "list_pinned_sessions", let order = session["pinned_order"]?.intValue {
+                    parts.append("manual rank \(order)")
+                }
+                if let parameters = agentObject?["model_parameters"]?.arrayValue {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "\(configID)=\(value)"
+                    }
+                    if !selected.isEmpty { parts.append(selected.joined(separator: ",")) }
+                }
                 lines.append("  - \(parts.joined(separator: " · "))")
             }
         }
@@ -5829,6 +6518,22 @@ extension ToolOutputFormatter {
             lines.append("- Deleted: **\(deletedCount)** sessions")
             if skippedCount > 0 {
                 lines.append("- Skipped: **\(skippedCount)** sessions")
+            }
+            if let result = object["result"]?.stringValue { lines.append("- Result: `\(result)`") }
+            // Every item is listed, so a caller can see what was deleted, not only what failed.
+            for (key, label) in [("deleted_sessions", "deleted"), ("skipped_sessions", "skipped"), ("unprocessed_sessions", "unprocessed")] {
+                for entry in object[key]?.arrayValue ?? [] {
+                    guard let item = entry.objectValue else { continue }
+                    let id = item["session_id"]?.stringValue ?? "unknown"
+                    let name = item["name"]?.stringValue.map { " (\($0))" } ?? ""
+                    guard let code = item["code"]?.stringValue ?? item["reason"]?.stringValue else {
+                        lines.append("  - `\(id)`\(name) — \(label)")
+                        continue
+                    }
+                    let detail = item["detail"]?.stringValue ?? item["message"]?.stringValue ?? ""
+                    let next = item["next_step"]?.stringValue ?? "Inspect the session in the app."
+                    lines.append("  - `\(id)`\(name) — \(label) `\(code)`: \(detail) Next: \(next)")
+                }
             }
         }
         if let returned = object["returned_turn_count"]?.intValue,

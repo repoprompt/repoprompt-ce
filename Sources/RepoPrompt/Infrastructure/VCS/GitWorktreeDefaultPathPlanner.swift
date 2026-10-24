@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptVCS
 
 enum GitWorktreeDefaultPathPlanner {
     enum Purpose: Equatable {
@@ -17,6 +18,8 @@ enum GitWorktreeDefaultPathPlanner {
         var force: Bool
         var lockReason: String?
         var allowExternalPath: Bool
+        var cloneTrackedCheckout: Bool
+        var copyWorktreeIncludeUntrackedFiles: Bool
         var purpose: Purpose
 
         init(
@@ -29,6 +32,8 @@ enum GitWorktreeDefaultPathPlanner {
             force: Bool = false,
             lockReason: String? = nil,
             allowExternalPath: Bool = false,
+            cloneTrackedCheckout: Bool = true,
+            copyWorktreeIncludeUntrackedFiles: Bool = false,
             purpose: Purpose
         ) {
             self.mainWorktreeRoot = mainWorktreeRoot
@@ -40,6 +45,8 @@ enum GitWorktreeDefaultPathPlanner {
             self.force = force
             self.lockReason = lockReason
             self.allowExternalPath = allowExternalPath
+            self.cloneTrackedCheckout = cloneTrackedCheckout
+            self.copyWorktreeIncludeUntrackedFiles = copyWorktreeIncludeUntrackedFiles
             self.purpose = purpose
         }
     }
@@ -87,7 +94,9 @@ enum GitWorktreeDefaultPathPlanner {
             appManagedContainer: container,
             mainWorktreeRoot: mainRoot,
             knownWorktreeRoots: existingRoots,
-            copyWorktreeIncludeFiles: copyWorktreeIncludeFiles
+            copyWorktreeIncludeFiles: copyWorktreeIncludeFiles,
+            copyWorktreeIncludeUntrackedFiles: request.copyWorktreeIncludeUntrackedFiles,
+            cloneTrackedCheckout: request.cloneTrackedCheckout
         )
         return Plan(path: path, branch: branch, appManagedContainer: container, createRequest: createRequest)
     }
@@ -157,7 +166,8 @@ enum GitWorktreeDefaultPathPlanner {
     private static func uniqueDefaultPath(in container: URL, leaf: String, occupiedRoots: [URL]) -> URL {
         var candidate = container.appendingPathComponent(leaf, isDirectory: true).standardizedFileURL
         var suffix = 2
-        while pathExists(candidate) || occupiedRoots.contains(where: { samePath($0, candidate) }) {
+        let occupiedPaths = Set(occupiedRoots.map(\.standardizedFileURL.path))
+        while pathExists(candidate) || occupiedPaths.contains(candidate.path) {
             candidate = container.appendingPathComponent("\(leaf)-\(suffix)", isDirectory: true).standardizedFileURL
             suffix += 1
         }
@@ -165,9 +175,13 @@ enum GitWorktreeDefaultPathPlanner {
     }
 
     private static func standardizedExistingRoots(_ roots: [URL], mainRoot: URL) -> [URL] {
-        var result = [mainRoot.standardizedFileURL]
-        for root in roots.map({ expandTilde(in: $0).standardizedFileURL }) where !result.contains(where: { samePath($0, root) }) {
-            result.append(root)
+        let standardizedMain = mainRoot.standardizedFileURL
+        var result = [standardizedMain]
+        var seen = Set([standardizedMain.path])
+        for root in roots.map({ expandTilde(in: $0).standardizedFileURL }) {
+            if seen.insert(root.path).inserted {
+                result.append(root)
+            }
         }
         return result
     }
@@ -248,9 +262,5 @@ enum GitWorktreeDefaultPathPlanner {
         let rootComponents = root.standardizedFileURL.pathComponents
         guard pathComponents.count >= rootComponents.count else { return false }
         return Array(pathComponents.prefix(rootComponents.count)) == rootComponents
-    }
-
-    private static func samePath(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.standardizedFileURL.path == rhs.standardizedFileURL.path
     }
 }

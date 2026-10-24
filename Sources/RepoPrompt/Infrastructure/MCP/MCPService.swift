@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Logging
 import RepoPromptShared
 import SwiftUI
 
@@ -29,6 +30,8 @@ actor MCPService: Sendable {
     struct Snapshot: Equatable {
         var isRunning: Bool
         var pendingClientID: String?
+        var pendingApprovalGeneration: UInt64?
+        var pendingApprovalExecutablePath: String?
         var diagnostics: MCPDiagnostics
     }
 
@@ -38,11 +41,39 @@ actor MCPService: Sendable {
         diagnostics: MCPDiagnostics()
     )
 
-    /// Async publisher for incremental updates
-    private let updates = AsyncStream.makeStream(of: Snapshot.self)
+    /// Subscribers for state updates (one stream per subscriber).
+    /// Each subscriber receives every snapshot; a single shared `AsyncStream`
+    /// would distribute each yield to exactly one iterator, so consumers
+    /// (including view models of already-closed windows) could steal updates
+    /// meant for live windows.
+    private var stateSubscribers: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
 
-    nonisolated var stateStream: AsyncStream<Snapshot> {
-        updates.stream
+    /// Creates a new state stream for a subscriber. The current snapshot is
+    /// yielded immediately so a late subscriber does not miss state that
+    /// changed before it subscribed.
+    func subscribeToStateUpdates() -> (id: UUID, stream: AsyncStream<Snapshot>) {
+        let id = UUID()
+        var continuation: AsyncStream<Snapshot>.Continuation!
+        let stream = AsyncStream<Snapshot> { cont in
+            continuation = cont
+        }
+        stateSubscribers[id] = continuation
+        continuation.yield(state)
+        return (id, stream)
+    }
+
+    /// Unsubscribes from state updates and finishes that subscriber's stream.
+    func unsubscribeFromStateUpdates(id: UUID) {
+        if let cont = stateSubscribers.removeValue(forKey: id) {
+            cont.finish()
+        }
+    }
+
+    /// Broadcasts the current snapshot to every state subscriber.
+    private func yieldState() {
+        for (_, continuation) in stateSubscribers {
+            continuation.yield(state)
+        }
     }
 
     /// Subscribers for dashboard updates (multicast to all windows)
@@ -67,30 +98,64 @@ actor MCPService: Sendable {
         }
     }
 
-    /// Returns the latest server snapshot synchronously (callers must `await`).
-    func currentState() -> Snapshot {
-        state
-    }
-
     // ──────────────────────────────────────────────
     // MARK: - Private implementation objects
 
     /// ──────────────────────────────────────────────
-    private let controller = ServerController.shared
+    private let controller: ServerController
+    private let hostBootstrapOperation: @Sendable () async -> Void
+    private let controllerStartOperation: @Sendable () async throws -> Void
+    private let controllerFullShutdownOperation: @Sendable () async -> Void
 
-    /// Tracks which windows are participating in MCP
-    private var participatingWindows = Set<Int>()
+    private struct StartAttempt {
+        let id: UUID
+        let generation: UInt64
+        let task: Task<Void, Error>
+    }
+
+    private struct TeardownAttempt {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private enum LifecycleError: Error {
+        case startSuperseded
+    }
+
+    private var lifecycleGeneration: UInt64 = 0
+    private var activeStartAttempt: StartAttempt?
+    private var activeTeardownAttempt: TeardownAttempt?
+    private var joinedWindowIDs = Set<Int>()
+    #if DEBUG
+        private var teardownRequestCount = 0
+    #endif
 
     // ──────────────────────────────────────────────
     // MARK: - Initialization
 
     /// ──────────────────────────────────────────────
-    init() {
+    init(
+        controller: ServerController = .shared,
+        hostBootstrapOperation: @escaping @Sendable () async -> Void = {
+            // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
+            _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+        },
+        controllerStartOperation: @escaping @Sendable () async throws -> Void = {
+            try await ServerController.shared.startServer()
+        },
+        controllerFullShutdownOperation: @escaping @Sendable () async -> Void = {
+            await ServerController.shared.fullShutdown()
+        }
+    ) {
+        self.controller = controller
+        self.hostBootstrapOperation = hostBootstrapOperation
+        self.controllerStartOperation = controllerStartOperation
+        self.controllerFullShutdownOperation = controllerFullShutdownOperation
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
-            await controller.setApprovalCallback { [weak self] clientID in
-                await self?.setPendingApproval(clientID)
+            await controller.setApprovalCallback { [weak self] clientID, generation, executablePath in
+                await self?.setPendingApproval(clientID, generation: generation, executablePath: executablePath)
             }
             await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
@@ -103,55 +168,111 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     func start() async throws {
+        try await ensureTransportRunning()
+    }
+
+    private func ensureTransportRunning() async throws {
+        while let teardown = activeTeardownAttempt {
+            await teardown.task.value
+            if activeTeardownAttempt?.id == teardown.id {
+                activeTeardownAttempt = nil
+            }
+        }
+        try Task.checkCancellation()
         guard !state.isRunning else { return }
-        // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
-        _ = MCPIntegrationHelper.ensureCodexToolTimeout()
-        mcpServiceLog("Starting MCP listener")
-        await controller.startServer()
-        state.isRunning = true
-        updates.continuation.yield(state)
-    }
 
-    func stop() async {
-        guard state.isRunning else { return }
-        mcpServiceLog("Stopping MCP listener")
-        await controller.stopServer()
-        state.isRunning = false
-        updates.continuation.yield(state)
-    }
-
-    func join(windowID: Int) async throws {
-        let inserted = participatingWindows.insert(windowID).inserted
-        mcpServiceLog("Window \(windowID) joining MCP (new: \(inserted), total: \(participatingWindows.count))")
-
-        if inserted, participatingWindows.count == 1 {
-            try await start() // start() already yields
+        let attempt: StartAttempt
+        if let activeStartAttempt, activeStartAttempt.generation == lifecycleGeneration {
+            attempt = activeStartAttempt
+        } else {
+            lifecycleGeneration &+= 1
+            let generation = lifecycleGeneration
+            let bootstrap = hostBootstrapOperation
+            let operation = controllerStartOperation
+            let task = Task {
+                await bootstrap()
+                mcpServiceLog("Starting MCP listener")
+                try await operation()
+            }
+            attempt = StartAttempt(id: UUID(), generation: generation, task: task)
+            activeStartAttempt = attempt
         }
 
-        // Always re-broadcast so newly-joined windows get an up-to-date snapshot
-        updates.continuation.yield(state)
+        do {
+            try await attempt.task.value
+        } catch {
+            if activeStartAttempt?.id == attempt.id,
+               activeStartAttempt?.generation == attempt.generation,
+               lifecycleGeneration == attempt.generation
+            {
+                activeStartAttempt = nil
+                state.isRunning = false
+                yieldState()
+            }
+            throw error
+        }
+
+        guard activeStartAttempt?.id == attempt.id,
+              activeStartAttempt?.generation == attempt.generation,
+              lifecycleGeneration == attempt.generation
+        else {
+            if state.isRunning { return }
+            throw LifecycleError.startSuperseded
+        }
+
+        activeStartAttempt = nil
+        state.isRunning = true
+        yieldState()
+    }
+
+    private func performTeardown(
+        operation: @escaping @Sendable () async -> Void
+    ) async {
+        #if DEBUG
+            teardownRequestCount += 1
+        #endif
+        lifecycleGeneration &+= 1
+        let supersededStartAttempt = activeStartAttempt
+        activeStartAttempt = nil
+        supersededStartAttempt?.task.cancel()
+        state.isRunning = false
+        yieldState()
+
+        let predecessor = activeTeardownAttempt?.task
+        let task = Task {
+            await predecessor?.value
+            await operation()
+        }
+        let teardown = TeardownAttempt(id: UUID(), task: task)
+        activeTeardownAttempt = teardown
+        await task.value
+        if activeTeardownAttempt?.id == teardown.id {
+            activeTeardownAttempt = nil
+        }
+    }
+
+    /// Attach presentation state only. Process transport ownership belongs to app startup
+    /// and explicit lifecycle actions; opening a window must never resurrect a stopped server.
+    func join(windowID: Int) async {
+        joinedWindowIDs.insert(windowID)
+        mcpServiceLog("Window \(windowID) attached to process-owned MCP presentation")
+        yieldState()
     }
 
     func leave(windowID: Int) async {
-        let removed = participatingWindows.remove(windowID) != nil
-        mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
-
-        if participatingWindows.isEmpty {
-            await stop() // stop() already yields
-        }
-
-        // Broadcast even if nothing else changed so UI stays in sync
-        updates.continuation.yield(state)
+        joinedWindowIDs.remove(windowID)
+        mcpServiceLog("Window \(windowID) detached from process-owned MCP presentation")
+        yieldState()
     }
 
     /// Force a state refresh (useful when UI needs immediate update)
     func refreshState() async {
-        updates.continuation.yield(state)
+        yieldState()
     }
 
     func updateDiagnostics(_ diag: MCPDiagnostics) {
         state.diagnostics = diag
-        updates.continuation.yield(state)
+        yieldState()
     }
 
     /// Called when a client successfully connects/approves.
@@ -162,39 +283,58 @@ actor MCPService: Sendable {
             MCPExternalEventsMonitor.shared.clearEventForClient(name)
         }
         // Trigger state update so the UI refreshes the dashboard
-        updates.continuation.yield(state)
+        yieldState()
     }
 
     /// Expose enable/disable for Settings
-    func setEnabled(_ flag: Bool) async {
+    func setEnabled(_ flag: Bool) async throws {
         mcpServiceLog("Setting MCP server enabled: \(flag)")
-        await controller.setEnabled(flag)
+        try await controller.setEnabled(flag)
         // No state change for UI, so no yield necessary
     }
 
     func fullShutdown() async {
         mcpServiceLog("Performing full MCP server shutdown")
-        participatingWindows.removeAll()
-        state.isRunning = false
-        updates.continuation.yield(state)
+        await performTeardown(operation: controllerFullShutdownOperation)
+    }
 
-        await controller.fullShutdown()
-
-        // Preserve participation registered while the controller shutdown was suspended.
-        // Such a join represents a newer lifecycle and must be made ready again.
-        if !participatingWindows.isEmpty {
-            await controller.startServer()
-            state.isRunning = true
+    #if DEBUG
+        func teardownRequestCountForTesting() -> Int {
+            teardownRequestCount
         }
-        updates.continuation.yield(state)
+
+        func joinedWindowIDsForTesting() -> Set<Int> {
+            joinedWindowIDs
+        }
+
+        func stateSubscriberCountForTesting() -> Int {
+            stateSubscribers.count
+        }
+
+        /// Sets the pending-approval client and broadcasts the snapshot without
+        /// going through the controller callback, so tests can exercise the
+        /// per-subscriber state fan-out directly.
+        func setPendingApprovalForTesting(_ clientID: String?, generation: UInt64? = nil, executablePath: String? = nil) {
+            state.pendingClientID = clientID
+            state.pendingApprovalGeneration = generation
+            state.pendingApprovalExecutablePath = executablePath
+            yieldState()
+        }
+    #endif
+
+    nonisolated func captureInvocationContext(
+        toolName: String,
+        expectedWindowID: Int? = nil
+    ) throws -> ToolInvocationContext {
+        try MCPInvocationContextBridge.require(toolName: toolName, expectedWindowID: expectedWindowID)
     }
 
     func currentRequestConnectionID() async -> UUID? {
-        await ServerNetworkManager.shared.currentConnectionUUID()
+        MCPInvocationContextBridge.current?.connectionID
     }
 
     func currentRequestClientName() async -> String? {
-        await ServerNetworkManager.shared.currentClientIdentifier()
+        MCPInvocationContextBridge.current?.metadata.clientName
     }
 
     func currentRequestClientID() async -> String? {
@@ -202,11 +342,11 @@ actor MCPService: Sendable {
     }
 
     func currentRequestWindowID() async -> Int? {
-        await ServerNetworkManager.shared.currentConnectionWindowID()
+        MCPInvocationContextBridge.current?.metadata.windowID
     }
 
     func currentRequestExplicitWindowRoutingHint() -> MCPExplicitWindowRoutingHint? {
-        ServerNetworkManager.currentExplicitWindowRoutingHint
+        MCPInvocationContextBridge.current?.metadata.explicitWindowRoutingHint
     }
 
     // ──────────────────────────────────────────────
@@ -215,21 +355,29 @@ actor MCPService: Sendable {
     /// ──────────────────────────────────────────────
     /// Called by the MainActor after the alert sheet closes
     /// Runs on the actor executor – no extra Task hop required.
-    func continuePendingApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        await controller.resolvePendingApproval(
-            allow: allow,
-            alwaysAllow: alwaysAllow
-        )
-        // Clear the pending client ID and notify observers.
+    func continuePendingApproval(allow: Bool, generation: UInt64) async {
+        guard state.pendingApprovalGeneration == generation else { return }
+        // Clear before the controller activates the next queued request; clearing
+        // afterward would erase that next prompt, including a same-name peer.
+        clearPendingApproval(generation: generation)
+        await controller.resolvePendingApproval(allow: allow, generation: generation)
+    }
+
+    func clearPendingApproval(generation: UInt64) {
+        guard state.pendingApprovalGeneration == generation else { return }
         state.pendingClientID = nil
-        updates.continuation.yield(state)
+        state.pendingApprovalGeneration = nil
+        state.pendingApprovalExecutablePath = nil
+        yieldState()
     }
 
     /// Controller → Service callback - called when a new client requests approval
-    private func setPendingApproval(_ clientID: String?) {
+    private func setPendingApproval(_ clientID: String?, generation: UInt64, executablePath: String?) {
         mcpServiceLog("Setting pending approval for client: \(clientID ?? "nil")")
         state.pendingClientID = clientID
-        updates.continuation.yield(state)
+        state.pendingApprovalGeneration = generation
+        state.pendingApprovalExecutablePath = executablePath
+        yieldState()
     }
 
     // ──────────────────────────────────────────────
@@ -359,5 +507,17 @@ actor MCPService: Sendable {
         for (_, continuation) in dashboardSubscribers {
             continuation.yield(())
         }
+    }
+}
+
+/// Existing app adapter owns redacted diagnostics, not the neutral carrier.
+/// A fresh fallback is injected at ingress so a missing TaskLocal cannot suppress DEBUG evidence.
+struct MCPInvocationDiagnosticAdapter {
+    private let logger = Logger(label: "com.repoprompt.mcp.invocation")
+
+    func report(_ failure: MCPInvocationContextFailure) {
+        #if DEBUG
+            logger.error("MCP invocation adapter rejected context: \(String(describing: failure))")
+        #endif
     }
 }

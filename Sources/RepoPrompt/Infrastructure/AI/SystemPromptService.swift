@@ -1,20 +1,10 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptShared
 
 class SystemPromptService {
-    static let chatCodeFence = "```"
-
-    // MARK: - Language to Extension Mapping
-
-    private static let languageToExtension: [String: String] = [
-        "Swift": "swift", "JavaScript": "js", "TypeScript": "ts",
-        "Python": "py", "Java": "java", "C#": "cs", "C++": "cpp", "C": "c",
-        "Go": "go", "Rust": "rs", "PHP": "php", "Ruby": "rb", "Dart": "dart"
-    ]
-
-    static func fileExtension(for language: String) -> String {
-        languageToExtension[language] ?? "txt"
-    }
-
     /// Returns the Discover prompt with an optional token budget.
     /// - Parameter tokenBudget: Optional token budget for the final selection. If nil, targets 50-80k tokens.
     /// - Parameter agentKind: The agent that will execute this prompt, affects tool restriction warnings.
@@ -22,8 +12,8 @@ class SystemPromptService {
     /// - Parameter allowClarifyingQuestions: Whether the agent can use the ask_user tool to ask clarifying questions.
     /// - Parameter responseType: Optional response type for context_builder (e.g., "review" for code review context).
     /// - Parameter instructions: Optional discovery instructions, used for hidden review hotword detection in clarify mode.
-    static func discoverPrompt(tokenBudget: Int? = nil, agentKind: AgentProviderKind? = nil, enhancementMode: PromptEnhancementMode = .fullRewrite, allowClarifyingQuestions: Bool = false, responseType: String? = nil, instructions: String? = nil, questionTimeoutSeconds: TimeInterval = ContextBuilderDefaults.questionTimeoutSeconds) -> String {
-        mcpDiscoverPrompt(tokenBudget: tokenBudget, agentKind: agentKind, enhancementMode: enhancementMode, allowClarifyingQuestions: allowClarifyingQuestions, responseType: responseType, instructions: instructions, questionTimeoutSeconds: questionTimeoutSeconds)
+    static func discoverPrompt(tokenBudget: Int? = nil, agentKind: AgentProviderKind? = nil, enhancementMode: PromptEnhancementMode = .fullRewrite, allowClarifyingQuestions: Bool = false, responseType: String? = nil, instructions: String? = nil, questionTimeoutSeconds: TimeInterval = ContextBuilderDefaults.questionTimeoutSeconds, restrictsReviewGitToExplicitReadOnly: Bool = false, reviewRootNames: [String] = []) -> String {
+        mcpDiscoverPrompt(tokenBudget: tokenBudget, agentKind: agentKind, enhancementMode: enhancementMode, allowClarifyingQuestions: allowClarifyingQuestions, responseType: responseType, instructions: instructions, questionTimeoutSeconds: questionTimeoutSeconds, restrictsReviewGitToExplicitReadOnly: restrictsReviewGitToExplicitReadOnly, reviewRootNames: reviewRootNames)
     }
 
     /// MCP Discover prompt – context-first, codemap-driven discovery, selected-scope, and prompt handoff.
@@ -33,7 +23,11 @@ class SystemPromptService {
     /// - Parameter allowClarifyingQuestions: Whether the agent can use the ask_user tool to ask clarifying questions.
     /// - Parameter responseType: Optional response type for context_builder (e.g., "review" for code review context).
     /// - Parameter instructions: Optional discovery instructions, used for hidden review hotword detection in clarify mode.
-    private static func mcpDiscoverPrompt(tokenBudget: Int? = nil, agentKind: AgentProviderKind? = nil, enhancementMode: PromptEnhancementMode = .fullRewrite, allowClarifyingQuestions: Bool = false, responseType: String? = nil, instructions: String? = nil, questionTimeoutSeconds: TimeInterval = ContextBuilderDefaults.questionTimeoutSeconds) -> String {
+    /// - Parameter restrictsReviewGitToExplicitReadOnly: Whether the run has no elected review target
+    ///   (`ContextBuilderReviewTargetResolution.restrictsGitToExplicitReadOnly`), so Git artifact publication
+    ///   and implicit-repository Git calls are refused.
+    /// - Parameter reviewRootNames: Workspace root names usable as `repo_root` in the restricted guidance.
+    private static func mcpDiscoverPrompt(tokenBudget: Int? = nil, agentKind: AgentProviderKind? = nil, enhancementMode: PromptEnhancementMode = .fullRewrite, allowClarifyingQuestions: Bool = false, responseType: String? = nil, instructions: String? = nil, questionTimeoutSeconds: TimeInterval = ContextBuilderDefaults.questionTimeoutSeconds, restrictsReviewGitToExplicitReadOnly: Bool = false, reviewRootNames: [String] = []) -> String {
         // coverageLine from SyntaxManager is kept
         let coverageLine = {
             let langs = Array(Set(SyntaxManager.shared.extensionToLanguage.values)).sorted()
@@ -112,27 +106,63 @@ class SystemPromptService {
         if useReviewMode {
             print("[SystemPromptService] Review mode activated — responseType: \(normalizedResponseType ?? "nil"), instructions preview: \(instructions?.prefix(120) ?? "nil")")
         }
-        let reviewModeGuidance = useReviewMode ? """
+        let reviewModeGuidance: String
+        if !useReviewMode {
+            reviewModeGuidance = ""
+        } else if restrictsReviewGitToExplicitReadOnly {
+            // Must match MCPContextBuilderGitReviewPolicy: without an elected target, only explicit-repository,
+            // artifact-free Git reads are admitted, and final review authorization rejects selected Git artifacts.
+            let repoRootGuidance = if let exampleRoot = reviewRootNames.first {
+                """
+                Set `repo_root` to the workspace root that owns the changes (\(reviewRootNames.map { "`\($0)`" }.joined(separator: ", "))):
 
-        ## Review Mode
+                ```json
+                {"tool":"git","args":{"op":"diff","repo_root":"\(exampleRoot)","detail":"files"}}
+                {"tool":"git","args":{"op":"diff","repo_root":"\(exampleRoot)","detail":"full"}}
+                ```
+                """
+            } else {
+                "Set `repo_root` to the name of the workspace root that owns the changes, as listed by `get_file_tree` with `type` `roots`; request `detail` `files` first, then `full`."
+            }
+            reviewModeGuidance = """
 
-        You are building context for a **code review**. Use the `git` tool to understand what changed and generate diff artifacts:
+            ## Review Mode
 
-        ```json
-        {"tool":"git","args":{"op":"diff","artifacts":true}}
-        ```
+            You are building context for a **code review**. This run has no elected review repository target, so Git diff artifacts cannot be published or selected. Use the `git` tool read-only to understand what changed: always pass `repo_root` (or `repo_key`) and omit `artifacts`.
 
-        The response shows selectable paths. You **must** select the diff patches (`all.patch` or per-file patches from `diff/per-file/`) using `manage_selection`, along with source files that provide context for the changes—including files that weren't changed but are affected.
+            \(repoRootGuidance)
 
-        **Balancing context:** Aim for full source files + relevant diff artifacts. If token-constrained, you can slice both—trim source files to relevant sections and slice diff artifacts to focus on key changes. Use your judgment to maximize useful context within budget.
+            Then select the changed source files with `manage_selection`, along with files that provide context for the changes—including files that weren't changed but are affected. When the review is finalized, its package adds only the uncommitted (working tree vs `HEAD`) Git diff for selected files, not already-committed changes, so summarize the key committed changes you inspected in the handoff prompt.
 
-        **Review mode anti-patterns:**
-        - 🚫 Selecting only git artifacts without source files—the reviewer needs implementation context, not just diffs
-        - 🚫 Including all diff data but minimal source files—prioritize full file context with focused diffs
-        - 🚫 Omitting files affected by the changes just because they weren't modified
-        - 🚫 Halting without selecting any diff artifacts—the reviewer needs to see what actually changed
+            **Review mode anti-patterns:**
+            - 🚫 Calling `git` without `repo_root`/`repo_key`, or with `artifacts`—both are refused for this run
+            - 🚫 Omitting files affected by the changes just because they weren't modified
+            - 🚫 Halting without selecting the changed source files—the reviewer needs to see what changed
 
-        """ : ""
+            """
+        } else {
+            reviewModeGuidance = """
+
+            ## Review Mode
+
+            You are building context for a **code review**. Use the `git` tool to understand what changed and generate diff artifacts:
+
+            ```json
+            {"tool":"git","args":{"op":"diff","artifacts":true}}
+            ```
+
+            The response shows selectable paths. You **must** select the diff patches (`all.patch` or per-file patches from `diff/per-file/`) using `manage_selection`, along with source files that provide context for the changes—including files that weren't changed but are affected.
+
+            **Balancing context:** Aim for full source files + relevant diff artifacts. If token-constrained, you can slice both—trim source files to relevant sections and slice diff artifacts to focus on key changes. Use your judgment to maximize useful context within budget.
+
+            **Review mode anti-patterns:**
+            - 🚫 Selecting only git artifacts without source files—the reviewer needs implementation context, not just diffs
+            - 🚫 Including all diff data but minimal source files—prioritize full file context with focused diffs
+            - 🚫 Omitting files affected by the changes just because they weren't modified
+            - 🚫 Halting without selecting any diff artifacts—the reviewer needs to see what actually changed
+
+            """
+        }
 
         // Additional tool for available tools list
         let askUserTool = allowClarifyingQuestions ? ", `ask_user`" : ""
@@ -1118,11 +1148,6 @@ class SystemPromptService {
         """
     }
 
-    static func predominantLanguage(from files: [FileViewModel]) -> String {
-        let extensions = files.compactMap { $0.fileExtension?.lowercased() }
-        return predominantLanguage(fromExtensions: extensions)
-    }
-
     static func predominantLanguage(from files: [WorkspaceFileRecord]) -> String {
         let extensions = files.map { file in
             let ext = (file.name as NSString).pathExtension.lowercased()
@@ -1147,16 +1172,6 @@ class SystemPromptService {
         return map[mostCommon] ?? "Swift"
     }
 
-    /// Determines the predominant language from selected files
-    @MainActor
-    static func getPredominantLanguage(from fileManager: WorkspaceFilesViewModel) -> (language: String, fileExtension: String) {
-        let files = fileManager.selectedFiles
-        let language = predominantLanguage(from: files)
-        // Keep the old signature for backward compatibility, but the extension is derived from language
-        let ext = fileExtension(for: language)
-        return (language: language, fileExtension: ext)
-    }
-
     static func getFileRecommendationPrompt() -> String {
         """
         You are an assistant tasked with recommending relevant plain-text files from a codebase, based solely on the user's prompt, a provided file tree, and available codemaps.
@@ -1164,7 +1179,7 @@ class SystemPromptService {
         Your Inputs:
 
         - File Tree: Lists the names and paths of all files and folders in the project.
-        - Codemap: Provides brief summaries, definitions, and import statements for files with extensions: "swift", "js", "cs", "py", "c", "rs", "cpp", "go", "java", "dart", "ts", "tsx".
+        - Codemap: Provides brief summaries, definitions, and import statements for files with extensions: "swift", "js", "cs", "py", "c", "rs", "cpp", "go", "java", "ts", "tsx".
         - User Prompt: The user's exact request.
 
         How to Evaluate Relevance:

@@ -1,31 +1,49 @@
 import Foundation
+import RepoPromptProcess
+
+enum CursorAgentCommandSelection: Equatable {
+    case automatic
+    case exact(String)
+}
 
 struct CursorAgentConfig {
     static let promptOnlySessionModeID = "ask"
 
-    let commandName: String
+    let commandSelection: CursorAgentCommandSelection
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
     let modelString: String?
     let includeRepoPromptMCPServer: Bool
     let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
+    let modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override]
+
+    var commandName: String {
+        switch commandSelection {
+        case .automatic:
+            CLILaunchProfiles.cursor.commandName
+        case let .exact(commandName):
+            commandName
+        }
+    }
 
     init(
-        commandName: String = "cursor-agent",
+        commandName: String? = nil,
         additionalPathHints: [String] = CLIPathHints.cursor,
         enableDebugLogging: Bool = false,
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
         cleanupProjectMCPApproval: Bool = true,
-        sessionModeID: String? = nil
+        sessionModeID: String? = nil,
+        modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
     ) {
-        self.commandName = commandName
+        commandSelection = commandName.map(CursorAgentCommandSelection.exact) ?? .automatic
         self.additionalPathHints = additionalPathHints
         self.enableDebugLogging = enableDebugLogging
         self.modelString = modelString
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
         self.cleanupProjectMCPApproval = cleanupProjectMCPApproval
         self.sessionModeID = sessionModeID
+        self.modelOverrides = modelOverrides
     }
 }

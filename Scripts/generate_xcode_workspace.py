@@ -24,6 +24,8 @@ import tempfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
+from modularization_modules import target_dependency_names
+
 
 SCHEMA_VERSION = 1
 GENERATOR_ID = "com.repoprompt.ce.xcode-workspace-generator"
@@ -90,6 +92,24 @@ def _by_name_dependencies(target: dict) -> list[str]:
     ]
 
 
+def validate_repo_prompt_test_dependencies(target: dict, repo_root: Path) -> None:
+    catalog_path = repo_root / "Scripts/modularization/modules.json"
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        expected = set(catalog["modules"]["RepoPromptTests"]["allowed_dependencies"])
+    except (OSError, KeyError, ValueError, TypeError) as error:
+        raise GeneratorError(f"Cannot read RepoPromptTests dependency catalog: {error}") from error
+    dependency_errors: list[str] = []
+    actual = target_dependency_names(target, dependency_errors)
+    if dependency_errors:
+        raise GeneratorError(f"RepoPromptTests has malformed dependencies: {dependency_errors}")
+    if actual != expected:
+        raise GeneratorError(
+            "RepoPromptTests target dependencies differ from the modularization catalog: "
+            f"missing {sorted(expected - actual)}, unexpected {sorted(actual - expected)}"
+        )
+
+
 def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if manifest.get("name") != "RepoPromptCE":
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
@@ -112,7 +132,15 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptRegexCore",
+        "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
+        "RepoPromptWorkspaceCoreTests",
+        "RepoPromptDomainRuntimeTests",
+        "RepoPromptRegexCoreTests",
+        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
@@ -130,15 +158,6 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp"
     ]:
         raise GeneratorError("Target 'RepoPrompt' must depend only on 'RepoPromptApp'")
-    repo_prompt_unsafe_flags = [
-        setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
-        for setting in repo_prompt.get("settings", [])
-    ]
-    if any("-import-objc-header" in flags for flags in repo_prompt_unsafe_flags):
-        raise GeneratorError(
-            "Target 'RepoPrompt' must not own the RepoPromptApp Objective-C bridging header"
-        )
-
     repo_prompt_app = targets["RepoPromptApp"]
     if repo_prompt_app.get("type") != "regular":
         raise GeneratorError("Target 'RepoPromptApp' must remain an internal library target")
@@ -147,34 +166,49 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
-    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
-    repo_prompt_tests = targets["RepoPromptTests"]
+    validate_repo_prompt_test_dependencies(targets["RepoPromptTests"], repo_root)
+
+    domain_runtime = targets["RepoPromptDomainRuntime"]
+    if domain_runtime.get("type") != "regular":
+        raise GeneratorError("RepoPromptDomainRuntime must remain an internal regular target")
+    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime":
+        raise GeneratorError("RepoPromptDomainRuntime target path drifted")
+    domain_runtime_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("product")
+    }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
-        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
+        _by_name_dependencies(domain_runtime)
+        != ["RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"]
+        or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
+        or len(domain_runtime.get("dependencies", [])) != 6
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, "
+            "RepoPromptCodeMapCore, Logging, and pinned MCP"
         )
 
-    unsafe_flags: list[list[str]] = []
-    for setting in repo_prompt_app.get("settings", []):
-        value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
-        if isinstance(value, list):
-            unsafe_flags.append(value)
-    expected_header = repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
-    if not any(
-        len(flags) == 3
-        and flags[0] == "-import-objc-header"
-        and Path(flags[1]) == expected_header
-        and flags[2] == "-disable-bridging-pch"
-        for flags in unsafe_flags
-    ):
-        raise GeneratorError(
-            "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
-        )
+    domain_runtime_tests = targets["RepoPromptDomainRuntimeTests"]
+    if domain_runtime_tests.get("type") != "test":
+        raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
+    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
+        raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
+    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
+        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
+    if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
+        raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 
-    expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
+    for target in targets.values():
+        for setting in target.get("settings", []):
+            flags = setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
+            if isinstance(flags, list) and "-import-objc-header" in flags:
+                raise GeneratorError(
+                    f"Target '{target.get('name')}' must not import an Objective-C bridging header; "
+                    "expose C declarations through a C target module instead"
+                )
+
+    expected_resources = {("Fixtures", True), ("Goldens", True)}
     test_targets_with_codemap_resources = []
     for target in targets.values():
         if target.get("type") != "test":
@@ -185,9 +219,10 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         }
         if expected_resources.issubset(resources):
             test_targets_with_codemap_resources.append(target.get("name"))
-    if len(test_targets_with_codemap_resources) != 1:
+    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
         raise GeneratorError(
-            "Exactly one SwiftPM test target must copy CodeMap/Fixtures and CodeMap/Goldens"
+            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
+            "that copies Fixtures and Goldens"
         )
 
     expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
@@ -531,8 +566,8 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
-test action is not the supported test workflow because Xcode does not expose the
-`RepoPromptMCP` executable dependency as an importable test module. The vendored Sparkle
+test action is not the supported test workflow because conductor owns the sandboxed test environment the root suites
+require. The vendored Sparkle
 XCFramework also declares an omitted dSYMs directory; this generator deliberately does
 not mutate `Vendor/` to compensate. Use the convenience schemes above.
 
@@ -876,7 +911,12 @@ def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:

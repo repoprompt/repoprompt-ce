@@ -56,8 +56,10 @@ def normalize_bundle(bundle: Path) -> None:
             continue
         shutil.move(str(entry), str(resources / entry.name))
 
+    canonical_root = bundle / "Contents"
+    canonical_root.mkdir()
     for entry in list((temporary / "Contents").iterdir()):
-        shutil.move(str(entry), str(bundle / "Contents" / entry.name))
+        shutil.move(str(entry), str(canonical_root / entry.name))
     (temporary / "Contents").rmdir()
     temporary.rmdir()
 

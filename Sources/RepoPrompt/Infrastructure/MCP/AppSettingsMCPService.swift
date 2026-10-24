@@ -1,6 +1,10 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+import RepoPromptShared
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -8,6 +12,12 @@ import MCP
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
+    private static let humanOnlySettingKeys: Set<String> = [
+        "agent_mode.codex_hook_approval_strict_mode_enabled",
+        "agent_mode.codex_hook_approval_strict_mode_workspace_overrides"
+    ]
+
+    let domainRegistrationID = MCPDomainToolRegistrationID()
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
@@ -42,13 +52,14 @@ final class AppSettingsMCPService: Service {
 
                 **Selectors**: `get` accepts exactly one of `key`, `keys`, or `group`. `set` and `options` take one `key`.
 
-                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode`
+                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode` · `notifications`
 
                 **Examples**:
                 - `{"op":"list","group":"ui"}`
                 - `{"op":"get","keys":["ui.appearance_mode","ui.show_tooltips"]}`
                 - `{"op":"get","group":"file_system"}`
                 - `{"op":"set","key":"models.planning_model","value":null}`
+                - `{"op":"set","key":"models.additional_oracle_models","value":["openai/gpt-5.2","anthropic/claude-opus-4-6"]}`
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
@@ -57,10 +68,18 @@ final class AppSettingsMCPService: Service {
                 inputSchema: .object(
                     properties: [
                         "op": .string(description: "Operation.", enum: ["list", "get", "set", "options"]),
-                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]),
+                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]),
                         "key": .string(description: "Allowlisted setting key (required for set/options)."),
                         "keys": .array(description: "Multiple keys (get only).", items: .string()),
-                        "value": .anyOf([.boolean(), .integer(), .number(), .string(), .null]),
+                        "value": .anyOf([
+                            .boolean(), .integer(), .number(), .string(),
+                            .array(
+                                description: "Ordered Oracle roster additions (maximum four model identifiers).",
+                                items: .string(maxLength: OracleRosterContract.maximumModelIdentifierLength),
+                                maxItems: OracleRosterContract.maximumAdditionalCount
+                            ),
+                            .null
+                        ]),
                         "agent": .string(description: "Filter options by CLI backend."),
                         "limit": .integer(description: "Maximum options returned (1–200)."),
                         "detailed": .boolean(description: "Include descriptions and model metadata.")
@@ -171,6 +190,11 @@ final class AppSettingsMCPService: Service {
         }
         guard let rawValue = args["value"] else {
             throw MCPError.invalidParams("app_settings op='set' requires 'value'.")
+        }
+        guard !Self.humanOnlySettingKeys.contains(key) else {
+            throw MCPError.invalidParams(
+                "Setting '\(key)' is security-sensitive and can only be changed by a human in RepoPrompt Settings."
+            )
         }
 
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
@@ -313,6 +337,14 @@ final class AppSettingsMCPService: Service {
             "corrupt_unrecoverable"
         case .saveFailed:
             "save_failed"
+        case .writerBusy:
+            "settings_writer_busy"
+        case .changedOnDisk:
+            "settings_changed_on_disk"
+        case .missingOnDisk:
+            "settings_missing_on_disk"
+        case .loadFailed:
+            "settings_load_failed"
         case .automaticSchemaNormalizationFailed:
             "automatic_schema_normalization_failed"
         }
@@ -325,9 +357,17 @@ final class AppSettingsMCPService: Service {
         case .incompatibleSchema:
             "Setting was applied in memory, but globalSettings.json was written by a different or unrecognized RepoPrompt settings schema; it will not persist until the settings file is imported or recovered."
         case .corruptUnrecoverable:
-            "Setting was applied in memory, but globalSettings.json is unreadable and could not be backed up; it will not persist until the settings file is recovered."
+            "Setting was applied in memory, but globalSettings.json is unreadable or malformed and remains preserved; it will not persist until the settings file is explicitly recovered."
         case .saveFailed:
             "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
+        case .writerBusy:
+            "Setting was applied in memory, but another RepoPrompt CE process is updating settings. Retry saving after that update finishes."
+        case .changedOnDisk:
+            "Setting was applied in memory, but settings changed on disk. Reload settings in Settings before making further changes; reloading replaces unsaved in-memory changes."
+        case .missingOnDisk:
+            "Setting was applied in memory, but the settings file is missing. In Settings, explicitly save the current in-memory settings to a new file, or restore the file and reload."
+        case .loadFailed:
+            "Setting was applied in memory, but settings could not be loaded safely. Retry loading in Settings before making further changes; reloading replaces unsaved in-memory changes."
         case .automaticSchemaNormalizationFailed:
             "Setting was applied in memory, but RepoPrompt could not safely back up and normalize the existing globalSettings.json schema header; the original file is preserved and the setting will not persist until explicit recovery."
         }
@@ -417,6 +457,7 @@ private enum AppSettingValueType: String {
     case boolean
     case string
     case optionalString = "string|null"
+    case stringArray = "string[]"
     case number
 }
 
@@ -566,7 +607,7 @@ private struct AppSettingDefinition: @unchecked Sendable {
 }
 
 private enum AppSettingsMCPRegistry {
-    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]
+    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]
 
     private static let appearanceModes = ["System", "Light", "Dark"]
     private static let filePathDisplayOptions = ["Full", "Relative"]
@@ -701,6 +742,12 @@ private enum AppSettingsMCPRegistry {
             afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
+        oracleRosterSetting(
+            read: { .array($0.additionalOracleModelRaws().map(Value.string)) },
+            write: { try $0.setAdditionalOracleModelRaws(requiredStringArray(from: $1)) },
+            afterWrite: postRecommendationsDidApply,
+            candidateProvider: aiModelRawCandidates
+        ),
         boolSetting(
             key: "models.sync_chat_model_with_oracle",
             group: "models",
@@ -740,50 +787,62 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCustomPlanningPrompt(requiredString(from: $1)) }
         ),
 
-        // Context Builder agent/model selection. Uses the legacy persisted
-        // discover-agent slot only; workspace-scoped context builder fields are
-        // intentionally not exposed here.
+        // Context Builder agent/model selection only. Behavioral controls remain
+        // globally owned by the app Settings and panel UI.
         stringEnumSetting(
             key: "context_builder.agent",
             group: "context_builder",
-            description: "CLI agent used by the Context Builder MCP tool.",
-            allowedValues: AgentProviderKind.allCases.map(\.rawValue),
-            read: { .string($0.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue) },
+            description: "CLI agent used by the Context Builder MCP tool. Reads may return a saved ID outside allowed_values, which lists accepted writes.",
+            allowedValues: AgentProviderKind.allCases
+                .filter { AgentModelCatalog.AgentSelectionSurface.headless.allows($0) }
+                .map(\.rawValue),
+            read: { store in
+                let profile = store.globalAgentModelsProfile()
+                if hasUnusableSavedContextBuilderAgent(in: profile), let agentRaw = profile.contextBuilderAgentRaw {
+                    return .string(agentRaw)
+                }
+                return .string(contextBuilderAgent(in: profile).rawValue)
+            },
             write: { store, value in
                 let agentRaw = try requiredString(from: value)
                 let kind = AgentProviderKind(rawValue: agentRaw) ?? .claudeCode
-                let rememberedModelRaw = store.globalContextBuilderRememberedModelRaw(for: kind.rawValue)
-                let modelRaw = rememberedModelRaw ?? AgentModelCatalog.defaultModelRaw(for: kind)
-                store.setGlobalContextBuilderAgentSelection(
-                    agentRaw: kind.rawValue,
-                    modelRaw: modelRaw,
-                    markUserDefined: true,
-                    reason: "app_settings.context_builder.agent"
-                )
+                var profile = store.globalAgentModelsProfile()
+                profile.contextBuilderAgentRaw = kind.rawValue
+                if profile.contextBuilderModelsByAgent?[kind.rawValue] == nil {
+                    profile = profile.replacingContextBuilderModel(
+                        AgentModelCatalog.defaultModelRaw(for: kind),
+                        for: kind.rawValue
+                    )
+                }
+                store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
             },
             afterWrite: postRecommendationsDidApply
         ),
         optionalModelRawSetting(
             key: "context_builder.model",
             group: "context_builder",
-            description: "Model raw identifier used by the Context Builder MCP tool.",
+            description: "Context Builder model raw ID. Unusable saved agent: reads null; null is a no-op; non-null sets agent claudeCode.",
             read: { store in
-                let agentRaw = store.globalContextBuilderAgentSelection().agentRaw
-                return stringOrNull(agentRaw.flatMap { store.globalContextBuilderRememberedModelRaw(for: $0) })
+                let profile = store.globalAgentModelsProfile()
+                guard !hasUnusableSavedContextBuilderAgent(in: profile) else { return .null }
+                let agent = contextBuilderAgent(in: profile)
+                return stringOrNull(profile.contextBuilderModelsByAgent?[agent.rawValue])
             },
             write: { store, value in
-                let currentAgentRaw = store.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue
-                try store.setGlobalContextBuilderAgentSelection(
-                    agentRaw: currentAgentRaw,
-                    modelRaw: optionalString(from: value),
-                    markUserDefined: true,
-                    reason: "app_settings.context_builder.model"
-                )
+                var profile = store.globalAgentModelsProfile()
+                let agent = contextBuilderAgent(in: profile)
+                let modelRaw = try optionalString(from: value)
+                if modelRaw != nil, profile.contextBuilderAgentRaw != agent.rawValue {
+                    // Runtime resolution needs a usable agent as well as the model.
+                    profile.contextBuilderAgentRaw = agent.rawValue
+                }
+                let updated = profile.replacingContextBuilderModel(modelRaw, for: agent.rawValue)
+                store.setGlobalAgentModelsProfile(updated, contextBuilderWriteIntent: .userInitiated)
             },
             afterWrite: postRecommendationsDidApply,
             candidateProvider: agentModelRawCandidates,
             defaultOptionsAgent: { store in
-                store.globalContextBuilderAgentSelection().agentRaw.flatMap(AgentProviderKind.init(rawValue:))
+                contextBuilderAgent(in: store.globalAgentModelsProfile())
             }
         ),
 
@@ -807,6 +866,13 @@ private enum AppSettingsMCPRegistry {
             description: "Whether Code Maps are globally disabled. Disabling also suppresses the MCP get_code_structure tool.",
             read: { .bool($0.globalCodeMapsDisabled()) },
             write: { try $0.setCodeMapsGloballyDisabled(requiredBool(from: $1)) }
+        ),
+        boolSetting(
+            key: "code_maps.non_git_enabled",
+            group: "code_maps",
+            description: "Explicit opt-in for Code Maps in non-Git folders. Existing settings without this key remain disabled.",
+            read: { .bool($0.nonGitCodeMapsEnabled) },
+            write: { try $0.setNonGitCodeMapsEnabled(requiredBool(from: $1)) }
         ),
 
         // Agent Mode behavior. This exposes durable prompt-shaping preferences only;
@@ -833,6 +899,78 @@ private enum AppSettingsMCPRegistry {
             description: "Whether Codex Agent Mode app-server threads request Codex model reasoning summaries. Defaults off; when disabled RepoPrompt sends model_reasoning_summary=none in Codex thread/start and thread/resume config. Does not affect Chat/Oracle model preferences, reasoning effort selection, or non-Agent Mode Codex runs.",
             read: { .bool($0.codexReasoningSummariesEnabled()) },
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
+        ),
+        boolSetting(
+            key: "agent_mode.claude_usage_quota_enabled",
+            group: "agent_mode",
+            label: "Claude Run Rate-Limit Telemetry (Passive)",
+            description: "Default-off passive diagnostics: records rate-limit events reported during new first-party Claude runs. Starts no request or polling and never reads Claude credentials. This setting does NOT authorize Claude account usage reads; that requires an explicit Connect in Settings, which is not available over MCP. Does not affect routing.",
+            read: { .bool($0.claudeUsageQuotaEnabled()) },
+            write: { try $0.setClaudeUsageQuotaEnabled(requiredBool(from: $1)) },
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                ClaudeUsageQuotaRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
+        boolSetting(
+            key: "agent_mode.usage_limits_display_enabled",
+            group: "agent_mode",
+            label: "Show Usage Limits When Available",
+            description: "Presentation only: shows provider plan usage in Settings and a compact Agent Mode indicator for sources that are already enabled or connected. Does not enable any source, read credentials, or authorize account requests by itself, and never affects routing. When unset, follows the legacy Codex/Claude usage opt-ins. Quota values are not exposed over MCP.",
+            read: { .bool($0.usageLimitsDisplayEnabled()) },
+            write: { try $0.setUsageLimitsDisplayEnabled(requiredBool(from: $1)) },
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                UsageLimitsDisplayRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
+        boolSetting(
+            key: "agent_mode.codex_usage_quota_enabled",
+            group: "agent_mode",
+            label: "Codex Usage Quota (Observe-Only)",
+            description: "Opt-in, observe-only display of Codex account usage limits in Settings. Defaults off. When off, RepoPrompt starts no quota app-server client, process, subscription, or polling. This setting only controls visibility: quota readings never influence model routing, candidate selection, or Agent Mode behavior. Quota values themselves are not exposed over MCP.",
+            read: { .bool($0.codexUsageQuotaEnabled()) },
+            write: { try $0.setCodexUsageQuotaEnabled(requiredBool(from: $1)) },
+            // Persisting the flag is not the same as applying it. Without this, disabling
+            // over MCP would leave an already-visible pane observing, so the service would
+            // keep its app-server process alive until the pane happened to close. Enabling
+            // still creates no transport on its own: the service only starts once a surface
+            // actually subscribes.
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                CodexUsageQuotaRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
+        stringEnumSetting(
+            key: "agent_mode.provider_conversation_cleanup_action",
+            group: "agent_mode",
+            label: "Provider Conversation Cleanup",
+            description: "Controls best-effort provider-side Agent Mode conversation cleanup when deleting supported sessions. Archive is safer and is the default; delete asks supported providers to remove the conversation.",
+            allowedValues: ProviderConversationCleanupAction.allCases.map(\.rawValue),
+            read: { .string($0.providerConversationCleanupAction().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let action = ProviderConversationCleanupAction(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
+                }
+                store.setProviderConversationCleanupAction(action)
+            }
+        ),
+        integerEnumSetting(
+            key: "agent_mode.subagent_default_wait_seconds",
+            group: "agent_mode",
+            label: "Default Subagent Wait",
+            description: "Maximum otherwise-quiet wait for MCP subagent start, wait, and steer-and-wait operations when timeout is omitted. Shorter waits allow more frequent progress checks; longer waits reduce routine model calls.",
+            allowedValues: MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds,
+            read: { .int($0.subagentDefaultWaitSeconds()) },
+            write: { store, value in
+                let seconds = try requiredInt(from: value)
+                guard store.setSubagentDefaultWaitSeconds(seconds) else {
+                    throw MCPError.invalidParams(
+                        "Invalid value for 'agent_mode.subagent_default_wait_seconds'. Allowed values: \(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.map(String.init).joined(separator: ", "))."
+                    )
+                }
+            }
         ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
@@ -887,7 +1025,23 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setShowEmptyFolders(requiredBool(from: $1)) },
             afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.show_empty_folders")
         )
-    ] + debugDefinitions
+    ] + notificationDefinitions + debugDefinitions
+
+    /// Notification preferences. Keys, labels, and descriptions are single-sourced in
+    /// `NotificationSettingDescriptor` so the Settings pane and this surface cannot drift.
+    private static let notificationDefinitions: [AppSettingDefinition] = NotificationSettingDescriptor.all.map { descriptor in
+        boolSetting(
+            key: descriptor.appSettingsKey,
+            group: "notifications",
+            label: descriptor.label,
+            description: descriptor.description,
+            read: { .bool($0.notificationSetting(descriptor)) },
+            write: { store, value in
+                let enabled = try requiredBool(from: value)
+                store.setNotificationSetting(descriptor, enabled)
+            }
+        )
+    }
 
     #if DEBUG
         private static let debugDefinitions: [AppSettingDefinition] = [
@@ -1009,6 +1163,31 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func integerEnumSetting(
+        key: String,
+        group: String,
+        label: String? = nil,
+        description: String,
+        allowedValues: [Int],
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil
+    ) -> AppSettingDefinition {
+        let allowedValueStrings = allowedValues.map(String.init)
+        return AppSettingDefinition(
+            key: key,
+            group: group,
+            valueType: .number,
+            label: label,
+            description: description,
+            allowedValues: allowedValueStrings,
+            read: read,
+            validate: { value in try validateEnumInteger(value, key: key, allowedValues: allowedValues) },
+            write: write,
+            afterWrite: afterWrite
+        )
+    }
+
     private static func freeformStringSetting(
         key: String,
         group: String,
@@ -1055,6 +1234,38 @@ private enum AppSettingsMCPRegistry {
             validate: { value in try validateRawString(value, key: key, maxLength: maxLength, allowEmpty: allowEmpty) },
             write: write,
             afterWrite: afterWrite
+        )
+    }
+
+    private static func oracleRosterSetting(
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil,
+        candidateProvider: (@MainActor (AppSettingCandidateRequest) throws -> AppSettingCandidatesResult)? = nil
+    ) -> AppSettingDefinition {
+        let descriptor = OracleRosterSettingsDescriptor.additional
+        return AppSettingDefinition(
+            key: descriptor.key,
+            group: descriptor.group,
+            valueType: .stringArray,
+            label: "Additional Oracle Models",
+            description: descriptor.description,
+            allowedValues: nil,
+            valueFormat: "Ordered model identifiers; maximum \(OracleRosterContract.maximumAdditionalCount).",
+            read: read,
+            validate: { value in
+                guard let domainValue = DomainSettingValue(mcpValue: value) else {
+                    throw MCPError.invalidParams("\(descriptor.key) must be an array of model identifier strings.")
+                }
+                do {
+                    return try DomainAppSettingsCatalog.normalize(domainValue, for: descriptor).mcpValue
+                } catch {
+                    throw MCPError.invalidParams(error.localizedDescription)
+                }
+            },
+            write: write,
+            afterWrite: afterWrite,
+            candidateProvider: candidateProvider
         )
     }
 
@@ -1133,6 +1344,27 @@ private enum AppSettingsMCPRegistry {
             throw MCPError.invalidParams("Invalid value for '\(key)'. Allowed values: \(allowedValues.joined(separator: ", ")).")
         }
         return .string(raw)
+    }
+
+    private static func validateEnumInteger(_ value: Value, key: String, allowedValues: [Int]) throws -> Value {
+        let number: Int
+        switch value {
+        case let .int(int):
+            number = int
+        case let .double(double):
+            guard let exact = Int(exactly: double) else {
+                throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+            }
+            number = exact
+        default:
+            throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+        }
+        guard allowedValues.contains(number) else {
+            throw MCPError.invalidParams(
+                "Invalid value for '\(key)'. Allowed values: \(allowedValues.map(String.init).joined(separator: ", "))."
+            )
+        }
+        return .int(number)
     }
 
     private static func validateTrimmedString(_ value: Value, key: String, maxLength: Int, allowEmpty: Bool) throws -> Value {
@@ -1277,11 +1509,25 @@ private enum AppSettingsMCPRegistry {
         return try requiredString(from: value)
     }
 
+    private static func requiredStringArray(from value: Value) throws -> [String] {
+        guard case let .array(values) = value else {
+            throw MCPError.invalidParams("Expected normalized string-array value.")
+        }
+        return try values.map(requiredString(from:))
+    }
+
     private static func requiredDouble(from value: Value) throws -> Double {
         guard case let .double(double) = value else {
             throw MCPError.invalidParams("Expected normalized numeric value.")
         }
         return double
+    }
+
+    private static func requiredInt(from value: Value) throws -> Int {
+        guard case let .int(int) = value else {
+            throw MCPError.invalidParams("Expected normalized integer value.")
+        }
+        return int
     }
 
     private static func stringOrNull(_ value: String?) -> Value {
@@ -1316,8 +1562,14 @@ private enum AppSettingsMCPRegistry {
             .codex
         case .openCode:
             .openCode
+        case .antigravity:
+            nil
+        case .devin:
+            .devin
         case .cursor:
             .cursor
+        case .grokBuild:
+            .grokBuild
         }
     }
 
@@ -1339,6 +1591,8 @@ private enum AppSettingsMCPRegistry {
         case .codex: "codex"
         case .openCode: "openCode"
         case .cursor: "cursor"
+        case .grokBuild: "grokBuild"
+        case .devin: "devin"
         }
     }
 
@@ -1443,6 +1697,20 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func hasUnusableSavedContextBuilderAgent(in profile: AgentModelsSettingsProfile) -> Bool {
+        guard let agentRaw = profile.contextBuilderAgentRaw else { return false }
+        return contextBuilderAgent(in: profile).rawValue != agentRaw
+    }
+
+    /// Stored configuration is independent of runtime provider availability.
+    private static func contextBuilderAgent(in profile: AgentModelsSettingsProfile) -> AgentProviderKind {
+        guard let raw = profile.contextBuilderAgentRaw,
+              let agent = AgentProviderKind(rawValue: raw),
+              AgentModelCatalog.AgentSelectionSurface.headless.allows(agent)
+        else { return .claudeCode }
+        return agent
+    }
+
     /// Returns model-raw candidates for string-typed Context Builder settings using the shared
     /// `AgentModelCatalog` discovery data. Task labels such as explore/engineer/pair/design
     /// are intentionally excluded — they are higher-level `agent_run model_id` aliases and
@@ -1451,7 +1719,15 @@ private enum AppSettingsMCPRegistry {
     static func agentModelRawCandidates(
         request: AppSettingCandidateRequest
     ) throws -> AppSettingCandidatesResult {
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: request.availability)
+        // Known models remain configurable even when runtime availability has not been verified.
+        let catalogAvailability: AgentModelCatalog.AvailabilityContext = if let agent = request.agentFilter,
+                                                                            agent == .grokBuild || agent == .cursor
+        {
+            request.availability.assumingAvailable(agent)
+        } else {
+            request.availability
+        }
+        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: catalogAvailability, surface: .headless)
         let filteredAgents: [AgentModelCatalog.DiscoveryAgent] = if let agentFilter = request.agentFilter {
             discoveryAgents.filter { $0.agent == agentFilter && $0.available }
         } else {
@@ -1467,9 +1743,10 @@ private enum AppSettingsMCPRegistry {
 
         var allCandidates: [AppSettingCandidate] = []
         for discoveryAgent in filteredAgents {
+            let runtimeAvailable = AgentModelCatalog.isAgentAvailable(discoveryAgent.agent, availability: request.availability)
             for model in discoveryAgent.models {
                 for target in model.startTargets {
-                    // Only surface available runtime candidates, skip anything that would fail
+                    // Only surface known catalog candidates, skip anything that would fail
                     // the shared `set` validator, and belt-and-braces exclude reserved task
                     // labels even if a future catalog entry happens to match one.
                     guard target.available else { continue }
@@ -1482,7 +1759,7 @@ private enum AppSettingsMCPRegistry {
                     var attributes: [String: Value] = [
                         "agent": .string(discoveryAgent.agent.rawValue),
                         "agent_name": .string(discoveryAgent.agent.displayName),
-                        "available": .bool(discoveryAgent.available && target.available),
+                        "available": .bool(runtimeAvailable && target.available),
                         "is_default": .bool(target.isDefault)
                     ]
                     if request.detailed {
@@ -1516,7 +1793,7 @@ private enum AppSettingsMCPRegistry {
         let options = truncated ? Array(allCandidates.prefix(clampedLimit)) : allCandidates
 
         let notes = [
-            "These are current runtime model candidates; custom raw identifiers may still be accepted by app_settings op='set'.",
+            "These are known model identifiers, not proof that a provider is installed or signed in; custom raw identifiers may still be accepted by app_settings op='set'.",
             "Task labels such as explore/engineer/pair/design are not valid values for this setting."
         ]
 

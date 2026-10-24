@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptProcess
 
 final class CodexExecAgentProvider: HeadlessAgentProvider {
     private enum StreamRetryAction {
@@ -9,8 +11,10 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     private static let codexMCPClientID = AgentProviderKind.codexMCPClientID
 
-    private let runner: CLIProcessRunner
+    private var runner: CLIProcessRunner?
     private let config: CodexExecAgentConfig
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
     private var streamTask: Task<Void, Never>?
@@ -20,9 +24,16 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(runner: CLIProcessRunner, config: CodexExecAgentConfig) {
-        self.runner = runner
+    init(
+        config: CodexExecAgentConfig,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
+        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
+            try $0.prepareState()
+        }
+    ) {
         self.config = config
+        self.launchSnapshot = launchSnapshot
+        self.runtimeStatePreparer = runtimeStatePreparer
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Initialized provider with model: \(config.modelString ?? "default")")
         }
@@ -42,7 +53,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     static func buildCodexExecArguments(
         selectedModelString: String?,
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
-        brokenServers: Set<String>
+        brokenServers: Set<String>,
+        fullAccess: Bool = false
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
         let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
@@ -57,8 +69,6 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: nil,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false,
             multiAgentEnabled: false,
             modelReasoningSummary: nil
         )
@@ -76,13 +86,28 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         args.append(contentsOf: modelCLIArgs.configArgs)
         args.append(contentsOf: toolOverrideArgs)
         args.append(contentsOf: serverOverrideArgs)
-        args.append(contentsOf: [
-            "--json",
-            "--skip-git-repo-check",
-            "--full-auto"
-        ])
+        args.append(contentsOf: ["--json", "--skip-git-repo-check"])
+        if fullAccess {
+            args.append("--dangerously-bypass-approvals-and-sandbox")
+        } else {
+            args.append(contentsOf: ["--sandbox", "workspace-write"])
+        }
 
         return (args, modelSpecifier)
+    }
+
+    static func processConfiguration(
+        for resolution: CodexProviderHelpers.CodexExecutableResolution,
+        enableDebugLogging: Bool
+    ) -> CLIProcessConfiguration {
+        CLIProcessConfiguration(
+            command: resolution.resolvedCommand,
+            environment: resolution.environmentOverrides,
+            enableDebugLogging: enableDebugLogging,
+            captureStdoutTailBytes: 128 * 1024,
+            captureStderrTailBytes: 256 * 1024,
+            logStdinSampleBytes: 0
+        )
     }
 
     // MARK: - HeadlessAgentProvider
@@ -92,6 +117,34 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Preparing context for run \(actualRunID)")
         }
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: enableDebugLogging,
+            launchSnapshot: launchSnapshot
+        )
+        if enableDebugLogging {
+            print("[DEBUG] CodexExec: \(resolution.debugMessage)")
+        }
+        guard resolution.status == .available,
+              let runtime = resolution.runtime
+        else {
+            throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
+        }
+        do {
+            try runtimeStatePreparer(runtime)
+        } catch {
+            throw AIProviderError.invalidConfiguration(
+                detail: "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
+            )
+        }
+
+        var processConfig = Self.processConfiguration(
+            for: resolution,
+            enableDebugLogging: enableDebugLogging
+        )
+        processConfig.ensureAdditionalPaths(config.additionalPathHints)
+        runner = CLIProcessRunner(config: processConfig)
 
         // Verify MCP server is running
         if enableDebugLogging {
@@ -108,18 +161,20 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Ensuring Codex MCP server entry")
         }
-        let (ensureSuccess, wasAlreadyPresent) = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        guard ensureSuccess else {
-            throw AIProviderError.invalidConfiguration(detail: "Failed to install RepoPrompt MCP config for Codex CLI.")
+        let ensureResult = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+        guard ensureResult.success else {
+            throw AIProviderError.invalidConfiguration(
+                detail: ensureResult.errorMessage ?? "Failed to install RepoPrompt MCP config for Codex."
+            )
         }
         if enableDebugLogging {
-            print("[DEBUG] CodexExec: MCP server ensured (wasAlreadyPresent: \(wasAlreadyPresent))")
+            print("[DEBUG] CodexExec: MCP server ensured (wasAlreadyPresent: \(ensureResult.wasAlreadyPresent))")
         }
 
         return HeadlessAgentContext(
             runID: actualRunID,
             configURL: nil,
-            environment: ProcessInfo.processInfo.environment
+            environment: ProcessInfo.processInfo.environment.merging(runtime.statePaths.environment) { _, ownedValue in ownedValue }
         )
     }
 
@@ -158,6 +213,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                             }
 
                             let context = try await self.prepare(runID: runID)
+                            guard let runner = self.runner else {
+                                throw AIProviderError.invalidConfiguration(detail: "RepoPrompt could not initialize the Codex runtime.")
+                            }
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.cleanup(context: context)
                             }) {
@@ -176,7 +234,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                 let command = Self.buildCodexExecArguments(
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
-                                    brokenServers: brokenServers
+                                    brokenServers: brokenServers,
+                                    fullAccess: config.fullAccess
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier
@@ -203,7 +262,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
                                 // Register tool observer with cleanup
                                 try await AsyncScope.withCleanup({}, cleanup: {
-                                    await self.runner.cancelAll()
+                                    await runner.cancelAll()
                                     await self.toolTracking.stopTracking()
                                 }) {
                                     if self.enableDebugLogging {
@@ -221,7 +280,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     }
 
                                     let expectedPIDRunID = context.runID
-                                    let stream = try await self.runner.runStreaming(
+                                    let stream = try await runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,
                                         outputMode: .none,
@@ -318,7 +377,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                         if self.enableDebugLogging {
                                             print("[DEBUG] CodexExec: Completion seen; cancelling runner to close pipes.")
                                         }
-                                        await self.runner.cancelAll()
+                                        await runner.cancelAll()
                                     }
 
                                     // Process any trailing data without newline
@@ -462,7 +521,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                     }
                     Task { [weak self] in
                         // Kill the child aggressively, then ensure our outer stream ends.
-                        await self?.runner.cancelAll()
+                        await self?.runner?.cancelAll()
                         continuation.finish()
                     }
                 })
@@ -479,7 +538,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             print("[DEBUG] CodexExec: Disposing provider, cancelling stream task & runners")
         }
         streamTask?.cancel()
-        await runner.cancelAll()
+        await runner?.cancelAll()
     }
 
     func extractUserMessage(from aiMessage: AIMessage) -> String {
@@ -922,10 +981,12 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
         let lower = stderr.lowercased()
         if lower.contains("command not found") || lower.contains("no such file") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI not found. Install it and ensure it is available on PATH.")
+            return AIProviderError.invalidConfiguration(
+                detail: "The selected Codex runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
+            )
         }
         if lower.contains("not authenticated") || lower.contains("unauthorized") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI not authenticated. Run `codex login` in a terminal and try again.")
+            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait and try again.")

@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptVCS
 
 struct WorkspaceGitDiffArtifactSelectionMergeResult: Equatable {
     let selection: StoredSelection
@@ -322,14 +324,19 @@ extension MCPServerViewModel {
         rawPaths: [String],
         strict _: Bool,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> (StoredSelection, [String], Bool) {
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool, validCandidateCount: Int) {
         let result = await mcpSelectionMutationService().promotePaths(
             existing: existing,
             paths: paths,
             rawPaths: rawPaths,
             rootScope: lookupRootScope
         )
-        return (result.selection, result.invalidPaths, result.mutated)
+        return (
+            result.selection,
+            result.invalidPaths,
+            result.mutated,
+            result.validCandidateCount
+        )
     }
 
     /// Result of demoting paths to codemap mode
@@ -338,6 +345,7 @@ extension MCPServerViewModel {
         let invalidPaths: [String]
         let codemapUnavailable: [String]
         let mutated: Bool
+        let validCandidateCount: Int
     }
 
     @MainActor
@@ -358,7 +366,8 @@ extension MCPServerViewModel {
             selection: result.selection,
             invalidPaths: result.invalidPaths,
             codemapUnavailable: result.codemapUnavailable,
-            mutated: result.mutated
+            mutated: result.mutated,
+            validCandidateCount: result.validCandidateCount
         )
     }
 }
