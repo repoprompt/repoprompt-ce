@@ -20229,7 +20229,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -20284,7 +20284,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -21804,7 +21804,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            initialUserItemID: directStartOptions.initialUserItemID
         )
     }
 

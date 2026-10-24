@@ -187,6 +187,7 @@ actor MCPBootstrapLease {
     private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?
+    private var policyReinstallOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
     #if DEBUG
         // Test-only observability for the join probe (see debugWaitForPolicyClearJoiner()).
@@ -390,13 +391,17 @@ actor MCPBootstrapLease {
     /// installer collapses any unreserved pending policy for this run, so at most one stays queued.
     ///
     /// Valid only between a successful `acquire()` and any release or cleanup; returns `false`
-    /// otherwise, or when an expected-PID policy could not be re-armed. A policy installed while a
-    /// concurrent cleanup was in flight is left to be collapsed by the run's next install or pruned
-    /// by its TTL, exactly as after `cancelAndCleanup(preservingCommittedRoute: true)`.
+    /// otherwise, or when an expected-PID policy could not be re-armed. Full cleanup joins an
+    /// in-flight installation before its final revoke, so a replacement policy cannot outlive Stop.
     func reinstallPolicyForReplacementProcess() async -> Bool {
-        guard hasAcquired, !shouldAbortAcquire else { return false }
+        guard hasAcquired, !shouldAbortAcquire,
+              policyReinstallOperation == nil, policyClearOperation == nil
+        else { return false }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) reinstalling connection policy for a replacement provider process")
-        await policyInstaller(spec)
+        let operation = Task { await self.policyInstaller(self.spec) }
+        policyReinstallOperation = operation
+        await operation.value
+        policyReinstallOperation = nil
         policyInstalled = true
         guard !shouldAbortAcquire else { return false }
         if spec.requiresExpectedAgentPID {
@@ -657,7 +662,11 @@ actor MCPBootstrapLease {
             return
         }
         guard ownsState else { return }
-        let operation = Task { await self.policyClearer(self.spec) }
+        let reinstall = policyReinstallOperation
+        let operation = Task {
+            await reinstall?.value
+            await self.policyClearer(self.spec)
+        }
         policyClearOperation = operation
         await operation.value
     }

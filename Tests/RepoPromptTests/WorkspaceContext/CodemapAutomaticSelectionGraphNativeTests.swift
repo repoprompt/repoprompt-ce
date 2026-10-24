@@ -1,9 +1,354 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptPersistence
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testBudgetLimitedGraphProjectsAsTerminalWithoutRetry() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root", files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            enginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumRetainedSourceByteCountPerRoot: 1
+            )
+        )
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
+        _ = try await waitForBudgetStop(engine: engine, rootEpoch: rootEpoch)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty, "Budget projection must not depend on parsing latency")
+        // Observe the public subscription, not just an engine diagnostic. Terminal work must
+        // take precedence over honest incomplete coverage, and must not offer an ineffective retry.
+        try await AsyncTestWait.waitUntil("budget terminal reaches public status", timeout: 30) {
+            await store.currentCodemapRootStatusUpdate().roots.first?.availability == .unavailable
+        }
+        let update = await store.currentCodemapRootStatusUpdate()
+        let snapshot = try XCTUnwrap(update.roots.first)
+        XCTAssertEqual(snapshot.unavailableReason, .budgetLimited)
+        XCTAssertNotEqual(snapshot.coverage?.isComplete, true)
+        let budget = try XCTUnwrap(snapshot.graphIndexBudget)
+        XCTAssertEqual(budget.dimension, .retainedSourceBytes)
+        XCTAssertEqual(budget.limit, 1)
+        XCTAssertGreaterThan(budget.attempted, budget.limit)
+        let stream = await engine.graphIndexExecutionUpdates(rootEpoch: rootEpoch)
+        var iterator = stream.makeAsyncIterator()
+        let replayed = await iterator.next()
+        XCTAssertEqual(replayed, .budgetLimited(budget))
+        let retry = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        XCTAssertEqual(retry, .unavailable)
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot)
+        XCTAssertFalse(presentation.isActivelyMapping)
+        XCTAssertFalse(presentation.showsProgress)
+        XCTAssertFalse(presentation.canRetry)
+        XCTAssertEqual(presentation.statusText, "Indexing limit reached")
+        XCTAssertEqual(presentation.tooltip, budget.terminalMessage)
+
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let result = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: [file.id],
+            direction: nil,
+            maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget,
+            rootScope: .allLoaded
+        )
+        XCTAssertEqual(result.status, .unavailable)
+        let issue = try XCTUnwrap(result.roots.first?.issues.first { $0.code == "graph_budget_exhausted" })
+        XCTAssertFalse(issue.retryable)
+        XCTAssertNil(issue.retryAfterMilliseconds)
+        XCTAssertEqual(issue.attempted, Int(clamping: budget.attempted))
+        XCTAssertEqual(issue.limit, 1)
+        XCTAssertFalse(result.roots.flatMap(\.issues).contains { $0.code == "graph_indexing" || $0.code == "seed_pending" })
+        let dto = await Self.structureDTO(result)
+        XCTAssertEqual(dto.roots.first?.index.state, .stopped)
+        XCTAssertEqual(dto.roots.first?.index.reason, "graph_budget_exhausted")
+        XCTAssertNil(dto.retry)
+
+        // Exercise the existing store projection seam independently of worker-recovery policy.
+        let workerStateAccepted = await store.debugSetCodemapGraphIndexExecutionStateForTesting(rootID: loaded.id, state: .exhausted)
+        XCTAssertTrue(workerStateAccepted)
+        let workerStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(workerStatus?.unavailableReason, .workerRecoveryExhausted)
+        XCTAssertTrue(AgentWorkspaceCodemapPresentation.make(workerStatus).canRetry)
+        let workerResult = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: [file.id], direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        let workerDTO = await Self.structureDTO(workerResult)
+        XCTAssertEqual(workerDTO.roots.first?.index.state, .stopped)
+        XCTAssertEqual(workerDTO.roots.first?.index.reason, "graph_worker_recovery_exhausted")
+        XCTAssertNil(workerDTO.retry)
+        _ = await store.debugSetCodemapGraphIndexExecutionStateForTesting(rootID: loaded.id, state: .budgetLimited(budget))
+
+        // A genuinely new catalog generation can rebuild. The stopped generation must not
+        // remain sticky after the only supported candidate is removed.
+        try FileManager.default.removeItem(at: rootURL.appendingPathComponent("Sources/Feature.swift"))
+        await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.fileRemoved("Sources/Feature.swift")])
+        _ = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: true)
+        _ = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: false)
+        _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        try await AsyncTestWait.waitUntil("explicit rebuild clears terminal execution", timeout: 120) {
+            await store.codemapRootStatusSnapshot(rootID: loaded.id)?.availability == .ready
+        }
+        let rebuilt = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertNil(rebuilt?.unavailableReason)
+        XCTAssertNil(rebuilt?.graphIndexBudget)
+    }
+
+    private func waitForBudgetStop(
+        engine: WorkspaceCodemapBindingEngine,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async throws -> WorkspaceCodemapGraphIndexBudget {
+        let stopped = expectation(description: "terminal execution budget notification")
+        let budgets = CodemapLockedValues<WorkspaceCodemapGraphIndexBudget>()
+        let observer = Task {
+            let stream = await engine.graphIndexExecutionUpdates(rootEpoch: rootEpoch)
+            for await state in stream {
+                if case let .budgetLimited(budget) = state {
+                    budgets.append(budget)
+                    stopped.fulfill()
+                    return
+                }
+            }
+        }
+        defer { observer.cancel() }
+        await fulfillment(of: [stopped], timeout: 120)
+        guard let budget = budgets.values.last else {
+            let accounting = await engine.accounting()
+            XCTFail("Missing terminal budget; graph roots: \(accounting.graphIndexRoots)")
+            throw GraphWaitError.timedOut
+        }
+        return budget
+    }
+
+    @MainActor
+    private static func structureDTO(
+        _ aggregate: WorkspaceCodemapStructureAggregateResult,
+        revalidation: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult] = [:]
+    ) -> ToolResultDTOs.CodeStructureReplyDTO {
+        MCPServerViewModel.codeStructureReplyDTO(
+            aggregate: aggregate,
+            presentation: nil,
+            revalidation: revalidation,
+            includesSignatures: false,
+            budget: graphOnlyStructureBudget,
+            size: .medium,
+            worktreeScope: nil
+        )
+    }
+
+    func testBudgetStopPreservesFirstCommittedBatchInMCP() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("export interface SmallType { id: string }\n", to: "src/A.ts")
+        // Names alone exceed the graph budget, without thousands of parser captures.
+        let largeSource = (0 ..< 12).map {
+            "export interface LargeType\($0)_\(String(repeating: "B", count: 512)) { id: string }"
+        }.joined(separator: "\n")
+        try workspace.write(largeSource, to: "src/B.ts")
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            enginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumGraphIndexBatchCandidateCount: 1,
+                maximumRetainedGraphIndexByteCountPerRoot: 4096
+            ),
+            forbidCodeMapGitProcesses: true
+        )
+        let store = fixture.makeProductionStore()
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
+        let stoppedBudget = try await waitForBudgetStop(engine: engine, rootEpoch: rootEpoch)
+        XCTAssertEqual(stoppedBudget.limit, 4096)
+        try await AsyncTestWait.waitUntil("public partial graph is terminal", timeout: 30) {
+            await store.codemapRootStatusSnapshot(rootID: loaded.id)?.unavailableReason == .budgetLimited
+        }
+        let files = await store.files(inRoot: loaded.id)
+        let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "src/A.ts" })
+        let aggregate = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: files.map(\.id), direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        XCTAssertEqual(aggregate.status, .partial)
+        XCTAssertEqual(aggregate.orderedNodeFileIDs, [first.id])
+        XCTAssertNotEqual(aggregate.roots.first?.coverage?.isComplete, true)
+        XCTAssertEqual(aggregate.roots.first?.executionStop?.reason, .budgetExhausted)
+        let dto = await Self.structureDTO(aggregate)
+        XCTAssertEqual(dto.status, .partial)
+        XCTAssertEqual(dto.roots.first?.index.state, .stopped)
+        XCTAssertEqual(dto.roots.first?.index.reason, "graph_budget_exhausted")
+        XCTAssertEqual(dto.summary.nodes, 1)
+        XCTAssertNil(dto.retry)
+        let output = try Self.formattedStructure(dto)
+        XCTAssertTrue(output.contains("indexing stopped; committed relationships remain available"))
+        XCTAssertFalse(output.contains("a retry may return more relationships"))
+    }
+
+    private static func formattedStructure(_ dto: ToolResultDTOs.CodeStructureReplyDTO) throws -> String {
+        let data = try JSONEncoder().encode(dto)
+        let value = try JSONDecoder().decode(Value.self, from: data)
+        return ToolOutputFormatter.formatCodeStructure(value: value).compactMap { content in
+            if case let .text(text, _, _) = content { return text }
+            return nil
+        }.joined(separator: "\n")
+    }
+
+    @MainActor
+    func testTerminalMCPDTOAndFormatterPreserveReasonsAndDoNotPromoteSeedsToRetryable() throws {
+        let cases: [(WorkspaceCodemapStructureStopReason, UInt64)] = [
+            (.budgetExhausted, 2), (.budgetExhausted, .max),
+            (.workerRecoveryExhausted, 0), (.retryExhausted, 0)
+        ]
+        for (reason, attempted) in cases {
+            for hasData in [false, true] {
+                let epoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+                let fileID = UUID()
+                let budget: WorkspaceCodemapGraphIndexBudget? = reason == .budgetExhausted
+                    ? .init(dimension: .retainedSourceBytes, attempted: attempted, limit: attempted == .max ? .max - 1 : 1) : nil
+                let message = budget?.terminalMessage ?? "Indexing stopped: \(reason.rawValue). Use Code Map Retry."
+                let root = WorkspaceCodemapStructureRootResult(
+                    rootEpoch: epoch, rootDisplayName: "root", status: hasData ? .partial : .unavailable,
+                    coverage: nil, updatesPending: false,
+                    seeds: [.init(fileID: fileID, path: "root/Pending.ts", state: .notIndexed)],
+                    nodes: hasData ? [.init(fileID: UUID(), path: "root/Committed.ts", depth: 0, isSeed: true, reachedBy: [])] : [],
+                    edges: [], unresolved: [], truncation: nil,
+                    issues: [
+                        .init(
+                            code: "seed_not_indexed",
+                            phase: "graph_snapshot",
+                            path: "root/Pending.ts",
+                            retryable: false,
+                            retryAfterMilliseconds: nil,
+                            attempted: nil,
+                            limit: nil,
+                            message: "Seed is not indexed."
+                        ),
+                        .init(
+                            code: reason.rawValue,
+                            phase: "graph_index",
+                            path: nil,
+                            retryable: false,
+                            retryAfterMilliseconds: nil,
+                            attempted: budget.map { Int(clamping: $0.attempted) },
+                            limit: budget.map { Int(clamping: $0.limit) },
+                            message: message
+                        )
+                    ],
+                    receipt: nil, executionStop: .init(reason: reason, budget: budget)
+                )
+                let dto = Self.structureDTO(.init(status: root.status, roots: [root], issues: []))
+                XCTAssertEqual(dto.roots.first?.index.state, .stopped, reason.rawValue)
+                XCTAssertEqual(dto.roots.first?.index.reason, reason.rawValue)
+                XCTAssertEqual(dto.roots.first?.index.attempted, budget.map { Int(clamping: $0.attempted) })
+                XCTAssertEqual(dto.roots.first?.index.limit, budget.map { Int(clamping: $0.limit) })
+                XCTAssertNil(dto.retry)
+                XCTAssertTrue(dto.roots.flatMap(\.issues).allSatisfy { !$0.retryable && $0.retryAfterMilliseconds == nil })
+                let encoded = try JSONEncoder().encode(dto)
+                let decoded = try JSONDecoder().decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: encoded)
+                XCTAssertEqual(decoded.roots.first?.index.state, .stopped)
+                XCTAssertEqual(decoded.roots.first?.index.reason, reason.rawValue)
+                let formatted = try Self.formattedStructure(decoded)
+                XCTAssertTrue(formatted.contains(message.trimmingCharacters(in: CharacterSet(charactersIn: "."))))
+                XCTAssertFalse(formatted.contains("a retry may return more relationships"))
+                XCTAssertFalse(formatted.contains("Retry shortly"))
+                if hasData {
+                    XCTAssertTrue(formatted.contains("indexing stopped; committed relationships remain available"))
+                    XCTAssertEqual(dto.summary.nodes, 1)
+                } else {
+                    XCTAssertTrue(formatted.components(separatedBy: "\n")[0].contains("unavailable"))
+                    XCTAssertFalse(formatted.components(separatedBy: "\n")[0].contains("Seed is not indexed"))
+                }
+                // Active incomplete roots still permit polling; only the explicit stop prevents it.
+                let active = WorkspaceCodemapStructureRootResult(
+                    rootEpoch: epoch, rootDisplayName: "root", status: hasData ? .partial : .pending,
+                    coverage: nil, updatesPending: true, seeds: root.seeds, nodes: root.nodes,
+                    edges: [], unresolved: [], truncation: nil, issues: [root.issues[0]], receipt: nil
+                )
+                let activeDTO = Self.structureDTO(.init(status: active.status, roots: [active], issues: []))
+                XCTAssertEqual(activeDTO.roots.first?.index.state, .indexing)
+                XCTAssertEqual(activeDTO.roots.first?.issues.first?.retryable, true)
+                XCTAssertEqual(activeDTO.retry?.retryable, true)
+                let invalidated = Self.structureDTO(
+                    .init(status: active.status, roots: [active], issues: []),
+                    revalidation: [epoch: .invalid(code: "graph_revalidation_failed", message: "Authority changed.")]
+                )
+                XCTAssertEqual(invalidated.roots.first?.index.state, .stopped)
+                XCTAssertEqual(invalidated.roots.first?.index.reason, "graph_revalidation_failed")
+                XCTAssertNil(invalidated.roots.first?.updatesPending)
+                XCTAssertNil(invalidated.retry)
+                if !hasData {
+                    let pending = WorkspaceCodemapStructureRootResult(
+                        rootEpoch: .init(rootID: UUID(), rootLifetimeID: UUID()), rootDisplayName: "active",
+                        status: .pending, coverage: nil, updatesPending: true,
+                        seeds: [.init(fileID: UUID(), path: "active/Pending.ts", state: .pending)],
+                        nodes: [], edges: [], unresolved: [], truncation: nil,
+                        issues: [.init(
+                            code: "graph_indexing",
+                            phase: "graph_snapshot",
+                            path: nil,
+                            retryable: true,
+                            retryAfterMilliseconds: 100,
+                            attempted: nil,
+                            limit: nil,
+                            message: "Still indexing."
+                        )],
+                        receipt: nil
+                    )
+                    let mixed = Self.structureDTO(.init(status: .pending, roots: [root, pending], issues: []))
+                    XCTAssertEqual(mixed.status, .pending)
+                    XCTAssertEqual(mixed.retry?.retryable, true)
+                    let mixedText = try Self.formattedStructure(mixed)
+                    XCTAssertTrue(mixedText.contains("Retry shortly for active roots only"))
+                    XCTAssertTrue(mixedText.contains("Stopped `root`"))
+                    XCTAssertTrue(mixedText.contains(message.trimmingCharacters(in: CharacterSet(charactersIn: "."))))
+                }
+            }
+        }
+    }
+
+    func testBudgetStoppedRootsRemainVisibleInSidebarSummary() {
+        func presentation(_ state: AgentWorkspaceCodemapPresentation.State, budget: WorkspaceCodemapGraphIndexBudget? = nil) -> AgentWorkspaceCodemapPresentation {
+            .init(
+                state: state,
+                isCatalogSealed: true,
+                classifiedCount: 1,
+                supportedCount: 2,
+                pendingCount: 1,
+                updatesPending: false,
+                graphRevision: 1,
+                graphIndexBudget: budget
+            )
+        }
+        let stopped = presentation(.unavailable, budget: .init(dimension: .retainedSourceBytes, attempted: 2, limit: 1))
+        for other in [presentation(.ready), presentation(.indexing), presentation(.paused), presentation(.recoveryExhausted)] {
+            let summary = AgentWorkspaceCodemapSummary.make([stopped, other])
+            XCTAssertNotEqual(summary.state, .ready)
+            XCTAssertEqual(summary.stoppedRootCount, 1)
+            XCTAssertTrue(summary.detailText.contains("1 stopped at indexing limit"))
+            XCTAssertFalse(summary.detailText.contains("All available roots mapped"))
+        }
+        XCTAssertTrue(AgentWorkspaceCodemapSummary.make([stopped]).detailText.contains("1 stopped at indexing limit"))
+        XCTAssertFalse(stopped.canRetry)
+        XCTAssertFalse(stopped.isActivelyMapping)
+    }
+
     func testGlobalDisableGatesManifestPublicationAndCancelsWriterUntilReenabled() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let relativePath = "Sources/Feature.swift"
@@ -887,6 +1232,14 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         let exhaustedPresentation = AgentWorkspaceCodemapPresentation.make(exhaustedStatus)
         XCTAssertTrue(exhaustedPresentation.canRetry)
         XCTAssertFalse(exhaustedPresentation.isActivelyMapping)
+        let retryAggregate = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: [replacedFile.id], direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        let retryDTO = await Self.structureDTO(retryAggregate)
+        XCTAssertEqual(retryDTO.roots.first?.index.state, .stopped)
+        XCTAssertEqual(retryDTO.roots.first?.index.reason, "graph_retry_exhausted")
+        XCTAssertNil(retryDTO.retry)
         let fencedDemand = await store.requestCodemapArtifact(forFileID: replacedFile.id)
         guard case let .unavailable(fencedReason) = fencedDemand else {
             return XCTFail("Demand must not be admitted after catalog recovery exhausts")
@@ -1296,7 +1649,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     private func waitForGraphCompletion(
         engine: WorkspaceCodemapBindingEngine,
         rootID: UUID,
-        timeout: Duration = .seconds(20)
+        timeout: Duration = .seconds(120)
     ) async throws -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)

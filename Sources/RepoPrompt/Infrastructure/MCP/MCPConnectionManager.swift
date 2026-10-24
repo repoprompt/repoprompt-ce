@@ -5430,6 +5430,9 @@ actor ServerNetworkManager {
             pendingPoliciesByClient[key]?.removeAll { $0.runID == runID }
             if pendingPoliciesByClient[key]?.isEmpty == true { pendingPoliciesByClient.removeValue(forKey: key) }
         }
+        // Mapping cleanup signals asynchronously. Bind that signal to the retiring waiter before
+        // any successor can register the same process run; an unqualified late signal could fail it.
+        let routingWaitGeneration = await MCPRoutingWaiter.generation(runID: runID)
         await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
@@ -5452,7 +5455,11 @@ actor ServerNetworkManager {
             }
             for window in windows {
                 if let connectionID = window.mcpServer.connectionID(forRunID: runID) {
-                    window.mcpServer.cleanupRunIDMapping(runID: runID, connectionID: connectionID)
+                    window.mcpServer.cleanupRunIDMapping(
+                        runID: runID, connectionID: connectionID,
+                        signalRoutingFailure: routingWaitGeneration != nil,
+                        routingWaitGeneration: routingWaitGeneration
+                    )
                     connectionLog("Cleaned up runID mapping for runID \(runID) in window \(window.windowID)")
                 }
             }
@@ -11985,6 +11992,10 @@ actor ServerNetworkManager {
 
         func debugRunCatalogWaiterCount(for runID: UUID) -> Int {
             runCatalogWaitersByRunID[runID]?.count ?? 0
+        }
+
+        func debugRunRouteChangeWaiterCount(for runID: UUID) -> Int {
+            runRouteChangeWaitersByRunID[runID]?.count ?? 0
         }
 
         func debugPublishRunCatalogObservation(

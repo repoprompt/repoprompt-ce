@@ -1058,9 +1058,9 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
-        // A control command acts only on the conversation it was admitted for and never interrupts.
-        // A rebind, a fresh-start fallback after a failed resume (whose staged recovery handoff stays
-        // for the next ordinary turn), or a turn in flight all refuse it.
+        /// A control command acts only on the conversation it was admitted for and never interrupts.
+        /// A rebind, a fresh-start fallback after a failed resume (whose staged recovery handoff stays
+        /// for the next ordinary turn), or a turn in flight all refuse it.
         func controlCommandRefusal(
             _ command: AgentProviderControlCommand,
             controller: any NativeAgentRuntimeControlling
@@ -1100,9 +1100,9 @@ final class ClaudeAgentModeCoordinator {
             }
             return nil
         }
-        // The same refusal is reachable from three predicates that fail for different reasons and
-        // are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
-        // names the branch; it carries no identifiers or user content.
+        /// The same refusal is reachable from three predicates that fail for different reasons and
+        /// are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
+        /// names the branch; it carries no identifiers or user content.
         func routeVerificationFailure(_ code: String) -> String {
             "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. \(Self.routeVerificationFailureMarkerPrefix)\(code)]"
         }

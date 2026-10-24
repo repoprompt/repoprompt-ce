@@ -86,7 +86,8 @@ final class ClaudeIntegratedAgentModeRunner {
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
@@ -160,10 +161,10 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
-        // The user row this ordinary run carries, if any. The host re-verifies it is still the
-        // trailing, never-answered row before withdrawing it after a route refusal.
-        let initialUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
-            ? session.items.last(where: { $0.kind == .user })?.id
+        // Only the producer can identify its newly appended row. An Auto-wake can follow an
+        // unanswered historical user row, so even a trailing-row check cannot establish ownership.
+        let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
+            ? initialUserItemID
             : nil
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
@@ -326,11 +327,11 @@ final class ClaudeIntegratedAgentModeRunner {
                     // sent. Mirror Codex: withdraw the unsent row and hand the text back for a resend.
                     if outcome.kind == .failed, !didSendToProvider,
                        routeRefusalMessage != nil,
-                       let initialUserItemID
+                       let rollbackUserItemID
                     {
                         self.hooks.queuedWorkRecovery.restoreRouteRefusedUnsentTurn(
                             session,
-                            initialUserItemID,
+                            rollbackUserItemID,
                             "\(session.selectedAgent.displayName) did not send because the RepoPrompt MCP route could not be verified. Your message was restored."
                         )
                     }
@@ -345,7 +346,8 @@ final class ClaudeIntegratedAgentModeRunner {
     /// layered over the app env), so `CLAUDE_CONFIG_DIR` set only in a shell profile counts.
     private static func claudeRunUsageProfileID() async -> String {
         let environment = await ProcessEnvironmentBuilder.build(ProcessEnvironmentRequest(purpose: .claudeNative)).environment
-        return ClaudeUsageCredentialProfile.current(environment: environment).id
+        let filtered = await ProviderEnvironmentFiltering.filter(environment, for: .claudeCode)
+        return ClaudeUsageCredentialProfile.current(environment: filtered).id
     }
 
     private func consumeEvents(

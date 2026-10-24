@@ -143,6 +143,19 @@ from pathlib import Path
 args = sys.argv[1:]
 state = json.loads(Path(os.environ["PUBLISHER_STUB_STATE"]).read_text(encoding="utf-8"))
 asset_dir = Path(os.environ["PUBLISHER_ASSET_DIR"])
+# Inspect the actual argv before decoding the private config for fixture auth.
+for token_name in ("TIP_GH_TOKEN", "TIP_SOURCE_GH_TOKEN"):
+    token = os.environ.get(token_name)
+    if token and any(token in argument for argument in args):
+        raise SystemExit("bearer token must not appear in curl argv")
+if "--config" in args:
+    config = Path(args[args.index("--config") + 1])
+    if config.stat().st_mode & 0o777 != 0o600 or config.parent.stat().st_mode & 0o777 != 0o700:
+        raise SystemExit("curl config must be private")
+    state.setdefault("curl_configs", []).append(str(config))
+    Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(json.dumps(state))
+    import shlex
+    args += shlex.split(config.read_text())[2:]
 output = Path(args[args.index("--output") + 1])
 urls = [argument for argument in args if argument.startswith("https://")]
 if not urls:
@@ -398,7 +411,8 @@ class PublishTipReleaseTests(unittest.TestCase):
         scenario: str,
         release: dict[str, object] | None,
         *,
-        source_token: str | None = "fixture-source-token",
+        source_token: str | None = 'fixture-source"-token\\',
+        update_token: str = 'fixture-update"-token\\',
         live_main: str = COMMIT,
     ) -> subprocess.CompletedProcess[str]:
         self.state_path.write_text(
@@ -425,8 +439,8 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "PUBLISHER_ASSET_DIR": str(self.asset_dir),
                 "PUBLISHER_STABLE_APPCAST": str(self.stable_appcast),
                 "PUBLISHER_STABLE_FEED_URL": policy["sparkle"]["stableFeedURL"],
-                "TIP_GH_TOKEN": "fixture-update-token",
-                "PUBLISHER_EXPECTED_SOURCE_TOKEN": "fixture-source-token",
+                "TIP_GH_TOKEN": update_token,
+                "PUBLISHER_EXPECTED_SOURCE_TOKEN": 'fixture-source"-token\\',
                 "PUBLISHER_LIVE_MAIN": live_main,
                 "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
                 "TIP_SOURCE_REPOSITORY": SOURCE_REPOSITORY,
@@ -446,7 +460,7 @@ class PublishTipReleaseTests(unittest.TestCase):
             environment.pop("TIP_SOURCE_GH_TOKEN", None)
         else:
             environment["TIP_SOURCE_GH_TOKEN"] = source_token
-        return subprocess.run(
+        result = subprocess.run(
             [
                 "bash",
                 str(PUBLISHER),
@@ -460,6 +474,13 @@ class PublishTipReleaseTests(unittest.TestCase):
             capture_output=True,
             timeout=30,
         )
+        for config in self._state().get("curl_configs", []):
+            self.assertFalse(Path(config).exists(), "curl config survived script exit")
+        for token_name in ("TIP_GH_TOKEN", "TIP_SOURCE_GH_TOKEN"):
+            token = environment.get(token_name)
+            if token:
+                self.assertNotIn(token, result.stdout + result.stderr)
+        return result
 
     def _state(self) -> dict[str, object]:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -471,6 +492,16 @@ class PublishTipReleaseTests(unittest.TestCase):
             self.assertIn("--paginate", arguments)
             self.assertNotIn("--slurp", arguments)
             self.assertNotIn("--jq", arguments)
+
+    def test_config_line_breaks_are_rejected_before_curl(self) -> None:
+        for arguments, message in (({"update_token": "fixture\ninvalid"}, "Invalid Tip token"),
+                                   ({"source_token": "fixture\rinvalid"}, "Invalid source token")):
+            with self.subTest(message=message):
+                result = self._run("existing", self._release(), **arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self._state().get("curl_configs", []), [])
+                self.assertEqual(self._state()["mutations"], [])
 
     def test_existing_release_on_later_page_is_reused_without_mutation(self) -> None:
         result = self._run("existing", self._release())

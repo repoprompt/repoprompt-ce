@@ -720,10 +720,10 @@ actor WorkspaceCodemapBindingEngine {
     private var graphIndexAdmissionQueue: [GraphIndexAdmissionWaiter] = []
     private var activeGraphIndexJobIDs: Set<UUID> = []
     private var graphIndexWatchdogTasks: [UUID: Task<Void, Never>] = [:]
-    private var graphIndexWorkerRecoveryContinuations: [
+    private var graphIndexExecutionContinuations: [
         UUID: (
             rootEpoch: WorkspaceCodemapRootEpoch,
-            continuation: AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState>.Continuation
+            continuation: AsyncStream<WorkspaceCodemapGraphIndexExecutionState>.Continuation
         )
     ] = [:]
     private var prioritizedGraphIndexRootEpoch: WorkspaceCodemapRootEpoch?
@@ -1531,7 +1531,7 @@ actor WorkspaceCodemapBindingEngine {
         job.retryAttempt = 0
         job.retry = nil
         graphIndexJobs[rootEpoch] = job
-        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         #if DEBUG
             recordGraphIndexDebugEvent(
                 kind: .graphIndexRunScheduled,
@@ -2017,34 +2017,38 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
-    func graphIndexWorkerRecoveryUpdates(
+    func graphIndexExecutionUpdates(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState> {
+    ) -> AsyncStream<WorkspaceCodemapGraphIndexExecutionState> {
         let id = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            graphIndexWorkerRecoveryContinuations[id] = (rootEpoch, continuation)
-            continuation.yield(graphIndexWorkerRecoveryState(rootEpoch: rootEpoch))
+            graphIndexExecutionContinuations[id] = (rootEpoch, continuation)
+            continuation.yield(graphIndexExecutionState(rootEpoch: rootEpoch))
             continuation.onTermination = { _ in
-                Task { await self.removeGraphIndexWorkerRecoveryContinuation(id) }
+                Task { await self.removeGraphIndexExecutionContinuation(id) }
             }
         }
     }
 
-    private func graphIndexWorkerRecoveryState(
+    private func graphIndexExecutionState(
         rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapGraphIndexWorkerRecoveryState {
-        graphIndexJobs[rootEpoch]?.workerRecoveryExhausted == true ? .exhausted : .available
+    ) -> WorkspaceCodemapGraphIndexExecutionState {
+        guard let job = graphIndexJobs[rootEpoch] else { return .available }
+        if job.phase == .budgetLimited, let budget = job.budget {
+            return .budgetLimited(budget)
+        }
+        return job.workerRecoveryExhausted ? .exhausted : .available
     }
 
-    private func publishGraphIndexWorkerRecoveryState(rootEpoch: WorkspaceCodemapRootEpoch) {
-        let state = graphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
-        for entry in graphIndexWorkerRecoveryContinuations.values where entry.rootEpoch == rootEpoch {
+    private func publishGraphIndexExecutionState(rootEpoch: WorkspaceCodemapRootEpoch) {
+        let state = graphIndexExecutionState(rootEpoch: rootEpoch)
+        for entry in graphIndexExecutionContinuations.values where entry.rootEpoch == rootEpoch {
             entry.continuation.yield(state)
         }
     }
 
-    private func removeGraphIndexWorkerRecoveryContinuation(_ id: UUID) {
-        graphIndexWorkerRecoveryContinuations.removeValue(forKey: id)
+    private func removeGraphIndexExecutionContinuation(_ id: UUID) {
+        graphIndexExecutionContinuations.removeValue(forKey: id)
     }
 
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
@@ -5595,6 +5599,7 @@ actor WorkspaceCodemapBindingEngine {
         job.budget = budget
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         emit(
             .graphIndexBudget,
             rootEpoch: rootEpoch,
@@ -5685,7 +5690,7 @@ actor WorkspaceCodemapBindingEngine {
             job.workerRestartRequestedReason = nil
             let task = job.task
             graphIndexJobs[rootEpoch] = job
-            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+            publishGraphIndexExecutionState(rootEpoch: rootEpoch)
             graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
             // A cancellation-ignoring worker may still own mutation/publication work for an admitted batch.
             // Keep its admission and resources quarantined until finishGraphIndexWorker releases them.
@@ -5801,7 +5806,7 @@ actor WorkspaceCodemapBindingEngine {
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
         if terminalCompletionReconciledRecovery {
-            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+            publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         }
         #if DEBUG
             recordGraphIndexDebugEvent(
@@ -5892,7 +5897,7 @@ actor WorkspaceCodemapBindingEngine {
         cancelRunning: Bool = false
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
-        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        publishGraphIndexExecutionState(rootEpoch: rootEpoch)
         discardGraphIndexManifestStages(&job)
         graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
         if prioritizedGraphIndexRootEpoch == rootEpoch {

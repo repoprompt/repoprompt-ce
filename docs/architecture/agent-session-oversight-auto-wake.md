@@ -431,7 +431,9 @@ route still recycles immediately, and steering still fails closed with no wait a
 route-recovery recycle re-arms the run's one-shot admission policy through the run's bootstrap lease
 (`MCPBootstrapLease.reinstallPolicyForReplacementProcess`), because the retired process's child
 consumed the original. When an initial run send is still refused (`[route:*]`, nothing dispatched),
-the unsent user row is withdrawn and its text restored to an empty composer, as Codex already does.
+only the exact user row identified by its submission producer is withdrawn and its text restored to an
+empty composer, as Codex already does. Rowless Auto-wake and maintenance starts never infer a rollback
+row from transcript history, even if the last historical user row is unanswered.
 
 Prompt carry and wake admission read exact published membership and the claim epoch, not catalog
 freshness. Required rendered content, current authority, budget and provider acceptance still own
@@ -770,6 +772,10 @@ endpoints, the workspace, and admission synchronously; a run that settled during
 refused as `target_busy` rather than started from a deferred path.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
+ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
+response fails after the write (including Stop shutting down the transport), the batch is not
+restored or requeued, its transcript rows remain, and managed sinks settle as unconfirmed. A write
+alone is not proof of provider acceptance or successful completion.
 
 The provider sees a RepoPrompt-authored envelope with `delegation="user_delegated_management"`:
 direction from the user's delegated overseer, to be followed within the session's workspace and

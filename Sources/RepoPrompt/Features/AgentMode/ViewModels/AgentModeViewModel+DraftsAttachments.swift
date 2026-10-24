@@ -164,7 +164,7 @@ extension AgentModeViewModel {
         guard session.removeItem(at: index) != nil else { return false }
         session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == userItemID }
         session.isDirty = true
-        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .replaceIfEmpty)
+        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .prependAlways)
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)
         return true
