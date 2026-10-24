@@ -174,13 +174,16 @@ private final class OracleCancellationFixture {
         readiness = directory.appendingPathComponent("ready")
         acknowledgement = directory.appendingPathComponent("ack")
         let script = #"""
+        # Match the production CLI contract without calling a provider.
+        case " $* " in *" --verbose "*) ;; *) exit 64 ;; esac
+        case " $* " in *" --output-format stream-json "*) ;; *) exit 64 ;; esac
         exec 3< "$1"
         printf '%s\n' "$$" > "$2"
         while IFS= read -r -t 30 command <&3; do
             case "$command" in
                 probe) printf 'alive\n' > "$3" ;;
                 finish)
-                    printf '%s\n' '{"result":"fixture answer","usage":{"input_tokens":3,"output_tokens":5},"total_cost_usd":0.01}'
+                    printf '%s\n' '{"type":"result","result":"fixture answer","usage":{"input_tokens":3,"output_tokens":5},"total_cost_usd":0.01}'
                     exit 0 ;;
                 *) exit 65 ;;
             esac

@@ -3297,12 +3297,19 @@ class PromptViewModel: ObservableObject {
             )
         }
 
+        let timing = manager.makeAgentAdmissionTiming()
         return try await manager.withAgentSessionAdmission(
             workspaceID: expectedWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            kind: .freshTab,
+            classifyOutcome: { (result: DurableBackgroundComposeTabCreationResult) in
+                if case .created = result { return .committed }
+                return .rejected
+            },
+            timing: timing
         ) {
-            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID) {
+            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID, timing: timing) {
                 return .rejected(
                     AgentAdmissionPersistenceReceipt(outcome: rejection, commitEvidence: .none),
                     .workspacePersistenceRejected
@@ -3391,7 +3398,9 @@ class PromptViewModel: ObservableObject {
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
-            let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            timing.begin(.save)
+            let receipt = await manager.persistAgentAdmission(provisionalIdentity, timing: timing)
+            timing.end()
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
@@ -3593,7 +3602,14 @@ class PromptViewModel: ObservableObject {
                 do {
                     outcome = try await manager.withAgentSessionAdmission(
                         workspaceID: identity.workspaceID,
-                        admissionID: UUID()
+                        admissionID: UUID(),
+                        kind: .recovery,
+                        classifyOutcome: { result in
+                            switch result {
+                            case .recovered, .alreadyRecovered, .localOnly: .committed
+                            default: .rejected
+                            }
+                        }
                     ) {
                         await manager.recoverProvisionalAgentAdmission(identity)
                     }
