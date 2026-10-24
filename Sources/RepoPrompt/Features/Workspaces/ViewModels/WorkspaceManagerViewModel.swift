@@ -6,6 +6,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -64,12 +65,18 @@ private enum WorkspaceExitPerf {
 }
 
 enum WorkspaceStoragePaths {
+    /// The one-click backup uses a fixed destination (not a user-selected export).
+    /// Debug must not replace or consume the release app's recovery archive.
+    static var userDataBackupDirectoryName: String {
+        MCPFilesystemIdentity.current.buildFlavor == .debug ? "RepoPrompt-Debug-Backup" : "RepoPrompt-Backup"
+    }
+
     static let defaultRoot: URL = {
         let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         return home
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             .appendingPathComponent("Workspaces", isDirectory: true)
     }()
 }
@@ -1218,7 +1225,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // These positions are derived alongside the routing indexes, never a second authority.
         lifecycleBindingPositions.removeAll(keepingCapacity: true)
         lifecycleSessionPositions.removeAll(keepingCapacity: true)
-        for (workspaceIndex, workspace) in workspaces.enumerated() {
+        for (workspaceIndex, workspace) in workspaces.enumerated() where workspace.consolidatedIntoWorkspaceID == nil {
             for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                 #if DEBUG
                     test_sessionCarrierIndexMaintenanceRowsVisited += 1
@@ -1233,7 +1240,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         sessionCarrierPositionsByTabID.removeAll(keepingCapacity: true)
         sessionCarrierPositionsBySessionID.removeAll(keepingCapacity: true)
-        for (workspaceIndex, workspace) in workspaces.enumerated() {
+        for (workspaceIndex, workspace) in workspaces.enumerated() where workspace.consolidatedIntoWorkspaceID == nil {
             for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                 indexSessionCarrier(tab, position: .init(workspace: workspaceIndex, tab: tabIndex, isStashed: false))
             }
@@ -1526,13 +1533,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             tabIDs.insert(tab.id)
             let position = SessionCarrierPosition(workspace: workspaceIndex, tab: tabIndex, isStashed: false)
-            nextTabPositions[tab.id, default: []].append(position)
+            if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                nextTabPositions[tab.id, default: []].append(position)
+            }
             nextRouting[tab.id] = nextRouting[tab.id] == nil ? tabIndex : -1
             if let sessionID = tab.activeAgentSessionID {
                 sessionIDs.insert(sessionID)
                 lifecycleKeys.insert(.init(tabID: tab.id, sessionID: sessionID))
-                nextSessionPositions[sessionID, default: []].append(position)
-                nextLifecyclePositions[sessionID, default: []].append((workspaceIndex, tabIndex))
+                if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                    nextSessionPositions[sessionID, default: []].append(position)
+                    nextLifecyclePositions[sessionID, default: []].append((workspaceIndex, tabIndex))
+                }
             }
         }
         for (tabIndex, stash) in publication.replacement.stashedTabs.enumerated() {
@@ -1541,10 +1552,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             tabIDs.insert(stash.tab.id)
             let position = SessionCarrierPosition(workspace: workspaceIndex, tab: tabIndex, isStashed: true)
-            nextTabPositions[stash.tab.id, default: []].append(position)
+            if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                nextTabPositions[stash.tab.id, default: []].append(position)
+            }
             if let sessionID = stash.tab.activeAgentSessionID {
                 sessionIDs.insert(sessionID)
-                nextSessionPositions[sessionID, default: []].append(position)
+                if publication.replacement.consolidatedIntoWorkspaceID == nil {
+                    nextSessionPositions[sessionID, default: []].append(position)
+                }
             }
         }
         for tabID in tabIDs {
@@ -1612,6 +1627,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func sessionCarrier(at position: SessionCarrierPosition) -> SessionCarrier? {
         guard workspaces.indices.contains(position.workspace) else { return nil }
         let workspace = workspaces[position.workspace]
+        // Consolidation keeps these tabs for recovery, not as a second live binding owner.
+        guard workspace.consolidatedIntoWorkspaceID == nil else { return nil }
         #if DEBUG
             test_sessionCarrierRowsVisited += 1
         #endif
@@ -1624,7 +1641,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         return SessionCarrier(workspaceID: workspace.id, tab: workspace.composeTabs[position.tab], stashedTabID: nil)
     }
 
-    /// Physical claims, preserving duplicates and conflicting identities. Reads never rebuild the
+    /// Physical claims from unconsolidated workspaces, preserving duplicates and conflicting
+    /// identities. Recovery copies retain their data but confer no binding ownership.
+    /// Reads never rebuild the
     /// index; generic model replacement and the identity mutation owner maintain it synchronously.
     func sessionCarriers(
         sessionIDs: Set<UUID>, tabIDs: Set<UUID> = [], excludingSessionIDs: Set<UUID> = []
@@ -1979,6 +1998,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         var agentAdmissionRecoveryWillDrainOwnSavesHandlerForTesting: (@MainActor (UUID, Int) -> Void)?
         /// Observes admission awaiting this window's own saves (workspace, own save task count).
         var agentAdmissionWillAwaitOwnSavesHandlerForTesting: (@MainActor (UUID, Int) -> Void)?
+        /// Supplies the clock/report sink at the real fresh/existing admission entry points.
+        var agentAdmissionTimingFactoryForTesting: (@MainActor () -> WorkspaceAgentAdmissionTiming)?
         /// Observes actual scheduled/awaited save registration and captured predecessor count.
         var ownSaveDidRegisterHandlerForTesting: (@MainActor (UUID, Int) -> Void)?
         /// Replaces `WindowStatesManager`'s count of windows showing the active workspace.
@@ -4781,6 +4802,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private nonisolated func ensureBaseRootExists(at baseRoot: URL) throws {
+        try AppProfileLocations.current.validateMetadataFile(baseRoot)
         let fm = FileManager.default
         if !fm.fileExists(atPath: baseRoot.path) {
             try fm.createDirectory(at: baseRoot, withIntermediateDirectories: true)
@@ -4827,7 +4849,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.fileManager.setWorkspaceManager(self)
 
         if let path = WorkspaceStoragePreference.customStoragePath() {
-            globalCustomStorageURL = URL(fileURLWithPath: path)
+            globalCustomStorageURL = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: URL(fileURLWithPath: path))
         }
 
         if let sessionRuntimeWorkspace {
@@ -11057,9 +11079,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func persistAgentAdmission(
         _ identity: AgentProvisionalAdmissionIdentity,
-        source: WorkspaceSaveSource = WorkspaceSaveSource("agentSessionLifecycleAdmission")
+        source: WorkspaceSaveSource = WorkspaceSaveSource("agentSessionLifecycleAdmission"),
+        timing: WorkspaceAgentAdmissionTiming? = nil
     ) async -> AgentAdmissionPersistenceReceipt {
-        let receipt = await persistAgentAdmissionAttempt(identity, source: source)
+        let receipt = await persistAgentAdmissionAttempt(identity, source: source, timing: timing)
         // A pre-commit conflict may have been a peer's ordinary save. Reconcile through the
         // existing document/protected-identity owner once, then save the same provisional tab.
         // A working commit (including one later superseded) belongs to recovery, never replay.
@@ -11078,8 +11101,12 @@ class WorkspaceManagerViewModel: ObservableObject {
               let canonicalBefore = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: before.document.documentBytes, fileURL: before.document.fileURL
               ),
-              case .absent = Self.provisionalAdmissionProjection(in: canonicalBefore, identity: identity),
-              await refresh(), !Task.isCancelled, !isPreparingForWindowClose,
+              case .absent = Self.provisionalAdmissionProjection(in: canonicalBefore, identity: identity)
+        else { return receipt }
+        timing?.begin(.catalogRefresh)
+        let didRefresh = await refresh()
+        timing?.end()
+        guard didRefresh, !Task.isCancelled, !isPreparingForWindowClose,
               activeWorkspaceID == identity.workspaceID,
               let after = await client.canonicalWorkspaceSnapshot(identity.workspaceID),
               after.health.acceptsMutations,
@@ -11109,13 +11136,15 @@ class WorkspaceManagerViewModel: ObservableObject {
               baseline.fileURL == after.document.fileURL
         else { return receipt }
         markWorkspaceDirty(workspaceID: identity.workspaceID)
-        return await persistAgentAdmissionAttempt(identity, source: source)
+        return await persistAgentAdmissionAttempt(identity, source: source, timing: timing)
     }
 
     private func persistAgentAdmissionAttempt(
         _ identity: AgentProvisionalAdmissionIdentity,
-        source: WorkspaceSaveSource
+        source: WorkspaceSaveSource,
+        timing: WorkspaceAgentAdmissionTiming?
     ) async -> AgentAdmissionPersistenceReceipt {
+        timing?.recordSaveAttempt()
         let outcome = await pollAndSaveStateWithOutcomeAsync(
             workspaceID: identity.workspaceID,
             source: source,
@@ -12283,7 +12312,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         return NSError(domain: "RepoPrompt.AgentAdmission", code: 2, userInfo: userInfo)
     }
 
-    private func refreshCanonicalWorkspaceForAgentAdmission(workspaceID: UUID) async throws {
+    private func refreshCanonicalWorkspaceForAgentAdmission(
+        workspaceID: UUID,
+        timing: WorkspaceAgentAdmissionTiming? = nil
+    ) async throws {
         guard let initialWorkspace = workspace(withID: workspaceID) else {
             throw NSError(
                 domain: "RepoPrompt.AgentAdmission",
@@ -12292,6 +12324,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         guard !initialWorkspace.isEphemeral, let domainWorkspaceAuthorityClient else { return }
+        timing?.begin(.refresh)
+        defer { timing?.end() }
         var admissionSnapshot: DomainWorkspaceSnapshot?
         var admissionDiagnostic: DomainWorkspaceTransitionDiagnostic?
         #if DEBUG
@@ -12317,11 +12351,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             // about to clean canonical state.
             let ownSaves = ownTrackedSaveTasks(workspaceID: workspaceID)
             if !ownSaves.isEmpty {
-                #if DEBUG
-                    agentAdmissionWillAwaitOwnSavesHandlerForTesting?(workspaceID, ownSaves.count)
-                #endif
-                for task in ownSaves {
-                    try await Self.awaitOwnSaveCompletion(task)
+                do {
+                    timing?.begin(.save)
+                    defer { timing?.end() }
+                    #if DEBUG
+                        agentAdmissionWillAwaitOwnSavesHandlerForTesting?(workspaceID, ownSaves.count)
+                    #endif
+                    for task in ownSaves {
+                        try await Self.awaitOwnSaveCompletion(task)
+                    }
                 }
                 let refreshed = await domainWorkspaceAuthorityClient.agentAdmissionSnapshot(workspaceID)
                 admissionSnapshot = refreshed.snapshot
@@ -12332,10 +12370,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         if admissionDiagnostic?.admissionState == .dirtyWithoutLiveSave {
             // Dirty with no live save may be this window's own interrupted save (#1089). Finish it
             // once, under this admission lease, then admit only from a fresh clean read.
+            timing?.begin(.save)
             let resolution = await resolveDirtyCanonicalForAgentAdmission(
                 workspaceID: workspaceID,
                 client: domainWorkspaceAuthorityClient
             )
+            timing?.end()
             try Task.checkCancellation()
             dirtyOwnership = resolution.ownership
             if let refreshed = resolution.refreshed {
@@ -12492,12 +12532,23 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Must run inside the admission lease, before a new provisional binding is installed.
     /// Identity-only refresh can observe a newer digest without adopting its complete document.
     /// Join the existing projection owner to obtain that witness instead of rebasing stale bytes.
-    func prepareAgentAdmissionWriteBaseline(workspaceID: UUID) async throws -> WorkspacePersistenceOutcome? {
+    func prepareAgentAdmissionWriteBaseline(
+        workspaceID: UUID,
+        timing: WorkspaceAgentAdmissionTiming? = nil
+    ) async throws -> WorkspacePersistenceOutcome? {
         guard let workspace = workspace(withID: workspaceID), !workspace.isEphemeral,
               domainWorkspaceAuthorityClient != nil
         else { return nil }
         if fullDocumentWriteBaseline(workspaceID: workspaceID) != nil { return nil }
-        guard let refresh = domainCatalogRefreshAwaiter, await refresh() else {
+        let didRefresh: Bool
+        if let refresh = domainCatalogRefreshAwaiter {
+            timing?.begin(.catalogRefresh)
+            didRefresh = await refresh()
+            timing?.end()
+        } else {
+            didRefresh = false
+        }
+        guard didRefresh else {
             try Task.checkCancellation()
             return .rejected(
                 reason: "workspace_save_failed", category: .workspaceChanged,
@@ -12505,7 +12556,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         try Task.checkCancellation()
-        try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID)
+        try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
         guard !isPreparingForWindowClose, activeWorkspaceID == workspaceID,
               fullDocumentWriteBaseline(workspaceID: workspaceID) != nil
         else {
@@ -12517,23 +12568,50 @@ class WorkspaceManagerViewModel: ObservableObject {
         return nil
     }
 
+    func makeAgentAdmissionTiming() -> WorkspaceAgentAdmissionTiming {
+        #if DEBUG
+            if let factory = agentAdmissionTimingFactoryForTesting { return factory() }
+        #endif
+        return WorkspaceAgentAdmissionTiming()
+    }
+
     func withAgentSessionAdmission<T>(
         workspaceID: UUID,
         admissionID: UUID,
         refreshCanonicalState: Bool = false,
+        kind: WorkspaceAgentAdmissionTiming.Kind,
+        classifyOutcome: @MainActor (T) -> WorkspaceAgentAdmissionTiming.Outcome = { _ in .committed },
+        classifyError: @MainActor (Error) -> WorkspaceAgentAdmissionTiming.Outcome = { _ in .threw },
+        timing injectedTiming: WorkspaceAgentAdmissionTiming? = nil,
         operation: @MainActor () async throws -> T
     ) async throws -> T {
-        let lease = try await workspaceAgentAdmissionCoordinator.acquire(
-            workspaceID: workspaceID,
-            admissionID: admissionID
-        )
-        defer { lease.release() }
-        try Task.checkCancellation()
-        if refreshCanonicalState {
-            try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID)
+        let timing = injectedTiming ?? makeAgentAdmissionTiming()
+        timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: kind)
+        var outcome = WorkspaceAgentAdmissionTiming.Outcome.threw
+        defer { timing.finish(outcome: outcome) }
+        do {
+            let lease = try await workspaceAgentAdmissionCoordinator.acquire(
+                workspaceID: workspaceID,
+                admissionID: admissionID
+            )
+            timing.acquired()
+            defer {
+                // Stop measuring before release; emit only after releasing the admission lease.
+                timing.end()
+                lease.release()
+            }
+            try Task.checkCancellation()
+            if refreshCanonicalState {
+                try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
+            }
+            try Task.checkCancellation()
+            let result = try await operation()
+            outcome = Task.isCancelled ? .cancelled : classifyOutcome(result)
+            return result
+        } catch {
+            outcome = error is CancellationError || Task.isCancelled ? .cancelled : classifyError(error)
+            throw error
         }
-        try Task.checkCancellation()
-        return try await operation()
     }
 
     func reserveProvisionalAgentSession(
@@ -14494,6 +14572,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let directory: URL
         if let directoryURL {
+            try AppProfileLocations.current.validateMetadataFile(directoryURL)
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             directory = directoryURL
         } else {
@@ -14525,8 +14604,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         let directory = appSupport
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             .appendingPathComponent("workspace-cleanup-backups", isDirectory: true)
+        try AppProfileLocations.current.validateMetadataFile(directory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
@@ -16181,6 +16261,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         do {
             let (merged, data, indexFieldsChanged, preservedDiskRepoPaths) = try await Task.detached(priority: .utility) {
+                try AppProfileLocations.current.validateMetadataFile(fileURL)
                 let workspaceDir = fileURL.deletingLastPathComponent()
                 let chatsDir = workspaceDir.appendingPathComponent("Chats", isDirectory: true)
                 let fm = FileManager.default
@@ -17120,7 +17201,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         scheduleNormalizationWriteback: Bool,
         workspaceDiskWriter: WorkspaceDiskWriter<WorkspaceAppDiskWritePolicy> = WorkspaceDiskWriterComposition.processWriter
     ) throws -> WorkspaceFileLoadResult {
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
+        if let customRoot = cachedResult.workspace.customStoragePath {
+            try AppProfileLocations.current.validateCustomWorkspaceDirectory(customRoot)
+        }
         let normalizationSaveTask: Task<Void, Never>?
         if scheduleNormalizationWriteback,
            !cachedResult.workspace.isEphemeral,
@@ -17223,6 +17308,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
         let dir = workspaceDirectory(for: workspace, baseRoot: baseRoot)
+        try AppProfileLocations.current.validateMetadataFile(dir)
         let chats = chatsFolder(for: workspace, baseRoot: baseRoot)
         let fm = FileManager.default
 
@@ -17255,6 +17341,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
 
+        try AppProfileLocations.current.validateMetadataFile(currentGlobal)
+        try AppProfileLocations.current.validateMetadataFile(defaultWorkspaceRoot())
         for ws in workspaces {
             let oldFolder = currentGlobal.appendingPathComponent(directoryName(for: ws))
             let newFolder = defaultWorkspaceRoot().appendingPathComponent(directoryName(for: ws))
@@ -17287,11 +17375,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func moveFolderContents(from oldFolder: URL, to newFolder: URL) throws {
+        try AppProfileLocations.current.validateMetadataFile(oldFolder)
+        try AppProfileLocations.current.validateMetadataFile(newFolder)
         let fm = FileManager.default
         let items = try fm.contentsOfDirectory(atPath: oldFolder.path)
         for item in items {
             let srcURL = oldFolder.appendingPathComponent(item)
             let dstURL = newFolder.appendingPathComponent(item)
+            try AppProfileLocations.current.validateMetadataFile(srcURL)
+            try AppProfileLocations.current.validateMetadataFile(dstURL)
             if fm.fileExists(atPath: dstURL.path) {
                 try fm.removeItem(at: dstURL)
             }
@@ -17307,11 +17399,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    func updateGlobalStoragePath(_ newURL: URL) throws {
+    func updateGlobalStoragePath(_ selectedURL: URL) throws {
+        let locations = AppProfileLocations.current
+        let newURL = locations.identity.buildFlavor == .debug
+            ? try locations.customWorkspaceRoot(selectedDirectory: selectedURL) : selectedURL
         let oldBase = currentBaseRoot
+        try locations.validateMetadataFile(oldBase)
+        try locations.validateMetadataFile(newURL)
+        try domainWorkspaceAuthorityClient?.admitStorageRoot(newURL)
+        try FileManager.default.createDirectory(at: newURL, withIntermediateDirectories: true)
         for ws in workspaces {
             let oldFolder = oldBase.appendingPathComponent(directoryName(for: ws))
             let newFolder = newURL.appendingPathComponent(directoryName(for: ws))
+            try locations.validateMetadataFile(oldFolder)
+            try locations.validateMetadataFile(newFolder)
             if FileManager.default.fileExists(atPath: oldFolder.path) {
                 try FileManager.default.moveItem(at: oldFolder, to: newFolder)
             }
@@ -18677,7 +18778,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     NSLocalizedDescriptionKey: "Could not find the user's Downloads folder."
                 ])
             }
-            let exportFolder = downloads.appendingPathComponent("RepoPrompt-Backup", isDirectory: true)
+            let exportFolder = downloads.appendingPathComponent(WorkspaceStoragePaths.userDataBackupDirectoryName, isDirectory: true)
 
             if !fm.fileExists(atPath: exportFolder.path) {
                 try fm.createDirectory(
@@ -18729,7 +18830,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Could not find the user's Downloads folder."]
             )
         }
-        let exportFolder = downloads.appendingPathComponent("RepoPrompt-Backup", isDirectory: true)
+        let exportFolder = downloads.appendingPathComponent(WorkspaceStoragePaths.userDataBackupDirectoryName, isDirectory: true)
         guard fm.fileExists(atPath: exportFolder.path) else {
             print("No RepoPrompt-Backup folder found in ~/Downloads. Nothing to restore.")
             return
@@ -18748,6 +18849,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // 2) Attempt to restore workspace index if it exists
         let indexSource = exportFolder.appendingPathComponent("workspacesIndex.json")
         if fm.fileExists(atPath: indexSource.path) {
+            try AppProfileLocations.current.validateMetadataFile(workspaceIndexFileURL)
             if fm.fileExists(atPath: workspaceIndexFileURL.path) {
                 try fm.removeItem(at: workspaceIndexFileURL)
             }
@@ -18796,6 +18898,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                     .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id)")
             }
 
+            // Imported metadata must not direct debug cleanup into release state.
+            if workspace.customStoragePath != nil {
+                try AppProfileLocations.current.validateCustomWorkspaceDirectory(localWsDir)
+            }
+            try AppProfileLocations.current.validateMetadataFile(localWsDir)
             // If it already exists, remove it to avoid partial merges
             if fm.fileExists(atPath: localWsDir.path) {
                 try fm.removeItem(at: localWsDir)

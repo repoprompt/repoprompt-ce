@@ -163,7 +163,7 @@ enum WindowStateCompositionFactory {
         // A nonvisual runtime shares MCP routing, but never owns or projects the visible workspace
         // document. Its one-carrier snapshot is read-only placement, not a second workspace writer.
         let domainWorkspaceClient = sessionRuntimeWorkspace == nil ? domainRuntime.map {
-            DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID)
+            DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID, metadataPathPolicy: $0.configuration.metadataPathPolicy)
         } : nil
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
@@ -280,6 +280,7 @@ enum WindowStateCompositionFactory {
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
             perfRecorder: AppAgentModePerfRecorder()
         )
+        agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

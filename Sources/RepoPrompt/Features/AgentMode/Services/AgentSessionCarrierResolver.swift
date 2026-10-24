@@ -61,7 +61,17 @@ enum AgentSessionCarrierResolver {
         var runtimeStatesByWindow: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
         var claimedWorkspaceIDs: [UUID: Set<UUID>] = [:]
         var sessionIDs: Set<UUID> = []
+        var bindingClaimDescriptions: [UUID: Set<String>] = [:]
         fileprivate var fences: [WindowFence] = []
+
+        func bindingConflictDetail(for sessionID: UUID) -> String? {
+            guard ambiguousSessionIDs.contains(sessionID) else { return nil }
+            let claims = bindingClaimDescriptions[sessionID, default: []].sorted()
+            guard !claims.isEmpty else { return "More than one physical or runtime binding claims this session." }
+            let suffix = claims.count > 8 ? "; plus \(claims.count - 8) additional claims" : ""
+            return "More than one physical or runtime binding claims this session. Competing carriers: "
+                + claims.prefix(8).joined(separator: "; ") + suffix
+        }
 
         func affectedWorkspaceIDs(for sessionID: UUID) -> Set<UUID> {
             Set(metadata[sessionID, default: []].map(\.workspaceID))
@@ -187,6 +197,7 @@ enum AgentSessionCarrierResolver {
         var tabIDs: Set<UUID> = []
         var liveAddresses: [UUID: Set<LiveAddress>] = [:]
         var identitiesByTabID: [UUID: Set<UUID>] = [:]
+        var claimDescriptionsByTabID: [UUID: Set<String>] = [:]
         for window in windows {
             let manager = window.workspaceManager
             let workspace = manager.activeWorkspace
@@ -214,6 +225,9 @@ enum AgentSessionCarrierResolver {
                     identitiesByTabID[tabID, default: []].insert(id)
                     snapshot.sessionIDs.insert(id)
                     liveAddresses[id, default: []].insert(LiveAddress(workspaceID: workspace?.id, tabID: tabID))
+                    snapshot.bindingClaimDescriptions[id, default: []].insert(
+                        "live window \(window.windowID), workspace \(workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                    )
                 }
             }
             let direct = manager.sessionCarriers(sessionIDs: ids)
@@ -230,6 +244,9 @@ enum AgentSessionCarrierResolver {
             for tabID in tabIDs {
                 if let id = capture.window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID {
                     identitiesByTabID[tabID, default: []].insert(id)
+                    claimDescriptionsByTabID[tabID, default: []].insert(
+                        "live window \(capture.window.windowID), workspace \(capture.workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                    )
                 }
             }
         }
@@ -278,11 +295,16 @@ enum AgentSessionCarrierResolver {
                     effectiveID = nil
                 }
                 identitiesByTabID[tab.id, default: []].formUnion(claims)
+                let workspaceName = window.workspaceManager.workspace(withID: carrier.workspaceID)?.name
+                let description = "window \(window.windowID), workspace '\(workspaceName ?? "Unknown")' (\(carrier.workspaceID)), "
+                    + "\(carrier.stashedTabID == nil ? "compose" : "stashed") tab \(tab.id)"
+                claimDescriptionsByTabID[tab.id, default: []].insert(description)
                 for id in claims where ids.contains(id) {
+                    snapshot.bindingClaimDescriptions[id, default: []].insert(description)
                     snapshot.sessionIDs.insert(id)
                     snapshot.claimedWorkspaceIDs[id, default: []].insert(carrier.workspaceID)
                     physicalKeys[id, default: []].insert(key)
-                    var presentation = Presentation(tab, workspaceName: window.workspaceManager.workspace(withID: carrier.workspaceID)?.name)
+                    var presentation = Presentation(tab, workspaceName: workspaceName)
                     if let acknowledged = acknowledgedGroupOrders[id] {
                         guard carrier.workspaceID == acknowledged.workspaceID, tab.id == acknowledged.tabID,
                               carrier.stashedTabID == nil, tab.sidebarGroup == acknowledged.group,
@@ -312,8 +334,12 @@ enum AgentSessionCarrierResolver {
                 ))
             }
         }
-        for claims in identitiesByTabID.values where claims.count > 1 {
-            snapshot.ambiguousSessionIDs.formUnion(claims.intersection(ids))
+        for (tabID, claims) in identitiesByTabID where claims.count > 1 {
+            let affected = claims.intersection(ids)
+            snapshot.ambiguousSessionIDs.formUnion(affected)
+            for id in affected {
+                snapshot.bindingClaimDescriptions[id, default: []].formUnion(claimDescriptionsByTabID[tabID] ?? [])
+            }
         }
         for (id, addresses) in liveAddresses {
             // Keep an ownerless live address too: lack of a workspace must not erase a second

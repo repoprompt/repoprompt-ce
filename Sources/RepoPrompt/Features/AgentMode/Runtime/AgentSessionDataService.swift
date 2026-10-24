@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 #if canImport(Darwin)
     import Darwin
 #else
@@ -129,6 +130,7 @@ private actor AgentSessionDiskWriter {
 
             let writeResult: Result<Void, Error> = await Task.detached(priority: .utility) {
                 do {
+                    try AppProfileLocations.current.validateMetadataFile(url)
                     try data.write(to: url, options: .atomic)
                     return .success(())
                 } catch {
@@ -172,8 +174,7 @@ actor AgentSessionDataService {
     }
 
     static func defaultWorkspaceRootURL() -> URL {
-        MCPFilesystemConstants.identity.applicationSupportRootURL()
-            .appendingPathComponent("Workspaces", isDirectory: true)
+        AppProfileLocations.current.workspaceRoot
     }
 
     private let encoder = JSONEncoder()
@@ -525,11 +526,8 @@ actor AgentSessionDataService {
     /// Failure aborts the load rather than silently destroying the only recovery copy.
     private func preserveMalformedSelfCompactRecord(_ data: Data, from fileURL: URL) throws {
         let directory = fileURL.deletingLastPathComponent().appendingPathComponent(".self-compact-recovery", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        try AppProfileLocations.current.validateMetadataFile(directory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let backupURL = directory.appendingPathComponent("\(fileURL.lastPathComponent).\(UUID().uuidString).original")
         try data.write(to: backupURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
@@ -755,8 +753,10 @@ actor AgentSessionDataService {
         normalized.schemaVersion = AgentSessionMetadataIndex.currentSchemaVersion
         normalized.entries = normalized.entries.sortedForAgentSessionMetadataIndex()
         let data = try encoder.encode(normalized)
+        let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         metadataIndexCacheByFolder[key] = normalized
-        try data.write(to: metadataIndexFileURL(forAgentSessionsFolder: folder), options: .atomic)
+        try data.write(to: fileURL, options: .atomic)
         #if DEBUG
             perfRecorder.durationEvent(
                 "cleanup.metadata.writeIndex",
@@ -1840,6 +1840,7 @@ actor AgentSessionDataService {
         // Admission must precede the local tombstone: post-write cleanup can remove a tombstoned
         // file, so even that cleanup needs an attempt counted by the termination fence. Saves that
         // enter during this hop are covered by the writer drain and the existing post-write checks.
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
         deletedSessionFileURLs.insert(fileURL)
         deletionAttemptCountByFileURL[fileURL, default: 0] += 1
@@ -1855,6 +1856,7 @@ actor AgentSessionDataService {
                 throw AgentSessionDestructiveCommitRefused()
             }
             if FileManager.default.fileExists(atPath: fileURL.path) {
+                try AppProfileLocations.current.validateMetadataFile(fileURL)
                 try FileManager.default.removeItem(at: fileURL)
             }
         } catch {
@@ -1878,6 +1880,7 @@ actor AgentSessionDataService {
         folder: URL
     ) async throws {
         guard deletedSessionFileURLs.contains(fileURL) else { return }
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         try? FileManager.default.removeItem(at: fileURL)
         await removeMetadataRecords(
             matching: { $0.id == sessionID || $0.filename == fileURL.lastPathComponent },
@@ -1958,6 +1961,7 @@ actor AgentSessionDataService {
     private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
+        try AppProfileLocations.current.validateMetadataFile(agentSessionsFolder)
 
         if !FileManager.default.fileExists(atPath: agentSessionsFolder.path) {
             try FileManager.default.createDirectory(at: agentSessionsFolder, withIntermediateDirectories: true)
@@ -1984,6 +1988,7 @@ actor AgentSessionDataService {
     /// Return the main folder for the workspace.
     private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
         let workspaceDir = resolvedWorkspaceFolderURL(for: workspace)
+        try AppProfileLocations.current.validateMetadataFile(workspaceDir)
         if !FileManager.default.fileExists(atPath: workspaceDir.path) {
             try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         }

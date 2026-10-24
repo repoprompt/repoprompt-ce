@@ -164,6 +164,189 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(runCallCount, 1)
     }
 
+    func testWorktreePhysicalAdmissionAuthorizesResolvedCanonicalScopeNotRawSelector() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-scope-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        let foreignRoot = container.appendingPathComponent("foreign", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot, foreignRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // The raw repo_root is outside the workspace. Only the backend's resolved mapping
+        // can establish that it belongs to the canonical repository authorized for this run.
+        for action in ["create", "apply", "continue", "abort"] {
+            for scenario in ["mapped", "foreign", "no-grant", "no-admission"] {
+                let fixture = try RuntimeFixture(
+                    mode: .app,
+                    storage: container.appendingPathComponent("policy-\(action)-\(scenario)", isDirectory: true)
+                )
+                let calls = CallCounter()
+                let binding = MCPDomainToolBinding(
+                    definition: MCPDomainToolDefinition(
+                        name: "manage_worktree",
+                        description: "fixture",
+                        inputSchema: .object(["type": .string("object")]),
+                        annotations: .init(readOnlyHint: false, destructiveHint: true)
+                    ),
+                    operation: { _ in
+                        if scenario != "no-admission" {
+                            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                                [physicalRoot.path],
+                                rootMappings: [.init(
+                                    canonicalRoot: scenario == "foreign" ? foreignRoot.path : canonicalRoot.path,
+                                    physicalRoot: physicalRoot.path
+                                )]
+                            )
+                        }
+                        try await MCPDomainMutationCommitContext.willCommit()
+                        await calls.increment()
+                        return .string("applied")
+                    }
+                )
+                let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+                let context = fixture.context(
+                    kind: .runScoped,
+                    assurance: .verifiedProcess,
+                    authorizedCanonicalRoots: [canonicalRoot.path],
+                    ephemeralGrantedToolNames: scenario == "no-grant" ? [] : ["manage_worktree"]
+                )
+                do {
+                    _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                        try await protectedBinding(["op": .string(action), "repo_root": .string(physicalRoot.path)])
+                    }
+                    XCTAssertEqual(scenario, "mapped", action)
+                } catch {
+                    if scenario == "no-admission" {
+                        XCTAssertEqual(error as? DomainMutationPathFenceError, .scopeUnavailable, action)
+                    } else {
+                        XCTAssertNotEqual(scenario, "mapped", action)
+                        XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing, "\(action): \(scenario)")
+                    }
+                }
+                let callCount = await calls.value
+                XCTAssertEqual(callCount, scenario == "mapped" ? 1 : 0, "\(action): \(scenario)")
+            }
+        }
+    }
+
+    func testOnlyBackendFencedWorktreeCreateSeesAdmittedGuardBeforeCommit() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-guard-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // Creation commits at its backend's final fence, but must evaluate admitted targets (clone
+        // eligibility, the spawn of `git worktree add`) under their path fence before that point.
+        for action in ["create", "apply"] {
+            let fixture = try RuntimeFixture(
+                mode: .app,
+                storage: container.appendingPathComponent("policy-\(action)", isDirectory: true)
+            )
+            let observations = GuardObservations()
+            let binding = Self.worktreeBinding { _ in
+                let beforeAdmission = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("beforeAdmission", beforeAdmission != nil)
+                try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                    [physicalRoot.path],
+                    rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+                )
+                let admitted = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("admittedBeforeCommit", admitted != nil)
+                try await MCPDomainMutationCommitContext.willCommit()
+                let committed = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("afterCommit", committed != nil)
+                return .string("applied")
+            }
+            let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+            let context = fixture.context(
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                authorizedCanonicalRoots: [canonicalRoot.path],
+                ephemeralGrantedToolNames: ["manage_worktree"]
+            )
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                try await protectedBinding(["op": .string(action)])
+            }
+            let seen = await observations.values
+            XCTAssertEqual(
+                seen,
+                ["beforeAdmission": false, "admittedBeforeCommit": action == "create", "afterCommit": true],
+                action
+            )
+        }
+    }
+
+    func testBackendFencedWorktreeCreateSettlesPreFenceRefusalAsNotApplied() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-refusal-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // A deterministic backend refusal before the fence is the backend's own error and not
+        // applied; the same refusal after the fence remains indeterminate.
+        for refuseAfterFence in [false, true] {
+            let fixture = try RuntimeFixture(
+                mode: .app,
+                storage: container.appendingPathComponent("policy-\(refuseAfterFence)", isDirectory: true)
+            )
+            let binding = Self.worktreeBinding { _ in
+                try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                    [physicalRoot.path],
+                    rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+                )
+                if refuseAfterFence {
+                    try await MCPDomainMutationCommitContext.willCommit()
+                }
+                throw BackendRefusal()
+            }
+            let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+            let context = fixture.context(
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                authorizedCanonicalRoots: [canonicalRoot.path],
+                ephemeralGrantedToolNames: ["manage_worktree"]
+            )
+            let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+            await XCTAssertThrowsErrorAsync(
+                try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                    settlementState.withLock { $0 = settlement.state }
+                }) {
+                    try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                        try await protectedBinding(["op": .string("create"), "branch": .string("taken")])
+                    }
+                }
+            ) { error in
+                if refuseAfterFence {
+                    guard case .partialSuccessAfterCommit = error as? DomainProtectedMutationError else {
+                        return XCTFail("Expected partialSuccessAfterCommit, got \(error)")
+                    }
+                } else {
+                    XCTAssertEqual(error as? BackendRefusal, BackendRefusal())
+                }
+            }
+            XCTAssertEqual(
+                settlementState.withLock { $0 },
+                refuseAfterFence ? .indeterminateAfterCommit : .notApplied
+            )
+            let journal = try await fixture.runtime.mutationJournal.snapshot()
+            XCTAssertEqual(
+                journal.recordSnapshots.map(\.status),
+                [refuseAfterFence ? .indeterminateAfterCommit : .failedBeforeCommit]
+            )
+        }
+    }
+
     func testUnsupportedProtectedPhysicalMutationFinishesBeforeCommitWithoutCreatingParent() async throws {
         let fixture = try RuntimeFixture(mode: .standalone)
         let fileManager = FileManager.default
@@ -732,6 +915,20 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(capturedCategory, "journalError")
     }
 
+    private static func worktreeBinding(
+        _ operation: @escaping @Sendable ([String: Value]) async throws -> Value
+    ) -> MCPDomainToolBinding {
+        MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: operation
+        )
+    }
+
     private func operation(_ toolName: String, _ arguments: [String: Value]) -> DomainProtectedMutationOperation? {
         MCPDomainProtectedMutationToolProvider.operation(
             toolName: toolName,
@@ -750,6 +947,16 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             runID: nil,
             provider: nil
         )
+    }
+}
+
+private struct BackendRefusal: Error, Equatable {}
+
+private actor GuardObservations {
+    private(set) var values: [String: Bool] = [:]
+
+    func record(_ key: String, _ value: Bool) {
+        values[key] = value
     }
 }
 

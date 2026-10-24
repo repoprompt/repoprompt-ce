@@ -31,6 +31,7 @@ import socketserver
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -3594,6 +3595,8 @@ class OperationRegistry:
     TEST_ENV_KEYS = [
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
+        "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT",
+        "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES",
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
@@ -4750,6 +4753,7 @@ class DaemonState:
                             "cache_retry",
                             {
                                 "argv": argv,
+                                "testBuildReceipt": job.operation == "test",
                                 "key": cache_context.snapshot.key,
                                 "outcomePath": str(cache_context.outcome_path),
                                 "attemptTimeout": attempt_timeout,
@@ -5121,7 +5125,10 @@ class DaemonState:
         job.timed_out = True
         job.state = "failed"
         job.exit_code = 124
-        job.error = f"{attempt} cache build attempt timed out{suffix}"
+        if not cold_attempted and outcome.get("testBuildSucceeded"):
+            job.error = f"post-build test execution timed out{suffix}"
+        else:
+            job.error = f"{attempt} cache build attempt timed out{suffix}"
         job.result_summary = job.error
 
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
@@ -8437,6 +8444,7 @@ def _run_cache_attempt(
     attempt_timeout: Optional[float],
     attempt_record_path: Path,
     ticket: str,
+    env: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, bool]:
     wrapper_start = process_start_token(os.getpid())
     if not wrapper_start:
@@ -8457,6 +8465,7 @@ def _run_cache_attempt(
         process = subprocess.Popen(
             gate_argv,
             cwd=str(repo_root),
+            env=env,
             stdin=subprocess.DEVNULL,
             pass_fds=(read_fd,),
             start_new_session=True,
@@ -8594,13 +8603,25 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     if not math.isfinite(cleanup_timeout) or cleanup_timeout < 0:
         raise ConductorError("cache retry cleanup timeout must be a finite non-negative number")
 
-    first_code, first_timed_out = _run_cache_attempt(
-        argv,
-        repo_root,
-        attempt_timeout,
-        attempt_record_path,
-        ticket,
-    )
+    # A test invocation contains both compilation and execution. Only failures before
+    # its successful build boundary are candidates for seeded-cache recovery. Use a
+    # private per-attempt receipt, not log matching or an inherited/stale .build file.
+    with contextlib.ExitStack() as stack:
+        test_build_receipt = None
+        attempt_env = dict(os.environ)
+        if args.get("testBuildReceipt"):
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="conductor-cache-attempt-"))
+            test_build_receipt = Path(directory) / "test-build-succeeded"
+            attempt_env["REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT"] = str(test_build_receipt)
+        first_code, first_timed_out = _run_cache_attempt(
+            argv,
+            repo_root,
+            attempt_timeout,
+            attempt_record_path,
+            ticket,
+            env=attempt_env,
+        )
+        test_build_succeeded = test_build_receipt is not None and test_build_receipt.is_file()
     if first_code == 0:
         return 0
     build_dir = repo_root / ".build"
@@ -8610,8 +8631,14 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
         "cleanupTimeoutSeconds": cleanup_timeout,
         "seededExitCode": first_code,
         "seededTimedOut": first_timed_out,
+        "testBuildSucceeded": test_build_succeeded,
         "coldRetryAttempted": False,
     }
+    if test_build_succeeded:
+        outcome["reason"] = "test build succeeded; post-build failure is not a seeded-cache failure"
+        if outcome_path.parent.is_dir():
+            _atomic_write_json(outcome_path, outcome)
+        return first_code
     if not (
         provenance
         and provenance.get("key") == key

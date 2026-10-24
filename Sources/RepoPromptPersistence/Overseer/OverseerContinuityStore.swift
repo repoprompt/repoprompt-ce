@@ -19,6 +19,46 @@ package final class OverseerContinuityStore: @unchecked Sendable {
         self.profile = profile
     }
 
+    /// Read-only retention projection, never an authorization input. Unknown schemas/profiles
+    /// fail rather than silently returning no backing and allowing a snapshot to displace it.
+    package struct BackingIdentities {
+        package var sessions: Set<String> = []
+        package var workspaces: Set<String> = []
+        package init() {}
+    }
+
+    package func readOnlyBackingIdentities() throws -> BackingIdentities {
+        try acquireAccess()
+        defer { Self.accessLock.unlock() }
+        let handle = try FileHandle(forReadingFrom: databaseURL)
+        defer { try? handle.close() }
+        let header = try handle.read(upToCount: 100) ?? Data()
+        guard header.count == 100, header.prefix(16) == Data("SQLite format 3\0".utf8) else { throw OverseerContinuityError.invalidRecord }
+        // A read-only WAL connection may write shared-memory read marks. Never open it here.
+        guard header[18] != 2 else { throw OverseerContinuityError.unsupportedEngineSettings }
+        let db = try SessionCatalogDatabase(url: databaseURL, readOnly: true)
+        try db.execute("PRAGMA busy_timeout = 250")
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        let version = try Int(db.integer("PRAGMA user_version") ?? 0)
+        guard version == 1 else { throw OverseerContinuityError.incompatibleSchema(version) }
+        guard try db.rows("SELECT profile FROM profile_state WHERE singleton=1", map: { try SessionCatalogDatabase.string($0) }).first == profile else {
+            throw OverseerContinuityError.profileMismatch
+        }
+        var result = BackingIdentities()
+        _ = try db.rows("SELECT owner_id,anchor_id,workspace_id FROM continuity_rows WHERE terminal=0") { row in
+            for column in [Int32(0), 1] {
+                if let text = try? SessionCatalogDatabase.string(row, column: column), let id = UUID(uuidString: text) {
+                    result.sessions.insert(id.uuidString)
+                }
+            }
+            if let text = try? SessionCatalogDatabase.string(row, column: 2), let id = UUID(uuidString: text) {
+                result.workspaces.insert(id.uuidString)
+            }
+        }
+        return result
+    }
+
     private func acquireAccess() throws {
         guard Self.accessLock.lock(before: Date().addingTimeInterval(0.25)) else { throw OverseerContinuityError.writerBusy }
     }

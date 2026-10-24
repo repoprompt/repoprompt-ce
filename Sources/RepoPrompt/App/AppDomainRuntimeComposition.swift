@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 #if DEBUG
     import os
 #endif
@@ -111,11 +112,8 @@ final class AppDomainRuntimeComposition: Sendable {
     }
 
     private init() {
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.temporaryDirectory
-        let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let locations = AppProfileLocations.current
+        let root = locations.applicationSupportRoot
         let defaults = UserDefaults.standard
         let customStoragePath = WorkspaceStoragePreference.customStoragePath(defaults: defaults)
         var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
@@ -125,19 +123,20 @@ final class AppDomainRuntimeComposition: Sendable {
             legacyRuntimeDefaults["GlobalCustomStorageURL"] = bytes
         }
         let workspaceStorageDirectory = customStoragePath.map {
-            URL(fileURLWithPath: $0, isDirectory: true)
+            locations.customWorkspaceDirectory(selectedDirectory: URL(fileURLWithPath: $0, isDirectory: true))
         } ?? root.appendingPathComponent("Workspaces", isDirectory: true)
         let runtime = MCPDomainRuntime(
             configuration: DomainRuntimeConfiguration(
                 mode: .app,
-                profileIdentifier: "default",
+                profileIdentifier: locations.profileIdentifier,
                 storageDirectory: root,
                 workspaceStorageDirectory: workspaceStorageDirectory,
                 eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
-                temporaryDirectory: FileManager.default.temporaryDirectory
-                    .appendingPathComponent("RepoPrompt CE", isDirectory: true),
+                temporaryDirectory: MCPFilesystemIdentity.current.temporaryRootURL(),
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
-                metrics: AppDomainRuntimeMetrics.editFlowSink
+                metrics: AppDomainRuntimeMetrics.editFlowSink,
+                metadataPathPolicy: locations.identity.buildFlavor == .debug
+                    ? AppMetadataPathPolicy(locations: locations, roots: [root, workspaceStorageDirectory]) : nil
             )
         )
         defaultRuntime = runtime

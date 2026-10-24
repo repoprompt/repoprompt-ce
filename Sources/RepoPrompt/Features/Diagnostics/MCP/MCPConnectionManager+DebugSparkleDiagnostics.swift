@@ -54,6 +54,9 @@ import RepoPromptFoundation
                 payload["appcast_task_cancelled"] = NSNull()
             }
 
+            let historySnapshot = await MainActor.run { SparkleUpdaterManager.shared?.tipHistoryStore?.debugPublishedSnapshot() }
+            payload["tip_history"] = historySnapshot ?? ["store_present": false]
+
             return debugDiagnosticsResult(payload)
         }
 

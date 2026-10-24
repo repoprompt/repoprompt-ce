@@ -285,6 +285,14 @@ struct AgentSessionScopeVisibility {
         }
     }
 
+    /// Address collisions may involve another session entirely. Only an all-sessions chain may
+    /// see its workspace/tab details; narrower scopes can still see their own unresolved ID/code.
+    var mayDiscloseCompetingCarriers: Bool {
+        !chain.isEmpty && chain.allSatisfy { if case .allSessions = $0.grant.kind { return true }
+            return false
+        }
+    }
+
     func mayDiscloseUnresolved(_ sessionID: UUID) -> Bool {
         !chain.isEmpty && chain.allSatisfy { scope in
             switch scope.grant.kind {
@@ -355,7 +363,7 @@ enum AgentSessionInventoryReadFailure: Error, Equatable {
         var nextStep: String {
             switch self {
             case .ambiguousBinding:
-                "Ask the user to close duplicate bindings, then call session_admin inventory again."
+                "Ask the user to reconcile the competing workspace/tab carriers named in detail, then retry; hidden workspaces can also contain real claims."
             case .replicaMismatch:
                 "Ask the user to reconcile the session’s window replicas, then call session_admin inventory again."
             case .sessionsChangedDuringRead:
@@ -593,7 +601,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             records: records, edges: edges,
             isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil,
             recordsComplete: (read.loadedOnly || recordsComplete) && loaded.unresolved.isEmpty,
-            unresolvedSessions: loaded.unresolved,
+            unresolvedSessions: loaded.unresolved, unresolvedDetails: loaded.details,
             historyIssue: read.loadedOnly ? nil : historyIssue
         )
         try Task.checkCancellation()
@@ -753,7 +761,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
     private func loadedRecords(
         historyByID: [UUID: (AgentSessionMetadataRecord, String)],
         read: AgentSessionInventoryRead
-    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String]) {
+    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String], details: [UUID: String]) {
         // Exactly two total attempts, sharing the invocation's original deadline/work budget.
         do {
             return try await captureLoadedRecords(historyByID: historyByID, read: read)
@@ -765,7 +773,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
 
     private func captureLoadedRecords(
         historyByID: [UUID: (AgentSessionMetadataRecord, String)], read: AgentSessionInventoryRead
-    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String]) {
+    ) async throws -> (records: [DomainAgentSessionInventoryRecord], unresolved: [UUID: String], details: [UUID: String]) {
         try await Self.projectionCheckpoint(projected: 0, budget: read.budget)
         let capture = AgentSessionCarrierResolver.capture(windows: windows(), sessionIDs: read.sessionIDs)
         let rows = capture.rows.filter { read.workspaceID == nil || $0.workspaceID == read.workspaceID }
@@ -856,7 +864,10 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         }
         try await Self.projectionCheckpoint(projected: 0, budget: read.budget)
         guard capture.isCurrent() else { throw AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) }
-        return (projections.filter { unresolved[$0.key] == nil }.values.map { $0.resolvedRecord() }, unresolved)
+        let details = Dictionary(uniqueKeysWithValues: unresolved.keys.compactMap { id in
+            capture.bindingConflictDetail(for: id).map { (id, $0) }
+        })
+        return (projections.filter { unresolved[$0.key] == nil }.values.map { $0.resolvedRecord() }, unresolved, details)
     }
 }
 
@@ -879,7 +890,7 @@ enum AgentSessionInventoryRendering {
             "unresolved_session_count": .int(snapshot.unresolvedSessionCount),
             "unresolved_sessions_redacted_count": .int(snapshot.unresolvedSessionCount - snapshot.unresolvedSessions.count),
             "unresolved_sessions": .array(snapshot.unresolvedSessions.sorted { $0.key.uuidString < $1.key.uuidString }.map {
-                unresolvedValue(id: $0.key, reason: $0.value)
+                unresolvedValue(id: $0.key, reason: $0.value, detail: snapshot.unresolvedDetails[$0.key])
             })
         ]
     }
@@ -899,13 +910,13 @@ enum AgentSessionInventoryRendering {
         ]
     }
 
-    static func unresolvedValue(id: UUID, reason: String) -> Value {
+    static func unresolvedValue(id: UUID, reason: String, detail: String? = nil) -> Value {
         let reason = AgentSessionInventoryReadFailure.Reason(rawValue: reason) ?? .ambiguousBinding
         return .object([
             "session_id": .string(id.uuidString),
             "code": .string(reason.rawValue),
             "subreason": .string(reason.rawValue),
-            "detail": .string(reason.detail),
+            "detail": .string(detail ?? reason.detail),
             "next_step": .string(reason.nextStep),
             "retryable": .bool(reason.retryable)
         ])

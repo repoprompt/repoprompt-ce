@@ -1387,3 +1387,49 @@ Still required before C3 extraction: complete assembled production-ingress
 coverage and Stage 0 validation, reconcile exact source/test claims and dependency
 closure, then perform audited moves and app-free module/test validation. No files
 have moved, no module/ratchet limits changed, and no live app action occurred.
+
+### Batch integration checkpoint (2026-10-25)
+
+Integrated current main `a7c3c892ef17fe91596cdd88a16a72436e2f6c27` without
+rewriting the published checkpoint history. The independent engineer review found
+no demonstrated production regression and identified two test-oracle gaps, both
+corrected in the existing two-lane journey:
+
+- Record each first task's actual destination and match the two returned lane IDs,
+  rather than accepting two identical messages sent to an unspecified destination.
+- Join the temporary intent store's writer and open a fresh reader before and after
+  retirement. Require both exact observer/target pairs to be durable first, then
+  require neither pair to restore after cleanup. Empty bridge inventory alone is
+  not proof that a durable store was installed or that its rows were removed.
+
+Also applied the shared test-only admission-fixture repair from
+`65c4fdea53b41e35b9edc3c1333eeb2828702d35`: join root loading and the foreground
+badge callback before measuring Git-mode save invalidations. The exact retry
+allowance and durable-save assertions remain enforced; no #1310 feature code was
+included.
+
+- Separate pair cleanup and a local Oracle diff review found no further actionable
+  findings. These checkpoint reviews are **not** the final pinned M6 review.
+- Coordinated formatter `664e3cc1-e143-4ce8-abe9-88139cf93b0c`: PASS, exit 0,
+  no additional formatting changes. Coordinated strict lint
+  `ea9224d6-dcac-47c2-9c2d-68aa0fdc43af`: PASS, exit 0, zero formatting drift.
+- Coordinated focused tests `ad04aaff-0374-4fae-a1b1-6f0ec2e58dee`: PASS, exit 0,
+  **260 tests, zero failures**: 98 link-tool service, 27 same-workspace admission,
+  103 initial-window selection, 23 production-organizer journey, four real-Git
+  worktree recovery and five canonical transcript tests. Auxiliary bundles ran
+  zero matching tests and are not extra coverage. Execution including build and
+  post-test work took 15m 14s; selected tests took 49.32s; heavy admission took 11ms.
+- Coordinated app product build `7f525a87-ed6c-4169-acbf-c261616368da`: PASS,
+  exit 0, 13.2s execution with 10ms heavy admission. This builds the product but
+  does not package or launch it and does not establish live-ingress behavior.
+- An earlier attempt executed no tests because the sandbox prevented conductor's
+  required process-identity check. Its lint run passed formatting but could not
+  write SwiftLint's cache. Both were retried through the same coordinated lanes
+  after restarting only this worktree's idle daemon with the required permissions;
+  neither failed attempt is counted as passing evidence.
+
+This remains a **partial Stage 0 checkpoint**, not M6 readiness. Production-ingress
+and remaining adversarial/effect coverage, C3 app-free extraction, move/access/index
+and edit-to-test evidence, final milestone review, and broader product/release/live
+validation remain outstanding. No roadmap/readiness issue is closed, no module or
+ratchet limit is raised, and no visible app is launched, stopped or replaced.

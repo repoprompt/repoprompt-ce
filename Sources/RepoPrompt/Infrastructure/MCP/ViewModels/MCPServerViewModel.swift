@@ -1184,6 +1184,8 @@ final class MCPServerViewModel: ObservableObject {
 
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
+    @Published private(set) var pendingApprovalGeneration: UInt64?
+    @Published private(set) var pendingApprovalExecutablePath: String?
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
         issue: .none,
         lastEventAt: nil,
@@ -3222,6 +3224,8 @@ final class MCPServerViewModel: ObservableObject {
 
         isRunning = snap.isRunning
         pendingClientID = snap.pendingClientID
+        pendingApprovalGeneration = snap.pendingApprovalGeneration
+        pendingApprovalExecutablePath = snap.pendingApprovalExecutablePath
         diagnostics = snap.diagnostics
         lastErrorMessage = humanReadableError(from: snap.diagnostics.issue)
 
@@ -3506,11 +3510,8 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Called by UI after the alert sheet closes
-    func resolveApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        await service.continuePendingApproval(
-            allow: allow,
-            alwaysAllow: alwaysAllow
-        )
+    func resolveApproval(allow: Bool, generation: UInt64) async {
+        await service.continuePendingApproval(allow: allow, generation: generation)
     }
 
     // MARK: - Dashboard Methods
@@ -3849,15 +3850,18 @@ final class MCPServerViewModel: ObservableObject {
             : nil
         // Capture the exact self caller at registration, before the tool body can suspend. Neither
         // request metadata nor a later live tab lookup may substitute a successor run attempt.
-        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
-                                                         let context = resolvedContext?.snapshot,
-                                                         let runID = context.runID,
-                                                         indexedRunID == runID,
-                                                         let window = try? requireTargetWindow(),
-                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
-                                                         let session = window.agentModeViewModel.sessions[context.tabID],
-                                                         session.runID == runID,
-                                                         let ownership = session.activeRunOwnership
+        // `manage_worktree` uses the same proof to defer a session's own worktree switch to the
+        // terminal boundary of exactly this turn.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf
+            || name == MCPWindowToolName.manageWorktree,
+            let context = resolvedContext?.snapshot,
+            let runID = context.runID,
+            indexedRunID == runID,
+            let window = try? requireTargetWindow(),
+            let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+            let session = window.agentModeViewModel.sessions[context.tabID],
+            session.runID == runID,
+            let ownership = session.activeRunOwnership
         {
             .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
         } else {
@@ -6286,7 +6290,9 @@ final class MCPServerViewModel: ObservableObject {
             let coverage = root.coverage
             var rootIssues = root.issues.map { issue in
                 let mapped = codeStructureIssueDTO(issue)
-                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                guard root.executionStop == nil, root.status != .unavailable, !graphInvalid,
+                      issue.code == "seed_not_indexed", coverage?.isComplete != true
+                else { return mapped }
                 return DTO.IssueDTO(
                     code: mapped.code,
                     phase: mapped.phase,
@@ -6336,15 +6342,28 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .ok
             }
+            let indexStopReason: String? = if let stop = root.executionStop {
+                stop.reason.rawValue
+            } else if case let .invalid(code, _)? = graphRevalidation {
+                code
+            } else if root.status == .unavailable {
+                rootIssues.first?.code ?? "graph_unavailable"
+            } else {
+                nil
+            }
             rootDTOs.append(DTO.RootDTO(
                 root: root.rootDisplayName,
                 status: status,
                 index: DTO.IndexDTO(
-                    state: coverage?.isComplete == true ? .complete : .indexing,
+                    state: root.executionStop != nil || root.status == .unavailable || graphInvalid
+                        ? .stopped : coverage?.isComplete == true ? .complete : .indexing,
                     indexed: coverage?.classifiedCount ?? 0,
-                    total: coverage?.supportedCount ?? 0
+                    total: coverage?.supportedCount ?? 0,
+                    reason: indexStopReason,
+                    attempted: root.executionStop?.budget.map { Int(clamping: $0.attempted) },
+                    limit: root.executionStop?.budget.map { Int(clamping: $0.limit) }
                 ),
-                updatesPending: (root.updatesPending || revalidationUpdatesPending) ? true : nil,
+                updatesPending: indexStopReason == nil && (root.updatesPending || revalidationUpdatesPending) ? true : nil,
                 seeds: root.seeds.map {
                     DTO.SeedDTO(path: $0.path, state: codeStructureSeedStateDTO($0.state))
                 },

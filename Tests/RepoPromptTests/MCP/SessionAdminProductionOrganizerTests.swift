@@ -622,6 +622,189 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         }
     }
 
+    func testConsolidatedRecoveryCopiesDoNotOwnSessionCarriersOrBlockOrganization() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            do {
+                let manager = fixture.window.workspaceManager
+                let targetID = try XCTUnwrap(fixture.targetTab.activeAgentSessionID)
+                let canonical = try fixture.workspace()
+                // Exercise both persisted carrier collections with the same tab/session IDs.
+                let recovery = WorkspaceModel(
+                    name: "Consolidated recovery", repoPaths: canonical.repoPaths, ephemeralFlag: true,
+                    isHiddenInMenus: true, consolidatedIntoWorkspaceID: canonical.id,
+                    composeTabs: [fixture.targetTab], activeComposeTabID: fixture.targetTab.id,
+                    stashedTabs: [StashedTab(tab: fixture.targetTab)]
+                )
+                manager.workspaces.insert(recovery, at: 0)
+
+                @MainActor func assertCanonicalOwner(archived: Bool = false) {
+                    let capture = AgentSessionCarrierResolver.capture(windows: [fixture.window], sessionIDs: [targetID])
+                    XCTAssertTrue(capture.ambiguousSessionIDs.isEmpty)
+                    XCTAssertTrue(capture.placementConflictSessionIDs.isEmpty)
+                    XCTAssertEqual(capture.claimedWorkspaceIDs[targetID], [canonical.id])
+                    XCTAssertEqual(capture.uniqueLocations[targetID]?.workspaceID, canonical.id)
+                    XCTAssertEqual(manager.agentSessionLifecycleWorkspaceID(tabID: fixture.targetTab.id, sessionID: targetID), archived ? nil : canonical.id)
+                    XCTAssertEqual(manager.sessionCarriers(sessionIDs: [targetID]).count, 1)
+                }
+                assertCanonicalOwner()
+                // The structural delta path must not reinsert a recovery copy into the indexes.
+                XCTAssertTrue(manager.replaceComposeTabCarriers(
+                    workspaceID: recovery.id, composeTabs: recovery.composeTabs,
+                    stashedTabs: recovery.stashedTabs + [StashedTab(tab: ComposeTabState(name: "Unrelated recovery tab", activeAgentSessionID: UUID()))]
+                ))
+                assertCanonicalOwner()
+                let savedRecovery = try XCTUnwrap(manager.workspace(withID: recovery.id))
+                try await fixture.assertReadTarget(name: "Target", pinned: false, loadedOnly: true)
+                let rename = try await fixture.call("rename", ["name": .string("Recovered lane")])
+                let pin = try await fixture.call("set_pin", ["pinned": .bool(true)])
+                let group = try await fixture.call("set_group", ["group": .string("Recovered")])
+                for reply in [rename, pin, group] {
+                    XCTAssertEqual(reply["result"], .string("applied"))
+                }
+                try fixture.assertTarget(name: "Recovered lane", pinned: true, group: "Recovered")
+                try await fixture.assertReadTarget(name: "Recovered lane", pinned: true, loadedOnly: true)
+                let inventory = try await fixture.call("inventory", ["filter": .object(["pinned": .bool(true), "loaded": .bool(true)])])
+                let row = try XCTUnwrap(inventory["sessions"]?.arrayValue?.compactMap(\.objectValue).first {
+                    $0["session_id"] == .string(targetID.uuidString)
+                })
+                XCTAssertEqual(row["group"], .string("Recovered"))
+                XCTAssertNil(inventory["unresolved_sessions"])
+                let archive = try await fixture.call("archive", [:])
+                XCTAssertEqual(archive["result"], .string("applied"))
+                try await fixture.assertReadTarget(name: "Recovered lane", pinned: true, archived: true, loadedOnly: true)
+                assertCanonicalOwner(archived: true)
+                XCTAssertEqual(manager.workspace(withID: recovery.id), savedRecovery, "Organization must not mutate recovery data")
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testResumeUsesCanonicalBindingDespiteConsolidatedRecoveryCopy() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            do {
+                let window = fixture.window
+                let viewModel = window.agentModeViewModel
+                let sessionID = try XCTUnwrap(fixture.targetTab.activeAgentSessionID)
+                let session = viewModel.session(for: fixture.targetTab.id)
+                session.hasLoadedPersistedState = true
+                _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+                    sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+                ))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                let canonical = try fixture.workspace()
+                let recovery = WorkspaceModel(
+                    name: "Resume recovery", repoPaths: [], ephemeralFlag: true,
+                    isHiddenInMenus: true, consolidatedIntoWorkspaceID: canonical.id,
+                    composeTabs: [fixture.targetTab], activeComposeTabID: fixture.targetTab.id
+                )
+                window.workspaceManager.workspaces.insert(recovery, at: 0)
+                let service = AgentManageMCPToolService(
+                    toolName: MCPWindowToolName.agentManage,
+                    captureRequestMetadata: { .init(connectionID: UUID(), clientName: "recovery-resume", windowID: window.windowID) },
+                    requireTargetWindow: { window }, resolveSpawnSourceTabID: { _ in nil },
+                    resolveSpawnParentSessionID: { _, _ in nil }, bindCurrentRequestToTab: { _, _ in },
+                    restrictDiscoveryToRoleLabels: { _ in false }
+                )
+                let reply = try await service.execute(args: ["op": .string("resume_session"), "session_id": .string(sessionID.uuidString)])
+                XCTAssertEqual(reply.objectValue?["session_id"], .string(sessionID.uuidString))
+                XCTAssertTrue(viewModel.session(for: fixture.targetTab.id, createIfNeeded: false) === session)
+                XCTAssertEqual(session.mcpControlContext?.sessionID, sessionID)
+                XCTAssertEqual(window.workspaceManager.workspace(withID: recovery.id), recovery)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testRealConflictsNameCarriersOnlyToCallersAllowedToSeeUnresolvedSessions() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+            defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+            for sameSessionID in [true, false] {
+                OverseerGlobalAutoApprove.isEnabled = { false }
+                let fixture = try await Fixture.make(isolated: true)
+                do {
+                    let canonical = try fixture.workspace()
+                    var duplicate = WorkspaceModel(
+                        name: "Hidden conflicting workspace", repoPaths: canonical.repoPaths, ephemeralFlag: true,
+                        isHiddenInMenus: true, composeTabs: [fixture.targetTab]
+                    )
+                    if !sameSessionID { duplicate.composeTabs[0].activeAgentSessionID = UUID() }
+                    fixture.window.workspaceManager.workspaces.append(duplicate)
+                    OverseerGlobalAutoApprove.isEnabled = { true }
+                    let inventory = try await fixture.call("inventory", ["filter": .object(["loaded": .bool(true)])])
+                    let unresolved = try XCTUnwrap(inventory["unresolved_sessions"]?.arrayValue?.first?.objectValue)
+                    for reply in try await [
+                        unresolved,
+                        fixture.call("get", [:]),
+                        fixture.call("set_pin", ["pinned": .bool(true), "preview": .bool(true)]),
+                        fixture.call("rename", ["name": .string("Must not apply")])
+                    ] {
+                        XCTAssertEqual(reply["code"], .string("ambiguous_binding"))
+                        let detail = try XCTUnwrap(reply["detail"]?.stringValue)
+                        XCTAssertTrue(detail.contains(duplicate.name), detail)
+                        XCTAssertTrue(detail.contains(canonical.id.uuidString), detail)
+                        XCTAssertTrue(detail.contains(duplicate.id.uuidString), detail)
+                        XCTAssertTrue(detail.contains(fixture.targetTab.id.uuidString), detail)
+                    }
+                    let unchanged = try fixture.workspace()
+                    XCTAssertEqual(unchanged.composeTabs.first { $0.id == fixture.targetTab.id }, canonical.composeTabs.first { $0.id == fixture.targetTab.id })
+                    XCTAssertEqual(unchanged.activeComposeTabID, canonical.activeComposeTabID)
+                    XCTAssertEqual(fixture.window.workspaceManager.workspace(withID: duplicate.id), duplicate)
+                    // Ambiguous workspace placement cannot authorize disclosure to a workspace scope.
+                    OverseerGlobalAutoApprove.isEnabled = { false }
+                    do {
+                        _ = try await fixture.call("get", [:])
+                        XCTFail("A restricted scope must not learn competing workspace identities")
+                    } catch {
+                        XCTAssertTrue("\(error)".contains("not available to this caller's scope"), "\(error)")
+                        XCTAssertFalse("\(error)".contains(duplicate.name))
+                    }
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+    }
+
+    func testRecoveryMarkerChangesRebuildOwnershipAndPreserveGenuineConflicts() async throws {
+        try await withStopCarrierWindows(count: 1) { windows, canonical, tab, target in
+            let window = try XCTUnwrap(windows.first)
+            let manager = window.workspaceManager
+            // Hidden alone does not revoke ownership.
+            let duplicate = WorkspaceModel(
+                name: "Real duplicate", repoPaths: canonical.repoPaths, ephemeralFlag: true,
+                isHiddenInMenus: true, composeTabs: canonical.composeTabs, activeComposeTabID: canonical.activeComposeTabID
+            )
+            manager.workspaces.insert(duplicate, at: 0)
+            @MainActor func capture() -> AgentSessionCarrierResolver.Snapshot {
+                AgentSessionCarrierResolver.capture(windows: windows, sessionIDs: [target])
+            }
+            XCTAssertTrue(capture().ambiguousSessionIDs.contains(target))
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == duplicate.id })
+            manager.workspaces[index].consolidatedIntoWorkspaceID = canonical.id
+            XCTAssertTrue(capture().ambiguousSessionIDs.isEmpty)
+            XCTAssertEqual(capture().uniqueLocations[target]?.workspaceID, canonical.id)
+            XCTAssertEqual(manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: target), canonical.id)
+            manager.workspaces[index].consolidatedIntoWorkspaceID = nil
+            XCTAssertTrue(capture().ambiguousSessionIDs.contains(target), "Restoring a copy restores its real conflict evidence")
+            manager.workspaces[index].consolidatedIntoWorkspaceID = UUID() // Missing destination is still recovery provenance.
+            manager.workspaces.removeAll { $0.id == canonical.id }
+            XCTAssertTrue(manager.sessionCarriers(sessionIDs: [target], tabIDs: [tab.id]).isEmpty)
+            XCTAssertNil(manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: target))
+            XCTAssertNil(capture().uniqueLocations[target])
+        }
+    }
+
     func testRenamePinGroupAndUndoReachWorkspaceAndSidebarWithoutChangingSelection() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let fixture = try await Fixture.make()
@@ -756,6 +939,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                         }
                         XCTAssertEqual(try fixture.workspace().composeTabs.first { $0.id == independent.id }, independent)
                         await manager.debugDrainScheduledSaves()
+                        // Scheduled saves finish at enqueue; the actual writer may still be
+                        // coalescing that payload. Join durability before reading real bytes.
+                        await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
                         let final = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
                         XCTAssertEqual(final.composeTabs.first { $0.id == fixture.targetTab.id }?.name, "Target")
                         XCTAssertEqual(final.composeTabs.first { $0.id == independent.id }, independent)
@@ -1520,11 +1706,13 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             return try XCTUnwrap(reply.objectValue)
         }
 
-        func assertReadTarget(name: String, pinned: Bool, archived: Bool = false) async throws {
+        func assertReadTarget(name: String, pinned: Bool, archived: Bool = false, loadedOnly: Bool = false) async throws {
             let get = try await call("get", [:])
             XCTAssertEqual(get["result"], .string("ok"))
             let exact = try XCTUnwrap(get["session"]?.objectValue)
-            let inventory = try await call("inventory", ["limit": .int(500)])
+            var fields: [String: Value] = ["limit": .int(500)]
+            if loadedOnly { fields["filter"] = .object(["loaded": .bool(true)]) }
+            let inventory = try await call("inventory", fields)
             XCTAssertEqual(inventory["result"], .string("ok"))
             let listed = try XCTUnwrap(inventory["sessions"]?.arrayValue?.compactMap(\.objectValue).first {
                 $0["session_id"] == .string(targetTab.activeAgentSessionID!.uuidString)

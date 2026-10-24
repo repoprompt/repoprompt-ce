@@ -7,6 +7,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         case codexLive
         case toolDerived
         case unavailable
+        case awaitingPostCompaction
 
         var label: String {
             switch self {
@@ -16,6 +17,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
                 "Estimated (tools)"
             case .unavailable:
                 "Unavailable"
+            case .awaitingPostCompaction:
+                "Awaiting post-compaction usage"
             }
         }
     }
@@ -23,6 +26,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
     struct ContextSnapshot: Equatable {
         var updatedAt: Date?
         var usedTokens: Int?
+        var awaitingPostCompactionUsage = false
         var estimatedTranscriptTokens: Int?
         var contextWindowTokens: Int?
         var usageSource: UsageSource = .unavailable
@@ -35,12 +39,24 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var selectedAgent: AgentProviderKind?
         var selectedModelRaw: String?
 
+        /// The whole transcript is not an occupancy estimate once compaction invalidated it.
+        var displayUsedTokens: Int? {
+            awaitingPostCompactionUsage ? nil : (usedTokens ?? estimatedTranscriptTokens)
+        }
+
+        var displayUsageLabel: String {
+            if awaitingPostCompactionUsage { return UsageSource.awaitingPostCompaction.label }
+            return usedTokens != nil ? usageSource.label : "Estimated"
+        }
+
         /// Context window with agent-specific fallback when the provider hasn't reported one yet.
         /// With a known agent, encoded selections (`base:effort`) resolve through
         /// `resolvedModel(forRaw:agentKind:)`; without one, only an exact raw match
         /// can be trusted because the specifier grammar is agent-specific.
         var effectiveContextWindowTokens: Int {
-            if let contextWindowTokens { return contextWindowTokens }
+            if let contextWindowTokens {
+                return contextWindowTokens
+            }
             let model: AgentModel? = if let selectedAgent {
                 AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent)
             } else {
@@ -186,7 +202,9 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             let used = last > 0 ? last : total
             next.usedTokens = used > 0 ? used : nil
             next.contextWindowTokens = codexUsage.modelContextWindow
-            next.usageSource = .codexLive
+            next.awaitingPostCompactionUsage = codexUsage.awaitingPostCompactionUsage == true
+            next.usageSource = next.awaitingPostCompactionUsage ? .awaitingPostCompaction
+                : (next.usedTokens != nil ? .codexLive : .unavailable)
         } else if let toolTotalTokens {
             next.usedTokens = toolTotalTokens
             next.contextWindowTokens = nil
@@ -256,7 +274,9 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             let used = last > 0 ? last : total
             next.usedTokens = used > 0 ? used : nil
             next.contextWindowTokens = codexUsage.modelContextWindow
-            next.usageSource = .codexLive
+            next.awaitingPostCompactionUsage = codexUsage.awaitingPostCompactionUsage == true
+            next.usageSource = next.awaitingPostCompactionUsage ? .awaitingPostCompaction
+                : (next.usedTokens != nil ? .codexLive : .unavailable)
         } else if let toolTotalTokens {
             next.usedTokens = toolTotalTokens
             next.contextWindowTokens = nil

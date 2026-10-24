@@ -529,6 +529,10 @@ actor ACPTimeoutState {
 /// Cursor's normalizer; Grok Build feeds the same shapes through it. Provider-specific
 /// suppression rules (e.g. Cursor's placeholder tools) stay in the provider normalizers.
 enum ACPToolUpdateResultAdapter {
+    /// Generated-diff input limits shared by the persistence policy and provider enrichment.
+    static let generatedDiffInputBytesLimit = 16384
+    static let generatedDiffInputLineLimit = 800
+
     static func adaptedTerminalToolUpdatePayload(_ payload: [String: Any], sessionUpdate: String) -> [String: Any] {
         guard sessionUpdate == "tool_call_update",
               let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?.lowercased(),

@@ -3,8 +3,8 @@ import Foundation
 
 /// Shared filesystem and stable-name authority for RepoPrompt MCP products.
 ///
-/// Callers select their build flavor locally and pass it explicitly so this
-/// shared target never depends on compile-configuration conditionals.
+/// Explicit identities remain available to tests and tooling; `current` is the
+/// compile-time identity used by application-state writers.
 public struct MCPFilesystemIdentity: Equatable, Sendable {
     public enum Product: String, Sendable {
         case repoPromptCE
@@ -14,6 +14,13 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
         case debug
         case release
     }
+
+    // The one build-flavor selection for app, CLI, and shared state writers.
+    #if DEBUG
+        public static let current = repoPromptCE(.debug)
+    #else
+        public static let current = repoPromptCE(.release)
+    #endif
 
     public static let currentProtocolVersion = 7
 
@@ -61,9 +68,15 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
     }
 
     public var applicationSupportDirectoryName: String {
-        switch product {
-        case .repoPromptCE:
-            "RepoPrompt CE"
+        "RepoPrompt CE"
+    }
+
+    /// Mutable session/settings state must not share the release app's files.
+    /// Already flavor-namespaced MCP discovery and installation paths stay stable.
+    public var applicationStateDirectoryName: String {
+        switch (product, buildFlavor) {
+        case (.repoPromptCE, .release): "RepoPrompt CE"
+        case (.repoPromptCE, .debug): "RepoPrompt CE Debug"
         }
     }
 

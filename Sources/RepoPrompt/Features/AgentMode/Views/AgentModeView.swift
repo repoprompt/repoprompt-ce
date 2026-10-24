@@ -2428,6 +2428,7 @@ struct AgentModeChatDetailView: View {
                     .foregroundColor(.secondary)
             }
         }
+        AgentRepromptQuestionsView(viewModel: agentModeVM, store: agentModeVM.repromptUIStore, tabID: currentTabID)
         runningIndicatorSlot
         DelegationApprovalSlot(
             windowID: windowID,

@@ -77,7 +77,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         )
         visibleIDs.formUnion(full.unresolvedSessions.keys.filter { visibility.mayDiscloseUnresolved($0) })
         visibleIDs.formUnion(batch.admittedSessionIDs.filter { full.unresolvedSessions[$0] != nil })
-        let snapshot = full.restricted(to: visibleIDs)
+        let snapshot = full.restricted(to: visibleIDs, includingUnresolvedDetails: visibility.mayDiscloseCompetingCarriers)
         let unresolved = AgentSessionInventoryRendering.unresolvedFields(snapshot)
         func readValue(_ fields: [String: Value]) -> Value {
             .object(fields.merging(unresolved) { _, diagnostic in diagnostic })
@@ -85,7 +85,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         // An exact get has current app-owned target leases. An unresolved binding must return
         // its reason, never a usable row or a stale history substitute.
         if exactGet, let target = batch.admittedSessionIDs.first, let reason = full.unresolvedSessions[target] {
-            var result = AgentSessionInventoryRendering.unresolvedValue(id: target, reason: reason).objectValue ?? [:]
+            var result = AgentSessionInventoryRendering.unresolvedValue(id: target, reason: reason, detail: snapshot.unresolvedDetails[target]).objectValue ?? [:]
             result["result"] = .string("not_applied")
             return .object(result)
         }

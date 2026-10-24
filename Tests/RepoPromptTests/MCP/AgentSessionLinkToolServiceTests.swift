@@ -1491,7 +1491,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     }
 
     private func withActivatedLaneFixture(_ body: (ReadReleaseFixture) async throws -> Void) async throws {
-        let fixture = try await makeReadReleaseFixture()
+        var fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let currentReference = await fixture.linkReference()
         let reference = try XCTUnwrap(currentReference)
@@ -1507,7 +1507,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("activated-lane-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        fixture.bridge.installIntentStore(AgentSessionOversightIntentStore(fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename), backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled))
+        let fileURL = directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+        fixture.intentStoreFileURL = fileURL
+        let store = AgentSessionOversightIntentStore(fileURL: fileURL, backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled)
+        fixture.intentStore = store
+        fixture.bridge.installIntentStore(store)
         try await body(fixture)
     }
 
@@ -1537,9 +1541,16 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 XCTAssertEqual(created["first_task"], .string("delivered"))
                 try laneIDs.append(XCTUnwrap(created["session_id"]))
             }
-            XCTAssertEqual(Set(laneIDs.compactMap(\.stringValue)).count, 2)
+            let laneSessionIDs = try laneIDs.map { try XCTUnwrap($0.stringValue.flatMap(UUID.init(uuidString:))) }
+            XCTAssertEqual(Set(laneSessionIDs).count, 2)
             XCTAssertEqual(fixture.host.firstTaskRequests.map(\.message), ["LANE_OK", "LANE_OK"])
+            XCTAssertEqual(fixture.host.firstTaskTargetSessionIDs, laneSessionIDs, "Each returned lane must receive its own first task")
             XCTAssertEqual(fixture.host.lastLaneSelection?.role, .explore)
+            let expectedIntents = Set(laneSessionIDs.map {
+                AgentSessionOversightIntent(observerSessionID: fixture.observer.sessionID, targetSessionID: $0)
+            })
+            let persistedBeforeRetirement = try await fixture.readPersistedIntents()
+            XCTAssertEqual(persistedBeforeRetirement, expectedIntents, "Both exact pairs must be durable before cleanup is exercised")
             let polled = try await Self.executeObject(fixture.service, args: [
                 "op": .string("poll"), "session_ids": .array(laneIDs)
             ])
@@ -1572,6 +1583,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let inventory = await fixture.bridge.oversightInventory()
             XCTAssertTrue(inventory.live.isEmpty)
             XCTAssertTrue(inventory.persisted.isEmpty, "Retirement removes the durable intent, not just its live grant")
+            let persistedAfterRetirement = try await fixture.readPersistedIntents()
+            XCTAssertTrue(persistedAfterRetirement.isEmpty, "Fresh storage readback must not restore either retired pair")
             XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace, workspaceBefore)
             XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, tabBefore)
         }
@@ -1589,7 +1602,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: .enabled
         ))
-        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let workspace = await installLaneWorkspace(in: fixture.window)
         let args: [String: Value] = [
             "op": .string("create_lane"),
             "idempotency_key": .string("service-replay-1"),
@@ -1659,7 +1672,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let workspace = await installLaneWorkspace(in: fixture.window)
         let byName = AgentSessionLaneMCPToolService.resolveDestination(
             workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
         )
@@ -4278,9 +4291,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         var acceptFirstTasks = false
         var firstTaskRequests: [AgentSessionLinkSendRequest] = []
+        var firstTaskTargetSessionIDs: [UUID] = []
 
         func agentSessionLinkPerformSend(
-            to _: AgentSessionLinkEndpointCandidate,
+            to candidate: AgentSessionLinkEndpointCandidate,
             request: AgentSessionLinkSendRequest,
             liveness: @escaping AgentSessionLinkSendLivenessProbe,
             commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
@@ -4290,6 +4304,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             guard commit == .committed else { return .blocked(commit.refusal) }
             guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
             firstTaskRequests.append(request)
+            firstTaskTargetSessionIDs.append(candidate.sessionID)
             return .delivered(.init(targetItemID: UUID(), acceptedAt: Date(), deliveryState: .runStarted, resultingRunState: "running"))
         }
 
@@ -4351,6 +4366,27 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let observer: AgentSessionLinkEndpointCandidate
         let target: AgentSessionLinkEndpointCandidate
         let service: AgentSessionLinkMCPToolService
+        var intentStoreFileURL: URL?
+        var intentStore: AgentSessionOversightIntentStore?
+
+        @MainActor
+        func readPersistedIntents() async throws -> Set<AgentSessionOversightIntent> {
+            // Continuity saving is asynchronous; join its owning writer before reading disk.
+            let writer = try XCTUnwrap(intentStore)
+            await writer.serializationBarrier()
+            let fileURL = try XCTUnwrap(intentStoreFileURL)
+            let store = AgentSessionOversightIntentStore(
+                fileURL: fileURL,
+                backupsDirectoryURL: fileURL.deletingLastPathComponent().appendingPathComponent("Backups"),
+                mode: .enabled
+            )
+            let load = await store.loadForLaunch()
+            let pairs: Set<AgentSessionOversightIntent>? = switch load {
+            case let .ready(ready): Set(ready.tokenByPair.keys)
+            default: nil
+            }
+            return try XCTUnwrap(pairs, "A fresh intent store must successfully read durable continuity")
+        }
 
         func linkReference() async -> DomainAgentSessionLinkReference? {
             let inventory = await authority.links(forObserver: observer.sessionID)
@@ -4412,6 +4448,16 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             locationLabel: "worktree/main",
             restorationReadiness: .authoritative(token, .persistedPayloadApplied)
         )
+    }
+
+    /// Lane routing tests need a known active destination, not whichever startup
+    /// selection wins scheduling in an otherwise inert tool-service fixture.
+    private func installLaneWorkspace(in window: WindowState) async -> WorkspaceModel {
+        await window.workspaceManager.awaitInitialized()
+        let workspace = WorkspaceModel(name: "Lane destination fixture", repoPaths: [])
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        return workspace
     }
 
     /// One granted oversight link over a real authority, plus a tool service wired to it.

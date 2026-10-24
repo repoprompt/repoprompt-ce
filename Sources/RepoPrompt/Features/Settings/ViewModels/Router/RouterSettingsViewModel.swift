@@ -338,6 +338,11 @@ final class RouterSettingsViewModel: ObservableObject {
         synchronizeConfiguration()
     }
 
+    func setUsageBalancingOverride(_ enabled: Bool) {
+        settingsStore.setUsageBalancingOverride(enabled)
+        synchronizeConfiguration()
+    }
+
     func setAllowPaidFastRouting(_ enabled: Bool) {
         settingsStore.setAllowPaidFastRouting(enabled)
         synchronizeConfiguration()

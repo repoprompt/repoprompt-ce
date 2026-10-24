@@ -9,6 +9,129 @@ import RepoPromptSettingsCore
 
     final class PersistedMCPRoutingIdentityTests: XCTestCase {
         @MainActor
+        func testAppManagedAdmissionRequiresObservedHelperAndCurrentRunOwnership() async throws {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            let clientName = AgentProviderKind.claudeMCPClientID
+            let runID = UUID()
+            let token = "app-managed-admission-\(runID)"
+            addTeardownBlock { @MainActor in
+                await manager.clearExpectedAgentPID(getppid(), for: clientName, runID: runID)
+                await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
+                await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+
+            await manager.registerExpectedAgentPID(getppid(), for: clientName, runID: runID)
+            func installPolicy(ttl: TimeInterval = 60) async {
+                await manager.installClientConnectionPolicy(
+                    for: clientName, windowID: window.windowID,
+                    restrictedTools: ["apply_edits"], oneShot: true,
+                    ttl: ttl, runID: runID, purpose: .agentModeRun, requiresExpectedAgentPID: true
+                )
+            }
+            await installPolicy()
+            // A real MCP initialize with the provider's name reaches the production admission
+            // predicate. Only executable verification is substituted: XCTest is not a bundled helper.
+            // The socket fixture carries explicit observed identity and uses real process ancestry.
+            let initial = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: token,
+                requireAppManagedAdmission: true
+            )
+            addTeardownBlock { await initial.cleanup() }
+            func isAdmitted(_ connectionID: UUID, verifiedPID: Int = Int(getpid())) async -> Bool {
+                await manager.authorizeAutomaticAppManagedAgentAdmission(
+                    connectionID: connectionID, clientName: clientName, verifiedBundledHelperPID: verifiedPID
+                )
+            }
+            let pendingBefore = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertEqual(pendingBefore.count, 1, "Admission must not consume the one-shot routing policy")
+
+            await manager.debugSetObservedPeerPIDForTesting(nil, connectionID: initial.connectionID)
+            let missingObserved = await isAdmitted(initial.connectionID)
+            XCTAssertFalse(missingObserved, "The fixture's claimed PID must not substitute for observed identity")
+            await manager.debugSetObservedPeerPIDForTesting(Int(getpid()), connectionID: initial.connectionID)
+            let mismatchedVerification = await isAdmitted(initial.connectionID, verifiedPID: Int(getppid()))
+            XCTAssertFalse(mismatchedVerification)
+
+            await manager.clearExpectedAgentPID(getppid(), for: clientName, runID: runID)
+            await manager.registerExpectedAgentPID(1, for: clientName, runID: runID)
+            let unrelatedSameName = await isAdmitted(initial.connectionID)
+            XCTAssertFalse(unrelatedSameName, "A provider display name and unrelated run must still require approval")
+            await manager.clearExpectedAgentPID(1, for: clientName, runID: runID)
+            await manager.registerExpectedAgentPID(getppid(), for: clientName, runID: runID)
+
+            let initialAuthorized = await isAdmitted(initial.connectionID)
+            XCTAssertTrue(initialAuthorized)
+            // Both initializes see the same unconsumed one-shot policy. Complete the first
+            // before allowing the contender to continue across the approval/policy handoff.
+            let contender = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: "contender-\(token)",
+                requireAppManagedAdmission: true
+            )
+            addTeardownBlock { await contender.cleanup() }
+            let initialCompleted = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: initial.connectionID,
+                sessionToken: token, clientPid: Int(getpid())
+            )
+            XCTAssertTrue(initialCompleted)
+            let contenderCompleted = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: contender.connectionID,
+                sessionToken: "contender-\(token)", clientPid: Int(getpid())
+            )
+            XCTAssertFalse(contenderCompleted, "Consumed policy must not degrade automatic approval to unrestricted fallback")
+            let contenderRun = await manager.debugCachedRunID(for: contender.connectionID)
+            XCTAssertNil(contenderRun)
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), initial.connectionID)
+            let pendingAfter = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pendingAfter.isEmpty)
+
+            let unrelatedToken = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: "unrelated-\(token)"
+            )
+            addTeardownBlock { await unrelatedToken.cleanup() }
+            let newTokenAdmitted = await isAdmitted(unrelatedToken.connectionID)
+            XCTAssertFalse(newTokenAdmitted, "Ancestry alone must not bypass one-shot policy consumption")
+            let reconnect = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: token,
+                requireAppManagedAdmission: true
+            )
+            addTeardownBlock { await reconnect.cleanup() }
+            let reconnectAdmitted = await isAdmitted(reconnect.connectionID)
+            XCTAssertTrue(reconnectAdmitted, "A live token plus expected ancestry may reconnect")
+            let reconnectCompleted = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: reconnect.connectionID,
+                sessionToken: token, clientPid: Int(getpid())
+            )
+            XCTAssertTrue(reconnectCompleted)
+
+            await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+            let retiredRun = await isAdmitted(reconnect.connectionID)
+            XCTAssertFalse(retiredRun)
+            await installPolicy(ttl: -1)
+            let expiredPolicy = await isAdmitted(unrelatedToken.connectionID)
+            XCTAssertFalse(expiredPolicy)
+            await installPolicy()
+            let authorizedBeforeRetirement = await isAdmitted(unrelatedToken.connectionID)
+            XCTAssertTrue(authorizedBeforeRetirement)
+            await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+            let retiredHandoff = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: unrelatedToken.connectionID,
+                sessionToken: "unrelated-\(token)", clientPid: Int(getpid())
+            )
+            XCTAssertFalse(retiredHandoff, "Retirement during approval must reject the saved handoff proof")
+            let leftoverPolicy = await isAdmitted(unrelatedToken.connectionID)
+            XCTAssertFalse(leftoverPolicy, "A leftover queued policy cannot resurrect a retired run")
+            await manager.stop()
+            let stoppedLifecycle = await isAdmitted(initial.connectionID)
+            XCTAssertFalse(stoppedLifecycle)
+        }
+
+        @MainActor
         func testExpectedPIDAloneDoesNotJoinEstablishedRunButTokenAndPendingPolicyDo() async {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
@@ -1094,7 +1217,8 @@ import RepoPromptSettingsCore
         private func makeProductionMCPConnection(
             networkManager: ServerNetworkManager,
             clientName: String,
-            sessionToken: String
+            sessionToken: String,
+            requireAppManagedAdmission: Bool = false
         ) async throws -> Issue862ProductionMCPConnection {
             var descriptors = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
@@ -1132,9 +1256,16 @@ import RepoPromptSettingsCore
                 pendingClientID: clientName
             )
             _ = await networkManager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+            await networkManager.debugSetObservedPeerPIDForTesting(Int(getpid()), connectionID: connectionID)
 
             do {
-                try await connectionManager.start { $0.name == clientName }
+                try await connectionManager.start { info in
+                    guard info.name == clientName else { return false }
+                    guard requireAppManagedAdmission else { return true }
+                    return await networkManager.authorizeAutomaticAppManagedAgentAdmission(
+                        connectionID: connectionID, clientName: info.name, verifiedBundledHelperPID: Int(getpid())
+                    )
+                }
                 let client = Client(name: clientName, version: "1.0")
                 _ = try await client.connect(transport: clientTransport)
                 return Issue862ProductionMCPConnection(

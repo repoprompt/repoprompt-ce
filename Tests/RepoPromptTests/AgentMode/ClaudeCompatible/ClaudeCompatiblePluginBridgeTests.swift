@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
@@ -360,3 +361,258 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         }
     }
 }
+
+#if DEBUG
+    @MainActor
+    final class ClaudeCompactionContextUsageTests: XCTestCase {
+        func testProviderSwitchClearsPendingClaudeCompactionUsage() throws {
+            let viewModel = AgentModeViewModel(
+                testWindowID: -972,
+                testWorkspacePath: FileManager.default.currentDirectoryPath,
+                codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Provider switch must not launch a provider") },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpServerEnabler: { true }
+            )
+            let session = viewModel.session(for: UUID())
+            defer { session.saveDebounceTask?.cancel() }
+            session.selectedAgent = .claudeCode
+            session.appendItem(.user("Historical transcript retained across the provider switch."))
+            session.codexContextUsage = AgentContextUsage(
+                modelContextWindow: 200_000,
+                lastTotalTokens: nil,
+                totalTotalTokens: nil,
+                awaitingPostCompactionUsage: true
+            )
+            let sidebar = AgentRuntimeSidebarViewModel()
+            func refreshSidebar() {
+                sidebar.update(
+                    snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                    codexUsage: session.codexContextUsage
+                )
+            }
+            refreshSidebar()
+            XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertNil(sidebar.snapshot.displayUsedTokens)
+
+            viewModel.test_codexCoordinator.handleProviderSwitch(from: .claudeCode, to: .openCode, session: session)
+            session.selectedAgent = .openCode
+            refreshSidebar()
+
+            XCTAssertNil(session.codexContextUsage?.awaitingPostCompactionUsage)
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 200_000)
+            XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+            XCTAssertGreaterThan(try XCTUnwrap(sidebar.snapshot.displayUsedTokens), 0)
+            XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Estimated")
+        }
+
+        func testCompactionBoundaryInvalidatesRingUntilFreshOccupancyArrives() async throws {
+            for trigger in ["manual", "auto"] {
+                let viewModel = AgentModeViewModel(
+                    testWindowID: -972,
+                    testWorkspacePath: FileManager.default.currentDirectoryPath,
+                    codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Replay must not launch a provider") },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpServerEnabler: { true }
+                )
+                let session = viewModel.session(for: UUID())
+                defer { session.saveDebounceTask?.cancel() }
+                session.selectedAgent = .claudeCode
+                session.appendItem(.user(String(repeating: "Pre-compaction transcript context. ", count: 1000)))
+                let runID = UUID()
+                let attemptID = UUID()
+                session.installRunID(runID)
+                session.beginRunAttempt(source: "compaction-replay", attemptID: attemptID)
+                var translator = ClaudeSDKNDJSONTranslator()
+                let sidebar = AgentRuntimeSidebarViewModel()
+                func consume(_ line: String) async throws {
+                    var envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                    envelope["session_id"] = "72c65f88-2b76-4406-9b32-93d61df09272"
+                    envelope["uuid"] = UUID().uuidString
+                    for result in try translator.parseNDJSONLine(JSONSerialization.data(withJSONObject: envelope)) {
+                        await viewModel.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+                    }
+                    sidebar.update(
+                        snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                        codexUsage: session.codexContextUsage
+                    )
+                }
+                let usage = #"{"type":"assistant","message":{"id":"msg_before_compaction","role":"assistant","content":[],"usage":{"input_tokens":1000,"cache_read_input_tokens":149000,"output_tokens":10}}}"#
+                let result = #"{"type":"result","subtype":"success","is_error":false,"result":"Done","duration_ms":100,"duration_api_ms":100,"num_turns":1,"total_cost_usd":0,"usage":{"input_tokens":150000,"output_tokens":10},"modelUsage":{"claude-sonnet-4-6":{"contextWindow":200000}}}"#
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Earlier turn")
+                try await consume(usage)
+                try await consume(result)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 150_000)
+                try await consume(#"{"type":"system","subtype":"task_notification","task_id":"worker-1","status":"completed","summary":"Context compacted inside worker task"}"#)
+                try await consume(#"{"type":"system","message":"The worker reported context compacted successfully"}"#)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 150_000, "Task prose is not a compaction boundary")
+                XCTAssertFalse(session.providerTokenUsageByTurn.contains(where: \.contextCompacted))
+
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "/compact")
+                // Automatic compaction can occur after this turn already reported its old context.
+                if trigger == "auto" { try await consume(usage) }
+                try await consume(#"{"type":"system","subtype":"status","status":"compacting"}"#)
+                try await consume("{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"\(trigger)\",\"pre_tokens\":150000}}")
+                XCTAssertNil(session.contextUsageSnapshot?.used, trigger)
+                XCTAssertNil(sidebar.snapshot.usedTokens, trigger)
+                XCTAssertEqual(sidebar.snapshot.contextWindowTokens, 200_000)
+                XCTAssertNotNil(session.contextUsageSnapshot?.compactedAt)
+                XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage)
+                XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Awaiting post-compaction usage")
+                XCTAssertNotEqual(sidebar.snapshot.usageSource, .codexLive)
+                XCTAssertGreaterThan(try XCTUnwrap(sidebar.snapshot.estimatedTranscriptTokens), 0)
+                XCTAssertNil(sidebar.snapshot.displayUsedTokens, "Never substitute the whole historical transcript while pending")
+                XCTAssertNil(session.activeNonCodexTurnTokenAccumulator?.observedContextUsedTokens)
+
+                if trigger == "auto" {
+                    // Auto-compaction continues the SAME turn with a new API context before result.
+                    try await consume(#"{"type":"assistant","message":{"id":"msg_after_auto","role":"assistant","content":[],"usage":{"input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":10}}}"#)
+                    try await consume(result)
+                    XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                    XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                    viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Unmeasured after recovery")
+                    try await consume(result)
+                    XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                    XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                    continue
+                }
+
+                // Init has no post-compaction size; result usage is billed aggregate, not occupancy.
+                try await consume(#"{"type":"system","subtype":"init","session_id":"compact-fixture","model":"claude-sonnet-4-6"}"#)
+                await viewModel.test_handleStreamResult(
+                    AIStreamResult(type: "usage", text: nil, promptTokens: 150_000),
+                    session: session, runID: runID, runAttemptID: attemptID
+                )
+                XCTAssertNil(session.contextUsageSnapshot?.used, "Billed input alone cannot establish post-compaction occupancy")
+                try await consume(result)
+                XCTAssertNil(sidebar.snapshot.usedTokens, "Finalization must not restore old context")
+                XCTAssertNil(session.providerTokenUsageByTurn.last?.contextUsedTokens)
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Continue")
+                try await consume(result)
+                XCTAssertNil(sidebar.snapshot.usedTokens, "Unmeasured later turns must remain unknown")
+
+                viewModel.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: "Fresh measurement")
+                try await consume(#"{"type":"assistant","message":{"id":"msg_after_manual_compaction","role":"assistant","content":[],"usage":{"input_tokens":2000,"cache_read_input_tokens":8000,"output_tokens":10}}}"#)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                XCTAssertFalse(sidebar.snapshot.awaitingPostCompactionUsage)
+                try await consume(result)
+                XCTAssertEqual(sidebar.snapshot.usedTokens, 10000)
+                XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 10000)
+            }
+        }
+
+        func testCompactionFenceRoundTripAndLegacyUsageDecoding() throws {
+            let legacy = Data(#"{"promptTokens":150000,"completionTokens":10,"contextUsedTokens":150000,"timestamp":0}"#.utf8)
+            let old = try JSONDecoder().decode(AgentTokenUsagePersist.self, from: legacy)
+            XCTAssertFalse(old.contextCompacted)
+            let oldSnapshot = try JSONDecoder().decode(AgentContextUsage.self, from: Data(#"{"modelContextWindow":200000,"lastTotalTokens":150000,"totalTotalTokens":150000}"#.utf8))
+            XCTAssertNotEqual(oldSnapshot.awaitingPostCompactionUsage, true)
+            let sidebar = AgentRuntimeSidebarViewModel()
+            sidebar.update(
+                snapshot: AgentTranscriptAnalyticsSnapshot(estimatedTranscriptTokens: 1000),
+                codexUsage: AgentContextUsage(modelContextWindow: 200_000, lastTotalTokens: nil, totalTotalTokens: nil)
+            )
+            XCTAssertEqual(sidebar.snapshot.usageSource, .unavailable, "A window without occupancy is not Live")
+            XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Estimated")
+            let fence = AgentTokenUsagePersist(promptTokens: 0, completionTokens: 0, contextCompacted: true)
+            let unmeasured = AgentTokenUsagePersist(promptTokens: 42, completionTokens: 5)
+            let rows = try JSONDecoder().decode([AgentTokenUsagePersist].self, from: JSONEncoder().encode([old, fence, unmeasured]))
+            XCTAssertEqual(rows, [old, fence, unmeasured])
+            XCTAssertEqual(rows.map(\.providerTotalTokens).reduce(0, +), 150_057, "A compaction fence is not billable usage")
+            let pending = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+            XCTAssertNil(pending?.lastTotalTokens)
+            XCTAssertEqual(pending?.awaitingPostCompactionUsage, true, "The fence works even without a known window")
+            let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
+            let recovered = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
+            XCTAssertEqual(recovered?.lastTotalTokens, 10000)
+            XCTAssertNotEqual(recovered?.awaitingPostCompactionUsage, true)
+        }
+
+        func testPendingOccupancySurvivesHydrationAndHistoryReopen() async throws {
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeCompactionHydration-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            defer {
+                for session in window.agentModeViewModel.sessions.values {
+                    session.saveDebounceTask?.cancel()
+                }
+                WindowStatesManager.shared.unregisterWindowState(window)
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            }
+            await window.workspaceManager.awaitInitialized()
+            let workspace = window.workspaceManager.createWorkspace(name: "Compaction hydration", repoPaths: [root.path], ephemeral: true)
+            await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "compactionHydrationTests")
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+            let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == activeWorkspace.id })
+            window.workspaceManager.workspaces[index].customStoragePath = root.appendingPathComponent("sessions", isDirectory: true)
+            let oldRequest = AgentChatItem.user(String(repeating: "Old context. ", count: 1000))
+            let storedTranscript = AgentTranscript(turns: [AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: oldRequest),
+                terminalState: .completed,
+                startedAt: oldRequest.timestamp,
+                completedAt: oldRequest.timestamp
+            )], nextSequenceIndex: 1)
+            let compactedAt = Date(timeIntervalSince1970: 100)
+            let rows = [
+                AgentTokenUsagePersist(promptTokens: 150_000, completionTokens: 10, contextUsedTokens: 150_000),
+                AgentTokenUsagePersist(promptTokens: 0, completionTokens: 0, contextCompacted: true, timestamp: compactedAt),
+                AgentTokenUsagePersist(promptTokens: 150_000, completionTokens: 10)
+            ]
+            let viewModel = window.agentModeViewModel
+            func save(_ usage: [AgentTokenUsagePersist], staleStoredCount: Int? = nil) async throws -> UUID {
+                let id = UUID()
+                let persisted = AgentSession(
+                    id: id, workspaceID: activeWorkspace.id, composeTabID: tabID, name: "Compacted Claude",
+                    transcript: storedTranscript, agentKind: AgentProviderKind.claudeCode.rawValue,
+                    agentModel: "claude-sonnet-4-6", lastRunState: "completed", providerTokenUsageByTurn: usage,
+                    codexContextWindow: 200_000, codexLastTotalTokens: staleStoredCount, codexTotalTotalTokens: staleStoredCount
+                )
+                _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: window.workspaceManager.workspaces[index])
+                return id
+            }
+            func assertPending(_ session: AgentTabSession, file: StaticString = #filePath, line: UInt = #line) {
+                let sidebar = AgentRuntimeSidebarViewModel()
+                XCTAssertFalse(session.transcript.turns.isEmpty, file: file, line: line)
+                sidebar.update(
+                    snapshot: AgentTranscriptAnalyticsBuilder.build(from: session.transcript, selectedAgent: session.selectedAgent),
+                    codexUsage: session.codexContextUsage
+                )
+                XCTAssertGreaterThan(sidebar.snapshot.estimatedTranscriptTokens ?? 0, 0, file: file, line: line)
+                XCTAssertNil(sidebar.snapshot.displayUsedTokens, file: file, line: line)
+                XCTAssertEqual(sidebar.snapshot.displayUsageLabel, "Awaiting post-compaction usage", file: file, line: line)
+                XCTAssertTrue(sidebar.snapshot.awaitingPostCompactionUsage, file: file, line: line)
+                XCTAssertNil(session.codexContextUsage?.lastTotalTokens, file: file, line: line)
+                XCTAssertEqual(session.contextCompactedAt, compactedAt, file: file, line: line)
+            }
+            let initialID = try await save(rows)
+            let initial = viewModel.session(for: tabID)
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: initialID, on: initial, updateWorkspaceMetadata: true))
+            initial.hasLoadedPersistedState = false
+            let hydrated = await viewModel.ensureSessionReady(tabID: tabID)
+            XCTAssertTrue(hydrated.permitsBoundOperationAndSave)
+            assertPending(hydrated)
+
+            // A different saved conversation takes the history-route hydration branch, not ensure-ready's fast path.
+            let historyID = try await save(rows, staleStoredCount: 150_000)
+            let routed = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: historyID, workspace: window.workspaceManager.workspaces[index])
+            XCTAssertEqual(routed, .ready)
+            let reopened = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertEqual(reopened.activeAgentSessionID, historyID)
+            assertPending(reopened)
+
+            let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
+            let recoveredID = try await save(rows + [fresh, AgentTokenUsagePersist(promptTokens: 500, completionTokens: 5)])
+            let recoveredRoute = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: recoveredID, workspace: window.workspaceManager.workspaces[index])
+            XCTAssertEqual(recoveredRoute, .ready)
+            let recovered = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertEqual(recovered.codexContextUsage?.lastTotalTokens, 10000)
+            XCTAssertNotEqual(recovered.codexContextUsage?.awaitingPostCompactionUsage, true)
+        }
+    }
+#endif
