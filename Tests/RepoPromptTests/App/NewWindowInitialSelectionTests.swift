@@ -7,6 +7,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import SwiftUI
 import XCTest
 
@@ -18,6 +19,355 @@ import XCTest
     @MainActor
     final class NewWindowInitialSelectionTests: XCTestCase {
         private typealias Fixture = NewWindowInitialSelectionFixture
+
+        // MARK: Off-main catalog preparation and its new suspension boundary
+
+        func testCoveringManagerReconciliationDuringPreparationCreditsBridgeWithoutReadoptingModels() async throws {
+            for coveringPreparation in [1, 2] {
+                try await Fixture.run { f in
+                    let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                    let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let gate = f.makeGate()
+                    let entered = Signal("initial preparation ready before manager reconciliation")
+                    var preparations = 0
+                    bridge.catalogPreparationDidFinishForTesting = { _ in
+                        preparations += 1
+                        if preparations < coveringPreparation {
+                            manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                            return
+                        }
+                        entered.fire()
+                        await gate.wait()
+                    }
+                    window.restartDomainWorkspaceProjectionForTesting()
+                    try await f.wait(entered)
+                    let catalog = await f.runtime.workspaceStore.snapshot()
+                    let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                        catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    let tab = try XCTUnwrap(workspace.composeTabs.first)
+                    let title = "Local descendant of the covering reconciliation"
+                    manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
+                        value.name = title
+                    }
+                    manager.markWorkspaceDirty(workspaceID: workspace.id)
+                    let adoptions = catalog.workspaces.map {
+                        manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                    }
+                    gate.release()
+                    let accepted = try await f.awaitCatalogProjection(window)
+                    XCTAssertEqual(preparations, coveringPreparation, "handoff must not trigger a third decode")
+                    XCTAssertEqual(receipt.kind, .full)
+                    XCTAssertEqual(accepted.catalogReceipt?.kind, .metadata)
+                    XCTAssertEqual(catalog.workspaces.map {
+                        manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                    }, adoptions, "the bridge must not replace already-qualified document lineages")
+                    XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
+                    XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                }
+            }
+        }
+
+        func testFinalPreparationHandoffPreservesNewerCatalogFailure() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("final preparation ready before covering reconciliation")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                        return
+                    }
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertTrue(manager.reportDomainCatalogFailure(
+                    .modelProjection("newer independent failure"), snapshot: catalog,
+                    attempt: manager.beginDomainCatalogAttempt()
+                ))
+                let failure = manager.workspaceChooserPresentation.failure
+                let issue = manager.domainWorkspaceAuthorityIssue
+                gate.release()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .metadata)
+                XCTAssertEqual(preparations, 2)
+                XCTAssertNotNil(failure)
+                XCTAssertEqual(manager.workspaceChooserPresentation.failure, failure)
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue, issue)
+            }
+        }
+
+        func testFinalPreparationHandoffRejectsRevokedFullDocumentBaseline() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("final preparation ready before covering reconciliation")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                        return
+                    }
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let models = manager.workspaces
+                let repair = Task { @MainActor in
+                    await manager.reconcileDuplicateCleanupAuthorityAfterFailedSaveForTesting()
+                }
+                repair.cancel()
+                let reconciled = await repair.value
+                XCTAssertFalse(reconciled)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+                let resolved = events.resolution(through: catalog.publicationSequence)
+                gate.release()
+                try await f.wait(resolved)
+                XCTAssertEqual(preparations, 2, "a revoked baseline must not authorize a third decode")
+                XCTAssertTrue(events.catalogCheckpoints.isEmpty)
+                XCTAssertNil(bridge.projectionObservationStateForTesting.checkpoint)
+                XCTAssertEqual(manager.workspaces, models)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+            }
+        }
+
+        func testPointAdoptedDescendantSurvivesFirstBridgeCatalogPreparation() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let tab = try XCTUnwrap(workspace.composeTabs.first)
+                let title = "Point-adopted descendant before first bridge projection"
+                manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
+                    value.name = title
+                }
+                manager.markWorkspaceDirty(workspaceID: workspace.id)
+                let adoptions = catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
+                XCTAssertEqual(catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }, adoptions)
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+            }
+        }
+
+        func testCancelledRepairFenceDuringPreparationForcesUnchangedRecordDecode() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("partial decode plan ready before independent repair fence")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        entered.fire()
+                        await gate.wait()
+                    }
+                }
+                let added = try await f.commitWorkspace(named: "Repair fence race", window: window, awaitProjection: false)
+                try await f.wait(entered)
+                var fencedDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    guard id == Fixture.aardvarkID else { return nil }
+                    fencedDecodes += 1
+                    return NSError(domain: "PreparationFenceRegression", code: 1)
+                }
+                // This real repair raises its independent fence before observing cancellation.
+                // It accepts no catalog and changes no model, dirty counter or publication floor.
+                let repair = Task { @MainActor in
+                    await manager.reconcileDuplicateCleanupAuthorityAfterFailedSaveForTesting()
+                }
+                repair.cancel()
+                let reconciled = await repair.value
+                XCTAssertFalse(reconciled)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+                let readsBeforeRelease = fencedDecodes
+                gate.release()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertGreaterThan(fencedDecodes, readsBeforeRelease, "the pre-fence reuse plan must not certify an unchanged cached member")
+                XCTAssertGreaterThan(preparations, 1)
+                XCTAssertNotNil(manager.workspaceChooserPresentation.failure)
+                XCTAssertNotNil(manager.workspace(withID: added.id))
+            }
+        }
+
+        func testPointAuthorityOutcomeInvalidatesPreparationWithoutPublishingModels() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                await manager.awaitInitialized()
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12060)
+                let initial = await client.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                var changed = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                changed.currentPromptText = "A peer's canonical working edit"
+                let outcome = try await client.replaceWorkingFailClosed(
+                    changed, fileURL: record.document.fileURL,
+                    expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(outcome.disposition, .applied)
+                let latest = await client.snapshot()
+                let canonical = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == changed.id })
+                let witness = manager.catalogPreparationWitness
+                let models = manager.workspaces
+                let reconciliation = manager.domainCatalogReconciliationGeneration
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: changed.id, revisions: canonical.revisions,
+                    digest: canonical.document.contentDigest, health: canonical.health,
+                    catalogRevision: latest.catalogRevision
+                )
+                XCTAssertEqual(manager.workspaces, models, "a point outcome has not adopted the peer's full document")
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, reconciliation)
+                XCTAssertEqual(manager.catalogPreparationWitness.publicationSerial, witness.publicationSerial)
+                XCTAssertNil(manager.qualifiedDomainWorkspaceDescendant(canonical), "point revision knowledge must never certify an unadopted document")
+                XCTAssertNotEqual(manager.catalogPreparationWitness, witness, "revision/digest knowledge invalidates suspended preparation independently")
+            }
+        }
+
+        func testLargePreparedDocumentPreservesBytesCASAndDurableSelectedTab() async throws {
+            try await Fixture.run { f in
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12061)
+                let initial = await client.snapshot()
+                let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                var workspace = try XCTUnwrap(f.decoded(initial).first { $0.id == Fixture.aardvarkID })
+                let date = Date(timeIntervalSince1970: 1_234_567_890)
+                workspace.composeTabs = (0 ..< 1603).map { index in
+                    ComposeTabState(name: "Session \(index)", lastModified: date, promptText: String(repeating: "immutable preparation ", count: 48))
+                }
+                workspace.activeComposeTabID = workspace.composeTabs[1100].id
+                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: record.document.fileURL)
+                let reference = try DomainWorkspaceAuthorityClient.document(for: workspace, fileURL: record.document.fileURL)
+                XCTAssertEqual(document.documentBytes, reference.documentBytes)
+                XCTAssertEqual(document.contentDigest, reference.contentDigest)
+                let saved = try await client.saveFailClosed(
+                    document, expectedWorkspaceRevision: record.revisions.workingRevision,
+                    expectedContentDigest: record.document.contentDigest
+                )
+                XCTAssertEqual(saved.working?.disposition, .applied)
+                XCTAssertEqual(saved.saved?.disposition, .applied)
+                let durable = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: Data(contentsOf: record.document.fileURL), fileURL: record.document.fileURL
+                )
+                XCTAssertEqual(durable.composeTabs, workspace.composeTabs)
+                XCTAssertEqual(durable.activeComposeTabID, workspace.activeComposeTabID)
+                let stale = try await client.replaceWorkingFailClosed(
+                    reference, expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(stale.disposition, .conflict, "prepared bytes must not bypass the original CAS baseline")
+                XCTAssertEqual(try Data(contentsOf: record.document.fileURL), document.documentBytes)
+            }
+        }
+
+        func testCatalogPreparationRunsOffMainAndKeepsInitialAuthorityMembership() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread, "the real catalog decoder must not run on main")
+                    preparations += 1
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                XCTAssertGreaterThan(preparations, 0)
+                XCTAssertTrue(Fixture.standardIDs.isSubset(of: Set(manager.workspaces.map(\.id))))
+            }
+        }
+
+        func testLocalEditDuringCatalogPreparationIsNotRolledBackByPreparedOverlay() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let original = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let tab = try XCTUnwrap(original.composeTabs.first)
+                let gate = f.makeGate()
+                let entered = Signal("real decode completed before main-actor application")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread)
+                    preparations += 1
+                    if preparations == 1 {
+                        entered.fire()
+                        await gate.wait()
+                    }
+                }
+                let added = try await f.commitWorkspace(named: "Preparation race", window: window, awaitProjection: false)
+                try await f.wait(entered)
+                let title = "Local edit while CPU preparation was suspended"
+                XCTAssertEqual(manager.updateComposeTabPresentation(workspaceID: original.id, tabIDs: [tab.id]) { _, value in
+                    value.name = title
+                }, [tab.id])
+                manager.markWorkspaceDirty(workspaceID: original.id)
+                gate.release()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertGreaterThanOrEqual(preparations, 2, "the stale preparation must use the existing bounded refetch")
+                XCTAssertEqual(manager.workspace(withID: original.id)?.composeTabs.first?.name, title)
+                XCTAssertNotNil(manager.workspace(withID: added.id))
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+            }
+        }
+
+        func testStoppedCatalogPreparationCannotPublishOrCreditItsOldRun() async throws {
+            try await Fixture.run { f in
+                let (window, manager, chooser, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("initial projection prepared but not applied")
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread)
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let emissions = chooser.emitted.count
+                bridge.stop()
+                gate.release()
+                await bridge.stopAndJoinForTesting()
+                XCTAssertEqual(chooser.emitted.count, emissions)
+                XCTAssertEqual(manager.workspaceChooserPresentation, .loading)
+                XCTAssertTrue(events.catalogCheckpoints.isEmpty)
+                XCTAssertNil(bridge.projectionObservationStateForTesting.checkpoint)
+            }
+        }
 
         // MARK: 1. Decisive production-composition regression
 
@@ -644,6 +994,10 @@ import XCTest
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                     XCTAssertEqual(route.rootRoute, .main)
                     XCTAssertNil(window.protectedRestoreEntryForTesting)
+                    // This composition fixture deliberately never registers a window manager.
+                    // Durable capture needs a qualified assignment; selection alone cannot invent it.
+                    XCTAssertNil(window.sessionCaptureCandidate().entry)
+                    window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                     XCTAssertEqual(
                         window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
@@ -670,6 +1024,8 @@ import XCTest
                 // observer's RunLoop delivery lands after the acceptance. The setter publishes
                 // synchronously; a requested switch suspends and could let the observer drain first.
                 manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                // Unregistered fixture: install the otherwise manager-owned coherent assignment.
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.aardvarkID, number: 1))
                 let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                 let restored = Signal("restore completion")
                 window.applyWindowRestoreEntry(entry) { restored.fire() }
@@ -694,6 +1050,9 @@ import XCTest
                 XCTAssertEqual(restored.count, 1)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                 XCTAssertNil(window.protectedRestoreEntryForTesting, "Post-acceptance selection releases protection")
+                XCTAssertNil(window.workspaceInstanceNumber(for: Fixture.requestedID))
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "a settled unregistered restore cannot retain outgoing identity")
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                 XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
             }
         }
@@ -2287,6 +2646,157 @@ import XCTest
             return try (dirty, XCTUnwrap(target))
         }
 
+        func testInventoryReclassifiesOnceAfterScopedSupersessionWithoutSpinning() async throws {
+            for missingScopedRecord in [false, true] {
+                // Zero completes; two supersedes the retry; three holds unfinished scoped work.
+                for supersessions in 0 ... 3 where supersessions != 3 || !missingScopedRecord {
+                    try await Fixture.run { f in
+                        let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                        let previousWindows = WindowStatesManager.shared.allWindows
+                        WindowStatesManager.shared.allWindows = [window]
+                        defer { WindowStatesManager.shared.allWindows = previousWindows }
+                        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+                        await service.prepareDomainTools()
+                        let tools = await service.tools
+                        let list = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+                        let invocation = ToolInvocationContext.trustedLocal(
+                            toolName: "manage_workspaces", metadata: MCPRequestMetadata(connectionID: UUID(), clientName: "Inventory fixture", windowID: window.windowID)
+                        )
+                        let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                        let clean = await client.snapshot()
+                        let models = try f.decoded(clean)
+                        XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                            clean, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                        let aRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                        var a = try XCTUnwrap(models.first { $0.id == Fixture.aardvarkID })
+                        a.currentPromptText = "Scoped A newly dirty"
+                        let aOutcome = try await client.replaceWorking(
+                            a, fileURL: aRecord.document.fileURL, expectedWorkspaceRevision: aRecord.revisions.workingRevision
+                        )
+                        XCTAssertEqual(aOutcome.disposition, .applied)
+                        var savedA = a
+                        if supersessions == 3 { savedA.consolidatedIntoWorkspaceID = Fixture.requestedID }
+                        try f.writeDocument(savedA)
+                        let bRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == Fixture.requestedID })
+                        var b = try XCTUnwrap(models.first { $0.id == Fixture.requestedID })
+                        b.currentPromptText = "B newly dirty, saved phase still marked"
+                        let bOutcome = try await client.replaceWorking(
+                            b, fileURL: bRecord.document.fileURL, expectedWorkspaceRevision: bRecord.revisions.workingRevision
+                        )
+                        XCTAssertEqual(bOutcome.disposition, .applied)
+                        var savedB = b
+                        savedB.consolidatedIntoWorkspaceID = Fixture.aardvarkID
+                        try f.writeDocument(savedB)
+                        if missingScopedRecord {
+                            // Delete before inventory captures its snapshot: scoped unowned A
+                            // supersedes at the SAME sequence, rather than testing stale retry refusal.
+                            let current = await client.snapshot()
+                            let record = try XCTUnwrap(current.workspaces.first { $0.document.workspaceID == a.id })
+                            let deleted = await client.delete(
+                                workspaceID: a.id, expectedCatalogRevision: current.catalogRevision,
+                                expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(deleted.disposition, .applied)
+                        }
+                        XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(b.id))
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.defaultID)
+                        let entered = Signal("first inventory classification gated")
+                        let retryOrFinished = Signal("retry entered or inventory returned")
+                        let scopedEntered = Signal("scoped classification still unfinished")
+                        let scopedGate = f.makeGate()
+                        var unfinishedScoped: Task<Void, Never>?
+                        let firstGate = f.makeGate()
+                        let retryGate = f.makeGate()
+                        var bulkReads = 0
+                        manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                            if id == a.id, supersessions == 3 {
+                                await scopedGate.wait { scopedEntered.fire() }
+                            }
+                            guard id == nil else { return }
+                            bulkReads += 1
+                            if bulkReads == 1, supersessions > 0 {
+                                await firstGate.wait { entered.fire() }
+                            } else if bulkReads == 2, supersessions == 2 {
+                                await retryGate.wait { retryOrFinished.fire() }
+                            }
+                        }
+                        defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                        let inventory = f.startOwned { () -> [String: Any]? in
+                            defer { retryOrFinished.fire() }
+                            do {
+                                let result = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                                    try await list(["action": .string("list")])
+                                }
+                                return try JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any]
+                            } catch {
+                                XCTFail("bounded retry preserves the existing successful inventory response: \(error)")
+                                return nil
+                            }
+                        }
+                        if supersessions > 0 {
+                            try await f.wait(entered)
+                            if !missingScopedRecord, supersessions != 3 {
+                                manager.setCatalogRecordDecodeFailureForTesting { $0 == a.id ? InjectedDecodeFailure() : nil }
+                            }
+                            if supersessions == 3 {
+                                unfinishedScoped = f.startOwned {
+                                    let scoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                    XCTAssertFalse(scoped.didSwitch)
+                                }
+                                try await f.wait(scopedEntered)
+                            } else {
+                                let scoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                XCTAssertFalse(scoped.didSwitch)
+                            }
+                            firstGate.release()
+                            if supersessions == 2 {
+                                // On the broken implementation inventory finishes instead of
+                                // entering a retry; either signal makes this test finite and red.
+                                try await f.wait(retryOrFinished)
+                                if bulkReads == 2 {
+                                    let secondScoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                    XCTAssertFalse(secondScoped.didSwitch)
+                                }
+                                retryGate.release()
+                            }
+                        }
+                        let inventoryResponse = await inventory.value
+                        let response = try XCTUnwrap(inventoryResponse)
+                        XCTAssertEqual(response["status"] as? String, "ok")
+                        let rows = try XCTUnwrap(response["workspaces"] as? [[String: Any]])
+                        let exposesB = rows.contains { ($0["id"] as? String)?.lowercased() == b.id.uuidString.lowercased() }
+                        let completed = supersessions < 2
+                        XCTAssertEqual(exposesB, !completed, "visible inventory (missing=\(missingScopedRecord), supersessions=\(supersessions))")
+                        XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(b.id), completed)
+                        XCTAssertEqual(bulkReads, supersessions == 0 || supersessions == 3 ? 1 : 2, "exactly one retry, never a third attempt")
+                        let deleteInventory = WindowRoutingService.workspaceInventoryModels(
+                            [b], authorityIncompleteWorkspaceIDs: manager.pendingConsolidatedRestoreIDs, includeHidden: true
+                        )
+                        if completed {
+                            XCTAssertThrowsError(try WindowRoutingService.test_resolveWorkspaceReference(
+                                b.name, workspaces: deleteInventory, includeHiddenForName: false, action: "delete"
+                            )) { error in
+                                XCTAssertTrue(String(describing: error).contains("hidden"))
+                            }
+                        } else {
+                            XCTAssertEqual(try WindowRoutingService.test_resolveWorkspaceReference(
+                                b.name, workspaces: deleteInventory, includeHiddenForName: false, action: "delete"
+                            ).id, b.id, "refusal or second supersession intentionally preserves today's fallback behavior")
+                        }
+                        if let unfinishedScoped {
+                            // Inventory returned without waiting for or revoking the scoped owner.
+                            XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(a.id))
+                            scopedGate.release()
+                            await unfinishedScoped.value
+                            XCTAssertTrue(manager.pendingConsolidatedRestoreIDs.contains(a.id), "unfinished scoped result still owns its publication")
+                        }
+                    }
+                }
+            }
+        }
+
         func testSameSequenceScopedRecoveryCannotBeOverwrittenByBulkClassification() async throws {
             for inventoryPath in [false, true] {
                 for initiallyPending in [false, true] {
@@ -3538,7 +4048,7 @@ import XCTest
                 let initial = try await f.awaitCatalogProjection(window)
                 let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                 let before = await f.runtime.workspaceStore.snapshot()
-                let record = try XCTUnwrap(before.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                XCTAssertTrue(before.workspaces.contains { $0.document.workspaceID == Fixture.aardvarkID })
                 let gate = f.makeGate()
                 let entered = Signal("older real reload held before application")
                 let heldIO = f.startOwned { await gate.wait() }
@@ -3548,11 +4058,10 @@ import XCTest
                 bridge.requestCatalogRefresh(isRetry: false)
                 try await f.wait(entered)
                 var edited = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
-                edited.name = "Newer self echo"
+                edited.currentPromptText = "Newer self echo"
                 let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == edited.id })
                 manager.workspaces[index] = edited
-                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
-                _ = try await client.replaceWorking(edited, fileURL: record.document.fileURL, expectedWorkspaceRevision: record.revisions.workingRevision, operationID: UUID())
+                _ = try await manager.saveWorkspaceToFileAsync(edited)
                 let current = await f.runtime.workspaceStore.snapshot()
                 let echo = await f.projectionObserver(for: window).waitForProjection(afterGeneration: initial.generation, through: current.publicationSequence)
                 XCTAssertEqual(echo?.application, .selfEchoBaseline)
@@ -3591,7 +4100,8 @@ import XCTest
                         XCTAssertTrue(manager.acceptDomainAuthoritySelfEchoBaseline(
                             workspaceID: record.document.workspaceID, revisions: record.revisions,
                             digest: record.document.contentDigest, health: record.health, catalogRevision: snapshot.catalogRevision,
-                            publicationSequence: snapshot.publicationSequence + 1, baselineGeneration: receipt.reconciliationGeneration
+                            publicationSequence: snapshot.publicationSequence + 1, baselineGeneration: receipt.reconciliationGeneration,
+                            operationID: nil, eventRevisions: record.revisions
                         ))
                     } else {
                         manager.applyDomainAuthorityBaseline(workspaceID: record.document.workspaceID, revisions: record.revisions, digest: record.document.contentDigest, health: record.health, catalogRevision: snapshot.catalogRevision + 1)
@@ -4233,6 +4743,190 @@ import XCTest
             }
         }
 
+        func testPassivePinnedCatalogFollowsOwningWindowUnpinArchiveAndRestore() async throws {
+            var seeds = Fixture.standardSeeds
+            let targetWorkspaceIndex = try XCTUnwrap(seeds.firstIndex { $0.id == Fixture.aardvarkID })
+            var target = ComposeTabState(name: "Archive target")
+            let sessionID = UUID()
+            target.activeAgentSessionID = sessionID
+            target.isPinned = true
+            seeds[targetWorkspaceIndex].composeTabs.append(target)
+            try await Fixture.run(seeds: seeds) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let registered = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                var located = try JSONDecoder().decode(WorkspaceModel.self, from: registered.document.documentBytes)
+                located.customStoragePath = registered.document.fileURL.deletingLastPathComponent()
+                let seedClient = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -1363)
+                let locationSaved = try await seedClient.save(
+                    located,
+                    fileURL: registered.document.fileURL,
+                    expectedWorkspaceRevision: registered.revisions.workingRevision,
+                    expectedContentDigest: registered.document.contentDigest
+                )
+                XCTAssertEqual(locationSaved.disposition, .applied)
+                let payload = AgentSession(
+                    id: sessionID,
+                    workspaceID: located.id,
+                    composeTabID: target.id,
+                    name: target.name,
+                    agentKind: AgentProviderKind.claudeCode.rawValue
+                )
+                let payloadURL = try await AgentSessionDataService.shared.saveAgentSession(payload, for: located)
+                XCTAssertEqual(
+                    payloadURL.deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL,
+                    registered.document.fileURL.deletingLastPathComponent().standardizedFileURL
+                )
+                let owner = f.makeWindow()
+                let mirror = f.makeWindow()
+                for window in [owner, mirror] {
+                    await window.workspaceManager.awaitInitialized()
+                    await window.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                }
+                let selected = try XCTUnwrap(owner.workspaceManager.workspace(withID: Fixture.aardvarkID))
+                let switched = await owner.workspaceManager.switchWorkspace(to: selected, saveState: false)
+                XCTAssertTrue(switched.didSwitch)
+                let restored = await owner.agentModeViewModel.ensureSessionReady(tabID: target.id, reconnectActiveProviders: false)
+                XCTAssertEqual(restored.activeAgentSessionID, sessionID)
+                XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertEqual(owner.agentModeViewModel.ownerValidatedSessionIndex[sessionID]?.tabID, target.id)
+                XCTAssertNotEqual(mirror.workspaceManager.activeWorkspaceID, selected.id)
+                XCTAssertEqual(mirror.workspaceManager.workspace(withID: selected.id)?.composeTabs.last?.isPinned, true)
+                let originalMirrorVersion = mirror.workspaceManager.debugStateVersionForWorkspace(selected.id)
+                let organizer = OpenWindowsAgentSessionOrganizer(windows: { [owner, mirror] })
+
+                @MainActor
+                func acknowledgeOwnerSave() async throws {
+                    // A real owner persistence acknowledgement, not a test-only queue flush.
+                    let outcome = await owner.workspaceManager.pollAndSaveStateWithOutcomeAsync()
+                    XCTAssertTrue(outcome.acceptedForLifecycleAdmission, "\(outcome)")
+                    for window in [owner, mirror] {
+                        try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    }
+                }
+                @MainActor
+                func assertCarrier(archived: Bool) async throws {
+                    let catalog = await f.runtime.workspaceStore.snapshot()
+                    let record = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == selected.id })
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: record.document.documentBytes)
+                    let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: record.document.fileURL))
+                    for workspace in try [canonical, disk, XCTUnwrap(owner.workspaceManager.workspace(withID: selected.id)), XCTUnwrap(mirror.workspaceManager.workspace(withID: selected.id))] {
+                        XCTAssertEqual(workspace.composeTabs.contains { $0.id == target.id }, !archived)
+                        XCTAssertEqual(workspace.stashedTabs.contains { $0.tab.id == target.id }, archived)
+                        let carrier = try XCTUnwrap(
+                            workspace.composeTabs.first { $0.id == target.id }
+                                ?? workspace.stashedTabs.first { $0.tab.id == target.id }?.tab
+                        )
+                        XCTAssertFalse(carrier.isPinned)
+                        XCTAssertEqual(carrier.activeAgentSessionID, sessionID)
+                    }
+                    XCTAssertEqual(organizer.state(of: sessionID)?.isArchived, archived)
+                    XCTAssertEqual(
+                        mirror.workspaceManager.debugStateVersionForWorkspace(selected.id),
+                        originalMirrorVersion,
+                        "A passive catalog must not request a repair of another window's accepted mutation"
+                    )
+                }
+
+                XCTAssertEqual(organizer.setPinned(false, sessionIDs: [sessionID]), [sessionID])
+                try await acknowledgeOwnerSave()
+                try await assertCarrier(archived: false)
+                let archived = await organizer.archive([sessionID], isAuthorized: { _ in true })
+                XCTAssertEqual(archived, [sessionID])
+                try await acknowledgeOwnerSave()
+                try await assertCarrier(archived: true)
+
+                // A later full catalog projection must not re-arm the old pin or revive its tab.
+                var unrelated = try XCTUnwrap(owner.workspaceManager.workspace(withID: Fixture.requestedID))
+                unrelated.name = "Unrelated catalog update"
+                let before = await f.runtime.workspaceStore.snapshot()
+                let prior = try XCTUnwrap(before.workspaces.first { $0.document.workspaceID == unrelated.id })
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -1363)
+                let saved = try await client.save(
+                    unrelated,
+                    fileURL: prior.document.fileURL,
+                    expectedWorkspaceRevision: prior.revisions.workingRevision,
+                    expectedContentDigest: prior.document.contentDigest
+                )
+                XCTAssertEqual(saved.disposition, .applied)
+                for window in [owner, mirror] {
+                    try await f.awaitCatalogProjection(window)
+                }
+                try await assertCarrier(archived: true)
+
+                // Archive undo uses this same unarchive owner path; verify canonical and disk readback.
+                let unarchived = await organizer.unarchive([sessionID], isAuthorized: { _ in true })
+                XCTAssertEqual(unarchived.restored, [sessionID])
+                XCTAssertTrue(unarchived.failures.isEmpty)
+                // No caller-triggered save may be needed to make an acknowledged restore durable.
+                for window in [owner, mirror] {
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                }
+                try await assertCarrier(archived: false)
+                await owner.workspaceManager.debugDrainScheduledSaves()
+                for window in [owner, mirror] {
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                }
+                try await assertCarrier(archived: false)
+            }
+        }
+
+        func testProductionLifecycleClaimsStillProtectOwnedPinsAndInactiveLiveSessions() async throws {
+            for inactiveLiveSession in [false, true] {
+                var seeds = Fixture.standardSeeds
+                let index = try XCTUnwrap(seeds.firstIndex { $0.id == Fixture.aardvarkID })
+                var target = ComposeTabState(name: "Protected target")
+                let sessionID = UUID()
+                target.activeAgentSessionID = sessionID
+                target.isPinned = !inactiveLiveSession
+                seeds[index].composeTabs.append(target)
+                try await Fixture.run(seeds: seeds) { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await manager.awaitInitialized()
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    if inactiveLiveSession {
+                        XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
+                        let session = AgentTabSession(tabID: target.id)
+                        window.agentModeViewModel.test_installLiveSession(session)
+                        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                            sessionID: sessionID, on: session
+                        ))
+                        XCTAssertFalse(session.runState.isActive, "An idle live owner still needs protection during workspace teardown")
+                        XCTAssertTrue(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) === session)
+                    } else {
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+                        XCTAssertNotEqual(
+                            manager.activeWorkspace?.activeComposeTabID,
+                            target.id,
+                            "Every cold pin in the owned workspace is protected, not only the selected tab"
+                        )
+                        XCTAssertNil(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID))
+                    }
+                    let originalVersion = manager.debugStateVersionForWorkspace(Fixture.aardvarkID)
+                    let before = await f.runtime.workspaceStore.snapshot()
+                    let record = try XCTUnwrap(before.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                    var damaged = try JSONDecoder().decode(WorkspaceModel.self, from: record.document.documentBytes)
+                    damaged.composeTabs.removeAll { $0.id == target.id }
+                    damaged.stashedTabs.append(StashedTab(tab: target))
+                    let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -1363)
+                    let saved = try await client.save(
+                        damaged,
+                        fileURL: record.document.fileURL,
+                        expectedWorkspaceRevision: record.revisions.workingRevision,
+                        expectedContentDigest: record.document.contentDigest
+                    )
+                    XCTAssertEqual(saved.disposition, .applied)
+                    try await f.awaitCatalogProjection(window)
+                    let repaired = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    XCTAssertEqual(repaired.composeTabs.first { $0.id == target.id }, target)
+                    XCTAssertFalse(repaired.stashedTabs.contains { $0.tab.id == target.id })
+                    XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(Fixture.aardvarkID), originalVersion)
+                }
+            }
+        }
+
         func testCallerRootMapContractsAndProductionLifecycleOverlayReachChooser() async throws {
             try await Fixture.run { f in
                 let base = await f.runtime.workspaceStore.snapshot()
@@ -4370,6 +5064,223 @@ import XCTest
             }
         }
 
+        func testUnregisteredSameWindowDocumentCommitRequiresFreshProjection() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                let initial = try await f.awaitCatalogProjection(window)
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                let currentRecord = await client.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let record = try XCTUnwrap(currentRecord)
+                var submitted = try manager.decodeDomainWorkspaceCatalogRecord(record)
+                submitted.currentPromptText = "Canonical document submitted outside this manager"
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == submitted.id })
+                manager.workspaces[index].currentPromptText = "Unrelated local overlay"
+                var targetDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    if id == Fixture.aardvarkID { targetDecodes += 1 }
+                    return nil
+                }
+                defer { manager.setCatalogRecordDecodeFailureForTesting(nil) }
+
+                let outcome = try await client.replaceWorkingFailClosed(
+                    submitted, fileURL: record.document.fileURL,
+                    expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(outcome.disposition, .applied)
+                let current = await client.snapshot()
+                let observed = await f.projectionObserver(for: window).waitForProjection(
+                    afterGeneration: initial.generation, through: current.publicationSequence
+                )
+                let checkpoint = try XCTUnwrap(observed)
+                XCTAssertEqual(
+                    checkpoint.catalogReceipt?.kind,
+                    .full,
+                    "matching a window ID does not prove that the manager adopted the submitted bytes"
+                )
+                XCTAssertEqual(targetDecodes, 1, "an unproven newer document must be freshly decoded")
+                XCTAssertEqual(manager.workspace(withID: submitted.id)?.currentPromptText, submitted.currentPromptText)
+                let canonical = try XCTUnwrap(outcome.workspace)
+                XCTAssertTrue(manager.hasAdoptedFullDocumentBaseline(
+                    workspaceID: submitted.id, contentDigest: canonical.document.contentDigest
+                ))
+            }
+        }
+
+        func testEarlierOwnEventCannotAdoptANewerPeerDocumentFromItsPointRead() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                    initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .decodedModels
+                ).receipt)
+                let subscription = await f.runtime.workspaceStore.subscribe()
+                var events = subscription.events.makeAsyncIterator()
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.aardvarkID })
+                manager.workspaces[index].currentPromptText = "Own submitted document"
+                _ = try await manager.saveWorkspaceToFileAsync(manager.workspaces[index])
+                let observedWorkingEvent = await events.next()
+                XCTAssertEqual(observedWorkingEvent?.kind, .workingStateCommitted)
+                let observedOwnEvent = await events.next()
+                let ownEvent = try XCTUnwrap(observedOwnEvent)
+                XCTAssertEqual(ownEvent.workspaceID, Fixture.aardvarkID)
+                XCTAssertEqual(ownEvent.kind, .savedDocumentCommitted)
+
+                let peer = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -11280)
+                let ownRecord = await peer.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let own = try XCTUnwrap(ownRecord)
+                XCTAssertTrue(manager.acceptDomainAuthoritySelfEchoBaseline(
+                    workspaceID: Fixture.aardvarkID, revisions: own.revisions,
+                    digest: own.document.contentDigest, health: own.health,
+                    catalogRevision: ownEvent.catalogRevision, publicationSequence: ownEvent.sequence,
+                    baselineGeneration: receipt.reconciliationGeneration,
+                    operationID: ownEvent.operationID, eventRevisions: ownEvent.revisions
+                ), "the same event is admissible while its canonical document is still current")
+                var replacement = try manager.decodeDomainWorkspaceCatalogRecord(own)
+                replacement.currentPromptText = "Newer peer document"
+                let peerOutcome = try await peer.replaceWorkingFailClosed(
+                    replacement, fileURL: own.document.fileURL,
+                    expectedWorkspaceRevision: own.revisions.workingRevision
+                )
+                XCTAssertEqual(peerOutcome.disposition, .applied)
+                let newestRecord = await peer.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let newest = try XCTUnwrap(newestRecord)
+                let before = manager.debugDomainAuthorityBaseline(for: Fixture.aardvarkID)
+                XCTAssertFalse(manager.acceptDomainAuthoritySelfEchoBaseline(
+                    workspaceID: Fixture.aardvarkID, revisions: newest.revisions,
+                    digest: newest.document.contentDigest, health: newest.health,
+                    catalogRevision: ownEvent.catalogRevision, publicationSequence: ownEvent.sequence,
+                    baselineGeneration: receipt.reconciliationGeneration,
+                    operationID: ownEvent.operationID, eventRevisions: ownEvent.revisions
+                ), "the point read may advance while the event still names an older own operation")
+                let after = manager.debugDomainAuthorityBaseline(for: Fixture.aardvarkID)
+                XCTAssertEqual(after.revisions, before.revisions)
+                XCTAssertEqual(after.digest, before.digest)
+                XCTAssertEqual(manager.workspace(withID: Fixture.aardvarkID)?.currentPromptText, "Own submitted document")
+                XCTAssertFalse(manager.hasAdoptedFullDocumentBaseline(
+                    workspaceID: Fixture.aardvarkID, contentDigest: newest.document.contentDigest
+                ))
+            }
+        }
+
+        func testUnrelatedCatalogProjectionPreservesCurrentLocalDescendantOfCachedDocument() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let initialSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let initial = try XCTUnwrap(initialSnapshot)
+                let original = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let target = try XCTUnwrap(original.composeTabs.first)
+                let generation = try XCTUnwrap(manager.adoptedFullDocumentGeneration(
+                    workspaceID: original.id, contentDigest: initial.document.contentDigest
+                ))
+                let restoredTitle = "Restored local title awaiting its save"
+                let changed = manager.updateComposeTabPresentation(workspaceID: original.id, tabIDs: [target.id]) { _, tab in
+                    tab.name = restoredTitle
+                }
+                XCTAssertEqual(changed, [target.id])
+                manager.markWorkspaceDirty(workspaceID: original.id)
+                let dirtyVersion = manager.debugStateVersionForWorkspace(original.id)
+                XCTAssertEqual(manager.adoptedFullDocumentGeneration(
+                    workspaceID: original.id, contentDigest: initial.document.contentDigest
+                ), generation, "a local descendant retains its adopted canonical ancestor")
+                var targetDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    if id == original.id { targetDecodes += 1 }
+                    return nil
+                }
+                defer { manager.setCatalogRecordDecodeFailureForTesting(nil) }
+
+                // A real new record forces a full catalog application while this target's
+                // canonical document is unchanged. No save or flush can mask the local rollback.
+                let unrelated = try await f.commitWorkspace(named: "Unrelated catalog member", window: window)
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                let after = try XCTUnwrap(manager.workspace(withID: original.id))
+                XCTAssertEqual(after.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertNotNil(manager.workspace(withID: unrelated.id))
+                XCTAssertEqual(manager.debugStateVersionForWorkspace(original.id), dirtyVersion)
+                XCTAssertEqual(targetDecodes, 0, "the same-lineage target must not be decoded again")
+                let unchangedSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(original.id)
+                let unchanged = try XCTUnwrap(unchangedSnapshot)
+                XCTAssertEqual(unchanged.revisions, initial.revisions)
+                XCTAssertEqual(unchanged.document.contentDigest, initial.document.contentDigest)
+
+                // The retained descendant must still be writable through the real owner.
+                _ = try await manager.saveWorkspaceToFileAsync(after)
+                let savedSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(original.id)
+                let saved = try XCTUnwrap(savedSnapshot)
+                let canonical = try manager.decodeDomainWorkspaceCatalogRecord(saved)
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: saved.document.fileURL))
+                XCTAssertEqual(canonical.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertEqual(disk.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertNil(saved.revisions.dirtyRevision)
+            }
+        }
+
+        func testPointDefaultAdoptionPreventsCachedOverlayReturningOnUnrelatedCatalogChange() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                let resolution = f.holdInitialResolution(manager)
+                let publication = f.holdPublication(manager, of: Fixture.defaultID)
+                try await f.wait(resolution.entered)
+                try await f.awaitCatalogProjection(window)
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let subscription = await f.runtime.workspaceStore.subscribe()
+                var events = subscription.events.makeAsyncIterator()
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.defaultID })
+                manager.workspaces[index].currentPromptText = "Canonical Default prompt"
+                _ = try await manager.saveWorkspaceToFileAsync(manager.workspaces[index])
+                let workingEvent = await events.next()
+                XCTAssertEqual(workingEvent?.kind, .workingStateCommitted)
+                let savedEvent = await events.next()
+                let ownEvent = try XCTUnwrap(savedEvent)
+                XCTAssertEqual(ownEvent.workspaceID, Fixture.defaultID)
+                XCTAssertEqual(ownEvent.kind, .savedDocumentCommitted)
+                try await f.awaitCaughtUpWithCatalogBaseline(window)
+                let canonicalRecord = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(Fixture.defaultID)
+                let canonical = try XCTUnwrap(canonicalRecord)
+                let canonicalModel = try manager.decodeDomainWorkspaceCatalogRecord(canonical)
+
+                manager.workspaces[index].currentPromptText = "Local edit discarded by Default adoption"
+                // Replay the exact accepted event through the shortcut after a newer local edit.
+                // This isolates the legitimate overlay-cache state without adding a production hook.
+                let cachedOverlay = await bridge.suppressSelfEchoForTesting(ownEvent)
+                XCTAssertTrue(cachedOverlay)
+                let catalogGeneration = manager.domainCatalogReconciliationGeneration
+                let cachedGeneration = try XCTUnwrap(manager.adoptedFullDocumentGeneration(
+                    workspaceID: Fixture.defaultID, contentDigest: canonical.document.contentDigest
+                ))
+
+                resolution.gate.release()
+                try await f.wait(publication.entered)
+                XCTAssertEqual(manager.workspace(withID: Fixture.defaultID)?.currentPromptText, canonicalModel.currentPromptText)
+                XCTAssertEqual(
+                    manager.domainCatalogReconciliationGeneration,
+                    catalogGeneration,
+                    "Default resolution adopts one document without reconciling the catalog"
+                )
+                let adoptedGeneration = try XCTUnwrap(manager.adoptedFullDocumentGeneration(
+                    workspaceID: Fixture.defaultID, contentDigest: canonical.document.contentDigest
+                ))
+                XCTAssertGreaterThan(adoptedGeneration, cachedGeneration)
+                var defaultDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    if id == Fixture.defaultID { defaultDecodes += 1 }
+                    return nil
+                }
+                defer { manager.setCatalogRecordDecodeFailureForTesting(nil) }
+                _ = try await f.commitWorkspace(named: "Unrelated record after point adoption", window: window)
+                XCTAssertEqual(defaultDecodes, 1, "the discarded overlay must be replaced by a fresh record decode")
+                XCTAssertEqual(manager.workspace(withID: Fixture.defaultID)?.currentPromptText, canonicalModel.currentPromptText)
+                publication.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+            }
+        }
+
         func testDegradedAcceptedCatalogsAdmitSelfEchoWithoutClearingWarnings() async throws {
             for state in 0 ..< 3 {
                 try await Fixture.run { f in
@@ -4397,7 +5308,8 @@ import XCTest
                     XCTAssertTrue(manager.acceptDomainAuthoritySelfEchoBaseline(
                         workspaceID: Fixture.aardvarkID, revisions: record.revisions, digest: record.document.contentDigest,
                         health: record.health, catalogRevision: 6, publicationSequence: 6,
-                        baselineGeneration: receipt.reconciliationGeneration
+                        baselineGeneration: receipt.reconciliationGeneration,
+                        operationID: nil, eventRevisions: record.revisions
                     ))
                     XCTAssertEqual(manager.domainCatalogReconciliationGeneration, receipt.reconciliationGeneration, "an echo is not a catalog reconciliation")
                     XCTAssertEqual(manager.workspaceChooserPresentation, presented, "an echo cannot erase degradation or certify freshness")
@@ -4429,18 +5341,11 @@ import XCTest
                     let failure = manager.workspaceChooserPresentation.failure
                     let generation = manager.domainCatalogReconciliationGeneration
                     let applications = events.catalogCheckpoints.count
-                    let canonical = await client.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
-                    let record = try XCTUnwrap(canonical)
                     var edited = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
-                    edited.name = failRefresh ? "Echo after failed refresh" : "Echo with missing peer"
+                    edited.currentPromptText = failRefresh ? "Echo after failed refresh" : "Echo with missing peer"
                     let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == edited.id })
                     manager.workspaces[index] = edited
-                    _ = try await client.replaceWorking(
-                        edited,
-                        fileURL: record.document.fileURL,
-                        expectedWorkspaceRevision: record.revisions.workingRevision,
-                        operationID: UUID()
-                    )
+                    _ = try await manager.saveWorkspaceToFileAsync(edited)
                     let current = await client.snapshot()
                     let echo = await f.projectionObserver(for: window).waitForProjection(
                         afterGeneration: checkpoint.generation, through: current.publicationSequence
@@ -4468,7 +5373,8 @@ import XCTest
                     manager.acceptDomainAuthoritySelfEchoBaseline(
                         workspaceID: Fixture.aardvarkID, revisions: record.revisions, digest: record.document.contentDigest,
                         health: record.health, catalogRevision: catalogRevision, publicationSequence: sequence,
-                        baselineGeneration: receipt.reconciliationGeneration
+                        baselineGeneration: receipt.reconciliationGeneration,
+                        operationID: nil, eventRevisions: record.revisions
                     )
                 }
                 XCTAssertFalse(accept(catalogRevision: 4, sequence: 6), "an echo below the catalog floor is stale")
@@ -4797,7 +5703,9 @@ import XCTest
 
         private init(sandbox: URL, seeds: [WorkspaceModel], unavailableSeedIDs: Set<UUID>) {
             base = sandbox.appendingPathComponent("new-window-selection-\(UUID().uuidString)", isDirectory: true)
-            storage = base.appendingPathComponent("Workspaces", isDirectory: true)
+            storage = AppProfileLocations.current.customWorkspaceDirectory(
+                selectedDirectory: base.appendingPathComponent("Workspaces", isDirectory: true)
+            )
             self.seeds = seeds
             self.unavailableSeedIDs = unavailableSeedIDs
         }
@@ -5401,6 +6309,7 @@ import XCTest
             }
             for window in windows {
                 window.domainWorkspacePresentationBridgeForTesting?.afterCatalogReloadForTesting = nil
+                window.domainWorkspacePresentationBridgeForTesting?.catalogPreparationDidFinishForTesting = nil
             }
             if let runtimeStartTask {
                 do { try await runtimeStartTask.value } catch { XCTFail("Fixture runtime start failed: \(error)") }

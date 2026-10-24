@@ -20,6 +20,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         let cancelledReaders = CodemapLockedValues<Int>()
         let readerGate = TestReleaseFence(name: "old writer setting read")
         let armStoreFence = CodemapLockedValues<Bool>()
+        let cancelledStoreWrites = CodemapLockedValues<Int>()
         let storeFence = TestReleaseFence(name: "store final suspension")
         let beforeWrite = TestReleaseFence(name: "manifest publication admission")
         let fixture = try CodemapStoreFixture(
@@ -38,7 +39,15 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             manifestStoreHooks: CodeMapRootManifestStoreHooks(
                 beforePublish: { publications.append(1) },
                 beforeMaintenanceLock: {
-                    if armStoreFence.takeFirst() != nil { await storeFence.enterAndWait() }
+                    if armStoreFence.takeFirst() != nil {
+                        // Keep publication suspended after cancellation removes its writer state.
+                        // The existing detached-fence pattern makes task return an explicit event.
+                        await withTaskCancellationHandler {
+                            await Task.detached { await storeFence.enterAndWait() }.value
+                        } onCancel: {
+                            cancelledStoreWrites.append(1)
+                        }
+                    }
                 },
                 scanStarted: { scans.append(1) }
             ),
@@ -67,6 +76,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             repository.cleanup()
         }
         let engine = try fixture.runtime().bindingEngine()
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
         let files = await store.files(inRoot: loaded.id)
         let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == relativePath })
 
@@ -158,12 +169,51 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         }
         let storeEntered = await storeFence.waitUntilEntered(timeout: 30)
         guard storeEntered else { return XCTFail("Writer must reach the store suspension") }
+        let publishing = await engine.debugManifestWriterActivity(rootEpoch: rootEpoch)
+        XCTAssertTrue(publishing.accountingComplete)
+        XCTAssertFalse(publishing.quiescenceConfirmed)
+        XCTAssertGreaterThan(publishing.liveTaskCount, 0)
+        XCTAssertEqual(publishing.omittedLiveTaskCount, 0)
+        let publishingTask = try XCTUnwrap(publishing.tasks.first {
+            $0.rootEpoch == rootEpoch && $0.phase == "awaiting_publication"
+        })
+        XCTAssertNotNil(publishingTask.batchID)
+        XCTAssertNotNil(publishingTask.origin)
+        XCTAssertNotNil(publishingTask.batchStartedUptimeNanoseconds)
+
         disabled.append(true)
-        await engine.refreshGlobalCodeMapsDisabled()
+        let storeDisableDrain = Task { await engine.refreshGlobalCodeMapsDisabled() }
+        addTeardownBlock {
+            storeFence.release()
+            await storeDisableDrain.value
+        }
+        try await AsyncTestWait.waitUntil("publication task cancelled while store fence remains held", timeout: 30) {
+            !cancelledStoreWrites.values.isEmpty
+        }
+        let draining = await engine.debugManifestWriterActivity(rootEpoch: rootEpoch)
+        XCTAssertEqual(draining.engineInstanceID, publishing.engineInstanceID)
+        XCTAssertTrue(draining.accountingComplete)
+        XCTAssertEqual(draining.namespaceCount, 0, "Cancellation has removed the writer dictionary")
+        XCTAssertGreaterThan(draining.liveTaskCount, 0, "The suspended task still owns publication work")
+        XCTAssertFalse(draining.quiescenceConfirmed, "An empty dictionary does not prove task completion")
+        let drainingTask = try XCTUnwrap(draining.tasks.first { $0.writerID == publishingTask.writerID })
+        XCTAssertEqual(drainingTask.rootEpoch, rootEpoch)
+        XCTAssertEqual(drainingTask.batchID, publishingTask.batchID)
+        XCTAssertEqual(drainingTask.phase, "awaiting_publication")
+        XCTAssertEqual(drainingTask.taskStartedUptimeNanoseconds, publishingTask.taskStartedUptimeNanoseconds)
+
+        storeFence.release()
+        await storeDisableDrain.value
         _ = await storeDemand.value
+        let drained = await engine.debugManifestWriterActivity(rootEpoch: rootEpoch)
+        XCTAssertEqual(drained.engineInstanceID, publishing.engineInstanceID)
+        XCTAssertTrue(drained.accountingComplete)
+        XCTAssertEqual(drained.liveTaskCount, 0)
+        XCTAssertEqual(drained.namespaceCount, 0)
+        XCTAssertEqual(drained.tasks.count, 0)
+        XCTAssertTrue(drained.quiescenceConfirmed, "Quiescence follows the writer task's actual return")
         XCTAssertEqual(publications.values.count, 0)
         XCTAssertEqual(scans.values.count, 0, "ON during the store suspension must not enter reconciliation")
-        storeFence.release()
 
         disabled.append(false)
         await engine.refreshGlobalCodeMapsDisabled()

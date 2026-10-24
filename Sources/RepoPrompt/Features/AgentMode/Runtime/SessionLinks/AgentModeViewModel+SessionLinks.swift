@@ -131,6 +131,8 @@ extension AgentModeViewModel {
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
+        // Discovery state is pane presentation input (§4.2); it grants no session-link authority.
+        syncTranscriptUIState()
         return AgentSessionLinkDiscoveryEpoch(
             windowID: windowID,
             workspaceID: workspaceID,
@@ -164,6 +166,7 @@ extension AgentModeViewModel {
             return
         }
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
+        syncTranscriptUIState()
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.discovery",
@@ -327,7 +330,9 @@ extension AgentModeViewModel {
             // rather than travelling on the candidate as authoritative.
             restorationReadiness: session.qualifiedRestorationReadiness,
             isDeletionInProgress: AgentSessionDeletionRegistry.shared
-                .isDeletionInProgress(sessionID: sessionID)
+                .isDeletionInProgress(sessionID: sessionID),
+            parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID
         )
     }
 
@@ -1181,8 +1186,9 @@ extension AgentModeViewModel {
     }
 
     /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
-    /// overseer for this row). The bridge enforces the Oversee-by rule: the pasted session must
-    /// already hold an outbound link.
+    /// overseer for this row). The pasted session may be any eligible session — the menu list
+    /// still offers existing overseers only, but a pasted ID may name a session that has not
+    /// overseen anything yet.
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
@@ -1303,6 +1309,7 @@ extension AgentModeViewModel {
             periodicIdleWakeEnabled: overlaid.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: overlaid.periodicIdleWakeIntervalSeconds,
             pendingUpdates: overlaid.pendingUpdates,
+            overseerBootstrapState: overlaid.overseerBootstrapState,
             persistence: overlaid.persistence
         )
     }
@@ -1323,6 +1330,9 @@ extension AgentModeViewModel {
             .filter { tabID, session in sessions[tabID] == nil && session.activeAgentSessionID != nil }
             .map(\.key)
         guard !closedTabIDs.isEmpty else { return }
+        // sessions.removeValue/removeAll have already committed in this didSet. Retire the
+        // presentation census before pruning can repaint rows or bindingEnded can suspend.
+        AgentSessionLinkRuntimeBridge.shared.noteCandidateReadinessChanged()
         agentSessionLinkPruneProjections()
         for tabID in closedTabIDs {
             AgentSessionLinkInvalidationSink.bindingEnded(
@@ -1378,7 +1388,7 @@ extension AgentModeViewModel {
         }
         return AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: identity?.persistentBindingGeneration != nil,
-            hasLoadedPersistedState: session.hasLoadedPersistedState,
+            hasLoadedPersistedState: session.hasLoadedPersistedState && session.permitsBoundOperationAndSave,
             isChildSession: session.parentSessionID != nil,
             isMCPControlled: session.mcpControlContext != nil,
             isMCPOriginated: session.isMCPOriginated,
@@ -1446,6 +1456,7 @@ extension AgentModeViewModel {
                 for: endpoint,
                 outbound: props.outbound
             )
+            props.overseerBootstrapState = agentSessionLinkBootstrapState(for: endpoint)
         }
         return props
     }

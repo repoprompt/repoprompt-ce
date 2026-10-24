@@ -256,3 +256,110 @@ final class AgentSessionLifecycleAuthorityContractTests: XCTestCase {
         }
     }
 #endif
+
+/// Ported from b9b950516: attempt-local indexes must retain sequential repair semantics.
+@MainActor
+final class AgentProjectionTabIndexTests: XCTestCase {
+    func testCarrierIndexesFollowReplacementAndInsertionBeforeLaterClaims() throws {
+        let sessionA = UUID(), sessionB = UUID(), sessionC = UUID()
+        let a = ComposeTabState(activeAgentSessionID: sessionA)
+        let b = ComposeTabState(activeAgentSessionID: sessionB)
+        let c = ComposeTabState(activeAgentSessionID: sessionC)
+        let current = WorkspaceModel(name: "Current", repoPaths: [], composeTabs: [a, b, c], activeComposeTabID: b.id)
+        var staleA = a
+        staleA.activeAgentSessionID = sessionB
+        var staleB = b
+        staleB.activeAgentSessionID = sessionA
+        let duplicateCarrier = ComposeTabState(activeAgentSessionID: sessionA)
+        var projected = current
+        projected.composeTabs = [staleA, duplicateCarrier, staleB]
+        projected.stashedTabs = [StashedTab(tab: b)]
+        projected.activeComposeTabID = a.id
+
+        let result = AgentSessionLifecycleAuthority().reconcileProjection(
+            projectedWorkspaces: [projected], currentWorkspaces: [current],
+            claims: [a, c, b].map { claim($0, in: current) }
+        )
+        let repaired = try XCTUnwrap(result.workspaces.first)
+        var clearedCarrier = duplicateCarrier
+        clearedCarrier.activeAgentSessionID = nil
+        XCTAssertEqual(repaired.composeTabs, [a, clearedCarrier, c, b])
+        XCTAssertTrue(repaired.stashedTabs.isEmpty)
+        XCTAssertEqual(repaired.activeComposeTabID, b.id)
+        XCTAssertEqual(result.protectedClaimCount, 3)
+        XCTAssertEqual(result.protectedWorkspaceIDs, [current.id])
+    }
+
+    func testLaterClaimClearsAFormerCarrierAndDuplicateTabIDsKeepFirstMatch() throws {
+        let session = UUID()
+        var first = ComposeTabState(activeAgentSessionID: session)
+        first.name = "Protected first"
+        let second = ComposeTabState(activeAgentSessionID: session)
+        var duplicate = first
+        duplicate.name = "Damaged duplicate"
+        let current = WorkspaceModel(name: "Current", repoPaths: [], composeTabs: [first, second])
+        var projected = current
+        projected.composeTabs = [first, duplicate, second]
+        let firstOnly = AgentSessionLifecycleAuthority().reconcileProjection(
+            projectedWorkspaces: [projected], currentWorkspaces: [current],
+            claims: [claim(first, in: current)]
+        )
+        var clearedSecond = second
+        clearedSecond.activeAgentSessionID = nil
+        XCTAssertEqual(try XCTUnwrap(firstOnly.workspaces.first).composeTabs, [first, duplicate, clearedSecond], "Same-ID duplicates keep their carrier until a different tab claims the session")
+        let result = AgentSessionLifecycleAuthority().reconcileProjection(
+            projectedWorkspaces: [projected], currentWorkspaces: [current],
+            claims: [first, second].map { claim($0, in: current) }
+        )
+        var clearedFirst = first
+        clearedFirst.activeAgentSessionID = nil
+        duplicate.activeAgentSessionID = nil
+        XCTAssertEqual(try XCTUnwrap(result.workspaces.first).composeTabs, [clearedFirst, duplicate, second])
+    }
+
+    func testLargeSidebarOverlayKeepsAllProtectedPayloadsAndUnrelatedStashedTabs() throws {
+        let tabs = (0 ..< 1500).map { index in
+            ComposeTabState(name: "Protected \(index)", isPinned: true, activeAgentSessionID: UUID(), promptText: "Local payload \(index)")
+        }
+        let current = WorkspaceModel(name: "Large", repoPaths: [], composeTabs: tabs, activeComposeTabID: tabs.last?.id)
+        var projected = current
+        projected.composeTabs = tabs.map { tab in
+            var stale = tab
+            stale.promptText = "Stale payload"
+            return stale
+        }
+        projected.stashedTabs = (0 ..< 1500).map { index in
+            StashedTab(tab: ComposeTabState(name: "Unrelated archived \(index)"))
+        }
+        let authority = AgentSessionLifecycleAuthority()
+        let claims = tabs.map { claim($0, in: current) }
+        let result = authority.reconcileProjection(
+            projectedWorkspaces: [projected], currentWorkspaces: [current], claims: claims
+        )
+        let repaired = try XCTUnwrap(result.workspaces.first)
+        XCTAssertEqual(repaired.composeTabs, tabs)
+        XCTAssertEqual(repaired.stashedTabs, projected.stashedTabs)
+        XCTAssertEqual(result.protectedClaimCount, tabs.count)
+        XCTAssertEqual(repaired.activeComposeTabID, current.activeComposeTabID)
+        #if DEBUG
+            XCTAssertEqual(authority.test_projectionTabIndexVisits, 6000, "Three tab passes and one stash pass, never a pass per claim")
+            XCTAssertEqual(authority.test_projectionCarrierVisits, 1500, "Only the exact session carriers are visited")
+        #endif
+        let unchanged = authority.reconcileProjection(
+            projectedWorkspaces: result.workspaces, currentWorkspaces: [current], claims: claims
+        )
+        XCTAssertEqual(unchanged.workspaces, result.workspaces)
+        XCTAssertEqual(unchanged.protectedClaimCount, 0)
+        #if DEBUG
+            XCTAssertEqual(authority.test_projectionTabIndexVisits, 6000)
+            XCTAssertEqual(authority.test_projectionCarrierVisits, 1500)
+        #endif
+    }
+
+    private func claim(_ tab: ComposeTabState, in workspace: WorkspaceModel) -> AgentSessionLifecycleAuthority.ProtectionClaim {
+        .init(
+            identity: .init(workspaceID: workspace.id, tabID: tab.id, sessionID: tab.activeAgentSessionID, persistentBindingGeneration: nil, bindingTransitionGeneration: 0),
+            tab: tab, isLive: true, isActive: tab.id == workspace.activeComposeTabID, isPinned: tab.isPinned, hasActiveRun: false
+        )
+    }
+}

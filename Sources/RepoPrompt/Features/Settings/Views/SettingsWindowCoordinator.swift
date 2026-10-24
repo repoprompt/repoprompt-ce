@@ -23,7 +23,17 @@ final class SettingsWindowModel: ObservableObject {
 /// SEARCH-HELPER: Settings window, Settings NSWindow, Settings window title,
 /// Settings window autosave, modeless settings, dedicated settings window.
 @MainActor
-final class SettingsWindowCoordinator: NSObject, NSWindowDelegate {
+final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDelegate {
+    enum AgentDecisionsSection: String, Equatable {
+        case modelRouter
+        case autoEffort
+    }
+
+    struct AgentDecisionsSectionRequest: Equatable {
+        let section: AgentDecisionsSection
+        let token = UUID()
+    }
+
     static let shared = SettingsWindowCoordinator()
 
     /// Key used to persist the window frame between launches via
@@ -53,6 +63,7 @@ final class SettingsWindowCoordinator: NSObject, NSWindowDelegate {
         )
     }
 
+    @Published private(set) var pendingAgentDecisionsSectionRequest: AgentDecisionsSectionRequest?
     private var windowController: NSWindowController?
     private var hostingController: NSHostingController<SettingsWindowRootView>?
     private var model: SettingsWindowModel?
@@ -132,6 +143,28 @@ final class SettingsWindowCoordinator: NSObject, NSWindowDelegate {
 
     func retarget(windowState: WindowState, selectedTab: SettingsTab) {
         open(windowState: windowState, selectedTab: selectedTab)
+    }
+
+    /// Opens or retargets the Settings window before publishing section intent.
+    /// An already-mounted router view observes the token change; a cold-mounted
+    /// view reads the retained request when it enters the hierarchy.
+    func openAgentDecisions(windowState: WindowState, section: AgentDecisionsSection) {
+        open(windowState: windowState, selectedTab: .modelRouter)
+        publishAgentDecisionsSectionRequest(section)
+    }
+
+    /// Kept as a separate seam for focused request/consume regression coverage.
+    /// Deep-link callers must use `openAgentDecisions(windowState:section:)` so
+    /// window filtering and retargeting happen before publication.
+    func publishAgentDecisionsSectionRequest(_ section: AgentDecisionsSection) {
+        pendingAgentDecisionsSectionRequest = AgentDecisionsSectionRequest(section: section)
+    }
+
+    func consumeAgentDecisionsSectionRequest(token: UUID) -> AgentDecisionsSection? {
+        guard pendingAgentDecisionsSectionRequest?.token == token else { return nil }
+        let section = pendingAgentDecisionsSectionRequest?.section
+        pendingAgentDecisionsSectionRequest = nil
+        return section
     }
 
     func closeIfTargeting(_ windowState: WindowState) {

@@ -113,23 +113,25 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let date = Date(timeIntervalSince1970: 1_900_000_000)
         let snapshot = try cliPlanUsageSnapshot(observedAt: date)
         let hourOld = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(60 * 60)), "an hour-old 5-hour reading is within 25% of its window")
-        XCTAssertEqual(hourOld.usedPercent, 6)
+        XCTAssertEqual(hourOld.usedPercent, 5, "the weekly window remains the primary figure")
+        XCTAssertEqual(hourOld.shortWindowPercent, 6, "the hour-old 5-hour reading remains visible as the secondary figure")
         let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
         XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
         XCTAssertEqual(pastFiveHourHorizon.freshness, .fresh)
         let everythingAged = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(43 * 3600)), "aged readings stay visible")
-        XCTAssertEqual(everythingAged.usedPercent, 6)
+        XCTAssertEqual(everythingAged.usedPercent, 5, "the aged weekly reading stays primary")
+        XCTAssertEqual(everythingAged.shortWindowPercent, 6, "the aged 5-hour reading also stays visible")
         XCTAssertEqual(everythingAged.freshness, .resetPassed, "the 5-hour reset has passed with nothing newer")
     }
 
-    func testCLIUsageWeeklyReadingInformsBalancingWithinOneHour() throws {
+    func testCLIUsageWeeklyReadingInformsBalancingWithinSixHours() throws {
         let date = Date(timeIntervalSince1970: 1_900_000_000)
         let snapshot = try cliPlanUsageSnapshot(observedAt: date)
         let recent = ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(40 * 60))
         XCTAssertTrue(recent.known)
-        XCTAssertNotNil(recent.weeklyPace)
+        XCTAssertNotNil(recent.weeklySparePace)
         XCTAssertEqual(recent.weeklyHeadroom, 95)
-        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(3601)).known, "weekly routing evidence is capped at one hour")
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(6 * 3600 + 1)).known, "weekly routing evidence is capped at six hours")
     }
 
     func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {
@@ -452,7 +454,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             if request["subtype"] as? String == "apply_flag_settings" { controls.append(Data()) }
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "first ordinary turn", attachments: [], intent: intent,
@@ -633,7 +635,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     private func ordinaryTurnFixture(
         controller: ClaudeNativeProcessSessionController,
         replacement: ClaudeNativeProcessSessionController? = nil
-    ) -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
+    ) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         var creations = 0
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
@@ -642,13 +644,18 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 creations += 1
                 return creations == 1 ? controller : (replacement ?? controller)
             },
-            autoEffortEnabledProvider: { true }
+            autoEffortConfigurationProvider: { .init(enabled: true, selectedBackendRawValue: nil, revision: 0) }
         )
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-opus-5-5:high"
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The restored conversation must be ready before exercising native configuration."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -665,7 +672,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             await controller.test_installConfigurationTransport(
                 initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
             )
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
                 await coordinator.sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
@@ -695,7 +702,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         await controller.test_installConfigurationTransport(
             initialized: true, controlRequest: { _ in await gate.respond() }, write: { writes.append($0) }
         )
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
@@ -715,14 +722,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testOrdinaryApplicationFailurePreservesIdentityAndDoesNotPrompt() async {
+    func testOrdinaryApplicationFailurePreservesIdentityAndDoesNotPrompt() async throws {
         for failure in [NativeAgentRuntimeControllerError.invalidControlResponse("rejected")] {
             let controller = applicationController()
             let writes = WrittenLines()
             await controller.test_installConfigurationTransport(
                 initialized: true, controlRequest: { _ in throw failure }, write: { writes.append($0) }
             )
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let outcome = await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
@@ -735,7 +742,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testComposerModelSwitchRequiringRestartDeliversWithoutRetry() async {
+    func testComposerModelSwitchRequiringRestartDeliversWithoutRetry() async throws {
         let controller = applicationController()
         let replacement = applicationController()
         let writes = WrittenLines()
@@ -743,7 +750,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             throw NativeAgentRuntimeControllerError.liveModelSwitchRequiresRestart
         }, write: { writes.append($0) })
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
         let ready = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
         XCTAssertEqual(ready, .ready)
         session.selectedModelRaw = "claude-sonnet-4-6:high"
@@ -770,20 +777,20 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
-    func testOptionalAutoFailureReestablishesSameModelManualProofBeforePrompt() async {
+    func testOptionalAutoFailureReestablishesSameModelManualProofBeforePrompt() async throws {
         let controller = applicationController()
         let requests = EffortRequests()
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(
             initialized: true, controlRequest: { try await requests.respond($0) }, write: { writes.append($0) }
         )
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let outcome = await coordinator.sendClaudeNativeMessage(
             session: session, text: "ordinary", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
                 provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                manualEffortRaw: "high", effortRaw: "low"
+                manualEffortRaw: "high", effortRaw: "low", backendID: .jev, autoEffortRevision: 0
             )
         )
         XCTAssertEqual(outcome, .sent)
@@ -812,7 +819,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 if !isPreWriteRefusal { throw NativeAgentRuntimeControllerError.inputWriteFailed("uncertain write") }
             })
             await controller.test_setBeforeConfigurationSend { _ = await gate.respond() }
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             var notAttempted = 0
             var failed = 0
             var accepted = 0
@@ -826,7 +833,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 acceptAgentSessionLinkPromptClaim: { _, _, _ in accepted += 1 }
             ), providerBindingService: AgentModeProviderBindingService())
             var state = session.selfCompactState
-            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race")
+            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             else { return XCTFail("Expected parked note reservation") }
             let noteID = noteAttempt.id
             state.active?.phase = .parked
@@ -898,7 +905,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 }
                 return [:]
             }, write: { writes.append($0) })
-            let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller)
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
                 await coordinator.sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
@@ -907,7 +914,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                         provider: .claudeCode,
                         selectedModelRaw: session.selectedModelRaw,
                         manualEffortRaw: "high",
-                        effortRaw: "low"
+                        effortRaw: "low", backendID: .jev, autoEffortRevision: 0
                     )
                 )
             }
@@ -937,7 +944,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         )
         let replacement = applicationController()
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
-        let (coordinator, session, intent) = ordinaryTurnFixture(controller: controller, replacement: replacement)
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
         let send = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
@@ -1255,5 +1262,112 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             "serverName": "RepoPromptCE",
             "message": "Approve?"
         ]))
+    }
+}
+
+@MainActor
+final class ClaudeUsageSetupTests: XCTestCase {
+    func testProductionConnectAndSetupActionAcceptPendingConsentButCollectionDoesNot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ClaudeUsageSetupTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        var source: ClaudeCLIUsageSource?
+        let runtime = ProviderQuotaRuntime(
+            accountIDProvider: { nil },
+            managedAuthTransitions: { AsyncStream { $0.finish() } },
+            settingsStore: settings,
+            claudeSourceFactory: { readConsent, setupConsent in
+                let value = ClaudeCLIUsageSource(root: root.appendingPathComponent("usage"), collect: { _, _ in
+                    try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+                }, consentProvider: readConsent, setupConsentProvider: setupConsent, setupCommandProvider: { "/usr/bin/false" })
+                source = value
+                return value
+            }
+        )
+        let action = ClaudeUsageSetupAction()
+        // These are the production Connect confirmation and Open Terminal action, not a
+        // hand-built ready grant. Before this fix the latter failed with needsConsent.
+        runtime.connectClaudeUsage(startReading: false)
+        let grant = try XCTUnwrap(settings.claudeCLIUsageGrant())
+        XCTAssertFalse(grant.isReady)
+        var launched: URL?
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { launched = $0 })
+        XCTAssertNil(action.error)
+        let script = try XCTUnwrap(launched)
+        XCTAssertEqual(action.script, script)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: script.path))
+        XCTAssertTrue(try String(contentsOf: script, encoding: .utf8).contains("'--tools' ''"))
+        XCTAssertEqual(settings.claudeCLIUsageGrant(), grant, "Opening setup cannot mark consent ready")
+        let connectedSource = try XCTUnwrap(source)
+        do {
+            _ = try await connectedSource.read(.init(userInitiated: true))
+            XCTFail("Pending setup authorized collection")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+        try await runtime.completeClaudeUsageSetup()
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.grantedAt, grant.grantedAt)
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.isReady, true)
+        let reading = try await connectedSource.read(.init(userInitiated: true))
+        XCTAssertFalse(reading.buckets.isEmpty)
+        runtime.disconnectClaudeUsage()
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { _ in XCTFail("Revoked consent opened Terminal") })
+        XCTAssertNotNil(action.error)
+        XCTAssertNil(action.manualCommand, "Do not retain a runnable command after revocation")
+    }
+
+    func testTerminalFailureRetainsCopyableQuotedManualCommandAndSuccessClearsError() async throws {
+        let action = ClaudeUsageSetupAction()
+        let script = URL(fileURLWithPath: "/fixture/helper's folder/Set up Claude usage.command")
+        await action.open(prepare: { script }, launch: { _ in throw NSError(domain: "Terminal", code: 42, userInfo: [NSLocalizedDescriptionKey: "Automation denied"]) })
+        XCTAssertTrue(try XCTUnwrap(action.error).contains("Automation denied"))
+        XCTAssertEqual(action.manualCommand, "/bin/zsh '/fixture/helper'\\''s folder/Set up Claude usage.command'")
+        await action.open(prepare: { script }, launch: { XCTAssertEqual($0, script) })
+        XCTAssertNil(action.error)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testPreparationFailureNeverLaunchesOrOffersStaleCommand() async {
+        let action = ClaudeUsageSetupAction()
+        action.script = URL(fileURLWithPath: "/stale/setup.command")
+        await action.open(prepare: { throw ProviderQuotaReadError.needsConsent }, launch: { _ in XCTFail("No authorized setup script") })
+        XCTAssertNil(action.manualCommand)
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testMissingCLIProvidesPreparationFailureWithoutLaunching() async {
+        let profile = ClaudeUsageCredentialProfile.current()
+        let source = ClaudeCLIUsageSource(consentProvider: { nil }, setupConsentProvider: { profile.id }, setupCommandProvider: { "not-an-executable" })
+        do {
+            _ = try await source.prepareSetup()
+            XCTFail("Missing CLI accepted")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .cliUnavailable) }
+    }
+
+    func testSetupRevalidatesConsentAfterPreparingFiles() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile.current()
+        let consent = OneUseSetupConsent(profileID: profile.id)
+        let source = ClaudeCLIUsageSource(root: root, consentProvider: { nil }, setupConsentProvider: { await consent.next() }, setupCommandProvider: { "/usr/bin/false" })
+        let action = ClaudeUsageSetupAction()
+        await action.open(prepare: { try await source.prepareSetup() }, launch: { _ in XCTFail("Revoked consent launched setup") })
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertNil(action.manualCommand)
+    }
+
+    private actor OneUseSetupConsent {
+        let profileID: String
+        var calls = 0
+        init(profileID: String) {
+            self.profileID = profileID
+        }
+
+        func next() -> String? {
+            calls += 1
+            return calls == 1 ? profileID : nil
+        }
     }
 }

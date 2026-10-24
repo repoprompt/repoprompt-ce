@@ -241,10 +241,36 @@ def command_for_suite(
     return (swift_binary, "test", "--skip-build", "--filter", suite)
 
 
+INHERITED_STORAGE_PREFERENCE_ENV = "REPOPROMPT_TEST_INHERITED_STORAGE_PREFERENCE"
+
+
+def read_inherited_storage_preference(
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str | None:
+    """Read-only: the workspace-storage preference test processes inherit before the run starts.
+
+    A fixture killed before restoring `GlobalCustomStorageURL` leaves it pinned in the xctest tool's
+    defaults, which cfprefsd keeps outside the sandboxed HOME. The value is handed to the test process
+    so the app ignores exactly that inherited value; nothing is written or deleted.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = run(
+            ["defaults", "read", "com.apple.dt.xctest.tool", "GlobalCustomStorageURL"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and value else None
+
+
 def isolated_suite_environment(
     sandbox_root: Path,
     suite: str,
     base_environment: Mapping[str, str] | None = None,
+    inherited_storage_preference: Callable[[], str | None] | None = None,
 ) -> dict[str, str]:
     digest = hashlib.sha256(suite.encode("utf-8")).hexdigest()[:16]
     suite_root = sandbox_root / digest
@@ -272,6 +298,11 @@ def isolated_suite_environment(
             "NSUnbufferedIO": "YES",
         }
     )
+    # Looked up at call time so the runner's own unit tests can stub the defaults read.
+    inherited = (inherited_storage_preference or read_inherited_storage_preference)()
+    environment.pop(INHERITED_STORAGE_PREFERENCE_ENV, None)
+    if inherited:
+        environment[INHERITED_STORAGE_PREFERENCE_ENV] = inherited
     return environment
 
 
@@ -759,6 +790,7 @@ def run_selected_suites(
 ) -> int:
     executed = []
     skipped = []
+    failures = []
     if suite_methods is not None and (not suites or receipt_path is None):
         print('::error::empty shard or missing receipt destination', file=output)
         return 2
@@ -782,9 +814,10 @@ def run_selected_suites(
                 result = verify_execution(list(suite_methods[suite]), transcript, return_code)
             except ValueError as error:
                 print(f'::error::{suite}: {error}', file=output, flush=True)
-                return return_code or 1
-            executed.extend(result['executed'])
-            skipped.extend(result['skipped'])
+                return_code = return_code or 1
+            else:
+                executed.extend(result['executed'])
+                skipped.extend(result['skipped'])
         print("::endgroup::", file=output, flush=True)
 
         if return_code == 0:
@@ -794,7 +827,14 @@ def run_selected_suites(
             file=output,
             flush=True,
         )
-        return return_code or 1
+        failures.append((suite, return_code))
+    if failures:
+        print(f'::error::Shard {shard_index}/{shard_count}: {len(failures)} of {len(suites)} suites failed; '
+              'all assigned suites were attempted once, no success receipt was published',
+              file=output, flush=True)
+        for suite, status in failures:
+            print(f'  {suite}: exit {status}', file=output, flush=True)
+        return failures[0][1]
     if suite_methods is not None:
         full_listing = listed_tests('\n'.join(method for methods in suite_methods.values() for method in methods))
         assigned = sorted(method for suite in suites for method in suite_methods[suite])

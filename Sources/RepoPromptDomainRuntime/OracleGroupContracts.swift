@@ -542,6 +542,13 @@ package enum OracleLaneResultStatus: String, Codable {
 }
 
 package struct OracleLaneError: Codable, Equatable {
+    /// Shared by live coverage and bounded persistence so truncation cannot
+    /// turn a known timeout into a generic provider failure.
+    package static func indicatesTimeout(code: String?, message: String?) -> Bool {
+        let text = "\(code ?? "") \(message ?? "")".lowercased()
+        return text.contains("timeout") || text.contains("timed out") || text.contains("timed_out")
+    }
+
     package let code: String
     package let message: String
     package let partialResponse: String?

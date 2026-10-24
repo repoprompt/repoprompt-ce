@@ -74,7 +74,7 @@ enum AgentSessionOversightRestoreTopologyState: Equatable {
 ///
 /// Diagnostics only: these are enum-like outcome labels, never rendered with a session name or UUID.
 enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
-    /// The saved UUID resolves to more than one live incarnation, so neither may be granted.
+    /// A previously granted UUID resolves to multiple live incarnations; its exact grant is revoked.
     case ambiguousDuplicate = "ambiguous_duplicate"
     /// No descriptor and no candidate, under a topology that proves absence.
     case missing
@@ -86,10 +86,18 @@ enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
     case bindingDrift = "binding_drift"
     /// A committed deletion tombstone covers one of the endpoints.
     case deleted
-    /// The shared establishment path refused for a non-shutdown reason.
+    /// Retained for diagnostics compatibility. Launch restoration no longer ends an entry with this
+    /// reason: a refused establishment is never proof the saved pair is gone (see `establish`).
     case activationFailed = "activation_failed"
     /// Lifecycle revoked the restored grant; only exact captured window-close ownership may requeue.
     case lifecycleRevoked = "lifecycle_revoked"
+
+    /// Whether ending the launch entry may also remove the saved row. Only a committed deletion is a
+    /// proven-permanent fact; every other reason ends the entry for this launch and keeps the intent
+    /// dormant for the next one (no data loss on transient or environmental conditions).
+    var removesDurableIntent: Bool {
+        self == .deleted
+    }
 }
 
 // MARK: - Delegate
@@ -105,12 +113,13 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     /// Termination freeze. A frozen process makes no new missing classification and performs no
     /// cleanup, so grace-uncertain and lazy entries stay durable for the next launch.
     var launchCoordinatorIsFrozen: Bool { get }
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure?
 
     /// The one shared fresh-establishment path. Restoration never reconstructs a grant itself.
     ///
     /// - Parameter proof: the binding-qualified hydration proof this entry was classified against.
     ///   It travels *through* the shared path rather than being re-derived inside it, because the
-    ///   resolver there deliberately gates on the legacy `hasLoadedPersistedState` latch.
+    ///   endpoint eligibility alone does not preserve the exact hydration outcome across awaits.
     func launchCoordinatorEstablish(
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken?,
@@ -135,11 +144,31 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 
     /// Reports an aggregate, identifier-free warning for the persistence surface.
     func launchCoordinatorReportWarning(id: String, message: String)
+    /// Removes a transient aggregate notice after its condition no longer holds.
+    func launchCoordinatorClearWarning(id: String)
 
     /// Asks the host to passively load the persisted state of these described-but-unhydrated
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
     /// each tab. Fire-and-forget: readiness changes re-enter the pass through the ordinary signal.
     func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>)
+
+    /// Resolves only saved targets named by waiting intents before missing classification. Returned
+    /// identities have uncertain saved state and must not be retired as missing in this pass.
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID>
+    /// Releases temporary runtime ownership after every establishment/early-exit path in the pass.
+    func launchCoordinatorFinishSavedTargetPreparation()
+}
+
+extension AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
+        AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
+    }
+
+    func launchCoordinatorFinishSavedTargetPreparation() {}
+
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID> {
+        []
+    }
 }
 
 // MARK: - Coordinator
@@ -184,14 +213,23 @@ final class AgentSessionOversightLaunchCoordinator {
         let pair: AgentSessionOversightIntent
         var token: AgentSessionOversightIntentToken?
         var state: EntryState = .waiting
-        /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it.
+        /// Presentation-only result of the latest topology census, never establishment authority.
+        var isBlockedByDuplicate = false
+        /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it or a
+        /// refused establishment spends one of its bounded per-launch retries.
         var didStartReservation = false
+        /// Refused establishments against `lastRefusedProof`. Bounds automatic retries of one exact
+        /// endpoint pair state; never a deletion trigger.
+        var refusedEstablishmentCount = 0
+        /// The proof the last refusal was classified against. A different proof (a new incarnation or
+        /// readiness) is new evidence and earns a fresh retry budget.
+        var lastRefusedProof: AgentSessionOversightRestorationProof?
         /// Sessions this launch has actually seen described or live at least once.
         ///
         /// A session that was observed and then disappeared is a *positive* fact about this process,
         /// unlike a session that was never there: it survives an uncertain restore topology, which is
-        /// what lets an ordinary close of a waiting, never-granted pair end the saved relationship
-        /// instead of leaving it to reactivate later.
+        /// what lets an ordinary close of a waiting pair end its attempt for this launch, retaining
+        /// saved intent for a later launch instead of letting it reactivate in this one.
         var observedSessions: Set<UUID> = []
         /// The exact incarnations and grant generation this entry was activated against.
         ///
@@ -230,7 +268,9 @@ final class AgentSessionOversightLaunchCoordinator {
     private var storeIsReady = false
     private var isFrozen = false
     private var didLoadLaunchEntries = false
-    private var didReportTerminalSummary = false
+    private var reportedTerminalSummaryIDs: Set<String> = []
+    /// Tracks the condition edge, not warning presence, so Dismiss survives ordinary passes.
+    private var wasDuplicateBlocked = false
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -342,6 +382,7 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.targetEndpoint = nil
         entry.reference = nil
         entries[pair] = entry
+        synchronizeDuplicateWarning()
         markDirty()
     }
 
@@ -371,6 +412,7 @@ final class AgentSessionOversightLaunchCoordinator {
             entry.state = .terminal(.lifecycleRevoked)
         }
         entries[pair] = entry
+        synchronizeDuplicateWarning()
     }
 
     /// Capture exact saved ownership synchronously, before close hides either endpoint.
@@ -461,6 +503,12 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.state = .cleanupPending(token)
         entries[pair] = entry
         if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
+        synchronizeDuplicateWarning()
+    }
+
+    /// The token a still-owed cleanup for `pair` would remove, if any.
+    func pendingCleanupToken(for pair: AgentSessionOversightIntent) -> AgentSessionOversightIntentToken? {
+        if case let .cleanupPending(token) = entries[pair]?.state { token } else { nil }
     }
 
     var hasPendingCleanup: Bool {
@@ -535,6 +583,8 @@ final class AgentSessionOversightLaunchCoordinator {
         isDirty = false
         drainTask?.cancel()
         drainTask = nil
+        clearDuplicateFlags()
+        synchronizeDuplicateWarning()
     }
 
     // MARK: Diagnostics
@@ -596,6 +646,12 @@ final class AgentSessionOversightLaunchCoordinator {
         entries.values.count { $0.didStartReservation }
     }
 
+    #if DEBUG
+        func refusedEstablishmentCount(for pair: AgentSessionOversightIntent) -> Int {
+            entries[pair]?.refusedEstablishmentCount ?? 0
+        }
+    #endif
+
     // MARK: Pass
 
     /// One reconciliation pass over the launch-loaded and close-captured worklist.
@@ -605,6 +661,7 @@ final class AgentSessionOversightLaunchCoordinator {
     /// would either grant against a half-built window or misclassify a session that simply has not
     /// been described yet.
     private func performPass() async {
+        defer { synchronizeDuplicateWarning() }
         guard !isFrozen,
               storeIsReady,
               automaticRestoreEnabled,
@@ -616,11 +673,17 @@ final class AgentSessionOversightLaunchCoordinator {
               !delegate.launchCoordinatorIsFrozen,
               let host = delegate.launchCoordinatorHost
         else {
+            clearDuplicateFlags()
             return
+        }
+        defer {
+            if isFrozen || delegate.launchCoordinatorIsFrozen { clearDuplicateFlags() }
         }
         let discovery = host.agentSessionLinkDiscoveryStates()
         // An empty set means no window has registered a level yet — that is "not described", not
         // "nothing to describe".
+        // Discovery and dirty-pass exits are transient: retain the last completed census until
+        // a successor is available, including across unrelated synchronous entry updates.
         guard !discovery.isEmpty, discovery.allSatisfy(\.isComplete) else {
             #if DEBUG
                 logDiscoveryPendingOnce(discovery)
@@ -631,6 +694,11 @@ final class AgentSessionOversightLaunchCoordinator {
             didLogDiscoveryPending = false
         #endif
 
+        defer { delegate.launchCoordinatorFinishSavedTargetPreparation() }
+        let uncertainSavedTargets = await delegate.launchCoordinatorPrepareSavedTargets(launchPairOrder.filter {
+            entries[$0]?.state == .waiting || entries[$0]?.parkedReference != nil
+        })
+        guard !isFrozen, !delegate.launchCoordinatorIsFrozen, !isDirty else { return }
         let descriptors = host.agentSessionLinkComposeTabDescriptors()
         let candidates = host.agentSessionLinkCandidates()
         var descriptorCounts: [UUID: Int] = [:]
@@ -642,6 +710,14 @@ final class AgentSessionOversightLaunchCoordinator {
             candidatesBySession[candidate.sessionID, default: []].append(candidate)
         }
 
+        for pair in launchPairOrder {
+            guard var entry = entries[pair] else { continue }
+            entry.isBlockedByDuplicate = [pair.observerSessionID, pair.targetSessionID].contains {
+                (descriptorCounts[$0] ?? 0) > 1 || (candidatesBySession[$0] ?? []).count > 1
+            }
+            entries[pair] = entry
+        }
+
         requestHydrationForWaitingEntries(
             descriptorCounts: descriptorCounts,
             candidatesBySession: candidatesBySession
@@ -650,6 +726,7 @@ final class AgentSessionOversightLaunchCoordinator {
         for pair in launchPairOrder {
             guard !isFrozen, !isDirty else { return }
             guard var entry = entries[pair] else { continue }
+            if uncertainSavedTargets.contains(pair.targetSessionID) { continue }
             if entry.parkedReference != nil {
                 let sessions = [pair.observerSessionID, pair.targetSessionID]
                 guard sessions.allSatisfy({ sessionID in
@@ -736,7 +813,9 @@ final class AgentSessionOversightLaunchCoordinator {
                 case 1:
                     switch matches[0].restorationReadiness {
                     case .pending, .unbound: true
-                    case .authoritative, .terminal: false
+                    // An owned creation must finish its configured first save. Loading a missing
+                    // payload cannot establish that preparation or authorize its replacement.
+                    case .creating, .authoritative, .terminal: false
                     }
                 default:
                     false
@@ -770,6 +849,14 @@ final class AgentSessionOversightLaunchCoordinator {
         descriptorCounts: [UUID: Int],
         candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]]
     ) -> Disposition {
+        // Record presence for both endpoints before any early wait (including a duplicate on the
+        // first endpoint). Closing every observed copy must still end the launch entry rather than
+        // look like an uncertain workspace that never returned.
+        for sessionID in [pair.observerSessionID, pair.targetSessionID]
+            where (descriptorCounts[sessionID] ?? 0) > 0 || !(candidatesBySession[sessionID] ?? []).isEmpty
+        {
+            noteObserved(pair: pair, sessionID: sessionID)
+        }
         var resolved: [UUID: AgentSessionLinkEndpointCandidate] = [:]
         for sessionID in [pair.observerSessionID, pair.targetSessionID] {
             let descriptorCount = descriptorCounts[sessionID] ?? 0
@@ -785,15 +872,16 @@ final class AgentSessionOversightLaunchCoordinator {
                 return .wait
             }
 
-            // A duplicate is a *positive* fact even under an uncertain topology: two live
-            // incarnations of one UUID mean neither may be granted, exactly as manual Add refuses.
-            if descriptorCount > 1 || matches.count > 1 { return .terminal(.ambiguousDuplicate) }
+            // Neither copy may be granted, but a waiting, not active, entry can become unique when
+            // the extra window closes. Keep waiting on ordinary topology/readiness events and
+            // re-prove every establishment fence then; an active entry's audit remains terminal.
+            if descriptorCount > 1 || matches.count > 1 { return .wait }
 
             if descriptorCount == 0, matches.isEmpty {
                 // An endpoint this launch already observed and then watched disappear is a fact about
                 // *this* process, not the uncertainty an abandoned restore leftover represents: the
                 // tab, window, or workspace holding it was torn down while we were looking. That ends
-                // the saved relationship exactly as an ordinary close does.
+                // this launch's attempt; saved intent remains available for a later launch.
                 if entries[pair]?.observedSessions.contains(sessionID) == true {
                     return .terminal(.bindingDrift)
                 }
@@ -802,8 +890,6 @@ final class AgentSessionOversightLaunchCoordinator {
                 // rather than deleting an intent whose window may simply never have come back.
                 return topology.provesAbsence ? .terminal(.missing) : .wait
             }
-            noteObserved(pair: pair, sessionID: sessionID)
-
             // A described-but-unhydrated background tab. Waiting here is the entire reason
             // descriptors exist: restoration must never force-hydrate a lazy tab.
             guard let candidate = matches.first else { continue }
@@ -811,7 +897,9 @@ final class AgentSessionOversightLaunchCoordinator {
             // Candidate construction carries the same transient marker for UI eligibility. Keep the
             // registry check above as the authority because it closes the gap before candidates update.
             if candidate.isDeletionInProgress { return .wait }
-            if !candidate.isTopLevel { return .terminal(.ineligible) }
+            if sessionID == pair.observerSessionID, !candidate.isTopLevel { return .terminal(.ineligible) }
+            if sessionID == pair.targetSessionID,
+               delegate?.launchCoordinatorTargetFailure(for: candidate, observerSessionID: pair.observerSessionID) == .childSession { return .terminal(.ineligible) }
             if candidate.isClosing { return .terminal(.ineligible) }
             if sessionID == pair.observerSessionID, !candidate.roleAllowsOutboundMonitoring {
                 return .terminal(.ineligible)
@@ -832,7 +920,7 @@ final class AgentSessionOversightLaunchCoordinator {
                     // Still inspect the other endpoint for a proven terminal reason.
                     continue
                 }
-            case .pending, .unbound:
+            case .creating, .pending, .unbound:
                 return .wait
             }
         }
@@ -892,7 +980,7 @@ final class AgentSessionOversightLaunchCoordinator {
         if !observer.roleAllowsOutboundMonitoring || observer.isMCPControlled || observer.isMCPOriginated {
             return .ineligible
         }
-        if !target.isTopLevel || target.isClosing { return .ineligible }
+        if target.isClosing || delegate?.launchCoordinatorTargetFailure(for: target, observerSessionID: pair.observerSessionID) == .childSession { return .ineligible }
         return nil
     }
 
@@ -944,6 +1032,14 @@ final class AgentSessionOversightLaunchCoordinator {
         proof: AgentSessionOversightRestorationProof
     ) async {
         guard let delegate, var entry = entries[pair] else { return }
+        // A refusal budget is spent per exact endpoint state. Changed endpoints are new evidence, so a
+        // pair is never locked out for the rest of the launch by refusals of an earlier incarnation.
+        if entry.didStartReservation, entry.refusedEstablishmentCount >= Self.maxAutomaticEstablishmentAttempts,
+           let lastRefusedProof = entry.lastRefusedProof, lastRefusedProof != proof
+        {
+            entry.didStartReservation = false
+            entry.refusedEstablishmentCount = 0
+        }
         // At-most-once is enforced by launch-entry state, not by the bridge's task table: a joined
         // task would satisfy the table while still counting as a second automatic reservation.
         guard !entry.didStartReservation else { return }
@@ -978,73 +1074,44 @@ final class AgentSessionOversightLaunchCoordinator {
                 }
             #endif
         case .failed, .rejected:
-            // A shutdown-shaped refusal preserves the intent for the next launch; anything else is a
-            // real refusal and the saved request is removed.
-            guard !isFrozen else {
-                settled.state = .waiting
-                entries[pair] = settled
-                return
-            }
-            // A hydration outcome can supersede the classified proof inside the shared path's
-            // authority hops. That refusal grants nothing, but is not proof the saved pair is gone.
-            if case .failed(.rebinding) = outcome,
-               let host = delegate.launchCoordinatorHost,
-               transientHydrationDrift(
-                   from: proof,
-                   candidates: host.agentSessionLinkCandidates(
-                       forSessionIDs: [proof.observerEndpoint.sessionID, proof.targetEndpoint.sessionID],
-                       includeLocation: true
-                   ).values.flatMap(\.self)
-               )
-            {
-                // The launch reservation budget is spent; retain intent for the next launch.
-                settled.state = .waiting
-                entries[pair] = settled
-                return
-            }
+            // A refused establishment grants nothing, and it is never proof that the saved pair is
+            // gone: at launch the shared path routinely refuses transiently (an endpoint still
+            // hydrating or rebinding, a superseded hydration proof, a closing or retiring endpoint,
+            // a transient observer eligibility input). Deleting here erased user-created links on
+            // ordinary restarts. Only `classify` may end this launch's attempt, and only on a proven
+            // fact (deleted, missing under a fully observed topology, ineligible, terminal hydration).
+            // A waiting entry blocked by a duplicate waits for topology to settle instead.
             settled.state = .waiting
-            entries[pair] = settled
-            await retire(pair: pair, reason: .activationFailed)
-        }
-    }
-
-    private func transientHydrationDrift(
-        from proof: AgentSessionOversightRestorationProof,
-        candidates: [AgentSessionLinkEndpointCandidate]
-    ) -> Bool {
-        let observers = candidates.filter { $0.sessionID == proof.observerEndpoint.sessionID }
-        let targets = candidates.filter { $0.sessionID == proof.targetEndpoint.sessionID }
-        guard observers.count == 1, targets.count == 1,
-              let observer = observers.first, let target = targets.first,
-              observer.domainEndpoint == proof.observerEndpoint,
-              target.domainEndpoint == proof.targetEndpoint,
-              observer.isTopLevel, !observer.isClosing,
-              observer.roleAllowsOutboundMonitoring,
-              !observer.isMCPControlled, !observer.isMCPOriginated,
-              target.isTopLevel, !target.isClosing
-        else {
-            return false
-        }
-        func isTransient(
-            _ current: AgentSessionRestorationReadiness,
-            insteadOf expected: AgentSessionRestorationReadiness
-        ) -> Bool {
-            guard case let .terminal(token, failure) = current,
-                  token == expected.bindingToken
-            else { return false }
-            return switch failure {
-            case .loadFailed, .sourceRevisionSuperseded: true
-            case .missingPayload: false
+            guard !isFrozen else {
+                entries[pair] = settled
+                return
             }
+            if settled.lastRefusedProof != proof {
+                settled.lastRefusedProof = proof
+                settled.refusedEstablishmentCount = 0
+            }
+            settled.refusedEstablishmentCount += 1
+            if settled.refusedEstablishmentCount < Self.maxAutomaticEstablishmentAttempts {
+                // Rearm one bounded retry. No immediate re-pass: the retry runs on the next
+                // readiness or topology event, so a transient refusal cannot burn the budget
+                // back-to-back. That pass reclassifies first, so a permanent cause retires with its
+                // real reason and a transient one waits for the event that settles it.
+                settled.didStartReservation = false
+            }
+            // Otherwise this endpoint state's budget is spent; a changed endpoint earns a fresh one, and
+            // the intent stays durable for the next launch either way.
+            entries[pair] = settled
+            #if DEBUG
+                logReconcile(pair: pair, outcome: "refused")
+            #endif
         }
-        let observerTransient = isTransient(observer.restorationReadiness, insteadOf: proof.observerReadiness)
-        let targetTransient = isTransient(target.restorationReadiness, insteadOf: proof.targetReadiness)
-        return (observerTransient || observer.restorationReadiness == proof.observerReadiness)
-            && (targetTransient || target.restorationReadiness == proof.targetReadiness)
-            && (observerTransient || targetTransient)
     }
 
-    /// Terminalizes one entry and removes exactly its own durable token.
+    /// Automatic establishment attempts per launch entry. Bounded so a persistently refusing path
+    /// cannot spin; exhaustion preserves intent rather than deleting it.
+    static let maxAutomaticEstablishmentAttempts = 3
+
+    /// Terminalizes one entry, removing exactly its own durable token only for committed deletion.
     private func retire(
         pair: AgentSessionOversightIntent,
         reason: AgentSessionOversightLaunchTerminalReason
@@ -1053,7 +1120,7 @@ final class AgentSessionOversightLaunchCoordinator {
         else {
             return
         }
-        guard let token = entry.token else {
+        guard let token = entry.token, reason.removesDurableIntent else {
             entry.parkedReference = nil
             entry.closedReferences.removeAll()
             entry.state = .terminal(reason)
@@ -1061,7 +1128,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
             return
         }
         entry.state = .terminal(reason)
@@ -1091,7 +1158,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
         case .tokenMismatch:
             // A generation mismatch is the store proving this retirement is stale. The explicit Add
             // will hand the entry to the interactive path; do not pre-emptively terminalize it.
@@ -1105,7 +1172,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+        // Token mismatch proves no removal. Do not report that the saved row was removed.
         case .writeFailed, .blocked:
             // Suppressed for this launch and recorded token-qualified, so no topology event retries
             // it and no stale receipt can later delete a reasserted intent.
@@ -1121,13 +1188,43 @@ final class AgentSessionOversightLaunchCoordinator {
         }
     }
 
-    /// One aggregate summary per launch. Never names a session.
-    private func reportTerminalSummaryIfNeeded() {
-        guard !didReportTerminalSummary else { return }
-        didReportTerminalSummary = true
+    /// Lasting restoration barriers invalidate the presentation condition, not saved intent.
+    private func clearDuplicateFlags() {
+        for pair in launchPairOrder {
+            entries[pair]?.isBlockedByDuplicate = false
+        }
+    }
+
+    /// A transient, identifier-free projection over the bounded launch worklist.
+    private func synchronizeDuplicateWarning() {
+        guard let delegate else { return }
+        let isWaiting = entries.values.contains {
+            $0.isBlockedByDuplicate && ($0.state == .waiting || $0.parkedReference != nil)
+        }
+        guard isWaiting != wasDuplicateBlocked else { return }
+        wasDuplicateBlocked = isWaiting
+        if isWaiting {
+            delegate.launchCoordinatorReportWarning(
+                id: AgentSessionOversightWarningID.duplicateWaiting,
+                message: AgentSessionOversightPersistenceCopy.duplicateWaiting
+            )
+        } else {
+            delegate.launchCoordinatorClearWarning(id: AgentSessionOversightWarningID.duplicateWaiting)
+        }
+    }
+
+    /// One aggregate summary per disposition per launch. Never names a session.
+    private func reportTerminalSummaryIfNeeded(reason: AgentSessionOversightLaunchTerminalReason) {
+        let removed = reason.removesDurableIntent
+        let id = removed
+            ? AgentSessionOversightWarningID.deletedRestoration
+            : AgentSessionOversightWarningID.terminalRestoration
+        guard reportedTerminalSummaryIDs.insert(id).inserted else { return }
         delegate?.launchCoordinatorReportWarning(
-            id: AgentSessionOversightWarningID.terminalRestoration,
-            message: AgentSessionOversightPersistenceCopy.terminalRestorationSummary
+            id: id,
+            message: removed
+                ? AgentSessionOversightPersistenceCopy.deletedRestorationSummary
+                : AgentSessionOversightPersistenceCopy.terminalRestorationSummary
         )
     }
 }

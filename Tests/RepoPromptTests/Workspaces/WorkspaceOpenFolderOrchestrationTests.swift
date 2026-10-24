@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptWorkspaceCore
 import XCTest
 
@@ -23,6 +24,7 @@ import XCTest
             originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WorkspaceOpenFolderOrchestrationTests-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()

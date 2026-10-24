@@ -111,6 +111,7 @@ package extension MCPDomainHost {
         .agentExploreControl,
         .agentExternalControl,
         .agentSessionLinkControl,
+        .agentSessionAdmin,
     ]
 
     package func advertisedCatalog(

@@ -26,7 +26,12 @@ enum AgentModeProcessRunIdentity {
             return false
         }
         if existingRunID == nil {
+            // A span annotation is not a canonical commit — the local-input index projects
+            // nothing from response spans — so preserve the gate exactly: a pending commit
+            // stays pending and a clean one is not falsely reported pending.
+            let canonicalCommitPending = session.localInputCanonicalCommitPending
             session.transcript.turns[turnIndex].responseSpans[spanIndex].runID = runID
+            session.localInputCanonicalCommitPending = canonicalCommitPending
             session.isDirty = true
         }
         return true

@@ -1556,10 +1556,6 @@ struct AgentModeChatDetailView: View {
         transcriptPresentation.isCompressedHistoryRevealed && canRevealCompressedHistory
     }
 
-    private var hasTranscriptContent: Bool {
-        !transcriptPresentation.visibleRows.isEmpty || transcriptPresentation.archivedHistoryState.hasArchivedHistory
-    }
-
     private var dynamicSummaryLockTargetTurnID: UUID? {
         transcriptPresentation.metadata.dynamicSummaryLockTargetTurnID
     }
@@ -1875,6 +1871,9 @@ struct AgentModeChatDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let currentTabID, let session = agentModeVM.sessions[currentTabID] {
+                AgentSessionRestorationRecoveryView(session: session, viewModel: agentModeVM)
+            }
             // Main content area with floating input bar
             ZStack(alignment: .bottom) {
                 // Background layer: scroll view + fixed spacer for the base bar
@@ -2385,7 +2384,7 @@ struct AgentModeChatDetailView: View {
             .frame(
                 maxWidth: .infinity,
                 minHeight: viewportHeight,
-                alignment: hasTranscriptContent ? .topLeading : .center
+                alignment: transcriptSnapshot.panePresentation == .transcript ? .topLeading : .center
             )
         #if DEBUG
             .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
@@ -2407,12 +2406,36 @@ struct AgentModeChatDetailView: View {
         if shouldShowStreamingHistoryIndicator {
             streamingHistoryIndicator
         }
-        if !hasTranscriptContent {
-            emptyStateView
-        } else {
+        switch transcriptSnapshot.panePresentation {
+        case .transcript:
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
+        case .welcome:
+            emptyStateView
+        case .restoring:
+            restoringPaneView
+        case let .unavailable(reason, retry):
+            unavailablePaneView(reason: reason, retry: retry)
+        case .runningOrWaiting:
+            // The existing run indicator and interaction cards below present current run facts; show
+            // fallback copy only when neither is visible.
+            if let fallback = AgentTranscriptPanePresentation.runningOrWaitingFallback(
+                isWaitingForInput: isRunWaitingForInput,
+                isRunIndicatorVisible: shouldShowRunningIndicator,
+                isInteractionCardVisible: hasVisibleRunInteractionCard
+            ) {
+                Text(fallback)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
         }
+        AgentRepromptQuestionsView(viewModel: agentModeVM, store: agentModeVM.repromptUIStore, tabID: currentTabID)
         runningIndicatorSlot
+        DelegationApprovalSlot(
+            windowID: windowID,
+            tabID: currentTabID,
+            sessionID: currentTabID.flatMap { agentModeVM.sessions[$0]?.activeAgentSessionID },
+            runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
+        )
         if let request = runInteractionSnapshot.pendingCodexHookReview {
             CodexHookReviewCard(
                 request: request,
@@ -3325,6 +3348,26 @@ struct AgentModeChatDetailView: View {
 
     private var shouldShowRunningIndicator: Bool {
         runInteractionSnapshot.isAgentBusy && runInteractionSnapshot.runState == .running
+    }
+
+    private var isRunWaitingForInput: Bool {
+        switch runInteractionSnapshot.runState {
+        case .waitingForUser, .waitingForQuestion, .waitingForApproval: true
+        default: false
+        }
+    }
+
+    /// Mirrors the interaction-card chain in `messageRowsContent`.
+    private var hasVisibleRunInteractionCard: Bool {
+        let snapshot = runInteractionSnapshot
+        return snapshot.pendingCodexHookReview != nil
+            || snapshot.pendingApplyEditsReview != nil
+            || snapshot.pendingWorktreeMergeReview != nil
+            || snapshot.pendingApproval != nil
+            || snapshot.pendingMCPElicitationRequest != nil
+            || snapshot.pendingUserInputRequest != nil
+            || snapshot.pendingAskUser != nil
+            || snapshot.activeWorktreeMergeConflict != nil
     }
 
     private var runningIndicatorSlot: some View {
@@ -5952,6 +5995,34 @@ struct AgentModeChatDetailView: View {
         ]
     }
 
+    private var restoringPaneView: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Restoring conversation…")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func unavailablePaneView(
+        reason: AgentTranscriptPanePresentation.UnavailableReason,
+        retry: AgentTranscriptRetryTarget?
+    ) -> some View {
+        VStack(spacing: 10) {
+            Text(reason.message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            if let retry {
+                Button("Retry") {
+                    _ = agentModeVM.retryTranscriptRestoration(retry)
+                }
+            }
+        }
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 20) {
             HStack(spacing: 10) {
@@ -6042,5 +6113,56 @@ private struct AgentRunningElapsedText: View {
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         return "\(minutes)m \(String(format: "%02d", seconds))s"
+    }
+}
+
+/// A failed restore must remain visible and recoverable without overwriting its original identity.
+private struct AgentSessionRestorationRecoveryView: View {
+    @ObservedObject var session: AgentTabSession
+    let viewModel: AgentModeViewModel
+
+    var body: some View {
+        if let failure = session.qualifiedRestorationReadiness.terminalFailure {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(
+                    failure == .missingPayload
+                        ? "This session's saved conversation is unavailable. Its identity has been preserved."
+                        : "This session could not be restored. Its saved data has not been replaced."
+                )
+                .font(.callout)
+                Spacer(minLength: 8)
+                Button("Retry Loading") {
+                    let expectedSession = session
+                    Task { await viewModel.retrySessionRestoration(tabID: expectedSession.tabID, expectedSession: expectedSession) }
+                }
+                Button("New Session") {
+                    Task { await viewModel.createAndActivateSessionTab() }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        } else if let creation = session.creationState {
+            HStack(spacing: 12) {
+                switch creation.phase {
+                case .preparing:
+                    Text("This new session is being prepared.").font(.callout)
+                case .readyToPersist:
+                    Text("This prepared session has not been saved yet.").font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Retry Saving") {
+                        guard let handle = viewModel.captureSessionCreationRetry(for: session) else { return }
+                        Task { await viewModel.retrySessionInitialSave(handle) }
+                    }
+                case let .failedBeforeConfiguration(message):
+                    Text(message).font(.callout)
+                    Spacer(minLength: 8)
+                    Button("New Session") {
+                        Task { await viewModel.createAndActivateSessionTab() }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        }
     }
 }

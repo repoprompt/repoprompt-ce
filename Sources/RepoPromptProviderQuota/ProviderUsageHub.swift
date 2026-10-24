@@ -27,6 +27,8 @@ package struct ProviderUsageSignal: Equatable, CustomStringConvertible, CustomDe
     package let source: ProviderQuotaSource
     package let headroom: Headroom
     package let resetsAt: Date?
+    /// Declared window length, or the well-known length for a known native role.
+    package let windowDuration: TimeInterval?
     package let availability: ProviderQuotaAvailability
     package var description: String {
         "ProviderUsageSignal(identified: \(account.isIdentified), fresh: \(availability.isFresh))"
@@ -38,6 +40,14 @@ package struct ProviderUsageSignal: Equatable, CustomStringConvertible, CustomDe
 
     package var customMirror: Mirror {
         Mirror(self, children: ["identified": account.isIdentified, "fresh": availability.isFresh], displayStyle: .struct)
+    }
+
+    private static func knownDuration(forNativeRole role: String) -> TimeInterval? {
+        switch role {
+        case "five_hour": 18000
+        case "seven_day": 604_800
+        default: nil
+        }
     }
 
     package static func readings(from snapshot: ProviderQuotaSnapshot, now: Date, maximumObservationAge: TimeInterval? = 900) -> [Self] {
@@ -66,6 +76,7 @@ package struct ProviderUsageSignal: Equatable, CustomStringConvertible, CustomDe
                     source: snapshot.source,
                     headroom: headroom,
                     resetsAt: window.resetsAt,
+                    windowDuration: window.windowDuration ?? knownDuration(forNativeRole: window.nativeRole),
                     availability: availability
                 )
             }

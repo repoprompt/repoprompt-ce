@@ -427,10 +427,13 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Pipeline delivery begins with an existing restored conversation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         return Node(
             viewModel: viewModel,
             session: session,

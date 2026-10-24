@@ -84,7 +84,17 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .openCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Steering starts from an existing restored session with a live run, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before waiting on provider gates"
+        )
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID, sessionID: sessionID, tabName: "ACP steer target", isWindowClosing: false
         ))

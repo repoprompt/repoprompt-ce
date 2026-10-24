@@ -198,6 +198,7 @@
     "RepoPromptPersistence": {
       "source_root": "Sources/RepoPromptPersistence",
       "allowed_dependencies": [
+        "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptFileSystem",
         "RepoPromptVCS",

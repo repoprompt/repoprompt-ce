@@ -378,6 +378,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let executeAgentSessionLink: ExecuteTool
         let executeBecomeOverseer: ExecuteTool
         let executeAgentSelf: ExecuteTool
+        let executeSessionAdmin: ExecuteTool
         let requireTargetWindow: RequireTargetWindow
         let requireCurrentTabContext: RequireCurrentTabContext
         let requireAgentModeConnection: RequireAgentModeConnection

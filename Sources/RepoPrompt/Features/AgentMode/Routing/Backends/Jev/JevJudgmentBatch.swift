@@ -43,7 +43,7 @@ struct JevJudgmentBatch: Equatable {
     }
 
     static let minimumCriteria = 2
-    static let maximumCriteria = AgentTaskRoutingEnvelopeBuilder.maximumCandidates
+    static let maximumCriteria = FiniteChoiceDecisionValidator.maximumChoices
 
     let questions: [JevJudgmentQuestion]
 

@@ -163,7 +163,17 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             session.providerSessionID = "provider-conversation"
             session.codexConversationID = "codex-thread"
         }
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -306,6 +316,41 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         // `AgentSessionLinkCompactClaudeDispatchTests`, which drives the raw lane directly.
         XCTAssertEqual(fixture.session.runState, .running)
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim is released")
+    }
+
+    func testAgentSelfOversizeAdmissionReportsEnforcedWindowBasis() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.noteLimit")
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        let cases: [(Int?, Int, String)] = [
+            (1000, 400, "10% of context window at 4 UTF-8 bytes/token"),
+            (nil, 65536, "unknown context window fallback")
+        ]
+        for (window, maximum, basis) in cases {
+            fixture.session.contextUsageSnapshot = nil
+            if let window {
+                fixture.session.contextUsageSnapshot = ContextUsageSnapshot(
+                    used: 1, window: window, confidence: .exact, source: .claudeUsageEvent, compactedAt: nil
+                )
+                fixture.session.noteLiveContextUsageReport(contextUsedTokens: 1, promptTokens: nil, modelContextWindow: window)
+            }
+            let admission = await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: String(repeating: "x", count: maximum + 1), idempotencyKey: "oversized"
+            )
+            guard case let .noteTooLong(byteCount, enforcedMaximum, enforcedBasis) = admission else {
+                return XCTFail("Expected an oversized-note refusal from real VM admission")
+            }
+            XCTAssertEqual(byteCount, maximum + 1)
+            XCTAssertEqual(enforcedMaximum, maximum)
+            XCTAssertEqual(enforcedBasis, basis)
+            XCTAssertNil(fixture.session.selfCompactState.active)
+        }
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
     func testSelfTerminalBoundaryStartsNativeCommandPipelineAfterPersistingFixedRow() async throws {
@@ -982,7 +1027,17 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         session.claudeController = controller
         let inventory = MonitorInventoryPublisher(viewModel: viewModel, observerSessionID: sessionID, tabID: tabID)
         return (viewModel, session, inventory, tabID)
@@ -1106,7 +1161,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             runAttemptID: XCTUnwrap(session.activeRunAttemptID)
         )
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "native-note-test", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "native-note-test", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .dispatchingNote
         state.active?.compactProviderConversation = "monitor-native-session"
         let id = try XCTUnwrap(state.active?.id)
