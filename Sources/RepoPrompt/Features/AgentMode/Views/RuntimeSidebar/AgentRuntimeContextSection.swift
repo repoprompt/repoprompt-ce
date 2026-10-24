@@ -27,6 +27,7 @@ struct AgentRuntimeContextSection: View {
                 contextWindowTokens: snapshot.effectiveContextWindowTokens,
                 usedTokens: snapshot.usedTokens,
                 sourceLabel: usageSubtitle,
+                awaitingPostCompactionUsage: snapshot.awaitingPostCompactionUsage,
                 style: .labeled
             )
 

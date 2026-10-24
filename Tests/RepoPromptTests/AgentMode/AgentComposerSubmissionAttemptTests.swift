@@ -1447,3 +1447,258 @@ private extension DecisionServiceCapabilities {
         evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
     )
 }
+
+// MARK: - Slash-command composer suggestions
+
+@MainActor
+final class AgentSlashCommandSuggestionsTests: XCTestCase {
+    func testClaudeCompactIsDiscoverableAndPrefixFiltered() async {
+        let viewModel = makeViewModel()
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        viewModel.selectedAgent = .claudeCode
+
+        let fresh = await viewModel.slashSkillSuggestions(for: "")
+        XCTAssertFalse(fresh.contains { $0.relativePath == "compact" })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "   "
+        viewModel.test_installLiveSession(session)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        let emptyConversation = await viewModel.slashSkillSuggestions(for: "comp")
+        XCTAssertTrue(emptyConversation.isEmpty)
+        session.providerSessionID = "restored-conversation"
+        let all = await viewModel.slashSkillSuggestions(for: "")
+        XCTAssertEqual(all.first?.relativePath, "compact")
+        let filtered = await viewModel.slashSkillSuggestions(for: "comp")
+        XCTAssertEqual(filtered.first?.displayName, "/compact")
+        let unrelated = await viewModel.slashSkillSuggestions(for: "zz-no-command")
+        XCTAssertFalse(unrelated.contains { $0.relativePath == "compact" })
+        let explicitSkill = await viewModel.slashSkillSuggestions(for: "skill:compact")
+        XCTAssertFalse(explicitSkill.contains { $0.subtitle == "Compact Claude Code conversation context" })
+    }
+
+    func testClaudeBuiltinDoesNotLeakIntoOtherProviderMenus() async {
+        let viewModel = makeViewModel()
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        for provider: AgentProviderKind in [.codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .cursor, .openCode, .grokBuild, .devin, .antigravity] {
+            viewModel.selectedAgent = provider
+            let suggestions = await viewModel.slashSkillSuggestions(for: "comp")
+            XCTAssertFalse(suggestions.contains { $0.subtitle == "Compact Claude Code conversation context" }, provider.rawValue)
+        }
+    }
+
+    func testActiveClaudeRuntimeCommandsReachMenuButNotOtherProviders() async {
+        let viewModel = makeViewModel()
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "restored-conversation"
+        session.claudeController = SlashSuggestionRuntime()
+        viewModel.test_installLiveSession(session)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+
+        let claude = await viewModel.slashSkillSuggestions(for: "context")
+        XCTAssertEqual(claude.map(\.relativePath), ["context"])
+        session.selectedAgent = .cursor
+        let cursor = await viewModel.slashSkillSuggestions(for: "context")
+        XCTAssertFalse(cursor.contains { $0.relativePath == "context" })
+    }
+
+    func testSuspendedRuntimeLookupCannotPublishAfterProviderSwitch() async {
+        let viewModel = makeViewModel()
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        let started = expectation(description: "runtime command lookup started")
+        let runtime = SlashSuggestionRuntime(holdLookup: true, onLookup: { started.fulfill() })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.claudeController = runtime
+        viewModel.test_installLiveSession(session)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+
+        let pending = Task { await viewModel.slashSkillSuggestions(for: "context") }
+        await fulfillment(of: [started], timeout: 2)
+        session.selectedAgent = .cursor
+        await runtime.releaseLookup()
+        let stale = await pending.value
+        XCTAssertTrue(stale.isEmpty)
+    }
+
+    func testAdvertisedCommandsAreMergedAndDeduplicatedWithCompactFallback() {
+        let commands: [NativeAgentRuntimeSlashCommand] = [
+            .init(name: "context", description: "Show context", argumentHint: "[detail]"),
+            .init(name: "compact", description: "Provider compact", argumentHint: ""),
+            .init(name: "CONTEXT", description: "Duplicate", argumentHint: "")
+        ]
+        let all = AgentModeViewModel.claudeSlashCommandSuggestions(for: "", runtimeCommands: commands, canCompact: true)
+        XCTAssertEqual(all.map(\.relativePath), ["compact", "context"])
+        XCTAssertEqual(all.last?.subtitle, "Show context — [detail]")
+        let filtered = AgentModeViewModel.claudeSlashCommandSuggestions(for: " CON ", runtimeCommands: commands, canCompact: true)
+        XCTAssertEqual(filtered.map(\.relativePath), ["context"])
+    }
+
+    func testExactAdvertisedCommandSurvivesSuggestionLimit() {
+        var commands = (0 ..< 80).map {
+            NativeAgentRuntimeSlashCommand(name: "context-\($0)", description: "Related command", argumentHint: "")
+        }
+        commands.append(.init(name: "context", description: "Exact command", argumentHint: ""))
+        let native = AgentModeViewModel.claudeSlashCommandSuggestions(for: "context", runtimeCommands: commands, canCompact: true)
+        let suggestions = AgentModeViewModel.mergeClaudeSlashSuggestions(native: native, skills: [], query: "context")
+        XCTAssertEqual(suggestions.count, 6)
+        XCTAssertEqual(suggestions.first?.relativePath, "context")
+        XCTAssertEqual(suggestions.count(where: { $0.relativePath == "context" }), 1)
+    }
+
+    func testCompactSkillCollisionKeepsNativeCommandAndExplicitSkillSeparate() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let commands = root.appendingPathComponent(".claude/commands", isDirectory: true)
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        try "Local compact instructions".write(to: commands.appendingPathComponent("compact.md"), atomically: true, encoding: .utf8)
+        try "---\ndescription: Local context skill\n---\nLocal context instructions".write(to: commands.appendingPathComponent("context.md"), atomically: true, encoding: .utf8)
+        let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        let viewModel = makeViewModel(root: root, catalog: catalog)
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        viewModel.selectedAgent = .claudeCode
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "restored-conversation"
+        session.claudeController = SlashSuggestionRuntime()
+        viewModel.test_installLiveSession(session)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+
+        let suggestions = await viewModel.slashSkillSuggestions(for: "compact")
+        XCTAssertEqual(suggestions.map(\.relativePath), ["compact", "skill:compact"])
+        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/skill:compact", agentKind: .claudeCode).first?.definition.name, "compact")
+        let explicit = await viewModel.slashSkillSuggestions(for: "skill:compact")
+        XCTAssertEqual(explicit.map(\.relativePath), ["skill:compact"])
+        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+        // Deliberate compatibility policy: a local skill shadows even an advertised
+        // non-compact built-in. The displayed local row must match actual expansion.
+        let context = await viewModel.slashSkillSuggestions(for: "context")
+        XCTAssertEqual(context.map(\.relativePath), ["context"])
+        XCTAssertEqual(context.first?.subtitle, "Local context skill")
+        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/context", agentKind: .claudeCode).first?.definition.name, "context")
+        XCTAssertFalse(context.first?.submitsOnExactEnter ?? true)
+        session.selectedAgent = .cursor
+        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+    }
+
+    func testLargeRuntimeMenuRetainsLocalSkillAfterDeduplication() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let commands = root.appendingPathComponent(".claude/commands", isDirectory: true)
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        try "---\ndescription: Local review skill\n---\nReview instructions".write(to: commands.appendingPathComponent("review-local.md"), atomically: true, encoding: .utf8)
+        var runtimeCommands = (0 ..< 9).map {
+            NativeAgentRuntimeSlashCommand(name: "review-\($0)", description: "Runtime review", argumentHint: "", builtin: true)
+        }
+        runtimeCommands.append(.init(name: "review-local", description: "Runtime duplicate", argumentHint: ""))
+        let viewModel = makeViewModel(root: root, catalog: AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home")))
+        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "existing-conversation"
+        session.claudeController = SlashSuggestionRuntime(commands: runtimeCommands)
+        viewModel.test_installLiveSession(session)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+
+        let suggestions = await viewModel.slashSkillSuggestions(for: "review")
+        XCTAssertEqual(suggestions.count, 6)
+        XCTAssertEqual(Set(suggestions.map(\.relativePath)).count, 6)
+        XCTAssertEqual(suggestions.count(where: { $0.relativePath == "review-local" }), 1)
+        XCTAssertEqual(suggestions.first { $0.relativePath == "review-local" }?.subtitle, "Local review skill")
+    }
+
+    func testRuntimeBuiltinMarkerAndArgumentHintsControlExactEnterPolicy() {
+        let snapshot = ClaudeNativeProcessSessionController.parseInitializeResponseSnapshot(from: ["commands": [
+            ["name": "context", "description": "Context", "argumentHint": "", "builtin": true],
+            ["name": "review", "description": "Review", "argumentHint": "<file>", "builtin": true],
+            ["name": "review-skill", "description": "Skill", "argumentHint": ""],
+            ["name": "compact", "description": "Compact", "argumentHint": "", "builtin": true]
+        ]])
+        let suggestions = AgentModeViewModel.claudeSlashCommandSuggestions(for: "", runtimeCommands: snapshot.commands, canCompact: false)
+        XCTAssertEqual(suggestions.first { $0.relativePath == "context" }?.submitsOnExactEnter, true)
+        XCTAssertEqual(suggestions.first { $0.relativePath == "review" }?.submitsOnExactEnter, false)
+        XCTAssertEqual(suggestions.first { $0.relativePath == "review-skill" }?.submitsOnExactEnter, false)
+        XCTAssertFalse(suggestions.contains { $0.relativePath == "compact" })
+        let compactWithHint = AgentModeViewModel.claudeSlashCommandSuggestions(for: "", runtimeCommands: [
+            .init(name: "compact", description: "Compact", argumentHint: "[instructions]", builtin: true)
+        ], canCompact: true)
+        XCTAssertEqual(compactWithHint.first?.submitsOnExactEnter, false)
+    }
+
+    private func makeViewModel(root: URL? = nil, catalog: AgentSkillCatalog? = nil) -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWorkspacePath: root?.path,
+            skillCatalog: catalog,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Slash suggestions must not start Codex") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "slash suggestions test") }
+        )
+    }
+}
+
+/// Command discovery is a cached runtime read, not a provider launch or model turn.
+private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
+    var hasActiveSession = true
+    var hasTurnInFlight = false
+    var events: AsyncStream<NativeAgentRuntimeEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    private let commands: [NativeAgentRuntimeSlashCommand]
+    private let holdLookup: Bool
+    private let onLookup: (@Sendable () -> Void)?
+    private var lookupContinuation: CheckedContinuation<Void, Never>?
+    private var lookupReleased = false
+
+    init(
+        commands: [NativeAgentRuntimeSlashCommand] = [.init(name: "context", description: "Show runtime context", argumentHint: "", builtin: true)],
+        holdLookup: Bool = false,
+        onLookup: (@Sendable () -> Void)? = nil
+    ) {
+        self.commands = commands
+        self.holdLookup = holdLookup
+        self.onLookup = onLookup
+    }
+
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
+        onLookup?()
+        if holdLookup, !lookupReleased {
+            await withCheckedContinuation { lookupContinuation = $0 }
+        }
+        return commands
+    }
+
+    func releaseLookup() {
+        lookupReleased = true
+        lookupContinuation?.resume()
+        lookupContinuation = nil
+    }
+
+    func ensureEventsStreamReady() {}
+    func resetEventsStreamForNewRun() {}
+    func currentSessionRef() -> NativeAgentRuntimeSessionRef {
+        .init(sessionID: "slash-test")
+    }
+
+    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) {}
+    func shutdown() {
+        hasActiveSession = false
+    }
+
+    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) {}
+
+    func startOrResume(existingSessionID: String?, model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, systemPromptOverride: String?) -> NativeAgentRuntimeSessionRef {
+        preconditionFailure("Slash suggestions must not start a provider")
+    }
+
+    func sendUserMessage(_ text: String) -> UUID {
+        preconditionFailure("Slash suggestions must not send provider messages")
+    }
+
+    func interruptTurn(reason: String) -> NativeAgentRuntimeInterruptOutcome {
+        .noTurnInFlight
+    }
+}

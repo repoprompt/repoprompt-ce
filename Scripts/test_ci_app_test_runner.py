@@ -852,27 +852,32 @@ class TestExecutionTests(unittest.TestCase):
                 self.assertTrue(Path(first[key]).is_dir(), key)
                 self.assertNotEqual(first[key], inherited[key])
 
-    def test_runner_stops_on_first_failure(self) -> None:
+    def test_runner_attempts_each_isolated_suite_once_and_preserves_first_failure(self) -> None:
         calls: list[tuple[str, ...]] = []
+        statuses = iter([9, 3, 0])
 
         def executor(command, _cwd, _environment) -> int:
             calls.append(tuple(command))
-            return 9
+            return next(statuses)
 
+        output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             result = runner.run_selected_suites(
-                ("RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests"),
+                ("RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests"),
                 swift_binary="swift",
                 cwd=None,
                 bundle_selection=self.empty_bundle_selection(),
                 sandbox_root=Path(directory),
                 executor=executor,
-                output=io.StringIO(),
+                output=output,
             )
 
         self.assertEqual(result, 9)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][-1], "RepoPromptTests.FirstTests")
+        self.assertEqual([call[-1] for call in calls], [
+            "RepoPromptTests.FirstTests", "RepoPromptTests.SecondTests", "RepoPromptTests.ThirdTests",
+        ])
+        self.assertIn('2 of 3 suites failed', output.getvalue())
+        self.assertEqual(output.getvalue().count('::endgroup::'), 3)
 
 if __name__ == "__main__":
     unittest.main()

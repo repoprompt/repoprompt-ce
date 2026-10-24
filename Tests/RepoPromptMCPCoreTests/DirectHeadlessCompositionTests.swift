@@ -94,6 +94,54 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         }
     }
 
+    func testCanonicalAgentControlDescriptionsExplainCompoundTaskRoles() throws {
+        let selectionClauses = [
+            "app-backed sessions", "compound model_id", "assigns no task role to a fresh session",
+            "set that role's default"
+        ]
+        let childClauses = [
+            "agent_explore requires an engineer, pair, or design task role",
+            "start a child that will need Explore helpers with one of those role labels"
+        ]
+        let resumeClauses = [
+            "parented MCP sub-agents cannot use create_session or resume_session, whatever their role",
+            "matching MCP control context keeps its task role even if model_id is supplied",
+            "otherwise a role label installs that role", "an omitted or compound model_id installs none"
+        ]
+        let pointerClauses = [
+            "effective workspace or global role defaults", "compound model_id",
+            "assigns no task role", "see the tool description"
+        ]
+        var cases: [(label: String, text: String, required: [String])] = []
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentManage] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let modelDescription = try XCTUnwrap(properties["model_id"]?.objectValue?["description"]?.stringValue)
+            let required = selectionClauses + childClauses
+                + (toolName == MCPWindowToolName.agentManage ? resumeClauses : ["effective workspace or global role defaults"])
+            let manageSelectionClauses = toolName == MCPWindowToolName.agentManage
+                ? ["on create_session, a compound model_id pins the exact target"] : []
+            let managePointerClauses = toolName == MCPWindowToolName.agentManage
+                ? [
+                    "on create_session, a compound model_id assigns no task role",
+                    "on resume_session, a matching MCP control context keeps its task role even if model_id is supplied",
+                    "otherwise an omitted or compound model_id installs none"
+                ] : []
+            cases.append(("\(toolName) description", definition.description, required + manageSelectionClauses))
+            cases.append(("\(toolName).model_id", modelDescription, pointerClauses + managePointerClauses))
+        }
+        for entry in cases {
+            let text = entry.text.replacingOccurrences(of: "`", with: "").lowercased()
+            XCTAssertFalse(text.contains("role-default mapping"), entry.label)
+            let missing = entry.required.filter { !text.contains($0.lowercased()) }
+            XCTAssertTrue(
+                missing.isEmpty,
+                "\(entry.label) is missing compound task-role guidance: \(missing.joined(separator: "; "))"
+            )
+        }
+    }
+
     func testCanonicalOracleSendToolsAdvertiseImageAttachments() throws {
         for toolName in ["ask_oracle", "oracle_send"] {
             let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))

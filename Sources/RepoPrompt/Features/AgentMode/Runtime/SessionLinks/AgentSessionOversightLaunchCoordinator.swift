@@ -74,7 +74,7 @@ enum AgentSessionOversightRestoreTopologyState: Equatable {
 ///
 /// Diagnostics only: these are enum-like outcome labels, never rendered with a session name or UUID.
 enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
-    /// The saved UUID resolves to more than one live incarnation, so neither may be granted.
+    /// A previously granted UUID resolves to multiple live incarnations; its exact grant is revoked.
     case ambiguousDuplicate = "ambiguous_duplicate"
     /// No descriptor and no candidate, under a topology that proves absence.
     case missing
@@ -144,6 +144,8 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 
     /// Reports an aggregate, identifier-free warning for the persistence surface.
     func launchCoordinatorReportWarning(id: String, message: String)
+    /// Removes a transient aggregate notice after its condition no longer holds.
+    func launchCoordinatorClearWarning(id: String)
 
     /// Asks the host to passively load the persisted state of these described-but-unhydrated
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
@@ -211,6 +213,8 @@ final class AgentSessionOversightLaunchCoordinator {
         let pair: AgentSessionOversightIntent
         var token: AgentSessionOversightIntentToken?
         var state: EntryState = .waiting
+        /// Presentation-only result of the latest topology census, never establishment authority.
+        var isBlockedByDuplicate = false
         /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it or a
         /// refused establishment spends one of its bounded per-launch retries.
         var didStartReservation = false
@@ -224,8 +228,8 @@ final class AgentSessionOversightLaunchCoordinator {
         ///
         /// A session that was observed and then disappeared is a *positive* fact about this process,
         /// unlike a session that was never there: it survives an uncertain restore topology, which is
-        /// what lets an ordinary close of a waiting, never-granted pair end the saved relationship
-        /// instead of leaving it to reactivate later.
+        /// what lets an ordinary close of a waiting pair end its attempt for this launch, retaining
+        /// saved intent for a later launch instead of letting it reactivate in this one.
         var observedSessions: Set<UUID> = []
         /// The exact incarnations and grant generation this entry was activated against.
         ///
@@ -264,7 +268,9 @@ final class AgentSessionOversightLaunchCoordinator {
     private var storeIsReady = false
     private var isFrozen = false
     private var didLoadLaunchEntries = false
-    private var didReportTerminalSummary = false
+    private var reportedTerminalSummaryIDs: Set<String> = []
+    /// Tracks the condition edge, not warning presence, so Dismiss survives ordinary passes.
+    private var wasDuplicateBlocked = false
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
@@ -376,6 +382,7 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.targetEndpoint = nil
         entry.reference = nil
         entries[pair] = entry
+        synchronizeDuplicateWarning()
         markDirty()
     }
 
@@ -405,6 +412,7 @@ final class AgentSessionOversightLaunchCoordinator {
             entry.state = .terminal(.lifecycleRevoked)
         }
         entries[pair] = entry
+        synchronizeDuplicateWarning()
     }
 
     /// Capture exact saved ownership synchronously, before close hides either endpoint.
@@ -495,6 +503,7 @@ final class AgentSessionOversightLaunchCoordinator {
         entry.state = .cleanupPending(token)
         entries[pair] = entry
         if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
+        synchronizeDuplicateWarning()
     }
 
     /// The token a still-owed cleanup for `pair` would remove, if any.
@@ -574,6 +583,8 @@ final class AgentSessionOversightLaunchCoordinator {
         isDirty = false
         drainTask?.cancel()
         drainTask = nil
+        clearDuplicateFlags()
+        synchronizeDuplicateWarning()
     }
 
     // MARK: Diagnostics
@@ -650,6 +661,7 @@ final class AgentSessionOversightLaunchCoordinator {
     /// would either grant against a half-built window or misclassify a session that simply has not
     /// been described yet.
     private func performPass() async {
+        defer { synchronizeDuplicateWarning() }
         guard !isFrozen,
               storeIsReady,
               automaticRestoreEnabled,
@@ -661,11 +673,17 @@ final class AgentSessionOversightLaunchCoordinator {
               !delegate.launchCoordinatorIsFrozen,
               let host = delegate.launchCoordinatorHost
         else {
+            clearDuplicateFlags()
             return
+        }
+        defer {
+            if isFrozen || delegate.launchCoordinatorIsFrozen { clearDuplicateFlags() }
         }
         let discovery = host.agentSessionLinkDiscoveryStates()
         // An empty set means no window has registered a level yet — that is "not described", not
         // "nothing to describe".
+        // Discovery and dirty-pass exits are transient: retain the last completed census until
+        // a successor is available, including across unrelated synchronous entry updates.
         guard !discovery.isEmpty, discovery.allSatisfy(\.isComplete) else {
             #if DEBUG
                 logDiscoveryPendingOnce(discovery)
@@ -690,6 +708,14 @@ final class AgentSessionOversightLaunchCoordinator {
         var candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]] = [:]
         for candidate in candidates {
             candidatesBySession[candidate.sessionID, default: []].append(candidate)
+        }
+
+        for pair in launchPairOrder {
+            guard var entry = entries[pair] else { continue }
+            entry.isBlockedByDuplicate = [pair.observerSessionID, pair.targetSessionID].contains {
+                (descriptorCounts[$0] ?? 0) > 1 || (candidatesBySession[$0] ?? []).count > 1
+            }
+            entries[pair] = entry
         }
 
         requestHydrationForWaitingEntries(
@@ -823,6 +849,14 @@ final class AgentSessionOversightLaunchCoordinator {
         descriptorCounts: [UUID: Int],
         candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]]
     ) -> Disposition {
+        // Record presence for both endpoints before any early wait (including a duplicate on the
+        // first endpoint). Closing every observed copy must still end the launch entry rather than
+        // look like an uncertain workspace that never returned.
+        for sessionID in [pair.observerSessionID, pair.targetSessionID]
+            where (descriptorCounts[sessionID] ?? 0) > 0 || !(candidatesBySession[sessionID] ?? []).isEmpty
+        {
+            noteObserved(pair: pair, sessionID: sessionID)
+        }
         var resolved: [UUID: AgentSessionLinkEndpointCandidate] = [:]
         for sessionID in [pair.observerSessionID, pair.targetSessionID] {
             let descriptorCount = descriptorCounts[sessionID] ?? 0
@@ -838,15 +872,16 @@ final class AgentSessionOversightLaunchCoordinator {
                 return .wait
             }
 
-            // A duplicate is a *positive* fact even under an uncertain topology: two live
-            // incarnations of one UUID mean neither may be granted, exactly as manual Add refuses.
-            if descriptorCount > 1 || matches.count > 1 { return .terminal(.ambiguousDuplicate) }
+            // Neither copy may be granted, but a waiting, not active, entry can become unique when
+            // the extra window closes. Keep waiting on ordinary topology/readiness events and
+            // re-prove every establishment fence then; an active entry's audit remains terminal.
+            if descriptorCount > 1 || matches.count > 1 { return .wait }
 
             if descriptorCount == 0, matches.isEmpty {
                 // An endpoint this launch already observed and then watched disappear is a fact about
                 // *this* process, not the uncertainty an abandoned restore leftover represents: the
                 // tab, window, or workspace holding it was torn down while we were looking. That ends
-                // the saved relationship exactly as an ordinary close does.
+                // this launch's attempt; saved intent remains available for a later launch.
                 if entries[pair]?.observedSessions.contains(sessionID) == true {
                     return .terminal(.bindingDrift)
                 }
@@ -855,8 +890,6 @@ final class AgentSessionOversightLaunchCoordinator {
                 // rather than deleting an intent whose window may simply never have come back.
                 return topology.provesAbsence ? .terminal(.missing) : .wait
             }
-            noteObserved(pair: pair, sessionID: sessionID)
-
             // A described-but-unhydrated background tab. Waiting here is the entire reason
             // descriptors exist: restoration must never force-hydrate a lazy tab.
             guard let candidate = matches.first else { continue }
@@ -1045,9 +1078,9 @@ final class AgentSessionOversightLaunchCoordinator {
             // gone: at launch the shared path routinely refuses transiently (an endpoint still
             // hydrating or rebinding, a superseded hydration proof, a closing or retiring endpoint,
             // a transient observer eligibility input). Deleting here erased user-created links on
-            // ordinary restarts. Only `classify` may end the saved relationship, and only on a proven
-            // fact (deleted, missing under a fully observed topology, duplicate, ineligible, terminal
-            // hydration).
+            // ordinary restarts. Only `classify` may end this launch's attempt, and only on a proven
+            // fact (deleted, missing under a fully observed topology, ineligible, terminal hydration).
+            // A waiting entry blocked by a duplicate waits for topology to settle instead.
             settled.state = .waiting
             guard !isFrozen else {
                 entries[pair] = settled
@@ -1078,7 +1111,7 @@ final class AgentSessionOversightLaunchCoordinator {
     /// cannot spin; exhaustion preserves intent rather than deleting it.
     static let maxAutomaticEstablishmentAttempts = 3
 
-    /// Terminalizes one entry and removes exactly its own durable token.
+    /// Terminalizes one entry, removing exactly its own durable token only for committed deletion.
     private func retire(
         pair: AgentSessionOversightIntent,
         reason: AgentSessionOversightLaunchTerminalReason
@@ -1095,7 +1128,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
             return
         }
         entry.state = .terminal(reason)
@@ -1125,7 +1158,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+            reportTerminalSummaryIfNeeded(reason: reason)
         case .tokenMismatch:
             // A generation mismatch is the store proving this retirement is stale. The explicit Add
             // will hand the entry to the interactive path; do not pre-emptively terminalize it.
@@ -1139,7 +1172,7 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
-            reportTerminalSummaryIfNeeded()
+        // Token mismatch proves no removal. Do not report that the saved row was removed.
         case .writeFailed, .blocked:
             // Suppressed for this launch and recorded token-qualified, so no topology event retries
             // it and no stale receipt can later delete a reasserted intent.
@@ -1155,13 +1188,43 @@ final class AgentSessionOversightLaunchCoordinator {
         }
     }
 
-    /// One aggregate summary per launch. Never names a session.
-    private func reportTerminalSummaryIfNeeded() {
-        guard !didReportTerminalSummary else { return }
-        didReportTerminalSummary = true
+    /// Lasting restoration barriers invalidate the presentation condition, not saved intent.
+    private func clearDuplicateFlags() {
+        for pair in launchPairOrder {
+            entries[pair]?.isBlockedByDuplicate = false
+        }
+    }
+
+    /// A transient, identifier-free projection over the bounded launch worklist.
+    private func synchronizeDuplicateWarning() {
+        guard let delegate else { return }
+        let isWaiting = entries.values.contains {
+            $0.isBlockedByDuplicate && ($0.state == .waiting || $0.parkedReference != nil)
+        }
+        guard isWaiting != wasDuplicateBlocked else { return }
+        wasDuplicateBlocked = isWaiting
+        if isWaiting {
+            delegate.launchCoordinatorReportWarning(
+                id: AgentSessionOversightWarningID.duplicateWaiting,
+                message: AgentSessionOversightPersistenceCopy.duplicateWaiting
+            )
+        } else {
+            delegate.launchCoordinatorClearWarning(id: AgentSessionOversightWarningID.duplicateWaiting)
+        }
+    }
+
+    /// One aggregate summary per disposition per launch. Never names a session.
+    private func reportTerminalSummaryIfNeeded(reason: AgentSessionOversightLaunchTerminalReason) {
+        let removed = reason.removesDurableIntent
+        let id = removed
+            ? AgentSessionOversightWarningID.deletedRestoration
+            : AgentSessionOversightWarningID.terminalRestoration
+        guard reportedTerminalSummaryIDs.insert(id).inserted else { return }
         delegate?.launchCoordinatorReportWarning(
-            id: AgentSessionOversightWarningID.terminalRestoration,
-            message: AgentSessionOversightPersistenceCopy.terminalRestorationSummary
+            id: id,
+            message: removed
+                ? AgentSessionOversightPersistenceCopy.deletedRestorationSummary
+                : AgentSessionOversightPersistenceCopy.terminalRestorationSummary
         )
     }
 }

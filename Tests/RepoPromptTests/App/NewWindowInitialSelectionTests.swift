@@ -23,41 +23,131 @@ import XCTest
         // MARK: Off-main catalog preparation and its new suspension boundary
 
         func testCoveringManagerReconciliationDuringPreparationCreditsBridgeWithoutReadoptingModels() async throws {
+            for coveringPreparation in [1, 2] {
+                try await Fixture.run { f in
+                    let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                    let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let gate = f.makeGate()
+                    let entered = Signal("initial preparation ready before manager reconciliation")
+                    var preparations = 0
+                    bridge.catalogPreparationDidFinishForTesting = { _ in
+                        preparations += 1
+                        if preparations < coveringPreparation {
+                            manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                            return
+                        }
+                        entered.fire()
+                        await gate.wait()
+                    }
+                    window.restartDomainWorkspaceProjectionForTesting()
+                    try await f.wait(entered)
+                    let catalog = await f.runtime.workspaceStore.snapshot()
+                    let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                        catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    let tab = try XCTUnwrap(workspace.composeTabs.first)
+                    let title = "Local descendant of the covering reconciliation"
+                    manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
+                        value.name = title
+                    }
+                    manager.markWorkspaceDirty(workspaceID: workspace.id)
+                    let adoptions = catalog.workspaces.map {
+                        manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                    }
+                    gate.release()
+                    let accepted = try await f.awaitCatalogProjection(window)
+                    XCTAssertEqual(preparations, coveringPreparation, "handoff must not trigger a third decode")
+                    XCTAssertEqual(receipt.kind, .full)
+                    XCTAssertEqual(accepted.catalogReceipt?.kind, .metadata)
+                    XCTAssertEqual(catalog.workspaces.map {
+                        manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                    }, adoptions, "the bridge must not replace already-qualified document lineages")
+                    XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
+                    XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                }
+            }
+        }
+
+        func testFinalPreparationHandoffPreservesNewerCatalogFailure() async throws {
             try await Fixture.run { f in
                 let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
                 let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                 let gate = f.makeGate()
-                let entered = Signal("initial preparation ready before manager reconciliation")
+                let entered = Signal("final preparation ready before covering reconciliation")
+                var preparations = 0
                 bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                        return
+                    }
                     entered.fire()
                     await gate.wait()
                 }
                 window.restartDomainWorkspaceProjectionForTesting()
                 try await f.wait(entered)
                 let catalog = await f.runtime.workspaceStore.snapshot()
-                let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
                     catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
                     rootMapPolicy: .snapshotMetadata
                 ).receipt)
-                let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
-                let tab = try XCTUnwrap(workspace.composeTabs.first)
-                let title = "Local descendant of the covering reconciliation"
-                manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
-                    value.name = title
-                }
-                manager.markWorkspaceDirty(workspaceID: workspace.id)
-                let adoptions = catalog.workspaces.map {
-                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
-                }
+                XCTAssertTrue(manager.reportDomainCatalogFailure(
+                    .modelProjection("newer independent failure"), snapshot: catalog,
+                    attempt: manager.beginDomainCatalogAttempt()
+                ))
+                let failure = manager.workspaceChooserPresentation.failure
+                let issue = manager.domainWorkspaceAuthorityIssue
                 gate.release()
                 let accepted = try await f.awaitCatalogProjection(window)
-                XCTAssertEqual(receipt.kind, .full)
                 XCTAssertEqual(accepted.catalogReceipt?.kind, .metadata)
-                XCTAssertEqual(catalog.workspaces.map {
-                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
-                }, adoptions, "the bridge must not replace already-qualified document lineages")
-                XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
-                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                XCTAssertEqual(preparations, 2)
+                XCTAssertNotNil(failure)
+                XCTAssertEqual(manager.workspaceChooserPresentation.failure, failure)
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue, issue)
+            }
+        }
+
+        func testFinalPreparationHandoffRejectsRevokedFullDocumentBaseline() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("final preparation ready before covering reconciliation")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        manager.markWorkspaceDirty(workspaceID: Fixture.aardvarkID)
+                        return
+                    }
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let models = manager.workspaces
+                let repair = Task { @MainActor in
+                    await manager.reconcileDuplicateCleanupAuthorityAfterFailedSaveForTesting()
+                }
+                repair.cancel()
+                let reconciled = await repair.value
+                XCTAssertFalse(reconciled)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+                let resolved = events.resolution(through: catalog.publicationSequence)
+                gate.release()
+                try await f.wait(resolved)
+                XCTAssertEqual(preparations, 2, "a revoked baseline must not authorize a third decode")
+                XCTAssertTrue(events.catalogCheckpoints.isEmpty)
+                XCTAssertNil(bridge.projectionObservationStateForTesting.checkpoint)
+                XCTAssertEqual(manager.workspaces, models)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
             }
         }
 

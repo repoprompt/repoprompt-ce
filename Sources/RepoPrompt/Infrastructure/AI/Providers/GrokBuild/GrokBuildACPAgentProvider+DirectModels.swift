@@ -56,6 +56,13 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let description = nonEmpty(entry["description"] as? String)
 
             let meta = entry["_meta"] as? [String: Any]
+            let contextWindowTokens: Int? = {
+                guard let number = meta?["totalContextTokens"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      let tokens = number as? Int, tokens > 0
+                else { return nil }
+                return tokens
+            }()
             let supportsEffort = (meta?["supportsReasoningEffort"] as? Bool) == true
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
             let advertisedEfforts = effortEntries.map { effortEntry in
@@ -138,7 +145,8 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                     isPlaceholderDefault: false,
                     isProviderDefault: false,
                     supportedReasoningEfforts: supportedEfforts,
-                    defaultReasoningEffort: defaultEffort
+                    defaultReasoningEffort: defaultEffort,
+                    contextWindowTokens: contextWindowTokens
                 )
             )
 
@@ -148,7 +156,9 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                     guard let otherID = nonEmpty($0["modelId"] as? String) else { return false }
                     return otherID.caseInsensitiveCompare(compound) == .orderedSame
                 }
-                if collidesWithBase { continue }
+                if collidesWithBase {
+                    continue
+                }
                 variants.append(
                     AgentModelOption(
                         rawValue: compound,
@@ -159,7 +169,8 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                         effortVariant: AgentModelEffortVariant(
                             baseModelRaw: rawID,
                             reasoningEffort: selection.effort
-                        )
+                        ),
+                        contextWindowTokens: contextWindowTokens
                     )
                 )
             }

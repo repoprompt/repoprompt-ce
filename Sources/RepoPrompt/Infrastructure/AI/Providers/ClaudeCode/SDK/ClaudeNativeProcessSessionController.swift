@@ -23,6 +23,14 @@ final actor ClaudeNativeProcessSessionController {
                 let name: String
                 let description: String
                 let argumentHint: String
+                let builtin: Bool
+
+                init(name: String, description: String, argumentHint: String, builtin: Bool = false) {
+                    self.name = name
+                    self.description = description
+                    self.argumentHint = argumentHint
+                    self.builtin = builtin
+                }
             }
 
             struct Agent: Equatable {
@@ -455,6 +463,11 @@ final actor ClaudeNativeProcessSessionController {
 
     func currentSessionRef() async -> SessionRef {
         SessionRef(sessionID: sessionID)
+    }
+
+    func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
+        guard hasActiveSession, !isShuttingDown else { return [] }
+        return initializeResponseSnapshot?.commands ?? []
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
@@ -1753,7 +1766,8 @@ final actor ClaudeNativeProcessSessionController {
                 return .init(
                     name: name,
                     description: (cmd["description"] as? String) ?? "",
-                    argumentHint: (cmd["argumentHint"] as? String) ?? ""
+                    argumentHint: (cmd["argumentHint"] as? String) ?? "",
+                    builtin: (cmd["builtin"] as? Bool) == true
                 )
             }
         } else {
