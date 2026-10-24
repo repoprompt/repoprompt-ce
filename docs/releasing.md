@@ -120,6 +120,9 @@ RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
 
+For the opt-in user MCP snapshot import and its isolation/permission contract, see
+[Codex user MCP import](architecture/codex-user-mcp-import.md).
+
 Within that isolated `config.toml`, RepoPrompt owns the
 `[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output
 limit, and exactly `[features.code_mode].enabled` plus

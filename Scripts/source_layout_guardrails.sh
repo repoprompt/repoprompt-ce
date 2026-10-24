@@ -806,6 +806,7 @@ allowed_tracked_docs=(
   "docs/architecture/ci-reliability-2026-10-23.md"
   "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
+  "docs/architecture/codex-user-mcp-import.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
