@@ -461,6 +461,13 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             XCTAssertTrue(outcome.isError, "\(op): \(outcome.text)")
             XCTAssertTrue(outcome.text.contains("No authorized Git repository"), outcome.text)
         }
+        // A syntactically present but invalid metadata directory must not let
+        // worktree reads fall through to the enclosing linked checkout either.
+        try FileManager.default.createDirectory(at: fixture.loadedRoot.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        for op in ["list", "show"] {
+            let outcome = try await Self.callManageWorktree(fixture.client, arguments: ["op": .string(op)])
+            XCTAssertTrue(outcome.isError, "\(op) adopted an enclosing repository: \(outcome.text)")
+        }
     }
 
     func testHeadlessGitStillReadsRegisteredLinkedWorktree() async throws {
@@ -594,6 +601,35 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let supportedBinding = try GitReadRepositoryBinding(layout: supportedLayout)
         let probe = try await DirectProcess.run("/usr/bin/git", arguments: supportedBinding.ownershipProbeArguments, isProvider: false, readBinding: supportedBinding)
         try supportedBinding.validateOwnershipProbe(probe)
+    }
+
+    func testHeadlessGitShowRejectsOptionsAndPreservesValidRevision() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        let marker = fixture.linkedWorktree.deletingLastPathComponent().appendingPathComponent("show-output")
+        let original = Data("preserved\n".utf8)
+        try original.write(to: marker)
+        for ref in ["--output=\(marker.path)", "-p", "--", "HEAD\0tail"] {
+            do {
+                let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string(ref)])
+                XCTAssertEqual(result.isError, true)
+                let text = result.content.compactMap { content -> String? in
+                    guard case let .text(value, _, _) = content else { return nil }
+                    return value
+                }.joined()
+                XCTAssertTrue(text.contains("Invalid Git revision operand"), text)
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("Invalid Git revision operand"), String(describing: error))
+            }
+            XCTAssertEqual(try Data(contentsOf: marker), original)
+        }
+        let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string("HEAD")])
+        XCTAssertFalse(result.isError == true)
+        let text = result.content.compactMap { content -> String? in
+            guard case let .text(value, _, _) = content else { return nil }
+            return value
+        }.joined()
+        XCTAssertTrue(text.contains("Fixture"), text)
+        XCTAssertEqual(try Data(contentsOf: marker), original)
     }
 
     private struct HeadlessWorktreeFixture {

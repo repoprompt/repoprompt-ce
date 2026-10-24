@@ -251,16 +251,20 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 
     func inspectGit(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
+        let op = args["op"]?.stringValue ?? "status"
+        let ref = args["ref"]?.stringValue ?? "HEAD"
+        if op == "show" {
+            try GitRevisionArgument.validate(ref)
+        }
         let snapshot = try await context.snapshot(for: request)
         let roots = try resolveGitRoots(args: args, snapshot: snapshot)
-        let op = args["op"]?.stringValue ?? "status"
         var outputs: [Value] = []
         for root in roots {
             let command: [String]
             switch op {
             case "status": command = ["status", "--short", "--branch"]
             case "log": command = ["log", "--oneline", "-n", String(max(1, min(args["count"]?.intValue ?? 10, 100)))]
-            case "show": command = ["show", "--no-ext-diff", "--no-textconv", args["ref"]?.stringValue ?? "HEAD"]
+            case "show": command = ["show", "--no-ext-diff", "--no-textconv", ref, "--"]
             case "blame":
                 guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("blame requires path") }
                 command = ["blame", "--", path]
@@ -268,19 +272,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 command = ["diff", "--no-ext-diff", "--no-textconv", "--color=never"]
             default: throw MCPError.invalidParams("unknown git op: \(op)")
             }
-            guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: snapshot.roots) else {
-                throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
-            }
-            let binding = try GitReadRepositoryBinding(layout: layout)
-            let probe = try await DirectProcess.run(
-                "/usr/bin/git", arguments: binding.ownershipProbeArguments,
-                isProvider: false, readBinding: binding
-            )
-            try binding.validateOwnershipProbe(probe)
-            let output = try await DirectProcess.run(
-                "/usr/bin/git", arguments: binding.boundArguments(command),
-                isProvider: false, readBinding: binding
-            )
+            let output = try await boundGitRead(at: root, authorizedRoots: snapshot.roots, arguments: command)
             outputs.append(.object(["repo_root": .string(root.path), "output": .string(output)]))
         }
         return try .object(["op": .string(op), "repositories": .array(outputs)])
@@ -300,11 +292,8 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         }
         let op = args["op"]?.stringValue ?? "list"
         switch op {
-        case "list":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"], isProvider: false)
-            return try .object(["op": .string(op), "output": .string(output)])
-        case "show":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"], isProvider: false)
+        case "list", "show":
+            let output = try await boundGitRead(at: repo, authorizedRoots: snapshot.roots, arguments: ["worktree", "list", "--porcelain"])
             return try .object(["op": .string(op), "output": .string(output)])
         case "create":
             guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("create requires path") }
@@ -324,8 +313,8 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             let sessionID = try sessionID(args: args, request: request)
             let worktree = try await resolveWorktree(args: args, repository: repo, roots: snapshot.roots)
             let repositoryID = DomainContentDigest.sha256(Data(repo.path.utf8))
-            let branch = try? await gitLine(at: worktree, arguments: ["branch", "--show-current"])
-            let head = try? await gitLine(at: worktree, arguments: ["rev-parse", "HEAD"])
+            let branch = try await gitLine(at: worktree, roots: snapshot.roots, arguments: ["branch", "--show-current"])
+            let head = try? await gitLine(at: worktree, roots: snapshot.roots, arguments: ["rev-parse", "HEAD"])
             let binding = AgentSessionWorktreeBinding(
                 id: "\(repositoryID):\(worktree.path)",
                 repositoryID: repositoryID,
@@ -364,12 +353,12 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             ])
         case "preview":
             let target = try await resolveMergeTarget(args: args, repository: repo, roots: snapshot.roots)
-            let sourceHead = try await gitLine(at: repo, arguments: ["rev-parse", "HEAD"])
-            let targetHead = try await gitLine(at: target, arguments: ["rev-parse", "HEAD"])
-            let sourceRepositoryIdentity = try await gitCommonDirectory(at: repo)
-            let sourceWorktreeIdentity = try await gitDirectory(at: repo)
-            let targetRepositoryIdentity = try await gitCommonDirectory(at: target)
-            let targetWorktreeIdentity = try await gitDirectory(at: target)
+            let sourceHead = try await gitLine(at: repo, roots: snapshot.roots, arguments: ["rev-parse", "HEAD"])
+            let targetHead = try await gitLine(at: target, roots: snapshot.roots, arguments: ["rev-parse", "HEAD"])
+            let sourceRepositoryIdentity = try await gitCommonDirectory(at: repo, roots: snapshot.roots)
+            let sourceWorktreeIdentity = try await gitDirectory(at: repo, roots: snapshot.roots)
+            let targetRepositoryIdentity = try await gitCommonDirectory(at: target, roots: snapshot.roots)
+            let targetWorktreeIdentity = try await gitDirectory(at: target, roots: snapshot.roots)
             let id = UUID()
             mergeOperations[id] = MergeOperation(
                 id: id,
@@ -382,10 +371,9 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 targetRepositoryIdentity: targetRepositoryIdentity,
                 targetWorktreeIdentity: targetWorktreeIdentity
             )
-            let patch = try await DirectProcess.run(
-                "/usr/bin/git",
-                arguments: ["-C", target.path, "diff", "--no-ext-diff", "--color=never", "\(targetHead)..\(sourceHead)"],
-                isProvider: false
+            let patch = try await boundGitRead(
+                at: target, authorizedRoots: snapshot.roots,
+                arguments: ["diff", "--no-ext-diff", "--no-textconv", "--color=never", "\(targetHead)..\(sourceHead)"]
             )
             return try .object([
                 "op": .string(op),
@@ -422,7 +410,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
         case "status":
             if let raw = args["operation_id"]?.stringValue, let id = UUID(uuidString: raw), let operation = mergeOperations[id] {
-                let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", operation.targetRoot.path, "status", "--short", "--branch"], isProvider: false)
+                let output = try await boundGitRead(at: operation.targetRoot, authorizedRoots: snapshot.roots, arguments: ["status", "--short", "--branch"])
                 return try .object(["op": .string(op), "operation_id": .string(id.uuidString), "output": .string(output)])
             }
             let bindings: [Value] = if let sessionID = try? sessionID(args: args, request: request) {
@@ -502,19 +490,19 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         request: DomainPhysicalToolRequest
     ) async throws -> MergeMutationTargets {
         let snapshot = try await context.snapshot(for: request)
-        let listed = try await listedWorktrees(repository: repository)
+        let listed = try await listedWorktrees(repository: repository, roots: snapshot.roots)
         let endpoints = try Self.revalidateMergeEndpointPaths(
             sourceRoot: operation.sourceRoot,
             targetRoot: operation.targetRoot,
             roots: snapshot.roots,
             listedWorktrees: listed
         )
-        let sourceHead = try await gitLine(at: endpoints.source, arguments: ["rev-parse", "HEAD"])
-        let targetHead = try await gitLine(at: endpoints.target, arguments: ["rev-parse", "HEAD"])
-        let sourceRepositoryIdentity = try await gitCommonDirectory(at: endpoints.source)
-        let sourceWorktreeIdentity = try await gitDirectory(at: endpoints.source)
-        let targetRepositoryIdentity = try await gitCommonDirectory(at: endpoints.target)
-        let targetWorktreeIdentity = try await gitDirectory(at: endpoints.target)
+        let sourceHead = try await gitLine(at: endpoints.source, roots: snapshot.roots, arguments: ["rev-parse", "HEAD"])
+        let targetHead = try await gitLine(at: endpoints.target, roots: snapshot.roots, arguments: ["rev-parse", "HEAD"])
+        let sourceRepositoryIdentity = try await gitCommonDirectory(at: endpoints.source, roots: snapshot.roots)
+        let sourceWorktreeIdentity = try await gitDirectory(at: endpoints.source, roots: snapshot.roots)
+        let targetRepositoryIdentity = try await gitCommonDirectory(at: endpoints.target, roots: snapshot.roots)
+        let targetWorktreeIdentity = try await gitDirectory(at: endpoints.target, roots: snapshot.roots)
         try Self.validateMergeEndpointIdentity(
             expectedHead: operation.sourceHead,
             currentHead: sourceHead,
@@ -618,7 +606,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             }
             return url
         }
-        let worktrees = try await listedWorktrees(repository: repository)
+        let worktrees = try await listedWorktrees(repository: repository, roots: roots)
         if selector == "@current" {
             return try Self.authorizeWorktreePath(repository, roots: roots)
         }
@@ -627,8 +615,9 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         }
         let normalizedBranch = selector.hasPrefix("@branch:") ? String(selector.dropFirst("@branch:".count)) : selector
         let normalizedID = normalizedBranch.replacingOccurrences(of: "@id:", with: "")
-        for worktree in worktrees {
-            let branch = try? await gitLine(at: worktree, arguments: ["branch", "--show-current"])
+        for candidate in worktrees {
+            guard let worktree = try? Self.authorizeWorktreePath(candidate, roots: roots) else { continue }
+            let branch = try? await gitLine(at: worktree, roots: roots, arguments: ["branch", "--show-current"])
             if worktree.lastPathComponent == normalizedBranch
                 || DomainContentDigest.sha256(Data(worktree.path.utf8)) == normalizedID
                 || branch == normalizedBranch
@@ -649,11 +638,10 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         return try await resolveWorktree(args: targetArgs, repository: repository, roots: roots)
     }
 
-    private func listedWorktrees(repository: URL) async throws -> [URL] {
-        let output = try await DirectProcess.run(
-            "/usr/bin/git",
-            arguments: ["-C", repository.path, "worktree", "list", "--porcelain"],
-            isProvider: false
+    private func listedWorktrees(repository: URL, roots: [URL]) async throws -> [URL] {
+        let output = try await boundGitRead(
+            at: repository, authorizedRoots: roots,
+            arguments: ["worktree", "list", "--porcelain"]
         )
         return output.split(separator: "\n").compactMap { line in
             guard line.hasPrefix("worktree ") else { return nil }
@@ -661,21 +649,37 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         }
     }
 
-    private func gitLine(at root: URL, arguments: [String]) async throws -> String {
-        try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments, isProvider: false)
+    private func boundGitRead(at root: URL, authorizedRoots: [URL], arguments: [String]) async throws -> String {
+        guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: authorizedRoots) else {
+            throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
+        }
+        let binding = try GitReadRepositoryBinding(layout: layout)
+        let probe = try await DirectProcess.run(
+            "/usr/bin/git", arguments: binding.ownershipProbeArguments,
+            isProvider: false, readBinding: binding
+        )
+        try binding.validateOwnershipProbe(probe)
+        return try await DirectProcess.run(
+            "/usr/bin/git", arguments: binding.boundArguments(arguments),
+            isProvider: false, readBinding: binding
+        )
+    }
+
+    private func gitLine(at root: URL, roots: [URL], arguments: [String]) async throws -> String {
+        try await boundGitRead(at: root, authorizedRoots: roots, arguments: arguments)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func gitCommonDirectory(at root: URL) async throws -> String {
-        let raw = try await gitLine(at: root, arguments: ["rev-parse", "--git-common-dir"])
+    private func gitCommonDirectory(at root: URL, roots: [URL]) async throws -> String {
+        let raw = try await gitLine(at: root, roots: roots, arguments: ["rev-parse", "--git-common-dir"])
         let url = raw.hasPrefix("/")
             ? URL(fileURLWithPath: raw)
             : URL(fileURLWithPath: root.path).appendingPathComponent(raw)
         return Self.canonicalWorktreePath(url)
     }
 
-    private func gitDirectory(at root: URL) async throws -> String {
-        let raw = try await gitLine(at: root, arguments: ["rev-parse", "--git-dir"])
+    private func gitDirectory(at root: URL, roots: [URL]) async throws -> String {
+        let raw = try await gitLine(at: root, roots: roots, arguments: ["rev-parse", "--git-dir"])
         let url = raw.hasPrefix("/")
             ? URL(fileURLWithPath: raw)
             : URL(fileURLWithPath: root.path).appendingPathComponent(raw)

@@ -739,7 +739,7 @@ actor WorkspaceFileContextStore {
             WorkspaceCodemapFrozenPresentationBundleID: CodemapPresentationRecord
         ] = [:]
         var graphStatusTask: Task<Void, Never>?
-        var graphWorkerRecoveryStatusTask: Task<Void, Never>?
+        var graphExecutionStatusTask: Task<Void, Never>?
         var selectionGraph: WorkspaceCodemapSelectionGraph?
     }
 
@@ -752,7 +752,7 @@ actor WorkspaceFileContextStore {
         let setupTask: Task<CodemapSetupDisposition, Never>?
         let demandTasks: [Task<Void, Never>]
         let graphStatusTask: Task<Void, Never>?
-        let graphWorkerRecoveryStatusTask: Task<Void, Never>?
+        let graphExecutionStatusTask: Task<Void, Never>?
         let selectionGraph: WorkspaceCodemapSelectionGraph?
         let preloadLaunchTask: Task<Void, Never>?
         let eligibilityTask: Task<CodemapEligibilityResolution, Never>?
@@ -2020,18 +2020,13 @@ actor WorkspaceFileContextStore {
             return await owner.engine.accounting()
         }
 
-        func debugSetCodemapGraphIndexWorkerRecoveryStateForTesting(
+        func debugSetCodemapGraphIndexExecutionStateForTesting(
             rootID: UUID,
-            state: WorkspaceCodemapGraphIndexWorkerRecoveryState
+            state: WorkspaceCodemapGraphIndexExecutionState
         ) -> Bool {
             guard let root = rootStatesByID[rootID] else { return false }
             let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: root.lifetimeID)
-            switch state {
-            case .available:
-                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
-            case .exhausted:
-                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.insert(rootEpoch)
-            }
+            codemapGraphIndexExecutionStatesByRootEpoch[rootEpoch] = state
             publishCodemapRootStatusesIfChanged()
             return true
         }
@@ -3234,7 +3229,9 @@ actor WorkspaceFileContextStore {
     private var codemapGraphAccountingByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
     ] = [:]
-    private var codemapGraphIndexWorkerRecoveryExhaustedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapGraphIndexExecutionStatesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIndexExecutionState
+    ] = [:]
     private var codemapRootStatusCoverageBaselinesByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapRootStatusCoverageBaseline
     ] = [:]
@@ -3517,7 +3514,7 @@ actor WorkspaceFileContextStore {
                 demand.task?.cancel()
             }
             session.graphStatusTask?.cancel()
-            session.graphWorkerRecoveryStatusTask?.cancel()
+            session.graphExecutionStatusTask?.cancel()
             for bundle in session.bundlesByRequestID.values {
                 bundle.close()
             }
@@ -11249,12 +11246,9 @@ actor WorkspaceFileContextStore {
                 ? .unavailable : .scheduled
         }
         if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
-            let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
-            if disposition != .unavailable {
-                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
-            }
-            publishCodemapRootStatusesIfChanged()
-            return disposition
+            // Only the execution stream may clear a terminal state. A worker can publish a
+            // newer terminal result while this actor is suspended in the prioritize call.
+            return await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
         }
         if let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] {
             switch launch.phase {
@@ -11406,10 +11400,13 @@ actor WorkspaceFileContextStore {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
+        let executionState = codemapGraphIndexExecutionStatesByRootEpoch[rootEpoch]
         let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
             .retryExhausted
-        } else if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+        } else if executionState == .exhausted {
             .workerRecoveryExhausted
+        } else if executionState?.budget != nil {
+            .budgetLimited
         } else {
             switch launchPhase {
             case .terminalUnavailable: .sourceRootUnavailable
@@ -11485,7 +11482,8 @@ actor WorkspaceFileContextStore {
                 highFanoutApplyCount: accounting?.highFanoutApplyCount ?? 0,
                 observedToAppliedGenerationLag: accounting?.observedToAppliedGenerationLag ?? 0
             ),
-            unavailableReason: unavailableReason
+            unavailableReason: unavailableReason,
+            graphIndexBudget: executionState?.budget
         )
     }
 
@@ -12197,7 +12195,7 @@ actor WorkspaceFileContextStore {
             codemapSuspendedRootEpochs.remove(rootEpoch)
             codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
-            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
+            codemapGraphIndexExecutionStatesByRootEpoch.removeValue(forKey: rootEpoch)
             codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
             publishCodemapRootStatusesIfChanged()
             if let cleanup = detachCodemapSession(
@@ -15019,7 +15017,7 @@ actor WorkspaceFileContextStore {
                 // root that is still awaiting its graph stays pending, whatever its source mode is.
                 let terminalReason = codemapTerminalSetupUnavailableReason(rootEpoch: rootEpoch)
                 let isUnavailable = terminalReason != nil
-                roots.append(WorkspaceCodemapStructureRootResult(
+                let pending = WorkspaceCodemapStructureRootResult(
                     rootEpoch: rootEpoch,
                     rootDisplayName: rootName,
                     status: isUnavailable ? .unavailable : .pending,
@@ -15049,15 +15047,16 @@ actor WorkspaceFileContextStore {
                             : "The root-local committed graph is still being initialized."
                     )],
                     receipt: nil
-                ))
+                )
+                roots.append(projectCodemapStructureExecutionStatus(pending))
                 continue
             }
 
-            let mapped = mapCodemapStructureRoot(
+            let mapped = projectCodemapStructureExecutionStatus(mapCodemapStructureRoot(
                 raw,
                 rootName: rootName,
                 seedPathsByFileID: seedPathsByFileID
-            )
+            ))
             roots.append(mapped)
             remainingNodes = max(0, remainingNodes - mapped.nodes.count)
             remainingEdges = max(0, remainingEdges - mapped.edges.count)
@@ -15226,6 +15225,62 @@ actor WorkspaceFileContextStore {
                 )
             },
             receipt: raw.receipt
+        )
+    }
+
+    /// Keep committed partial data, but never tell MCP consumers to poll work that has stopped.
+    private func projectCodemapStructureExecutionStatus(
+        _ mapped: WorkspaceCodemapStructureRootResult
+    ) -> WorkspaceCodemapStructureRootResult {
+        let snapshot = makeCodemapRootStatusSnapshot(rootEpoch: mapped.rootEpoch)
+        guard snapshot.availability == .unavailable else { return mapped }
+        let reason: WorkspaceCodemapStructureStopReason
+        let message: String
+        switch snapshot.unavailableReason {
+        case .budgetLimited:
+            reason = .budgetExhausted
+            message = snapshot.graphIndexBudget?.terminalMessage ?? "Code Map indexing reached its resource budget."
+        case .workerRecoveryExhausted:
+            reason = .workerRecoveryExhausted
+            message = "Code Map indexing stopped after repeated worker recovery attempts. Use Code Map Retry to restart; polling cannot restart it."
+        case .retryExhausted:
+            reason = .retryExhausted
+            message = "Code Map indexing stopped after repeated retries. Use Code Map Retry to restart; polling cannot restart it."
+        default:
+            return mapped
+        }
+        let issue = WorkspaceCodemapStructureIssueRecord(
+            code: reason.rawValue,
+            phase: "graph_index",
+            path: nil,
+            retryable: false,
+            retryAfterMilliseconds: nil,
+            attempted: snapshot.graphIndexBudget.map { Int(clamping: $0.attempted) },
+            limit: snapshot.graphIndexBudget.map { Int(clamping: $0.limit) },
+            message: message
+        )
+        return WorkspaceCodemapStructureRootResult(
+            rootEpoch: mapped.rootEpoch,
+            rootDisplayName: mapped.rootDisplayName,
+            status: mapped.hasUsefulData ? .partial : .unavailable,
+            coverage: mapped.coverage,
+            updatesPending: false,
+            seeds: mapped.seeds.map { seed in
+                WorkspaceCodemapStructureSeedResult(
+                    fileID: seed.fileID,
+                    path: seed.path,
+                    state: seed.state == .pending ? .notIndexed : seed.state
+                )
+            },
+            nodes: mapped.nodes,
+            edges: mapped.edges,
+            unresolved: mapped.unresolved,
+            truncation: mapped.truncation,
+            issues: mapped.issues.filter {
+                !["graph_indexing", "seed_pending", "updates_pending", "watcher_gap_reconciling"].contains($0.code)
+            } + [issue],
+            receipt: mapped.receipt,
+            executionStop: WorkspaceCodemapStructureExecutionStop(reason: reason, budget: snapshot.graphIndexBudget)
         )
     }
 
@@ -16195,7 +16250,7 @@ actor WorkspaceFileContextStore {
               session.engine === engine
         else { return }
         session.graphStatusTask?.cancel()
-        session.graphWorkerRecoveryStatusTask?.cancel()
+        session.graphExecutionStatusTask?.cancel()
         let task = Task { [weak self] in
             guard let graph = await engine.selectionGraph(rootEpoch: authority.rootEpoch) else { return }
             let stream = await graph.statusUpdates()
@@ -16210,11 +16265,11 @@ actor WorkspaceFileContextStore {
             }
         }
         session.graphStatusTask = task
-        session.graphWorkerRecoveryStatusTask = Task { [weak self] in
-            let stream = await engine.graphIndexWorkerRecoveryUpdates(rootEpoch: authority.rootEpoch)
+        session.graphExecutionStatusTask = Task { [weak self] in
+            let stream = await engine.graphIndexExecutionUpdates(rootEpoch: authority.rootEpoch)
             for await state in stream {
                 guard !Task.isCancelled else { return }
-                await self?.acceptCodemapGraphIndexWorkerRecoveryState(
+                await self?.acceptCodemapGraphIndexExecutionState(
                     state,
                     authority: authority,
                     engine: engine
@@ -16240,8 +16295,8 @@ actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
     }
 
-    private func acceptCodemapGraphIndexWorkerRecoveryState(
-        _ state: WorkspaceCodemapGraphIndexWorkerRecoveryState,
+    private func acceptCodemapGraphIndexExecutionState(
+        _ state: WorkspaceCodemapGraphIndexExecutionState,
         authority: CodemapRootAuthority,
         engine: WorkspaceCodemapBindingEngine
     ) {
@@ -16250,13 +16305,8 @@ actor WorkspaceFileContextStore {
               session.engine === engine,
               codemapAuthorityIsCurrent(authority)
         else { return }
-        let changed = switch state {
-        case .available:
-            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(authority.rootEpoch) != nil
-        case .exhausted:
-            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.insert(authority.rootEpoch).inserted
-        }
-        if changed {
+        let previous = codemapGraphIndexExecutionStatesByRootEpoch.updateValue(state, forKey: authority.rootEpoch)
+        if previous != state {
             publishCodemapRootStatusesIfChanged()
         }
     }
@@ -17647,7 +17697,7 @@ actor WorkspaceFileContextStore {
         )
         let session = codemapSessionsByRootEpoch.removeValue(forKey: rootEpoch)
         codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
+        codemapGraphIndexExecutionStatesByRootEpoch.removeValue(forKey: rootEpoch)
         codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
         publishCodemapRootStatusesIfChanged()
         if let session, !session.markerReadinessByFileID.isEmpty {
@@ -17713,7 +17763,7 @@ actor WorkspaceFileContextStore {
             : authorityGeneration + 1
         session?.setupTask?.cancel()
         session?.graphStatusTask?.cancel()
-        session?.graphWorkerRecoveryStatusTask?.cancel()
+        session?.graphExecutionStatusTask?.cancel()
         let demandRecords = session.map { Array($0.demandsByFileID.values) } ?? []
         for record in demandRecords {
             record.task?.cancel()
@@ -17734,7 +17784,7 @@ actor WorkspaceFileContextStore {
             setupTask: session?.setupTask,
             demandTasks: demandRecords.compactMap(\.task),
             graphStatusTask: session?.graphStatusTask,
-            graphWorkerRecoveryStatusTask: session?.graphWorkerRecoveryStatusTask,
+            graphExecutionStatusTask: session?.graphExecutionStatusTask,
             selectionGraph: session?.selectionGraph,
             preloadLaunchTask: launch?.task,
             eligibilityTask: eligibilityFlight?.task,
@@ -17789,8 +17839,8 @@ actor WorkspaceFileContextStore {
         if let graphStatusTask = detached.graphStatusTask {
             await graphStatusTask.value
         }
-        if let graphWorkerRecoveryStatusTask = detached.graphWorkerRecoveryStatusTask {
-            await graphWorkerRecoveryStatusTask.value
+        if let graphExecutionStatusTask = detached.graphExecutionStatusTask {
+            await graphExecutionStatusTask.value
         }
         await detached.selectionGraph?.shutdown(reason: detached.graphInvalidationReason)
         if let registry = detached.registry, let routeToken = detached.routeToken {

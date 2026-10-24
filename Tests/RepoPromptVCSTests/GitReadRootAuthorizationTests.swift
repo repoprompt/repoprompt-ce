@@ -3,6 +3,48 @@ import RepoPromptVCS
 import XCTest
 
 final class GitReadRootAuthorizationTests: XCTestCase {
+    func testOwnershipProbeUsesFilesystemIdentityWithoutAcceptingAnotherDirectory() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("MixedCaseRoot")
+        let dotGit = root.appendingPathComponent(".git")
+        try directory(dotGit)
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        let binding = try GitReadRepositoryBinding(layout: layout)
+        try binding.validateOwnershipProbe(dotGit.path + "\n")
+        let alternateCase = base.appendingPathComponent("mixedcaseroot/.git")
+        if FileManager.default.fileExists(atPath: alternateCase.path) {
+            try binding.validateOwnershipProbe(alternateCase.path + "\n")
+        } else {
+            // On a case-sensitive volume, the same spelling after lowercasing
+            // may name a different directory and must never satisfy the probe.
+            try directory(alternateCase)
+            XCTAssertThrowsError(try binding.validateOwnershipProbe(alternateCase.path + "\n"))
+        }
+        let other = base.appendingPathComponent("other/.git")
+        try directory(other)
+        XCTAssertThrowsError(try binding.validateOwnershipProbe(other.path + "\n"))
+        for output in [dotGit.path, dotGit.path + "\nextra\n", dotGit.path + "\0\n", ".git\n"] {
+            XCTAssertThrowsError(try binding.validateOwnershipProbe(output))
+        }
+    }
+
+    func testOwnershipProbeAcceptsAuthorizedMetadataSymlinkTarget() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("root")
+        let metadata = root.appendingPathComponent("metadata")
+        try directory(metadata)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent(".git"), withDestinationURL: metadata)
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        let binding = try GitReadRepositoryBinding(layout: layout)
+        try binding.validateOwnershipProbe(metadata.path + "\n")
+        let outside = base.appendingPathComponent("outside")
+        try directory(outside)
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".git"))
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent(".git"), withDestinationURL: outside)
+        XCTAssertThrowsError(try binding.revalidate())
+        XCTAssertThrowsError(try binding.validateOwnershipProbe(outside.path + "\n"))
+    }
+
     func testNormalBindingIgnoresIrrelevantBackpointer() throws {
         let base = try fixture()
         let root = base.appendingPathComponent("root")
@@ -87,6 +129,15 @@ final class GitReadRootAuthorizationTests: XCTestCase {
         try write("../shared\n", to: dotGit.appendingPathComponent("commondir"))
         let pointed = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
         XCTAssertEqual(pointed.commonDir.path, common.path)
+
+        let separateRoot = base.appendingPathComponent("worktrees/separate")
+        let metadata = separateRoot.appendingPathComponent("metadata")
+        try directory(metadata)
+        try write("gitdir: metadata\n", to: separateRoot.appendingPathComponent(".git"))
+        let separate = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: separateRoot, authorizedRoots: [separateRoot]))
+        XCTAssertEqual(separate.commonDir.path, metadata.path)
+        XCTAssertFalse(separate.isLinkedWorktree)
+        XCTAssertEqual(separate.knownMainWorktreeRoot?.path, separateRoot.path)
     }
 
     func testNestedWorkspaceDoesNotAdoptEnclosingRepository() throws {
@@ -111,6 +162,28 @@ final class GitReadRootAuthorizationTests: XCTestCase {
         try FileManager.default.removeItem(at: dotGit)
         try FileManager.default.createSymbolicLink(at: dotGit, withDestinationURL: external)
         XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+    }
+
+    func testMetadataPathsDoNotTrimWhitespaceIntoLoadedRootAuthority() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("root")
+        let whitespaceSibling = base.appendingPathComponent("root ")
+        try directory(root)
+        try directory(whitespaceSibling)
+        let dotGit = root.appendingPathComponent(".git")
+        for pointer in [whitespaceSibling.path, "../root "] {
+            try write("gitdir: \(pointer)\n", to: dotGit)
+            XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+            XCTAssertNotNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root, whitespaceSibling]))
+        }
+        try FileManager.default.removeItem(at: dotGit)
+        try FileManager.default.createSymbolicLink(at: dotGit, withDestinationURL: whitespaceSibling)
+        XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        try FileManager.default.removeItem(at: dotGit)
+        try directory(dotGit)
+        try write(whitespaceSibling.path + "\n", to: dotGit.appendingPathComponent("commondir"))
+        XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        XCTAssertNotNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root, whitespaceSibling]))
     }
 
     func testExternalCommonDirectoryIsRejectedForInternalMetadata() throws {

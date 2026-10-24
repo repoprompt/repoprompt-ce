@@ -835,9 +835,17 @@ enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
     case prioritizeRestart
 }
 
-enum WorkspaceCodemapGraphIndexWorkerRecoveryState: Hashable {
+/// Terminal execution blockers are independent of graph coverage. `available` means that
+/// execution has no terminal blocker, not that the graph has finished indexing.
+enum WorkspaceCodemapGraphIndexExecutionState: Hashable {
     case available
     case exhausted
+    case budgetLimited(WorkspaceCodemapGraphIndexBudget)
+
+    var budget: WorkspaceCodemapGraphIndexBudget? {
+        if case let .budgetLimited(budget) = self { return budget }
+        return nil
+    }
 }
 
 enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {

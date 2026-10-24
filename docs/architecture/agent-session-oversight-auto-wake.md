@@ -756,6 +756,10 @@ endpoints, the workspace, and admission synchronously; a run that settled during
 refused as `target_busy` rather than started from a deferred path.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
+ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
+response fails after the write (including Stop shutting down the transport), the batch is not
+restored or requeued, its transcript rows remain, and managed sinks settle as unconfirmed. A write
+alone is not proof of provider acceptance or successful completion.
 
 The provider sees a RepoPrompt-authored envelope with `delegation="user_delegated_management"`:
 direction from the user's delegated overseer, to be followed within the session's workspace and

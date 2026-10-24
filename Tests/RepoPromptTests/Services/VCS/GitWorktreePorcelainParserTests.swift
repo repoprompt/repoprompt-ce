@@ -958,6 +958,32 @@ private actor ListingSpy {
 }
 
 final class VCSReadRootAuthorizationTests: XCTestCase {
+    func testAppDiscoverySupportsSubdirectoriesAndBareRepositoriesWithoutGrantingScopedReads() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-discovery-\(UUID().uuidString)")
+            .resolvingSymlinksInPath()
+        let root = base.appendingPathComponent("root")
+        let nested = root.appendingPathComponent("nested")
+        let bare = base.appendingPathComponent("bare")
+        let plain = base.appendingPathComponent("plain")
+        for directory in [nested, bare, plain] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runFixtureGit(["init", "--quiet"], at: root)
+        try Self.runFixtureGit(["init", "--bare", "--quiet"], at: bare)
+        let service = GitService()
+        let discovered = try await service.findGitRoot(from: nested)
+        XCTAssertEqual(discovered?.resolvingSymlinksInPath().path, root.path)
+        let nestedKind = try await service.gitRepositoryKind(at: nested)
+        let bareKind = try await service.gitRepositoryKind(at: bare)
+        let plainKind = try await service.gitRepositoryKind(at: plain)
+        XCTAssertEqual(nestedKind, .worktree)
+        XCTAssertEqual(bareKind, .bare)
+        XCTAssertEqual(plainKind, .nonGit)
+        let scoped = await VCSService().resolveRepoForRead(at: nested, authorizedRoots: [nested])
+        XCTAssertNil(scoped, "App discovery must not become an MCP root grant")
+    }
+
     func testNormalCheckoutReadDoesNotFollowConfiguredExternalWorktree() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-read-binding-\(UUID().uuidString)")
         let root = base.appendingPathComponent("root")
