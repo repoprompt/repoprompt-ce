@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 @testable import RepoPromptApp
 import XCTest
 
@@ -738,6 +739,103 @@ final class AgentTranscriptPanePresentationTests: XCTestCase {
 
 // MARK: - Shared real-restoration fixtures (used by the lifecycle and snapshot publication suites)
 
+/// The synchronous cancellation handler can run off actor; every shared field is lock protected.
+private final class RestorationFixtureCancellationTrace: Sendable {
+    struct Cancellation {
+        let phase: String
+        let stack: [String]
+    }
+
+    private struct State {
+        var phase = "setup"
+        var cancellation: Cancellation?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func setPhase(_ phase: String) {
+        state.withLock { $0.phase = phase }
+    }
+
+    func recordCancellation() {
+        let phase = state.withLock { $0.phase }
+        let cancellation = Cancellation(phase: phase, stack: Thread.callStackSymbols)
+        state.withLock {
+            if $0.cancellation == nil { $0.cancellation = cancellation }
+        }
+    }
+
+    var cancellation: Cancellation? {
+        state.withLock { $0.cancellation }
+    }
+}
+
+/// Failure-only provenance for #1382; timings are observations, not deadlines or assertions.
+@MainActor
+private final class RestorationFixtureFailureTrace {
+    let cancellationTrace = RestorationFixtureCancellationTrace()
+    var invocationID = "not-created"
+    var pendingSaveDebounceCountBeforeClose: Int?
+    private let clock = ContinuousClock()
+    private var phaseStarted = ContinuousClock.now
+    private var elapsedPhases: [String] = []
+    var phase = "setup" {
+        didSet {
+            let now = clock.now
+            elapsedPhases.append("\(oldValue)=\(phaseStarted.duration(to: now))")
+            phaseStarted = now
+            cancellationTrace.setPhase(phase)
+            observeCallerCancellation()
+        }
+    }
+
+    private var firstErrorPhase: String?
+    private var firstErrorCallerCancelled: Bool?
+    private var firstObservedCancelledPhase: String?
+
+    init() {
+        observeCallerCancellation()
+    }
+
+    static func shouldDiagnose(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        return !(error is XCTSkip) && (error as NSError).domain != XCTestErrorDomain
+    }
+
+    private func observeCallerCancellation() {
+        if Task.isCancelled, firstObservedCancelledPhase == nil {
+            firstObservedCancelledPhase = phase
+        }
+    }
+
+    func noteRetainedError() {
+        observeCallerCancellation()
+        guard firstErrorPhase == nil else { return }
+        firstErrorPhase = phase
+        firstErrorCallerCancelled = Task.isCancelled
+    }
+
+    func failureMessage(for error: Error) -> String {
+        observeCallerCancellation()
+        let cancelledAtCatch = firstErrorCallerCancelled.map { String($0) } ?? "not-retained"
+        let timings = elapsedPhases + ["\(phase)=\(phaseStarted.duration(to: clock.now))"]
+        let cancellation = cancellationTrace.cancellation
+        let stack = cancellation?.stack.joined(separator: "\n") ?? "not-observed"
+        return """
+        Restoration fixture failure (#1382), invocation=\(invocationID)
+        phase=\(phase), firstErrorPhase=\(firstErrorPhase ?? "not-retained")
+        phaseElapsed: \(timings.joined(separator: ", "))
+        cancelledAtCatch=\(cancelledAtCatch), cancelledNow=\(Task.isCancelled)
+        firstObservedCancelledPhase=\(firstObservedCancelledPhase ?? "not-observed")
+        cancellationHandlerPhase=\(cancellation?.phase ?? "not-observed")
+        pendingSaveDebounceCountBeforeClose=\(pendingSaveDebounceCountBeforeClose.map { String($0) } ?? "not-reached")
+        errorType=\(String(reflecting: type(of: error))), error=\(String(reflecting: error))
+        cancellationStack (pre-cancelled entry may show handler installation):
+        \(stack)
+        """
+    }
+}
+
 private actor PrepareGate {
     private var entryCount = 0
     private var isOpen = false
@@ -924,6 +1022,7 @@ private extension XCTestCase {
             firstError = firstError ?? error
         }
         await viewModel.prepareForWindowClose()
+        await viewModel.test_drainSessionPersistenceAfterWindowClose()
         // Reset only after every producer/index/activation path has drained.
         viewModel.test_setSuppressesAgentSessionPersistence(nil)
         viewModel.test_afterTabActivationContinuation = nil
@@ -940,14 +1039,42 @@ private extension XCTestCase {
     }
 
     func withRealObserverSavedTab(bound: Bool = true, _ body: (RealObserverFixture) async throws -> Void) async throws {
+        // Sandbox/XCTest setup failures already have their own attribution, not #1382 provenance.
         let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let trace = RestorationFixtureFailureTrace()
+        let cancellationTrace = trace.cancellationTrace
+        do {
+            try await withTaskCancellationHandler {
+                try await performWithRealObserverSavedTab(sandbox: sandbox, bound: bound, trace: trace, body)
+            } onCancel: {
+                cancellationTrace.recordCancellation()
+            }
+        } catch {
+            // Keep skips and framework assertions untouched; preserve every original error identity.
+            if RestorationFixtureFailureTrace.shouldDiagnose(error) {
+                XCTFail(trace.failureMessage(for: error))
+            }
+            throw error
+        }
+    }
+
+    func performWithRealObserverSavedTab(
+        sandbox: URL,
+        bound: Bool,
+        trace: RestorationFixtureFailureTrace,
+        _ body: (RealObserverFixture) async throws -> Void
+    ) async throws {
         let root = sandbox.appendingPathComponent("restoration-observer-\(UUID().uuidString)", isDirectory: true)
+        trace.invocationID = root.lastPathComponent
+        trace.phase = "create-root"
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let dataService = AgentSessionDataService.shared
+        trace.phase = "install-root-override"
         await dataService.test_setWorkspaceRootOverride(root)
         let gate = PrepareGate()
         let tabID = UUID()
         let sessionID = UUID()
+        trace.phase = "install-hydration-hook"
         await dataService.test_setAfterHydrationPrepareHook { preparedSessionID in
             guard preparedSessionID == sessionID else { return }
             try await gate.hold()
@@ -976,6 +1103,7 @@ private extension XCTestCase {
             completions.record(tabID: tabID, generation: generation)
         }
         var firstError: Error?
+        trace.phase = "body"
         do {
             try await body(RealObserverFixture(
                 viewModel: viewModel,
@@ -988,35 +1116,54 @@ private extension XCTestCase {
                 completions: completions
             ))
         } catch {
+            trace.noteRetainedError()
             firstError = error
         }
+        trace.phase = "cancel-loads"
         let pendingLoads = viewModel.sessions.values.compactMap(\.persistedLoadTask)
         pendingLoads.forEach { $0.cancel() }
+        trace.phase = "open-gate"
         await gate.open()
+        trace.phase = "join-loads"
         for task in pendingLoads {
             await task.value
         }
+        trace.phase = "join-cache-refresh"
         await viewModel.test_waitForSessionListCacheRefresh()
+        trace.phase = "drain-cleanup"
         do {
             try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
         } catch {
+            trace.noteRetainedError()
             firstError = firstError ?? error
         }
+        // This counts debounce handles only, not pending workspace-listener flush tasks.
+        trace.pendingSaveDebounceCountBeforeClose = viewModel.sessions.values.compactMap(\.saveDebounceTask).count
+        trace.phase = "close-agent-mode"
         await viewModel.prepareForWindowClose()
+        trace.phase = "drain-session-persistence"
+        await viewModel.test_drainSessionPersistenceAfterWindowClose()
         viewModel.test_afterTabActivationContinuation = nil
         viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
         viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
+        trace.phase = "reset-hydration-hook"
         await dataService.test_setAfterHydrationPrepareHook(nil)
+        trace.phase = "reset-root-override"
         await dataService.test_setWorkspaceRootOverride(nil)
+        trace.phase = "remove-root"
         do {
             try FileManager.default.removeItem(at: root)
         } catch {
+            trace.noteRetainedError()
             firstError = firstError ?? error
         }
+        trace.phase = "lifetime-fence"
         withExtendedLifetime((manager, prompt)) {}
+        trace.phase = "rethrow-retained-error"
         if let firstError {
             throw firstError
         }
+        trace.phase = "return"
     }
 }
 
@@ -2234,6 +2381,110 @@ extension AgentTranscriptRestorationLifecycleTests {
 /// current-tab override. Sandbox first; bounded teardown before shared state resets.
 @MainActor
 extension AgentTranscriptRestorationLifecycleTests {
+    func testRealObserverFixtureJoinsWorkspaceFlushBeforeRemovingStorage() async throws {
+        enum BodyFailure: Error {
+            case expected
+        }
+
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        for bodyFails in [false, true] {
+            let writeEntered = expectation(description: "workspace listener entered session writer")
+            writeEntered.assertForOverFulfill = false
+            let drainEntered = expectation(description: "fixture joined outstanding session persistence")
+            let writeGate = PrepareGate()
+            var fixtureRoot: URL?
+            var retainedSession: AgentTabSession?
+            var wroteBeforeRemoval = false
+            var observedDrain = false
+            let fixtureTask = Task { @MainActor in
+                // Exercise teardown directly: the throwing case intentionally retains an error,
+                // so it must not invoke the wrapper's failure-only XCTFail diagnostic.
+                try await performWithRealObserverSavedTab(
+                    sandbox: sandbox, bound: true, trace: RestorationFixtureFailureTrace()
+                ) { fixture in
+                    let root = try URL(fileURLWithPath: XCTUnwrap(fixture.viewModel.workspacePathProvider()))
+                    fixtureRoot = root
+                    var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
+                    saved.items = [AgentChatItemPersist(
+                        from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Retained transcript")
+                    )]
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
+                    fixture.viewModel.setAgentModeActive(true)
+                    await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
+                    try await AsyncTestWait.waitUntil("restoration fixture hydration prepared", timeout: 15) {
+                        await fixture.gate.entries >= 1
+                    }
+                    let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+                    let load = try XCTUnwrap(session.persistedLoadTask)
+                    await fixture.gate.open()
+                    await load.value
+                    await fixture.prompt.switchComposeTab(fixture.tabID)
+                    retainedSession = session
+                    fixture.viewModel.test_setSuppressesAgentSessionPersistence(false)
+                    fixture.viewModel.test_setAgentSessionSaver { [weak viewModel = fixture.viewModel] _, _, _ in
+                        writeEntered.fulfill()
+                        try await writeGate.hold()
+                        let marker = root.appendingPathComponent("joined-session-write")
+                        try Data("settled".utf8).write(to: marker)
+                        wroteBeforeRemoval = true
+                        viewModel?.scheduleSave(for: session.tabID)
+                        return marker
+                    }
+                    fixture.viewModel.test_beforeSessionPersistenceDrainWait = {
+                        if !observedDrain {
+                            observedDrain = true
+                            drainEntered.fulfill()
+                        }
+                    }
+                    session.isDirty = true
+                    fixture.manager.pollAndSaveState()
+                    await fulfillment(of: [writeEntered], timeout: 15)
+                    if bodyFails { throw BodyFailure.expected }
+                }
+            }
+
+            let drainResult = await XCTWaiter.fulfillment(of: [drainEntered], timeout: 15)
+            await writeGate.open()
+            let result = await fixtureTask.result
+            XCTAssertEqual(drainResult, .completed)
+            switch result {
+            case .success:
+                XCTAssertFalse(bodyFails)
+            case let .failure(error):
+                XCTAssertTrue(bodyFails && error is BodyFailure, "Preserve the original fixture error: \(error)")
+            }
+            XCTAssertTrue(wroteBeforeRemoval, "Fixture storage must outlive the real before-save listener's writer")
+            XCTAssertNil(retainedSession?.saveDebounceTask, "A successor scheduled during the joined flush must also drain")
+            XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(fixtureRoot).path))
+        }
+    }
+
+    func testFixtureFailureTraceRecordsCancellationAndFiltersFrameworkErrors() async {
+        let trace = RestorationFixtureFailureTrace()
+        trace.invocationID = "restoration-observer-test"
+        let cancellationTrace = trace.cancellationTrace
+        let task = Task { @MainActor in
+            await withTaskCancellationHandler {
+                trace.phase = "body"
+                return trace.failureMessage(for: CancellationError())
+            } onCancel: {
+                cancellationTrace.recordCancellation()
+            }
+        }
+        task.cancel()
+        let message = await task.value
+        XCTAssertTrue(message.contains("invocation=restoration-observer-test"))
+        XCTAssertTrue(message.contains("phaseElapsed: setup="))
+        XCTAssertTrue(message.contains(", body="))
+        XCTAssertTrue(message.contains("firstObservedCancelledPhase=body"))
+        XCTAssertEqual(cancellationTrace.cancellation?.phase, "setup")
+        XCTAssertFalse(cancellationTrace.cancellation?.stack.isEmpty ?? true)
+        XCTAssertFalse(RestorationFixtureFailureTrace.shouldDiagnose(XCTSkip("skip")))
+        XCTAssertFalse(RestorationFixtureFailureTrace.shouldDiagnose(NSError(domain: XCTestErrorDomain, code: 0)))
+        XCTAssertTrue(RestorationFixtureFailureTrace.shouldDiagnose(CancellationError()))
+        XCTAssertTrue(RestorationFixtureFailureTrace.shouldDiagnose(NSError(domain: NSCocoaErrorDomain, code: 513)))
+    }
+
     /// §4.5: the same complete IDs with no live attempt or continuation start a real activation that
     /// reapplies current bindings; the selection publication is never ignored by tab ID alone.
     func testSameTabSelectionWithoutLiveWorkReappliesCurrentBindings() async throws {
@@ -2612,18 +2863,28 @@ extension AgentTranscriptPaneSnapshotPublicationTests {
     /// §4.5: when the target is replaced (awaiting the incoming owner), the published snapshot carries
     /// none of the outgoing conversation's rows.
     func testTargetReplacementDropsOutgoingRowsFromPublishedSnapshot() async throws {
+        for _ in 0 ..< 3 {
+            try await assertTargetReplacementDropsOutgoingRowsFromPublishedSnapshot()
+        }
+    }
+
+    private func assertTargetReplacementDropsOutgoingRowsFromPublishedSnapshot() async throws {
         try await withRealObserverSavedTab { fixture in
             var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
             saved.items = [AgentChatItemPersist(
                 from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Outgoing content")
             )]
             _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
-            await fixture.gate.open()
+            XCTAssertNil(fixture.prompt.activeComposeTabID, "precondition: selection not yet published")
             fixture.viewModel.setAgentModeActive(true)
             await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
-            if let loadTask = fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask {
-                await loadTask.value
-            }
+            // Activation queues the loader; its task does not exist yet when the workspace switch returns.
+            // Hold preparation until that producer exists, then await the activation continuation too.
+            await fixture.gate.waitUntilEntered()
+            let loadTask = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask)
+            await fixture.gate.open()
+            await loadTask.value
+            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
             await fixture.prompt.switchComposeTab(fixture.tabID)
             XCTAssertFalse(fixture.viewModel.ui.transcript.snapshot.presentation.workingRows.isEmpty, "precondition: outgoing rows")
 

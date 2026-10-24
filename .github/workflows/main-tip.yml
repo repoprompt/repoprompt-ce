@@ -425,7 +425,8 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.commit }}
           path: approved-source
-          fetch-depth: 1
+          # History notes/barriers and admission ancestry use reviewed source as data.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify and expand staged tip source
@@ -675,6 +676,7 @@ jobs:
       - name: Validate package
         if: needs.setup.outputs.installation-type == 'package'
         env:
+          REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
           TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
           TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
@@ -817,7 +819,9 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.tooling-commit }}
           path: trusted-control-plane
-          fetch-depth: 1
+          # setup requires tooling-commit == approved candidate; publication
+          # re-derives history from this full source, never downloaded build code.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Download signed tip assets

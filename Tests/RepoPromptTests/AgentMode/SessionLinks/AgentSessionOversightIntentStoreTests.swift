@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptPersistence
@@ -233,5 +234,90 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         XCTAssertEqual(AppLaunchConfiguration.agentSessionOversightPersistenceMode(suppressesOversightPersistence: false, autoRestoreWorkspacesEnabled: true), .enabled)
         XCTAssertEqual(AppLaunchConfiguration.agentSessionOversightPersistenceMode(suppressesOversightPersistence: false, autoRestoreWorkspacesEnabled: false), .dormant)
         XCTAssertEqual(AppLaunchConfiguration.agentSessionOversightPersistenceMode(suppressesOversightPersistence: true, autoRestoreWorkspacesEnabled: true), .suppressed)
+    }
+}
+
+/// The legacy atomic writer must report unconfirmed durability even after replacement succeeds.
+final class DurableAtomicFileWriterTests: XCTestCase {
+    func testDirectoryOpenFailureIsReportedAfterReplacement() throws {
+        try withDestination { url in
+            let replacement = Data("replacement".utf8)
+            XCTAssertThrowsError(try DurableAtomicFileWriter.write(replacement, to: url, openDirectory: { _ in
+                errno = EACCES
+                return -1
+            })) { error in
+                XCTAssertEqual((error as? POSIXError)?.code, .EACCES)
+            }
+            XCTAssertEqual(try Data(contentsOf: url), replacement, "An error after rename must not undo the replacement")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: url.deletingLastPathComponent().path), [url.lastPathComponent])
+        }
+    }
+
+    func testDirectorySyncFailureIsReportedAndDescriptorIsClosed() throws {
+        try withDestination { url in
+            let replacement = Data("replacement".utf8)
+            var directoryDescriptor: Int32 = -1
+            var closedDescriptors: [Int32] = []
+            var closeResults: [Int32] = []
+            XCTAssertThrowsError(try DurableAtomicFileWriter.write(replacement, to: url, syncDirectory: { descriptor in
+                directoryDescriptor = descriptor
+                errno = EIO
+                return -1
+            }, closeDirectory: { descriptor in
+                closedDescriptors.append(descriptor)
+                closeResults.append(Darwin.close(descriptor))
+                errno = EBADF // Cleanup must not replace the captured sync error.
+            })) { error in
+                XCTAssertEqual((error as? POSIXError)?.code, .EIO)
+            }
+            XCTAssertGreaterThanOrEqual(directoryDescriptor, 0)
+            XCTAssertEqual(closedDescriptors, [directoryDescriptor])
+            XCTAssertEqual(closeResults, [0])
+            XCTAssertEqual(try Data(contentsOf: url), replacement)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: url.deletingLastPathComponent().path), [url.lastPathComponent])
+        }
+    }
+
+    func testInterruptedDirectorySyncRetriesAndClosesOnce() throws {
+        try withDestination { url in
+            let replacement = Data("replacement".utf8)
+            var syncDescriptors: [Int32] = []
+            var closedDescriptors: [Int32] = []
+            var closeResults: [Int32] = []
+            try DurableAtomicFileWriter.write(replacement, to: url, syncDirectory: { descriptor in
+                syncDescriptors.append(descriptor)
+                if syncDescriptors.count == 1 {
+                    errno = EINTR
+                    return -1
+                }
+                return Darwin.fsync(descriptor)
+            }, closeDirectory: { descriptor in
+                closedDescriptors.append(descriptor)
+                closeResults.append(Darwin.close(descriptor))
+            })
+            XCTAssertEqual(syncDescriptors.count, 2)
+            XCTAssertEqual(syncDescriptors.first, syncDescriptors.last)
+            XCTAssertEqual(closedDescriptors, Array(syncDescriptors.prefix(1)))
+            XCTAssertEqual(closeResults, [0])
+            XCTAssertEqual(try Data(contentsOf: url), replacement)
+        }
+    }
+
+    func testSuccessfulWriteReplacesBytes() throws {
+        try withDestination { url in
+            let replacement = Data("replacement".utf8)
+            try DurableAtomicFileWriter.write(replacement, to: url)
+            XCTAssertEqual(try Data(contentsOf: url), replacement)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: url.deletingLastPathComponent().path), [url.lastPathComponent])
+        }
+    }
+
+    private func withDestination(_ body: (URL) throws -> Void) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("state.json")
+        try Data("original".utf8).write(to: url)
+        try body(url)
     }
 }

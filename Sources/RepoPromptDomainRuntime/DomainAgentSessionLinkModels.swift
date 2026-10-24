@@ -252,6 +252,7 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
         case timeout
         case agentError = "agent_error"
         case resumeTimedOut = "resume_timed_out"
+        case resumeHistoryTooLarge = "resume_history_too_large"
         case cancelled
     }
 
