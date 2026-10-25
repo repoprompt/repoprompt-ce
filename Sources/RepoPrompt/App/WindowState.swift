@@ -1254,8 +1254,8 @@ class WindowState: ObservableObject {
         }
 
         return Task {
-            await AgentSessionDeletionOrigin.$current.withValue(.userUI) {
-                await promptManager.stashTab(activeTabID)
+            await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.userUI) {
+                _ = await promptManager.stashTab(activeTabID)
             }
         }
     }

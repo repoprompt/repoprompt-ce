@@ -1388,7 +1388,11 @@ final class DelegationScopeRuntime: ObservableObject {
         // durability. If the entire write fails, only this process knows the deny; report that
         // limitation honestly and retain the exact operation for retry.
         if !invalidated.isEmpty || !deletedSessions.isEmpty {
-            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: invalidated, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: scopeEndings.filter { invalidated.contains($0.key) })
+            // A later cascade can reach stored children whose earlier ending has not saved yet.
+            // Carry those queued terminal facts into this transaction, deepest-first in the store,
+            // so retrying the child's original operation cannot find a later ending already sealed.
+            let terminalIDs = Set(invalidated).union(pendingSaves.flatMap(\.revoked))
+            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: terminalIDs.sorted { $0.uuidString < $1.uuidString }, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: scopeEndings.filter { terminalIDs.contains($0.key) })
             let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions, deletionEndings: terminal.deletionEndings, endings: terminal.endings) ?? .pending
             lastPersistenceOutcome = outcome
             if outcome == .applied || outcome == .unchanged {

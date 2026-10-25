@@ -19,7 +19,10 @@ struct AgentSessionDeletionOrigin: Equatable {
         .init(kind: .agentCleanup, actorSessionID: caller)
     }
 
-    @TaskLocal static var current: Self = .unknown
+    static let currentTaskLocal = BoxedTaskLocal<Self>(.unknown)
+    static var current: Self {
+        currentTaskLocal.get()
+    }
 }
 
 /// Process-owned record of which agent sessions are being, or have been, durably deleted.

@@ -203,7 +203,7 @@ extension AgentModeViewModel {
                     )
                 }
             #endif
-            let report = await AgentSessionDeletionOrigin.$current.withValue(.userUI) {
+            let report = await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.userUI) {
                 await promptManager.deleteComposeAndStashedTabs(
                     composeTabIDs: targets.activeDeleteTabIDs,
                     archivedTargets: targets.archivedDeleteTargets,

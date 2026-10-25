@@ -1532,7 +1532,7 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID, openTabID: openTabID)
                     mutationStarted = true
                     providerCleanupOutcome = try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+                        try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
                             try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
                         }
                     }
@@ -1562,7 +1562,7 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID)
                     mutationStarted = true
                     try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+                        try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
                             try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
                         }
                     }

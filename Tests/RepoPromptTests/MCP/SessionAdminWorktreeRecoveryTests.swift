@@ -445,6 +445,62 @@ final class DelegationScopeEndingTests: XCTestCase {
         }
     }
 
+    func testFailedChildEndingSurvivesLaterAncestorCascadeAndRetry() async throws {
+        final class FailureGate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var failing = false
+            func setFailing(_ value: Bool) {
+                lock.withLock { failing = value }
+            }
+
+            func check() throws {
+                if lock.withLock({ failing }) { throw CocoaError(.fileWriteOutOfSpace) }
+            }
+        }
+        for deleteAncestor in [false, true] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let gate = FailureGate()
+            func store() -> DelegationScopeStore {
+                .init(fileURL: directory.appendingPathComponent("delegationScopes.json"), backupsDirectoryURL: directory, mode: .enabled, beforeCommit: { try gate.check() })
+            }
+            var clock = Date(timeIntervalSince1970: 2_000_000)
+            let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { clock }, notifyCatalogChanged: { _ in })
+            await runtime.bootstrap(store: store())
+            let owner = UUID(), childOwner = UUID()
+            let request = try runtime.requestScope(requesterSessionID: owner, requesterTabID: nil, kind: .tree(rootSessionID: owner), capabilities: [.observe, .spawn], guardrails: .init(), reason: nil, idempotencyKey: nil).get()
+            let parent = try runtime.approve(requestID: request.id).get()
+            let child = try runtime.attenuate(parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(owner), newGranteeSessionID: childOwner, newGranteeMemberships: [.init(scopeID: parent.id, targetSessionID: childOwner, basis: .treePath([childOwner, owner]))], capabilities: [.observe], guardrails: .init()).get()
+            await runtime.flushPersistence()
+            gate.setFailing(true)
+            clock = clock.addingTimeInterval(1)
+            _ = try runtime.release(scopeID: child.id, caller: .agentSession(childOwner)).get()
+            let firstEnding = try XCTUnwrap(runtime.ending(for: child.id))
+            XCTAssertEqual(firstEnding.reason, .granteeReleased)
+            XCTAssertEqual(runtime.lastPersistenceOutcome, .writeFailed)
+            XCTAssertNotEqual(runtime.continuityState, "saved")
+            // No suspension between the failed child save and the successful ancestor transaction:
+            // the queued retry cannot run first and accidentally hide the ordering defect.
+            gate.setFailing(false)
+            clock = clock.addingTimeInterval(1)
+            if deleteAncestor { runtime.revokeAll(involving: owner, origin: .userUI, fileRemoved: true) }
+            else { runtime.revoke(scopeID: parent.id) }
+            let parentEnding = try XCTUnwrap(runtime.ending(for: parent.id))
+            XCTAssertNotEqual(parentEnding, firstEnding)
+            await runtime.flushPersistence()
+            XCTAssertEqual(runtime.continuityState, "saved")
+            runtime.freezeForTermination()
+            let restored = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { clock }, notifyCatalogChanged: { _ in })
+            await restored.bootstrap(store: store())
+            XCTAssertEqual(restored.ending(for: child.id), firstEnding, "A later ancestor transaction must retain the child's earlier reason, clock, and actor")
+            XCTAssertEqual(restored.ending(for: parent.id), parentEnding)
+            XCTAssertFalse(restored.hasLiveScope(grantedTo: owner))
+            XCTAssertFalse(restored.hasLiveScope(grantedTo: childOwner))
+            XCTAssertNil(restored.record(id: child.id))
+            restored.freezeForTermination()
+        }
+    }
+
     func testExpiryDuringShutdownIsRecordedOnRecovery() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

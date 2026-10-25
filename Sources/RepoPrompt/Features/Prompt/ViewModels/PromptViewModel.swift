@@ -4204,7 +4204,7 @@ class PromptViewModel: ObservableObject {
         deletionOrigin: AgentSessionDeletionOrigin = .current,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
-        await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
             await removeComposeTabs(
                 withIDs: [id],
                 isMutationContextCurrent: isMutationContextCurrent
