@@ -886,21 +886,20 @@ struct CustomTextField: NSViewRepresentable {
             guard parent.externalEditTransaction != nil, !externalEditUndoRegistered else { return }
             externalEditUndoRegistered = true
             let undo = parent.onUndoExternalEdit
-            // beginUndoGrouping can implicitly open an outer event group. Without this fence,
-            // the first native edit in the same turn also undoes the preceding rewrite.
-            // Keep explicitly nested caller groups and undo/redo grouping under their owner.
-            let separatesEventGroup = textViewUndoManager.groupsByEvent
-                && !textViewUndoManager.isUndoing && !textViewUndoManager.isRedoing
-            if separatesEventGroup {
-                if textViewUndoManager.groupingLevel == 1 { textViewUndoManager.endUndoGrouping() }
-                textViewUndoManager.groupsByEvent = false
-            }
-            defer { if separatesEventGroup { textViewUndoManager.groupsByEvent = true } }
             let ownsUndoGroup = textViewUndoManager.groupingLevel == 0
             if ownsUndoGroup { textViewUndoManager.beginUndoGrouping() }
             textViewUndoManager.registerUndo(withTarget: self) { _ in undo?() }
             textViewUndoManager.setActionName("Re-prompt")
             if ownsUndoGroup { textViewUndoManager.endUndoGrouping() }
+            // An explicit group can leave the implicit event group open. Split that outer group
+            // after the rewrite, then leave a fresh event group for native typing registration.
+            // Do not toggle groupsByEvent or close explicitly nested/undo/redo-owned groups.
+            if textViewUndoManager.groupsByEvent, textViewUndoManager.groupingLevel == 1,
+               !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing
+            {
+                textViewUndoManager.endUndoGrouping()
+                textViewUndoManager.beginUndoGrouping()
+            }
         }
 
         func clearUndoHistory() {
