@@ -1473,7 +1473,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
-            makeSaveCommitToken(for: session, workspaceID: workspaceID)
+            guard let workspace = workspaceManager?.workspace(withID: workspaceID) else { return nil }
+            return makeSaveCommitToken(for: session, workspace: workspace)
         }
 
         func test_isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken) -> Bool {
@@ -2542,6 +2543,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        usesProductionAgentDefaultsAndModelPolling: Bool = true,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -2644,7 +2646,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
-        usesProductionAgentDefaultsAndModelPolling = true
+        self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
@@ -2733,7 +2735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshAvailableAgents()
 
         // Restore last-used agent and model so new sessions default to the user's previous choice.
-        restoreLastUsedAgentSelectionIfNeeded()
+        if usesProductionAgentDefaultsAndModelPolling {
+            restoreLastUsedAgentSelectionIfNeeded()
+        }
 
         setupObservers()
         modelRouterRuntime?.objectWillChange
@@ -6873,7 +6877,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Publishes the current local projection for a retained cancelled-drift scope, without latching
     /// completion, recording proof or marking the binding hydrated. Revalidates synchronously right
-    /// before publication.
+    /// before publication. Returns whether this scope owns the local projection, including a no-op
+    /// publication, so ordinary refreshes never replace its unchanged content with a loading frame.
     @discardableResult
     private func publishRetainedLocalProjection(_ session: TabSession) -> Bool {
         guard session.tabID == currentTabID,
@@ -6881,7 +6886,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         else { return false }
         guard retainsCancelledLocalDrift(session) else { return false }
-        return publishTranscriptPresentation(from: session)
+        _ = publishTranscriptPresentation(from: session)
+        return true
     }
 
     /// Cancelled current attempt whose source changed: project current local items without latching
@@ -12367,7 +12373,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if bindingOnlyMCPSessionTargetRecoveryIDs.contains(recoveryID) {
             do {
-                try await agentSessionDeleter(sessionID, workspace)
+                try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+                    try await agentSessionDeleter(sessionID, workspace)
+                }
             } catch {
                 return .retainedForRetry
             }
@@ -12382,7 +12390,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .complete
             }
         } else if target.origin == .createdNewTab {
-            let failures = await agentSessionsBatchDeleter([target.tabID], workspace)
+            let failures = await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+                await agentSessionsBatchDeleter([target.tabID], workspace)
+            }
             guard failures[target.tabID] == nil else { return .retainedForRetry }
             guard pendingMCPSessionTargetDiscardIsCurrent(
                 recoveryID: recoveryID,
@@ -12474,7 +12484,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessions.removeValue(forKey: target.tabID)
         tabsWithActiveAgentRun.remove(target.tabID)
         mcpControlledTabIDs.remove(target.tabID)
-        await promptManager?.closeComposeTab(target.tabID)
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+            await promptManager?.closeComposeTab(target.tabID)
+        }
     }
 
     func mcpDeactivateControlContext(
@@ -13936,7 +13948,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func applySessionToBindings(_ session: TabSession) {
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            if session.tabID == currentTabID {
+            if session.tabID == currentTabID, !publishRetainedLocalProjection(session) {
                 publishLoadingTranscriptPresentation(tabID: session.tabID)
             }
             return
@@ -14470,7 +14482,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            publishLoadingTranscriptPresentation(tabID: session.tabID)
+            if !publishRetainedLocalProjection(session) {
+                publishLoadingTranscriptPresentation(tabID: session.tabID)
+            }
             return
         }
 
@@ -17411,7 +17425,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func makeSaveCommitToken(
         for session: TabSession,
-        workspaceID: UUID
+        workspace: WorkspaceModel
     ) -> SessionSaveCommitToken? {
         guard let binding = session.persistentSessionBindingIdentity,
               binding.sessionID == session.activeAgentSessionID,
@@ -17422,7 +17436,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return SessionSaveCommitToken(
             tabID: session.tabID,
             sessionIdentity: ObjectIdentifier(session),
-            workspaceID: workspaceID,
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: sessionSaveWorkspaceDirectoryPath(for: workspace),
             binding: binding,
             bindingTransitionGeneration: session.bindingTransitionGeneration,
             sourceItemsRevision: session.sourceItemsRevision,
@@ -17431,15 +17446,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func sessionSaveWorkspaceDirectoryPath(for workspace: WorkspaceModel) -> String {
+        WorkspaceSessionSidecarMigration.workspaceDirectory(
+            for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+        ).standardizedFileURL.path
+    }
+
     private func isSaveCommitTokenCurrent(
         _ token: SessionSaveCommitToken,
         requireWorkspaceMatch: Bool = true,
         creationHandle: AgentSessionCreationHandle? = nil
     ) -> Bool {
-        if requireWorkspaceMatch,
-           workspaceManager?.activeWorkspace?.id != token.workspaceID
-        {
-            return false
+        if requireWorkspaceMatch {
+            // A storage move can preserve every session/binding identity. The completed write
+            // only acknowledges the placement captured from the workspace passed to its saver.
+            guard let workspace = workspaceManager?.activeWorkspace,
+                  workspace.id == token.workspaceID,
+                  sessionSaveWorkspaceDirectoryPath(for: workspace) == token.workspaceDirectoryPath
+            else { return false }
         }
         guard let session = sessions[token.tabID],
               ObjectIdentifier(session) == token.sessionIdentity,
@@ -17940,11 +17964,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } catch {
             return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
         }
-        guard let saveToken = makeSaveCommitToken(for: session, workspaceID: workspace.id),
+        guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
               isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
         else {
             requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-            return .deferred("The session binding changed before persistence could commit.")
+            return .deferred("The session or its storage location changed before persistence could commit.")
         }
 
         do {
@@ -17952,7 +17976,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentSession.fileURL = fileURL
             guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session changed while persistence was committing.")
+                return .deferred("The session or its storage location changed while persistence was committing.")
             }
             if case let .configured(handle) = effectiveCreationSave, let creationStamp {
                 var currentConfiguration = agentSession
@@ -18237,13 +18261,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         let repromptRecoveryID = repromptUIStore.recoveries[target.tabID]?.id
+        // A presented handoff owns restoration even if it is cancelled while this executor awaits.
+        let presentedHandoffOwnsRecovery = ui.composer.pendingSubmissions[claim.attempt.id] != nil
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
         guard composerSubmitClaimIsCurrent(claim) else {
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
-            if let approvedBriefForRecovery, !submittedApprovedBrief {
+            if !presentedHandoffOwnsRecovery, let approvedBriefForRecovery, !submittedApprovedBrief {
                 repromptUIStore.recoveries[target.tabID] = .init(
                     text: approvedBriefForRecovery, originalDraft: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot,
                     reason: "The approved turn could not be submitted.",
@@ -18254,10 +18281,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
                 repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-            repromptAudits[claim.attempt.id] = nil
-            repromptDispatchTexts[claim.attempt.id] = nil
-            repromptDispatchOriginals[claim.attempt.id] = nil
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18441,6 +18465,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
+            movePendingComposerSubmission(claim, to: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
@@ -18538,6 +18563,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         destinationTabID: UUID,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        movePendingComposerSubmission(claim, to: destinationTabID)
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
@@ -18864,7 +18890,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         guard let session = sessions[tabID], isFreshFirstSendDestination(session) else { return }
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
-            await promptManager?.closeComposeTab(tabID)
+            await promptManager?.closeComposeTab(tabID, deletionOrigin: .automaticDiscard)
         } else {
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)

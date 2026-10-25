@@ -13,6 +13,21 @@ enum AgentRepromptDisclosure {
     static func acknowledge(providerID: String, defaults: UserDefaults) {
         defaults.set(true, forKey: key + providerID)
     }
+
+    /// Essential informed-consent facts, kept short enough to read before enabling.
+    static func summary(modelName: String, routeName: String, includesRecentChat: Bool) -> [String] {
+        let history = includesRecentChat ? ", recent chat excerpts" : ""
+        return [
+            "Sends your message, guidance, root names and selected paths\(history) to \(modelName) via \(routeName). Never file contents, attachments, git or tool output.",
+            "\(routeName) billing and retention apply. Avoid secrets.",
+            "Model Router or Auto Effort, if on, may judge the draft before you send."
+        ]
+    }
+
+    static let howItWorks = "Send or Return rewrites the message in the composer; press either again to send the visible text. "
+        + "You can keep editing at any time; typing stops the rewrite. Esc restores the original for your next Send, ⌘↩ rewrites again, "
+        + "and ⌘⇧O sends the original immediately. Clarification is optional; an answer may trigger one more rewrite. Send automatically mode "
+        + "(Re-prompt menu) dispatches completed rewrites unless a question or slash-leading text needs review."
 }
 
 extension AgentModeViewModel {
@@ -55,16 +70,42 @@ extension AgentModeViewModel {
     }
 
     func resolvedRepromptModel(session: TabSession? = nil) -> AIModel? {
+        repromptModelResolution(session: session).model
+    }
+
+    /// Automatic defaults are pinned only once Re-prompt is enabled or a preparation begins, so
+    /// rendering the pill while availability is still loading never freezes a worse billing route.
+    func repromptModelResolution(session: TabSession? = nil, pinningDefault: Bool = false) -> AgentRepromptModelResolution {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
         let provider = (session ?? activeSession)?.selectedAgent
         let configured = configuredRepromptModels()
-        if profile.agentRepromptModelRaw == nil, let cached = repromptDefaultModel, cached.provider == provider {
-            // Losing availability after resolution requires a choice, never a silent billing-route switch.
-            return configured.contains(cached.model) ? cached.model : nil
+        if let raw = profile.agentRepromptModelRaw, !raw.isEmpty {
+            // An explicit selection is never replaced, even when it is disconnected.
+            return AgentRepromptModelPolicy.resolve(selection: raw, currentProvider: provider, configured: configured)
+                .map(AgentRepromptModelResolution.resolved) ?? .savedSelectionUnavailable(raw: raw)
         }
-        let resolved = AgentRepromptModelPolicy.resolve(selection: profile.agentRepromptModelRaw, currentProvider: provider, configured: configured)
-        if profile.agentRepromptModelRaw == nil, let resolved { repromptDefaultModel = (provider, resolved) }
-        return resolved
+        if let cached = repromptDefaultModel, cached.provider == provider {
+            // Losing availability after resolution requires a choice, never a silent billing-route switch.
+            return configured.contains(cached.model) ? .resolved(cached.model) : .automaticDefaultUnavailable(cached.model)
+        }
+        guard let resolved = AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: provider, configured: configured) else {
+            return .noAutomaticDefault
+        }
+        if pinningDefault || repromptEnabled { repromptDefaultModel = (provider, resolved) }
+        return .resolved(resolved)
+    }
+
+    /// Clears an explicit choice so the bounded automatic policy applies again.
+    func useAutomaticRepromptModel() {
+        repromptDefaultModel = nil
+        setRepromptModelRaw("")
+    }
+
+    /// Human-readable billing route for the disclosure; compatible backends name their backend.
+    func repromptRouteName(for model: AIModel) -> String {
+        let provider = AIProviderType.displayName(for: model.providerType)
+        guard let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) else { return provider }
+        return "\(String(describing: descriptor.backendID)) through \(provider)"
     }
 
     func setRepromptModelRaw(_ raw: String) {
@@ -85,7 +126,8 @@ extension AgentModeViewModel {
     }
 
     func repromptPillProps() -> AgentRepromptPillProps {
-        let model = resolvedRepromptModel()
+        let resolution = repromptModelResolution()
+        let model = resolution.model
         let recipient = model.map { model in
             let route = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model).map { String(describing: $0.backendID) }
                 ?? String(describing: model.providerType)
@@ -95,7 +137,7 @@ extension AgentModeViewModel {
             isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isStreaming == true,
             modelDisplayName: model?.displayName ?? "Choose a model", providerID: recipient,
             requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: recipient, defaults: .standard),
-            unavailableReason: model == nil ? "Connect or choose a Re-prompt model in Agent Models settings." : nil
+            unavailableReason: resolution.unavailableReason
         )
     }
 
@@ -110,15 +152,21 @@ extension AgentModeViewModel {
             guard AgentRepromptDisclosure.isAcknowledged(providerID: providerID, defaults: .standard) else { return }
         } else if repromptOperation?.phase.isBusy == true { cancelReprompt() }
         repromptEnabled = enabled
+        if enabled {
+            // Freeze the consented route synchronously, with no await since recipient validation.
+            _ = repromptModelResolution(pinningDefault: true)
+        } else if repromptOperation == nil {
+            repromptDefaultModel = nil
+        }
         syncStatusPillsUIState()
     }
 
     /// Resolve an invalidated edited draft explicitly; keeping it bypasses preparation on the next Return.
     func keepRepromptRewrite(tabID: UUID) {
-        guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID] else { return }
+        guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
+              recovery.draftAtInvalidation == retrieveDraftText(for: tabID) else { return }
         recovery.requiresDecision = false
         recovery.bypassesPreparation = true
-        recovery.draftAtInvalidation = retrieveDraftText(for: tabID)
         repromptUIStore.recoveries[tabID] = recovery
     }
 

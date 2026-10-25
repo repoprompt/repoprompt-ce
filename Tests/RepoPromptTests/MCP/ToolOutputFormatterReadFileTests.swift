@@ -1,3 +1,4 @@
+import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptFileSystem
@@ -187,6 +188,35 @@ final class ToolOutputFormatterReadFileTests: XCTestCase {
             XCTAssertTrue(text.contains("## File Read ✅"), text)
             XCTAssertTrue(text.contains("**Lines**: \(first)–\(last) of 3"), text)
         }
+    }
+
+    func testDecodedReadReplyFeedsExactSelectorAndSliceMetadata() throws {
+        let wanted = " Sources/AGENTS.md \n"
+        let neighbor = "Sources/AGENTS.md"
+        let reply = ToolResultDTOs.ReadFileReply(
+            content: "two\nthree\nfour", totalLines: 8,
+            firstLine: 2, lastLine: 4, displayPath: wanted
+        )
+        let restored = try JSONDecoder().decode(
+            ToolResultDTOs.ReadFileReply.self, from: JSONEncoder().encode(reply)
+        )
+        XCTAssertEqual(try Data(XCTUnwrap(restored.displayPath).utf8), Data(wanted.utf8))
+        let selection = try XCTUnwrap(AutoSliceSelection.readFileSelection(from: restored, fallbackPath: neighbor))
+        guard case let .slice(entry) = selection else { return XCTFail("DTO adapter lost the requested slice") }
+        XCTAssertEqual(Data(entry.path.utf8), Data(wanted.utf8))
+        XCTAssertEqual(entry.ranges, [.init(start: 2, end: 4)])
+        let neighborOutcome = AutoSliceSelection.preserveExistingFullFileSelection(selection, existingFullPaths: [neighbor])
+        guard case let .slice(retained) = neighborOutcome else { return XCTFail("Neighbor replaced the requested slice") }
+        XCTAssertEqual(Data(retained.path.utf8), Data(wanted.utf8))
+        XCTAssertEqual(retained.ranges, entry.ranges)
+        let exactOutcome = AutoSliceSelection.preserveExistingFullFileSelection(selection, existingFullPaths: [wanted])
+        guard case let .full(path) = exactOutcome else { return XCTFail("Exact full-file selection was not retained") }
+        XCTAssertEqual(Data(path.utf8), Data(wanted.utf8))
+        let text = try Self.onlyText(ToolOutputFormatter.formatReadFile(
+            args: ["path": .string(neighbor)], value: Value(restored)
+        ))
+        XCTAssertTrue(text.contains("**Lines**: 2–4 of 8"), text)
+        XCTAssertTrue(text.contains("two\nthree\nfour"), text)
     }
 
     private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
