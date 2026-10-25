@@ -464,6 +464,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
+        case resumeHistoryTooLarge = "resume_history_too_large"
         case cancelled
 
         /// Fallback heuristic for restored/legacy snapshots whose terminal

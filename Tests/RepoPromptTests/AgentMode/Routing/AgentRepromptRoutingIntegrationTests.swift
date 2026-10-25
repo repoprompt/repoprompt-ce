@@ -5,6 +5,40 @@ import XCTest
 
 @MainActor
 final class AgentRepromptRoutingIntegrationTests: XCTestCase {
+    func testPendingSendIsVisibleAndDraftEmptyWhileRoutingIsSuspended() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let gate = AgentRepromptStartGate()
+        await fixture.backend.setGate(gate)
+        defer { Task { await gate.release() } }
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        vm.storeDraftText(for: tabID, "Send this task")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Send this task")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Expected local handoff")
+        }
+        let task = Task { @MainActor in
+            let result = await vm.submitUserTurnAfterFreshTaskRouting(
+                text: "Send this task", claim: claim, session: fixture.session, destinationTabID: tabID
+            )
+            vm.finishPresentedComposerSubmitAttempt(claim, result: result)
+            return result
+        }
+        try await AsyncTestWait.waitUntil("routing suspended", timeout: 5) { await !fixture.backend.requests.isEmpty }
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Send this task")
+        XCTAssertFalse(fixture.session.items.contains { $0.kind == .user })
+        vm.storeDraftText(for: tabID, "Next draft")
+        await gate.release()
+        let result = await task.value
+        XCTAssertEqual(result, .submitted)
+        XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .user }), 1)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next draft")
+    }
+
     func testUsagePeerReconciliationDoesNotInvalidatePreparedSpeculation() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
@@ -113,16 +147,22 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         }
     }
 
-    func testPreparationSpeculationAdoptsIntoFreshLocalClaimAndCancellationHasNoClaim() async throws {
+    func testCompletedReturnPreservesSpeculationAndAdoptsIntoFreshLocalClaim() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         fixture.enableReprompt()
-        XCTAssertTrue(try fixture.begin(text: "Original"))
+        XCTAssertTrue(try fixture.begin(text: AgentRepromptServiceTests.valid))
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
         try await AsyncTestWait.waitUntil("prepared draft", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
         let operationID = try XCTUnwrap(fixture.viewModel.repromptOperation?.id)
         let staged = try XCTUnwrap(fixture.viewModel.repromptSpeculations[operationID])
         _ = await staged.routingTask?.value
+        let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+        let generation = operation.expectedDraftGeneration
+        operation.useCurrentDraft(fixture.session.draftText) // The same entry point as composer Return.
+        XCTAssertEqual(operation.expectedDraftGeneration, generation)
+        XCTAssertFalse(operation.usedOriginal, "An unchanged rewrite must not become an explicit send-original audit")
+        XCTAssertTrue(fixture.viewModel.repromptSpeculations[operationID] === staged)
         let claim = try fixture.claim(text: fixture.session.draftText, local: true)
         defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
         XCTAssertNil(fixture.viewModel.repromptOperation)
@@ -246,12 +286,18 @@ actor AgentRepromptDecisionBackend: DecisionService {
         evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
     )
     private(set) var requests: [FiniteChoiceDecisionRequest] = []
+    private var gate: AgentRepromptStartGate?
+    func setGate(_ gate: AgentRepromptStartGate) {
+        self.gate = gate
+    }
+
     func readinessSnapshot() -> DecisionReadiness {
         .ready(generation: 1, policyVersion: "test")
     }
 
-    func decide(_ request: FiniteChoiceDecisionRequest) -> DecisionOutcome {
+    func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
         requests.append(request)
+        if let gate { _ = await gate.wait() }
         return .selected(opaqueKey: request.question.choices.last!.opaqueKey, evidence: nil)
     }
 }

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "title": "Browse existing Tip builds and save verified apps",
+  "notes": [
+    "Browse existing Tip releases immediately when no signed catalog has been published; release and commit metadata are clearly labeled.",
+    "Downloads are fully verified before saving. Older releases require separate backup and unknown-data-format acknowledgements.",
+    "Official identity boundaries stay enforced; Debug and unknown-identity apps can save official binaries for inspection, not replace themselves."
+  ],
+  "breaksDowngrade": false
+}

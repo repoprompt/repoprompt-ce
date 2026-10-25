@@ -203,12 +203,14 @@ extension AgentModeViewModel {
                     )
                 }
             #endif
-            let report = await promptManager.deleteComposeAndStashedTabs(
-                composeTabIDs: targets.activeDeleteTabIDs,
-                archivedTargets: targets.archivedDeleteTargets,
-                isMutationContextCurrent: contextIsCurrent,
-                onProjectionRemovalCommitted: onProjectionRemovalCommitted
-            )
+            let report = await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.userUI) {
+                await promptManager.deleteComposeAndStashedTabs(
+                    composeTabIDs: targets.activeDeleteTabIDs,
+                    archivedTargets: targets.archivedDeleteTargets,
+                    isMutationContextCurrent: contextIsCurrent,
+                    onProjectionRemovalCommitted: onProjectionRemovalCommitted
+                )
+            }
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         // Pin/unpin/stash share one mutation path with `session_admin` (design §3.4); delete stays
         // human-only and keeps its own path above.

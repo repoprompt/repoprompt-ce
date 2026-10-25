@@ -1446,36 +1446,141 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await MCPRoutingWaiter.shared.cleanup(runID: runID)
     }
 
-    func testOversizedResumeResponseFallsBackToFreshThreadOnFirstFailure() async throws {
+    func testOversizedResumeStopsWithoutReplacingTheConversation() async throws {
         let fixture = makeFixture([
             [.oversizedResume],
-            [.success("fresh-after-oversized-resume")]
+            [.success("unexpected-replacement")]
         ])
-        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
-        defer { startup.cancel() }
-        try await waitForPendingStart(fixture)
+        var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
+        var notifications: [String?] = []
+        fixture.session.appendItem(.user("continue the current task"))
+        fixture.coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(), terminalSessionBinder: { owned in
+            AgentRunTerminalSessionBinding(
+                tabID: owned.tabID, lifecycle: owned.runLifecycle,
+                hooks: .init(
+                    flushPendingAssistantDelta: {}, finalizeStreamingItems: {}, finalizePendingToolCalls: { _ in },
+                    finalizeNonCodexTurnUsage: {}, cancelPendingInteractions: { _ in }, finalizeAttachments: { _, _ in },
+                    setAgentRunInactive: {}, prepareTerminalPublication: {},
+                    makeTerminalPublicationEnvelope: { _, _, _, _ in nil }, updateBindings: {},
+                    notifyAgentTurnComplete: {}, notifyAgentTurnFailed: { notifications.append($0) }, scheduleSave: {},
+                    publishTerminalCommit: { revision, _ in
+                        reasons.append(revision.failureReason)
+                        return .accepted(successorEpoch: nil)
+                    }, startFollowUpRun: { _ in }
+                ),
+                validatesOwnership: { owned.isCurrentRunAttemptForCurrentBinding($0, expectedRunID: $1) },
+                providerDrainGeneration: { owned.providerTerminalDrainGeneration },
+                terminalTurnID: { owned.items.last(where: { $0.kind == .user })?.id },
+                queuedFollowUp: { nil }, setFollowUpPending: { _ in }, removeFirstQueuedFollowUp: { nil },
+                appendError: { owned.appendItem(.error($0, sequenceIndex: owned.nextSequenceIndex)) },
+                finishActiveState: { ownership, state, source in
+                    owned.runState = state
+                    _ = owned.endRunAttempt(ifCurrent: ownership, source: source)
+                }, retainProcessRunIdentity: { _, _ in }, sourceItemsRevision: { owned.sourceItemsRevision },
+                assistantDeltaFlushGeneration: { owned.assistantDeltaFlushGeneration },
+                latestFailureText: { AgentTranscriptIO.latestErrorText(from: owned.transcript, latestTurnOnly: true) }
+            )
+        })
+        let send = Task {
+            await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session,
+                text: "continue the current task",
+                attachments: []
+            )
+        }
+        defer { send.cancel() }
+        guard case let .failed(failureText) = await send.value else {
+            return XCTFail("An oversized resume must reject the send without dispatch")
+        }
 
-        XCTAssertEqual(fixture.factory.controllers.count, 2, "an oversized resume must retire the poisoned controller")
-        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
-        XCTAssertEqual(fixture.factory.controllers[0].shutdownCount, 1)
-        XCTAssertEqual(fixture.factory.controllers[1].receivedExistingIDs, [nil])
-        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0, "a frame overflow is not a timeout")
         assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.factory.controllers.count, 1, "overflow must not create a taskless replacement")
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        try await AsyncTestWait.waitUntil("oversized-resume controller retired", timeout: 4) {
+            fixture.factory.controllers[0].shutdownCount == 1
+        }
+        XCTAssertTrue(fixture.session.codexNeedsReconnect)
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0)
+        XCTAssertFalse(fixture.coordinator.test_hasPendingCodexStart(for: fixture.session))
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+        let notice = try XCTUnwrap(fixture.session.items.first { $0.text.contains("No new thread was started") })
+        XCTAssertEqual(failureText, notice.text)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .error }), 1)
+        XCTAssertEqual(notifications, [notice.text])
+        XCTAssertEqual(reasons, [.resumeHistoryTooLarge])
+        XCTAssertTrue(notice.text.contains("Handoff to New Chat"))
+        XCTAssertFalse(notice.text.contains("Retry"))
+        XCTAssertEqual(notice.recoveryDiagnostic?.reason, AgentTranscriptRecoveryDiagnostic.resumeFrameTooLargeReason)
+        XCTAssertEqual(notice.recoveryDiagnostic?.outcome, AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome)
+        XCTAssertEqual(notice.recoveryDiagnostic?.previousConversationID, Self.oldThreadID)
+        XCTAssertNil(notice.recoveryDiagnostic?.replacementConversationID)
 
-        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
-        await startup.value
-
-        XCTAssertEqual(fixture.session.codexConversationID, "fresh-after-oversized-resume")
-        XCTAssertEqual(fixture.session.providerCleanupHandle?.conversationID, "fresh-after-oversized-resume")
-        XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumeFellBackToFresh)
-        XCTAssertFalse(fixture.session.codexNeedsReconnect)
-        XCTAssertEqual(
-            fixture.session.items.count(where: { $0.text.contains("history was too large to load. Started a fresh thread") }),
-            1
+        var transcript = AgentTranscriptIO.importLegacyItems(
+            [.user("continue the current task"), notice],
+            terminalState: .completed
         )
-        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("after repeated timeout") })
-        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("frame budget") }, "the overflow must not surface as a send failure")
+        transcript.turns[0].retentionTier = .summary
+        let compacted = AgentTranscriptCompactor.compact(transcript)
+        let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(compacted))
+        let projection = AgentTranscriptProjectionBuilder.build(from: restored)
+        let retainedNotices = (projection.workingRows + projection.archivedRows).filter { $0.id == notice.id }
+        XCTAssertEqual(retainedNotices.count, 1)
+        XCTAssertEqual(retainedNotices.first?.text, notice.text)
+        XCTAssertEqual(retainedNotices.first?.kind, .error)
+        XCTAssertEqual(retainedNotices.first?.recoveryDiagnostic?.outcome, AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome)
+        XCTAssertEqual(AgentTranscriptIO.latestErrorText(from: restored, latestTurnOnly: true), notice.text)
+
+        fixture.session.runState = .running
+        fixture.session.beginRunAttempt(source: "repeat-oversized-send")
+        fixture.session.appendItem(.user("continue again", sequenceIndex: fixture.session.nextSequenceIndex))
+        guard case let .failed(repeatedText) = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session, text: "continue again", attachments: []
+        ) else { return XCTFail("The blocked pair must reject repeat sends") }
+        XCTAssertEqual(repeatedText, notice.text)
+        XCTAssertEqual(fixture.factory.controllers.count, 1, "a known oversized pair must not launch another app-server")
+        XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .error }), 2)
+        XCTAssertEqual(fixture.session.transcript.turns.last?.allActivities.count(where: { $0.itemKind == .error }), 1)
+        XCTAssertEqual(AgentTranscriptIO.latestErrorText(from: fixture.session.transcript, latestTurnOnly: true), notice.text)
+        XCTAssertEqual(notifications, [notice.text, notice.text])
+        XCTAssertEqual(reasons, [.resumeHistoryTooLarge, .resumeHistoryTooLarge])
+    }
+
+    func testOversizedResumeCompactAndRecoveryStopWithoutAutomaticFallback() async {
+        for recovering in [false, true] {
+            let fixture = makeFixture([[.oversizedResume], [.success(Self.oldThreadID)]], shouldManageCodexTooling: false)
+            if recovering {
+                _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: fixture.session)
+                let failed = await fixture.coordinator.test_attemptCodexStreamRecovery(session: fixture.session)
+                XCTAssertTrue(failed)
+            } else {
+                fixture.session.runState = .idle
+                let result = await fixture.coordinator.executeNativeSlashCommand(.compact, argumentsText: "", session: fixture.session)
+                guard case let .failed(message) = result else { return XCTFail("Oversized /compact must fail") }
+                XCTAssertTrue(message.contains("Handoff to New Chat"))
+            }
+            assertOldTuple(fixture.session)
+            XCTAssertEqual(fixture.factory.controllers.count, 1)
+            XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+            XCTAssertEqual(fixture.factory.controllers[0].compactCount, 0)
+            let errors = fixture.session.items.filter { $0.kind == .error }
+            XCTAssertEqual(errors.count, 1)
+            XCTAssertEqual(errors.first?.recoveryDiagnostic?.outcome, AgentTranscriptRecoveryDiagnostic.resumeStoppedOutcome)
+            if recovering {
+                let failed = await fixture.coordinator.test_attemptCodexStreamRecovery(session: fixture.session)
+                XCTAssertTrue(failed)
+            } else {
+                _ = await fixture.coordinator.executeNativeSlashCommand(.compact, argumentsText: "", session: fixture.session)
+            }
+            XCTAssertEqual(fixture.factory.controllers.count, 1, "repeat control/recovery must skip the blocked pair")
+            XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .error }), 1)
+
+            fixture.session.codexRolloutPath = "/tmp/changed-rollout.jsonl"
+            await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+            XCTAssertEqual(fixture.factory.controllers.count, 2, "a changed rollout must not inherit the old pair's block")
+            XCTAssertEqual(fixture.factory.controllers[1].receivedExistingIDs, [Self.oldThreadID])
+            XCTAssertNil(fixture.session.codexOversizedResumeTarget)
+        }
     }
 
     func testSettledOldLeaseCannotRevokeSameRunSuccessor() async {

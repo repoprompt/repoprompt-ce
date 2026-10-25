@@ -30,7 +30,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private lazy var terminationSignalRouter = AppTerminationSignalRouter(
         observer: DispatchTerminationSignalObserver()
     ) {
-        NSApp.terminate(nil)
+        // terminate: with .terminateLater spins a nested run loop. Run from a main-queue
+        // callout it would hold the main queue, so the @MainActor work that replies never runs.
+        RunLoop.main.perform(inModes: [.common]) {
+            NSApp.terminate(nil)
+        }
     }
 
     /// App startup owns one explicit registration attempt; readiness only observes it.
@@ -48,6 +52,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // MARK: - Global references
 
     let sparkleManager: SparkleUpdaterManager
+    let tipHistoryStore: TipHistoryStore
+    private let tipHistoryStagingRegistry: TipHistoryStagingRegistry
+    private var tipHistoryNoticeController: TipHistoryDownloadNoticeController?
+    private var tipHistoryCleanupTask: Task<Void, Never>?
     private let sparkleFeedDelegate: SparkleUpdateFeedDelegate
     private let sparkleVersionDisplay: SparkleVersionDisplay
 
@@ -80,6 +88,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         )
         sparkleManager = SparkleUpdaterManager(updaterController: updaterController)
         SparkleUpdaterManager.shared = sparkleManager
+        let registry = TipHistoryStagingRegistry()
+        tipHistoryStagingRegistry = registry
+        tipHistoryStore = TipHistoryStore(manager: sparkleManager, registry: registry)
+        sparkleManager.tipHistoryStore = tipHistoryStore
 
         // super.init
         super.init()
@@ -151,6 +163,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         signal(SIGPIPE, SIG_IGN)
 
         AppearanceController.shared.applyFromGlobalSettings()
+        if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
+            tipHistoryNoticeController = TipHistoryDownloadNoticeController(store: tipHistoryStore)
+            // Registry-only deferred cleanup. Never enumerate user destinations
+            // or fetch history merely because the application launched.
+            tipHistoryCleanupTask = Task.detached(priority: .utility) { [registry = tipHistoryStagingRegistry] in
+                await registry.removeStaleStaging()
+            }
+        }
 
         // ───────────────────────────────────────────────────
         // Start the runtime and publish both application-scoped MCP services before
@@ -245,6 +265,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
             // so child processes are terminated and reaped rather than orphaned on quit.
+            await tipHistoryStore.shutdown()
+            tipHistoryCleanupTask?.cancel()
+            await tipHistoryCleanupTask?.value
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
             await shutdownDomainRuntimeForTermination()

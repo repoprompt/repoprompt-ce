@@ -16,6 +16,8 @@ struct AgentContextUsage: Codable, Equatable {
     var modelContextWindow: Int?
     var lastTotalTokens: Int?
     var totalTotalTokens: Int?
+    /// Optional for backward-compatible decoding of older usage snapshots; nil means not pending.
+    var awaitingPostCompactionUsage: Bool? = nil
 }
 
 // MARK: - Agent Mode View Model
@@ -685,6 +687,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only exact route-token seam for synthetic catalog publications.
         var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
             ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        /// Test-only bounded route-token wait seam (run, window, tab, timeout seconds); mirrors the
+        /// immediate seam above for `ProviderInputRouteWait`. Must honor the timeout. When only the
+        /// immediate seam is installed, waits re-check it until it yields a token or time runs out.
+        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken:
+            ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
@@ -900,6 +907,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
     private var saveCompletionWaitersBySessionID: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var workspaceSaveFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var bypassesAgentSessionPersistenceSuppressionForTesting = false
     private var agentSessionSaver: AgentSessionSaver = { session, workspace, canonicalItemCount in
         try await AgentSessionDataService.shared.saveAgentSession(
@@ -1106,6 +1114,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_setAgentSessionSaver(_ saver: @escaping AgentSessionSaver) {
             bypassesAgentSessionPersistenceSuppressionForTesting = true
             agentSessionSaver = saver
+        }
+
+        var test_beforeSessionPersistenceDrainWait: (@MainActor () -> Void)?
+
+        func test_drainSessionPersistenceAfterWindowClose() async {
+            precondition(hasPreparedForWindowClose)
+            while true {
+                let debounces = sessions.values.compactMap { session -> Task<Void, Never>? in
+                    let task = session.saveDebounceTask
+                    session.saveDebounceTask = nil
+                    task?.cancel()
+                    return task
+                }
+                let flushes = Array(workspaceSaveFlushTasks.values)
+                let inFlightIDs = Array(saveInFlightSessionIDs)
+                guard !debounces.isEmpty || !flushes.isEmpty || !inFlightIDs.isEmpty else { return }
+                test_beforeSessionPersistenceDrainWait?()
+                for task in debounces + flushes {
+                    await task.value
+                }
+                for sessionID in inFlightIDs {
+                    await waitForInFlightSave(sessionID: sessionID)
+                }
+            }
         }
 
         func test_setAgentSessionLinkInheritanceHandler(
@@ -1441,7 +1473,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
-            makeSaveCommitToken(for: session, workspaceID: workspaceID)
+            guard let workspace = workspaceManager?.workspace(withID: workspaceID) else { return nil }
+            return makeSaveCommitToken(for: session, workspace: workspace)
         }
 
         func test_isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken) -> Bool {
@@ -2451,9 +2484,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
                 guard let self else { return .unavailable }
-                return await qualifyProviderInputRoute(for: session)
+                return await qualifyProviderInputRoute(for: session, routeWait: routeWait)
             },
             hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
@@ -2510,6 +2543,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        usesProductionAgentDefaultsAndModelPolling: Bool = true,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -2612,7 +2646,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
-        usesProductionAgentDefaultsAndModelPolling = true
+        self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
@@ -2701,7 +2735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshAvailableAgents()
 
         // Restore last-used agent and model so new sessions default to the user's previous choice.
-        restoreLastUsedAgentSelectionIfNeeded()
+        if usesProductionAgentDefaultsAndModelPolling {
+            restoreLastUsedAgentSelectionIfNeeded()
+        }
 
         setupObservers()
         modelRouterRuntime?.objectWillChange
@@ -2976,6 +3012,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     lazy var acpContextUsageEstimator = ACPContextUsageEstimator()
 
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
+        let sourceTabID = currentTabID
+        let sourceSession = activeSession
+        let sourceControllerID = sourceSession?.claudeController.map(ObjectIdentifier.init)
         let slashSession: TabSession? = {
             if let activeSession {
                 return activeSession
@@ -2995,19 +3034,53 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let skillQuery = isExplicitSkillNamespaceQuery
             ? String(query.dropFirst("skill:".count))
             : query
-        let nativeSuggestions = isExplicitSkillNamespaceQuery ? [] : (slashSession.map {
+        let agentKind = slashSession?.selectedAgent ?? selectedAgent
+        func requestIsCurrent() -> Bool {
+            currentTabID == sourceTabID
+                && activeSession === sourceSession
+                && (activeSession?.selectedAgent ?? selectedAgent) == agentKind
+                && sourceSession?.claudeController.map(ObjectIdentifier.init) == sourceControllerID
+        }
+        var nativeSuggestions = isExplicitSkillNamespaceQuery ? [] : (slashSession.map {
             codexCoordinator.nativeSlashCommandSuggestions(
                 for: $0,
                 query: query,
                 limit: Self.slashSkillSuggestionLimit
             )
         } ?? [])
-        let nativeNames: Set<String> = slashSession?.selectedAgent == .codexExec
-            ? Set(CodexAgentModeCoordinator.NativeSlashCommand.allCases.map { $0.rawValue.lowercased() })
-            : []
-        await refreshSkillCatalog(force: false)
+        if agentKind == .claudeCode, !isExplicitSkillNamespaceQuery {
+            let commands = await slashSession?.claudeController?.availableSlashCommands() ?? []
+            guard requestIsCurrent() else { return [] }
+            let canCompact: Bool = if let slashSession {
+                await agentSessionLinkCompactSupport(for: slashSession) == .claudeCode
+            } else {
+                false
+            }
+            nativeSuggestions = Self.claudeSlashCommandSuggestions(for: query, runtimeCommands: commands, canCompact: canCompact)
+        }
+        let nativeNames: Set<String> = switch agentKind {
+        case .codexExec where slashSession != nil:
+            Set(CodexAgentModeCoordinator.NativeSlashCommand.allCases.map { $0.rawValue.lowercased() })
+        case .claudeCode:
+            [AgentProviderControlCommand.Kind.compact.rawValue]
+        default:
+            []
+        }
+        guard requestIsCurrent() else { return [] }
+        let nativeCommandOwner = agentKind == .claudeCode ? "Claude Code" : "Codex"
+        await refreshSkillCatalog(force: false, agentKind: agentKind)
+        guard requestIsCurrent() else { return [] }
+        // Preserve local-skill precedence for non-compact collisions, even an advertised
+        // built-in such as /context. The local row describes what expansion will execute.
+        // /compact is the reserved exception, with its skill available as /skill:compact.
+        nativeSuggestions.removeAll {
+            !nativeNames.contains($0.relativePath.lowercased()) && skillCatalog.contains(name: $0.relativePath)
+        }
+        let skillLimit = agentKind == .claudeCode
+            ? Self.slashSkillSuggestionLimit
+            : max(0, Self.slashSkillSuggestionLimit - nativeSuggestions.count)
         let skillSuggestions = skillCatalog.suggestions(prefix: skillQuery, limit: Self.slashSkillSuggestionLimit)
-            .prefix(max(0, Self.slashSkillSuggestionLimit - nativeSuggestions.count))
+            .prefix(skillLimit)
             .map { suggestion in
                 let description = suggestion.description?.trimmingCharacters(in: .whitespacesAndNewlines)
                 let baseSubtitle = (description?.isEmpty == false) ? description : nil
@@ -3015,7 +3088,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let relativePath = collidesWithNativeCommand ? "skill:\(suggestion.name)" : suggestion.name
                 let displayName = collidesWithNativeCommand ? "/skill:\(suggestion.name)" : "/\(suggestion.name)"
                 let subtitle = collidesWithNativeCommand
-                    ? ["Slash skill — use /skill:\(suggestion.name) to bypass Codex native /\(suggestion.name)", baseSubtitle]
+                    ? ["Slash skill — use /skill:\(suggestion.name) to bypass \(nativeCommandOwner) native /\(suggestion.name)", baseSubtitle]
                     .compactMap(\.self)
                     .joined(separator: " — ")
                     : baseSubtitle
@@ -3026,7 +3099,78 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     subtitle: subtitle
                 )
             }
-        return nativeSuggestions + skillSuggestions
+        return agentKind == .claudeCode
+            ? Self.mergeClaudeSlashSuggestions(native: nativeSuggestions, skills: skillSuggestions, query: query)
+            : nativeSuggestions + skillSuggestions
+    }
+
+    /// Use advertised headless commands, not the interactive terminal's command catalog.
+    /// A stored provider conversation permits /compact even without a live runtime.
+    static func claudeSlashCommandSuggestions(
+        for query: String,
+        runtimeCommands: [NativeAgentRuntimeSlashCommand],
+        canCompact: Bool
+    ) -> [MentionSuggestion] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let compact = NativeAgentRuntimeSlashCommand(
+            name: AgentProviderControlCommand.Kind.compact.rawValue,
+            description: "Compact Claude Code conversation context",
+            argumentHint: "",
+            builtin: true
+        )
+        // Honor the runtime's builtin marker when multiple rows share a name. Prefer
+        // runtime metadata over the compact fallback so argument hints are not lost.
+        let commands = runtimeCommands.filter(\.builtin) + runtimeCommands + (canCompact ? [compact] : [])
+        let exactCommands = commands.filter {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedQuery
+        }
+        let compactCommands = commands.filter { $0.name.lowercased() == compact.name }
+        var seen: Set<String> = []
+        return (exactCommands + compactCommands + commands).compactMap { command -> MentionSuggestion? in
+            let name = command.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedName = name.lowercased()
+            guard !name.isEmpty, normalizedName.hasPrefix(normalizedQuery),
+                  normalizedName != compact.name || canCompact,
+                  seen.insert(normalizedName).inserted
+            else { return nil }
+            let subtitle = [command.description, command.argumentHint]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " — ")
+            return MentionSuggestion(
+                displayName: "/\(name)",
+                relativePath: name,
+                kind: .skill,
+                subtitle: subtitle.isEmpty ? nil : subtitle,
+                submitsOnExactEnter: (command.builtin || normalizedName == compact.name)
+                    && command.argumentHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+        }
+        // Apply the cap only after merging with local skills.
+    }
+
+    static func mergeClaudeSlashSuggestions(
+        native: [MentionSuggestion],
+        skills: [MentionSuggestion],
+        query: String
+    ) -> [MentionSuggestion] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var seen: Set<String> = []
+        var merged: [MentionSuggestion] = []
+        func append(_ suggestion: MentionSuggestion) {
+            if seen.insert(suggestion.relativePath.lowercased()).inserted {
+                merged.append(suggestion)
+            }
+        }
+        // Exact matches stay first; interleaving then guarantees skills a share of the menu.
+        for suggestion in native + skills where suggestion.relativePath.lowercased() == normalizedQuery {
+            append(suggestion)
+        }
+        for index in 0 ..< max(native.count, skills.count) {
+            if native.indices.contains(index) { append(native[index]) }
+            if skills.indices.contains(index) { append(skills[index]) }
+        }
+        return Array(merged.prefix(Self.slashSkillSuggestionLimit))
     }
 
     func effectiveWorkspacePath(for session: TabSession) throws -> String? {
@@ -3331,6 +3475,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isCurrentSessionBinding: { [weak self] session, fence in
                     self?.sessions[session.tabID] === session
                         && session.persistentSessionBindingIdentity == fence.binding
+                },
+                restoreRouteRefusedUnsentTurn: { [weak self] session, userItemID, message in
+                    _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
                 }
             ),
             persistence: .init(
@@ -3393,7 +3540,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
-                    await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
+                    _ = await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
                 },
                 prependPendingHandoffIfNeeded: { [weak self] text, session in
                     self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
@@ -4851,7 +4998,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
-        if session.runState.isActive {
+        if workspaceManager?.isSessionRuntimeProjection == true {
+            // Private retirement releases supporting infrastructure next. Join existing owned
+            // teardown, but never manufacture an attempt for idle or restored revisionless state.
+            if session.runState.isActive || (session.runState.isTerminalForCommit && session.lastTerminalCommitRevision != nil) {
+                await cancelAgentRun(tabID: session.tabID, completion: .terminalTeardownCompleted, origin: .internalLifecycle)
+            }
+        } else if session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
         }
         await cleanupACPStateForDeletedSession(session)
@@ -6724,7 +6877,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Publishes the current local projection for a retained cancelled-drift scope, without latching
     /// completion, recording proof or marking the binding hydrated. Revalidates synchronously right
-    /// before publication.
+    /// before publication. Returns whether this scope owns the local projection, including a no-op
+    /// publication, so ordinary refreshes never replace its unchanged content with a loading frame.
     @discardableResult
     private func publishRetainedLocalProjection(_ session: TabSession) -> Bool {
         guard session.tabID == currentTabID,
@@ -6732,7 +6886,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         else { return false }
         guard retainsCancelledLocalDrift(session) else { return false }
-        return publishTranscriptPresentation(from: session)
+        _ = publishTranscriptPresentation(from: session)
+        return true
     }
 
     /// Cancelled current attempt whose source changed: project current local items without latching
@@ -7333,7 +7488,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
-            if session.codexContextUsage?.lastTotalTokens == nil {
+            session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp
+            if session.codexContextUsage?.lastTotalTokens == nil || session.contextCompactedAt != nil {
                 session.codexContextUsage = Self.contextUsageFromClaudeProviderTokens(
                     session.providerTokenUsageByTurn,
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
@@ -9044,7 +9200,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         throw MCPError.invalidParams(
-            "Sub-agents cannot start additional agent runs. Only top-level MCP-started agent sessions may spawn sub-agents; non-explore sub-agents may start read-only explore children with agent_explore."
+            "Sub-agents cannot start additional agent runs. Only top-level MCP-started agent sessions may spawn sub-agents; sub-agents with an engineer, pair, or design task role may start read-only explore children with agent_explore."
         )
     }
 
@@ -9373,6 +9529,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // than binding fields: this is the single mutation point for a session's worktree binding.
         let previousLocation = agentSessionLinkLocationProjection(forTabID: session.tabID)
         session.worktreeBindings = bindings
+        publishWorktreeBindingChange(to: session, from: previousLocation)
+        return previous
+    }
+
+    private func publishWorktreeBindingChange(
+        to session: TabSession,
+        from previousLocation: AgentSessionLinkLocationProjection?
+    ) {
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
         syncComposerUIState(tabID: session.tabID)
@@ -9380,7 +9544,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         syncStatusPillsUIState()
         scheduleSave(for: session.tabID)
         notifyAgentSessionLinkLocationChange(forTabID: session.tabID, from: previousLocation)
-        return previous
     }
 
     private enum ExecutionLocationTransitionError: LocalizedError {
@@ -9505,6 +9668,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
         beforeCommit: (@MainActor () async throws -> Void)? = nil,
+        revalidateAuthority: (@MainActor () async throws -> Void)? = nil,
+        commitAuthority: (@MainActor (@MainActor () throws -> Void) throws -> Void)? = nil,
         afterCommit: (@MainActor () -> Void)? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
@@ -9596,11 +9761,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var ownershipCommitted = preparation == nil
         var providerContextInvalidated = false
         var bindingsPublished = false
+        // Rollback owns only a handoff staged by this transition, never a send's or
+        // cancellation's changes to a pre-existing handoff.
+        var handoffRollback: (previous: PendingHandoffState, staged: PendingHandoffState)?
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == changedDuringActiveRun
+                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
             else {
                 throw ExecutionLocationTransitionError.stale
             }
@@ -9619,13 +9787,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Provisional root preparation is abortable. Only now may the caller mark the
             // protected mutation committed and persist visual identity; ordinary rejection
             // above must remain a pre-commit, actionable error.
+            try await revalidateAuthority?()
             try await beforeCommit?()
+            try await revalidateAuthority?()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == changedDuringActiveRun
+                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
             else { throw ExecutionLocationTransitionError.stale }
             if executionRootsChanged, case .externalManagement = intent {
                 try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
@@ -9656,8 +9826,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     throw ExecutionLocationTransitionError.stale
                 }
                 if !changedDuringActiveRun {
-                    await stageResumeRecoveryHandoffIfNeeded(for: session)
+                    try commitAuthority? {}
+                    let previousHandoff = session.pendingHandoff
+                    if let stagedHandoff = await stageResumeRecoveryHandoffIfNeeded(for: session) {
+                        handoffRollback = (previousHandoff, stagedHandoff)
+                    }
+                    try await revalidateAuthority?()
                 }
+                try commitAuthority? {}
                 providerContextInvalidated = true
                 await invalidateProviderContextForExecutionLocationChange(session)
                 guard sessions[session.tabID] === session,
@@ -9669,16 +9845,38 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
 
-            // Native teardown and handoff may await. A path reused for a different Git
-            // identity must not become the newly published execution authority.
+            // Native teardown and handoff may await. Neither a revoked grant nor a path reused
+            // for a different Git identity may become the new execution authority.
+            try await revalidateAuthority?()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
-            _ = commitWorktreeBindings(desiredBindings, to: session)
+            // Root ownership installation also suspends. This is the final authority fence;
+            // there is no await between its return and publishing the binding.
+            try await revalidateAuthority?()
+            try Task.checkCancellation()
+            guard sessions[session.tabID] === session,
+                  session.activeAgentSessionID == sessionID,
+                  session.worktreeBindings == previousBindings,
+                  !executionRootsChanged || !session.runState.isActive
+            else { throw ExecutionLocationTransitionError.stale }
+            let previousLocation = agentSessionLinkLocationProjection(forTabID: session.tabID)
+            let publish: @MainActor () throws -> Void = {
+                // Authorization itself may have suspended since the last availability check.
+                try Task.checkCancellation()
+                try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
+                session.worktreeBindings = desiredBindings
+            }
+            if let commitAuthority {
+                try commitAuthority(publish)
+            } else {
+                try publish()
+            }
             bindingsPublished = true
+            publishWorktreeBindingChange(to: session, from: previousLocation)
             // Delegated ownership follows the actual in-memory publication even when its required
             // disk flush later fails. No callback runs for a rejected provisional transition.
             afterCommit?()
@@ -9698,8 +9896,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return session.worktreeBindings
         } catch {
+            if !providerContextInvalidated, let handoffRollback,
+               session.pendingHandoff == handoffRollback.staged
+            {
+                session.pendingHandoff = handoffRollback.previous
+                session.isDirty = true
+                if let workspaceID = workspaceManager?.activeWorkspace?.id {
+                    _ = await Task { @MainActor in
+                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
+                    }.value
+                }
+                scheduleSave(for: session)
+            }
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
+            } else if executionRootsChanged, ownershipCommitted, !bindingsPublished, let materializer, let preparation,
+                      !preparation.ownership.reusesInstalledOwnership,
+                      sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings
+            {
+                // A refused post-install publication must not leave the unbound destination
+                // installed as session-owned roots. The old binding rematerializes on demand.
+                await materializer.release(ifOwnedBy: preparation.ownership.token)
             }
             if providerContextInvalidated, !bindingsPublished,
                sessions[session.tabID] === session,
@@ -9722,9 +9941,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 if case let .failure(failure) = recoverySave {
                     scheduleSave(for: session)
+                    if error is SessionAdminHostError { throw error }
                     throw ExecutionLocationTransitionError.unavailable("\(message) Recovery persistence failed: \(failure.message). Inspect the session before retrying.")
                 }
+                if error is SessionAdminHostError { throw error }
                 throw ExecutionLocationTransitionError.unavailable(message)
+            }
+            if !providerContextInvalidated, !bindingsPublished, MCPDomainMutationCommitContext.controller != nil, error is MCPError {
+                throw DomainMutationRefusedBeforeEffects(error)
             }
             throw error
         }
@@ -10917,10 +11141,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        let timing = workspaceManager.makeAgentAdmissionTiming()
         return try await workspaceManager.withAgentSessionAdmission(
             workspaceID: owningWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            kind: .existingTab,
+            classifyError: { $0 is MCPError ? .rejected : .threw },
+            timing: timing
         ) {
             let admissionWorkspace = workspaceManager.workspaces.first { $0.id == expectedWorkspaceID }
             let hasUnboundTargetTab: Bool = admissionWorkspace?.composeTabs.contains {
@@ -10965,11 +11193,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
 
             try Task.checkCancellation()
+            timing.begin(.save)
+            timing.recordSaveAttempt()
             let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: expectedWorkspaceID,
                 source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission"),
                 allowRetainedAgentAdmissionRecoveryRetry: false
             )
+            timing.end()
             #if DEBUG
                 await test_afterProvisionalExistingTabBindingInstalled?()
             #endif
@@ -11822,7 +12053,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             return try await workspaceManager.withAgentSessionAdmission(
                 workspaceID: identity.workspaceID,
-                admissionID: identity.recoveryID
+                admissionID: identity.recoveryID,
+                kind: .discard,
+                classifyOutcome: { (result: MCPSessionTargetDiscardResult) in
+                    result == .complete ? .committed : .rejected
+                }
             ) {
                 switch claim.state {
                 case .accepted, .complete:
@@ -12206,7 +12441,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if bindingOnlyMCPSessionTargetRecoveryIDs.contains(recoveryID) {
             do {
-                try await agentSessionDeleter(sessionID, workspace)
+                try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+                    try await agentSessionDeleter(sessionID, workspace)
+                }
             } catch {
                 return .retainedForRetry
             }
@@ -12221,7 +12458,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .complete
             }
         } else if target.origin == .createdNewTab {
-            let failures = await agentSessionsBatchDeleter([target.tabID], workspace)
+            let failures = await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+                await agentSessionsBatchDeleter([target.tabID], workspace)
+            }
             guard failures[target.tabID] == nil else { return .retainedForRetry }
             guard pendingMCPSessionTargetDiscardIsCurrent(
                 recoveryID: recoveryID,
@@ -12313,7 +12552,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessions.removeValue(forKey: target.tabID)
         tabsWithActiveAgentRun.remove(target.tabID)
         mcpControlledTabIDs.remove(target.tabID)
-        await promptManager?.closeComposeTab(target.tabID)
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.automaticDiscard) {
+            await promptManager?.closeComposeTab(target.tabID)
+        }
     }
 
     func mcpDeactivateControlContext(
@@ -13775,7 +14016,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func applySessionToBindings(_ session: TabSession) {
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            if session.tabID == currentTabID {
+            if session.tabID == currentTabID, !publishRetainedLocalProjection(session) {
                 publishLoadingTranscriptPresentation(tabID: session.tabID)
             }
             return
@@ -14309,7 +14550,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            publishLoadingTranscriptPresentation(tabID: session.tabID)
+            if !publishRetainedLocalProjection(session) {
+                publishLoadingTranscriptPresentation(tabID: session.tabID)
+            }
             return
         }
 
@@ -17250,7 +17493,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func makeSaveCommitToken(
         for session: TabSession,
-        workspaceID: UUID
+        workspace: WorkspaceModel
     ) -> SessionSaveCommitToken? {
         guard let binding = session.persistentSessionBindingIdentity,
               binding.sessionID == session.activeAgentSessionID,
@@ -17261,7 +17504,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return SessionSaveCommitToken(
             tabID: session.tabID,
             sessionIdentity: ObjectIdentifier(session),
-            workspaceID: workspaceID,
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: sessionSaveWorkspaceDirectoryPath(for: workspace),
             binding: binding,
             bindingTransitionGeneration: session.bindingTransitionGeneration,
             sourceItemsRevision: session.sourceItemsRevision,
@@ -17270,15 +17514,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func sessionSaveWorkspaceDirectoryPath(for workspace: WorkspaceModel) -> String {
+        WorkspaceSessionSidecarMigration.workspaceDirectory(
+            for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+        ).standardizedFileURL.path
+    }
+
     private func isSaveCommitTokenCurrent(
         _ token: SessionSaveCommitToken,
         requireWorkspaceMatch: Bool = true,
         creationHandle: AgentSessionCreationHandle? = nil
     ) -> Bool {
-        if requireWorkspaceMatch,
-           workspaceManager?.activeWorkspace?.id != token.workspaceID
-        {
-            return false
+        if requireWorkspaceMatch {
+            // A storage move can preserve every session/binding identity. The completed write
+            // only acknowledges the placement captured from the workspace passed to its saver.
+            guard let workspace = workspaceManager?.activeWorkspace,
+                  workspace.id == token.workspaceID,
+                  sessionSaveWorkspaceDirectoryPath(for: workspace) == token.workspaceDirectoryPath
+            else { return false }
         }
         guard let session = sessions[token.tabID],
               ObjectIdentifier(session) == token.sessionIdentity,
@@ -17546,7 +17799,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary
             )
             if repairedCount > 0 {
-                session.setItemsSilently(workingItemsSnapshot, reason: .pendingToolFinalizationRepair)
+                session.setItemsSilentlyForPendingToolFinalizationRepair(workingItemsSnapshot)
                 session.isDirty = true
                 refreshDerivedTranscriptState(for: session, reason: .saveSession)
                 #if DEBUG
@@ -17658,7 +17911,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if shouldReconcileWorkingItems {
                 let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
                 if trimmedWorkingItems != session.items {
-                    session.setItemsSilently(trimmedWorkingItems, reason: .retentionCompaction)
+                    session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
                     markDerivedTranscriptSynchronized(
                         for: session,
                         projectionProtection: builtPresentation.projectionProtection
@@ -17779,11 +18032,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } catch {
             return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
         }
-        guard let saveToken = makeSaveCommitToken(for: session, workspaceID: workspace.id),
+        guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
               isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
         else {
             requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-            return .deferred("The session binding changed before persistence could commit.")
+            return .deferred("The session or its storage location changed before persistence could commit.")
         }
 
         do {
@@ -17791,7 +18044,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentSession.fileURL = fileURL
             guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session changed while persistence was committing.")
+                return .deferred("The session or its storage location changed while persistence was committing.")
             }
             if case let .configured(handle) = effectiveCreationSave, let creationStamp {
                 var currentConfiguration = agentSession
@@ -17955,7 +18208,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func persistCurrentSession() {
         guard !suppressesAgentSessionPersistence else { return }
         guard let tabID = currentTabID else { return }
-        Task {
+        let requestID = UUID()
+        workspaceSaveFlushTasks[requestID] = Task {
+            defer { workspaceSaveFlushTasks.removeValue(forKey: requestID) }
             await flushSave(for: tabID)
         }
     }
@@ -18074,13 +18329,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         let repromptRecoveryID = repromptUIStore.recoveries[target.tabID]?.id
+        // A presented handoff owns restoration even if it is cancelled while this executor awaits.
+        let presentedHandoffOwnsRecovery = ui.composer.pendingSubmissions[claim.attempt.id] != nil
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
         guard composerSubmitClaimIsCurrent(claim) else {
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
-            if let approvedBriefForRecovery, !submittedApprovedBrief {
+            if !presentedHandoffOwnsRecovery, let approvedBriefForRecovery, !submittedApprovedBrief {
                 repromptUIStore.recoveries[target.tabID] = .init(
                     text: approvedBriefForRecovery, originalDraft: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot,
                     reason: "The approved turn could not be submitted.",
@@ -18091,10 +18349,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
                 repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-            repromptAudits[claim.attempt.id] = nil
-            repromptDispatchTexts[claim.attempt.id] = nil
-            repromptDispatchOriginals[claim.attempt.id] = nil
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18278,6 +18533,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
+            movePendingComposerSubmission(claim, to: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
@@ -18375,6 +18631,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         destinationTabID: UUID,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        movePendingComposerSubmission(claim, to: destinationTabID)
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
@@ -18508,7 +18765,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return validationFailure
         }
         if resolvedNativeSlashCommand(in: trimmedText, session: session) == nil,
-           let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: workflow)
+           let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: workflow, agentKind: session.selectedAgent)
         {
             return validationFailure
         }
@@ -18701,7 +18958,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         guard let session = sessions[tabID], isFreshFirstSendDestination(session) else { return }
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
-            await promptManager?.closeComposeTab(tabID)
+            await promptManager?.closeComposeTab(tabID, deletionOrigin: .automaticDiscard)
         } else {
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)
@@ -18839,7 +19096,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nativePreparedTurn = nil
         }
         if nativePreparedTurn == nil,
-           let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: activeWorkflow)
+           let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: activeWorkflow, agentKind: session.selectedAgent)
         {
             return validationFailure
         }
@@ -18855,7 +19112,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if activeWorkflow != nil {
                 return activeWorkflow
             }
-            guard let invocation = resolvedSlashSkillInvocations(in: trimmedText).first else { return nil }
+            guard let invocation = resolvedSlashSkillInvocations(in: trimmedText, agentKind: session.selectedAgent).first else { return nil }
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
 
@@ -20066,7 +20323,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -20121,7 +20378,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -20589,9 +20846,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func validateSlashSkillUsage(
         in text: String,
-        activeWorkflow: AgentWorkflowDefinition?
+        activeWorkflow: AgentWorkflowDefinition?,
+        agentKind: AgentProviderKind
     ) -> UserTurnSubmissionResult? {
-        let invocations = resolvedSlashSkillInvocations(in: text)
+        let invocations = resolvedSlashSkillInvocations(in: text, agentKind: agentKind)
         guard !invocations.isEmpty else {
             return nil
         }
@@ -20604,8 +20862,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return nil
     }
 
-    func resolvedSlashSkillInvocations(in text: String) -> [ResolvedSlashSkillInvocation] {
+    func resolvedSlashSkillInvocations(in text: String, agentKind: AgentProviderKind) -> [ResolvedSlashSkillInvocation] {
         Self.extractSlashSkillTokens(from: text).compactMap { token in
+            // Keep Claude's native maintenance command distinct from a same-named local skill.
+            // The skill remains reachable via the existing explicit /skill: namespace.
+            if agentKind == .claudeCode,
+               token.name.lowercased() == AgentProviderControlCommand.Kind.compact.rawValue
+            {
+                return nil
+            }
             let resolvedName: String = {
                 let normalizedName = token.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 if normalizedName.lowercased().hasPrefix("skill:") {
@@ -21253,13 +21518,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // Shared helper that stages a resume-recovery handoff so the model has
     // conversational context after a forced fresh session start.
     @MainActor
-    func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        guard session.oversight.pendingAutoWake?.isPeriodic != true else { return }
-        // Don't overwrite an existing staged payload.
+    func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async -> PendingHandoffState? {
+        guard session.oversight.pendingAutoWake?.isPeriodic != true else { return nil }
+        // Don't overwrite an existing staged payload, or claim ownership of it for rollback.
         if let existingPayload = session.pendingHandoff.payload,
            !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-            return
+            return nil
         }
         let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
         let sourceTabName = normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID))
@@ -21280,9 +21545,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             deliveryID: deliveryID
         )
         guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
+            return nil
         }
-        session.pendingHandoff = PendingHandoffState(
+        let stagedHandoff = PendingHandoffState(
             payload: payload,
             createdAt: Date(),
             sourceItemID: cutoffItemID,
@@ -21290,12 +21555,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isStagedForSend: false,
             executionLocationFailure: session.pendingHandoff.executionLocationFailure
         )
+        session.pendingHandoff = stagedHandoff
         session.isDirty = true
+        return stagedHandoff
     }
 
     @MainActor
     func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        await stageResumeRecoveryHandoffIfNeeded(for: session)
+        _ = await stageResumeRecoveryHandoffIfNeeded(for: session)
     }
 
     @MainActor
@@ -21316,8 +21583,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentKind: AgentProviderKind? = nil
     ) async -> String {
         guard !text.isEmpty else { return text }
-        await refreshSkillCatalog(force: false, agentKind: agentKind)
-        var invocations = resolvedSlashSkillInvocations(in: text)
+        let effectiveAgent = agentKind ?? activeSession?.selectedAgent ?? selectedAgent
+        await refreshSkillCatalog(force: false, agentKind: effectiveAgent)
+        var invocations = resolvedSlashSkillInvocations(in: text, agentKind: effectiveAgent)
 
         // Defensive fallback: if slash-skill tokens were detected syntactically but none
         // resolved (e.g. a skill was just installed and we missed the dirty signal),
@@ -21325,8 +21593,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if invocations.isEmpty {
             let syntacticTokens = Self.extractSlashSkillTokens(from: text)
             if !syntacticTokens.isEmpty {
-                await refreshSkillCatalog(force: true, agentKind: agentKind)
-                invocations = resolvedSlashSkillInvocations(in: text)
+                await refreshSkillCatalog(force: true, agentKind: effectiveAgent)
+                invocations = resolvedSlashSkillInvocations(in: text, agentKind: effectiveAgent)
             }
         }
 
@@ -21632,7 +21900,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            initialUserItemID: directStartOptions.initialUserItemID
         )
     }
 

@@ -115,8 +115,11 @@ enum ClaudeCompatibleModelCatalogAdapter {
         forRequestedModelRaw rawModel: String?,
         agentKind: AgentProviderKind
     ) -> Int? {
-        guard let config = compatibleBackendConfig(for: agentKind),
-              let baseRaw = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
+        guard let config = compatibleBackendConfig(for: agentKind) else { return nil }
+        if let window = config.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            return window
+        }
+        guard let baseRaw = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
         let backendModelID = directBackendModelID(forCanonicalBaseRaw: baseRaw, agentKind: agentKind)
             ?? backendModelID(forCanonicalSlotRaw: baseRaw, config: config)
         return ClaudeCompatibleProviderRuntimeBridge.contextWindowTokens(forGLMBackendModelID: backendModelID)

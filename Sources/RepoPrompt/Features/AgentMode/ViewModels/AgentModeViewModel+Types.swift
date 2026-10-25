@@ -186,6 +186,7 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
         let workspaceID: UUID
+        let workspaceDirectoryPath: String
         let binding: AgentPersistentSessionBindingIdentity
         let bindingTransitionGeneration: UInt64
         let sourceItemsRevision: Int
@@ -724,6 +725,12 @@ extension AgentModeViewModel {
         case fresh
         case resumed
         case resumeFellBackToFresh
+    }
+
+    /// Exact provider reference known to exceed the resume frame budget in this session.
+    struct CodexOversizedResumeTarget: Equatable {
+        var conversationID: String?
+        var rolloutPath: String?
     }
 
     struct CodexResumeTimeoutState: Equatable {

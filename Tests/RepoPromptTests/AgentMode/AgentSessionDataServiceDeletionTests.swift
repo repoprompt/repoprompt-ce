@@ -58,6 +58,217 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testPendingDeletionDoesNotDiscardAnAlreadyAdmittedSaveBeforeItsCommitFence() async throws {
+        for authorityHolds in [false, true] {
+            let registry = AgentSessionDeletionRegistry.shared
+            registry.test_reset()
+            let fixture = try makeFixture()
+            addTeardownBlock {
+                await fixture.service.test_setBeforeSessionWriteHook(nil)
+                await MainActor.run { registry.test_reset() }
+                try? FileManager.default.removeItem(at: fixture.storageURL)
+            }
+            var session = AgentSession(
+                id: fixture.sessionID, workspaceID: fixture.workspace.id, composeTabID: fixture.tabID,
+                name: "Before concurrent save", itemCount: 0
+            )
+            let fileURL = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+            let writerFence = TestReleaseFence(name: "admitted session writer")
+            let commitFence = TestReleaseFence(name: "reversible deletion commit fence")
+            defer {
+                writerFence.release()
+                commitFence.release()
+            }
+            await fixture.service.test_setBeforeSessionWriteHook { url in
+                guard url.standardizedFileURL == fileURL.standardizedFileURL else { return }
+                await writerFence.enterAndWait()
+            }
+            session.name = "Admitted save must survive refusal"
+            let pendingSession = session
+            let saveTask = Task { try await fixture.service.saveAgentSession(pendingSession, for: fixture.workspace) }
+            addTeardownBlock {
+                writerFence.release()
+                commitFence.release()
+                _ = await saveTask.result
+            }
+            guard await writerFence.waitUntilEntered() else { return }
+            let deletionTask = Task {
+                let fence: @Sendable () async -> Bool = {
+                    await commitFence.enterAndWait()
+                    return authorityHolds
+                }
+                try await AgentSessionDataService.destructiveCommitFence.withValue(fence) {
+                    try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+                }
+            }
+            addTeardownBlock {
+                writerFence.release()
+                commitFence.release()
+                _ = await deletionTask.result
+            }
+            await fixture.service.test_waitUntilDeletionTombstone(for: fileURL)
+            writerFence.release()
+            guard await commitFence.waitUntilEntered() else { return }
+            _ = try await saveTask.value
+
+            XCTAssertTrue(registry.isDeletionInProgress(sessionID: fixture.sessionID))
+            let duringAdmission = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+            XCTAssertEqual(duringAdmission.name, pendingSession.name)
+            let metadataDuringAdmission = try await fixture.service.listAgentSessionsMeta(for: fixture.workspace)
+            XCTAssertEqual(metadataDuringAdmission.first { $0.id == fixture.sessionID }?.name, pendingSession.name)
+            await assertSaveBlockedByDeletion(pendingSession, fixture: fixture)
+
+            commitFence.release()
+            do {
+                try await deletionTask.value
+                XCTAssertTrue(authorityHolds)
+            } catch is AgentSessionDestructiveCommitRefused {
+                XCTAssertFalse(authorityHolds)
+            }
+            XCTAssertEqual(FileManager.default.fileExists(atPath: fileURL.path), !authorityHolds)
+            if authorityHolds {
+                XCTAssertEqual(registry.state(forSessionID: fixture.sessionID), .committed)
+                let metadata = try await fixture.service.listAgentSessionsMeta(for: fixture.workspace)
+                XCTAssertFalse(metadata.contains { $0.id == fixture.sessionID })
+                await assertSaveBlockedByDeletion(pendingSession, fixture: fixture)
+            } else {
+                XCTAssertNil(registry.state(forSessionID: fixture.sessionID))
+                let retained = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+                XCTAssertEqual(retained.name, pendingSession.name)
+                session.name = "Save after refused deletion"
+                _ = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+                let metadata = try await fixture.service.listAgentSessionsMeta(for: fixture.workspace)
+                XCTAssertEqual(metadata.first { $0.id == fixture.sessionID }?.name, session.name)
+            }
+        }
+    }
+
+    @MainActor
+    func testOverlappingDeletionRefusalCannotReleasePendingOrCommittedSaveFence() async throws {
+        for refusalFinishesFirst in [false, true] {
+            let registry = AgentSessionDeletionRegistry.shared
+            registry.test_reset()
+            let fixture = try makeFixture()
+            addTeardownBlock {
+                await MainActor.run { registry.test_reset() }
+                try? FileManager.default.removeItem(at: fixture.storageURL)
+            }
+            let session = AgentSession(id: fixture.sessionID, workspaceID: fixture.workspace.id, composeTabID: fixture.tabID)
+            let fileURL = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+            let refusedFence = TestReleaseFence(name: "overlapping refused deletion")
+            let allowedFence = TestReleaseFence(name: "overlapping allowed deletion")
+            defer {
+                refusedFence.release()
+                allowedFence.release()
+            }
+            let refusedTask = Task {
+                let fence: @Sendable () async -> Bool = {
+                    await refusedFence.enterAndWait()
+                    return false
+                }
+                try await AgentSessionDataService.destructiveCommitFence.withValue(fence) {
+                    try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+                }
+            }
+            addTeardownBlock {
+                refusedFence.release()
+                allowedFence.release()
+                _ = await refusedTask.result
+            }
+            guard await refusedFence.waitUntilEntered() else { return }
+            let allowedTask = Task {
+                let fence: @Sendable () async -> Bool = {
+                    await allowedFence.enterAndWait()
+                    return true
+                }
+                try await AgentSessionDataService.destructiveCommitFence.withValue(fence) {
+                    try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+                }
+            }
+            addTeardownBlock {
+                refusedFence.release()
+                allowedFence.release()
+                _ = await allowedTask.result
+            }
+            guard await allowedFence.waitUntilEntered() else { return }
+            if !refusalFinishesFirst {
+                allowedFence.release()
+                try await allowedTask.value
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+            }
+            refusedFence.release()
+            do {
+                try await refusedTask.value
+                XCTFail("The refused deletion must report refusal")
+            } catch is AgentSessionDestructiveCommitRefused {}
+            await assertSaveBlockedByDeletion(session, fixture: fixture)
+            if refusalFinishesFirst {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+                XCTAssertTrue(registry.isDeletionInProgress(sessionID: fixture.sessionID))
+                allowedFence.release()
+                try await allowedTask.value
+            }
+            XCTAssertEqual(registry.state(forSessionID: fixture.sessionID), .committed)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+            await assertSaveBlockedByDeletion(session, fixture: fixture)
+            let metadata = try await fixture.service.listAgentSessionsMeta(for: fixture.workspace)
+            XCTAssertFalse(metadata.contains { $0.id == fixture.sessionID })
+        }
+    }
+
+    @MainActor
+    func testCommittedDeletionRejectsSaveReturningFromItsWrite() async throws {
+        let registry = AgentSessionDeletionRegistry.shared
+        registry.test_reset()
+        let fixture = try makeFixture()
+        addTeardownBlock {
+            await fixture.service.test_setAfterSessionWriteHook(nil)
+            await MainActor.run { registry.test_reset() }
+            try? FileManager.default.removeItem(at: fixture.storageURL)
+        }
+        var session = AgentSession(id: fixture.sessionID, workspaceID: fixture.workspace.id, composeTabID: fixture.tabID)
+        let fileURL = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+        let metadataURL = fixture.agentSessionsFolder.appendingPathComponent("AgentSessionIndex.json")
+        let writeCompletionFence = TestReleaseFence(name: "completed session write before deletion check")
+        defer { writeCompletionFence.release() }
+        await fixture.service.test_setAfterSessionWriteHook { url in
+            guard url.standardizedFileURL == fileURL.standardizedFileURL else { return }
+            await writeCompletionFence.enterAndWait()
+        }
+        session.name = "Save paused after writing its transcript"
+        let pendingSession = session
+        let saveTask = Task { try await fixture.service.saveAgentSession(pendingSession, for: fixture.workspace) }
+        addTeardownBlock {
+            writeCompletionFence.release()
+            _ = await saveTask.result
+        }
+        guard await writeCompletionFence.waitUntilEntered() else { return }
+        let deletionTask = Task { try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace) }
+        addTeardownBlock {
+            writeCompletionFence.release()
+            _ = await deletionTask.result
+        }
+        await fixture.service.test_waitUntilDeletionTombstone(for: fileURL)
+        let deletionState = await registry.waitForDeletionAttemptToSettle(sessionID: fixture.sessionID)
+        XCTAssertEqual(deletionState, .committed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        writeCompletionFence.release()
+        do {
+            _ = try await saveTask.value
+            XCTFail("A save returning after committed deletion must not acknowledge durability")
+        } catch let AgentSessionDataError.sessionDeleted(sessionID) {
+            XCTAssertEqual(sessionID, fixture.sessionID)
+        }
+        try await deletionTask.value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        let metadata = try await fixture.service.listAgentSessionsMeta(for: fixture.workspace)
+        XCTAssertFalse(metadata.contains { $0.id == fixture.sessionID })
+        let diskIndex = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: Data(contentsOf: metadataURL))
+        XCTAssertFalse(diskIndex.entries.contains { $0.id == fixture.sessionID })
+        await assertSaveBlockedByDeletion(session, fixture: fixture)
+    }
+
     func testBatchDeleteIgnoresNestedAndMalformedMetadataIndexFilenames() async throws {
         let cases: [(String, String, String)] = [
             ("nested", "nested/nested-sentinel.json", "nested/nested-sentinel.json"),
@@ -288,6 +499,23 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         let agentSessionsFolder: URL
         let sessionID: UUID
         let tabID: UUID
+    }
+
+    @MainActor
+    private func assertSaveBlockedByDeletion(
+        _ session: AgentSession,
+        fixture: BatchDeleteFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+            XCTFail("Deletion must keep new writes fenced", file: file, line: line)
+        } catch let AgentSessionDataError.sessionDeleted(sessionID) {
+            XCTAssertEqual(sessionID, session.id, file: file, line: line)
+        } catch {
+            XCTFail("Unexpected save error: \(error)", file: file, line: line)
+        }
     }
 
     private func makeFixture() throws -> BatchDeleteFixture {

@@ -31,6 +31,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     let pendingCount: UInt64
     let updatesPending: Bool
     let graphRevision: UInt64?
+    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
 
     static let pending = Self(
         state: .notInitialized,
@@ -110,7 +111,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case .reconciling: "Reconciling…"
         case .paused: "Paused"
         case .recoveryExhausted: "Retry needed"
-        case .unavailable: "Unavailable"
+        case .unavailable: graphIndexBudget == nil ? "Unavailable" : "Indexing limit reached"
         case .revoked: "Revoked"
         }
     }
@@ -138,7 +139,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case .recoveryExhausted:
             "Code Map indexing stopped after repeated recovery attempts. Retry to resume indexing."
         case .unavailable:
-            "Code Maps are unavailable for this root."
+            graphIndexBudget?.terminalMessage ?? "Code Maps are unavailable for this root."
         case .revoked:
             "Code Map graph authority was revoked and must be re-established."
         }
@@ -174,7 +175,8 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
             supportedCount: stableSupportedCount,
             pendingCount: coverage?.pendingCount ?? 0,
             updatesPending: snapshot.updatesPending,
-            graphRevision: snapshot.graphRevision
+            graphRevision: snapshot.graphRevision,
+            graphIndexBudget: snapshot.graphIndexBudget
         )
     }
 }
@@ -198,6 +200,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
     let reconcilingRootCount: Int
     let pausedRootCount: Int
     let preSealHeaderText: String
+    var stoppedRootCount: Int = 0
 
     var progressPercentage: Int? {
         guard state == .indexing || state == .reconciling, let progressFraction else { return nil }
@@ -232,21 +235,29 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             var details = [primary]
             if reconcilingRootCount > 0 { details.append("\(reconcilingRootCount) reconciling") }
             if pausedRootCount > 0 { details.append("\(pausedRootCount) paused") }
+            if stoppedRootCount > 0 { details.append("\(stoppedRootCount) stopped at indexing limit") }
             return details.joined(separator: " • ")
         case .reconciling:
             let primary = progressPercentage.map { "Reconciling watcher changes • \($0)%" }
                 ?? preSealHeaderText
-            return pausedRootCount > 0 ? "\(primary) • \(pausedRootCount) paused" : primary
+            var details = [primary]
+            if pausedRootCount > 0 { details.append("\(pausedRootCount) paused") }
+            if stoppedRootCount > 0 { details.append("\(stoppedRootCount) stopped at indexing limit") }
+            return details.joined(separator: " • ")
         case .ready:
             return "All available roots mapped"
         case .paused:
             return "Indexing paused"
         case .recoveryExhausted:
-            return "Indexing needs retry"
+            return stoppedRootCount > 0
+                ? "Indexing needs retry • \(stoppedRootCount) stopped at indexing limit"
+                : "Indexing needs retry"
         case .mixed:
-            return "\(readyRootCount) mapped • \(pausedRootCount) paused"
+            var details = ["\(readyRootCount) mapped", "\(pausedRootCount) paused"]
+            if stoppedRootCount > 0 { details.append("\(stoppedRootCount) stopped at indexing limit") }
+            return details.joined(separator: " • ")
         case .unavailable:
-            return "Code Maps unavailable"
+            return stoppedRootCount > 0 ? "\(stoppedRootCount) stopped at indexing limit" : "Code Maps unavailable"
         }
     }
 
@@ -274,6 +285,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
         }
         let reconcilingRoots = availableRoots.filter { $0.state == .reconciling }
         let recoveryExhaustedRoots = presentations.filter { $0.state == .recoveryExhausted }
+        let stoppedRoots = presentations.filter { $0.state == .unavailable && $0.graphIndexBudget != nil }
         let pausedRoots = availableRoots.filter(\.isPaused)
         let readyRoots = availableRoots.filter { $0.state == .ready }
         let activeNonPausedRoots = availableRoots.filter { !$0.isPaused }
@@ -296,6 +308,8 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             .reconciling
         } else if !recoveryExhaustedRoots.isEmpty {
             .recoveryExhausted
+        } else if !stoppedRoots.isEmpty {
+            availableRoots.isEmpty ? .unavailable : .mixed
         } else if availableRoots.isEmpty {
             .unavailable
         } else if pausedRoots.count == availableRoots.count {
@@ -332,7 +346,8 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             readyRootCount: readyRoots.count,
             reconcilingRootCount: reconcilingRoots.count,
             pausedRootCount: pausedRoots.count,
-            preSealHeaderText: preSealHeaderText
+            preSealHeaderText: preSealHeaderText,
+            stoppedRootCount: stoppedRoots.count
         )
     }
 
