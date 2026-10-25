@@ -1473,7 +1473,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
-            makeSaveCommitToken(for: session, workspaceID: workspaceID)
+            guard let workspace = workspaceManager?.workspace(withID: workspaceID) else { return nil }
+            return makeSaveCommitToken(for: session, workspace: workspace)
         }
 
         func test_isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken) -> Bool {
@@ -17411,7 +17412,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func makeSaveCommitToken(
         for session: TabSession,
-        workspaceID: UUID
+        workspace: WorkspaceModel
     ) -> SessionSaveCommitToken? {
         guard let binding = session.persistentSessionBindingIdentity,
               binding.sessionID == session.activeAgentSessionID,
@@ -17422,7 +17423,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return SessionSaveCommitToken(
             tabID: session.tabID,
             sessionIdentity: ObjectIdentifier(session),
-            workspaceID: workspaceID,
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: sessionSaveWorkspaceDirectoryPath(for: workspace),
             binding: binding,
             bindingTransitionGeneration: session.bindingTransitionGeneration,
             sourceItemsRevision: session.sourceItemsRevision,
@@ -17431,15 +17433,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func sessionSaveWorkspaceDirectoryPath(for workspace: WorkspaceModel) -> String {
+        WorkspaceSessionSidecarMigration.workspaceDirectory(
+            for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+        ).standardizedFileURL.path
+    }
+
     private func isSaveCommitTokenCurrent(
         _ token: SessionSaveCommitToken,
         requireWorkspaceMatch: Bool = true,
         creationHandle: AgentSessionCreationHandle? = nil
     ) -> Bool {
-        if requireWorkspaceMatch,
-           workspaceManager?.activeWorkspace?.id != token.workspaceID
-        {
-            return false
+        if requireWorkspaceMatch {
+            // A storage move can preserve every session/binding identity. The completed write
+            // only acknowledges the placement captured from the workspace passed to its saver.
+            guard let workspace = workspaceManager?.activeWorkspace,
+                  workspace.id == token.workspaceID,
+                  sessionSaveWorkspaceDirectoryPath(for: workspace) == token.workspaceDirectoryPath
+            else { return false }
         }
         guard let session = sessions[token.tabID],
               ObjectIdentifier(session) == token.sessionIdentity,
@@ -17940,11 +17951,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } catch {
             return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
         }
-        guard let saveToken = makeSaveCommitToken(for: session, workspaceID: workspace.id),
+        guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
               isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
         else {
             requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-            return .deferred("The session binding changed before persistence could commit.")
+            return .deferred("The session or its storage location changed before persistence could commit.")
         }
 
         do {
@@ -17952,7 +17963,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentSession.fileURL = fileURL
             guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session changed while persistence was committing.")
+                return .deferred("The session or its storage location changed while persistence was committing.")
             }
             if case let .configured(handle) = effectiveCreationSave, let creationStamp {
                 var currentConfiguration = agentSession
