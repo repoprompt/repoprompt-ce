@@ -121,4 +121,34 @@ final class WorkspaceNativePathTests: XCTestCase {
         XCTAssertEqual(try WorkspaceNativePathInput.userText("alias//file ", homeDirectory: home).utf8ForWire(), "alias/file ")
         XCTAssertEqual(try WorkspaceNativePathInput.userText(" ~/file ", homeDirectory: home).utf8ForWire(), " ~/file ")
     }
+
+    func testTildeExpansionTreatsRepeatedSeparatorsAfterHomeLikeNativeSeparators() throws {
+        let home = try WorkspaceAbsolutePath.nativeText("/Users/test")
+        XCTAssertEqual(try WorkspaceNativePathInput.userText("~//file ", homeDirectory: home).utf8ForWire(), "/Users/test/file ")
+        let homeOnly = try WorkspaceNativePathInput.userText("~///", homeDirectory: home)
+        XCTAssertEqual(homeOnly, .absolute(home.requiringDirectory()), "An all-separator suffix is the home directory")
+        XCTAssertEqual(try homeOnly.utf8ForWire(), "/Users/test/")
+        XCTAssertEqual(try WorkspaceNativePathInput.userText("~//./a/../b ", homeDirectory: home).utf8ForWire(), "/Users/test/./a/../b ")
+        let decomposed = "e\u{0301}"
+        XCTAssertEqual(
+            Array(try WorkspaceNativePathInput.userText("~//\(decomposed)", homeDirectory: home).utf8ForWire().utf8),
+            Array("/Users/test/\(decomposed)".utf8), "Unicode spelling is preserved byte for byte"
+        )
+        XCTAssertEqual(
+            Array(try WorkspaceNativePathInput.userText("~//\u{0301}file", homeDirectory: home).utf8ForWire().utf8),
+            Array("/Users/test/\u{0301}file".utf8), "A separator followed by a combining mark is still a separator"
+        )
+        // Only the separators between `~` and the suffix are redundant; every other rule is unchanged.
+        for suffix in ["file ", "./a/../b", "../outside", "dir/", " lead"] {
+            XCTAssertEqual(
+                try WorkspaceNativePathInput.userText("~//" + suffix, homeDirectory: home),
+                try WorkspaceNativePathInput.userText("~/" + suffix, homeDirectory: home),
+                "suffix=\(suffix.debugDescription)"
+            )
+        }
+        XCTAssertThrowsError(try WorkspaceNativePathInput.userText("~//a\u{0}b", homeDirectory: home)) { error in
+            XCTAssertEqual(error as? WorkspaceNativePathError, .embeddedNUL)
+        }
+        XCTAssertEqual(try WorkspaceNativePathInput.userText("/abs//file", homeDirectory: home).utf8ForWire(), "/abs/file")
+    }
 }

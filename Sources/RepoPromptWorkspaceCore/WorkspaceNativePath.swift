@@ -40,7 +40,9 @@ package enum WorkspaceNativePathInput: Hashable {
         if text == "~" { return .absolute(homeDirectory.requiringDirectory()) }
         if text.hasPrefix("/") { return try .absolute(WorkspaceAbsolutePath.nativeText(text)) }
         if text.hasPrefix("~/") {
-            let suffix = String(text.dropFirst(2))
+            // Separators repeated after `~/` are redundant native separators, not an absolute suffix.
+            // Trim separator bytes, never grapheme clusters: "/\u{0301}" still begins with one.
+            let suffix = String(decoding: text.utf8.dropFirst(2).drop { $0 == 0x2F }, as: UTF8.self)
             if suffix.isEmpty { return .absolute(homeDirectory.requiringDirectory()) }
             return try .absolute(homeDirectory.appending(WorkspaceRelativePath.nativeText(suffix)))
         }
