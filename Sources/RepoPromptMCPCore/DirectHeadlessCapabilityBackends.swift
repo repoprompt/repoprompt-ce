@@ -654,11 +654,11 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
         }
         let binding = try GitReadRepositoryBinding(layout: layout)
-        let probe = try await DirectProcess.run(
+        let probe = try await DirectProcess.runCapturingOutput(
             "/usr/bin/git", arguments: binding.ownershipProbeArguments,
             isProvider: false, readBinding: binding
         )
-        try binding.validateOwnershipProbe(probe)
+        try binding.validateOwnershipProbe(probe.standardOutput)
         return try await DirectProcess.run(
             "/usr/bin/git", arguments: binding.boundArguments(arguments),
             isProvider: false, readBinding: binding
@@ -1121,6 +1121,11 @@ actor DirectHeadlessHistoryBackend: DomainHistoryCapabilityBackend {
 }
 
 enum DirectProcess {
+    struct Output {
+        let standardOutput: String
+        let standardError: String
+    }
+
     /// Child providers need basic process/configuration context and the explicit private
     /// launch carrier, but must not inherit arbitrary parent credentials or loader controls.
     private static let inheritedEnvironmentKeys: Set<String> = [
@@ -1199,6 +1204,32 @@ enum DirectProcess {
             environment: environment,
             currentDirectory: currentDirectory,
             readBinding: readBinding
+        ).run().standardOutput
+    }
+
+    /// Machine-readable stdout must not be contaminated by successful-command
+    /// warnings. The ordinary run API retains its existing combined-stream behavior.
+    static func runCapturingOutput(
+        _ executable: String,
+        arguments: [String],
+        input: Data? = nil,
+        environment: [String: String] = [:],
+        currentDirectory: URL? = nil,
+        isProvider: Bool = true,
+        allowsProviderProcessLaunchForTesting: Bool = false,
+        readBinding: GitReadRepositoryBinding? = nil
+    ) async throws -> Output {
+        if isProvider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        }
+        return try await DirectProcessInvocation(
+            executable: executable,
+            arguments: arguments,
+            input: input,
+            environment: environment,
+            currentDirectory: currentDirectory,
+            readBinding: readBinding,
+            separatesStandardError: true
         ).run()
     }
 }
@@ -1256,8 +1287,10 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     // Cancellation must not wait for a potentially blocking pipe read.
     private let lock = NSLock()
     private let outputCapture = DirectProcessOutputCapture()
+    private let errorCapture: DirectProcessOutputCapture?
     private let process = Process()
     private let pipe = Pipe()
+    private let errorPipe: Pipe?
     private let inputPipe: Pipe?
     private let input: Data?
     private let readBinding: GitReadRepositoryBinding?
@@ -1269,10 +1302,13 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         input: Data?,
         environment overrides: [String: String],
         currentDirectory: URL?,
-        readBinding: GitReadRepositoryBinding?
+        readBinding: GitReadRepositoryBinding?,
+        separatesStandardError: Bool = false
     ) {
         self.input = input
         self.readBinding = readBinding
+        errorPipe = separatesStandardError ? Pipe() : nil
+        errorCapture = separatesStandardError ? DirectProcessOutputCapture() : nil
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -1284,18 +1320,21 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         }
         process.currentDirectoryURL = currentDirectory
         process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardError = errorPipe ?? pipe
         if let inputPipe {
             process.standardInput = inputPipe
         }
     }
 
-    func run() async throws -> String {
+    func run() async throws -> DirectProcess.Output {
         try Task.checkCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                     self?.outputCapture.consume { handle.availableData }
+                }
+                errorPipe?.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                    self?.errorCapture?.consume { handle.availableData }
                 }
                 process.terminationHandler = { [weak self] process in
                     guard let self else {
@@ -1303,19 +1342,26 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                         return
                     }
                     pipe.fileHandleForReading.readabilityHandler = nil
+                    errorPipe?.fileHandleForReading.readabilityHandler = nil
                     let snapshot = outputCapture.finish {
                         self.pipe.fileHandleForReading.readDataToEndOfFile()
+                    }
+                    let errorSnapshot = errorCapture?.finish {
+                        self.errorPipe?.fileHandleForReading.readDataToEndOfFile() ?? Data()
                     }
                     if isCancellationRequested() {
                         continuation.resume(throwing: CancellationError())
                     } else {
                         var text = String(decoding: snapshot.data, as: UTF8.self)
                         if snapshot.truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
+                        var errorText = String(decoding: errorSnapshot?.data ?? Data(), as: UTF8.self)
+                        if errorSnapshot?.truncated == true { errorText += "\n[output truncated at \(Self.outputLimit) bytes]" }
                         if process.terminationStatus == 0 {
-                            continuation.resume(returning: text)
+                            continuation.resume(returning: DirectProcess.Output(standardOutput: text, standardError: errorText))
                         } else {
                             continuation.resume(throwing: MCPError.internalError(
-                                text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                [text, errorText].filter { !$0.isEmpty }.joined(separator: "\n")
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
                             ))
                         }
                     }
@@ -1330,6 +1376,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                     if isCancellationRequested() { cancelProcess() }
                 } catch {
                     pipe.fileHandleForReading.readabilityHandler = nil
+                    errorPipe?.fileHandleForReading.readabilityHandler = nil
                     continuation.resume(throwing: error)
                 }
             }

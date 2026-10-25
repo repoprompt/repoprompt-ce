@@ -3,6 +3,30 @@ import Foundation
 import XCTest
 
 final class DirectProcessOutputCaptureTests: XCTestCase {
+    func testSeparateOutputPreservesWarningsWithoutChangingCombinedCapture() async throws {
+        let arguments = ["-c", "printf 'payload\\n'; printf 'warning\\n' >&2"]
+        let separate = try await DirectProcess.runCapturingOutput("/bin/sh", arguments: arguments, isProvider: false)
+        XCTAssertEqual(separate.standardOutput, "payload\n")
+        XCTAssertEqual(separate.standardError, "warning\n")
+
+        let combined = try await DirectProcess.run("/bin/sh", arguments: arguments, isProvider: false)
+        XCTAssertEqual(combined, "payload\nwarning\n")
+    }
+
+    func testSeparateOutputFailureRetainsBothDiagnosticStreams() async throws {
+        do {
+            _ = try await DirectProcess.runCapturingOutput(
+                "/bin/sh", arguments: ["-c", "printf 'stdout detail\\n'; printf 'stderr failure\\n' >&2; exit 7"],
+                isProvider: false
+            )
+            XCTFail("A failing command must not return successful captured output")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("stdout detail"), message)
+            XCTAssertTrue(message.contains("stderr failure"), message)
+        }
+    }
+
     func testPipeReadStartsOnlyAfterAcquiringCaptureLock() {
         let mutex = NSLock()
         let attemptedLock = DispatchSemaphore(value: 0)

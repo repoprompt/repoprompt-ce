@@ -477,6 +477,26 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
     }
 
+    func testHeadlessGitOwnershipProbeAllowsSuccessfulCommandWarnings() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        try Self.runGit(["config", "core.bare", "true"], at: fixture.loadedRoot)
+        try Self.runGit(["config", "core.worktree", ".."], at: fixture.loadedRoot)
+        try Data("inside\n".utf8).write(to: fixture.loadedRoot.appendingPathComponent("inside-only.txt"))
+
+        // Real Git accepts this checkout but warns during native discovery. Its
+        // explicitly bound data command still reads the authorized working tree.
+        let probe = try await DirectProcess.run(
+            "/usr/bin/git", arguments: ["-C", fixture.loadedRoot.path, "rev-parse", "--absolute-git-dir"],
+            isProvider: false
+        )
+        XCTAssertTrue(probe.contains("warning:"), probe)
+        XCTAssertTrue(probe.contains(fixture.loadedRoot.appendingPathComponent(".git").path), probe)
+
+        let outcome = try await Self.callTool(fixture.client, name: "git", arguments: ["op": .string("status")])
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertTrue(outcome.text.contains("inside-only.txt"), outcome.text)
+    }
+
     func testHeadlessGitReadDoesNotFollowConfiguredExternalWorktree() async throws {
         let fixture = try await makeHeadlessWorktreeFixture(redirectWorktree: true)
         let outcome = try await Self.callTool(fixture.client, name: "git", arguments: ["op": .string("status")])

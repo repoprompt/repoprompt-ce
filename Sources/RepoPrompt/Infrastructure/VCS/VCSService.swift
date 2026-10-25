@@ -241,10 +241,7 @@ public actor VCSService {
 
     private static func readScopedMetadata(_ url: URL, roots: [String], trimLineEndings: Bool = false) -> String? {
         guard isScopedJJMetadataPath(url, roots: roots),
-              let handle = try? FileHandle(forReadingFrom: url)
-        else { return nil }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 4097), data.count <= 4096,
+              let data = try? VCSMetadataFileReader.contents(of: url),
               var text = String(data: data, encoding: .utf8)
         else { return nil }
         if trimLineEndings {

@@ -203,11 +203,7 @@ package struct GitReadRepositoryBinding {
             guard roots.contains(where: { target == $0 || target.hasPrefix($0 + "/") })
             else { throw BindingError.changedMetadata }
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-            let data = try handle.read(upToCount: 4097) ?? Data()
-            guard data.count <= 4096 else { throw BindingError.changedMetadata }
-            return data
+            return try VCSMetadataFileReader.contents(of: url)
         }
     }
 
@@ -361,9 +357,7 @@ public enum GitRepositoryLayoutResolver {
     }
 
     private static func readMetadataText(at url: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 4097), data.count <= 4096,
+        guard let data = try? VCSMetadataFileReader.contents(of: url),
               let content = String(data: data, encoding: .utf8)
         else { return nil }
         var text = content

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptVCS
@@ -958,6 +959,72 @@ private actor ListingSpy {
 }
 
 final class VCSReadRootAuthorizationTests: XCTestCase {
+    func testGitReadRejectsFIFOWithoutSpawningAndServiceRemainsUsable() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-fifo-\(UUID().uuidString)")
+        let malformed = base.appendingPathComponent("malformed")
+        let healthy = base.appendingPathComponent("healthy")
+        for root in [malformed, healthy] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Self.runFixtureGit(["init", "--quiet"], at: root)
+        }
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Data("inside\n".utf8).write(to: healthy.appendingPathComponent("inside-only.txt"))
+        let spawns = MetadataReadInvocationCounter()
+        let service = GitService(processSpawner: { executable, arguments, environment, directory in
+            spawns.increment()
+            return try GitService.defaultProcessSpawner(executable, arguments, environment, directory)
+        })
+        let watchdog = try ScopedMetadataFIFOReadWatchdog(at: malformed.appendingPathComponent(".git/commondir"))
+        defer { _ = watchdog.finish() }
+        do {
+            _ = try await service.getStatusPorcelainZ(at: malformed)
+            XCTFail("Special metadata must be rejected before Git starts")
+        } catch {}
+        XCTAssertFalse(watchdog.finish(), "A metadata read waited for a FIFO writer")
+        XCTAssertEqual(spawns.count, 0)
+
+        let status = try await service.getStatusPorcelainZ(at: healthy)
+        XCTAssertTrue(String(decoding: status, as: UTF8.self).contains("inside-only.txt"))
+        XCTAssertGreaterThan(spawns.count, 0)
+    }
+
+    func testJujutsuRejectsFIFOMetadataBeforeProbingAndCanResolveFollowingHealthyRoot() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("jj-fifo-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let probes = MetadataReadInvocationCounter()
+        let service = VCSService(jjRunner: JJCommandRunner { _, _, _ in
+            probes.increment()
+            return ("", "", 0)
+        })
+        for relativePath in [".jj/repo", ".jj/repo/store/type", ".jj/repo/store/git_target", ".jj/repo/store/git/commondir"] {
+            let root = base.appendingPathComponent(UUID().uuidString)
+            let fifo = root.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(at: fifo.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if relativePath.contains("git_target") || relativePath.contains("commondir") {
+                let store = root.appendingPathComponent(".jj/repo/store")
+                try Data("git".utf8).write(to: store.appendingPathComponent("type"))
+                if relativePath.contains("commondir") {
+                    try Data("git".utf8).write(to: store.appendingPathComponent("git_target"))
+                }
+            }
+            let watchdog = try ScopedMetadataFIFOReadWatchdog(at: fifo)
+            defer { _ = watchdog.finish() }
+            let result = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+            XCTAssertNil(result, relativePath)
+            XCTAssertFalse(watchdog.finish(), "\(relativePath) waited for a FIFO writer")
+            XCTAssertEqual(probes.count, 0)
+        }
+
+        let healthy = base.appendingPathComponent("healthy")
+        let store = healthy.appendingPathComponent(".jj/repo/store")
+        try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+        try Data("Simple".utf8).write(to: store.appendingPathComponent("type"))
+        let result = await service.resolveRepoForRead(at: healthy, authorizedRoots: [healthy])
+        XCTAssertEqual(result?.backendKind, .jujutsu)
+        XCTAssertGreaterThan(probes.count, 0)
+    }
+
     func testAppDiscoverySupportsSubdirectoriesAndBareRepositoriesWithoutGrantingScopedReads() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-discovery-\(UUID().uuidString)")
             .resolvingSymlinksInPath()
@@ -1185,5 +1252,50 @@ final class VCSReadRootAuthorizationTests: XCTestCase {
         XCTAssertNil(unauthorizedParent)
         let authorizedParent = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
         XCTAssertNotNil(authorizedParent)
+    }
+}
+
+private final class MetadataReadInvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.withLock { value }
+    }
+
+    func increment() {
+        lock.withLock { value += 1 }
+    }
+}
+
+/// Unblocks an old synchronous FIFO read independently of the service actor, so
+/// the regression reports a failure and still lets teardown and later reads run.
+private final class ScopedMetadataFIFOReadWatchdog: @unchecked Sendable {
+    private let completed = DispatchSemaphore(value: 0)
+    private let settled = DispatchGroup()
+    private let lock = NSLock()
+    private var rescued = false
+
+    init(at url: URL) throws {
+        guard mkfifo(url.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        settled.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { settled.leave() }
+            guard completed.wait(timeout: .now() + 5) == .timedOut else { return }
+            lock.withLock { rescued = true }
+            let descriptor = open(url.path, O_RDWR | O_NONBLOCK | O_CLOEXEC)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+            let bytes = Data(repeating: 0x78, count: 4097)
+            try? FileManager.default.removeItem(at: url)
+            try? bytes.write(to: url)
+            _ = bytes.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+        }
+    }
+
+    func finish() -> Bool {
+        completed.signal()
+        let finished = settled.wait(timeout: .now() + 6) == .success
+        return !finished || lock.withLock { rescued }
     }
 }
