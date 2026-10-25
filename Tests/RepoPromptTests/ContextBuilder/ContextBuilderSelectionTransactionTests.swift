@@ -123,7 +123,8 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                 XCTFail("Unexpected prompt mutation error: \(error)")
                 return
             }
-            XCTAssertTrue(message.contains("bound tab is no longer available"), message)
+            let unwrappedMessage = try XCTUnwrap(message)
+            XCTAssertTrue(unwrappedMessage.contains("bound tab is no longer available"), unwrappedMessage)
         }
 
         XCTAssertFalse(mutationWasCalled)
