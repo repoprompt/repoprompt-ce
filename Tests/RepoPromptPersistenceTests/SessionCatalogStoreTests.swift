@@ -35,22 +35,136 @@ final class SessionCatalogStoreTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerConcurrent-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("private/state.sqlite")
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for index in 0 ..< 12 {
+        let operationIDs = (0 ..< 12).map { _ in UUID() }
+        // Every handle shares one bounded process-local admission. A contender that loses that bound
+        // while a durable holder is slow gets the documented retryable `writerBusy`; any other error
+        // (schema, profile, SQLite, transition) fails the test from inside the group.
+        let outcomes = try await withThrowingTaskGroup(of: (Int, OverseerContinuityReceipt?).self) { group in
+            for (index, operationID) in operationIDs.enumerated() {
                 group.addTask {
                     let store = OverseerContinuityStore(databaseURL: url, profile: "test")
-                    _ = try store.commit(operationID: UUID(), origin: "parallel-owner", mutations: [.grant(.init(kind: .scope, id: "row-\(index)", payload: Data()))])
+                    do {
+                        return try (index, store.commit(operationID: operationID, origin: "parallel-owner", mutations: [Self.parallelGrant(index)]))
+                    } catch OverseerContinuityError.writerBusy {
+                        return (index, nil)
+                    }
                 }
             }
-            try await group.waitForAll()
+            var outcomes: [Int: OverseerContinuityReceipt?] = [:]
+            for try await (index, receipt) in group {
+                outcomes[index] = receipt
+            }
+            return outcomes
         }
+        // Every contended operation has settled; the remaining checks are uncontended.
+        XCTAssertEqual(outcomes.count, 12)
+        XCTAssertTrue(outcomes.values.contains { $0 != nil }, "The first opener must create the schema and commit")
         let store = OverseerContinuityStore(databaseURL: url, profile: "test")
-        XCTAssertEqual(try store.rows(kind: .scope).count, 12)
-        XCTAssertEqual(try store.engineSettings()["journal_mode"], "delete")
+        for (index, operationID) in operationIDs.enumerated() {
+            if let committed = outcomes[index] ?? nil {
+                XCTAssertFalse(committed.replayed)
+                XCTAssertEqual(try store.receipt(operationID: operationID), committed)
+                var replay = committed
+                replay.replayed = true
+                XCTAssertEqual(
+                    try store.commit(operationID: operationID, origin: "parallel-owner", mutations: [Self.parallelGrant(index)]),
+                    replay, "A committed operation replays its exact receipt"
+                )
+            } else {
+                XCTAssertNil(try store.receipt(operationID: operationID), "A bounded busy failure must not leave a receipt")
+                let recovered = try store.commit(operationID: operationID, origin: "parallel-owner", mutations: [Self.parallelGrant(index)])
+                XCTAssertFalse(recovered.replayed, "The uncontended retry of a busy operation is its first commit")
+                XCTAssertEqual(try store.receipt(operationID: operationID), recovered)
+            }
+        }
+        let rows = try store.rows(kind: .scope)
+        XCTAssertEqual(rows.map(\.id).sorted(), (0 ..< 12).map { "row-\($0)" }.sorted())
+        XCTAssertTrue(rows.allSatisfy { !$0.terminal })
+        XCTAssertEqual(try store.engineSettings(), ["journal_mode": "delete", "synchronous": "3", "fullfsync": "1", "foreign_keys": "1"])
+        let schema = try Self.overseerSchemaState(url)
+        XCTAssertEqual(schema.userVersion, 1)
+        XCTAssertEqual(schema.profiles, 1, "Concurrent first opens create exactly one profile row")
+        XCTAssertEqual(schema.operations, 12, "Each operation is recorded once; replays and busy failures add none")
+        _ = try store.rows(kind: .scope)
+        XCTAssertEqual(try Self.overseerSchemaState(url).epoch, schema.epoch, "A reopen must not reinitialize the schema")
         for error in [OverseerContinuityError.terminalIdentity, .revisionConflict, .operationConflict] {
             XCTAssertTrue(error.isPermanentTransitionFailure)
         }
         XCTAssertFalse(OverseerContinuityError.writerBusy.isPermanentTransitionFailure)
+    }
+
+    #if DEBUG
+        func testOverseerAccessHeldPastBudgetFailsRetryablyWithoutReceiptThenCommitsOnce() throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerHeldAccess-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let url = root.appendingPathComponent("private/state.sqlite")
+            let holderStore = OverseerContinuityStore(databaseURL: url, profile: "test")
+            _ = try holderStore.engineSettings()
+            let acquired = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let finished = DispatchSemaphore(value: 0)
+            let holderFailure = HolderFailure()
+            // A dedicated thread holds the real access ordering, as a slow durable holder would. Its own
+            // wait is bounded, and every exit path below releases and joins it.
+            let holder = Thread {
+                defer { finished.signal() }
+                do {
+                    try holderStore.withAccessHeldForTesting {
+                        acquired.signal()
+                        _ = release.wait(timeout: .now() + 30)
+                    }
+                } catch {
+                    holderFailure.error = error
+                }
+            }
+            holder.start()
+            var joined = false
+            func releaseAndJoin() {
+                guard !joined else { return }
+                joined = true
+                release.signal()
+                XCTAssertEqual(finished.wait(timeout: .now() + 30), .success, "The access holder must exit")
+            }
+            defer { releaseAndJoin() }
+            XCTAssertEqual(acquired.wait(timeout: .now() + 30), .success, "The holder must acquire uncontended access")
+
+            let contender = OverseerContinuityStore(databaseURL: url, profile: "test")
+            let operationID = UUID()
+            let mutation = OverseerContinuityMutation.grant(.init(kind: .scope, id: "live", payload: Data()))
+            XCTAssertThrowsError(try contender.commit(operationID: operationID, origin: "user", mutations: [mutation])) { error in
+                XCTAssertEqual(error as? OverseerContinuityError, .writerBusy)
+            }
+
+            releaseAndJoin()
+            XCTAssertNil(holderFailure.error)
+            XCTAssertNil(try contender.receipt(operationID: operationID), "A bounded busy failure must not leave a receipt")
+            XCTAssertEqual(try contender.rows(kind: .scope), [])
+            let receipt = try contender.commit(operationID: operationID, origin: "user", mutations: [mutation])
+            XCTAssertFalse(receipt.replayed)
+            XCTAssertEqual(try holderStore.receipt(operationID: operationID), receipt)
+            var replay = receipt
+            replay.replayed = true
+            XCTAssertEqual(try holderStore.commit(operationID: operationID, origin: "user", mutations: [mutation]), replay)
+            XCTAssertEqual(try holderStore.rows(kind: .scope).map(\.id), ["live"])
+        }
+    #endif
+
+    private final class HolderFailure: @unchecked Sendable {
+        var error: Error?
+    }
+
+    private static func parallelGrant(_ index: Int) -> OverseerContinuityMutation {
+        .grant(.init(kind: .scope, id: "row-\(index)", payload: Data()))
+    }
+
+    private static func overseerSchemaState(_ url: URL) throws -> (userVersion: Int64?, profiles: Int64?, operations: Int64?, epoch: String?) {
+        let db = try SessionCatalogDatabase(url: url, readOnly: true)
+        return try (
+            db.integer("PRAGMA user_version"),
+            db.integer("SELECT count(*) FROM profile_state"),
+            db.integer("SELECT count(*) FROM operations"),
+            db.rows("SELECT epoch FROM profile_state WHERE singleton=1") { try SessionCatalogDatabase.string($0) }.first
+        )
     }
 
     func testOverseerBusyFailureIsRetryableAndHasNoFalseReceipt() throws {

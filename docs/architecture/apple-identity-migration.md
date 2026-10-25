@@ -53,6 +53,27 @@ Draft creation, asset upload, and publication are reconciled by observation afte
 outcomes; existing bytes are never overwritten. A completed release is then audited anonymously,
 asset by asset, before it is accepted as the latest Tip release.
 
+## Tip history is not a migration ladder
+
+The separate signed `tip-history.json` catalog is a manual-reinstall archive, not an expansion of
+`appcast.xml` or its P → T → S predecessor authority. It reuses the existing Sparkle key with a
+history-only signature domain and leaves appcast rendering, feed URLs and Apple migration policy
+unchanged. Application catalog records bind to the exact rollout enclosure and final signed app
+manifest; T/package records have no history download action because their installer is upgrade-only.
+
+History acquisition must remain within the running official signing identity. Legacy/P → S requires
+the normal Check for Updates transition path; S → legacy/P is blocked in history even though
+maintainer-guided bridge recovery may be possible. The two bundle IDs have distinct defaults domains.
+Same-identity history writes no channel, automatic-check, pin/hold or migration preferences and makes
+no data-format compatibility or credential-migration promise. Admission/seed source audits must
+establish committed-bridge activation and passive-only update behavior; archive presence is not proof.
+
+Pipeline wiring is inactive until the separately reviewed admission/UI floors, activation tag,
+29-seed provenance/barrier audit and retention contract are provided. The known source floor candidate
+does not supply those remaining audits. See [the activation and recovery runbook](../releasing.md#tip-history-signing-activation-and-retention).
+An activated pipeline fails closed on missing catalogs rather than restarting a chain. Retaining a
+migration predecessor does not authorize arbitrary rollback or prove archive retention settings.
+
 ## Release ladder
 
 1. Ship a legacy-signed preparer (`P`) through the existing Sparkle path.

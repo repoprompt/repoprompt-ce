@@ -112,6 +112,10 @@ struct LicenseUpdatesSettingsView: View {
                     }
                 }
 
+                if sparkleManager.updateChannel == .tip, let history = sparkleManager.tipHistoryStore {
+                    TipBuildHistoryView(store: history, manager: sparkleManager)
+                }
+
                 Spacer()
             }
             .padding()

@@ -207,6 +207,34 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
         self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
 
+    def test_conductor_transports_execution_location_ui_smoke_env(self) -> None:
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        values = {
+            'REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT': '0.5',
+            'REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES': '2',
+        }
+        extra_key = 'REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_EXTRA'
+        cases = (
+            ('client overrides', values, None, values, 181.0),
+            ('unset defaults', {}, None, {}, 249.0),
+            ('direct request', {}, {**values, extra_key: 'ignored'}, values, 181.0),
+        )
+        for name, ambient, direct_env, expected_env, expected_timeout in cases:
+            with mock.patch.dict('os.environ', ambient, clear=True):
+                snapshot = registry.client_env_snapshot()
+                _, _, _, env, _ = registry.prepare({
+                    'operation': 'smoke', 'args': {'executionLocationUI': True},
+                    'env': snapshot if direct_env is None else direct_env,
+                })
+            with self.subTest(case=name, stage='snapshot'):
+                self.assertEqual(snapshot, ambient)
+            with self.subTest(case=name, stage='prepared env'):
+                self.assertNotIn(extra_key, env)
+                self.assertEqual(env, expected_env)
+            with self.subTest(case=name, stage='timeout'):
+                self.assertEqual(conductor.execution_location_ui_smoke_timeout(env),
+                                 expected_timeout)
+
     def test_enforced_ratchet_cleans_before_build(self) -> None:
         class BuildProcess:
             stdout = iter(['Build complete! (0.1s)\n'])

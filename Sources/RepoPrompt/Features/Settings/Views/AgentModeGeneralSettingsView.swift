@@ -174,6 +174,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providerCleanupActionCard
 
+            ProviderEnvironmentFilteringSettingsView(settings: globalSettings)
+
             codexHookApprovalStrictModeCard
 
             handoffInstructionsCard

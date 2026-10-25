@@ -35,6 +35,15 @@ enum UpdateChannel: String, CaseIterable, Identifiable {
         }
     }
 
+    var historyRepository: TipHistoryRepository? {
+        guard self == .tip else { return nil }
+        return TipHistoryRepository(feedURL: URL(string: feedURLString))
+    }
+
+    var historyCatalogURL: URL? {
+        historyRepository?.headURL
+    }
+
     static func load(defaults: UserDefaults = .standard) -> UpdateChannel {
         guard let rawValue = defaults.string(forKey: userDefaultsKey),
               let channel = UpdateChannel(rawValue: rawValue)
