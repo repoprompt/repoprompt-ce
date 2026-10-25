@@ -113,6 +113,9 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     var auth: Auth
     var modelBehavior: ModelBehavior
     var updatedAt: Date?
+    /// Nil preserves the backend/Claude Code default; overrides use provider-validated ranges.
+    var requestTimeoutMilliseconds: Int?
+    var contextWindowTokens: Int?
     var httpCredentialConsentEndpoint: String? = nil
 
     var normalizedDisplayName: String {
@@ -136,7 +139,9 @@ struct ClaudeCodeCompatibleBackendConfig: Codable, Equatable {
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true

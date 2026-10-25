@@ -39,6 +39,7 @@ final class ProviderEndpointConsentTests: XCTestCase {
                 baseURL: endpoint,
                 auth: .anthropicAuthToken,
                 modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil, contextWindowTokens: nil,
                 httpCredentialConsentEndpoint: intendedEndpoint
             ).normalized
             let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "test-only-token")
@@ -72,6 +73,7 @@ final class ProviderEndpointConsentTests: XCTestCase {
                 baseURL: endpoint,
                 auth: .anthropicAuthToken,
                 modelBehavior: .claudeSlotMapping(.init(haiku: "h", sonnet: "s", opus: "o")),
+                requestTimeoutMilliseconds: 600_000, contextWindowTokens: 262_144,
                 httpCredentialConsentEndpoint: consent
             )
         }
@@ -83,12 +85,14 @@ final class ProviderEndpointConsentTests: XCTestCase {
         let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: approved, apiKey: "test-only-token")
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], endpoint)
         XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "test-only-token")
+        XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
+        XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
         XCTAssertThrowsError(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config("http://other.example/anthropic", consent: endpoint), apiKey: "test-only-token"))
         XCTAssertNoThrow(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config("http://127.0.0.1:8080/anthropic"), apiKey: "test-only-token"))
     }
 
     func testLegacyClaudeConfigDoesNotAcquireConsentOnDecode() throws {
-        let config = ClaudeCompatibleBackendConfig(id: .custom, isEnabled: true, displayName: "Test", baseURL: "http://provider.example", auth: .anthropicAPIKey, modelBehavior: .noModel)
+        let config = ClaudeCompatibleBackendConfig(id: .custom, isEnabled: true, displayName: "Test", baseURL: "http://provider.example", auth: .anthropicAPIKey, modelBehavior: .noModel, requestTimeoutMilliseconds: nil, contextWindowTokens: nil)
         let data = try JSONEncoder().encode(config)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         object.removeValue(forKey: "httpCredentialConsentEndpoint")

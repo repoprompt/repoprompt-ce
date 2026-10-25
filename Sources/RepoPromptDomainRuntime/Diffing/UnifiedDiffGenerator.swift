@@ -267,15 +267,6 @@ package enum UnifiedDiffGenerator {
                         currentLines.append(contentsOf: leading)
                         contextBuffer.removeFirst(leading.count)
                         flushHunk()
-
-                        // seed next hunk with trailing context
-                        let trailing = contextBuffer.suffix(context)
-                        currentLines = Array(trailing)
-                        // The new hunk starts at the first line in the trailing context
-                        // oldIndex is currently at the end of this equal block
-                        // We need to go back to where the trailing context starts
-                        currentStart = oldIndex - trailing.count + 1
-                        contextBuffer.removeAll()
                     } else if !hunkHasChange(currentLines) {
                         // Before first change - keep only the last `context` lines
                         let toKeep = min(context, contextBuffer.count)

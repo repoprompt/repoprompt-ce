@@ -43,6 +43,73 @@ struct WorkspaceGitDiffArtifactSelectionService {
 }
 
 extension MCPServerViewModel {
+    @MainActor
+    func selectCreatedFile(
+        _ file: WorkspaceFileRecord?,
+        resolvedContext: MCPResolvedTabContextSnapshot,
+        metadata: MCPRequestMetadata,
+        lookupContext: WorkspaceLookupContext
+    ) async -> String? {
+        let warning = "The file was created, but its selection was not confirmed. Retry manage_selection for the same context_id."
+        let context = resolvedContext.snapshot
+        guard !Task.isCancelled,
+              let file,
+              let workspaceID = context.workspaceID,
+              let selectionCoordinator
+        else { return warning }
+
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        let connectionID = fileToolAuthorityConnectionID(metadata: metadata, routed: resolvedContext)
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: context.activeAgentSessionID,
+            worktreeBindingState: context.worktreeBindingState
+        )
+        let addedPaths = lookupContext.logicalizeSelection(
+            StoredSelection(selectedPaths: [file.standardizedFullPath])
+        ).selectedPaths
+        var accepted = false
+        guard let transaction = await selectionCoordinator.transformSelection(
+            for: identity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty,
+            { latestSelection in
+                guard !Task.isCancelled,
+                      fileToolLookupSnapshotIsCurrent(context, connectionID: connectionID),
+                      fileToolBindingSourceIsCurrent(source, for: context)
+                else { return latestSelection }
+                accepted = true
+                return mutatePreResolvedFullFilePaths(
+                    base: latestSelection,
+                    absolutePaths: addedPaths,
+                    mode: .add
+                )
+            }
+        ), accepted,
+        let canonical = selectionCoordinator.selectionSnapshot(
+            for: identity,
+            flushPendingUIIfActive: false
+        )?.selection
+        else { return warning }
+
+        let canonicalPaths = Set(StoredSelectionPathNormalization.standardizedPaths(canonical.selectedPaths))
+        guard addedPaths.allSatisfy({ canonicalPaths.contains($0) && canonical.slices[$0] == nil }) else {
+            return warning
+        }
+
+        if let connectionID,
+           var latest = tabContextByConnectionID[connectionID],
+           fileToolLookupSnapshotMatches(latest, context)
+        {
+            latest.selection = canonical
+            latest.selectionRevision = workspaceManager?.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: context.tabID
+            ) ?? transaction.revision
+            tabContextByConnectionID[connectionID] = latest
+        }
+        return nil
+    }
+
     /// Result of building a stored selection
     struct BuildStoredSelectionResult {
         let selection: StoredSelection

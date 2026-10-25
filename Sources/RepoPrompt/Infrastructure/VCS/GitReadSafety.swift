@@ -98,19 +98,28 @@ enum GitReadSafety {
     /// Git config errors may echo arbitrary config values and paths. Preserve
     /// known failure categories/line numbers, never those untrusted payloads.
     static func driverQueryFailure(exitCode: Int32, stderr: Data) -> String {
+        let detail = redactedFailureDetail(stderr)
+        return "Git inspection could not validate driver configuration (git config exit \(exitCode)): \(detail). Check the repository's Git configuration with Git outside RepoPrompt."
+    }
+
+    static func ownershipProbeFailure(exitCode: Int32, stderr: Data) -> String {
+        let detail = redactedFailureDetail(stderr)
+        return "Git inspection could not validate repository ownership (Git ownership probe exit \(exitCode)): \(detail). Check the repository with Git outside RepoPrompt."
+    }
+
+    private static func redactedFailureDetail(_ stderr: Data) -> String {
         let input = String(decoding: stderr.prefix(4096), as: UTF8.self)
         let diagnostics = input.split(whereSeparator: \.isNewline).prefix(4).map { line -> String in
             let text = String(line)
             if let range = text.range(of: #"bad config line [0-9]+"#, options: .regularExpression) {
                 return String(text[range]) + " in file <redacted>"
             }
-            for category in ["unable to read config file", "exceeded maximum include depth", "invalid key", "invalid config"] where text.contains(category) {
+            for category in ["unable to read config file", "exceeded maximum include depth", "invalid key", "invalid config", "detected dubious ownership"] where text.contains(category) {
                 return category + " <redacted>"
             }
             return "<redacted Git diagnostic>"
         }
-        let detail = diagnostics.isEmpty ? "no diagnostic output" : diagnostics.joined(separator: "; ")
-        return "Git inspection could not validate driver configuration (git config exit \(exitCode)): \(detail). Check the repository's Git configuration with Git outside RepoPrompt."
+        return diagnostics.isEmpty ? "no diagnostic output" : diagnostics.joined(separator: "; ")
     }
 
     static func environment(_ environment: [String: String]) -> [String: String] {

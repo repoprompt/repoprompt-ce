@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 
 /// The agent-only `session_admin` MCP surface.
 ///
@@ -179,7 +180,7 @@ struct SessionAdminMCPToolService {
             if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
                 // The requested scope may be narrower than the authority that actually settled it.
                 // Keep the proposal separate so it cannot be mistaken for the covering grant.
-                let scope = Self.scopeValue(record, now: now())
+                let scope = Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))
                 var requestedScope: [String: Value] = [:]
                 for key in ["kind", "capabilities", "guardrails"] {
                     requestedScope[key] = value[key]
@@ -235,8 +236,8 @@ struct SessionAdminMCPToolService {
             }
             var value = Self.requestValue(request)
             value["result"] = .string(request.state.label)
-            if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
-                value["scope"] = Self.scopeValue(record, now: now())
+            if case let .granted(scopeID) = request.state, let record = runtime.statusRecord(id: scopeID) {
+                value["scope"] = Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))
             }
             return Self.withScopeAvailability(value, runtime: runtime)
         }
@@ -244,16 +245,16 @@ struct SessionAdminMCPToolService {
             return Self.withScopeAvailability(["result": .string("scope_authority_unavailable")], runtime: runtime)
         }
         if let scopeID = try Self.parseUUID(args["scope_id"], field: "scope_id") {
-            guard let record = runtime.record(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
+            guard let record = runtime.statusRecord(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
                 throw Self.unavailableError
             }
-            return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now())], runtime: runtime)
+            return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))], runtime: runtime)
         }
         let scopes = runtime.scopes(grantedTo: callerSessionID)
         return Self.withScopeAvailability([
             "result": .string("ok"),
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
-            "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) }),
+            "scopes": .array(scopes.map { Self.scopeValue($0, now: now(), ending: runtime.ending(for: $0.id)) }),
             "operation_catalog": Self.operationCatalog(),
             "guidance": .string("Capabilities describe authority, not tool discovery. For a one-target task, become_overseer with session_id and optional message requests exactly the needed capabilities and continues automatically after approval, without waiting for catalog refresh. Other catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
         ], runtime: runtime)
@@ -633,7 +634,7 @@ struct SessionAdminMCPToolService {
         return value
     }
 
-    static func scopeValue(_ record: DomainDelegationScopeRecord, now: Date) -> Value {
+    static func scopeValue(_ record: DomainDelegationScopeRecord, now: Date, ending: OverseerScopeEnding? = nil) -> Value {
         let expired = record.isActive && record.grant.guardrails.isExpired(at: now)
         var value: [String: Value] = [
             "scope_id": .string(record.id.uuidString),
@@ -643,6 +644,17 @@ struct SessionAdminMCPToolService {
             "capabilities": capabilitiesValue(record.grant.capabilities),
             "guardrails": record.grant.unrestricted ? .object([:]) : guardrailsValue(record.grant.guardrails)
         ]
+        if let ending {
+            var evidence: [String: Value] = ["reason": .string(ending.reason.rawValue)]
+            if let at = ending.at { evidence["at"] = .string(ISO8601DateFormatter().string(from: at)) }
+            if let actor = ending.actorSessionID, actor == record.grant.granteeSessionID { evidence["actor_session_id"] = .string(actor.uuidString) }
+            if let origin = ending.originatingScopeID { evidence["originating_scope_id"] = .string(origin.uuidString) }
+            if let session = ending.originatingSessionID, session == record.grant.granteeSessionID { evidence["originating_session_id"] = .string(session.uuidString) }
+            evidence["initiator"] = .string(ending.initiator)
+            if let origin = ending.deletionOrigin { evidence["deletion_origin"] = .string(origin.rawValue) }
+            if let removed = ending.fileRemoved { evidence["file_removed"] = .bool(removed) }
+            value["ending"] = .object(evidence)
+        }
         switch record.grant.kind {
         case let .session(target):
             value["target_session_id"] = .string(target.uuidString)

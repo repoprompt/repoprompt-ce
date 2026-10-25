@@ -39,7 +39,14 @@ final class PathSearchIndex: @unchecked Sendable {
     init(paths: [String]) {
         originalPaths = paths
         filenames = paths.map { path in
-            URL(fileURLWithPath: path).lastPathComponent
+            // Candidate filename metadata preserves original bytes; the matcher uses the original keys.
+            let bytes = path.utf8
+            let start = bytes.lastIndex(of: 0x2F).map { bytes.index(after: $0) } ?? bytes.startIndex
+            let filename = String(decoding: bytes[start...], as: UTF8.self)
+            guard !filename.isEmpty, filename != ".", filename != ".." else {
+                return URL(fileURLWithPath: path).lastPathComponent
+            }
+            return filename
         }
 
         guard !paths.isEmpty else {
