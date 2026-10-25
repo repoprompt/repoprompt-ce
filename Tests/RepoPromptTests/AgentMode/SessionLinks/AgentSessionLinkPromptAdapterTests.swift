@@ -2691,10 +2691,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     await manager.removeConnection(connectionID)
                 }
             }
-            // Hold either terminal commitment BEFORE removal, or removal BEFORE mapping cleanup.
+            // Hold either transport termination (after termination commits its removal owner) or removal
+            // BEFORE mapping cleanup. Both intervals are already inside the committed removal.
             await removalGate.waitUntilEntered()
             let removalHasBegun = await manager.debugHasConnectionRemovalOperation(for: connectionID)
-            XCTAssertEqual(removalHasBegun, !pauseTermination)
+            XCTAssertTrue(removalHasBegun, "Removal must be committed before transport termination is observable")
             XCTAssertTrue(server.hasCurrentRunRouteMapping(
                 runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
             ), "retained mappings must reproduce the unsafe cleanup interval")

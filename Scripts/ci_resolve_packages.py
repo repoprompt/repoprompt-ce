@@ -4,76 +4,56 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import os
 import signal
 import subprocess
 import time
-
-
-def session_process_groups(session_id: int) -> set[int]:
-    try:
-        listing = subprocess.run(
-            ['ps', '-U', str(os.getuid()), '-o', 'pid=,stat='],
-            check=True, capture_output=True, text=True, timeout=5,
-        )
-    except subprocess.SubprocessError as error:
-        raise RuntimeError('Cannot inventory dependency attempt processes; refusing to retry') from error
-    groups = set()
-    for line in listing.stdout.splitlines():
-        raw_pid, state = line.split(maxsplit=1)
-        if state.startswith('Z'):
-            continue
-        pid = int(raw_pid)
-        try:
-            if os.getsid(pid) == session_id:
-                groups.add(os.getpgid(pid))
-        except ProcessLookupError:
-            pass
-    return groups
+from ci_process_session import defer_cancellation_during_cleanup, terminate_session
 
 
 def terminate_resolution(process: subprocess.Popen) -> None:
-    # Swift's Process creates a new process group for Git children. They remain
-    # in this attempt's private session, even after their parent has exited.
-    for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 1)):
-        deadline = None
-        while True:
-            process.poll()
-            groups = session_process_groups(process.pid)
-            if not groups:
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired as error:
-                    raise RuntimeError('Dependency launcher has not exited; refusing to retry') from error
-                return
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            for group in groups:
-                try:
-                    os.killpg(group, sig)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    # Darwin may report EPERM for a group emptied since the scan.
-                    if group in session_process_groups(process.pid):
-                        raise
-            if deadline is None:
-                # Inventory can take longer than the kill grace. Start the clock
-                # after signaling, then always inventory again to confirm exit.
-                deadline = time.monotonic() + grace
-            time.sleep(0.05)
-    raise RuntimeError('Dependency attempt still has live processes; refusing to retry')
+    terminate_session(process)
 
 
 def run_resolution(command, *, cwd, check, timeout):
-    process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    process = None
+    pending_cancellation = None
+    timeout_error = None
+
+    def cancel_resolution(signum, _frame):
+        nonlocal pending_cancellation
+        if pending_cancellation is None:
+            pending_cancellation = signum
+        # Popen may already have launched the child without returning its handle.
+        # Defer until ownership is recorded; masking here would also mask the child.
+        if process is not None:
+            if pending_cancellation == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + pending_cancellation)
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
     try:
-        status = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        terminate_resolution(process)
-        raise
-    if status:
-        terminate_resolution(process)
+        signal.signal(signal.SIGTERM, cancel_resolution)
+        signal.signal(signal.SIGINT, cancel_resolution)
+        process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+        if pending_cancellation is not None:
+            cancel_resolution(pending_cancellation, None)
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # A timeout is retryable only after cleanup. A first cancellation
+            # during that cleanup must abort instead of being hidden by this error.
+            timeout_error = error
+    finally:
+        try:
+            if process is not None:
+                with defer_cancellation_during_cleanup():
+                    terminate_resolution(process)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    if timeout_error is not None:
+        raise timeout_error
     return subprocess.CompletedProcess(command, status)
 
 
