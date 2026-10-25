@@ -220,6 +220,8 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
         registerHUDShortcut(.showCurrentWindowAgentNavigationHUD, mode: .currentWindow)
         registerHUDShortcut(.showAllAgentsNavigationHUD, mode: .allAgents)
+        register(.showAgentModelPicker) { [weak self] in self?.showAgentModelPicker() }
+        register(.showAgentEffortPicker) { [weak self] in self?.showAgentEffortPicker() }
     }
 
     private func startNewAgentSessionFromShortcut() {
@@ -304,11 +306,31 @@ final class GlobalKeyboardShortcutsCoordinator {
             AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
             AgentNavigationHUDNotificationUserInfoKey.mode: mode.rawValue
         ]
-        if let eventTimestamp { userInfo[AgentNavigationHUDNotificationUserInfoKey.eventTimestamp] = eventTimestamp }
+        if let eventTimestamp {
+            userInfo[AgentNavigationHUDNotificationUserInfoKey.eventTimestamp] = eventTimestamp
+        }
         NotificationCenter.default.post(
             name: .showAgentNavigationHUD,
             object: nil,
             userInfo: userInfo
+        )
+    }
+
+    private func showAgentModelPicker() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentModelPicker,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func showAgentEffortPicker() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentEffortPicker,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
         )
     }
 }

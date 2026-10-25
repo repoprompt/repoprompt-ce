@@ -323,8 +323,12 @@ struct AgentComposerProps: Equatable {
     /// Auto Effort status is informational; users can still choose the fallback effort.
     var manualEffortControl: ManualEffortControl? {
         guard hasAvailableAgentProviders, !isGlobalModelRouterControllingFreshTask else { return nil }
-        if selectedAgent == .codexExec { return .codex }
-        if selectedAgent.usesClaudeTooling, providerControls?.claudeTools != nil { return .claude }
+        if selectedAgent == .codexExec {
+            return .codex
+        }
+        if selectedAgent.usesClaudeTooling, providerControls?.claudeTools != nil {
+            return .claude
+        }
         return nil
     }
 
@@ -353,6 +357,7 @@ struct AgentComposerProps: Equatable {
     var selectedModelDisplayName: String
     var selectedReasoningEffortRaw: String?
     var selectedReasoningEffortDisplayName: String
+    let codexReasoningEffortOptions: [CodexReasoningEffort]
     var acpModelParameterControls: [AgentComposerModelParameterControlProps]
     let availableAgents: [AgentProviderKind]
     let isProviderPickerLockedForCurrentTab: Bool
@@ -390,6 +395,7 @@ struct AgentComposerProps: Equatable {
         selectedModelDisplayName: AgentModel.defaultModel.displayName,
         selectedReasoningEffortRaw: nil,
         selectedReasoningEffortDisplayName: "",
+        codexReasoningEffortOptions: [],
         acpModelParameterControls: [],
         availableAgents: [],
         isProviderPickerLockedForCurrentTab: false,
