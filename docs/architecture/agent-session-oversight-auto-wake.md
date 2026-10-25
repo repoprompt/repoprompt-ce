@@ -419,6 +419,22 @@ acquisition and cancelled-before-dispatch tombstones remain independent hard gat
 failure still refuses or uses the existing bounded route recovery. Unknown, absent or stale tool names
 are not route failures and never trigger send-time controller recycling.
 
+The one permitted wait is on the route token itself, and only for a Claude controller the same send
+just launched (a fresh start after an app restart, or a recovery replacement): its `repoprompt-mcp`
+child may not yet have connected, passed the PID gate and admission, and committed the run mapping.
+`ServerNetworkManager.awaitAuthoritativeRunCatalogRouteToken` re-runs the strict token query, waking
+on a per-run route-change pulse (route commit, run mapping, cleanup/revoke) with a short poll as
+backstop; it never consults catalogs or the weaker `MCPRoutingWaiter` routed flag. The wait is bounded
+(about 10 s per controller, 15 s per send), abandoned as soon as the send's intent or controller
+ownership is lost, and a timed-out wait recycles at most once. A reused controller with a missing
+route still recycles immediately, and steering still fails closed with no wait and no recycle. Every
+route-recovery recycle re-arms the run's one-shot admission policy through the run's bootstrap lease
+(`MCPBootstrapLease.reinstallPolicyForReplacementProcess`), because the retired process's child
+consumed the original. When an initial run send is still refused (`[route:*]`, nothing dispatched),
+only the exact user row identified by its submission producer is withdrawn and its text restored to an
+empty composer, as Codex already does. Rowless Auto-wake and maintenance starts never infer a rollback
+row from transcript history, even if the last historical user row is unanswered.
+
 Prompt carry and wake admission read exact published membership and the claim epoch, not catalog
 freshness. Required rendered content, current authority, budget and provider acceptance still own
 claims/receipts; catalog refresh cannot acknowledge them. ACP's existing route/startup and dispatch
@@ -756,6 +772,10 @@ endpoints, the workspace, and admission synchronously; a run that settled during
 refused as `target_busy` rather than started from a deferred path.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
+ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
+response fails after the write (including Stop shutting down the transport), the batch is not
+restored or requeued, its transcript rows remain, and managed sinks settle as unconfirmed. A write
+alone is not proof of provider acceptance or successful completion.
 
 The provider sees a RepoPrompt-authored envelope with `delegation="user_delegated_management"`:
 direction from the user's delegated overseer, to be followed within the session's workspace and

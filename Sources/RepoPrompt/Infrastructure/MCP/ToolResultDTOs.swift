@@ -320,6 +320,7 @@ enum ToolResultDTOs {
         enum IndexState: String, Codable {
             case complete
             case indexing
+            case stopped
         }
 
         enum UnresolvedReason: String, Codable {
@@ -346,6 +347,9 @@ enum ToolResultDTOs {
             let state: IndexState
             let indexed: UInt64
             let total: UInt64
+            var reason: String?
+            var attempted: Int?
+            var limit: Int?
         }
 
         struct SeedDTO: Codable, Equatable {

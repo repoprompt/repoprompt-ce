@@ -99,6 +99,38 @@ When the provider package is later moved to its own repository, the plan is:
 
 The remote-by-default policy avoids breaking checkouts that do not have a sibling clone, while still giving contributors a low-friction local edit workflow.
 
+## Optional provider environment filtering
+
+Settings → Agent Mode → Overview exposes a name-only opt-in mitigation. By default the
+withhold and pass-through lists are empty: existing native authentication, dynamic backend
+selection, and toolchain environment behavior are unchanged. No backend is inferred from
+an optional model string.
+
+- **Withhold ambient names** applies globally to new app-managed provider processes,
+  including ACP sessions, native Claude/Codex, CLI probes, and headless launches.
+- **Pass-through exceptions** let a specific provider retain selected withheld ambient
+  names. Names are exact and case-sensitive POSIX identifiers; values and wildcards are
+  not accepted. Only names are persisted, and credential values are not inspected or logged.
+- Filtering runs after ambient/login-shell reconstruction. Explicit app-owned launch
+  additions and per-invocation overrides retain their existing precedence. Copied ambient
+  snapshots are not treated as explicit credentials. Dynamic-loader and caller-declared
+  sanitizer removals still win, even over explicit overrides or pass-through exceptions.
+- Changes apply on the next covered provider process launch, not to already-running
+  sessions. Interactive user terminals and generic tool runners do not opt into this policy.
+  Synchronous installation/provisioning runtime-identity checks and provider-managed
+  subprocesses remain outside this app-managed policy; it is not a global process filter.
+
+This is **partial, opt-in mitigation**, not closed least privilege or credential-file
+sandboxing. Users must choose the names relevant to their environment; withholding a
+required name can break authentication or provider tools. A same-user child can still
+access credential files, native settings, shell profiles, and other capabilities. Provider
+configuration can independently supply credentials. The policy deliberately does not
+attempt to resolve every native backend/auth contract or constrain dynamic model changes.
+
+The settings live as optional fields in the existing raw-preserving global Agent Mode
+settings document. Unknown sibling fields and unknown provider exception entries survive
+edits; leaving the feature unconfigured emits no new filtering fields.
+
 ## Core vs plugin ownership
 
 | Concern | Owner |

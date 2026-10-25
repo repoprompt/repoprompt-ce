@@ -20,6 +20,8 @@ struct AgentModelOption: Identifiable, Hashable {
     let defaultReasoningEffort: CodexReasoningEffort?
     let defaultReasoningEffortRawValue: String?
     let effortVariant: AgentModelEffortVariant?
+    /// Provider-reported model capacity, when advertised (not a local fallback).
+    let contextWindowTokens: Int?
 
     init(
         rawValue: String,
@@ -31,7 +33,8 @@ struct AgentModelOption: Identifiable, Hashable {
         supportedReasoningEffortRawValues: [String] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil,
         defaultReasoningEffortRawValue: String? = nil,
-        effortVariant: AgentModelEffortVariant? = nil
+        effortVariant: AgentModelEffortVariant? = nil,
+        contextWindowTokens: Int? = nil
     ) {
         self.rawValue = rawValue
         self.displayName = displayName
@@ -43,6 +46,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.defaultReasoningEffortRawValue = defaultReasoningEffortRawValue
         self.effortVariant = effortVariant
+        self.contextWindowTokens = contextWindowTokens.flatMap { $0 > 0 ? $0 : nil }
     }
 
     init(
@@ -54,7 +58,8 @@ struct AgentModelOption: Identifiable, Hashable {
         supportedReasoningEffortRawValues: [String] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil,
         defaultReasoningEffortRawValue: String? = nil,
-        effortVariant: AgentModelEffortVariant? = nil
+        effortVariant: AgentModelEffortVariant? = nil,
+        contextWindowTokens: Int? = nil
     ) {
         let isPlaceholder =
             rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
@@ -68,6 +73,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.defaultReasoningEffortRawValue = defaultReasoningEffortRawValue
         self.effortVariant = effortVariant
+        self.contextWindowTokens = contextWindowTokens.flatMap { $0 > 0 ? $0 : nil }
     }
 
     var isDefault: Bool {

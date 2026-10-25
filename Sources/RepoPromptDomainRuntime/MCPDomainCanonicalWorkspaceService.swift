@@ -81,9 +81,11 @@ package struct DomainCanonicalWorkspaceAdapter {
 /// mutation admission, and response shapes are owned here.
 package struct MCPDomainCanonicalWorkspaceService {
     private let adapter: DomainCanonicalWorkspaceAdapter
+    private let fileReadSlotDirectory: URL?
 
-    package init(adapter: DomainCanonicalWorkspaceAdapter) {
+    package init(adapter: DomainCanonicalWorkspaceAdapter, fileReadSlotDirectory: URL? = nil) {
         self.adapter = adapter
+        self.fileReadSlotDirectory = fileReadSlotDirectory
     }
 
     package func mutateSelection(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -175,21 +177,18 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("missing path")
         }
         let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let lines = text.components(separatedBy: .newlines)
-        let start = args["start_line"]?.intValue
-        let limit = args["limit"]?.intValue
-        let selected: ArraySlice<String>
-        if let start, start < 0 {
-            selected = lines.suffix(min(lines.count, abs(start)))
-        } else if let start {
-            let index = max(0, start - 1)
-            guard index < lines.count else { return try .mcp(.string("")) }
-            selected = lines[index ..< min(lines.count, index + max(0, limit ?? lines.count))]
-        } else {
-            selected = lines[...]
+        do {
+            let text = try await MCPDomainHeadlessFileReader.read(
+                at: url,
+                startLine: args["start_line"]?.intValue,
+                limit: args["limit"]?.intValue,
+                slotDirectory: fileReadSlotDirectory
+            )
+            return try .mcp(.string(text))
+        } catch let error as POSIXError {
+            // Tool errors describe the requested operation, not hidden physical aliases.
+            throw MCPError.invalidParams("Cannot read requested file (POSIX \(error.code.rawValue): \(String(cString: strerror(error.code.rawValue))))")
         }
-        return try .mcp(.string(selected.joined(separator: "\n")))
     }
 
     package func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {

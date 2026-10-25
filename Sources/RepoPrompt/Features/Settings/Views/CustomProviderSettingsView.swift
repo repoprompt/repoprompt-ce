@@ -59,6 +59,18 @@ struct CustomProviderSettingsView: View {
             TextField("Provider URL", text: $viewModel.customProviderURL)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
 
+            ProviderHTTPConsentView(endpoint: viewModel.customProviderConsentURL, consentEndpoint: Binding(
+                get: { viewModel.customProviderHTTPConsentEndpoint },
+                set: { endpoint in
+                    do { try viewModel.setCustomProviderHTTPConsent(endpoint) }
+                    catch {
+                        alertMessage = "Could not update HTTP consent: \(error.localizedDescription)"
+                        showAlert = true
+                    }
+                }
+            ))
+            .disabled(isValidating)
+
             SecureField("API Key", text: $viewModel.customProviderApiKey)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
 
