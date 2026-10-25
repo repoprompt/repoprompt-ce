@@ -4228,8 +4228,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var committedWorkspaceSwitchOperationID: UUID?
     private var recoveringWorkspaceSwitchOperationID: UUID?
     private var rootsUnloadedWorkspaceSwitchOperationID: UUID?
-    private var postSwitchGitDataLoadTask: Task<Void, Never>?
-    private var postSwitchGitDataLoadToken: UUID?
+    /// Cancelled loads remain owned until their exact root cleanup completes.
+    private var postSwitchGitDataLoadTasks: [UUID: Task<Void, Never>] = [:]
     var isRefreshing: Bool = false
     private var rootRefreshOperationID: UUID?
     // Tracked reload tasks and tokens
@@ -5093,6 +5093,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             tasks.forEach { $0.cancel() }
         }
         postCatalogRootWorkTasks.removeAll()
+        postSwitchGitDataLoadTasks.values.forEach { $0.cancel() }
     }
 
     func prepareForWindowClose() {
@@ -5124,8 +5125,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         pendingPersistentWorkspacePublications.removeAll()
         pendingPersistentWorkspaceCreationsByWorkspaceID.removeAll()
         pendingSystemWorkspaceCreationTasks.removeAll()
-        postSwitchGitDataLoadTask?.cancel()
-        postSwitchGitDataLoadTask = nil
+        postSwitchGitDataLoadTasks.values.forEach { $0.cancel() }
         for tasks in postCatalogRootWorkTasks.values {
             tasks.forEach { $0.cancel() }
         }
@@ -7217,9 +7217,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let signpost = WorkspaceExitPerf.begin("switchWorkspace")
         defer { WorkspaceExitPerf.end("switchWorkspace", signpost) }
 
-        postSwitchGitDataLoadTask?.cancel()
-        postSwitchGitDataLoadTask = nil
-        postSwitchGitDataLoadToken = nil
+        postSwitchGitDataLoadTasks.values.forEach { $0.cancel() }
         stopPollTimer()
         if shouldShowWorkspaceSwitchOverlay(for: newWorkspace) {
             showWorkspaceSwitchOverlay(for: newWorkspace)
@@ -7843,25 +7841,34 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     #if DEBUG
-        /// Test support: awaits completion of any pending post-switch git-data load.
-        /// Returns immediately if no task is active (already completed or not scheduled).
+        var postSwitchGitDataLoadShutdownWillJoinForTesting: ((Int) -> Void)?
+
+        /// Test support: joins active loads and cancelled predecessors that still own cleanup.
         func waitUntilPostSwitchGitDataLoadComplete() async {
-            await postSwitchGitDataLoadTask?.value
+            await awaitPostSwitchGitDataLoadShutdown()
         }
     #endif
 
+    /// Closing prevents new admission before this snapshot, so every owned load is joined.
+    func awaitPostSwitchGitDataLoadShutdown() async {
+        let tasks = Array(postSwitchGitDataLoadTasks.values)
+        #if DEBUG
+            postSwitchGitDataLoadShutdownWillJoinForTesting?(tasks.count)
+        #endif
+        for task in tasks {
+            await task.value
+        }
+    }
+
     private func schedulePostSwitchGitDataLoad(for workspace: WorkspaceModel, reason: String) {
+        guard !isPreparingForWindowClose else { return }
         let token = UUID()
-        postSwitchGitDataLoadToken = token
         let workspaceID = workspace.id
-        postSwitchGitDataLoadTask = Task { @MainActor [weak self] in
+        postSwitchGitDataLoadTasks[token] = Task { @MainActor [weak self] in
             await Task.yield()
             guard let self else { return }
             defer {
-                if self.postSwitchGitDataLoadToken == token {
-                    self.postSwitchGitDataLoadTask = nil
-                    self.postSwitchGitDataLoadToken = nil
-                }
+                self.postSwitchGitDataLoadTasks.removeValue(forKey: token)
             }
             await ensureGitDataRootLoadedForActiveWorkspace(
                 reason: reason,
@@ -7912,7 +7919,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
         }
 
-        guard !Task.isCancelled else {
+        guard !isPreparingForWindowClose, !Task.isCancelled else {
             outcome = "cancelled"
             return
         }

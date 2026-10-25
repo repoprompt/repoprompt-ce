@@ -8,6 +8,16 @@ import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
+#if DEBUG
+    enum WorkspaceCodemapDebugReadContext {
+        // UUID payloads must use the boxed task-local to avoid the back-deployed runtime bug (#1039).
+        static let manifestWriterIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
+        static var manifestWriterID: UUID? {
+            manifestWriterIDTaskLocal.get()
+        }
+    }
+#endif
+
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.
 ///
 /// One injected instance can own bounded sessions for many roots. It deliberately owns no source
@@ -8708,8 +8718,13 @@ actor WorkspaceCodemapBindingEngine {
         while !Task.isCancelled {
             #if DEBUG
                 debugManifestWriterPhase(writerID: writerID, phase: "checking_enabled")
+                let publicationIsEnabled = await WorkspaceCodemapDebugReadContext.manifestWriterIDTaskLocal.withValue(writerID) {
+                    await manifestPublicationIsEnabled()
+                }
+            #else
+                let publicationIsEnabled = await manifestPublicationIsEnabled()
             #endif
-            guard await manifestPublicationIsEnabled() else {
+            guard publicationIsEnabled else {
                 // The setting read suspends. A cancelled predecessor must not tear down an
                 // OFF-era replacement that now owns this namespace.
                 guard let writer = manifestWriters[namespace], writer.writerID == writerID else { return }

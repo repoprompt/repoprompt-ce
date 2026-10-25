@@ -2884,6 +2884,7 @@ class WindowState: ObservableObject {
         beginClose()
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
+        await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
         await promptManager.awaitInitialModelRefreshCompletion()
         // Finish this window's own saves (including the final `onDisappear` capture) before any
         // teardown step can stop the presentation that owns them (#1089).
