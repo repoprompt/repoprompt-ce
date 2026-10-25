@@ -63,6 +63,16 @@ package final class OverseerContinuityStore: @unchecked Sendable {
         guard Self.accessLock.lock(before: Date().addingTimeInterval(0.25)) else { throw OverseerContinuityError.writerBusy }
     }
 
+    #if DEBUG
+        /// Test-only: runs `body` while holding the existing process-local access ordering, acquired
+        /// through the same bounded admission as every store operation. Opens no database.
+        package func withAccessHeldForTesting<T>(_ body: () throws -> T) throws -> T {
+            try acquireAccess()
+            defer { Self.accessLock.unlock() }
+            return try body()
+        }
+    #endif
+
     private func connection() throws -> SessionCatalogDatabase {
         guard databaseURL.isFileURL, !profile.isEmpty else { throw OverseerContinuityError.unsafeLocation }
         let parent = databaseURL.deletingLastPathComponent()
