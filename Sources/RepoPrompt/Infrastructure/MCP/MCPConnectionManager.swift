@@ -7834,6 +7834,20 @@ actor ServerNetworkManager {
             log.warning("terminateConnection: connection \(id) not found in connections dictionary")
             return
         }
+        // Registered connections always acquire their lifecycle generation before yielding.
+        // Revoke admission before transport closure becomes observable to a reentrant caller.
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("terminateConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("terminateConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
 
         let sem = semanticsOverride ?? defaultSemantics(for: reason)
         let sessionToken = capabilityTokenByConnection[id] ?? connection.capabilityToken
@@ -7876,8 +7890,10 @@ actor ServerNetworkManager {
         // 3. Terminate the connection (writes "killed" to meta.json for filesystem)
         await connection.terminate(reason: reason, message: message)
 
-        // 4. Clean up connection state
-        await removeConnection(id, context: closeContext)
+        // 4. Finish the same removal owner committed before transport termination.
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: false, context: closeContext
+        )
 
         connectionLog("Successfully terminated and removed connection \(id)")
 

@@ -7,6 +7,40 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPConnectionRemovalCompletionTests: XCTestCase {
+        func testTerminationRevokesApprovalLivenessBeforeTransportCloseCompletes() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            let gate = RemovalGate()
+            let entered = expectation(description: "termination paused before transport close completes")
+            let connection = RemovalTestConnection(onTerminate: {
+                entered.fulfill()
+                await gate.wait()
+            })
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: connection, pendingClientID: "termination-liveness-test"
+            )
+            let initiallyLive = await manager.isConnectionLiveForApproval(id)
+            XCTAssertTrue(initiallyLive)
+
+            let termination = Task {
+                await manager.terminateConnection(id, reason: .approvalDenied, message: "Denied by user")
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            let liveDuringTermination = await manager.isConnectionLiveForApproval(id)
+            XCTAssertFalse(liveDuringTermination, "termination must revoke admission before transport closure becomes observable")
+
+            gate.release()
+            await termination.value
+            let after = await manager.debugDirectAdmissionStateForTesting(connectionID: id)
+            XCTAssertNil(after.pendingClientID)
+            XCTAssertNil(after.indexedClientID)
+            XCTAssertTrue(after.activeClientIDs.isEmpty)
+            XCTAssertFalse(after.hasStats)
+            XCTAssertNil(after.connectionLifecycleGeneration)
+            let hasRemoval = await manager.debugHasConnectionRemovalOperation(for: id)
+            XCTAssertFalse(hasRemoval)
+        }
+
         func testDebugCleanupJoinsInFlightRemovalBeforeReadingAdmissionState() async {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let id = UUID()
@@ -147,6 +181,12 @@ import XCTest
     }
 
     private actor RemovalTestConnection: MCPServerConnection {
+        private let onTerminate: (@MainActor @Sendable () async -> Void)?
+
+        init(onTerminate: (@MainActor @Sendable () async -> Void)? = nil) {
+            self.onTerminate = onTerminate
+        }
+
         nonisolated var isFilesystemBacked: Bool {
             false
         }
@@ -179,7 +219,10 @@ import XCTest
             nil
         }
 
-        func terminate(reason _: TerminationReason, message _: String?) async {}
+        func terminate(reason _: TerminationReason, message _: String?) async {
+            await onTerminate?()
+        }
+
         func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
     }
 #endif
