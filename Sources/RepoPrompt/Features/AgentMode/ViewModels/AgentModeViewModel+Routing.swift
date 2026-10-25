@@ -149,9 +149,11 @@ extension AgentModeViewModel {
         guard let runtime = modelRouterRuntime,
               let owned = freshTaskRoutingByTabID[tabID]
         else { return }
-        await runtime.coordinator.cancel(requestID: owned.cancellationRequestID ?? owned.requestID)
+        // Withdraw ownership before backend cancellation suspends, so a cancelled route cannot
+        // dispatch or block a fresh local send while the coordinator settles.
         owned.task.cancel()
         clearFreshTaskRoutingOwnership(owned)
+        await runtime.coordinator.cancel(requestID: owned.cancellationRequestID ?? owned.requestID)
     }
 
     func isGlobalModelRouterControllingFreshTask(_ session: TabSession) -> Bool {
@@ -169,6 +171,9 @@ extension AgentModeViewModel {
         repromptedText: String? = nil,
         precomputedRouting: RepromptSpeculation? = nil
     ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         guard configuration.enabled,
               freshTaskRoutingEligibility(session: session, text: text)
@@ -322,6 +327,9 @@ extension AgentModeViewModel {
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         guard modelRouterSettingsStore.autoEffortEnabled() else {
             return submitUserTurn(
                 text: text,

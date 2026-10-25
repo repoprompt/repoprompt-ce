@@ -159,7 +159,9 @@ public extension ClaudeCompatibleBackendID {
                     haiku: "glm-4.5-air",
                     sonnet: "glm-5.2[1m]",
                     opus: "glm-5.2[1m]"
-                ))
+                )),
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .kimi:
             ClaudeCompatibleBackendConfig(
@@ -168,7 +170,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "https://api.kimi.com/coding/",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .custom:
             ClaudeCompatibleBackendConfig(
@@ -177,7 +181,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         }
     }
@@ -223,12 +229,16 @@ public extension ClaudeCompatibleBackendConfig {
             baseURL: baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             auth: auth,
             modelBehavior: normalizedBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
             httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true
@@ -270,6 +280,8 @@ public extension ClaudeCompatibleBackendConfig {
             baseURL: baseURL,
             auth: auth,
             modelBehavior: overrideBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
             httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
@@ -349,6 +361,14 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
                 environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
             }
+        }
+
+        if let timeout = normalizedConfig.requestTimeoutMilliseconds, ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains(timeout) {
+            environment["API_TIMEOUT_MS"] = String(timeout)
+        }
+        if let window = normalizedConfig.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            // The auto-compact threshold cannot raise an unknown model's assumed context window.
+            environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(window)
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {

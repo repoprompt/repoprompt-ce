@@ -196,19 +196,22 @@ extension AgentModeViewModel {
 
     private func writeDraftText(for tabID: UUID, _ text: String) {
         let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
+        if !repromptUIStore.hasCancelledDraft(tabID: tabID, text: text) {
+            repromptUIStore.clearCancelledDraft(tabID: tabID)
+        }
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
             if repromptOperation?.sourceTabID == tabID {
                 repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
-            } else if let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+            } else if var recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
                       !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
             {
-                // A kept draft authorizes only its exact text; edits need a new explicit recovery choice.
-                repromptUIStore.recoveries[tabID] = .init(
-                    text: text, originalDraft: recovery.originalDraft, reason: recovery.reason,
-                    draftAtInvalidation: text, requiresDecision: true
-                )
+                // Editing ends exact-draft authority. Preserve the old alternative without
+                // re-stamping its original/classification onto an unrelated new message.
+                recovery.bypassesPreparation = false
+                recovery.requiresDecision = false
+                repromptUIStore.recoveries[tabID] = recovery
             }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

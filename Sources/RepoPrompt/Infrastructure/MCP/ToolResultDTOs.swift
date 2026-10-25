@@ -893,7 +893,7 @@ enum ToolResultDTOs {
     /// - totalLinesChanged – sum of absolute line deltas across all committed chunks.
     /// - totalChunks       – number of diff chunks applied.
     struct EditSummary: Codable, Equatable {
-        let status: String // "success", "partial", "failed"
+        let status: String // "success", "partial", "failed", "no_change"
         let editsRequested: Int
         let editsApplied: Int
         let addedLines: Int?

@@ -2820,7 +2820,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func fileToolLookupSnapshotIsCurrent(
+    func fileToolLookupSnapshotIsCurrent(
         _ snapshot: MCPTabContextSnapshot,
         connectionID: UUID?,
         expectedBindingGeneration: UInt64? = nil
@@ -2842,7 +2842,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func fileToolAuthorityConnectionID(
+    func fileToolAuthorityConnectionID(
         metadata: MCPRequestMetadata,
         routed: MCPResolvedTabContextSnapshot
     ) -> UUID? {
@@ -2876,7 +2876,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func fileToolBindingSourceIsCurrent(
+    func fileToolBindingSourceIsCurrent(
         _ source: AgentWorkspaceLookupContextSource,
         for snapshot: MCPTabContextSnapshot
     ) -> Bool {

@@ -6,6 +6,117 @@ import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
     @MainActor
+    func testCustomRequestLimitsSurviveStoreAndRuntimeBridge() throws {
+        let defaults = try makeIsolatedDefaults()
+        let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)
+        var config = ClaudeCodeCompatibleBackendID.custom.defaultPreset
+        config.baseURL = "http://127.0.0.1:8000"
+        config.requestTimeoutMilliseconds = 600_000
+        config.contextWindowTokens = 262_144
+        store.saveConfig(config)
+        let restored = ClaudeCodeCompatibleBackendStore(defaults: defaults).config(for: .custom)
+        XCTAssertTrue(restored.isValid)
+        let environment = try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: restored, apiKey: "dummy")
+        XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
+        XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
+        XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        config.contextWindowTokens = 0
+        XCTAssertFalse(config.isValid)
+        config.contextWindowTokens = nil
+        config.requestTimeoutMilliseconds = -1
+        XCTAssertFalse(config.isValid)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(restored)) as? [String: Any])
+        legacy.removeValue(forKey: "contextWindowTokens")
+        legacy.removeValue(forKey: "requestTimeoutMilliseconds")
+        let decoded = try JSONDecoder().decode(ClaudeCodeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertNil(decoded.contextWindowTokens)
+        XCTAssertNil(decoded.requestTimeoutMilliseconds)
+        XCTAssertTrue(decoded.isValid)
+        for timeout in [600, 999, Int(Int32.max) + 1] {
+            config.requestTimeoutMilliseconds = timeout
+            XCTAssertFalse(config.isValid)
+        }
+
+        let restore = installTemporaryCustomSlotMapping()
+        defer { restore() }
+        var sharedConfig = ClaudeCodeCompatibleBackendStore.shared.config(for: .custom)
+        sharedConfig.contextWindowTokens = 262_144
+        ClaudeCodeCompatibleBackendStore.shared.saveConfig(sharedConfig)
+        XCTAssertEqual(ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(forRequestedModelRaw: "sonnet", agentKind: .customClaudeCompatible), 262_144)
+        var sidebar = AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: .customClaudeCompatible, selectedModelRaw: "sonnet")
+        XCTAssertEqual(sidebar.effectiveContextWindowTokens, 262_144)
+        sidebar.contextWindowTokens = 128_000
+        XCTAssertEqual(sidebar.effectiveContextWindowTokens, 128_000, "A provider-reported window remains authoritative")
+
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .customClaudeCompatible
+        session.selectedModelRaw = "sonnet"
+        let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
+            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+        })
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000, "Configured windows prevent valid usage above 200K from being discarded")
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000, modelContextWindow: 128_000, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000)
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 100_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000, "A later window-less event must retain the last reported window")
+
+        estimator.ingestSystemSignal("Context compacted", session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000)
+        XCTAssertNil(session.codexContextUsage?.lastTotalTokens)
+        XCTAssertEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+        _ = estimator.ingestUsageSignal(promptTokens: 100_000, completionTokens: nil, contextUsedTokens: nil, modelContextWindow: nil, session: session)
+        XCTAssertNil(session.codexContextUsage?.lastTotalTokens, "Billed input must not replace unknown post-compaction occupancy")
+        XCTAssertEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 80000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 128_000)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 80000)
+        XCTAssertNotEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+    }
+
+    @MainActor
+    func testConfiguredCustomWindowAcceptsFreshOccupancyAfterCompaction() {
+        let restore = installTemporaryCustomSlotMapping()
+        defer { restore() }
+        var config = ClaudeCodeCompatibleBackendStore.shared.config(for: .custom)
+        config.contextWindowTokens = 262_144
+        ClaudeCodeCompatibleBackendStore.shared.saveConfig(config)
+
+        for hasPriorUsage in [true, false] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .customClaudeCompatible
+            session.selectedModelRaw = "sonnet"
+            let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
+                AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            })
+            if hasPriorUsage {
+                _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+                XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+                XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000)
+            }
+
+            estimator.ingestSystemSignal("Context compacted", session: session)
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, hasPriorUsage ? 262_144 : nil)
+            XCTAssertNil(session.codexContextUsage?.lastTotalTokens)
+            XCTAssertEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+
+            if hasPriorUsage {
+                _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+            } else {
+                XCTAssertTrue(estimator.finalizeTurn(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, session: session))
+                XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 250_000)
+            }
+            XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
+            XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000, "Fresh occupancy above the default 200K must remain valid; prior usage: \(hasPriorUsage)")
+            XCTAssertNotEqual(session.codexContextUsage?.awaitingPostCompactionUsage, true)
+        }
+    }
+
+    @MainActor
     func testNativeSDKToolInputApprovalRoundTripPreservesMCPTypesAndStrictInventoryLimits() throws {
         let cases: [(literal: String, value: Value, acceptedLimit: Int?)] = [
             ("0", .int(0), nil), ("1", .int(1), 1), ("2", .int(2), 2),
