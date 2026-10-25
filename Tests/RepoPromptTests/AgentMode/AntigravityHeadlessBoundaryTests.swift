@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MCP
 import RepoPromptSettingsCore
@@ -283,5 +284,219 @@ final class AgentMCPSelectionResolverTests: XCTestCase {
         XCTAssertEqual(result.taskLabelKind, role, label, file: file, line: line)
         XCTAssertEqual(result.modelParameterSelections, parameters, label, file: file, line: line)
         XCTAssertFalse(result.usageBalancingEligible, label, file: file, line: line)
+    }
+}
+
+@MainActor
+final class AntigravityRuntimeManagerTests: XCTestCase {
+    private static let archiveData = Data(base64Encoded: "UEsDBBQAAAAAAAAAIVzihkXDEQAAABEAAAASAAAAYWd5X2FjcF9zZXJ2ZXIucGFyIyEvYmluL3NoCmV4aXQgMApQSwMEFAAAAAAAAAAhXOKGRcMRAAAAEQAAABUAAABsb2NhbGhhcm5lc3NfZXh0ZXJuYWwjIS9iaW4vc2gKZXhpdCAwClBLAQIUAxQAAAAAAAAAIVzihkXDEQAAABEAAAASAAAAAAAAAAAAAADtgQAAAABhZ3lfYWNwX3NlcnZlci5wYXJQSwECFAMUAAAAAAAAACFc4oZFwxEAAAARAAAAFQAAAAAAAAAAAAAA7YFBAAAAbG9jYWxoYXJuZXNzX2V4dGVybmFsUEsFBgAAAAACAAIAgwAAAIUAAAAAAA==")!
+
+    func testRequestedReleaseUsesAsyncExtractionAndReplacesOnlyIncompleteInstallation() async throws {
+        let root = try makeRoot()
+        let data = Self.archiveData
+        let release = Self.release(data: data)
+        let current = root.appendingPathComponent(AntigravityRuntimeRelease.current.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: current, withIntermediateDirectories: true)
+        try Self.writeExecutable("existing current runtime", at: current.appendingPathComponent(release.executable))
+        try Self.writeExecutable("existing current harness", at: current.appendingPathComponent(release.harness))
+        let incomplete = root.appendingPathComponent(release.version, isDirectory: true)
+        try FileManager.default.createDirectory(at: incomplete, withIntermediateDirectories: true)
+        try Self.writeExecutable("old partial runtime", at: incomplete.appendingPathComponent(release.executable))
+        let manager = AntigravityRuntimeManager(root: root, download: { url in
+            await Task.yield()
+            return Self.response(data: data, url: url)
+        })
+
+        let installed = try await manager.install(release)
+        XCTAssertEqual(installed.command, incomplete.appendingPathComponent(release.executable).path)
+        XCTAssertEqual(installed.harness, incomplete.appendingPathComponent(release.harness).path)
+        XCTAssertEqual(try String(contentsOfFile: installed.command, encoding: .utf8), "#!/bin/sh\nexit 0\n")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: installed.harness))
+        let requested = await manager.installedRuntime(release)
+        let stillCurrent = await manager.installedRuntime()
+        XCTAssertEqual(requested?.command, installed.command)
+        XCTAssertEqual(stillCurrent?.command, current.appendingPathComponent(release.executable).path)
+        XCTAssertEqual(try String(contentsOf: current.appendingPathComponent(release.executable), encoding: .utf8), "existing current runtime")
+        XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: root.path)), [release.version, AntigravityRuntimeRelease.current.version])
+    }
+
+    func testConcurrentAttemptsNeverPublishPartialRuntimeOrRemoveTheWinner() async throws {
+        for completion in [LateCompletion.success, .failure, .cancelled] {
+            let root = try makeRoot()
+            let data = Self.archiveData
+            let release = Self.release(data: data)
+            let firstEntered = expectation(description: "first extraction held: \(completion)")
+            let secondEntered = expectation(description: "second extraction held: \(completion)")
+            let extraction = AntigravityControlledExtraction(
+                release: release, entered: [firstEntered, secondEntered], failFirst: completion == .failure
+            )
+            let manager = AntigravityRuntimeManager(
+                root: root, download: { Self.response(data: data, url: $0) },
+                extractArchive: { try await extraction.run(archive: $0, payload: $1) }
+            )
+            let late = Task { try await manager.install(release) }
+            addTeardownBlock {
+                late.cancel()
+                await extraction.releaseAll()
+                _ = await late.result
+            }
+            await fulfillment(of: [firstEntered], timeout: 5)
+            let winner = Task { try await manager.install(release) }
+            addTeardownBlock {
+                winner.cancel()
+                await extraction.releaseAll()
+                _ = await winner.result
+            }
+            await fulfillment(of: [secondEntered], timeout: 5)
+            let attempts = await extraction.attempts
+            XCTAssertEqual(Set(attempts.map(\.archive)).count, 2)
+            XCTAssertEqual(Set(attempts.map(\.payload)).count, 2)
+            for attempt in attempts {
+                XCTAssertEqual(try Data(contentsOf: attempt.archive), data)
+            }
+            let whileExtracting = await manager.installedRuntime(release)
+            XCTAssertNil(whileExtracting)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(release.version).path))
+
+            await extraction.release(1)
+            let published = try await winner.value
+            XCTAssertEqual(try String(contentsOfFile: published.command, encoding: .utf8), "attempt-1")
+            if completion == .cancelled { late.cancel() }
+            await extraction.release(0)
+            do {
+                let result = try await late.value
+                XCTAssertEqual(completion, .success)
+                XCTAssertEqual(result.command, published.command)
+            } catch is CancellationError {
+                XCTAssertEqual(completion, .cancelled)
+            } catch AntigravityRuntimeError.invalidArchive {
+                XCTAssertEqual(completion, .failure)
+            }
+            XCTAssertEqual(try String(contentsOfFile: published.command, encoding: .utf8), "attempt-1")
+            XCTAssertEqual(try String(contentsOfFile: published.harness, encoding: .utf8), "harness-1")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [release.version])
+        }
+    }
+
+    func testInvalidHarnessCannotPublishAnInstallation() async throws {
+        for invalidHarness in ["missing", "directory", "not executable"] {
+            let root = try makeRoot()
+            let data = Self.archiveData
+            let release = Self.release(data: data)
+            let manager = AntigravityRuntimeManager(
+                root: root, download: { Self.response(data: data, url: $0) },
+                extractArchive: { _, payload in
+                    try Self.writeExecutable("partial executable", at: payload.appendingPathComponent(release.executable))
+                    let harness = payload.appendingPathComponent(release.harness)
+                    if invalidHarness == "directory" {
+                        try FileManager.default.createDirectory(at: harness, withIntermediateDirectories: false)
+                    } else if invalidHarness == "not executable" {
+                        try Data("harness".utf8).write(to: harness)
+                        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: harness.path)
+                    }
+                }
+            )
+            do {
+                _ = try await manager.install(release)
+                XCTFail("accepted \(invalidHarness) harness")
+            } catch AntigravityRuntimeError.invalidArchive {}
+            let installed = await manager.installedRuntime(release)
+            XCTAssertNil(installed)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+        }
+    }
+
+    func testChecksumAndHTTPFailuresNeverReachExtraction() async throws {
+        for invalidChecksum in [false, true] {
+            let root = try makeRoot()
+            let data = Self.archiveData
+            let release = Self.release(data: invalidChecksum ? Data("different bytes".utf8) : data)
+            let manager = AntigravityRuntimeManager(
+                root: root,
+                download: { Self.response(data: data, url: $0, status: invalidChecksum ? 200 : 503) },
+                extractArchive: { _, _ in XCTFail("unverified download reached extraction") }
+            )
+            do {
+                _ = try await manager.install(release)
+                XCTFail("accepted invalid download")
+            } catch AntigravityRuntimeError.checksumMismatch {
+                XCTAssertTrue(invalidChecksum)
+            } catch AntigravityRuntimeError.unavailable {
+                XCTAssertFalse(invalidChecksum)
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+        }
+    }
+
+    private func makeRoot() throws -> URL {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let root = sandbox.appendingPathComponent("antigravity-install-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return root
+    }
+
+    private nonisolated static func release(data: Data) -> AntigravityRuntimeRelease {
+        AntigravityRuntimeRelease(
+            version: "fixture-runtime", url: URL(string: "https://example.invalid/runtime.zip")!,
+            sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+            executable: AntigravityRuntimeRelease.current.executable, harness: AntigravityRuntimeRelease.current.harness
+        )
+    }
+
+    private nonisolated static func response(data: Data, url: URL, status: Int = 200) -> (Data, URLResponse) {
+        (data, HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!)
+    }
+
+    fileprivate nonisolated static func writeExecutable(_ contents: String, at url: URL) throws {
+        try Data(contents.utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private enum LateCompletion {
+        case success, failure, cancelled
+    }
+}
+
+private actor AntigravityControlledExtraction {
+    struct Attempt {
+        let archive: URL
+        let payload: URL
+    }
+
+    private let release: AntigravityRuntimeRelease
+    private let entered: [XCTestExpectation]
+    private let failFirst: Bool
+    private var continuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var released: Set<Int> = []
+    private(set) var attempts: [Attempt] = []
+
+    init(release: AntigravityRuntimeRelease, entered: [XCTestExpectation], failFirst: Bool) {
+        self.release = release
+        self.entered = entered
+        self.failFirst = failFirst
+    }
+
+    func run(archive: URL, payload: URL) async throws {
+        let index = attempts.count
+        attempts.append(Attempt(archive: archive, payload: payload))
+        try AntigravityRuntimeManagerTests.writeExecutable("attempt-\(index)", at: payload.appendingPathComponent(release.executable))
+        entered[index].fulfill()
+        if !released.contains(index) {
+            await withCheckedContinuation { continuations[index] = $0 }
+        }
+        if index == 0, failFirst { throw AntigravityRuntimeError.invalidArchive }
+        try AntigravityRuntimeManagerTests.writeExecutable("harness-\(index)", at: payload.appendingPathComponent(release.harness))
+    }
+
+    func release(_ index: Int) {
+        released.insert(index)
+        continuations.removeValue(forKey: index)?.resume()
+    }
+
+    func releaseAll() {
+        for index in entered.indices {
+            release(index)
+        }
     }
 }

@@ -6290,7 +6290,9 @@ final class MCPServerViewModel: ObservableObject {
             let coverage = root.coverage
             var rootIssues = root.issues.map { issue in
                 let mapped = codeStructureIssueDTO(issue)
-                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                guard root.executionStop == nil, root.status != .unavailable, !graphInvalid,
+                      issue.code == "seed_not_indexed", coverage?.isComplete != true
+                else { return mapped }
                 return DTO.IssueDTO(
                     code: mapped.code,
                     phase: mapped.phase,
@@ -6340,15 +6342,28 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .ok
             }
+            let indexStopReason: String? = if let stop = root.executionStop {
+                stop.reason.rawValue
+            } else if case let .invalid(code, _)? = graphRevalidation {
+                code
+            } else if root.status == .unavailable {
+                rootIssues.first?.code ?? "graph_unavailable"
+            } else {
+                nil
+            }
             rootDTOs.append(DTO.RootDTO(
                 root: root.rootDisplayName,
                 status: status,
                 index: DTO.IndexDTO(
-                    state: coverage?.isComplete == true ? .complete : .indexing,
+                    state: root.executionStop != nil || root.status == .unavailable || graphInvalid
+                        ? .stopped : coverage?.isComplete == true ? .complete : .indexing,
                     indexed: coverage?.classifiedCount ?? 0,
-                    total: coverage?.supportedCount ?? 0
+                    total: coverage?.supportedCount ?? 0,
+                    reason: indexStopReason,
+                    attempted: root.executionStop?.budget.map { Int(clamping: $0.attempted) },
+                    limit: root.executionStop?.budget.map { Int(clamping: $0.limit) }
                 ),
-                updatesPending: (root.updatesPending || revalidationUpdatesPending) ? true : nil,
+                updatesPending: indexStopReason == nil && (root.updatesPending || revalidationUpdatesPending) ? true : nil,
                 seeds: root.seeds.map {
                     DTO.SeedDTO(path: $0.path, state: codeStructureSeedStateDTO($0.state))
                 },

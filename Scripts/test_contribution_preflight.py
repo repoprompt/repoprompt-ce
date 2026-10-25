@@ -89,8 +89,12 @@ class PathSelectionTests(unittest.TestCase):
         self._assert_path_selection("ci_app_test_runner_paths_pattern", (
             ("Scripts/ci_app_test_runner.py", 0),
             ("Scripts/test_ci_app_test_runner.py", 0),
+            ("Scripts/ci_process_session.py", 0),
+            ("Scripts/ci_resolve_packages.py", 0),
+            ("Scripts/test_ci_resolve_packages.py", 0),
             (".github/workflows/ci.yml", 0),
             ("Scripts/test_conductor_future_probe.py", 1),
+            ("Scripts/ci_process_session.py.bak", 1),
         ))
         self._assert_path_selection("xcode_full_validation_paths_pattern", (
             ("Makefile", 0),
