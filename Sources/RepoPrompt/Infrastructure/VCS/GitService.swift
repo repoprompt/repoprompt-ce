@@ -2727,6 +2727,7 @@ actor GitService {
 
     /// Get uncommitted modified files in the repository
     func getUncommittedFiles(at repoURL: URL) async throws -> [UncommittedFile] {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "--untracked-files=all"],
             at: repoURL
@@ -2766,6 +2767,7 @@ actor GitService {
 
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "-z", "--untracked-files=all"],
             at: repoURL
@@ -3840,6 +3842,7 @@ actor GitService {
         for ref in reference {
             try GitRevisionArgument.validate(ref)
         }
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let numstatArgs = ["diff"] + reference + ["--numstat"]
         let nameStatusArgs = ["diff"] + reference + ["--name-status"]
 
@@ -4009,6 +4012,12 @@ actor GitService {
     ) async throws -> [UncommittedFile] {
         try compare.validateRevisionArgument()
         if let paths, paths.isEmpty { return [] }
+        switch compare {
+        case .uncommitted, .uncommittedMergeBase, .unstaged:
+            try await requireCompleteWorkingTreeInspection(at: repoURL)
+        case .staged, .stagedMergeBase, .revspec:
+            break
+        }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
             case .uncommitted, .uncommittedMergeBase, .unstaged:
@@ -4154,8 +4163,21 @@ actor GitService {
         let workingStatus: WorkingStatus
     }
 
+    private func requireCompleteWorkingTreeInspection(at repoURL: URL) async throws {
+        // The passive status fence suppresses Git's recursive submodule status:
+        // children have independent executable configuration that has not been
+        // validated. Never interpret that deliberately partial view as clean.
+        // Index metadata is safe to read without entering those repositories.
+        let (index, indexError, indexExit) = try await runGitData(["ls-files", "--stage", "-z", "--", ":/"], at: repoURL)
+        guard indexExit == 0 else { throw GitError(message: "Could not determine status completeness: \(String(decoding: indexError, as: UTF8.self))") }
+        if index.split(separator: 0).contains(where: { $0.starts(with: "160000 ".utf8) }) {
+            throw GitError(message: "Working-tree status is incomplete: tracked submodules cannot be safely inspected by passive Git reads. Cleanliness is unknown; inspect submodules with Git outside RepoPrompt before merging. RepoPrompt cannot approve a worktree merge from this partial status.")
+        }
+    }
+
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -4958,15 +4980,9 @@ actor GitService {
     private nonisolated static func targetEvidenceGitArguments(
         _ arguments: [String]
     ) -> [String] {
-        let safetyArguments = [
-            "-c", "core.fsmonitor=false",
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "core.untrackedCache=false"
-        ]
-        if Array(arguments.prefix(safetyArguments.count)) == safetyArguments {
-            return arguments
-        }
-        return safetyArguments + arguments
+        let fenced = GitReadSafety.arguments(arguments)
+        return fenced.starts(with: GitReadSafety.configurationArguments)
+            ? fenced : GitReadSafety.configurationArguments + fenced
     }
 
     private nonisolated static func targetEvidenceEnvironmentIdentity(
@@ -7529,25 +7545,7 @@ actor GitService {
     }
 
     nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
-        guard let command = args.first else { return false }
-        switch command {
-        case "rev-parse", "status", "ls-files", "ls-tree", "diff", "diff-tree", "check-attr", "merge-base", "merge-tree",
-             "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
-            return true
-        case "worktree":
-            return args.dropFirst().first == "list"
-        case "symbolic-ref":
-            return args.contains("--short") && args.last == "HEAD"
-        case "branch":
-            return args == ["branch", "--show-current"]
-        case "config":
-            return args.contains("--get") || args.contains("--get-regexp")
-        default:
-            if command == "--git-dir", let configIndex = args.firstIndex(of: "config") {
-                return args[configIndex...].contains("--get")
-            }
-            return false
-        }
+        GitReadSafety.isRead(args)
     }
 
     private func withWorkspaceAuthorityMutation<T>(
@@ -7763,6 +7761,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily
     ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -8110,7 +8113,7 @@ actor GitService {
         environment["GIT_ALLOW_PROTOCOL"] = ""
         environment["LC_ALL"] = "C"
         environment["LANG"] = "C"
-        return environment
+        return GitReadSafety.environment(environment)
     }
 
     private nonisolated static func exactWorktreeEnvironment(
@@ -8147,6 +8150,39 @@ actor GitService {
         }
     }
 
+    /// Called inside the existing admission lease; the config query uses that
+    /// lease too, rather than recursively acquiring a per-repository slot.
+    /// Do not cache this result: includes and worktree configuration can change
+    /// without changing the main config's modification time.
+    private func preparePassiveGitRead(
+        _ args: [String],
+        at repoURL: URL,
+        environment: [String: String],
+        diagnosticRepositoryPath: String,
+        admissionPriority: GitProcessAdmissionPriority,
+        commandTimeout: Duration
+    ) async throws -> ([String], [String: String]) {
+        guard GitReadSafety.isRead(args) else { return (args, environment) }
+        try GitReadSafety.validateSupportedRead(args)
+        let safeEnvironment = GitReadSafety.environment(environment)
+        if GitReadSafety.needsDriverCheck(args), let commandIndex = GitReadSafety.commandIndex(in: args) {
+            let query = Array(args.prefix(commandIndex)) + GitReadSafety.driverQuery
+            let (configuration, diagnostic, exitCode) = try await runAdmittedGitData(
+                query, at: repoURL, environment: safeEnvironment, stdin: nil,
+                diagnosticRepositoryPath: diagnosticRepositoryPath,
+                processQueueWaitMicroseconds: 0,
+                stdoutByteLimit: 1024 * 1024, stderrByteLimit: 64 * 1024,
+                admissionPriority: admissionPriority, commandFamily: .repositoryRead,
+                commandTimeout: commandTimeout
+            )
+            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
+                throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
+            }
+            try GitReadSafety.validateDriverConfiguration(configuration, for: args)
+        }
+        return (GitReadSafety.arguments(args), safeEnvironment)
+    }
+
     private func runAdmittedGitData(
         _ args: [String],
         at repoURL: URL,
@@ -8160,6 +8196,11 @@ actor GitService {
         commandFamily: GitProcessCommandFamily,
         commandTimeout: Duration
     ) async throws -> (Data, Data, Int32) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: commandTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif

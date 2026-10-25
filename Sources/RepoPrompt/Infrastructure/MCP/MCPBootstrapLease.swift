@@ -187,6 +187,7 @@ actor MCPBootstrapLease {
     private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?
+    private var policyReinstallOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
     #if DEBUG
         // Test-only observability for the join probe (see debugWaitForPolicyClearJoiner()).
@@ -379,6 +380,39 @@ actor MCPBootstrapLease {
             acpLeaseLog("[ACP-Runner] lease run=\(runID) gate=\(gateID) acquire() cancellation handler invoked")
             Task { await self.cancelAndCleanup() }
         }
+    }
+
+    /// Re-arms this run's pending connection policy for a replacement provider process.
+    ///
+    /// `acquire()` installs exactly one one-shot policy, which the first provider process's MCP
+    /// child consumes (or would consume) at admission. When a caller retires that process before
+    /// dispatch and launches a replacement for the *same* run, the replacement's child needs its own
+    /// pending policy or it is refused admission. Installation keeps the one-shot shape: the
+    /// installer collapses any unreserved pending policy for this run, so at most one stays queued.
+    ///
+    /// Valid only between a successful `acquire()` and any release or cleanup; returns `false`
+    /// otherwise, or when an expected-PID policy could not be re-armed. Full cleanup joins an
+    /// in-flight installation before its final revoke, so a replacement policy cannot outlive Stop.
+    func reinstallPolicyForReplacementProcess() async -> Bool {
+        guard hasAcquired, !shouldAbortAcquire,
+              policyReinstallOperation == nil, policyClearOperation == nil
+        else { return false }
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) reinstalling connection policy for a replacement provider process")
+        let operation = Task { await self.policyInstaller(self.spec) }
+        policyReinstallOperation = operation
+        await operation.value
+        policyReinstallOperation = nil
+        policyInstalled = true
+        guard !shouldAbortAcquire else { return false }
+        if spec.requiresExpectedAgentPID {
+            let policyArmed = await expectedPIDPolicyArmer(spec)
+            await recordDiagnosticEvent(
+                "lease_expected_pid_policy_rearmed",
+                fields: ["armed": String(policyArmed)]
+            )
+            guard policyArmed, !shouldAbortAcquire else { return false }
+        }
+        return true
     }
 
     // MARK: - Release Strategies
@@ -628,7 +662,11 @@ actor MCPBootstrapLease {
             return
         }
         guard ownsState else { return }
-        let operation = Task { await self.policyClearer(self.spec) }
+        let reinstall = policyReinstallOperation
+        let operation = Task {
+            await reinstall?.value
+            await self.policyClearer(self.spec)
+        }
         policyClearOperation = operation
         await operation.value
     }
