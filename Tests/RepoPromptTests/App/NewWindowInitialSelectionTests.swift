@@ -46,6 +46,54 @@ import XCTest
             }
         }
 
+        func testCatalogPreparationCannotOverwriteNewerPointObservedHealthWithoutRevisionChange() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let original = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                let gate = f.makeGate()
+                let entered = Signal("canonical preparation held before health-only authority change")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    guard preparations == 1 else { return }
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+
+                try Data("malformed externally edited workspace".utf8).write(to: original.document.fileURL, options: .atomic)
+                _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                let latest = await f.runtime.workspaceStore.snapshot()
+                let degraded = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                XCTAssertEqual(degraded.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+                XCTAssertEqual(degraded.revisions, original.revisions)
+                XCTAssertEqual(degraded.document.contentDigest, original.document.contentDigest)
+                XCTAssertEqual(latest.catalogRevision, initial.catalogRevision)
+                XCTAssertGreaterThan(latest.publicationSequence, initial.publicationSequence)
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: degraded.document.workspaceID, revisions: degraded.revisions,
+                    digest: degraded.document.contentDigest, health: degraded.health,
+                    catalogRevision: latest.catalogRevision
+                )
+                var acceptedHealth: [DomainAuthorityHealth?] = []
+                let observation = bridge.projectionObservationPublisherForTesting.sink { event in
+                    guard case .applied = event else { return }
+                    acceptedHealth.append(manager.catalogPreparationWitness.health[original.document.workspaceID])
+                }
+                defer { observation.cancel() }
+                gate.release()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.publicationSequence, latest.publicationSequence)
+                XCTAssertEqual(events.catalogCheckpoints.map(\.publicationSequence), [latest.publicationSequence], "an older writable catalog must not be accepted after a newer degraded point observation")
+                XCTAssertEqual(acceptedHealth, [degraded.health])
+                XCTAssertEqual(preparations, 2, "a health-only authority transition uses the existing single refetch")
+                XCTAssertEqual(manager.catalogPreparationWitness.health[original.document.workspaceID], degraded.health)
+            }
+        }
+
         func testCoveringManagerReconciliationDuringPreparationCreditsBridgeWithoutReadoptingModels() async throws {
             for coveringPreparation in [1, 2] {
                 try await Fixture.run { f in

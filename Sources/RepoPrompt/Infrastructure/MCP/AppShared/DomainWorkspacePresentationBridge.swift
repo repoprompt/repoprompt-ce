@@ -954,8 +954,19 @@ final class DomainWorkspacePresentationBridge {
                 if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) {
                     return rejection
                 }
+                // A point observation may learn a health-only authority transition while decoding.
+                // Such transitions need not advance document or catalog revisions, so stale
+                // snapshot health must not overwrite the newer observation during reconciliation.
+                let currentWitness = manager.catalogPreparationWitness
+                if records.contains(where: { record in
+                    let workspaceID = record.document.workspaceID
+                    guard let health = currentWitness.health[workspaceID] else { return false }
+                    return health != preparationWitness.health[workspaceID] && health != record.health
+                }) {
+                    return .superseded
+                }
                 #if DEBUG
-                    if manager.catalogPreparationWitness != preparationWitness {
+                    if currentWitness != preparationWitness {
                         AgentModePerfDiagnostics.increment("workspace.prepare.projectionReplanned")
                     }
                 #endif
