@@ -394,7 +394,7 @@ import XCTest
                     entered.fulfill()
                     await gate.wait()
                 }
-                fixture.startOwnedTask {
+                let reorder = fixture.startOwnedTask {
                     await fixture.manager.moveActiveWorkspaceRoot(path: fixture.rootPaths[1], direction: .up, visibleRootOrder: fixture.rootPaths)
                     done.fulfill()
                 }
@@ -404,20 +404,32 @@ import XCTest
                 let envelope = try XCTUnwrap(captured)
                 XCTAssertEqual(envelope.conflictRecoveryPolicy, .failClosed)
                 let client = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -945)
-                _ = try await client.replaceWorking(
-                    before.model,
-                    fileURL: fixture.workspaceURL,
+                // Reserve the ID without introducing an independent writer/projection. The
+                // seed file is not key-sorted: re-encoding its equal model changes the digest
+                // and can asynchronously replace the optimistic dateModified during capture.
+                let reserved = try await client.replaceWorkingFailClosed(
+                    before.canonical.document,
                     expectedWorkspaceRevision: before.canonical.revisions.workingRevision,
                     operationID: envelope.operationID
                 )
+                XCTAssertEqual(reserved.disposition, .unchanged)
+                XCTAssertEqual(reserved.workspace, before.canonical)
+                let catalog = await client.snapshot()
+                XCTAssertEqual(catalog.publicationSequence, before.publicationSequence, "Collision setup must not enqueue a separate projection")
                 gate.release()
                 try await fixture.awaitGateEvent(done)
+                await reorder.value
+                let issue = try XCTUnwrap(fixture.manager.domainWorkspaceAuthorityIssue)
+                XCTAssertEqual(issue.kind, .commandFailure)
+                XCTAssertEqual(issue.diagnostic, "operation_id_reused_with_different_command")
                 let after = try await fixture.capturePassive()
+                XCTAssertEqual(after.canonical, before.canonical)
+                XCTAssertEqual(after.diskBytes, before.diskBytes)
                 assertPassiveConvergence(after, paths: fixture.rootPaths)
                 await assertAdmission(fixture, capture: after)
                 XCTAssertEqual(after.primaryRoots.map(\.id), before.primaryRoots.map(\.id))
                 XCTAssertEqual(fixture.manager.debugRepoPathBaselineForWorkspace(fixture.workspace.id), fixture.rootPaths)
-                XCTAssertNotNil(fixture.manager.domainWorkspaceAuthorityIssue)
+                XCTAssertEqual(fixture.manager.domainWorkspaceAuthorityIssue, issue)
             }
         }
 
