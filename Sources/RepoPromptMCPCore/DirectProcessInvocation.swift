@@ -100,7 +100,7 @@ final class DirectProcessInvocation: @unchecked Sendable {
             try readBinding?.revalidate()
             let process: SpawnedProcess
             #if DEBUG
-                process = try ProcessLauncher.$onSpawnedOutputWritersForTesting.withValue(hooks?.onSpawnedOutputWriters) {
+                process = try ProcessLauncher.onSpawnedOutputWritersForTestingTaskLocal.withValue(hooks?.onSpawnedOutputWriters) {
                     try spawn()
                 }
             #else

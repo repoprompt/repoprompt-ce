@@ -20,7 +20,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
                 probe.complete()
                 finished.fulfill()
             }
-            return await DirectProcess.$lifecycleHooks.withValue(.init(
+            return await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
                 beforeLaunch: { entered.fulfill()
                     await gate.wait()
                 },
@@ -54,7 +54,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
                 probe.complete()
                 finished.fulfill()
             }
-            return await DirectProcess.$lifecycleHooks.withValue(.init(
+            return await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
                 afterSpawnBeforeRegistration: { pid in
                     probe.recordPID(pid)
                     registered.fulfill()
@@ -92,7 +92,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
                 probe.complete()
                 finished.fulfill()
             }
-            return await DirectProcess.$lifecycleHooks.withValue(.init(
+            return await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
                 afterSpawnBeforeRegistration: { probe.recordPID($0) },
                 afterReadingOutput: { data in
                     if probe.appendUntilReady(data) { ready.fulfill() }
@@ -123,7 +123,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
                 probe.complete()
                 finished.fulfill()
             }
-            return await DirectProcess.$lifecycleHooks.withValue(.init(
+            return await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
                 afterSpawnBeforeRegistration: { probe.recordPID($0) },
                 afterRootExit: {
                     probe.recordGroupAtRootExit()
@@ -162,7 +162,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
                     probe.complete()
                     finished.fulfill()
                 }
-                return await DirectProcess.$lifecycleHooks.withValue(.init(
+                return await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
                     afterSpawnBeforeRegistration: { probe.recordPID($0) },
                     onSpawnedOutputWriters: { stdout, stderr in
                         writer.retain(holdStderr ? stderr : stdout)
@@ -253,7 +253,7 @@ final class DirectProcessOutputCaptureTests: XCTestCase {
 
     func testLaunchFailureDoesNotRegisterAChildOrSubmitInput() async {
         let probe = DirectProcessTestProbe()
-        let result = await DirectProcess.$lifecycleHooks.withValue(.init(
+        let result = await DirectProcess.lifecycleHooksTaskLocal.withValue(.init(
             afterSpawnBeforeRegistration: { probe.recordPID($0) },
             afterInputSubmission: { probe.recordInputSubmission() }
         )) {

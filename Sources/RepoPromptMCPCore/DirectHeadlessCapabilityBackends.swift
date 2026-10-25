@@ -1136,7 +1136,10 @@ enum DirectProcess {
             var afterRootExit: (@Sendable () async -> Void)?
         }
 
-        @TaskLocal static var lifecycleHooks: LifecycleHooks?
+        static let lifecycleHooksTaskLocal = BoxedTaskLocal<LifecycleHooks?>(nil)
+        static var lifecycleHooks: LifecycleHooks? {
+            lifecycleHooksTaskLocal.get()
+        }
     #endif
 
     /// Child providers need basic process/configuration context and the explicit private

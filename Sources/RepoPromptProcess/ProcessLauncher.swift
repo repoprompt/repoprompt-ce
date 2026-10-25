@@ -47,7 +47,10 @@ package typealias ProviderProcessLaunchPolicy = RepoPromptShared.ProviderProcess
 
 package enum ProcessLauncher {
     #if DEBUG
-        @TaskLocal package static var onSpawnedOutputWritersForTesting: (@Sendable (Int32, Int32) -> Void)?
+        package static let onSpawnedOutputWritersForTestingTaskLocal = BoxedTaskLocal<(@Sendable (Int32, Int32) -> Void)?>(nil)
+        package static var onSpawnedOutputWritersForTesting: (@Sendable (Int32, Int32) -> Void)? {
+            onSpawnedOutputWritersForTestingTaskLocal.get()
+        }
     #endif
 
     package enum Purpose: Equatable {
