@@ -45,6 +45,7 @@ final class ImageAwareTextView: NSTextView {
     var commandReturnHandler: (() -> Bool)?
     var readOnlyReturnHandler: (() -> Void)?
     var beginUserEditingHandler: (() -> Void)?
+    private(set) var currentKeyDownEvent: NSEvent?
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
         if isEditable { beginUserEditingHandler?() }
@@ -57,6 +58,9 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        let previousEvent = currentKeyDownEvent
+        currentKeyDownEvent = event
+        defer { currentKeyDownEvent = previousEvent }
         if handleReadOnlyReturn(event) { return }
         super.keyDown(with: event)
     }
@@ -746,13 +750,16 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // AppKit can deliver a command while the window still reports a KitDefined event.
+            // Key-only accessors such as isARepeat raise an Objective-C exception for that event.
+            let currentEvent = (textView as? ImageAwareTextView)?.currentKeyDownEvent ?? textView.window?.currentEvent
+            let event = currentEvent?.type == .keyDown ? currentEvent : nil
             if parent.isReadOnly, commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 parent.onEscape?()
                 return true
             }
             if parent.isReadOnly {
                 // Preparation locks editing, not the composer's explicit Return override.
-                let event = textView.window?.currentEvent
                 let flags = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
                 if commandSelector == #selector(NSResponder.insertNewline(_:)),
                    !textView.hasMarkedText(), isActive,
@@ -787,7 +794,6 @@ struct CustomTextField: NSViewRepresentable {
                 return true
             }
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                let event = textView.window?.currentEvent
                 let flags = event?.modifierFlags.intersection([.shift, .command, .option, .control]) ?? []
                 if flags == .shift {
                     textView.insertNewline(nil) // Shift+Return → newline
@@ -880,6 +886,16 @@ struct CustomTextField: NSViewRepresentable {
             guard parent.externalEditTransaction != nil, !externalEditUndoRegistered else { return }
             externalEditUndoRegistered = true
             let undo = parent.onUndoExternalEdit
+            // beginUndoGrouping can implicitly open an outer event group. Without this fence,
+            // the first native edit in the same turn also undoes the preceding rewrite.
+            // Keep explicitly nested caller groups and undo/redo grouping under their owner.
+            let separatesEventGroup = textViewUndoManager.groupsByEvent
+                && !textViewUndoManager.isUndoing && !textViewUndoManager.isRedoing
+            if separatesEventGroup {
+                if textViewUndoManager.groupingLevel == 1 { textViewUndoManager.endUndoGrouping() }
+                textViewUndoManager.groupsByEvent = false
+            }
+            defer { if separatesEventGroup { textViewUndoManager.groupsByEvent = true } }
             let ownsUndoGroup = textViewUndoManager.groupingLevel == 0
             if ownsUndoGroup { textViewUndoManager.beginUndoGrouping() }
             textViewUndoManager.registerUndo(withTarget: self) { _ in undo?() }

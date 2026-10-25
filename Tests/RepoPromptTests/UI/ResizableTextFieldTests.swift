@@ -281,30 +281,66 @@ final class ResizableTextFieldTests: XCTestCase {
     }
 
     func testTakingOverStreamingKeepsTypedEditUndoSeparateFromRewriteUndo() throws {
-        let transaction = TextFieldExternalEditTransaction(id: UUID(), isComplete: false)
-        var rewriteUndos = 0
-        let fixture = try ResizableTextFieldHostingFixture(
-            initialText: "Rewrite",
-            initialExternalEditTransaction: transaction,
-            onBeginUserEditing: { _, yieldedID in
-                yieldedID == transaction.id ? nil : .init(id: transaction.id, revision: 0)
+        for hasOpenEventGroup in [false, true] {
+            let transaction = TextFieldExternalEditTransaction(id: UUID(), isComplete: false)
+            var rewriteUndos = 0
+            let fixture = try ResizableTextFieldHostingFixture(
+                initialText: "Rewrite",
+                initialExternalEditTransaction: transaction,
+                onBeginUserEditing: { _, yieldedID in
+                    yieldedID == transaction.id ? nil : .init(id: transaction.id, revision: 0)
+                }
+            )
+            defer { fixture.tearDown() }
+            fixture.coordinator.parent.onUndoExternalEdit = { rewriteUndos += 1 }
+            fixture.undoManager.groupsByEvent = true
+            if hasOpenEventGroup {
+                fixture.undoManager.registerUndo(withTarget: fixture) { _ in }
+                XCTAssertEqual(fixture.undoManager.groupingLevel, 1)
             }
-        )
-        defer { fixture.tearDown() }
-        fixture.coordinator.parent.onUndoExternalEdit = { rewriteUndos += 1 }
-        fixture.undoManager.groupsByEvent = true
 
-        fixture.textView.insertText("!", replacementRange: fixture.textView.selectedRange())
-        fixture.textView.breakUndoCoalescing()
-        while fixture.undoManager.groupingLevel > 0 {
-            fixture.undoManager.endUndoGrouping()
+            fixture.textView.insertText("!", replacementRange: fixture.textView.selectedRange())
+            fixture.textView.breakUndoCoalescing()
+            while fixture.undoManager.groupingLevel > 0 {
+                fixture.undoManager.endUndoGrouping()
+            }
+            XCTAssertTrue(fixture.undoManager.groupsByEvent, "Native event grouping must be restored")
+            XCTAssertEqual(fixture.textView.string, "Rewrite!")
+            fixture.undoManager.undo()
+            XCTAssertEqual(fixture.textView.string, "Rewrite")
+            XCTAssertEqual(rewriteUndos, 0, "The first undo reverses the user's edit")
+            fixture.undoManager.undo()
+            XCTAssertEqual(rewriteUndos, 1, "The second undo reverses the prior external rewrite")
         }
-        XCTAssertEqual(fixture.textView.string, "Rewrite!")
-        fixture.undoManager.undo()
-        XCTAssertEqual(fixture.textView.string, "Rewrite")
-        XCTAssertEqual(rewriteUndos, 0, "The first undo reverses the user's edit")
-        fixture.undoManager.undo()
-        XCTAssertEqual(rewriteUndos, 1, "The second undo reverses the prior external rewrite")
+    }
+
+    func testReturnUsesDeliveredKeyEventInsteadOfNonKeyboardWindowEvent() throws {
+        var returns = 0
+        let fixture = try ResizableTextFieldHostingFixture(initialText: "draft", onReturn: { returns += 1 })
+        defer { fixture.tearDown() }
+        let windowEvent = try XCTUnwrap(NSEvent.otherEvent(
+            with: .appKitDefined, location: .zero, modifierFlags: [], timestamp: 1,
+            windowNumber: fixture.window.windowNumber, context: nil, subtype: 4, data1: 0, data2: 0
+        ))
+        try fixture.sendReturn(currentWindowEvent: windowEvent)
+        XCTAssertEqual(returns, 1)
+        try fixture.sendReturn(repeatKey: true, currentWindowEvent: windowEvent)
+        XCTAssertEqual(returns, 1, "The delivered key event still owns repeat suppression")
+        try fixture.sendReturn(modifiers: .shift, currentWindowEvent: windowEvent)
+        XCTAssertEqual(returns, 1, "A stale window event must not turn Shift+Return into Send")
+        XCTAssertEqual(fixture.textView.string, "draft\n")
+        XCTAssertNil(fixture.textView.currentKeyDownEvent, "Key-event ownership ends with native delivery")
+
+        // Programmatic commands have no keyDown owner. The window fallback must not query
+        // key-only properties on a KitDefined event, whether the editor is editable or read-only.
+        fixture.window.injectedEvent = windowEvent
+        defer { fixture.window.injectedEvent = nil }
+        XCTAssertTrue(fixture.coordinator.textView(fixture.textView, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(returns, 2)
+        fixture.coordinator.parent.isReadOnly = true
+        fixture.coordinator.parent.onReadOnlyReturn = { returns += 1 }
+        XCTAssertTrue(fixture.coordinator.textView(fixture.textView, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(returns, 3)
     }
 
     func testNativeDeletionSurrendersRewriteBeforeChangingText() throws {
@@ -585,13 +621,13 @@ private final class ResizableTextFieldHostingFixture {
         deliverTextDidChange()
     }
 
-    func sendReturn(modifiers: NSEvent.ModifierFlags = [], repeatKey: Bool = false) throws {
+    func sendReturn(modifiers: NSEvent.ModifierFlags = [], repeatKey: Bool = false, currentWindowEvent: NSEvent? = nil) throws {
         let event = try XCTUnwrap(NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 1,
             windowNumber: window.windowNumber, context: nil, characters: "\r",
             charactersIgnoringModifiers: "\r", isARepeat: repeatKey, keyCode: 36
         ))
-        window.injectedEvent = event
+        window.injectedEvent = currentWindowEvent ?? event
         defer { window.injectedEvent = nil }
         if modifiers.contains(.command), textView.performKeyEquivalent(with: event) { return }
         undoManager.beginUndoGrouping()
