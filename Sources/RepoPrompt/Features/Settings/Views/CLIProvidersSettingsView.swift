@@ -3,6 +3,20 @@ import RepoPromptProcess
 import SwiftUI
 
 struct CLIProvidersSettingsView: View {
+    private func compatibleHTTPConsentView(for id: ClaudeCodeCompatibleBackendID) -> some View {
+        ProviderHTTPConsentView(
+            endpoint: viewModel.compatibleBackendConfig(for: id).baseURL,
+            consentEndpoint: Binding(
+                get: { viewModel.compatibleBackendConfig(for: id).httpCredentialConsentEndpoint },
+                set: { endpoint in
+                    var updated = viewModel.compatibleBackendConfig(for: id)
+                    updated.httpCredentialConsentEndpoint = endpoint
+                    viewModel.saveCompatibleBackendConfig(updated)
+                }
+            )
+        )
+    }
+
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
@@ -1078,6 +1092,8 @@ struct CLIProvidersSettingsView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
             }
 
+            compatibleHTTPConsentView(for: .custom)
+
             // Auth style picker
             HStack(spacing: 8) {
                 Text("Auth header")
@@ -1452,6 +1468,8 @@ struct CLIProvidersSettingsView: View {
                         ))
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                     }
+
+                    compatibleHTTPConsentView(for: backendID)
 
                     HStack(spacing: 8) {
                         Text("Auth header")

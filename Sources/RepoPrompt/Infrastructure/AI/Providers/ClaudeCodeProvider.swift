@@ -114,6 +114,7 @@ final class ClaudeCodeProvider: AIProvider {
     ) {
         var config = CLIProcessConfiguration(
             workingDirectory: workingDirectory,
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .claudeCode),
             captureStdoutTailBytes: 128 * 1024,
             captureStderrTailBytes: 256 * 1024
         )
@@ -216,7 +217,8 @@ final class ClaudeCodeProvider: AIProvider {
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
         }
-        let usesStreamJSONOutput = !aiMessage.transientImages.isEmpty
+        // Preserve every assistant message, including replies continued after max_tokens.
+        options.verbose = true
         let stdin: String
         if aiMessage.transientImages.isEmpty {
             stdin = prompt
@@ -224,7 +226,6 @@ final class ClaudeCodeProvider: AIProvider {
             Self.applyStreamJSONImageTransport(to: &options)
             stdin = try Self.makeStreamJSONInput(prompt: prompt, images: aiMessage.transientImages)
         }
-        let outputFormat: CLIOutputFormat = usesStreamJSONOutput ? .streamJson : .json
         let args = options.toTokens()
 
         var attempt = 0
@@ -236,10 +237,11 @@ final class ClaudeCodeProvider: AIProvider {
                 result = try await runner.run(
                     args: args,
                     stdin: stdin,
-                    outputMode: .auto(outputFormat),
+                    outputMode: .auto(.streamJson),
                     timeout: options.timeout,
                     additionalEnvironment: options.additionalEnvironment,
                     additionalRemovedKeys: options.removedEnvironmentKeys,
+                    environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.filteringProvider(for: model)),
                     cancelChildOnTaskCancellation: true
                 )
             } catch {
@@ -251,7 +253,7 @@ final class ClaudeCodeProvider: AIProvider {
                     throw AIProviderError.invalidResponse(detail: "Claude CLI returned no output")
                 }
                 do {
-                    return try parseCompletionPayload(result.stdout, isStreamJSON: usesStreamJSONOutput)
+                    return try parseCompletionPayload(result.stdout, isStreamJSON: true)
                 } catch {
                     throw AIProviderError.apiError(source: error)
                 }
@@ -259,7 +261,7 @@ final class ClaudeCodeProvider: AIProvider {
 
             if let humanMessage = extractCLIErrorDetail(
                 fromStdout: result.stdout,
-                isStreamJSON: usesStreamJSONOutput
+                isStreamJSON: true
             ) {
                 // Check for credit balance error and provide helpful guidance
                 let lowerMessage = humanMessage.lowercased()
@@ -475,14 +477,45 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     private func parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
-        guard let terminal = ClaudeStreamJSONImageTransport.terminalEvent(in: data) else {
+        // Decode complete events, not token deltas; counting both would duplicate text.
+        // Ignore non-JSON CLI diagnostics, but fail closed on malformed/truncated JSON events.
+        let events = try data.split(separator: 0x0A).compactMap { line -> [String: Any]? in
+            let payload = line.drop(while: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0D })
+            guard payload.first == 0x7B else { return nil }
+            guard let event = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                throw AIProviderError.invalidResponse(detail: "Claude CLI returned unsupported JSON payload")
+            }
+            return event
+        }
+        guard let terminal = events.last(where: { event in
+            let type = event["type"] as? String
+            return type == "result" || type == "error"
+        }) else {
             throw AIProviderError.invalidResponse(detail: "Claude CLI returned stream JSON without completion payload")
         }
-        if terminal.type == "error" || ClaudeStreamJSONImageTransport.indicatesError(terminal.payload) {
-            let detail = ClaudeStreamJSONImageTransport.errorMessage(from: terminal.payload) ?? "Claude CLI returned an error"
+        if ClaudeStreamJSONImageTransport.indicatesError(terminal) {
+            let detail = ClaudeStreamJSONImageTransport.errorMessage(from: terminal) ?? "Claude CLI returned an error"
             throw AIProviderError.invalidResponse(detail: detail)
         }
-        return parseCompletionDictionary(terminal.payload)
+        let texts = events.compactMap { event -> String? in
+            guard event["type"] as? String == "assistant",
+                  event["parent_tool_use_id"] == nil || event["parent_tool_use_id"] is NSNull,
+                  let message = event["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]]
+            else { return nil }
+            let text = content.compactMap { block -> String? in
+                guard block["type"] as? String == "text" else { return nil }
+                return block["text"] as? String
+            }.joined()
+            return text.isEmpty ? nil : text
+        }
+        let completion = parseCompletionDictionary(terminal)
+        return AICompletionResult(
+            text: texts.isEmpty ? completion.text : texts.joined(),
+            promptTokens: completion.promptTokens,
+            completionTokens: completion.completionTokens,
+            cost: completion.cost
+        )
     }
 
     private func parseCompletionDictionary(_ dict: [String: Any]) -> AICompletionResult {
@@ -565,7 +598,8 @@ final class ClaudeCodeProvider: AIProvider {
                 outputMode: .auto(.json),
                 timeout: options.timeout,
                 additionalEnvironment: additionalEnvironment,
-                additionalRemovedKeys: launchEnvironment.removedEnvironmentKeys
+                additionalRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.runtimeVariant(for: backendID).agentKind)
             )
         } catch {
             throw mapProcessError(error)
@@ -591,6 +625,11 @@ final class ClaudeCodeProvider: AIProvider {
             let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
             throw AIProviderError.invalidResponse(detail: "Failed to decode Claude Code CLI response: \(error.localizedDescription). STDOUT (first 500 bytes): \(stdoutPreview). STDERR: \(stderrPreview)")
         }
+    }
+
+    private static func filteringProvider(for model: AIModel) -> AgentProviderKind {
+        guard let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) else { return .claudeCode }
+        return runtimeVariant(for: descriptor.backendID).agentKind
     }
 
     private static func runtimeVariant(for backendID: ClaudeCodeCompatibleBackendID) -> ClaudeCodeRuntimeVariant {
@@ -644,7 +683,8 @@ final class ClaudeCodeProvider: AIProvider {
                 stdin: "User: Say OK\n",
                 outputMode: .auto(.json),
                 timeout: options.timeout,
-                additionalEnvironment: options.additionalEnvironment
+                additionalEnvironment: options.additionalEnvironment,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.filteringProvider(for: model))
             )
         } catch {
             throw mapProcessError(error)

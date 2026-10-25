@@ -4,6 +4,8 @@
 **Test Root Shard (No Build)** jobs. The exact required check **Style** runs last
 on Linux. It depends on the shared job, all shards, and Secret Scan; every
 prerequisite must succeed (failed, skipped, or cancelled is not success).
+The final gate prints those prerequisite results in its job summary so an
+upstream test or infrastructure failure is not mistaken for a formatting error.
 All former style/static/provider/import/index gates remain blocking. Compiler
 warning timing remains report-only on PRs and enforced on main, as before.
 
@@ -13,6 +15,9 @@ longer post-merge-only jobs. A module test failure or exhausted dependency fetch
 therefore blocks the existing required Style check before merge. Sentry-enabled
 build/privacy checks remain in CI (main), with complete console logs, explicit
 resolution retry failures, and no test/build retries or continue-on-error.
+Superseded commits coalesce independently per PR and main ref. CI (main) also
+cancels an older Sentry run when a newer main commit arrives; release and publish
+workflow cancellation policy is separate.
 
 ## Evidence and coverage authority
 
@@ -64,6 +69,11 @@ recorded separately as skipped, not passed. CI filtered Sentry runs and module
 XCTest executions apply the same count/identity checks; developer no-match
 semantics remain unchanged.
 
+Each assigned suite runs once in its own process and sandbox. After a suite
+fails, the shard attempts the remaining suites and reports all failures. Any
+failure keeps the shard red and prevents a success receipt; this is diagnostic
+coverage, not a test retry or permission to ignore an assertion.
+
 `shard-execution-*` artifacts retain full raw suite logs and schema-v1 JSON
 receipts for seven days. `expected-coverage-*` retains the built listing and
 target inventory independently. Final Style recomputes the deterministic
@@ -72,6 +82,9 @@ assignment/execution, and requires the disjoint union to equal the full listing
 and every target to be represented. Missing artifacts or receipts fail closed.
 Artifact overwrite supports rerunning failed jobs without reusing failed
 execution receipts. There are no filters on root shards.
+`root-build-*` also lasts seven days, so its lifetime matches those receipts.
+After artifact expiry, rerun the build as well as the shards; a shard-only rerun
+cannot reconstruct its attested executable.
 
 ## Download resilience and limits
 
@@ -84,8 +97,12 @@ failure.
 
 Root, owning-module scratch, provider, and Sentry package resolution is explicit
 before package-consuming checks. Each gets at most three five-minute attempts,
-with 10s/20s backoff. Timed-out attempt process groups are terminated before
-retry. Existing lockfiles are enforced; the dependency-free provider has none.
+with 10s/20s backoff. Each attempt owns a private process session. Timeout or
+nonzero exit terminates all remaining process groups in that session before
+retry: Swift's Git children can create groups different from the launcher.
+Process inventory and cleanup are bounded and fail closed if ownership cannot
+be checked or live attempt processes remain. Existing lockfiles are enforced;
+the dependency-free provider has none.
 Exhaustion is labeled infrastructure failure and remains red. Builds and tests
 are never retried to hide deterministic failures.
 
@@ -96,3 +113,7 @@ XCTest-specific and intentionally fails closed if its output format changes.
 Main-only Sentry failures still require maintainer triage. Moving all owning
 module checks to PRs removes the reported module-coverage post-merge blind spot
 without increasing the macOS runner budget.
+
+See the [October 23 reliability audit](ci-reliability-2026-10-23.md) for the
+historical failure census, same-commit retry evidence, repairs, and unresolved
+boundaries.

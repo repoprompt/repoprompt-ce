@@ -124,6 +124,9 @@ struct AgentDirectRunStartOptions: Equatable {
     var stopFence: AgentRunStartStopFence?
     /// Positive, exact retained-row candidate; absent for every non-composer producer.
     var localComposerCandidate: UUID?
+    /// Exact row appended by this submission, never inferred from transcript history.
+    /// Auto-wake and maintenance producers append no user row and leave this absent.
+    var initialUserItemID: UUID?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }

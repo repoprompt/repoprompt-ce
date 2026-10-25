@@ -32,7 +32,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             auth: .anthropicAuthToken,
             modelBehavior: .claudeSlotMapping(.init(haiku: " h ", sonnet: " s ", opus: " o "))
         )
-        let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
+        let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
         XCTAssertEqual(config.normalizedDisplayName, "Claude Code GLM")
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
         XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "secret")
@@ -43,14 +43,14 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_OPUS_MODEL"], "o")
         XCTAssertEqual(ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config), ["ANTHROPIC_API_KEY"])
 
-        let oneMillionEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let oneMillionEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-5.2[1m]"
         )
         XCTAssertEqual(oneMillionEnvironment["API_TIMEOUT_MS"], "3000000")
         XCTAssertEqual(oneMillionEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
-        let haikuEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let haikuEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-4.5-air"

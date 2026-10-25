@@ -415,6 +415,21 @@
         private let noticeText =
             "Codex couldn't resume the previous thread because its history was too large to load. Started a fresh thread."
 
+        func testRecoveryDiagnosticKindIsBackwardCompatibleAndCannotImpersonateRequests() throws {
+            let data = try JSONEncoder().encode(makeDiagnostic())
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            for kind in [nil, "futureNotice", "user"] as [String?] {
+                var legacy = object
+                legacy["itemKind"] = kind
+                let decoded = try JSONDecoder().decode(
+                    AgentTranscriptRecoveryDiagnostic.self,
+                    from: JSONSerialization.data(withJSONObject: legacy)
+                )
+                XCTAssertEqual(decoded.itemKind, .system)
+                XCTAssertEqual(decoded.text, noticeText)
+            }
+        }
+
         // MARK: - Defect A: summary-carried diagnostic survives demotion
 
         func testZeroToolTurnDiagnosticSurvivesDemotionAcrossSerialization() throws {

@@ -374,8 +374,8 @@ extension AgentTranscriptRequestAnchor {
 public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// Upper bound for the retained display text. Reuses the smallest per-entry
     /// budget `get_session` applies to comparable single-line entries (tool
-    /// summaries and error rows clip at this bound); the longest notice the
-    /// coordinator can emit today is 109 characters.
+    /// summaries and error rows clip at this bound). Recovery guidance must fit
+    /// this budget, including the stopped-resume Handoff instructions.
     public static let maximumTextLength = 500
     /// Upper bound for retained provider conversation identifiers. Codex thread
     /// IDs (`thread.id` on the app-server wire) are UUID strings (36 characters);
@@ -387,9 +387,9 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// emits today is `repeatedResumeTimeout` (21 characters).
     public static let maximumTokenLength = maximumIdentifierLength
     /// Upper bound for diagnostics carried by a single turn summary. This is a
-    /// malformed-payload guard, not a producer bound: a turn emits one record
-    /// per reconnect fallback with no limit (`resumeFrameTooLarge` falls back on
-    /// the first oversized-resume failure). The value mirrors the per-turn entry
+    /// malformed-payload guard, not a producer bound: a turn can emit multiple
+    /// reconnect recovery records, including stopped oversized resumes, with no
+    /// fixed producer limit. The value mirrors the per-turn entry
     /// budget the consumers enforce — `get_session` renders ≤20 entries per
     /// turn — so a corrupt persisted list can displace at most one turn's
     /// rendered entries, and read-time dedupe keeps distinct records intact.
@@ -398,8 +398,10 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// Stable outcome token for "the previous thread could not be resumed and a fresh
     /// thread was started in its place".
     public static let freshThreadStartedOutcome = "freshThreadStarted"
+    public static let resumeStoppedOutcome = "resumeStopped"
+    public static let resumeFrameTooLargeReason = "resumeFrameTooLarge"
 
-    /// Identity of the originating `.system` row. Compacted projections reuse it as the
+    /// Identity of the originating recovery row. Compacted projections reuse it as the
     /// rebuilt row's ID so dedup and `up_to_item_id` cutoff handling stay stable.
     public var id: UUID
     /// When the transition was recorded (mirrors the originating row).
@@ -417,6 +419,8 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     public var replacementConversationID: String?
     /// The bounded display line the live row showed, retained verbatim.
     public var text: String
+    /// Only system/error notices are allowed; old persisted diagnostics default to system.
+    public var itemKind: AgentChatItemKind
 
     public init(
         id: UUID = UUID(),
@@ -426,7 +430,8 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
         outcome: String,
         previousConversationID: String? = nil,
         replacementConversationID: String? = nil,
-        text: String
+        text: String,
+        itemKind: AgentChatItemKind = .system
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -440,6 +445,7 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
             Self.clamped($0, limit: Self.maximumIdentifierLength)
         }
         self.text = Self.clamped(text, limit: Self.maximumTextLength)
+        self.itemKind = itemKind == .error ? .error : .system
     }
 
     /// Re-keys the record to the row that carries it. Every carrier boundary (item,
@@ -477,7 +483,8 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
             outcome: c.decodeIfPresent(String.self, forKey: .outcome) ?? "",
             previousConversationID: c.decodeIfPresent(String.self, forKey: .previousConversationID),
             replacementConversationID: c.decodeIfPresent(String.self, forKey: .replacementConversationID),
-            text: c.decodeIfPresent(String.self, forKey: .text) ?? ""
+            text: c.decodeIfPresent(String.self, forKey: .text) ?? "",
+            itemKind: (try? c.decodeIfPresent(AgentChatItemKind.self, forKey: .itemKind)) ?? .system
         )
     }
 

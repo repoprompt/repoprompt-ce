@@ -139,7 +139,7 @@ Exceptions must be explicit, narrow, and documented here before they become prec
 These files are intentionally compiled as app-integrated diagnostics and live under `Sources/RepoPrompt/Features/Diagnostics`:
 
 - `Features/Diagnostics/Benchmark`: the Settings-visible Repo Bench surface, including benchmark core, settings UI/view model, run store, reporting, and local rankings. If Repo Bench needs a headless/CI runner, create a separate executable-target plan rather than hiding target churn in this layout cleanup.
-- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics.
+- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics. Release admission timing is owned by the workspace runtime as documented below; this does not enable the DEBUG-only instrumentation in release.
 - `Features/Diagnostics/AgentMode/Stress`: debug-only Agent chat stress launch configuration, harness, overlay panel, and stress support extensions on `AgentModeViewModel`, launched with `-RP_AGENT_CHAT_STRESS` and `RP_AGENT_STRESS_*` environment variables.
 - `Features/Diagnostics/MCP`: hidden DEBUG MCP diagnostics, transport diagnostics, Sparkle diagnostics, and memory sampling exposed through `__repoprompt_debug_diagnostics` / legacy debug transport tools.
 - `Features/Diagnostics/Prompt`: DEBUG prompt/token recount event forwarding, selection signatures, and selected-path watchdog state surfaced through restore performance diagnostics.
@@ -147,6 +147,8 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `Features/Diagnostics/App`: app-wide font-scale metrics, workspace/window restore performance logging, and DEBUG root-load trace correlation (`WorkspaceRootLoadDiagnostics`) surfaced through restore/workspace loading diagnostics.
 
 ### Documented wiring exceptions outside Diagnostics
+
+- `Features/Workspaces/Runtime/WorkspaceAgentAdmissionTiming.swift` intentionally ships in release beside `WorkspaceAgentAdmissionCoordinator`: it is per-admission runtime bookkeeping, not a DEBUG harness. Admission callers must not depend upward on the Diagnostics feature. `WorkspaceManagerViewModel.withAgentSessionAdmission` is its automatic entry point, emitting `event=agentAdmission.slow` in the `WorkspaceAgentAdmission` OSLog category on scope exit at five seconds or more. Fresh/existing tab admission explicitly propagates its recorder; retained recovery and discard have distinct kinds. See [diagnostic fields and interpretation](../testing.md#agent-admission-slow-phase-diagnostics). This narrow placement exception does not move other app-integrated diagnostic harnesses out of Diagnostics.
 
 - `App/SessionAdminWindowsHosts.swift` owns the concrete session-administration adapters over open windows, saved-session preparation, and target-owned workspace/worktree routing. The feature retains its host protocols and operation handlers; the app-level adapters compose them with `WindowStatesManager`, `WindowState`, and the UI view models. Keep these concrete window dependencies out of feature service implementations.
 
