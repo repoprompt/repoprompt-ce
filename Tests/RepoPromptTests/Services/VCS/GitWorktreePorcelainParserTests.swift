@@ -995,7 +995,7 @@ final class VCSReadRootAuthorizationTests: XCTestCase {
         let probes = MetadataReadInvocationCounter()
         let service = VCSService(jjRunner: JJCommandRunner { _, _, _ in
             probes.increment()
-            return ("", "", 0)
+            return ("M healthy.txt\n", "", 0)
         })
         for relativePath in [".jj/repo", ".jj/repo/store/type", ".jj/repo/store/git_target", ".jj/repo/store/git/commondir"] {
             let root = base.appendingPathComponent(UUID().uuidString)
@@ -1022,6 +1022,9 @@ final class VCSReadRootAuthorizationTests: XCTestCase {
         try Data("Simple".utf8).write(to: store.appendingPathComponent("type"))
         let result = await service.resolveRepoForRead(at: healthy, authorizedRoots: [healthy])
         XCTAssertEqual(result?.backendKind, .jujutsu)
+        let backend = await service.backend(forRepoRoot: healthy)
+        let status = try await backend.getWorkingStatus(at: healthy)
+        XCTAssertEqual(status.modified, ["healthy.txt"])
         XCTAssertGreaterThan(probes.count, 0)
     }
 
@@ -1133,6 +1136,7 @@ final class VCSReadRootAuthorizationTests: XCTestCase {
                 XCTFail("Explicit binding must not bypass Git's ownership refusal")
             } catch {
                 XCTAssertTrue(String(describing: error).contains("dubious ownership"), String(describing: error))
+                XCTAssertFalse(String(describing: error).contains(checkout.path), "Ownership failures must redact the checkout path")
             }
 
             environment["GIT_CONFIG_VALUE_0"] = checkout.resolvingSymlinksInPath().path
