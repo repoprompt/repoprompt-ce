@@ -126,6 +126,7 @@
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
+        "RepoPromptProcess",
         "RepoPromptShared",
         "RepoPromptVCS"
       ],

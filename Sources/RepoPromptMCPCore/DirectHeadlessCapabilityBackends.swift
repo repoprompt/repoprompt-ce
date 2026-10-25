@@ -1126,6 +1126,19 @@ enum DirectProcess {
         let standardError: String
     }
 
+    #if DEBUG
+        struct LifecycleHooks {
+            var beforeLaunch: (@Sendable () async -> Void)?
+            var afterSpawnBeforeRegistration: (@Sendable (Int32) async -> Void)?
+            var onSpawnedOutputWriters: (@Sendable (Int32, Int32) -> Void)?
+            var afterReadingOutput: (@Sendable (Data) -> Void)?
+            var afterInputSubmission: (@Sendable () -> Void)?
+            var afterRootExit: (@Sendable () async -> Void)?
+        }
+
+        @TaskLocal static var lifecycleHooks: LifecycleHooks?
+    #endif
+
     /// Child providers need basic process/configuration context and the explicit private
     /// launch carrier, but must not inherit arbitrary parent credentials or loader controls.
     private static let inheritedEnvironmentKeys: Set<String> = [
@@ -1203,7 +1216,9 @@ enum DirectProcess {
             input: input,
             environment: environment,
             currentDirectory: currentDirectory,
-            readBinding: readBinding
+            readBinding: readBinding,
+            isProvider: isProvider,
+            allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
         ).run().standardOutput
     }
 
@@ -1229,6 +1244,8 @@ enum DirectProcess {
             environment: environment,
             currentDirectory: currentDirectory,
             readBinding: readBinding,
+            isProvider: isProvider,
+            allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting,
             separatesStandardError: true
         ).run()
     }
@@ -1278,136 +1295,5 @@ final class DirectProcessOutputCapture: @unchecked Sendable {
         let remaining = limit - output.count
         output.append(data.prefix(remaining))
         if data.count > remaining { truncated = true }
-    }
-}
-
-private final class DirectProcessInvocation: @unchecked Sendable {
-    private static let outputLimit = DirectProcessOutputCapture.outputLimit
-
-    // Cancellation must not wait for a potentially blocking pipe read.
-    private let lock = NSLock()
-    private let outputCapture = DirectProcessOutputCapture()
-    private let errorCapture: DirectProcessOutputCapture?
-    private let process = Process()
-    private let pipe = Pipe()
-    private let errorPipe: Pipe?
-    private let inputPipe: Pipe?
-    private let input: Data?
-    private let readBinding: GitReadRepositoryBinding?
-    private var cancellationRequested = false
-
-    init(
-        executable: String,
-        arguments: [String],
-        input: Data?,
-        environment overrides: [String: String],
-        currentDirectory: URL?,
-        readBinding: GitReadRepositoryBinding?,
-        separatesStandardError: Bool = false
-    ) {
-        self.input = input
-        self.readBinding = readBinding
-        errorPipe = separatesStandardError ? Pipe() : nil
-        errorCapture = separatesStandardError ? DirectProcessOutputCapture() : nil
-        inputPipe = input == nil ? nil : Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        let sanitizedEnvironment = DirectProcess.childEnvironment(overrides: overrides)
-        if let readBinding {
-            process.environment = readBinding.ownershipProbeEnvironment(sanitizedEnvironment)
-        } else {
-            process.environment = sanitizedEnvironment
-        }
-        process.currentDirectoryURL = currentDirectory
-        process.standardOutput = pipe
-        process.standardError = errorPipe ?? pipe
-        if let inputPipe {
-            process.standardInput = inputPipe
-        }
-    }
-
-    func run() async throws -> DirectProcess.Output {
-        try Task.checkCancellation()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    self?.outputCapture.consume { handle.availableData }
-                }
-                errorPipe?.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    self?.errorCapture?.consume { handle.availableData }
-                }
-                process.terminationHandler = { [weak self] process in
-                    guard let self else {
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    errorPipe?.fileHandleForReading.readabilityHandler = nil
-                    let snapshot = outputCapture.finish {
-                        self.pipe.fileHandleForReading.readDataToEndOfFile()
-                    }
-                    let errorSnapshot = errorCapture?.finish {
-                        self.errorPipe?.fileHandleForReading.readDataToEndOfFile() ?? Data()
-                    }
-                    if isCancellationRequested() {
-                        continuation.resume(throwing: CancellationError())
-                    } else {
-                        var text = String(decoding: snapshot.data, as: UTF8.self)
-                        if snapshot.truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
-                        var errorText = String(decoding: errorSnapshot?.data ?? Data(), as: UTF8.self)
-                        if errorSnapshot?.truncated == true { errorText += "\n[output truncated at \(Self.outputLimit) bytes]" }
-                        if process.terminationStatus == 0 {
-                            continuation.resume(returning: DirectProcess.Output(standardOutput: text, standardError: errorText))
-                        } else {
-                            continuation.resume(throwing: MCPError.internalError(
-                                [text, errorText].filter { !$0.isEmpty }.joined(separator: "\n")
-                                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                            ))
-                        }
-                    }
-                }
-                do {
-                    try readBinding?.revalidate()
-                    try process.run()
-                    if let inputPipe, let input {
-                        inputPipe.fileHandleForWriting.write(input)
-                        try? inputPipe.fileHandleForWriting.close()
-                    }
-                    if isCancellationRequested() { cancelProcess() }
-                } catch {
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    errorPipe?.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: error)
-                }
-            }
-        } onCancel: {
-            requestCancellation()
-        }
-    }
-
-    private func isCancellationRequested() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancellationRequested
-    }
-
-    private func requestCancellation() {
-        lock.lock()
-        cancellationRequested = true
-        let isRunning = process.isRunning
-        let pid = process.processIdentifier
-        lock.unlock()
-        guard isRunning else { return }
-        cancelProcess()
-        if pid > 0 {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak process] in
-                guard let process, process.isRunning, process.processIdentifier == pid else { return }
-                _ = kill(pid, SIGKILL)
-            }
-        }
-    }
-
-    private func cancelProcess() {
-        if process.isRunning { process.terminate() }
     }
 }
