@@ -61,6 +61,13 @@ actor AgentSessionDataService {
     }
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
+    private struct MetadataPublication {
+        var activeCount = 0
+        var latestSequence: UInt64 = 0
+    }
+
+    /// Retain ordering only while callbacks can overlap; settled session URLs leave no receipt state.
+    private var metadataPublicationsByURL: [URL: MetadataPublication] = [:]
     /// Blocks new writes during reversible admission as well as after committed deletion.
     private var deletedSessionFileURLs: Set<URL> = []
     /// Only an irreversible deletion may withdraw an already-admitted write and its metadata.
@@ -394,8 +401,23 @@ actor AgentSessionDataService {
         )
     }
 
-    private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
+    private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws -> AgentSessionDiskWriter.Receipt? {
         try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+    }
+
+    private func finishMetadataPublication(for fileURL: URL) {
+        guard var publication = metadataPublicationsByURL[fileURL] else { return }
+        publication.activeCount -= 1
+        metadataPublicationsByURL[fileURL] = publication.activeCount == 0 ? nil : publication
+    }
+
+    private func acceptMetadataReceipt(_ receipt: AgentSessionDiskWriter.Receipt, fileURL: URL) -> Bool {
+        guard var publication = metadataPublicationsByURL[fileURL],
+              receipt.sequence >= publication.latestSequence
+        else { return false }
+        publication.latestSequence = receipt.sequence
+        metadataPublicationsByURL[fileURL] = publication
+        return true
     }
 
     /// Keep the original bytes before a load repair drops an invalid optional record.
@@ -440,37 +462,51 @@ actor AgentSessionDataService {
     ) async throws {
         let fileURL = fileURL.standardizedFileURL
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        metadataPublicationsByURL[fileURL, default: MetadataPublication()].activeCount += 1
+        defer { finishMetadataPublication(for: fileURL) }
         #if DEBUG
             if isLoadRepair, let testBeforeLoadRepairWriteHook {
                 await testBeforeLoadRepairWriteHook(fileURL)
             }
         #endif
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
-        try await writeDataAtomically(encodedData, to: fileURL)
+        let receipt = try await writeDataAtomically(encodedData, to: fileURL)
         #if DEBUG
             if let testAfterSessionWriteHook {
                 await testAfterSessionWriteHook(fileURL)
             }
         #endif
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
-        await upsertMetadataRecord(metadataRecord(from: session, fileURL: fileURL), folder: folder)
+        if let receipt {
+            let record = AgentSessionMetadataRecord.record(
+                from: session, fileURL: fileURL,
+                observedFileSize: receipt.observedFileSize,
+                observedFileModificationDate: receipt.observedFileModificationDate
+            )
+            await upsertMetadataRecord(record, folder: folder, fileURL: fileURL, receipt: receipt)
+        }
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
     }
 
     private func persistLoadedMetadataIfIndexPresent(
         _ session: AgentSession,
-        fileURL: URL
+        fileURL: URL,
+        observedData: Data
     ) async throws {
         let fileURL = fileURL.standardizedFileURL
         let folder = fileURL.deletingLastPathComponent()
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        metadataPublicationsByURL[fileURL, default: MetadataPublication()].activeCount += 1
+        defer { finishMetadataPublication(for: fileURL) }
         #if DEBUG
             if let testBeforeLoadRepairWriteHook {
                 await testBeforeLoadRepairWriteHook(fileURL)
             }
         #endif
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
-        await upsertMetadataRecordIfIndexPresent(session, fileURL: fileURL)
+        if let receipt = await diskWriter.metadataReceiptIfUnchanged(data: observedData, url: fileURL) {
+            await upsertMetadataRecordIfIndexPresent(session, fileURL: fileURL, receipt: receipt)
+        }
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
     }
 
@@ -650,7 +686,10 @@ actor AgentSessionDataService {
         #endif
     }
 
-    private func upsertMetadataRecord(_ record: AgentSessionMetadataRecord, folder: URL) async {
+    private func upsertMetadataRecord(
+        _ record: AgentSessionMetadataRecord, folder: URL, fileURL: URL,
+        receipt: AgentSessionDiskWriter.Receipt
+    ) async {
         do {
             let key = canonicalMetadataFolderKey(folder)
             var index: AgentSessionMetadataIndex = if let cached = metadataIndexCacheByFolder[key] {
@@ -660,6 +699,7 @@ actor AgentSessionDataService {
             } else {
                 AgentSessionMetadataIndex()
             }
+            guard acceptMetadataReceipt(receipt, fileURL: fileURL) else { return }
             index.entries.removeAll { existing in
                 existing.id == record.id || existing.filename == record.filename
             }
@@ -672,10 +712,17 @@ actor AgentSessionDataService {
         }
     }
 
-    private func upsertMetadataRecordIfIndexPresent(_ session: AgentSession, fileURL: URL) async {
+    private func upsertMetadataRecordIfIndexPresent(
+        _ session: AgentSession, fileURL: URL, receipt: AgentSessionDiskWriter.Receipt
+    ) async {
         let folder = fileURL.deletingLastPathComponent()
         guard var index = await readMetadataIndexIfAvailable(folder: folder) else { return }
-        let record = metadataRecord(from: session, fileURL: fileURL)
+        guard acceptMetadataReceipt(receipt, fileURL: fileURL) else { return }
+        let record = AgentSessionMetadataRecord.record(
+            from: session, fileURL: fileURL,
+            observedFileSize: receipt.observedFileSize,
+            observedFileModificationDate: receipt.observedFileModificationDate
+        )
         if let existing = index.entries.first(where: { $0.id == record.id }),
            existing.matchesIndexedSessionMetadata(record)
         {
@@ -1263,7 +1310,7 @@ actor AgentSessionDataService {
                     isLoadRepair: true
                 )
             } else {
-                try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL)
+                try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL, observedData: data)
             }
             return runtimeSession
         } catch {
@@ -1784,6 +1831,14 @@ actor AgentSessionDataService {
         /// Holds a completed real write before its deletion/metadata completion checks.
         func test_setAfterSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
             testAfterSessionWriteHook = hook
+        }
+
+        func test_pendingSessionWriteCount(for fileURL: URL) async -> Int {
+            await diskWriter.test_pendingWriteCount(for: fileURL)
+        }
+
+        func test_pendingMetadataPublicationCount() -> Int {
+            metadataPublicationsByURL.count
         }
 
         func test_setBeforeDeletionAdmissionHook(_ hook: (@Sendable (URL) async -> Void)?) {
