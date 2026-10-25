@@ -114,6 +114,7 @@ final class ClaudeCodeProvider: AIProvider {
     ) {
         var config = CLIProcessConfiguration(
             workingDirectory: workingDirectory,
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .claudeCode),
             captureStdoutTailBytes: 128 * 1024,
             captureStderrTailBytes: 256 * 1024
         )
@@ -240,6 +241,7 @@ final class ClaudeCodeProvider: AIProvider {
                     timeout: options.timeout,
                     additionalEnvironment: options.additionalEnvironment,
                     additionalRemovedKeys: options.removedEnvironmentKeys,
+                    environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.filteringProvider(for: model)),
                     cancelChildOnTaskCancellation: true
                 )
             } catch {
@@ -596,7 +598,8 @@ final class ClaudeCodeProvider: AIProvider {
                 outputMode: .auto(.json),
                 timeout: options.timeout,
                 additionalEnvironment: additionalEnvironment,
-                additionalRemovedKeys: launchEnvironment.removedEnvironmentKeys
+                additionalRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.runtimeVariant(for: backendID).agentKind)
             )
         } catch {
             throw mapProcessError(error)
@@ -622,6 +625,11 @@ final class ClaudeCodeProvider: AIProvider {
             let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
             throw AIProviderError.invalidResponse(detail: "Failed to decode Claude Code CLI response: \(error.localizedDescription). STDOUT (first 500 bytes): \(stdoutPreview). STDERR: \(stderrPreview)")
         }
+    }
+
+    private static func filteringProvider(for model: AIModel) -> AgentProviderKind {
+        guard let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) else { return .claudeCode }
+        return runtimeVariant(for: descriptor.backendID).agentKind
     }
 
     private static func runtimeVariant(for backendID: ClaudeCodeCompatibleBackendID) -> ClaudeCodeRuntimeVariant {
@@ -675,7 +683,8 @@ final class ClaudeCodeProvider: AIProvider {
                 stdin: "User: Say OK\n",
                 outputMode: .auto(.json),
                 timeout: options.timeout,
-                additionalEnvironment: options.additionalEnvironment
+                additionalEnvironment: options.additionalEnvironment,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: Self.filteringProvider(for: model))
             )
         } catch {
             throw mapProcessError(error)

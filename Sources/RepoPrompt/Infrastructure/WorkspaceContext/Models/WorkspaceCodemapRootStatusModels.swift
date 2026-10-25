@@ -17,6 +17,7 @@ enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
     case graphUnavailable
     case retryExhausted
     case workerRecoveryExhausted
+    case budgetLimited
 }
 
 struct WorkspaceCodemapGraphCommitCadence: Hashable {
@@ -69,6 +70,7 @@ struct WorkspaceCodemapRootStatusSnapshot: Hashable {
     let commitCadence: WorkspaceCodemapGraphCommitCadence
     let diagnostics: WorkspaceCodemapGraphRootDiagnostics
     let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason?
+    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
 }
 
 struct WorkspaceCodemapRootStatusUpdate: Hashable {

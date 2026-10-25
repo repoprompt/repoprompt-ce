@@ -101,6 +101,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
             let launch = try await resolveLaunchForProbe(for: config)
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .openCode),
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 shellLookupMode: .fallbackOnly

@@ -73,6 +73,15 @@ extension AgentModeRunService {
         var isCurrentSessionBinding: @MainActor (AgentTabSession, AgentRunStartStopFence) -> Bool = { session, fence in
             fence.binding == session.persistentSessionBindingIdentity
         }
+
+        /// Withdraws a run's initial user row whose send was refused by route verification before
+        /// any provider dispatch, restoring its text to an empty composer (see
+        /// `AgentModeViewModel.restoreRouteRefusedUnsentTurn`). Hosts without a composer keep the row.
+        var restoreRouteRefusedUnsentTurn: @MainActor (
+            _ session: AgentTabSession,
+            _ userItemID: UUID,
+            _ message: String
+        ) -> Void = { _, _, _ in }
     }
 
     /// Host persistence scheduling for session/tab state.

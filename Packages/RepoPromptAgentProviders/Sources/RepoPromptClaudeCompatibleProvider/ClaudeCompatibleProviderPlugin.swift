@@ -62,6 +62,7 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
     public let baseURL: String
     public let auth: ClaudeCompatibleBackendAuth
     public let modelBehavior: ClaudeCompatibleBackendModelBehavior
+    public let httpCredentialConsentEndpoint: String?
 
     public init(
         id: ClaudeCompatibleBackendID,
@@ -69,7 +70,8 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         displayName: String,
         baseURL: String,
         auth: ClaudeCompatibleBackendAuth,
-        modelBehavior: ClaudeCompatibleBackendModelBehavior
+        modelBehavior: ClaudeCompatibleBackendModelBehavior,
+        httpCredentialConsentEndpoint: String? = nil
     ) {
         self.id = id
         self.isEnabled = isEnabled
@@ -77,6 +79,7 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         self.baseURL = baseURL
         self.auth = auth
         self.modelBehavior = modelBehavior
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 }
 

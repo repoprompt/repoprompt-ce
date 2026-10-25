@@ -26,6 +26,122 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
         }
     }
 
+    func testUnsafeParentEntriesAreRejectedBeforeCreatingLock() throws {
+        for kind in ["file", "symlink", "permissive"] {
+            let directory = temporaryDirectory.appendingPathComponent(kind, isDirectory: true)
+            switch kind {
+            case "file":
+                try Data("sentinel".utf8).write(to: directory)
+            case "symlink":
+                try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: temporaryDirectory)
+            default:
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                XCTAssertEqual(chmod(directory.path, 0o777), 0)
+            }
+            let socket = directory.appendingPathComponent("rejected.sock")
+            XCTAssertThrowsError(try BootstrapSocketOwnership.acquire(socketURL: socket))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: socket.appendingPathExtension("lock").path))
+        }
+        XCTAssertEqual(try Data(contentsOf: temporaryDirectory.appendingPathComponent("file")), Data("sentinel".utf8))
+        var info = stat()
+        XCTAssertEqual(lstat(temporaryDirectory.appendingPathComponent("permissive").path, &info), 0)
+        XCTAssertEqual(info.st_mode & mode_t(0o777), mode_t(0o777))
+    }
+
+    func testDirectoryPolicyRejectsForeignOwnerAndSpecialBits() {
+        var info = stat()
+        info.st_mode = mode_t(S_IFDIR) | mode_t(0o700)
+        info.st_uid = getuid()
+        XCTAssertTrue(MCPBootstrapDirectory.isPrivateDirectory(info))
+        info.st_uid = getuid() == 0 ? 1 : 0
+        XCTAssertFalse(MCPBootstrapDirectory.isPrivateDirectory(info))
+        info.st_uid = getuid()
+        for permissions in [0o2700, 0o1700, 0o720, 0o707] {
+            info.st_mode = mode_t(S_IFDIR) | mode_t(permissions)
+            XCTAssertFalse(MCPBootstrapDirectory.isPrivateDirectory(info))
+        }
+    }
+
+    func testRetainedDirectoryRejectsReplacementAndDoesNotUnlinkReplacementSocket() throws {
+        let parent = temporaryDirectory.appendingPathComponent("parent", isDirectory: true)
+        let socket = parent.appendingPathComponent("identity.sock")
+        let owner = try BootstrapSocketOwnership.acquire(socketURL: socket)
+        defer { owner.release() }
+        let fd = try bindSocket(at: socket, listening: true)
+        defer { Darwin.close(fd) }
+        try owner.captureBoundSocketIdentity()
+        let moved = temporaryDirectory.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.moveItem(at: parent, to: moved)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let replacementFD = try bindSocket(at: socket, listening: true)
+        defer { Darwin.close(replacementFD) }
+        XCTAssertEqual(owner.pathStatus(), .lockLost)
+        XCTAssertThrowsError(try owner.validateDirectoryForBinding())
+        XCTAssertFalse(owner.removeOwnedSocketIfCurrent())
+        XCTAssertNotNil(BootstrapSocketOwnership.identity(atPath: socket.path))
+    }
+
+    func testDirectoryCreationAndClientValidationRequirePrivateSocket() throws {
+        let parent = temporaryDirectory.appendingPathComponent("created", isDirectory: true)
+        let directory = try MCPBootstrapDirectory.open(at: parent, createIfMissing: true)
+        try directory.validateCurrentPath()
+        XCTAssertNotEqual(fcntl(directory.descriptor, F_GETFD) & FD_CLOEXEC, 0)
+        let socket = parent.appendingPathComponent("client.sock")
+        let fd = try bindSocket(at: socket, listening: true)
+        defer { Darwin.close(fd) }
+        XCTAssertEqual(chmod(socket.path, 0o666), 0)
+        XCTAssertThrowsError(try directory.validateSocket(at: socket))
+        XCTAssertEqual(chmod(socket.path, 0o600), 0)
+        try directory.validateSocket(at: socket)
+        XCTAssertEqual(chmod(parent.path, 0o755), 0)
+        XCTAssertThrowsError(try directory.validateSocket(at: socket))
+    }
+
+    func testUntrustedAliasAncestorIsNotMadeTrustedByCanonicalization() throws {
+        let target = temporaryDirectory.appendingPathComponent("target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let directory = try MCPBootstrapDirectory.open(at: target.appendingPathComponent("sockets"), createIfMissing: true)
+        try directory.validateCurrentPath()
+        let unsafe = temporaryDirectory.appendingPathComponent("unsafe-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: unsafe, withIntermediateDirectories: false)
+        XCTAssertEqual(chmod(unsafe.path, 0o777), 0)
+        let alias = unsafe.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+        XCTAssertThrowsError(try MCPBootstrapDirectory.open(at: alias.appendingPathComponent("sockets")))
+    }
+
+    func testMissingDirectoryAndSocketRemainDistinguishableFromUntrustedEntries() throws {
+        let parent = temporaryDirectory.appendingPathComponent("missing", isDirectory: true)
+        XCTAssertThrowsError(try MCPBootstrapDirectory.open(at: parent)) { error in
+            XCTAssertTrue((error as? MCPBootstrapDirectory.DirectoryError)?.isMissing == true)
+        }
+        let directory = try MCPBootstrapDirectory.open(at: parent, createIfMissing: true)
+        XCTAssertThrowsError(try directory.validateSocket(at: parent.appendingPathComponent("missing.sock"))) { error in
+            XCTAssertTrue((error as? MCPBootstrapDirectory.DirectoryError)?.isMissing == true)
+        }
+        XCTAssertEqual(chmod(parent.path, 0o755), 0)
+        XCTAssertThrowsError(try MCPBootstrapDirectory.open(at: parent)) { error in
+            XCTAssertFalse((error as? MCPBootstrapDirectory.DirectoryError)?.isMissing == true)
+        }
+    }
+
+    func testServerRejectsUnsafeFixtureParentWithoutCreatingSocketOrLock() async throws {
+        let parent = temporaryDirectory.appendingPathComponent("unsafe", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        XCTAssertEqual(chmod(parent.path, 0o777), 0)
+        let socketURL = parent.appendingPathComponent("server.sock")
+        let server = BootstrapSocketServer(socketURL: socketURL, logger: Logger(label: "directory-test"))
+        do {
+            try await server.start { _, _, _, _ in .reject(.rejected(reason: "fixture", errorCode: "fixture")) }
+            XCTFail("Unsafe parent must not start")
+        } catch {
+            XCTAssertTrue(error is MCPBootstrapDirectory.DirectoryError)
+        }
+        await server.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: socketURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: socketURL.appendingPathExtension("lock").path))
+    }
+
     func testExclusiveLockRejectsSecondOwnerAndHasCloseOnExec() throws {
         let socketURL = temporaryDirectory.appendingPathComponent("owner.sock")
         let first = try BootstrapSocketOwnership.acquire(socketURL: socketURL)

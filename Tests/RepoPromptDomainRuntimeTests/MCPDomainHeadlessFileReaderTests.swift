@@ -117,7 +117,11 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         await fulfillment(of: [entered], timeout: 5)
         task.cancel()
         let fd = open(fixture.slots.appendingPathComponent("slot-0").path, O_RDWR)
-        defer { if fd >= 0 { close(fd) } }
+        defer {
+            if fd >= 0 {
+                close(fd)
+            }
+        }
         XCTAssertGreaterThanOrEqual(fd, 0)
         XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), -1, "Cancellation must not release an executing worker's slot")
         gate.signal()
@@ -140,31 +144,28 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         let input = Pipe()
         child.standardOutput = output
         child.standardInput = input
-        try child.run()
-        defer { if child.isRunning { child.terminate() }
-            child.waitUntilExit()
+        try await withChildProcess(child) { child in
+            let ready = try child.readReadyLine(from: output)
+            XCTAssertEqual(ready, "ready")
+            let waiting = expectation(description: "reader waits on child process slot")
+            waiting.assertForOverFulfill = false
+            let task = Task {
+                try await MCPDomainHeadlessFileReader.read(
+                    at: fixture.file, startLine: nil, limit: nil,
+                    slotDirectory: fixture.slots, slotCount: 1,
+                    didWaitForSlot: { waiting.fulfill() }
+                )
+            }
+            await fulfillment(of: [waiting], timeout: 5)
+            task.cancel()
+            do {
+                _ = try await task.value
+                XCTFail("A reader queued behind another process must honor cancellation")
+            } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+            await child.crash()
+            let recovered = try await read(fixture)
+            XCTAssertEqual(recovered, "content", "Process exit must release its slot without deleting lock files")
         }
-        let ready = try output.fileHandleForReading.read(upToCount: 6)
-        XCTAssertEqual(ready, Data("ready\n".utf8))
-        let waiting = expectation(description: "reader waits on child process slot")
-        waiting.assertForOverFulfill = false
-        let task = Task {
-            try await MCPDomainHeadlessFileReader.read(
-                at: fixture.file, startLine: nil, limit: nil,
-                slotDirectory: fixture.slots, slotCount: 1,
-                didWaitForSlot: { waiting.fulfill() }
-            )
-        }
-        await fulfillment(of: [waiting], timeout: 5)
-        task.cancel()
-        do {
-            _ = try await task.value
-            XCTFail("A reader queued behind another process must honor cancellation")
-        } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
-        child.terminate()
-        child.waitUntilExit()
-        let recovered = try await read(fixture)
-        XCTAssertEqual(recovered, "content", "Process exit must release its slot without deleting lock files")
     }
 
     func testCanonicalParentReplacedBySymlinkIsRejectedBeforeReading() async throws {
@@ -319,32 +320,23 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         let input = Pipe()
         child.standardOutput = output
         child.standardInput = input
-        try child.run()
-        defer { if child.isRunning { child.terminate() }
-            child.waitUntilExit()
+        try await withChildProcess(child) { child in
+            let name = try child.readReadyLine(from: output)
+            XCTAssertTrue(name.hasPrefix("wait-00000000000000000001-"), name)
+            let queued = expectation(description: "later reader waits despite an available slot")
+            queued.assertForOverFulfill = false
+            let read = Task {
+                try await MCPDomainHeadlessFileReader.read(
+                    at: fixture.file, startLine: nil, limit: nil, slotDirectory: fixture.slots, slotCount: 1,
+                    didWaitForSlot: { queued.fulfill() }
+                )
+            }
+            await fulfillment(of: [queued], timeout: 5)
+            await child.crash()
+            let result = try await read.value
+            XCTAssertEqual(result, "content")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.slots.appendingPathComponent(name).path))
         }
-        var ready = Data()
-        while ready.count < 128 {
-            guard let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { break }
-            if byte.first == 10 { break }
-            ready.append(byte)
-        }
-        let name = String(decoding: ready, as: UTF8.self)
-        XCTAssertTrue(name.hasPrefix("wait-00000000000000000001-"), name)
-        let queued = expectation(description: "later reader waits despite an available slot")
-        queued.assertForOverFulfill = false
-        let read = Task {
-            try await MCPDomainHeadlessFileReader.read(
-                at: fixture.file, startLine: nil, limit: nil, slotDirectory: fixture.slots, slotCount: 1,
-                didWaitForSlot: { queued.fulfill() }
-            )
-        }
-        await fulfillment(of: [queued], timeout: 5)
-        child.terminate()
-        child.waitUntilExit()
-        let result = try await read.value
-        XCTAssertEqual(result, "content")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.slots.appendingPathComponent(name).path))
     }
 
     func testMoreThanNSimultaneousReadersNeverExceedPhysicalBound() async throws {
@@ -419,6 +411,139 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
             XCTFail("Unsafe mode must not degrade to process-only admission")
         } catch { XCTAssertEqual(error as? MCPDomainHeadlessFileReader.ReadError, .unsafeAdmissionDirectory) }
         XCTAssertEqual(warning.value, 0)
+    }
+
+    private func withChildProcess(_ process: Process, body: (ChildProcess) async throws -> Void) async throws {
+        let child = ChildProcess(process)
+        try process.run()
+        do {
+            try await body(child)
+        } catch {
+            await child.cleanup()
+            throw error
+        }
+        await child.cleanup()
+    }
+
+    private final class ChildProcess {
+        let process: Process
+        private let exit = ExitSignal()
+
+        init(_ process: Process) {
+            self.process = process
+            // Install before launch: waitUntilExit can lose its run-loop wakeup on a
+            // cooperative thread after an await, even after the child has been reaped.
+            process.terminationHandler = { [exit] _ in exit.fire() }
+        }
+
+        func readReadyLine(from pipe: Pipe) throws -> String {
+            let fd = pipe.fileHandleForReading.fileDescriptor
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(5))
+            var bytes = Data()
+            while bytes.count < 128 {
+                let remaining = clock.now.duration(to: deadline)
+                guard remaining > .zero else { break }
+                let milliseconds = max(1, Int32(remaining.components.seconds * 1000 + remaining.components.attoseconds / 1_000_000_000_000_000))
+                var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let status = poll(&descriptor, 1, milliseconds)
+                if status < 0, errno == EINTR {
+                    continue
+                }
+                if status < 0 {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard status > 0 else { break }
+                var byte: UInt8 = 0
+                let count = Darwin.read(fd, &byte, 1)
+                if count < 0, errno == EINTR {
+                    continue
+                }
+                if count < 0 {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard count > 0 else { break }
+                if byte == 10 {
+                    return String(decoding: bytes, as: UTF8.self)
+                }
+                bytes.append(byte)
+            }
+            throw NSError(domain: "ChildProcessReadiness", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Child \(process.processIdentifier) did not emit a readiness line within 5s: \(String(decoding: bytes, as: UTF8.self))"
+            ])
+        }
+
+        func crash() async {
+            XCTAssertEqual(kill(process.processIdentifier, SIGKILL), 0)
+            let exited = await exit.wait(timeout: .seconds(5))
+            XCTAssertTrue(exited, "Child \(process.processIdentifier) did not exit after SIGKILL")
+            if exited {
+                XCTAssertEqual(process.terminationReason, .uncaughtSignal)
+                XCTAssertEqual(process.terminationStatus, SIGKILL)
+            }
+        }
+
+        func cleanup() async {
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            let exited = await exit.wait(timeout: .seconds(5))
+            XCTAssertTrue(exited, "Cleanup timed out for child \(process.processIdentifier)")
+        }
+    }
+
+    private final class ExitSignal: @unchecked Sendable {
+        private let lock = NSLock()
+        private var exited = false
+        private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+
+        func fire() {
+            let pending = lock.withLock {
+                exited = true
+                defer { waiters.removeAll() }
+                return Array(waiters.values)
+            }
+            for waiter in pending {
+                waiter.resume(returning: true)
+            }
+        }
+
+        private func wait() async -> Bool {
+            let id = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let result: Bool? = lock.withLock {
+                        if exited {
+                            return true
+                        }
+                        if Task.isCancelled {
+                            return false
+                        }
+                        waiters[id] = continuation
+                        return nil
+                    }
+                    if let result {
+                        continuation.resume(returning: result)
+                    }
+                }
+            } onCancel: {
+                let waiter = self.lock.withLock { self.waiters.removeValue(forKey: id) }
+                waiter?.resume(returning: false)
+            }
+        }
+
+        func wait(timeout: Duration) async -> Bool {
+            await withTaskGroup(of: Bool.self) { group in
+                group.addTask { await self.wait() }
+                group.addTask {
+                    try? await Task.sleep(for: timeout)
+                    return false
+                }
+                let result = await group.next() ?? false
+                group.cancelAll()
+                return result
+            }
+        }
     }
 
     private final class Trace: @unchecked Sendable {
