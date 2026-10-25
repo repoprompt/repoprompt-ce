@@ -225,6 +225,7 @@ final class DelegationScopeRuntime: ObservableObject {
         var deletedSessions: [UUID] = []
         var deletionEndings: [UUID: OverseerScopeEnding] = [:]
         var endings: [UUID: OverseerEndedScope] = [:]
+        var earlierTerminalMutations: [OverseerContinuityMutation] = []
     }
 
     private var pendingSaves: [PendingSave] = []
@@ -1388,12 +1389,14 @@ final class DelegationScopeRuntime: ObservableObject {
         // durability. If the entire write fails, only this process knows the deny; report that
         // limitation honestly and retain the exact operation for retry.
         if !invalidated.isEmpty || !deletedSessions.isEmpty {
-            // A later cascade can reach stored children whose earlier ending has not saved yet.
-            // Carry those queued terminal facts into this transaction, deepest-first in the store,
-            // so retrying the child's original operation cannot find a later ending already sealed.
-            let terminalIDs = Set(invalidated).union(pendingSaves.flatMap(\.revoked))
-            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: terminalIDs.sorted { $0.uuidString < $1.uuidString }, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: scopeEndings.filter { terminalIDs.contains($0.key) })
-            let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions, deletionEndings: terminal.deletionEndings, endings: terminal.endings) ?? .pending
+            // New terminal saves enter the front of the queue. Replay older decisions first in
+            // this transaction, including deletion-only facts about children absent from runtime.
+            // Compose each queued decision's own delta once, not its already-composed retry prefix.
+            let earlierTerminalMutations = pendingSaves.reversed().flatMap { pending in
+                DelegationScopeStore.terminalMutations(revoked: pending.revoked, deletedSessions: pending.deletedSessions, deletionEndings: pending.deletionEndings, endings: pending.endings)
+            }
+            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: invalidated, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: scopeEndings.filter { invalidated.contains($0.key) }, earlierTerminalMutations: earlierTerminalMutations)
+            let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions, deletionEndings: terminal.deletionEndings, endings: terminal.endings, earlierTerminalMutations: terminal.earlierTerminalMutations) ?? .pending
             lastPersistenceOutcome = outcome
             if outcome == .applied || outcome == .unchanged {
                 lastContinuityOperationID = terminal.id
@@ -1415,7 +1418,7 @@ final class DelegationScopeRuntime: ObservableObject {
             guard let self else { return }
             while let pending = pendingSaves.first {
                 let outcome = await Task.detached {
-                    store.record(operationID: pending.id, grants: pending.grants, revoked: pending.revoked, deletedSessions: pending.deletedSessions, deletionEndings: pending.deletionEndings, endings: pending.endings)
+                    store.record(operationID: pending.id, grants: pending.grants, revoked: pending.revoked, deletedSessions: pending.deletedSessions, deletionEndings: pending.deletionEndings, endings: pending.endings, earlierTerminalMutations: pending.earlierTerminalMutations)
                 }.value
                 guard let index = pendingSaves.firstIndex(where: { $0.id == pending.id }) else { continue }
                 lastPersistenceOutcome = outcome

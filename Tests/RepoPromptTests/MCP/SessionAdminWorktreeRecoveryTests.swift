@@ -457,7 +457,11 @@ final class DelegationScopeEndingTests: XCTestCase {
                 if lock.withLock({ failing }) { throw CocoaError(.fileWriteOutOfSpace) }
             }
         }
-        for deleteAncestor in [false, true] {
+        for (deleteAncestor, storeOnlyChild, failAncestorSave) in [
+            (false, false, false), (true, false, false),
+            (false, true, false), (true, true, false),
+            (false, true, true), (true, true, true)
+        ] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
             let gate = FailureGate()
@@ -470,23 +474,39 @@ final class DelegationScopeEndingTests: XCTestCase {
             let owner = UUID(), childOwner = UUID()
             let request = try runtime.requestScope(requesterSessionID: owner, requesterTabID: nil, kind: .tree(rootSessionID: owner), capabilities: [.observe, .spawn], guardrails: .init(), reason: nil, idempotencyKey: nil).get()
             let parent = try runtime.approve(requestID: request.id).get()
-            let child = try runtime.attenuate(parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(owner), newGranteeSessionID: childOwner, newGranteeMemberships: [.init(scopeID: parent.id, targetSessionID: childOwner, basis: .treePath([childOwner, owner]))], capabilities: [.observe], guardrails: .init()).get()
+            await runtime.flushPersistence()
+            let child: DomainDelegationScopeGrant
+            if storeOnlyChild {
+                child = .init(id: UUID(), granteeSessionID: childOwner, kind: .tree(rootSessionID: childOwner), capabilities: [.observe], guardrails: .init(), origin: .attenuatedFrom(scopeID: parent.id), grantedAt: clock)
+                XCTAssertEqual(store().record(operationID: UUID(), grants: [child], revoked: []), .applied)
+                XCTAssertNil(runtime.record(id: child.id), "Another writer's child must remain absent from this runtime")
+            } else {
+                child = try runtime.attenuate(parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(owner), newGranteeSessionID: childOwner, newGranteeMemberships: [.init(scopeID: parent.id, targetSessionID: childOwner, basis: .treePath([childOwner, owner]))], capabilities: [.observe], guardrails: .init()).get().grant
+            }
             await runtime.flushPersistence()
             gate.setFailing(true)
             clock = clock.addingTimeInterval(1)
-            _ = try runtime.release(scopeID: child.id, caller: .agentSession(childOwner)).get()
-            let firstEnding = try XCTUnwrap(runtime.ending(for: child.id))
-            XCTAssertEqual(firstEnding.reason, .granteeReleased)
+            let firstEnding: OverseerScopeEnding
+            if storeOnlyChild {
+                runtime.revokeAll(involving: childOwner, origin: .mcpClient(owner), fileRemoved: false)
+                firstEnding = .init(reason: .sessionDeleted, at: clock, actorSessionID: owner, originatingSessionID: childOwner, deletionOrigin: .mcpClient, fileRemoved: false)
+            } else {
+                _ = try runtime.release(scopeID: child.id, caller: .agentSession(childOwner)).get()
+                firstEnding = try XCTUnwrap(runtime.ending(for: child.id))
+                XCTAssertEqual(firstEnding.reason, .granteeReleased)
+            }
             XCTAssertEqual(runtime.lastPersistenceOutcome, .writeFailed)
             XCTAssertNotEqual(runtime.continuityState, "saved")
-            // No suspension between the failed child save and the successful ancestor transaction:
+            // No suspension between the failed child save and the ancestor's save attempt:
             // the queued retry cannot run first and accidentally hide the ordering defect.
-            gate.setFailing(false)
+            gate.setFailing(failAncestorSave)
             clock = clock.addingTimeInterval(1)
             if deleteAncestor { runtime.revokeAll(involving: owner, origin: .userUI, fileRemoved: true) }
             else { runtime.revoke(scopeID: parent.id) }
             let parentEnding = try XCTUnwrap(runtime.ending(for: parent.id))
             XCTAssertNotEqual(parentEnding, firstEnding)
+            if failAncestorSave { XCTAssertEqual(runtime.lastPersistenceOutcome, .writeFailed) }
+            gate.setFailing(false)
             await runtime.flushPersistence()
             XCTAssertEqual(runtime.continuityState, "saved")
             runtime.freezeForTermination()

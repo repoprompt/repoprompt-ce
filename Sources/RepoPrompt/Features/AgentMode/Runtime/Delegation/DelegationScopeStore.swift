@@ -155,38 +155,42 @@ final class DelegationScopeStore: @unchecked Sendable {
         }
     }
 
-    func record(operationID: UUID, grants: [DomainDelegationScopeGrant], revoked: [UUID], deletedSessions: [UUID] = [], deletionEndings: [UUID: OverseerScopeEnding] = [:], endings: [UUID: OverseerEndedScope] = [:]) -> DelegationScopeWriteOutcome {
+    /// Builds only irreversible deny mutations; the runtime retains their decision order for retry.
+    static func terminalMutations(revoked: [UUID], deletedSessions: [UUID], deletionEndings: [UUID: OverseerScopeEnding], endings: [UUID: OverseerEndedScope]) -> [OverseerContinuityMutation] {
+        // Evidence is best effort; malformed diagnostics must never stall a deny transaction.
+        let originals: [UUID: OverseerContinuityRow] = endings.compactMapValues { ended in
+            guard let grant = try? JSONDecoder().decode(DomainDelegationScopeGrant.self, from: ended.originalPayload),
+                  var row = try? OverseerContinuityRepository.scopeRow(grant) else { return nil }
+            row.payload = ended.originalPayload
+            return row
+        }
+        func depth(_ id: UUID) -> Int {
+            var cursor = originals[id]?.parentID.flatMap(UUID.init(uuidString:))
+            var seen: Set<UUID> = [id]
+            while let parent = cursor, seen.insert(parent).inserted {
+                cursor = originals[parent]?.parentID.flatMap(UUID.init(uuidString:))
+            }
+            return seen.count
+        }
+        // Capture each explicit child's evidence before an ancestor terminalizes it. Concurrent
+        // children not in this process still inherit the ancestor's evidence transactionally.
+        let ordered = revoked.sorted { depth($0) == depth($1) ? $0.uuidString < $1.uuidString : depth($0) > depth($1) }
+        return ordered.map { id -> OverseerContinuityMutation in
+            guard let ended = endings[id], let original = originals[id], original.id == id.uuidString else { return .revokeScope(id.uuidString) }
+            return .endScope(id.uuidString, ended.ending, original: original)
+        } + deletedSessions.map { id in
+            deletionEndings[id].map { OverseerContinuityMutation.deletedSessionWithEvidence(id.uuidString, $0) }
+                ?? .deletedSession(id.uuidString)
+        }
+    }
+
+    func record(operationID: UUID, grants: [DomainDelegationScopeGrant], revoked: [UUID], deletedSessions: [UUID] = [], deletionEndings: [UUID: OverseerScopeEnding] = [:], endings: [UUID: OverseerEndedScope] = [:], earlierTerminalMutations: [OverseerContinuityMutation] = []) -> DelegationScopeWriteOutcome {
         guard mode.performsProductionFileIO, !lock.withLock({ closed }) else { return .blocked }
         do {
             try beforeCommit()
-            // Evidence is best effort; malformed diagnostics must never stall a deny transaction.
-            let originals: [UUID: OverseerContinuityRow] = endings.compactMapValues { ended in
-                guard let grant = try? JSONDecoder().decode(DomainDelegationScopeGrant.self, from: ended.originalPayload),
-                      var row = try? OverseerContinuityRepository.scopeRow(grant) else { return nil }
-                row.payload = ended.originalPayload
-                return row
-            }
-            func depth(_ id: UUID) -> Int {
-                var cursor = originals[id]?.parentID.flatMap(UUID.init(uuidString:))
-                var seen: Set<UUID> = [id]
-                while let parent = cursor, seen.insert(parent).inserted {
-                    cursor = originals[parent]?.parentID.flatMap(UUID.init(uuidString:))
-                }
-                return seen.count
-            }
-            // Capture each explicit child's evidence before an ancestor terminalizes it. Concurrent
-            // children not in this process still inherit the ancestor's evidence transactionally.
-            let ordered = revoked.sorted { depth($0) == depth($1) ? $0.uuidString < $1.uuidString : depth($0) > depth($1) }
-            let terminalMutations = ordered.map { id -> OverseerContinuityMutation in
-                guard let ended = endings[id], let original = originals[id], original.id == id.uuidString else { return .revokeScope(id.uuidString) }
-                return .endScope(id.uuidString, ended.ending, original: original)
-            }
             let grantMutations: [OverseerContinuityMutation] = try grants.filter { !revoked.contains($0.id) }.map { try .grant(OverseerContinuityRepository.scopeRow($0)) }
-            let mutations = terminalMutations
-                + deletedSessions.map { id in
-                    deletionEndings[id].map { OverseerContinuityMutation.deletedSessionWithEvidence(id.uuidString, $0) }
-                        ?? .deletedSession(id.uuidString)
-                }
+            let mutations = earlierTerminalMutations
+                + Self.terminalMutations(revoked: revoked, deletedSessions: deletedSessions, deletionEndings: deletionEndings, endings: endings)
                 + grantMutations
             guard !mutations.isEmpty else { return .unchanged }
             let receipt = try repository.commit(operationID: operationID, mutations: mutations, origin: "live-scope-owner")
