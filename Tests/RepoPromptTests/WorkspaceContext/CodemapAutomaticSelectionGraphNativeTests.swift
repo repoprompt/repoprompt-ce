@@ -362,6 +362,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         let cancelledWrites = CodemapLockedValues<Int>()
         let armReaderRace = CodemapLockedValues<Bool>()
         let pauseReader = CodemapLockedValues<Bool>()
+        let pausedWriterIDs = CodemapLockedValues<UUID>()
         let cancelledReaders = CodemapLockedValues<Int>()
         let readerGate = TestReleaseFence(name: "old writer setting read")
         let armStoreFence = CodemapLockedValues<Bool>()
@@ -384,6 +385,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             manifestStoreHooks: CodeMapRootManifestStoreHooks(
                 beforePublish: { publications.append(1) },
                 beforeMaintenanceLock: {
+                    XCTAssertNil(WorkspaceCodemapDebugReadContext.manifestWriterID, "writer read identity must not leak into store publication")
                     if armStoreFence.takeFirst() != nil {
                         // Keep publication suspended after cancellation removes its writer state.
                         // The existing detached-fence pattern makes task return an explicit event.
@@ -398,7 +400,12 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             ),
             globalCodeMapsDisabled: {
                 let value = disabled.values.last ?? false
-                if pauseReader.takeFirst() != nil {
+                if let writerID = WorkspaceCodemapDebugReadContext.manifestWriterID,
+                   pauseReader.takeFirst() != nil
+                {
+                    pausedWriterIDs.append(writerID)
+                    // Only the actual writer may consume this pause; submission and store
+                    // readers share this closure but are not owned by writer cancellation.
                     // Keep this one old setting read suspended through ON/OFF. The detached
                     // fence is released explicitly; normal pre-write cancellation stays cooperative.
                     await withTaskCancellationHandler {
@@ -450,6 +457,10 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         }
         let readerEntered = await readerGate.waitUntilEntered(timeout: 30)
         guard readerEntered else { return XCTFail("Enabled graph work must reach its writer setting read") }
+        let pausedWriterID = try XCTUnwrap(
+            pausedWriterIDs.values.first,
+            "The cancellation fixture must pause the manifest writer, not an unrelated settings reader"
+        )
         disabled.append(true)
         let disableDrain = Task { await engine.refreshGlobalCodeMapsDisabled() }
         addTeardownBlock {
@@ -460,6 +471,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         try await AsyncTestWait.waitUntil("old writer is cancelled during its setting read", timeout: 30) {
             !cancelledReaders.values.isEmpty
         }
+        XCTAssertEqual(pausedWriterIDs.values, [pausedWriterID])
         disabled.append(false)
         await engine.refreshGlobalCodeMapsDisabled()
         try "struct ReplacementFeature {}\n".write(

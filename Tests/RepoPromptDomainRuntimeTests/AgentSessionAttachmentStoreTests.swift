@@ -77,6 +77,93 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: nestedFile.path))
     }
 
+    func testHandoffCopiesOwnedImagesAndRepairsCapturedTemporaryPathsWithoutMovingTheParent() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let parentID = UUID()
+        let childID = UUID()
+        let original = temporaryRoot.appendingPathComponent("original.png")
+        let bytes = Data("parent image".utf8)
+        try bytes.write(to: original)
+        let attachment = AgentImageAttachment(source: .localFile(path: original.path), title: "Keep this image")
+        let retained = try XCTUnwrap(store.retain([attachment], sessionID: parentID, temporaryRoot: temporaryRoot).retained[attachment.id])
+        guard case let .localFile(parentPath) = retained.source else { return XCTFail("Expected retained image") }
+
+        // Handoff captured the temporary path before retention finished. The same ID resolves only
+        // under the captured parent's folder, then gets an independently owned child copy.
+        let copied = try store.copyForHandoff(
+            [attachment, attachment], sourceSessionID: parentID, destinationSessionID: childID,
+            temporaryRoot: temporaryRoot
+        )
+        let child = try XCTUnwrap(copied[attachment.id])
+        guard case let .localFile(childPath) = child.source else { return XCTFail("Expected child image") }
+        XCTAssertEqual(copied.count, 1)
+        XCTAssertEqual(child.id, attachment.id)
+        XCTAssertEqual(child.title, attachment.title)
+        XCTAssertEqual(child.createdAt, attachment.createdAt)
+        XCTAssertNotEqual(childPath, parentPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: parentPath)), bytes)
+        XCTAssertTrue(store.isRetainedPath(childPath, sessionID: childID))
+        XCTAssertFalse(store.isRetainedPath(childPath, sessionID: parentID))
+        store.removeSessionFolder(sessionID: parentID)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: childPath)), bytes)
+        XCTAssertTrue(store.isRetainedPath(childPath, sessionID: childID))
+    }
+
+    func testHandoffFailureDiscardsPartialCopiesWithoutTouchingSourcesOrExistingDestination() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let source = temporaryRoot.appendingPathComponent("source.png")
+        let bytes = Data("original source".utf8)
+        try bytes.write(to: source)
+        let good = AgentImageAttachment(source: .localFile(path: source.path))
+        let foreign = baseURL.appendingPathComponent("foreign.png")
+        try bytes.write(to: foreign)
+        let symlink = temporaryRoot.appendingPathComponent("link.png")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: foreign)
+        for badPath in [temporaryRoot.appendingPathComponent("missing.png").path, foreign.path, symlink.path] {
+            let childID = UUID()
+            XCTAssertThrowsError(try store.copyForHandoff(
+                [good, AgentImageAttachment(source: .localFile(path: badPath))],
+                sourceSessionID: UUID(), destinationSessionID: childID, temporaryRoot: temporaryRoot
+            ))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.rootURL.path), [])
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            XCTAssertEqual(try Data(contentsOf: foreign), bytes)
+        }
+
+        let occupiedID = UUID()
+        let occupiedFolder = store.sessionFolderURL(sessionID: occupiedID)
+        try FileManager.default.createDirectory(at: occupiedFolder, withIntermediateDirectories: true)
+        let sentinel = occupiedFolder.appendingPathComponent("existing.png")
+        try bytes.write(to: sentinel)
+        XCTAssertThrowsError(try store.copyForHandoff(
+            [good], sourceSessionID: UUID(), destinationSessionID: occupiedID, temporaryRoot: temporaryRoot
+        ))
+        XCTAssertEqual(try Data(contentsOf: sentinel), bytes)
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+    }
+
+    func testHandoffRejectsOversizedSetsAndAmbiguousAttachmentIDsWithoutEvictingImages() throws {
+        let store = AgentSessionAttachmentStore(
+            agentSessionsFolder: agentSessionsFolder,
+            limits: .init(maxRetainedImageBytes: .max, downscaledLongEdgePixels: 4096, maxSessionFolderBytes: 6)
+        )
+        let first = temporaryRoot.appendingPathComponent("first.png")
+        let second = temporaryRoot.appendingPathComponent("second.png")
+        try Data("first".utf8).write(to: first)
+        try Data("second".utf8).write(to: second)
+        let attachment = AgentImageAttachment(source: .localFile(path: first.path))
+        for secondID in [UUID(), attachment.id] {
+            XCTAssertThrowsError(try store.copyForHandoff(
+                [attachment, AgentImageAttachment(id: secondID, source: .localFile(path: second.path))],
+                sourceSessionID: UUID(), destinationSessionID: UUID(), temporaryRoot: temporaryRoot
+            ))
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.rootURL.path), [])
+            XCTAssertEqual(try Data(contentsOf: first), Data("first".utf8))
+            XCTAssertEqual(try Data(contentsOf: second), Data("second".utf8))
+        }
+    }
+
     func testSymlinkedSessionFolderCannotBorrowAnotherSessionsImages() throws {
         let store = AgentSessionAttachmentStore(
             agentSessionsFolder: agentSessionsFolder,

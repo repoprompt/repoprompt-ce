@@ -86,7 +86,8 @@ final class ClaudeIntegratedAgentModeRunner {
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
@@ -160,6 +161,11 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
+        // Only the producer can identify its newly appended row. An Auto-wake can follow an
+        // unanswered historical user row, so even a trailing-row check cannot establish ownership.
+        let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
+            ? initialUserItemID
+            : nil
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
@@ -191,6 +197,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
                 let providerName = session.selectedAgent.rawValue
                 var didSendToProvider = false
+                var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
                 let report = await DomainAgentRunExecutionCore.execute(
                     failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
@@ -206,7 +213,10 @@ final class ClaudeIntegratedAgentModeRunner {
                         allowsCatalogRouteControllerRecovery: true,
                         autoEffortSelection: autoEffortSelection,
                         providerControlCommand: providerControlCommand,
-                        selfCompactDispatchID: selfCompactDispatchID
+                        selfCompactDispatchID: selfCompactDispatchID,
+                        // A replacement process's MCP child needs this run's one-shot admission
+                        // policy re-armed; the lease that installed it still owns it here.
+                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
                     )
                     if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {
@@ -231,8 +241,11 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .sent:
                         didSendToProvider = true
                         if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
-                    case .failed:
+                    case let .failed(message):
                         nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
+                        if ClaudeAgentModeCoordinator.isRouteVerificationFailure(message) {
+                            routeRefusalMessage = message
+                        }
                         throw NativeTerminalFailure()
                     case .superseded:
                         return .superseded
@@ -310,6 +323,18 @@ final class ClaudeIntegratedAgentModeRunner {
                         shouldShutdownSession: outcome.kind == .failed
                             && nativeFailureMetadata?.shouldShutdownSession == true
                     )
+                    // Route refusals happen before any provider write, so the user's message was never
+                    // sent. Mirror Codex: withdraw the unsent row and hand the text back for a resend.
+                    if outcome.kind == .failed, !didSendToProvider,
+                       routeRefusalMessage != nil,
+                       let rollbackUserItemID
+                    {
+                        self.hooks.queuedWorkRecovery.restoreRouteRefusedUnsentTurn(
+                            session,
+                            rollbackUserItemID,
+                            "\(session.selectedAgent.displayName) did not send because the RepoPrompt MCP route could not be verified. Your message was restored."
+                        )
+                    }
                 }
             } onCancel: {}
         }

@@ -687,6 +687,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only exact route-token seam for synthetic catalog publications.
         var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
             ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        /// Test-only bounded route-token wait seam (run, window, tab, timeout seconds); mirrors the
+        /// immediate seam above for `ProviderInputRouteWait`. Must honor the timeout. When only the
+        /// immediate seam is installed, waits re-check it until it yields a token or time runs out.
+        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken:
+            ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
@@ -2491,9 +2496,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
                 guard let self else { return .unavailable }
-                return await qualifyProviderInputRoute(for: session)
+                return await qualifyProviderInputRoute(for: session, routeWait: routeWait)
             },
             hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
@@ -3479,6 +3484,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isCurrentSessionBinding: { [weak self] session, fence in
                     self?.sessions[session.tabID] === session
                         && session.persistentSessionBindingIdentity == fence.binding
+                },
+                restoreRouteRefusedUnsentTurn: { [weak self] session, userItemID, message in
+                    _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
                 }
             ),
             persistence: .init(
@@ -20237,7 +20245,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -20292,7 +20300,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -21812,7 +21820,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            initialUserItemID: directStartOptions.initialUserItemID
         )
     }
 
@@ -25071,6 +25080,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sourceTabID: sourceTabID,
             sourceSession: sourceSession
         )
+        // Pin attachment authority alongside the transcript before payload/tab preparation can
+        // suspend or the window can switch workspaces.
+        let handoffAttachmentStore = sessionAttachmentsRootURL().map {
+            AgentSessionAttachmentStore(rootURL: $0, limits: sessionAttachmentLimits)
+        }
+        let handoffTemporaryRoot = attachmentWorkspaceDirectoryProvider().map {
+            AgentAttachmentStore.managedStorageRootURL(for: $0)
+        }
 
         // 1) Build the handoff payload from the same transcript universe used for migration.
         let payload = await buildHandoffPayload(
@@ -25081,10 +25098,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
 
         // 2) Build migrated transcript items (prefix copy up to cutoff, no thinking, no streaming)
-        let migratedItems = buildHandoffTranscriptItems(
+        var migratedItems = buildHandoffTranscriptItems(
             sourceTranscript: sourceTranscript,
             upToItemID: upToItemID
         )
+        let localAttachments = migratedItems.flatMap(\.attachments).filter {
+            if case .localFile = $0.source { true } else { false }
+        }
 
         // Capture the destination through the actual creation owner, before a visible tab can
         // suspend in Oracle cloning or activation. Never claim its later occupant by tab UUID.
@@ -25137,7 +25157,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         func destinationIsCurrent() -> Bool {
+            // Storage placement can change without rebinding the tab. Copied paths must still
+            // belong to the destination's current root at every later preparation boundary.
             freshSessionCreationIsCurrent(destinationCreation)
+                && (localAttachments.isEmpty || sessionAttachmentsRootURL() == handoffAttachmentStore?.rootURL)
         }
         #if DEBUG
             await test_afterHandoffDestinationCreation?(destSession)
@@ -25169,6 +25192,55 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: destinationClaim.sessionID, code: "target_changed",
                 detail: "The fork was created, but its destination changed during chat cloning."
             )
+        }
+        if !localAttachments.isEmpty {
+            guard let handoffAttachmentStore else {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "attachment_copy_failed",
+                    detail: "The fork could not keep its images because conversation attachment storage is unavailable."
+                )
+            }
+            do {
+                let copied = try await AgentSessionDataService.shared.copyHandoffAttachments(
+                    localAttachments,
+                    sourceSessionID: sourceWorktreeSnapshot.sourceSessionID,
+                    destinationSessionID: destinationClaim.sessionID,
+                    store: handoffAttachmentStore,
+                    temporaryRoot: handoffTemporaryRoot
+                )
+                guard destinationIsCurrent() else {
+                    throw PersistentBindingMutationError.staleTransition
+                }
+                if Task.isCancelled {
+                    // Nothing has published these paths or saved this payload yet. Only this
+                    // still-current fresh generation may roll back its completed copy. A changed
+                    // binding keeps its files, just as the existing failed-creation owner does.
+                    handoffAttachmentStore.removeSessionFolder(sessionID: destinationClaim.sessionID)
+                    throw CancellationError()
+                }
+                migratedItems = migratedItems.map { item in
+                    var item = item
+                    item.attachments = item.attachments.map { attachment in
+                        guard case .localFile = attachment.source, let copy = copied[attachment.id] else { return attachment }
+                        return AgentImageAttachment(
+                            id: attachment.id, source: copy.source,
+                            title: attachment.title, createdAt: attachment.createdAt
+                        )
+                    }
+                    return item
+                }
+            } catch PersistentBindingMutationError.staleTransition {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "target_changed",
+                    detail: "The fork was created, but its destination changed during image copying."
+                )
+            } catch {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID,
+                    code: error is CancellationError ? "cancelled" : "attachment_copy_failed",
+                    detail: "The fork could not keep its images: \(error.localizedDescription)"
+                )
+            }
         }
         // 5) Populate only the captured fresh destination.
         destSession.selectedAgent = destinationAgent
@@ -25208,7 +25280,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let stagedSave = await saveSessionCore(for: destTabID, creationSave: .recovery(destinationCreation))
             guard case let .durablySaved(token) = stagedSave,
                   token == expectedChildBindingToken,
-                  destSession.currentRestorationBindingToken == expectedChildBindingToken
+                  destSession.currentRestorationBindingToken == expectedChildBindingToken,
+                  destinationIsCurrent()
             else {
                 throw SessionAdminPartialForkError(
                     sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
@@ -25280,6 +25353,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw SessionAdminPartialForkError(
                 sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
                 detail: "The fork exists, but its configured first save did not complete: \(reason)"
+            )
+        }
+        guard destinationIsCurrent() else {
+            throw SessionAdminPartialForkError(
+                sessionID: destinationClaim.sessionID, code: "target_changed",
+                detail: "The fork was saved, but its destination changed during its first save."
             )
         }
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the

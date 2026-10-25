@@ -191,8 +191,9 @@ actor AgentSessionDataService {
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
     /// Actor-owned state shared with the attachment-retention extension.
     var deletedSessionFileURLs: Set<URL> = []
-    /// Admitted moves share the save/deletion tombstone. Deletion drains them before removing images.
-    var attachmentRetentionTasksByFileURL: [URL: [UUID: Task<AgentSessionAttachmentStore.RetentionResult, Never>]] = [:]
+    /// Admitted moves/copies share the save/deletion tombstone. Deletion drains their I/O before
+    /// removing images; workers wait only on handles captured before their own registration.
+    var attachmentFileTasksByFileURL: [URL: [UUID: Task<Void, Never>]] = [:]
     /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
     var deletionAttemptsByFileURL: [URL: DeletionAttempts] = [:]
     #if DEBUG
@@ -202,6 +203,7 @@ actor AgentSessionDataService {
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
         private var testBeforeDeletionAdmissionHook: (@Sendable (URL) async -> Void)?
         var testBeforeAttachmentRetentionHook: (@Sendable (URL) async -> Void)?
+        var testBeforeHandoffAttachmentCopyHook: (@Sendable (UUID) async -> Void)?
         /// Passive gate run inside `preparePersistedHydration` once the load result is known.
         private var testAfterHydrationPrepareHook: (@Sendable (UUID) async throws -> Void)?
     #endif
@@ -1851,10 +1853,10 @@ actor AgentSessionDataService {
             }
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
-        // Tombstone admission is already closed, so this snapshot covers every possible move.
-        let attachmentMoves = Array(attachmentRetentionTasksByFileURL[fileURL]?.values ?? [:].values)
-        for move in attachmentMoves {
-            _ = await move.value
+        // Tombstone admission is closed, so this covers all source/destination image operations.
+        let attachmentOperations = Array(attachmentFileTasksByFileURL[fileURL]?.values ?? [:].values)
+        for operation in attachmentOperations {
+            await operation.value
         }
         do {
             if let fence = Self.destructiveCommitFence.get(), await !fence() {

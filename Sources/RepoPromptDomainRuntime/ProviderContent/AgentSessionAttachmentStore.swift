@@ -48,6 +48,23 @@ package struct AgentSessionAttachmentStore {
         package var removedTemporaryFiles: [String]
     }
 
+    package enum HandoffCopyError: LocalizedError {
+        case sourceUnavailable(UUID)
+        case destinationInUse
+        case sessionLimitExceeded
+
+        package var errorDescription: String? {
+            switch self {
+            case let .sourceUnavailable(id):
+                "The source image \(id.uuidString) is missing or is not owned by this conversation."
+            case .destinationInUse:
+                "The new conversation already has attachment storage."
+            case .sessionLimitExceeded:
+                "The handoff images exceed the conversation's attachment storage limit."
+            }
+        }
+    }
+
     package static let directoryName = "attachments"
     package static let temporaryFileMaxAge: TimeInterval = 7 * 24 * 60 * 60
     /// Orphaned folders younger than this are left alone so a session whose transcript has not been
@@ -80,15 +97,7 @@ package struct AgentSessionAttachmentStore {
     /// rejected and both sides are compared after resolving symlinks, so a link planted in (or
     /// pointing out of) the folder never widens what the path authorizes.
     package func isRetainedPath(_ path: String, sessionID: UUID) -> Bool {
-        let candidate = URL(fileURLWithPath: path).standardizedFileURL
-        guard let values = try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
-              values.isSymbolicLink != true, values.isRegularFile == true
-        else { return false }
-        let folder = sessionFolderURL(sessionID: sessionID)
-        guard !isSymbolicLink(folder) else { return false }
-        let prefix = folder.resolvingSymlinksInPath().path + "/"
-        let resolved = candidate.resolvingSymlinksInPath().path
-        return resolved.hasPrefix(prefix) && !resolved.dropFirst(prefix.count).contains("/")
+        isRegularFile(URL(fileURLWithPath: path).standardizedFileURL, directlyIn: sessionFolderURL(sessionID: sessionID))
     }
 
     /// The kept copy of `attachmentID` in this session's folder, whatever its extension.
@@ -122,6 +131,101 @@ package struct AgentSessionAttachmentStore {
             )
         }
         return repaired
+    }
+
+    /// A fork owns independent files: retaining or deleting the source can never invalidate them.
+    /// Copy the complete set into private staging before publishing the fresh destination folder.
+    /// A missing image, storage limit, or cancellation fails the whole copy instead of silently
+    /// publishing transcript rows that depend on the parent or on already-consumed temporary files.
+    package func copyForHandoff(
+        _ attachments: [AgentImageAttachment],
+        sourceSessionID: UUID?,
+        destinationSessionID: UUID,
+        temporaryRoot: URL?
+    ) throws -> [UUID: AgentImageAttachment] {
+        let local = attachments.filter {
+            if case .localFile = $0.source { true } else { false }
+        }
+        guard !local.isEmpty else { return [:] }
+        try Task.checkCancellation()
+        let fileManager = FileManager.default
+        let destinationFolder = sessionFolderURL(sessionID: destinationSessionID)
+        guard sourceSessionID != destinationSessionID,
+              !fileManager.fileExists(atPath: destinationFolder.path),
+              !isSymbolicLink(destinationFolder)
+        else { throw HandoffCopyError.destinationInUse }
+
+        let staging = rootURL.appendingPathComponent(".handoff-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        var copied: [UUID: AgentImageAttachment] = [:]
+        var sourcesByID: [UUID: AgentImageSource] = [:]
+        var totalBytes: Int64 = 0
+        for attachment in local {
+            try Task.checkCancellation()
+            if let previous = sourcesByID[attachment.id] {
+                guard previous == attachment.source else { throw HandoffCopyError.sourceUnavailable(attachment.id) }
+                continue
+            }
+            sourcesByID[attachment.id] = attachment.source
+            let source = try handoffSource(for: attachment, sessionID: sourceSessionID, temporaryRoot: temporaryRoot)
+            let sourceAttributes = try fileManager.attributesOfItem(atPath: source.path)
+            let sourceSize = (sourceAttributes[.size] as? NSNumber)?.int64Value ?? 0
+            guard sourceSize <= limits.maxSessionFolderBytes - totalBytes else {
+                throw HandoffCopyError.sessionLimitExceeded
+            }
+            let fileExtension = source.pathExtension.isEmpty ? "png" : source.pathExtension.lowercased()
+            let stagedFile = staging.appendingPathComponent(attachment.id.uuidString).appendingPathExtension(fileExtension)
+            try fileManager.copyItem(at: source, to: stagedFile)
+            // copyItem preserves symlinks. A source replaced during the copy must not publish a
+            // link whose bytes still depend on the parent (or another folder).
+            guard isRegularFile(stagedFile, directlyIn: staging) else {
+                throw HandoffCopyError.sourceUnavailable(attachment.id)
+            }
+            let attributes = try fileManager.attributesOfItem(atPath: stagedFile.path)
+            let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            guard size <= limits.maxSessionFolderBytes - totalBytes else {
+                throw HandoffCopyError.sessionLimitExceeded
+            }
+            totalBytes += size
+            copied[attachment.id] = AgentImageAttachment(
+                id: attachment.id,
+                source: .localFile(path: destinationFolder.appendingPathComponent(stagedFile.lastPathComponent).path),
+                title: attachment.title,
+                createdAt: attachment.createdAt
+            )
+        }
+        try Task.checkCancellation()
+        // moveItem refuses an existing destination. Never merge with or replace another owner.
+        try fileManager.moveItem(at: staging, to: destinationFolder)
+        do {
+            try Task.checkCancellation()
+        } catch {
+            try? fileManager.removeItem(at: destinationFolder)
+            throw error
+        }
+        return copied
+    }
+
+    private func handoffSource(for attachment: AgentImageAttachment, sessionID: UUID?, temporaryRoot: URL?) throws -> URL {
+        guard case let .localFile(path) = attachment.source else {
+            throw HandoffCopyError.sourceUnavailable(attachment.id)
+        }
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        if let sessionID, isRetainedPath(candidate.path, sessionID: sessionID) {
+            return candidate
+        }
+        if let temporaryRoot, isRegularFile(candidate, directlyIn: temporaryRoot.standardizedFileURL) {
+            return candidate
+        }
+        // Turn-end retention may have moved the captured temporary path while Handoff prepared
+        // its payload. Resolve only the same attachment ID under the captured parent's authority.
+        if !FileManager.default.fileExists(atPath: candidate.path),
+           let sessionID, let retained = locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID)
+        {
+            return retained
+        }
+        throw HandoffCopyError.sourceUnavailable(attachment.id)
     }
 
     /// Moves (falling back to copy) each temporary attachment into the session folder.
@@ -294,6 +398,16 @@ package struct AgentSessionAttachmentStore {
     /// A per-session link cannot delegate one session's image authority to another folder.
     private func isSymbolicLink(_ url: URL) -> Bool {
         (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true
+    }
+
+    private func isRegularFile(_ candidate: URL, directlyIn folder: URL) -> Bool {
+        guard let values = try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
+              values.isSymbolicLink != true, values.isRegularFile == true,
+              !isSymbolicLink(folder)
+        else { return false }
+        let prefix = folder.resolvingSymlinksInPath().path + "/"
+        let resolved = candidate.resolvingSymlinksInPath().path
+        return resolved.hasPrefix(prefix) && !resolved.dropFirst(prefix.count).contains("/")
     }
 
     private func placeFile(_ source: URL, attachmentID: UUID, in folder: URL) -> URL? {

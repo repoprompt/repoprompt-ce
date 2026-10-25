@@ -319,6 +319,113 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         }
     }
 
+    func testDeletionDrainsHandoffCopyForBothSourceAndDestination() async throws {
+        for deleteParent in [true, false] {
+            let fixture = try makeFixture()
+            let store = AgentSessionAttachmentStore(agentSessionsFolder: fixture.agentSessionsFolder)
+            let childID = UUID()
+            let source = try writeTemporaryImage(fixture: fixture)
+            let attachment = try XCTUnwrap(store.retain(
+                [source], sessionID: fixture.sessionID,
+                temporaryRoot: AgentAttachmentStore.managedStorageRootURL(for: fixture.storageURL)
+            ).retained[source.id])
+            guard case let .localFile(parentPath) = attachment.source else { return XCTFail("Missing parent image") }
+            let originalBytes = try Data(contentsOf: URL(fileURLWithPath: parentPath))
+            for id in [fixture.sessionID, childID] {
+                try writeSession(
+                    AgentSession(id: id, workspaceID: fixture.workspace.id, name: "Handoff copy", itemCount: 0),
+                    to: fixture.agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
+                )
+            }
+            let gate = TestReleaseFence(name: "handoff copy before deletion")
+            defer { gate.release() }
+            await fixture.service.test_setBeforeHandoffAttachmentCopyHook { _ in await gate.enterAndWait() }
+            let copy = Task {
+                try await fixture.service.copyHandoffAttachments(
+                    [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
+                    store: store, temporaryRoot: nil
+                )
+            }
+            addTeardownBlock {
+                gate.release()
+                _ = await copy.result
+                await fixture.service.test_setBeforeHandoffAttachmentCopyHook(nil)
+                try? FileManager.default.removeItem(at: fixture.storageURL)
+            }
+            guard await gate.waitUntilEntered() else { return }
+            let deletedID = deleteParent ? fixture.sessionID : childID
+            let deletedURL = fixture.agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: deletedID))
+            let deletion = Task {
+                try await fixture.service.deleteAgentSession(id: deletedID, for: fixture.workspace)
+            }
+            addTeardownBlock {
+                gate.release()
+                _ = await deletion.result
+            }
+            await fixture.service.test_waitUntilDeletionTombstone(for: deletedURL)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: deletedURL.path), "Deletion must join the admitted copy")
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: parentPath)), originalBytes)
+            gate.release()
+            try await deletion.value
+            do {
+                let copied = try await copy.value
+                XCTAssertTrue(deleteParent, "A committed child deletion must refuse copied paths")
+                let child = try XCTUnwrap(copied[attachment.id])
+                guard case let .localFile(childPath) = child.source else { return XCTFail("Missing child image") }
+                XCTAssertTrue(store.isRetainedPath(childPath, sessionID: childID))
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: childPath)), originalBytes)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: parentPath))
+            } catch let AgentSessionDataError.sessionDeleted(id) {
+                XCTAssertFalse(deleteParent)
+                XCTAssertEqual(id, childID)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: parentPath)), originalBytes)
+            }
+            // The tombstone also refuses a later operation, rather than letting it recreate files.
+            do {
+                _ = try await fixture.service.copyHandoffAttachments(
+                    [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
+                    store: store, temporaryRoot: nil
+                )
+                XCTFail("A deleted source or destination must close copy admission")
+            } catch let AgentSessionDataError.sessionDeleted(id) {
+                XCTAssertEqual(id, deletedID)
+            }
+        }
+    }
+
+    func testCancelledHandoffCopyLeavesParentUntouchedAndNoChildFiles() async throws {
+        let fixture = try makeFixture()
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: fixture.agentSessionsFolder)
+        let attachment = try writeTemporaryImage(fixture: fixture)
+        let childID = UUID()
+        let gate = TestReleaseFence(name: "handoff copy before cancellation")
+        defer { gate.release() }
+        await fixture.service.test_setBeforeHandoffAttachmentCopyHook { _ in await gate.enterAndWait() }
+        let copy = Task {
+            try await fixture.service.copyHandoffAttachments(
+                [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
+                store: store, temporaryRoot: AgentAttachmentStore.managedStorageRootURL(for: fixture.storageURL)
+            )
+        }
+        addTeardownBlock {
+            gate.release()
+            _ = await copy.result
+            await fixture.service.test_setBeforeHandoffAttachmentCopyHook(nil)
+            try? FileManager.default.removeItem(at: fixture.storageURL)
+        }
+        guard await gate.waitUntilEntered() else { return }
+        copy.cancel()
+        gate.release()
+        do {
+            _ = try await copy.value
+            XCTFail("Cancellation must fail the copy")
+        } catch is CancellationError {}
+        guard case let .localFile(path) = attachment.source else { return XCTFail("Missing source path") }
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), Data([0x89, 0x50, 0x4E, 0x47]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
+    }
+
     func testFailedDeletionReopensRetentionAdmission() async throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.storageURL) }
