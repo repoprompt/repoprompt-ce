@@ -283,17 +283,32 @@ package final class OverseerContinuityStore: @unchecked Sendable {
             try put(row, revision: revision, db: db)
             return [row.id]
         case let .revokeScope(id):
+            return try apply(.endScope(id, .init(reason: .historicalUnknown), original: nil), revision: revision, db: db)
+        case let .endScope(id, ending, original):
+            if let original {
+                guard original.kind == .scope, original.id == id, !original.terminal else { throw OverseerContinuityError.invalidRecord }
+                if try db.integer("SELECT 1 FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) == nil {
+                    try put(original, revision: revision, db: db)
+                }
+            }
             let ids = try db.rows("WITH RECURSIVE descendants(id) AS (VALUES (?) UNION SELECT r.id FROM continuity_rows r JOIN descendants d ON r.parent_id=d.id WHERE r.kind='scope') SELECT id FROM descendants", [.text(id)]) { try SessionCatalogDatabase.string($0) }
             for id in ids {
-                try db.execute("INSERT INTO continuity_rows(kind,id,capabilities,payload,terminal,revision) VALUES ('scope',?,'[]',?,1,?) ON CONFLICT(kind,id) DO UPDATE SET terminal=1,revision=excluded.revision", [.text(id), .bytes(Data()), .integer(revision)])
+                // The first ending wins, including across retries and later ancestor cascades.
+                if try db.integer("SELECT terminal FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) == 1 { continue }
+                let payload = try db.rows("SELECT payload FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) { try SessionCatalogDatabase.data($0) }.first ?? Data()
+                let evidence = try JSONEncoder().encode(OverseerEndedScope(ending: ending, originalPayload: payload))
+                try db.execute("INSERT INTO continuity_rows(kind,id,capabilities,payload,terminal,revision) VALUES ('scope',?,'[]',?,1,?) ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload,terminal=1,revision=excluded.revision", [.text(id), .bytes(evidence), .integer(revision)])
             }
             return ids
         case let .deletedSession(id):
+            return try apply(.deletedSessionWithEvidence(id, .init(reason: .sessionDeleted, originatingSessionID: UUID(uuidString: id))), revision: revision, db: db)
+        case let .deletedSessionWithEvidence(id, ending):
+            guard ending.reason == .sessionDeleted, ending.originatingSessionID == UUID(uuidString: id) else { throw OverseerContinuityError.invalidRecord }
             try db.execute("INSERT INTO deleted_sessions VALUES (?,?) ON CONFLICT(id) DO NOTHING", [.text(id), .integer(revision)])
             let roots = try db.rows("SELECT id FROM continuity_rows WHERE kind='scope' AND (owner_id=? OR anchor_id=?)", [.text(id), .text(id)]) { try SessionCatalogDatabase.string($0) }
             var affected: [String] = []
             for root in roots {
-                affected += try apply(.revokeScope(root), revision: revision, db: db)
+                affected += try apply(.endScope(root, ending, original: nil), revision: revision, db: db)
             }
             try db.execute("UPDATE continuity_rows SET terminal=1,revision=? WHERE kind='link' AND (owner_id=? OR anchor_id=?)", [.integer(revision), .text(id), .text(id)])
             return affected
@@ -390,7 +405,7 @@ package final class OverseerContinuityStore: @unchecked Sendable {
                     id = row.id
                 case let .revokeScope(value): kind = .scope
                     id = value
-                case .remove, .deletedSession: throw OverseerContinuityError.invalidRecord
+                case .remove, .deletedSession, .deletedSessionWithEvidence, .endScope: throw OverseerContinuityError.invalidRecord
                 }
                 if try db.integer("SELECT 1 FROM continuity_rows WHERE kind=? AND id=?", [.text(kind.rawValue), .text(id)]) != nil {
                     outcome = "destination_wins"

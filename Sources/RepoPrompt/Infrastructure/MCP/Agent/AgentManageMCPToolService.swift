@@ -1270,6 +1270,11 @@ struct AgentManageMCPToolService {
         // Collection operations authorize every target before any mutation or data return, so a
         // partially applied cleanup can never leak that one of the requested UUIDs exists.
         let cleanupCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        let deletionOrigin: AgentSessionDeletionOrigin = if case let .agentSession(callerID) = cleanupCaller {
+            .agentCleanup(callerID)
+        } else {
+            .mcpClient()
+        }
         /// Deletion is human-only unless the user explicitly enabled full access. Neither spawn
         /// provenance nor an ordinary scope/link can supply this exception. Check before lookup.
         func requireCurrentCleanupAuthority(for sessionID: UUID) async throws {
@@ -1296,9 +1301,7 @@ struct AgentManageMCPToolService {
                 }
             }
         }
-        /// Agent callers' authority (full access, routed caller, connection, workspace, self-target)
-        /// can end while deletion waits for admission and writer draining. Re-prove all of it at
-        /// the storage commit point itself, not only before entering deletion.
+        /// Re-prove agent authority at disk commit, after admission/writer draining can suspend.
         func destructiveCommitFence(for sessionID: UUID) -> (@Sendable () async -> Bool)? {
             guard case .agentSession = cleanupCaller else { return nil }
             return { @MainActor in
@@ -1501,13 +1504,11 @@ struct AgentManageMCPToolService {
             var mutationStarted = false
             var durableDeletionCommitted = false
             var providerCleanupOutcome: ProviderConversationCleanupOutcome?
-            // The production deletion paths already report through `AgentSessionDataService`, but
-            // this service's dependencies are injectable, so it brackets its own boundary too. Both
-            // phases are idempotent, and a duplicate commit cannot downgrade an existing tombstone.
+            // Bracket injectable deletion dependencies too; duplicate commit cannot reopen a tombstone.
             var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
             do {
                 let attempt = try await AgentSessionDurableDeletionReporter
-                    .beginDurableDeletion(sessionID: sessionID)
+                    .beginDurableDeletion(sessionID: sessionID, origin: deletionOrigin)
                 deletionAttempt = attempt
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
@@ -1531,7 +1532,9 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID, openTabID: openTabID)
                     mutationStarted = true
                     providerCleanupOutcome = try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                        try await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+                            try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                        }
                     }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
@@ -1559,7 +1562,9 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID)
                     mutationStarted = true
                     try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                        try await AgentSessionDeletionOrigin.$current.withValue(deletionOrigin) {
+                            try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                        }
                     }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
