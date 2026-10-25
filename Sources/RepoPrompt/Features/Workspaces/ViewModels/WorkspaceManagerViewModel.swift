@@ -10800,35 +10800,17 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated static func normalizedPresetPath(_ rawPath: String) -> String? {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let standardized = StandardizedPath.absolute(trimmed)
-        if standardized.hasPrefix("/") {
-            return standardized
-        }
-        return StandardizedPath.relative(trimmed)
+        WorkspacePresetSelectionComparison.normalizedLegacyComparisonPath(rawPath)
     }
 
     nonisolated static func isPresetSelectionDirty(
         presetPaths: [String],
         selectionPaths: [(absolute: String, relative: String)]
     ) -> Bool {
-        let selAbs = Set(selectionPaths.map(\.absolute))
-        let selRel = Set(selectionPaths.map(\.relative))
-        let presetStd = Set(presetPaths.compactMap(normalizedPresetPath))
-
-        let presetCovered = presetStd.allSatisfy { path in
-            if path.hasPrefix("/") {
-                return selAbs.contains(path)
-            }
-            return selRel.contains(path)
-        }
-
-        let selectionCovered = selectionPaths.allSatisfy { path in
-            presetStd.contains(path.absolute) || presetStd.contains(path.relative)
-        }
-
-        return !(presetCovered && selectionCovered)
+        WorkspacePresetSelectionComparison.isDirty(
+            presetPaths: presetPaths,
+            selectionPaths: selectionPaths
+        )
     }
 
     @MainActor
@@ -12972,13 +12954,20 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func pollAndSaveState(source: WorkspaceSaveSource = .pollAndSaveState) {
         guard let captured = captureActiveWorkspaceForSave(source: source) else { return }
-        scheduleSave(workspaceID: captured.workspaceID, fileURL: captured.fileURL, source: source)
+        scheduleSave(
+            workspaceID: captured.workspaceID, fileURL: captured.fileURL, source: source,
+            recaptureActivationGeneration: captured.activationGeneration
+        )
     }
 
     /// Capture/publication is shared; the caller chooses its existing persistence owner.
-    private func captureActiveWorkspaceForSave(source: WorkspaceSaveSource) -> (workspaceID: UUID, fileURL: URL)? {
+    private func captureActiveWorkspaceForSave(
+        source: WorkspaceSaveSource,
+        requiringReadyForeground: Bool = false
+    ) -> (workspaceID: UUID, fileURL: URL, activationGeneration: UInt64)? {
         guard !isSessionRuntimeProjection, let active = activeWorkspace else { return nil }
         let workspaceID = active.id
+        let activationGeneration = rootActivationGeneration
 
         // Post notification to allow SwiftUI views to flush pending state
         NotificationCenter.default.post(
@@ -12997,7 +12986,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        guard let index = workspaceIndex(for: workspaceID) else { return nil }
+        guard activeWorkspaceID == workspaceID, rootActivationGeneration == activationGeneration,
+              let index = workspaceIndex(for: workspaceID)
+        else { return nil }
+        if requiringReadyForeground {
+            let tabID = workspaces[index].activeComposeTabID ?? workspaces[index].composeTabs.first?.id
+            guard tabID == promptViewModel.activeComposeTabID,
+                  tabID.map({ !isSnapshotCommitSuspended(forTabID: $0) }) ?? true
+            else { return nil }
+        }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
         guard let capturedWorkspace = workspace(withID: workspaceID) else { return nil }
         let fileURL = workspaceFileURL(for: capturedWorkspace)
@@ -13005,7 +13002,26 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
-        return (workspaceID, fileURL)
+        return (workspaceID, fileURL, activationGeneration)
+    }
+
+    /// A dirty notification can precede the deferred publication of that same live UI edit.
+    /// Recapture only for the active save owner; direct and inactive saves keep their model input.
+    private func recaptureWorkspaceForSaveRetry(
+        workspaceID: UUID,
+        activationGeneration: UInt64?,
+        fileURL: URL,
+        source: WorkspaceSaveSource
+    ) throws -> UInt64? {
+        guard let activationGeneration,
+              activeWorkspaceID == workspaceID, rootActivationGeneration == activationGeneration,
+              !isSwitchingWorkspace, !isPreparingForWindowClose
+        else { return nil }
+        guard let captured = captureActiveWorkspaceForSave(source: source, requiringReadyForeground: true),
+              captured.workspaceID == workspaceID, captured.activationGeneration == activationGeneration,
+              captured.fileURL == fileURL
+        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
+        return workingPublicationGenerationByWorkspaceID[workspaceID, default: 0]
     }
 
     func pollAndSaveStateAsync(
@@ -13174,6 +13190,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
+        let recaptureActivationGeneration = activeWorkspaceID == wsID && !isSwitchingWorkspace
+            ? rootActivationGeneration : nil
+
         // Post notification to allow SwiftUI views to flush pending state
         NotificationCenter.default.post(
             name: .workspaceWillSave,
@@ -13212,7 +13231,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceID: wsID,
             fileURL: fileURL,
             source: source,
-            ownSaveFence: ownSaveFence
+            ownSaveFence: ownSaveFence,
+            recaptureActivationGeneration: recaptureActivationGeneration
         )
         let savedStateVersion: Int
         switch saveResult {
@@ -16190,7 +16210,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURL: URL,
         source: WorkspaceSaveSource = .saveWorkspaceAsync,
         remainingRetryCount: Int = 1,
-        ownSaveFence: OwnSaveFence? = nil
+        ownSaveFence: OwnSaveFence? = nil,
+        recaptureActivationGeneration: UInt64? = nil
     ) async -> Result<Int, WorkspacePersistenceFailure> {
         // Nonvisual runtimes own session payloads, never the borrowed UI document.
         guard !isSessionRuntimeProjection else {
@@ -16221,10 +16242,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                     source: source,
                     remainingRetryCount: remainingRetryCount,
                     ownedPublicationGeneration: publicationGenerationAtStart,
-                    ownSaveFence: ownSaveFence
+                    ownSaveFence: ownSaveFence,
+                    recaptureActivationGeneration: recaptureActivationGeneration
                 )
                 lastSavedVersionByWorkspaceID[workspaceID] = result.savedStateVersion
-                markWorkingPublicationSaved(workspaceID: workspaceID, generation: publicationGenerationAtStart)
+                markWorkingPublicationSaved(
+                    workspaceID: workspaceID,
+                    generation: result.ownedPublicationGeneration ?? publicationGenerationAtStart
+                )
                 return .success(result.savedStateVersion)
             } catch let failure as WorkspacePersistenceFailure {
                 return .failure(failure)
@@ -16357,12 +16382,19 @@ class WorkspaceManagerViewModel: ObservableObject {
             case .current:
                 break
             case let .retry(nextRemainingCount):
+                if workspaces[latestIndex] == current {
+                    _ = try recaptureWorkspaceForSaveRetry(
+                        workspaceID: workspaceID, activationGeneration: recaptureActivationGeneration,
+                        fileURL: fileURL, source: source
+                    )
+                }
                 return await saveWorkspaceAsync(
                     workspaceID: workspaceID,
                     fileURL: fileURL,
                     source: source,
                     remainingRetryCount: nextRemainingCount,
-                    ownSaveFence: ownSaveFence
+                    ownSaveFence: ownSaveFence,
+                    recaptureActivationGeneration: recaptureActivationGeneration
                 )
             case .exhausted:
                 return .failure(WorkspacePersistenceFailure(
@@ -16393,13 +16425,18 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await rebuildAndSaveIndexAsync()
             }
             return .success(capturedStateVersion)
+        } catch let failure as WorkspacePersistenceFailure {
+            return .failure(failure)
         } catch {
             print("💾 Failed to serialize workspace: \(error)")
             return .failure(WorkspacePersistenceFailure(category: .persistenceFailure))
         }
     }
 
-    private func scheduleSave(workspaceID: UUID, fileURL: URL, source: WorkspaceSaveSource) {
+    private func scheduleSave(
+        workspaceID: UUID, fileURL: URL, source: WorkspaceSaveSource,
+        recaptureActivationGeneration: UInt64? = nil
+    ) {
         guard workspace(withID: workspaceID)?.isEphemeral != true,
               !agentAdmissionRecoveryOwnsWorkspace(workspaceID)
         else { return }
@@ -16425,7 +16462,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaceID: workspaceID,
                 fileURL: fileURL,
                 source: source,
-                ownSaveFence: fence
+                ownSaveFence: fence,
+                recaptureActivationGeneration: recaptureActivationGeneration
             )
         }
         scheduledWorkspaceSaveTasks[workspaceID, default: [:]][taskID] = task
@@ -16438,6 +16476,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let savedStateVersion: Int
         let fileURL: URL
         let outcome: DomainCommandOutcome
+        let ownedPublicationGeneration: UInt64?
     }
 
     /// The proposal may differ from the local model for an explicit direct save. Both it and
@@ -16474,7 +16513,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         creationOperationID: UUID?,
         issueClearance: DomainAuthorityIssueClearance,
         ownedPublicationGeneration: UInt64?,
-        ownSaveFence: OwnSaveFence?
+        ownSaveFence: OwnSaveFence?,
+        recaptureActivationGeneration: UInt64?
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
         #if DEBUG
@@ -16500,7 +16540,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "remainingRetries": String(remainingRetryCount)
             ])
         #endif
-        guard let current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
+        guard var current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
         guard !current.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: proposal.id) else {
             throw WorkspacePersistenceFailure(category: .cancelled)
@@ -16547,6 +16587,21 @@ class WorkspaceManagerViewModel: ObservableObject {
             remainingRetryCount: remainingRetryCount,
             source: source
         )
+        var retryPublicationGeneration = ownedPublicationGeneration
+        if current == capture.localWorkspace,
+           stateVersionByWorkspaceID[proposal.id, default: 0] != capture.stateVersion,
+           let generation = try recaptureWorkspaceForSaveRetry(
+               workspaceID: proposal.id, activationGeneration: recaptureActivationGeneration,
+               fileURL: capture.fileURL, source: source
+           )
+        {
+            // Do not stamp old stored bytes with a newer UI version and then reject the
+            // deferred publication of the same edit. Already-mutated models retain their
+            // existing stored authority; only an unmaterialized active UI edit is recaptured.
+            guard let recaptured = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
+            current = recaptured
+            retryPublicationGeneration = generation
+        }
         return try await persistWorkspaceThroughDomainAuthority(
             current,
             targetURL: targetURL,
@@ -16555,8 +16610,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             remainingRetryCount: remainingRetryCount - 1,
             creationOperationID: creationOperationID,
             issueClearance: issueClearance,
-            ownedPublicationGeneration: ownedPublicationGeneration,
-            ownSaveFence: ownSaveFence
+            ownedPublicationGeneration: retryPublicationGeneration,
+            ownSaveFence: ownSaveFence,
+            recaptureActivationGeneration: recaptureActivationGeneration
         )
     }
 
@@ -16569,7 +16625,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         creationOperationID: UUID? = nil,
         issueClearance: DomainAuthorityIssueClearance? = nil,
         ownedPublicationGeneration: UInt64? = nil,
-        ownSaveFence: OwnSaveFence? = nil
+        ownSaveFence: OwnSaveFence? = nil,
+        recaptureActivationGeneration: UInt64? = nil
     ) async throws -> DomainAuthoritySaveResult {
         let issueClearance = issueClearance ?? DomainAuthorityIssueClearance(issueID: domainWorkspaceAuthorityIssue?.id)
         guard !workspace.isEphemeral else {
@@ -16619,7 +16676,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
-                ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence
+                ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
+                recaptureActivationGeneration: recaptureActivationGeneration
             )
         }
 
@@ -16725,7 +16783,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
-                ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence
+                ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
+                recaptureActivationGeneration: recaptureActivationGeneration
             )
         }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspace.id) else {
@@ -16796,7 +16855,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                     source: source, remainingRetryCount: remainingRetryCount,
                     creationOperationID: creationOperationID, issueClearance: issueClearance,
-                    ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence
+                    ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
+                    recaptureActivationGeneration: recaptureActivationGeneration
                 )
             }
             // Last point before this save writes to the authority. A superseded own save bails
@@ -16929,7 +16989,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         return DomainAuthoritySaveResult(
             savedStateVersion: capturedStateVersion,
             fileURL: targetURL,
-            outcome: outcome
+            outcome: outcome,
+            ownedPublicationGeneration: ownedPublicationGeneration
         )
     }
 

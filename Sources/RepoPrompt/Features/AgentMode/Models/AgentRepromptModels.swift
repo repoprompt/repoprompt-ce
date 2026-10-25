@@ -74,7 +74,7 @@ struct AgentRepromptStreamParser {
             let json = String(trailer.dropLast(end.count)).trimmingCharacters(in: .whitespacesAndNewlines)
             guard json.utf8.count <= 16 * 1024,
                   let decoded = try? JSONDecoder().decode([AgentRepromptResult.Question].self, from: Data(json.utf8)),
-                  decoded.count <= 3, Set(decoded.map(\.id)).count == decoded.count,
+                  decoded.count <= 1, Set(decoded.map(\.id)).count == decoded.count,
                   !refinement || decoded.isEmpty
             else { throw AgentRepromptError.invalidResponse }
             let interaction = AgentAskUserInteraction(questions: decoded.map {
@@ -83,7 +83,7 @@ struct AgentRepromptStreamParser {
             if !decoded.isEmpty {
                 do { try interaction.validate() } catch { throw AgentRepromptError.invalidResponse }
             }
-            guard decoded.allSatisfy({ $0.options.count <= 4 }) else { throw AgentRepromptError.invalidResponse }
+            guard decoded.allSatisfy({ $0.options.count <= 3 }) else { throw AgentRepromptError.invalidResponse }
             questions = decoded
         } else if body != raw, raw != body + "\n" {
             // EOF in a delimiter prefix is truncation, not a successful brief.

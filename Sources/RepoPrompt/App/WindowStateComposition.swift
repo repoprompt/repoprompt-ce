@@ -85,6 +85,7 @@ enum WindowStateCompositionFactory {
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
+        automaticProviderModelDiscoveryEnabled: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
         agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
@@ -138,7 +139,7 @@ enum WindowStateCompositionFactory {
         let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
-            loadStoredDataOnInit: loadStoredAPISettingsDataOnInit,
+            loadStoredDataOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService
         )
 
@@ -155,7 +156,8 @@ enum WindowStateCompositionFactory {
             storedPromptPersistence: storedPromptPersistence,
             // The borrowed API owner is already live. A second prompt's startup refresh reloads
             // stored connection flags over it; it must not reset the canonical live connection.
-            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil,
+            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil
+                && loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
@@ -263,6 +265,7 @@ enum WindowStateCompositionFactory {
             settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
             codexModelPollingService: codexModelPollingService,
+            automaticModelPollingEnabled: automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
@@ -276,6 +279,7 @@ enum WindowStateCompositionFactory {
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
             modelRouterRuntime: modelRouterRuntime,
+            usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
             catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
             perfRecorder: AppAgentModePerfRecorder()

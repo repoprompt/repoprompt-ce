@@ -186,6 +186,7 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
         let workspaceID: UUID
+        let workspaceDirectoryPath: String
         let binding: AgentPersistentSessionBindingIdentity
         let bindingTransitionGeneration: UInt64
         let sourceItemsRevision: Int

@@ -346,10 +346,9 @@ package actor GitDiffEngine {
         let discoveryPathspecs = pathspecs.map {
             GitDiffPathNormalization.gitDiscoveryPathspecs(from: $0, repoRootPath: repoURL.path)
         }
-        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { rawPath in
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !(trimmed as NSString).expandingTildeInPath.hasPrefix("/")
-        } ?? false
+        // Match GitDiffPathNormalization: only a raw leading slash denotes an
+        // absolute input. Relative whitespace and tilde are authored Git syntax.
+        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { !$0.hasPrefix("/") } ?? false
         let scope: GitDiffScope = hasPathspecs ? .selected : .all
         let requestedPaths = hasPathspecs ? normalizedPathspecs : nil
 
@@ -372,9 +371,10 @@ package actor GitDiffEngine {
             at: repoURL
         )
 
-        // Keep backend-agnostic filtering as a defensive projection boundary.
-        let filtered: [VCSUncommittedFile] = if hasUserAuthoredRelativePathspecs {
-            // Git is authoritative for user-authored relative pathspec glob/magic semantics.
+        // Git has already constrained discovery using its own pathspec semantics. Re-matching
+        // normalized names against authored spellings (including ./ and ../) can discard matches.
+        // Retain the existing defensive projection for other backends.
+        let filtered: [VCSUncommittedFile] = if backend.kind == .git || hasUserAuthoredRelativePathspecs {
             changedFiles
         } else if let normalizedPathspecs, !normalizedPathspecs.isEmpty {
             filterByPathspecs(changedFiles, pathspecs: normalizedPathspecs)

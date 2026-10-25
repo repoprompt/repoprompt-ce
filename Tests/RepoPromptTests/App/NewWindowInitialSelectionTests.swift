@@ -3351,6 +3351,23 @@ import XCTest
             }) { f in
                 let (canonicalWindow, canonicalManager, _, _) = await f.makeWindowWithHeldInitialProjection()
                 let (duplicateWindow, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                // Cleanup owns exact workspace snapshots, not Chat's asynchronous blank-session
+                // restoration. Keep that unrelated writer behind a fixture-owned boundary.
+                let chatRestoreGate = f.makeGate()
+                let chatRestoreEntered = Signal("canonical Chat restore held until cleanup completes")
+                let canonicalID = canonical.id
+                let oracle = duplicateWindow.oracleViewModel
+                oracle.workspaceChatSessionLoadBeforePublicationForTesting = { id, _ in
+                    guard id == canonicalID else { return }
+                    await chatRestoreGate.wait { chatRestoreEntered.fire() }
+                }
+                defer {
+                    // Revoke held publications before releasing them on every exit. Their
+                    // existing generation fence must reject them before any stored-tab write.
+                    oracle.invalidateWorkspaceChatSessionLoads()
+                    oracle.workspaceChatSessionLoadBeforePublicationForTesting = nil
+                    chatRestoreGate.release()
+                }
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 let models = try f.decoded(snapshot)
                 for (owner, id) in [(canonicalManager, canonical.id), (manager, duplicate.id)] {
@@ -3394,8 +3411,9 @@ import XCTest
 
                 manager.setCatalogRecordDecodeFailureForTesting(nil)
                 let recovered = await manager.consolidateDuplicateWorkspaces()
-                XCTAssertEqual(recovered.groupsConsolidated, 1, "decoded known-group cleanup still works")
+                XCTAssertEqual(recovered.groupsConsolidated, 1, "decoded known-group cleanup still works: \(recovered)")
                 XCTAssertEqual(manager.activeWorkspaceID, canonical.id)
+                try await f.wait(chatRestoreEntered)
             }
         }
 

@@ -80,6 +80,105 @@ final class ProviderContentTests: XCTestCase {
         XCTAssertEqual(AICompletionResult(text: "complete").completionOutcome, .completed)
     }
 
+    func testLocalImageReadsExactWhitespaceFilenameInsteadOfViableTrimmedDecoy() throws {
+        let directory = try makeLocalImageFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for (index, suffix) in [" ", "\n", "\t"].enumerated() {
+            let exactURL = directory.appendingPathComponent("diagram\(suffix).png\(suffix)")
+            let trimmedURL = URL(fileURLWithPath: exactURL.path.trimmingCharacters(in: .whitespacesAndNewlines))
+            let expected = Data([0x10, 0x20, UInt8(index)])
+            let decoy = Data([0xDE, 0xC0])
+            try expected.write(to: exactURL)
+            try decoy.write(to: trimmedURL)
+            let block = try localImageBlock(path: exactURL.path, title: "diagram.png")
+            XCTAssertEqual(block["data"] as? String, expected.base64EncodedString())
+            XCTAssertNotEqual(block["data"] as? String, decoy.base64EncodedString())
+            XCTAssertEqual(block["type"] as? String, "image")
+            XCTAssertEqual(block["mimeType"] as? String, "image/png")
+            let uri = try XCTUnwrap(block["uri"] as? String)
+            XCTAssertEqual(uri, exactURL.absoluteString)
+            XCTAssertEqual(try Array(XCTUnwrap(URL(string: uri)?.path).utf8), Array(exactURL.path.utf8))
+        }
+    }
+
+    func testLocalImagePreservesUnicodePercentAndURLPunctuationAsNativeFilename() throws {
+        let directory = try makeLocalImageFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let exactURL = directory.appendingPathComponent("雪%20#?.png")
+        let decodedDecoy = directory.appendingPathComponent("雪 #?.png")
+        let expected = Data([1, 3, 5, 7])
+        try expected.write(to: exactURL)
+        try Data([2, 4, 6]).write(to: decodedDecoy)
+        let block = try localImageBlock(path: exactURL.path)
+        XCTAssertEqual(block["data"] as? String, expected.base64EncodedString())
+        let uri = try XCTUnwrap(block["uri"] as? String)
+        XCTAssertEqual(uri, exactURL.absoluteString)
+        XCTAssertTrue(uri.contains("%2520%23%3F.png"))
+        XCTAssertEqual(try Array(XCTUnwrap(URL(string: uri)?.path).utf8), Array(exactURL.path.utf8))
+    }
+
+    func testDecodedRelativeLocalImagePreservesLegacyCWDResolutionAndWhitespace() throws {
+        let directory = try makeLocalImageFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let target = directory.appendingPathComponent("legacy.png ")
+        let decoy = directory.appendingPathComponent("legacy.png")
+        let expected = Data([11, 12, 13])
+        try expected.write(to: target)
+        try Data([99]).write(to: decoy)
+        // Walk to / from the existing CWD without mutating process-wide CWD.
+        let cwdDepth = FileManager.default.currentDirectoryPath.split(separator: "/").count
+        let relative = String(repeating: "../", count: cwdDepth) + String(target.path.dropFirst())
+        let attachment = AgentImageAttachment(source: .localFile(path: relative), title: "legacy.png")
+        let decoded = try JSONDecoder().decode(AgentImageAttachment.self, from: JSONEncoder().encode(attachment))
+        XCTAssertEqual(decoded.source, .localFile(path: relative))
+        let block = try XCTUnwrap(ACPPromptContentBuilder.blocks(text: "", attachments: [decoded]).first)
+        XCTAssertEqual(block["data"] as? String, expected.base64EncodedString())
+        XCTAssertEqual(block["uri"] as? String, URL(fileURLWithPath: relative).absoluteString)
+        XCTAssertEqual(block["mimeType"] as? String, "image/png")
+    }
+
+    func testLocalImageLeavesSymlinkAndDotTraversalToFilesystem() throws {
+        let directory = try makeLocalImageFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let left = directory.appendingPathComponent("left", isDirectory: true)
+        let right = directory.appendingPathComponent("right", isDirectory: true)
+        let inside = right.appendingPathComponent("inside", isDirectory: true)
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: left.appendingPathComponent("link"), withDestinationURL: inside)
+        let expected = Data([41, 42])
+        try expected.write(to: right.appendingPathComponent("target.png"))
+        try Data([81, 82]).write(to: left.appendingPathComponent("target.png"))
+        let rawPath = left.path + "/link/../target.png"
+        let block = try localImageBlock(path: rawPath)
+        XCTAssertEqual(block["data"] as? String, expected.base64EncodedString())
+        XCTAssertEqual(block["uri"] as? String, URL(fileURLWithPath: rawPath).absoluteString)
+    }
+
+    func testLocalImageRefusesInvalidOrMissingExactPathWithoutReadingDecoy() throws {
+        let directory = try makeLocalImageFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let decoy = directory.appendingPathComponent("missing.png")
+        try Data([91, 92]).write(to: decoy)
+        for path in ["", decoy.path + " ", decoy.path + "\0ignored"] {
+            XCTAssertThrowsError(try localImageBlock(path: path)) { error in
+                XCTAssertEqual(error as? ACPPromptContentBuilder.Error, .unreadableLocalImage(path))
+            }
+        }
+    }
+
+    private func makeLocalImageFixture() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("provider-content-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func localImageBlock(path: String, title: String? = nil) throws -> [String: Any] {
+        let attachment = AgentImageAttachment(source: .localFile(path: path), title: title)
+        let blocks = try ACPPromptContentBuilder.blocks(text: "", attachments: [attachment])
+        return try XCTUnwrap(blocks.first)
+    }
+
     private func encodedMessages(_ message: AIMessage) throws -> [[String: Any]] {
         let data = try JSONEncoder().encode(CustomOpenAIMessageBuilder.messages(for: message))
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])

@@ -133,9 +133,9 @@ protocol SessionAdminWorktreeHost: AnyObject {
     ) async throws -> SessionAdminWorktreeInfo
     /// Binds `worktree` (selector: `@id:`, path, branch, or name) for the target now. Throws when the
     /// target is not idle; the handler decides whether to defer. `isStillAuthorized` is evaluated
-    /// synchronously right before the binding transition and again at its `beforeCommit` fence; `false`
-    /// throws `SessionAdminHostError.authorityEnded` and nothing changes. Work after that fence
-    /// (recovery handoff, publication) is not re-checked, as with `manage_worktree`. `admitBindings`
+    /// synchronously right before the binding transition and after preparation/retirement suspensions
+    /// through binding publication; `false` refuses the binding. If the provider was already retired,
+    /// the old binding and a visible recovery handoff remain. `admitBindings`
     /// runs once at that fence with resolved desired identities; `bindingsCommitted` runs at actual
     /// publication, before any required persistence await (or immediately for an admitted exact no-op).
     func bindWorktree(

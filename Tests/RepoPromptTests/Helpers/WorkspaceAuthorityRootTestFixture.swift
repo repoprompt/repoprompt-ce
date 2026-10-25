@@ -71,6 +71,7 @@ import XCTest
 
             override func checkIfActivePresetIsDirty(with newSelection: [FileViewModel]) {
                 super.checkIfActivePresetIsDirty(with: newSelection)
+                // The synchronous selection sink publishes its tab snapshot after this returns.
                 selectionObservationDidFinish?(newSelection)
             }
 
@@ -299,6 +300,12 @@ import XCTest
         }
 
         func selectFixtureFiles(_ paths: [String]) async throws {
+            // Root-only activation sets the manager ID, not the foreground compose-tab UI.
+            // Selection observation must have the same active tab before it can commit a
+            // meaningful snapshot; a later save deliberately keeps stored selection authority.
+            let active = try XCTUnwrap(manager.workspace(withID: workspace.id))
+            manager.promptViewModel.loadComposeTabsFromWorkspace(active, syncPromptText: true)
+            XCTAssertEqual(manager.promptViewModel.activeComposeTabID, active.activeComposeTabID)
             let dirty = XCTestExpectation(description: "selected files reached the real dirty observer")
             let observed = XCTestExpectation(description: "selected files reached the debounced selection observer")
             let expected = Set(paths)
@@ -325,6 +332,12 @@ import XCTest
             try await awaitGateEvent(observed)
             try await perform("selected fixture files saved") { await self.manager.pollAndSaveStateAsync() }
             try await settle()
+            let baseline = try await capturePassive()
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: baseline.canonical.document.documentBytes)
+            for model in [baseline.model, canonical, baseline.disk] {
+                let tab = try XCTUnwrap(model.composeTabs.first { $0.id == active.activeComposeTabID })
+                XCTAssertEqual(Set(tab.selection.selectedPaths), expected, "Fixture selection must be durable before the action under test")
+            }
         }
 
         /// Root-action return + save joins + bridge publication, not future W3 readiness.
@@ -450,6 +463,7 @@ import XCTest
             manager?.rootReconciliationWaiterCountDidChangeForTesting = nil
             manager?.rootProbeFailureForTesting = nil
             manager?.dirtyMarkDidFinish = nil
+            manager?.selectionObservationDidFinish = nil
             manager?.omitRootReconciliationRequests = false
             // Detach admission/operation continuations before joining tasks blocked on them.
             // Full manager close still follows the existing save/writer drains below.

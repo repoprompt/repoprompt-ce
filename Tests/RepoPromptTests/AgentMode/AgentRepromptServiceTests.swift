@@ -46,6 +46,21 @@ final class AgentRepromptServiceTests: XCTestCase {
         XCTAssertEqual(try plain.finish(refinement: false).body, "Hello")
     }
 
+    func testClarificationLimitsMatchTheSingleQuestionThreeShortcutContract() throws {
+        let trailers = [
+            #"[{"id":"a","question":"First?","options":[]},{"id":"b","question":"Second?","options":[]}]"#,
+            #"[{"id":"a","question":"Choose?","options":[{"label":"1"},{"label":"2"},{"label":"3"},{"label":"4"}]}]"#
+        ]
+        for trailer in trailers {
+            var parser = AgentRepromptStreamParser()
+            try parser.append(Self.valid + AgentRepromptStreamParser.delimiter + trailer + AgentRepromptStreamParser.endDelimiter)
+            XCTAssertEqual(parser.body, Self.valid)
+            XCTAssertThrowsError(try parser.finish(refinement: false)) { error in
+                XCTAssertEqual(error as? AgentRepromptError, .invalidResponse)
+            }
+        }
+    }
+
     func testIncompleteOrInvalidQuestionsKeepRecoverableBodyButCannotComplete() throws {
         for trailer in ["[", Self.questions, "[] trailing prose", #"[{"id":"x","question":"?","options":[]},{"id":"x","question":"?","options":[]}]"# + AgentRepromptStreamParser.endDelimiter] {
             var parser = AgentRepromptStreamParser()

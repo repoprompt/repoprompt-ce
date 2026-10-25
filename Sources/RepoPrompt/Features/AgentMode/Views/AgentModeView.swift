@@ -211,6 +211,7 @@ struct AgentModeChatDetailView: View {
     // MARK: - Consolidated Scroll State
 
     @State private var scrollViewState = AgentTranscriptScrollViewState()
+    @State private var lastPresentedPendingSendByTab: [UUID: UUID] = [:]
     @StateObject private var scrollEngine = AgentTranscriptScrollEngine()
 
     // Non-grouped state
@@ -2380,6 +2381,19 @@ struct AgentModeChatDetailView: View {
         proxy: ScrollViewProxy
     ) -> some View {
         messagesStack()
+            .onReceive(agentModeVM.ui.composer.$pendingSubmissions) { pendingSubmissions in
+                guard let tabID = currentTabID,
+                      let pending = pendingSubmissions.values.first(where: { $0.destinationTabID == tabID }),
+                      lastPresentedPendingSendByTab[tabID] != pending.id else { return }
+                lastPresentedPendingSendByTab[tabID] = pending.id
+                Task { @MainActor in
+                    await Task.yield()
+                    guard currentTabID == tabID,
+                          agentModeVM.ui.composer.pendingSubmissions[pending.id]?.destinationTabID == tabID else { return }
+                    pinToLiveBottom()
+                    requestScroll(proxy, intent: .bottom(animated: false, reason: .userSendWhileDetached), immediate: true)
+                }
+            }
             .padding()
             .frame(
                 maxWidth: .infinity,
@@ -2428,7 +2442,6 @@ struct AgentModeChatDetailView: View {
                     .foregroundColor(.secondary)
             }
         }
-        AgentRepromptQuestionsView(viewModel: agentModeVM, store: agentModeVM.repromptUIStore, tabID: currentTabID)
         runningIndicatorSlot
         DelegationApprovalSlot(
             windowID: windowID,
@@ -2604,6 +2617,9 @@ struct AgentModeChatDetailView: View {
             )
             .id("activeWorktreeMergeConflict")
             .transition(.opacity)
+        }
+        AgentPendingComposerSubmissionView(composerUI: agentModeVM.ui.composer, tabID: currentTabID) { id in
+            Task { await agentModeVM.cancelPresentedComposerSubmission(id: id) }
         }
         bottomTarget
         versionedBottomSentinel
