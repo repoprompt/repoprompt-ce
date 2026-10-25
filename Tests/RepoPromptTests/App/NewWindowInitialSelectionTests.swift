@@ -718,6 +718,70 @@ import XCTest
             }
         }
 
+        func testWindowCloseJoinsPublishedGitDataRootsBeforeTheirUIHandoff() async throws {
+            // Include a cancelled predecessor: a later switch must not erase its cleanup owner.
+            for loadCount in [1, 2] {
+                try await Fixture.run { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    let files = window.workspaceFilesViewModel
+                    let store = files.workspaceFileContextStore
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let targets = try [Fixture.requestedID, Fixture.aardvarkID].prefix(loadCount).map {
+                        try XCTUnwrap(manager.workspace(withID: $0))
+                    }
+                    let paths = targets.map { manager.gitDataDirectory(for: $0).path }
+                    let entered = paths.map { Signal("store published git-data root before UI handoff: \($0)") }
+                    let gate = f.makeGate()
+                    await store.setRootLoadWillReturnHandlerForTesting { path, _ in
+                        guard let index = paths.firstIndex(of: path) else { return }
+                        // Keep the handoff held even after its owning load is cancelled. The
+                        // fixture owns/releases this gate on every exit and this task is joined.
+                        await Task { @MainActor in
+                            await gate.wait { entered[index].fire() }
+                        }.value
+                    }
+                    for (index, target) in targets.enumerated() {
+                        let result = await manager.requestWorkspaceSwitch(to: target)
+                        XCTAssertTrue(result.didSwitch, "\(result)")
+                        try await f.wait(entered[index])
+                    }
+                    let published = await store.roots()
+                    XCTAssertEqual(Set(published.map(\.standardizedFullPath)), Set(paths))
+                    XCTAssertTrue(files.rootFolders.isEmpty, "the published roots have not reached their UI owner")
+
+                    let joining = Signal("window teardown joins every post-switch load")
+                    let finished = Signal("window teardown completed")
+                    var joinedCount: Int?
+                    manager.postSwitchGitDataLoadShutdownWillJoinForTesting = { count in
+                        joinedCount = count
+                        joining.fire()
+                    }
+                    defer { manager.postSwitchGitDataLoadShutdownWillJoinForTesting = nil }
+                    let close = f.startOwned {
+                        await window.tearDown()
+                        f.markTornDown(window)
+                        finished.fire()
+                    }
+                    try await f.wait(joining)
+                    XCTAssertEqual(joinedCount, loadCount, "cancelled predecessors retain their task owner")
+                    XCTAssertEqual(finished.count, 0, "teardown cannot finish ahead of owned root cleanup")
+                    gate.release()
+                    await close.value
+                    await store.setRootLoadWillReturnHandlerForTesting(nil)
+
+                    let remaining = await store.roots()
+                    XCTAssertTrue(remaining.isEmpty, "cancelled loads must unload their exact published roots")
+                    XCTAssertTrue(files.rootFolders.isEmpty, "closing must not publish a late UI root")
+                    await manager.ensureGitDataRootLoadedForActiveWorkspace(reason: "closed-window regression")
+                    let afterLateRequest = await store.roots()
+                    XCTAssertTrue(afterLateRequest.isEmpty, "a closed window cannot admit a new git-data load")
+                }
+            }
+        }
+
         // MARK: 3. Failed startup converges only on later System projection
 
         func testFailedInitialDefaultWaitsForLaterSystemProjection() async throws {
@@ -6356,6 +6420,8 @@ import XCTest
             for window in windows {
                 window.domainWorkspacePresentationBridgeForTesting?.afterCatalogReloadForTesting = nil
                 window.domainWorkspacePresentationBridgeForTesting?.catalogPreparationDidFinishForTesting = nil
+                await window.workspaceFileContextStore.setRootLoadWillReturnHandlerForTesting(nil)
+                window.workspaceManager.postSwitchGitDataLoadShutdownWillJoinForTesting = nil
             }
             if let runtimeStartTask {
                 do { try await runtimeStartTask.value } catch { XCTFail("Fixture runtime start failed: \(error)") }
