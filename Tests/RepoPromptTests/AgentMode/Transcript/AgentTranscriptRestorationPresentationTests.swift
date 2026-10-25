@@ -2942,16 +2942,17 @@ extension AgentTranscriptPaneSnapshotPublicationTests {
             )]
             _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
             XCTAssertNil(fixture.prompt.activeComposeTabID, "precondition: selection not yet published")
+            await fixture.prompt.switchComposeTab(fixture.tabID)
             fixture.viewModel.setAgentModeActive(true)
             await fixture.viewModel.handleWorkspaceSwitch(fixture.workspace)
             // Activation queues the loader; its task does not exist yet when the workspace switch returns.
             // Hold preparation until that producer exists, then await the activation continuation too.
+            let activationGeneration = fixture.viewModel.test_sessionActivationGeneration
             await fixture.gate.waitUntilEntered()
             let loadTask = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID]?.persistedLoadTask)
             await fixture.gate.open()
             await loadTask.value
-            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
-            await fixture.prompt.switchComposeTab(fixture.tabID)
+            await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
             XCTAssertFalse(fixture.viewModel.ui.transcript.snapshot.presentation.workingRows.isEmpty, "precondition: outgoing rows")
 
             let incomingTabID = UUID()
