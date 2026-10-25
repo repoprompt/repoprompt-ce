@@ -7,8 +7,8 @@ on:
       - main
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -161,7 +161,7 @@ jobs:
           overwrite: true
           name: root-build-${{ github.run_id }}
           path: root-build.tar.gz
-          retention-days: 1
+          retention-days: 7
 
       # Keep binary artifacts main-scoped too; PRs restore without saving their own caches.
       - name: Save checksum-verified SwiftPM binary artifacts (main only)
@@ -240,7 +240,18 @@ jobs:
           BUILD_RESULT: ${{ needs.build-test-bundles.result }}
           SECRET_RESULT: ${{ needs.secret-scan.result }}
           SHARD_RESULT: ${{ needs.build-and-test.result }}
-        run: test "$BUILD_RESULT" = success && test "$SHARD_RESULT" = success && test "$SECRET_RESULT" = success
+        shell: bash
+        run: |
+          {
+            echo '## CI prerequisite results'
+            echo "- Build and Static Gates: $BUILD_RESULT"
+            echo "- Root test shards: $SHARD_RESULT"
+            echo "- Secret Scan: $SECRET_RESULT"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
+            echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
+            exit 1
+          fi
 
       - name: Download expected coverage
         uses: actions/download-artifact@v4

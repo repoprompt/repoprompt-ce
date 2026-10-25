@@ -563,6 +563,10 @@ struct WorkspaceCodemapGraphIndexBudget: Hashable {
     let dimension: WorkspaceCodemapGraphIndexBudgetDimension
     let attempted: UInt64
     let limit: UInt64
+
+    var terminalMessage: String {
+        "Code Map indexing stopped at the \(dimension) budget (attempted \(attempted), limit \(limit)). This generation cannot be resumed with Retry."
+    }
 }
 
 struct WorkspaceCodemapGraphIndexResourceAccounting: Hashable {

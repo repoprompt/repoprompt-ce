@@ -250,16 +250,20 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 
     func inspectGit(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
+        let op = args["op"]?.stringValue ?? "status"
+        let ref = args["ref"]?.stringValue ?? "HEAD"
+        if op == "show" {
+            try GitRevisionArgument.validate(ref)
+        }
         let snapshot = try await context.snapshot(for: request)
         let roots = try resolveGitRoots(args: args, snapshot: snapshot)
-        let op = args["op"]?.stringValue ?? "status"
         var outputs: [Value] = []
         for root in roots {
             let command: [String]
             switch op {
             case "status": command = ["status", "--short", "--branch"]
             case "log": command = ["log", "--oneline", "-n", String(max(1, min(args["count"]?.intValue ?? 10, 100)))]
-            case "show": command = ["show", "--no-ext-diff", "--no-textconv", args["ref"]?.stringValue ?? "HEAD"]
+            case "show": command = ["show", "--no-ext-diff", "--no-textconv", ref, "--"]
             case "blame":
                 guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("blame requires path") }
                 command = ["blame", "--", path]

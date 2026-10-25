@@ -51,6 +51,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     override func tearDown() {
         for viewModel in retained {
             for session in viewModel.sessions.values {
+                session.oversight.retireSnoozeState()
                 session.oversight.retirePeriodicScheduling()
                 session.oversight.pendingAutoWake?.task?.cancel()
             }
@@ -3901,9 +3902,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    /// Many records, one task: a re-arm replaces its predecessor, and the cancelled token can never
-    /// expire the replacement's records.
-    func testOneNearestDeadlineTaskSurvivesExtensionAndAStaleTokenCannotExpireItsReplacement() async throws {
+    /// Many records, one task: even a cancelled predecessor resumed normally cannot re-arm or
+    /// expire the replacement's records. This exercises cancellation, not token-only invalidation.
+    func testOneNearestDeadlineTaskSurvivesExtensionAndACancelledDeadlineCannotRearmItsReplacement() async throws {
         let fixture = try makeFixture()
         let clock = installSnoozeClock(fixture)
         try publishInventory(fixture, revision: 1)
@@ -3926,20 +3927,36 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         _ = try requireSnoozeSuccess(
             mutateSnooze(fixture, endpoint: endpoint, laneIndex: 1, command: .set(durationSeconds: 1200))
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1, "two records still own exactly one deadline task")
+        let firstDeadline = clock.instant.advanced(by: .seconds(600))
+        // Cancellation reaps clock sleepers asynchronously; a yield budget is not a drain.
+        try await AsyncTestWait.waitUntil("two records to share only the nearest deadline") {
+            await MainActor.run { clock.pendingDeadlines == [firstDeadline] }
+        }
         let firstToken = try XCTUnwrap(fixture.session.oversight.snoozeTaskToken)
+        let firstTask = try XCTUnwrap(fixture.session.oversight.snoozeDeadlineTask)
+        let resumedBeforeExtension = clock.resumedSleepCount
+        let replacementDeadline = clock.instant.advanced(by: .seconds(1200))
+        let extendedDeadline = clock.instant.advanced(by: .seconds(3600))
 
-        // Extending past the other record's deadline re-arms on the new nearest deadline.
+        // No suspension between cancellation and firing: the old sleeper resumes successfully
+        // before its asynchronous cancellation cleanup can reap it.
         _ = try requireSnoozeSuccess(
             mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 3600))
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1)
-        XCTAssertNotEqual(fixture.session.oversight.snoozeTaskToken, firstToken)
-
+        let replacementToken = try XCTUnwrap(fixture.session.oversight.snoozeTaskToken)
+        XCTAssertNotEqual(replacementToken, firstToken)
         clock.advance(seconds: 600)
-        await settleSnoozeTasks()
+        XCTAssertEqual(clock.resumedSleepCount, resumedBeforeExtension + 1, "the superseded sleeper actually resumed")
+        await firstTask.value
+
+        try await AsyncTestWait.waitUntil("the replacement deadline and cancelled sleepers to settle") {
+            await MainActor.run { clock.pendingDeadlines == [replacementDeadline] }
+        }
+        XCTAssertEqual(
+            fixture.session.oversight.snoozeTaskToken,
+            replacementToken,
+            "the completed cancelled task cannot re-arm the replacement"
+        )
         XCTAssertEqual(
             fixture.session.oversight.autoWakeSnoozes.count,
             2,
@@ -3948,7 +3965,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         clock.advance(seconds: 600)
         try await AsyncTestWait.waitUntil("the surviving deadline to expire only the due record") {
-            await MainActor.run { fixture.session.oversight.autoWakeSnoozes.count == 1 }
+            await MainActor.run {
+                fixture.session.oversight.autoWakeSnoozes.count == 1
+                    && clock.pendingDeadlines == [extendedDeadline]
+            }
         }
         XCTAssertNotNil(
             fixture.session.oversight.autoWakeSnoozes[AgentSessionLinkAutoWakeSnoozeKey(
@@ -3979,8 +3999,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.oversight.pendingAutoWake,
             "routine content inside the interval reserves nothing"
         )
-        await settleSnoozeTasks()
-        XCTAssertEqual(clock.pendingSleepCount, 1, "the shared deadline carries the interval")
+        let intervalDeadline = clock.instant.advanced(by: .seconds(300))
+        try await AsyncTestWait.waitUntil("only the shared deadline to carry the interval") {
+            await MainActor.run { clock.pendingDeadlines == [intervalDeadline] }
+        }
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.entries.count,
             1,

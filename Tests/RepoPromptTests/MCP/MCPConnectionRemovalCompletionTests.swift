@@ -7,6 +7,40 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPConnectionRemovalCompletionTests: XCTestCase {
+        func testTerminationRevokesApprovalLivenessBeforeTransportCloseCompletes() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            let gate = RemovalGate()
+            let entered = expectation(description: "termination paused before transport close completes")
+            let connection = RemovalTestConnection(onTerminate: {
+                entered.fulfill()
+                await gate.wait()
+            })
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: connection, pendingClientID: "termination-liveness-test"
+            )
+            let initiallyLive = await manager.isConnectionLiveForApproval(id)
+            XCTAssertTrue(initiallyLive)
+
+            let termination = Task {
+                await manager.terminateConnection(id, reason: .approvalDenied, message: "Denied by user")
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            let liveDuringTermination = await manager.isConnectionLiveForApproval(id)
+            XCTAssertFalse(liveDuringTermination, "termination must revoke admission before transport closure becomes observable")
+
+            gate.release()
+            await termination.value
+            let after = await manager.debugDirectAdmissionStateForTesting(connectionID: id)
+            XCTAssertNil(after.pendingClientID)
+            XCTAssertNil(after.indexedClientID)
+            XCTAssertTrue(after.activeClientIDs.isEmpty)
+            XCTAssertFalse(after.hasStats)
+            XCTAssertNil(after.connectionLifecycleGeneration)
+            let hasRemoval = await manager.debugHasConnectionRemovalOperation(for: id)
+            XCTAssertFalse(hasRemoval)
+        }
+
         func testDebugCleanupJoinsInFlightRemovalBeforeReadingAdmissionState() async {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let id = UUID()
@@ -147,6 +181,12 @@ import XCTest
     }
 
     private actor RemovalTestConnection: MCPServerConnection {
+        private let onTerminate: (@MainActor @Sendable () async -> Void)?
+
+        init(onTerminate: (@MainActor @Sendable () async -> Void)? = nil) {
+            self.onTerminate = onTerminate
+        }
+
         nonisolated var isFilesystemBacked: Bool {
             false
         }
@@ -161,6 +201,141 @@ import XCTest
 
         func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
         func stop() async {}
+        func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
+        func notifyToolListChanged() async {}
+        func connectionState() -> ConnectionStateSnapshot {
+            .ready
+        }
+
+        func isViableForRetention() -> Bool {
+            true
+        }
+
+        func secondsSinceLastActivity() async -> TimeInterval {
+            0
+        }
+
+        func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+            nil
+        }
+
+        func terminate(reason _: TerminationReason, message _: String?) async {
+            await onTerminate?()
+        }
+
+        func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+    }
+
+    @MainActor
+    final class MCPConnectionReplacementLivenessTests: XCTestCase {
+        func testSameSessionReplacementRevokesPredecessorBeforeStopCompletes() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let predecessorID = UUID()
+            let replacementID = UUID()
+            let sessionToken = UUID().uuidString
+            let gate = StopGate()
+            defer { gate.release() }
+            let entered = expectation(description: "predecessor stop paused")
+            let predecessor = ReplacementTestConnection(capabilityToken: sessionToken, onFirstStop: {
+                entered.fulfill()
+                await gate.wait()
+            })
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: predecessorID, connection: predecessor, pendingClientID: "predecessor"
+            )
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: replacementID,
+                connection: ReplacementTestConnection(capabilityToken: sessionToken),
+                pendingClientID: "replacement"
+            )
+            let replacementBefore = await manager.debugDirectAdmissionStateForTesting(connectionID: replacementID)
+            let initiallyLive = await manager.isConnectionLiveForApproval(predecessorID)
+            XCTAssertTrue(initiallyLive)
+
+            let replacement = Task {
+                await manager.handleConnectionReplaced(existing: predecessorID, by: replacementID, runID: UUID())
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            let predecessorLive = await manager.isConnectionLiveForApproval(predecessorID)
+            let replacementLive = await manager.isConnectionLiveForApproval(replacementID)
+            let blockedDuringStop = await manager.isSessionBlocked(sessionToken)
+            XCTAssertFalse(predecessorLive)
+            XCTAssertTrue(replacementLive)
+            XCTAssertFalse(blockedDuringStop)
+
+            await manager.removeConnection(predecessorID)
+            let duringStop = await manager.debugDirectAdmissionStateForTesting(connectionID: predecessorID)
+            let ownsRemoval = await manager.debugHasConnectionRemovalOperation(for: predecessorID)
+            let stopCountDuringRemoval = await predecessor.stopCount
+            XCTAssertEqual(duringStop.pendingClientID, "predecessor")
+            XCTAssertNotNil(duringStop.connectionLifecycleGeneration)
+            XCTAssertTrue(ownsRemoval)
+            XCTAssertEqual(stopCountDuringRemoval, 1)
+
+            gate.release()
+            await replacement.value
+            let predecessorAfter = await manager.debugDirectAdmissionStateForTesting(connectionID: predecessorID)
+            let replacementAfter = await manager.debugDirectAdmissionStateForTesting(connectionID: replacementID)
+            let hasRemoval = await manager.debugHasConnectionRemovalOperation(for: predecessorID)
+            let stopCount = await predecessor.stopCount
+            let blockedAfterStop = await manager.isSessionBlocked(sessionToken)
+            XCTAssertNil(predecessorAfter.pendingClientID)
+            XCTAssertNil(predecessorAfter.connectionLifecycleGeneration)
+            XCTAssertFalse(hasRemoval)
+            XCTAssertEqual(stopCount, 1)
+            XCTAssertEqual(replacementAfter, replacementBefore)
+            XCTAssertFalse(blockedAfterStop)
+
+            await manager.debugRemoveConnection(replacementID)
+            await manager.stop()
+        }
+
+        @MainActor
+        private final class StopGate {
+            private var released = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+
+            func wait() async {
+                guard !released else { return }
+                await withCheckedContinuation { waiters.append($0) }
+            }
+
+            func release() {
+                released = true
+                let pending = waiters
+                waiters.removeAll()
+                pending.forEach { $0.resume() }
+            }
+        }
+    }
+
+    private actor ReplacementTestConnection: MCPServerConnection {
+        nonisolated let capabilityToken: String?
+        private let onFirstStop: (@MainActor @Sendable () async -> Void)?
+        private(set) var stopCount = 0
+
+        init(capabilityToken: String, onFirstStop: (@MainActor @Sendable () async -> Void)? = nil) {
+            self.capabilityToken = capabilityToken
+            self.onFirstStop = onFirstStop
+        }
+
+        nonisolated var isFilesystemBacked: Bool {
+            false
+        }
+
+        nonisolated var connectionFolderURL: URL? {
+            nil
+        }
+
+        func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+
+        func stop() async {
+            stopCount += 1
+            if stopCount == 1 {
+                await onFirstStop?()
+            }
+        }
+
         func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
         func notifyToolListChanged() async {}
         func connectionState() -> ConnectionStateSnapshot {
