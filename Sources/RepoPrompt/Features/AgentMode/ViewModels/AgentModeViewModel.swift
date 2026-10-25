@@ -18237,13 +18237,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         let repromptRecoveryID = repromptUIStore.recoveries[target.tabID]?.id
+        // A presented handoff owns restoration even if it is cancelled while this executor awaits.
+        let presentedHandoffOwnsRecovery = ui.composer.pendingSubmissions[claim.attempt.id] != nil
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
         guard composerSubmitClaimIsCurrent(claim) else {
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
-            if let approvedBriefForRecovery, !submittedApprovedBrief {
+            if !presentedHandoffOwnsRecovery, let approvedBriefForRecovery, !submittedApprovedBrief {
                 repromptUIStore.recoveries[target.tabID] = .init(
                     text: approvedBriefForRecovery, originalDraft: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot,
                     reason: "The approved turn could not be submitted.",
@@ -18254,10 +18257,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
                 repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-            repromptAudits[claim.attempt.id] = nil
-            repromptDispatchTexts[claim.attempt.id] = nil
-            repromptDispatchOriginals[claim.attempt.id] = nil
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18441,6 +18441,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
+            movePendingComposerSubmission(claim, to: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
@@ -18538,6 +18539,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         destinationTabID: UUID,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        movePendingComposerSubmission(claim, to: destinationTabID)
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
