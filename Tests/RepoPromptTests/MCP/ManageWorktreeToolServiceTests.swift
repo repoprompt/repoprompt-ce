@@ -787,6 +787,36 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        func testCreatePreservesAppliedBindingWhenRequiredPersistenceFails() async throws {
+            try await withProvider { fixture in
+                struct SaveFailure: Error {}
+                var saveAttempted = false
+                fixture.driver.window.agentModeViewModel.test_setAgentSessionSaver { _, _, _ in
+                    saveAttempted = true
+                    throw SaveFailure()
+                }
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("created-binding-save-failed"), "bind": .bool(true)
+                ], includeWorktree: false)
+                XCTAssertTrue(saveAttempted, "The real binding must reach its required persistence fence")
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue)
+                let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+                let binding = try XCTUnwrap(reply.objectValue?["binding"]?.objectValue)
+                XCTAssertEqual(binding["worktree_id"]?.stringValue, worktreeID)
+                XCTAssertEqual(fixture.session.worktreeBindings.first?.worktreeID, worktreeID)
+                let warning = try XCTUnwrap(reply.objectValue?["warning"]?.stringValue)
+                XCTAssertTrue(warning.contains("binding is currently applied"), warning)
+                XCTAssertTrue(warning.contains("persistence could not be confirmed"), warning)
+                XCTAssertFalse(warning.contains("no session binding was applied"), warning)
+                XCTAssertFalse(warning.contains("cleanup is manual"), warning)
+                XCTAssertNil(AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.records[worktreeID]?.releasedAt)
+            }
+        }
+
         func testCreateKeepsDescriptorAndWorktreeWhenBindingIsRefused() async throws {
             try await withProvider { fixture in
                 _ = try await fixture.call(["op": .string("bind")])

@@ -317,6 +317,10 @@ package struct MCPDomainProtectedMutationToolProvider {
                     MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
                 } catch {
                     // No effects occurred, but durable settlement could not be confirmed.
+                    MCPDomainProtectedMutationSettlementContext.report(.unknown, operationID: operationID)
+                    throw MCPError.internalError(
+                        "No backend effects occurred, but durable refusal settlement could not be confirmed. Inspect operation ID \(operationID) before retrying."
+                    )
                 }
                 throw refusal.underlying
             } catch {

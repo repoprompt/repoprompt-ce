@@ -404,9 +404,33 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 previousDTO = bindingResult.previous
                 pendingDTO = bindingResult.pending.map(Self.pendingApplicationDTO)
             } catch {
-                let warning = "Worktree was created, but session binding failed: \(error.localizedDescription) The created worktree is kept at \(created.path); cleanup is manual."
+                var currentBindings: [AgentSessionWorktreeBinding]?
+                do {
+                    // This is a fresh target observation, not the failed transition's receipt.
+                    // A revoked caller must not acquire newer binding state through error handling.
+                    try await bindingRequest.authority.revalidate()
+                    try bindingRequest.authority.commit {
+                        currentBindings = try dependencies.execution.requireTargetWindow().agentModeViewModel
+                            .worktreeBindingState(forAgentSessionID: bindingRequest.sessionID).bindings
+                    }
+                } catch {
+                    // Unavailable authority/state remains unknown; never infer an unbound orphan.
+                }
+                let viewModel = (try? dependencies.execution.requireTargetWindow())?.agentModeViewModel
+                let applied = currentBindings?.first {
+                    $0.repositoryID == created.repository.repositoryID && $0.worktreeID == created.worktreeID
+                }
+                let warning: String
+                if let applied {
+                    bindingDTO = self.bindingDTO(applied)
+                    warning = "Worktree was created and its session binding is currently applied, but completion or persistence could not be confirmed: \(error.localizedDescription) Inspect the session and worktree at \(created.path) before retrying."
+                } else if currentBindings != nil {
+                    warning = "Worktree was created, but session binding failed: \(error.localizedDescription) The created worktree is kept at \(created.path); cleanup is manual."
+                } else {
+                    warning = "Worktree was created, but the session binding's current state could not be confirmed: \(error.localizedDescription) Inspect the session and worktree at \(created.path) before retrying or cleanup."
+                }
                 bindingWarning = warning
-                if let viewModel = try? dependencies.execution.requireTargetWindow().agentModeViewModel,
+                if let viewModel,
                    let owner = try? viewModel.authoritativeLiveSession(for: bindingRequest.sessionID)
                 {
                     owner.appendItem(.system(warning, sequenceIndex: owner.nextSequenceIndex))
@@ -414,19 +438,21 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     viewModel.syncTranscriptUIState()
                     viewModel.scheduleSave(for: owner)
                 }
-                AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.markReleased([
-                    AgentSessionWorktreeBinding(
-                        id: UUID().uuidString, repositoryID: created.repository.repositoryID,
-                        repoKey: created.repository.repoKey, logicalRootPath: context.repo.rootURL.path,
-                        logicalRootName: context.repo.rootURL.lastPathComponent, worktreeID: created.worktreeID,
-                        worktreeRootPath: created.path, branch: created.branch, source: "manage_worktree.create.refused"
-                    ).summary
-                ], bySessionID: bindingRequest.sessionID, at: Date())
+                if currentBindings != nil, applied == nil {
+                    AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.markReleased([
+                        AgentSessionWorktreeBinding(
+                            id: UUID().uuidString, repositoryID: created.repository.repositoryID,
+                            repoKey: created.repository.repoKey, logicalRootPath: context.repo.rootURL.path,
+                            logicalRootName: context.repo.rootURL.lastPathComponent, worktreeID: created.worktreeID,
+                            worktreeRootPath: created.path, branch: created.branch, source: "manage_worktree.create.refused"
+                        ).summary
+                    ], bySessionID: bindingRequest.sessionID, at: Date())
+                }
             }
         }
 
         let includeCopyWarning = createResult.includeCopyResult?.warningText
-        let fallbackBindingWarning = bindAfterCreate && bindingDTO == nil
+        let fallbackBindingWarning = bindAfterCreate && bindingDTO == nil && bindingWarning == nil
             ? "Worktree created but no session binding was applied."
             : nil
         let warning = combinedWarnings([includeCopyWarning, bindingWarning, fallbackBindingWarning])
