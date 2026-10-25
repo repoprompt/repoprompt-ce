@@ -833,7 +833,6 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
             raise SystemExit(128 + signum)
 
         previous_sigterm = signal.getsignal(signal.SIGTERM)
-        previous_sigint = signal.getsignal(signal.SIGINT)
         try:
             signal.signal(signal.SIGTERM, terminate_runner)
             with process.stdout, selectors.DefaultSelector() as selector:
@@ -873,28 +872,12 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
             status = process.wait(timeout=5)
             return (124 if timed_out else status), ''.join(chunks)
         finally:
-            incoming_exception = sys.exc_info()[1]
-            deferred_signal = None
-
-            def defer_cancellation(signum, _frame):
-                nonlocal deferred_signal
-                if deferred_signal is None:
-                    deferred_signal = signum
-
-            cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
             try:
-                # Defer cancellation until ownership is drained. A first signal
-                # during normal teardown still cancels instead of being lost.
-                signal.signal(signal.SIGTERM, defer_cancellation)
-                signal.signal(signal.SIGINT, defer_cancellation)
-                stop_session()
-                process.wait(timeout=5)
+                with process_session.defer_cancellation_during_cleanup():
+                    stop_session()
+                    process.wait(timeout=5)
             finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
-                signal.signal(signal.SIGINT, previous_sigint)
                 signal.signal(signal.SIGTERM, previous_sigterm)
-            if deferred_signal is not None and incoming_exception is None:
-                raise SystemExit(128 + deferred_signal)
 
 
 def run_selected_suites(

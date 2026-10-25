@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import signal
 import subprocess
 import time
-from ci_process_session import terminate_session
+from ci_process_session import defer_cancellation_during_cleanup, terminate_session
 
 
 def terminate_resolution(process: subprocess.Popen) -> None:
@@ -14,14 +15,45 @@ def terminate_resolution(process: subprocess.Popen) -> None:
 
 
 def run_resolution(command, *, cwd, check, timeout):
-    process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    process = None
+    pending_cancellation = None
+    timeout_error = None
+
+    def cancel_resolution(signum, _frame):
+        nonlocal pending_cancellation
+        if pending_cancellation is None:
+            pending_cancellation = signum
+        # Popen may already have launched the child without returning its handle.
+        # Defer until ownership is recorded; masking here would also mask the child.
+        if process is not None:
+            if pending_cancellation == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + pending_cancellation)
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
     try:
-        status = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        terminate_resolution(process)
-        raise
-    if status:
-        terminate_resolution(process)
+        signal.signal(signal.SIGTERM, cancel_resolution)
+        signal.signal(signal.SIGINT, cancel_resolution)
+        process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+        if pending_cancellation is not None:
+            cancel_resolution(pending_cancellation, None)
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # A timeout is retryable only after cleanup. A first cancellation
+            # during that cleanup must abort instead of being hidden by this error.
+            timeout_error = error
+    finally:
+        try:
+            if process is not None:
+                with defer_cancellation_during_cleanup():
+                    terminate_resolution(process)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    if timeout_error is not None:
+        raise timeout_error
     return subprocess.CompletedProcess(command, status)
 
 

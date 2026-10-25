@@ -2,10 +2,40 @@
 """Bounded cleanup for subprocesses launched in a private POSIX session."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import signal
 import subprocess
+import sys
 import time
+
+
+@contextmanager
+def defer_cancellation_during_cleanup():
+    """Drain owned processes before honoring cancellation, preserving an active failure."""
+    incoming_exception = sys.exc_info()[1]
+    deferred_signal = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def defer_cancellation(signum, _frame):
+        nonlocal deferred_signal
+        if deferred_signal is None:
+            deferred_signal = signum
+
+    cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    try:
+        # A first cancellation during normal teardown still cancels; subsequent
+        # signals must not interrupt the inventory or strand an owned child.
+        signal.signal(signal.SIGTERM, defer_cancellation)
+        signal.signal(signal.SIGINT, defer_cancellation)
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    if deferred_signal is not None and incoming_exception is None:
+        raise SystemExit(128 + deferred_signal)
 
 
 def session_process_groups(session_id: int) -> set[int]:
