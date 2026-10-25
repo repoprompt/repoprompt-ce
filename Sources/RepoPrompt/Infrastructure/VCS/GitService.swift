@@ -7714,8 +7714,7 @@ actor GitService {
                     readBinding: readBinding
                 )
                 if probe.2 != 0 {
-                    await processAdmissionController.release(lease)
-                    return probe
+                    throw GitError(message: GitReadSafety.ownershipProbeFailure(exitCode: probe.2, stderr: probe.1))
                 }
                 try readBinding.validateOwnershipProbe(String(decoding: probe.0, as: UTF8.self))
                 try Task.checkCancellation()
