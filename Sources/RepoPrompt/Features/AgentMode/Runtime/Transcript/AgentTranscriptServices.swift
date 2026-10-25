@@ -5550,6 +5550,8 @@ enum AgentTranscriptCompactor {
 struct AgentTranscriptTurnProjectionCache: Equatable {
     struct ValidationToken: Equatable {
         let turnID: UUID
+        // Retained paths and request metadata can change after the turn has completed.
+        let request: AgentTranscriptRequestAnchor?
         let retentionTier: AgentTranscriptRetentionTier
         let isCompleted: Bool
         let responseSpanCount: Int
@@ -6224,6 +6226,7 @@ enum AgentTranscriptProjectionBuilder {
     static func validationToken(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnProjectionCache.ValidationToken {
         .init(
             turnID: turn.id,
+            request: turn.request,
             retentionTier: turn.retentionTier,
             isCompleted: turn.isCompleted,
             responseSpanCount: turn.responseSpans.count,

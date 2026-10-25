@@ -1673,6 +1673,120 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertEqual(row.attachments.first?.title, "lost.png")
     }
 
+    func testHydrationRepairsCompactedCanonicalImageAndPersistsItsRenderedPath() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let session = viewModel.session(for: UUID())
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        let attachment = AgentImageAttachment(
+            source: .localFile(path: workspaceDirectory.appendingPathComponent("lost.png").path),
+            title: "compacted image",
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let request = AgentChatItem.user("earlier request", attachments: [attachment], sequenceIndex: 0)
+        let transcript = compactedTranscript(for: request)
+        session.runState = .completed
+        session.nextSequenceIndex = transcript.nextSequenceIndex
+        session.setItemsSilently(AgentTranscriptIO.workingSourceItems(from: transcript), reason: .persistedSessionHydration)
+        viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+        session.isDirty = false
+        let mutationGeneration = session.persistenceMutationGeneration
+        XCTAssertTrue(session.items.isEmpty, "The request exists only in canonical compacted history")
+        XCTAssertNotNil(session.turnProjectionCaches[transcript.turns[0].id], "Prime the completed-turn projection cache")
+        XCTAssertEqual(session.fullTranscriptProjection.workingRows.first?.attachments, [attachment])
+        let folder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = folder.appendingPathComponent("\(attachment.id.uuidString).png")
+        try Data("compacted kept image".utf8).write(to: kept)
+
+        viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
+        await viewModel.waitForAttachmentRetention()
+
+        let expected = AgentImageAttachment(
+            id: attachment.id, source: .localFile(path: kept.path), title: attachment.title, createdAt: attachment.createdAt
+        )
+        XCTAssertTrue(session.items.isEmpty, "Repair must not reintroduce compacted requests into the working suffix")
+        XCTAssertEqual(session.transcript.turns.first?.request?.attachments, [expected])
+        XCTAssertEqual(session.fullTranscriptProjection.workingRows.first?.attachments, [expected])
+        XCTAssertEqual(session.fullTranscriptProjection.workingBlocks.first?.rows.first?.attachments, [expected])
+        XCTAssertTrue(session.isDirty)
+        XCTAssertGreaterThan(session.persistenceMutationGeneration, mutationGeneration)
+
+        let workspace = WorkspaceModel(name: "Compacted attachment repair", repoPaths: [], customStoragePath: workspaceDirectory)
+        let service = AgentSessionDataService()
+        let savedURL = try await service.saveAgentSession(
+            AgentSession(
+                id: sessionID, workspaceID: workspace.id, composeTabID: session.tabID,
+                transcript: session.transcript, lastRunState: AgentSessionRunState.completed.rawValue
+            ),
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript
+        )
+        let reloaded = try await service.loadAgentSession(from: savedURL)
+        let reloadedTranscript = try XCTUnwrap(reloaded.transcript)
+        XCTAssertTrue(reloaded.items.isEmpty)
+        XCTAssertEqual(reloadedTranscript.turns.first?.request?.attachments, [expected])
+        let reloadedProjection = AgentTranscriptProjectionBuilder.build(from: reloadedTranscript)
+        XCTAssertEqual(reloadedProjection.workingRows.first?.attachments, [expected])
+        XCTAssertEqual(reloadedProjection.workingBlocks.first?.rows.first?.attachments, [expected])
+        XCTAssertEqual(try Data(contentsOf: kept), Data("compacted kept image".utf8))
+    }
+
+    func testHydrationRepairsSharedAttachmentWithoutReplacingEachRequestsMetadata() async throws {
+        for workingPathAlreadyRetained in [false, true] {
+            let viewModel = makeViewModel()
+            let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+            viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+            let session = viewModel.session(for: UUID())
+            let sessionID = UUID()
+            session.testInstallPersistentSessionBinding(sessionID: sessionID)
+            let attachmentID = UUID()
+            let folder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: sessionID)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let kept = folder.appendingPathComponent("\(attachmentID.uuidString).png")
+            try Data("shared kept image".utf8).write(to: kept)
+            let missingPath = workspaceDirectory.appendingPathComponent("missing-\(attachmentID).png").path
+            let historicalAttachment = AgentImageAttachment(
+                id: attachmentID, source: .localFile(path: missingPath), title: "original title", createdAt: Date(timeIntervalSince1970: 10)
+            )
+            let workingAttachment = AgentImageAttachment(
+                id: attachmentID,
+                source: .localFile(path: workingPathAlreadyRetained ? kept.path : missingPath),
+                title: "reused title", createdAt: Date(timeIntervalSince1970: 20)
+            )
+            let historicalRequest = AgentChatItem.user("older", attachments: [historicalAttachment], sequenceIndex: 0)
+            let workingRequest = AgentChatItem.user("newer", attachments: [workingAttachment], sequenceIndex: 1)
+            var transcript = compactedTranscript(for: historicalRequest)
+            transcript.turns.append(AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: workingRequest), terminalState: .completed,
+                startedAt: workingRequest.timestamp, completedAt: workingRequest.timestamp
+            ))
+            transcript.nextSequenceIndex = 2
+            session.runState = .completed
+            session.nextSequenceIndex = transcript.nextSequenceIndex
+            session.setItemsSilently([workingRequest], reason: .persistedSessionHydration)
+            viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+
+            viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
+            await viewModel.waitForAttachmentRetention()
+
+            let expectedHistorical = AgentImageAttachment(
+                id: attachmentID, source: .localFile(path: kept.path), title: historicalAttachment.title, createdAt: historicalAttachment.createdAt
+            )
+            let expectedWorking = AgentImageAttachment(
+                id: attachmentID, source: .localFile(path: kept.path), title: workingAttachment.title, createdAt: workingAttachment.createdAt
+            )
+            XCTAssertEqual(session.items.map(\.id), [workingRequest.id])
+            XCTAssertEqual(session.items.first?.attachments, [expectedWorking])
+            XCTAssertEqual(session.transcript.turns.first { $0.request?.id == historicalRequest.id }?.request?.attachments, [expectedHistorical])
+            XCTAssertEqual(session.transcript.turns.first { $0.request?.id == workingRequest.id }?.request?.attachments, [expectedWorking])
+            XCTAssertEqual(session.fullTranscriptProjection.workingRows.first { $0.id == historicalRequest.id }?.attachments, [expectedHistorical])
+            XCTAssertEqual(session.fullTranscriptProjection.workingRows.first { $0.id == workingRequest.id }?.attachments, [expectedWorking])
+        }
+    }
+
     func testRetentionMarksTheMovedTemporaryPathMissing() async throws {
         let viewModel = makeViewModel()
         let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
@@ -1921,6 +2035,16 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func compactedTranscript(for request: AgentChatItem) -> AgentTranscript {
+        AgentTranscript(
+            turns: [AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: request), retentionTier: .condensed, terminalState: .completed,
+                startedAt: request.timestamp, completedAt: request.timestamp
+            )],
+            nextSequenceIndex: request.sequenceIndex + 1
+        )
+    }
 
     private func writeTemporaryImage() throws -> URL {
         let temporaryRoot = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)

@@ -595,7 +595,11 @@ extension AgentModeViewModel {
         guard clearConsumedAttachmentsAfterProviderConsumption,
               let root = sessionAttachmentsRootURL()
         else { return }
+        // Compacted requests remain canonical after they leave the working item suffix. Let the
+        // store coalesce repairs by ID after checking each path: a live working copy must not hide
+        // a dead path for the same attachment in an older canonical request.
         let attachments = session.items.filter { $0.kind == .user }.flatMap(\.attachments)
+            + session.transcript.turns.compactMap(\.request).flatMap(\.attachments)
         guard attachments.contains(where: {
             if case .localFile = $0.source {
                 true
@@ -616,21 +620,56 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Points every user row that carried a retained attachment at its kept copy and saves.
+    /// Repairs canonical requests and their working copies without replacing row-owned metadata.
     func applyRetainedAttachments(_ retained: [UUID: AgentImageAttachment], to session: TabSession, sessionID: UUID) {
-        guard !retained.isEmpty, session.activeAgentSessionID == sessionID else { return }
-        let indices = session.items.indices.filter { index in
-            session.items[index].kind == .user
-                && session.items[index].attachments.contains { retained[$0.id] != nil }
-        }
-        guard !indices.isEmpty else { return }
-        for index in indices {
-            session.mutateItem(at: index) { item in
-                item.attachments = item.attachments.map { retained[$0.id] ?? $0 }
+        guard !retained.isEmpty, session.activeAgentSessionID == sessionID,
+              sessions[session.tabID] === session
+        else { return }
+        func repaired(_ attachments: [AgentImageAttachment]) -> [AgentImageAttachment] {
+            attachments.map { attachment in
+                guard let kept = retained[attachment.id] else { return attachment }
+                return AgentImageAttachment(
+                    id: attachment.id,
+                    source: kept.source,
+                    title: attachment.title,
+                    createdAt: attachment.createdAt
+                )
             }
+        }
+
+        let canonicalRequestsChanged = session.transcript.turns.contains { turn in
+            guard let request = turn.request else { return false }
+            return repaired(request.attachments) != request.attachments
+        }
+        let workingRowsChanged = session.items.contains { item in
+            item.kind == .user && repaired(item.attachments) != item.attachments
+        }
+        guard workingRowsChanged || canonicalRequestsChanged else { return }
+
+        session.mutateItemsBatch(touchActivity: false) { items in
+            for index in items.indices where items[index].kind == .user {
+                items[index].attachments = repaired(items[index].attachments)
+            }
+        }
+        if !canReuseDerivedTranscriptForSave(
+            for: session,
+            projectionProtection: transcriptProjectionProtection(for: session)
+        ) {
+            // Drain pending working-row mutations before committing canonical-only repairs.
+            refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        }
+        var transcript = session.transcript
+        for index in transcript.turns.indices {
+            guard var request = transcript.turns[index].request else { continue }
+            request.attachments = repaired(request.attachments)
+            transcript.turns[index].request = request
+        }
+        if transcript != session.transcript {
+            applyTranscriptPresentation(transcript, to: session)
         }
         session.isDirty = true
         scheduleSave(for: session)
+        requestUIRefresh(tabID: session.tabID)
     }
 
     /// Awaits in-flight turn-end moves (tests and orderly teardown).
