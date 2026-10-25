@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 from modularization_ci_artifact import validate as validate_ci_artifact
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, listing_digest, verify_execution
+import ci_process_session as process_session
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
 SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
@@ -781,18 +782,10 @@ def suite_timeout_seconds(environment: Mapping[str, str]) -> float:
     return seconds
 
 
-def signal_process_group(process: subprocess.Popen, sig: int) -> None:
-    # The leader may have exited while a descendant still owns the output pipe.
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        pass
-
-
 def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]:
     """Capture output under a wall deadline, including silent/partial-line hangs.
 
-    Each suite owns a process group. Timeout is a failing attempt (124), never a retry
+    Each suite owns a process session. Timeout is a failing attempt (124), never a retry
     or a success receipt. Descendants cannot keep the output reader alive indefinitely.
     """
     seconds = suite_timeout_seconds(environment)  # Reject bad configuration before spawning.
@@ -825,13 +818,13 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
         assert process.stdout is not None
         deadline = time.monotonic() + seconds
         timed_out = False
-        group_killed = False
+        session_stopped = False
 
-        def kill_group():
-            nonlocal group_killed
-            if not group_killed:
-                signal_process_group(process, signal.SIGKILL)
-                group_killed = True
+        def stop_session():
+            nonlocal session_stopped
+            if not session_stopped:
+                process_session.terminate_session(process, escalation=((signal.SIGKILL, 1),))
+                session_stopped = True
 
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 
@@ -840,6 +833,7 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
             raise SystemExit(128 + signum)
 
         previous_sigterm = signal.getsignal(signal.SIGTERM)
+        previous_sigint = signal.getsignal(signal.SIGINT)
         try:
             signal.signal(signal.SIGTERM, terminate_runner)
             with process.stdout, selectors.DefaultSelector() as selector:
@@ -852,10 +846,10 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
                             emit(f'\n::error::Suite {command!r} exceeded {seconds:g}s; '
                                  f'last started: {last_started}\n')
                             timed_out = True
-                            signal_process_group(process, signal.SIGTERM)
-                            deadline = now + 5
+                            process_session.signal_session(process.pid, signal.SIGTERM)
+                            deadline = time.monotonic() + 5
                         else:
-                            kill_group()
+                            stop_session()
                             break
                     for key, _ in selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
                         data = os.read(key.fd, 65536)
@@ -865,7 +859,7 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
                             selector.unregister(key.fileobj)
                 if timed_out:
                     # Also kill descendants which closed stdout or survived their leader.
-                    kill_group()
+                    stop_session()
                     # Drain only bytes already available; never wait on a surviving pipe owner.
                     for _ in range(16):
                         try:
@@ -879,11 +873,28 @@ def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]
             status = process.wait(timeout=5)
             return (124 if timed_out else status), ''.join(chunks)
         finally:
+            incoming_exception = sys.exc_info()[1]
+            deferred_signal = None
+
+            def defer_cancellation(signum, _frame):
+                nonlocal deferred_signal
+                if deferred_signal is None:
+                    deferred_signal = signum
+
+            cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
             try:
-                kill_group()
+                # Defer cancellation until ownership is drained. A first signal
+                # during normal teardown still cancels instead of being lost.
+                signal.signal(signal.SIGTERM, defer_cancellation)
+                signal.signal(signal.SIGINT, defer_cancellation)
+                stop_session()
                 process.wait(timeout=5)
             finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
+                signal.signal(signal.SIGINT, previous_sigint)
                 signal.signal(signal.SIGTERM, previous_sigterm)
+            if deferred_signal is not None and incoming_exception is None:
+                raise SystemExit(128 + deferred_signal)
 
 
 def run_selected_suites(
