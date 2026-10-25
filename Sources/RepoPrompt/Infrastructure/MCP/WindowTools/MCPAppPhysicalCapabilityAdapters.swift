@@ -309,6 +309,12 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ metadata: MCPRequestMetadata,
         _ mutated: Bool
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
+    typealias SelectCreatedFile = @MainActor @Sendable (
+        _ file: WorkspaceFileRecord?,
+        _ resolvedContext: MCPResolvedTabContextSnapshot,
+        _ metadata: MCPRequestMetadata,
+        _ lookupContext: WorkspaceLookupContext
+    ) async -> String?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?, _ operationID: String) async throws -> MCPFileActionMutationAcknowledgement
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
@@ -450,6 +456,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let demoteStoredSelectionPaths: DemoteStoredSelectionPaths
         let computeSelectionSlicesVirtual: ComputeSelectionSlicesVirtual
         let persistResolvedTabContextSnapshot: PersistResolvedTabContextSnapshot
+        let selectCreatedFile: SelectCreatedFile
         let makeSelectionHintError: MakeSelectionHintError
     }
 

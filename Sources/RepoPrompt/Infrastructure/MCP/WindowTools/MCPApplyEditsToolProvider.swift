@@ -199,14 +199,16 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             }
 
             let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
+            let writeReceipt = WorkspaceFileEditHost.WriteReceipt()
             let host = WorkspaceFileEditHost(
                 store: store,
                 target: target,
                 selectionCoordinator: dependencies.context.selectionCoordinator,
                 lookupRootScope: lookupContext.rootScope,
                 createPathResolutionPolicy: .canonicalAliasFirst,
-                selectCreatedFiles: true,
-                mutationRootMappings: mutationRootMappings
+                selectCreatedFiles: false,
+                mutationRootMappings: mutationRootMappings,
+                writeReceipt: writeReceipt
             )
             let service = ApplyEditsService(engine: .default, host: host)
 
@@ -304,6 +306,9 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                         rootScope: lookupContext.rootScope
                     )
                     let persistedResult = previewResult.withFileMetadata(created: !preview.exists, overwritten: false)
+                    let selectionWarning = persistedResult.fileCreated
+                        ? await dependencies.selection.selectCreatedFile(writeReceipt.file, resolvedContext, metadata, lookupContext)
+                        : nil
                     #if DEBUG
                         MCPApplyEditsRebaseProbeRecorder.recordApplyEditsOutcome(
                             connectionID: metadata.connectionID,
@@ -321,7 +326,8 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                         reviewStatus: "accepted",
                         requiresUserApproval: true,
                         operationID: operationID,
-                        freshness: freshness
+                        freshness: freshness,
+                        selectionWarning: selectionWarning
                     )
                 case let .reject(reason):
                     return editSummary(
@@ -358,6 +364,9 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             let effectiveRequest = ApplyEditsRequest(path: effectivePath, mode: request.mode, verbose: request.verbose)
             try Task.checkCancellation()
             let result = try await service.run(effectiveRequest)
+            let selectionWarning = result.fileCreated
+                ? await dependencies.selection.selectCreatedFile(writeReceipt.file, resolvedContext, metadata, lookupContext)
+                : nil
             let freshness: String?
             if result.editsApplied > 0 {
                 freshness = await postMutationFreshness(
@@ -386,7 +395,8 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                 from: result,
                 path: displayPath,
                 operationID: result.editsApplied > 0 ? operationID : nil,
-                freshness: freshness
+                freshness: freshness,
+                selectionWarning: selectionWarning
             )
         } catch is CancellationError {
             throw CancellationError()
@@ -491,9 +501,11 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
         rejectionReason: String? = nil,
         requiresUserApproval: Bool? = nil,
         operationID: String? = nil,
-        freshness: String? = nil
+        freshness: String? = nil,
+        selectionWarning: String? = nil
     ) -> EditSummary {
         let lineStats = result.toolCardLineStats()
+        let notes = [noteOverride ?? result.note, selectionWarning].compactMap(\.self)
         return EditSummary(
             status: statusOverride ?? result.status.rawValue,
             editsRequested: result.editsRequested,
@@ -505,7 +517,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             results: result.outcomes,
             unifiedDiff: result.unifiedDiff,
             cardUnifiedDiff: result.unifiedDiffForToolCard(filePath: path),
-            note: noteOverride ?? result.note,
+            note: notes.isEmpty ? nil : notes.joined(separator: " "),
             fileCreated: result.fileCreated ? true : nil,
             fileOverwritten: result.fileOverwritten ? true : nil,
             reviewStatus: reviewStatus,
