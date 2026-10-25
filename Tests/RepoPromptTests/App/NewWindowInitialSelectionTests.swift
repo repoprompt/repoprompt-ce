@@ -94,6 +94,119 @@ import XCTest
             }
         }
 
+        func testCatalogAttemptFencesHealthObservedAfterReadForFullAndMetadataApplications() async throws {
+            for metadataOnly in [false, true] {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    let initial = await f.runtime.workspaceStore.snapshot()
+                    let models = try f.decoded(initial)
+                    let baseline = try XCTUnwrap(manager.applyDomainWorkspaceCatalog(
+                        initial, projection: .full(models), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    let original = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                    let originalBytes = try Data(contentsOf: original.document.fileURL)
+                    // This is the snapshot-return/preparation window from the review: the attempt
+                    // predates the read, but the point observation precedes any decode witness.
+                    let attempt = manager.beginDomainCatalogAttempt()
+                    let stale = await f.runtime.workspaceStore.snapshot()
+                    try Data("malformed externally edited workspace".utf8).write(to: original.document.fileURL, options: .atomic)
+                    _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                    let latest = await f.runtime.workspaceStore.snapshot()
+                    let degraded = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                    XCTAssertEqual(degraded.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+                    XCTAssertEqual(degraded.revisions, original.revisions)
+                    XCTAssertEqual(degraded.document.contentDigest, original.document.contentDigest)
+                    XCTAssertEqual(latest.catalogRevision, initial.catalogRevision)
+                    XCTAssertGreaterThan(latest.publicationSequence, stale.publicationSequence)
+                    manager.applyDomainAuthorityBaseline(
+                        workspaceID: degraded.document.workspaceID, revisions: degraded.revisions,
+                        digest: degraded.document.contentDigest, health: degraded.health,
+                        catalogRevision: latest.catalogRevision
+                    )
+                    let projection: DomainCatalogProjection = metadataOnly
+                        ? .metadata(baselineGeneration: baseline.reconciliationGeneration) : .full(models)
+                    let before = manager.workspaceChooserPresentation
+                    XCTAssertEqual(manager.catalogReadRejection(stale, attempt: attempt), .superseded)
+                    let rejected = manager.applyDomainWorkspaceCatalog(
+                        stale, projection: projection, preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata, attempt: attempt
+                    )
+                    XCTAssertEqual(rejected.rejection, .superseded)
+                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.reconciliationGeneration)
+                    XCTAssertEqual(manager.workspaceChooserPresentation, before)
+                    XCTAssertEqual(manager.catalogPreparationWitness.health[original.document.workspaceID], degraded.health)
+
+                    // A later read may legitimately recover health without changing any document
+                    // revision. Do not make disagreement with the existing baseline a permanent fence.
+                    let recoveryAttempt = manager.beginDomainCatalogAttempt()
+                    try originalBytes.write(to: original.document.fileURL, options: .atomic)
+                    _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                    let recovered = await f.runtime.workspaceStore.snapshot()
+                    let healthy = try XCTUnwrap(recovered.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                    XCTAssertEqual(healthy.health, .writable)
+                    XCTAssertEqual(healthy.revisions, original.revisions)
+                    XCTAssertEqual(recovered.catalogRevision, initial.catalogRevision)
+                    let accepted = manager.applyDomainWorkspaceCatalog(
+                        recovered, projection: projection, preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata, attempt: recoveryAttempt
+                    )
+                    XCTAssertEqual(accepted.receipt?.kind, metadataOnly ? .metadata : .full)
+                    XCTAssertEqual(manager.catalogPreparationWitness.health[original.document.workspaceID], .writable)
+                }
+            }
+        }
+
+        func testCatalogAttemptRejectsIntermediateHealthAfterSameValuePointObservation() async throws {
+            for observesIntermediateHealth in [false, true] {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    let initial = await f.runtime.workspaceStore.snapshot()
+                    let baseline = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                        initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    let original = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                    let originalBytes = try Data(contentsOf: original.document.fileURL)
+                    let attempt = manager.beginDomainCatalogAttempt()
+                    try Data("malformed externally edited workspace".utf8).write(to: original.document.fileURL, options: .atomic)
+                    _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                    let stale = await f.runtime.workspaceStore.snapshot()
+                    let degraded = try XCTUnwrap(stale.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                    XCTAssertEqual(degraded.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+                    if observesIntermediateHealth {
+                        manager.applyDomainAuthorityBaseline(
+                            workspaceID: degraded.document.workspaceID, revisions: degraded.revisions,
+                            digest: degraded.document.contentDigest, health: degraded.health,
+                            catalogRevision: stale.catalogRevision
+                        )
+                    }
+                    try originalBytes.write(to: original.document.fileURL, options: .atomic)
+                    _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                    let recovered = await f.runtime.workspaceStore.snapshot()
+                    let healthy = try XCTUnwrap(recovered.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                    XCTAssertEqual(healthy.health, original.health)
+                    XCTAssertEqual(healthy.revisions, degraded.revisions)
+                    XCTAssertEqual(recovered.catalogRevision, stale.catalogRevision)
+                    XCTAssertGreaterThan(recovered.publicationSequence, stale.publicationSequence)
+                    // Without the intermediate point read this equals the manager's existing value.
+                    // It is still newer evidence than the suspended degraded snapshot.
+                    manager.applyDomainAuthorityBaseline(
+                        workspaceID: healthy.document.workspaceID, revisions: healthy.revisions,
+                        digest: healthy.document.contentDigest, health: healthy.health,
+                        catalogRevision: recovered.catalogRevision
+                    )
+                    let rejected = manager.applyDomainWorkspaceCatalog(
+                        stale, projection: .metadata(baselineGeneration: baseline.reconciliationGeneration),
+                        preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata, attempt: attempt
+                    )
+                    XCTAssertEqual(rejected.rejection, .superseded)
+                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.reconciliationGeneration)
+                    XCTAssertEqual(manager.catalogPreparationWitness.health[original.document.workspaceID], .writable)
+                }
+            }
+        }
+
         func testCoveringManagerReconciliationDuringPreparationCreditsBridgeWithoutReadoptingModels() async throws {
             for coveringPreparation in [1, 2] {
                 try await Fixture.run { f in
@@ -192,6 +305,63 @@ import XCTest
                 XCTAssertNotNil(failure)
                 XCTAssertEqual(manager.workspaceChooserPresentation.failure, failure)
                 XCTAssertEqual(manager.domainWorkspaceAuthorityIssue, issue)
+            }
+        }
+
+        func testFinalPreparationHandoffCannotRefreshItsHealthObservationWitness() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("final preparation held before covering catalog and health observation")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        let catalog = await f.runtime.workspaceStore.snapshot()
+                        XCTAssertTrue(manager.reportDomainCatalogFailure(
+                            .modelProjection("competing attempt before final preparation"), snapshot: catalog,
+                            attempt: manager.beginDomainCatalogAttempt()
+                        ))
+                        return
+                    }
+                    if preparations == 2 {
+                        entered.fire()
+                        await gate.wait()
+                    }
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let original = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                try Data("malformed externally edited workspace".utf8).write(to: original.document.fileURL, options: .atomic)
+                _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                let latest = await f.runtime.workspaceStore.snapshot()
+                let degraded = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == original.document.workspaceID })
+                XCTAssertEqual(degraded.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+                XCTAssertEqual(degraded.revisions, original.revisions)
+                XCTAssertEqual(latest.catalogRevision, catalog.catalogRevision)
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: degraded.document.workspaceID, revisions: degraded.revisions,
+                    digest: degraded.document.contentDigest, health: degraded.health,
+                    catalogRevision: latest.catalogRevision
+                )
+                var acceptedHealth: [DomainAuthorityHealth?] = []
+                let observation = bridge.projectionObservationPublisherForTesting.sink { event in
+                    guard case .applied = event else { return }
+                    acceptedHealth.append(manager.catalogPreparationWitness.health[original.document.workspaceID])
+                }
+                defer { observation.cancel() }
+                gate.release()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.publicationSequence, latest.publicationSequence)
+                XCTAssertEqual(events.catalogCheckpoints.map(\.publicationSequence), [latest.publicationSequence], "the covered handoff cannot certify the older writable health")
+                XCTAssertEqual(acceptedHealth, [degraded.health])
+                XCTAssertEqual(preparations, 3, "two preparations use the original budget; the real degraded publication triggers the next projection")
             }
         }
 
@@ -4195,6 +4365,7 @@ import XCTest
                             workspaceID: record.document.workspaceID, revisions: record.revisions,
                             digest: record.document.contentDigest, health: record.health, catalogRevision: snapshot.catalogRevision,
                             publicationSequence: snapshot.publicationSequence + 1, baselineGeneration: receipt.reconciliationGeneration,
+                            authorityHealthGeneration: manager.domainAuthorityHealthGeneration,
                             operationID: nil, eventRevisions: record.revisions
                         ))
                     } else {
@@ -5229,6 +5400,7 @@ import XCTest
                     digest: own.document.contentDigest, health: own.health,
                     catalogRevision: ownEvent.catalogRevision, publicationSequence: ownEvent.sequence,
                     baselineGeneration: receipt.reconciliationGeneration,
+                    authorityHealthGeneration: manager.domainAuthorityHealthGeneration,
                     operationID: ownEvent.operationID, eventRevisions: ownEvent.revisions
                 ), "the same event is admissible while its canonical document is still current")
                 var replacement = try manager.decodeDomainWorkspaceCatalogRecord(own)
@@ -5246,6 +5418,7 @@ import XCTest
                     digest: newest.document.contentDigest, health: newest.health,
                     catalogRevision: ownEvent.catalogRevision, publicationSequence: ownEvent.sequence,
                     baselineGeneration: receipt.reconciliationGeneration,
+                    authorityHealthGeneration: manager.domainAuthorityHealthGeneration,
                     operationID: ownEvent.operationID, eventRevisions: ownEvent.revisions
                 ), "the point read may advance while the event still names an older own operation")
                 let after = manager.debugDomainAuthorityBaseline(for: Fixture.aardvarkID)
@@ -5403,6 +5576,7 @@ import XCTest
                         workspaceID: Fixture.aardvarkID, revisions: record.revisions, digest: record.document.contentDigest,
                         health: record.health, catalogRevision: 6, publicationSequence: 6,
                         baselineGeneration: receipt.reconciliationGeneration,
+                        authorityHealthGeneration: manager.domainAuthorityHealthGeneration,
                         operationID: nil, eventRevisions: record.revisions
                     ))
                     XCTAssertEqual(manager.domainCatalogReconciliationGeneration, receipt.reconciliationGeneration, "an echo is not a catalog reconciliation")
@@ -5468,6 +5642,7 @@ import XCTest
                         workspaceID: Fixture.aardvarkID, revisions: record.revisions, digest: record.document.contentDigest,
                         health: record.health, catalogRevision: catalogRevision, publicationSequence: sequence,
                         baselineGeneration: receipt.reconciliationGeneration,
+                        authorityHealthGeneration: manager.domainAuthorityHealthGeneration,
                         operationID: nil, eventRevisions: record.revisions
                     )
                 }
@@ -5479,6 +5654,43 @@ import XCTest
                 let cancelledResult = await cancelled.value
                 XCTAssertFalse(cancelledResult, "cancelled admission never advances the baseline")
                 XCTAssertTrue(accept(catalogRevision: 6, sequence: 6), "current, uncancelled control")
+            }
+        }
+
+        func testSelfEchoBaselineRejectsHealthObservedAfterItsCanonicalRead() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let baseline = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                    initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let authorityHealthGeneration = manager.domainAuthorityHealthGeneration
+                let staleRead = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let stale = try XCTUnwrap(staleRead)
+                XCTAssertEqual(stale.health, .writable)
+                try Data("malformed externally edited workspace".utf8).write(to: stale.document.fileURL, options: .atomic)
+                _ = await f.runtime.workspaceStore.reloadExternalChanges()
+                let latest = await f.runtime.workspaceStore.snapshot()
+                let degraded = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == stale.document.workspaceID })
+                XCTAssertEqual(degraded.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+                XCTAssertEqual(degraded.revisions, stale.revisions)
+                XCTAssertEqual(degraded.document.contentDigest, stale.document.contentDigest)
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: degraded.document.workspaceID, revisions: degraded.revisions,
+                    digest: degraded.document.contentDigest, health: degraded.health,
+                    catalogRevision: latest.catalogRevision
+                )
+                XCTAssertFalse(manager.acceptDomainAuthoritySelfEchoBaseline(
+                    workspaceID: stale.document.workspaceID, revisions: stale.revisions,
+                    digest: stale.document.contentDigest, health: stale.health,
+                    catalogRevision: initial.catalogRevision, publicationSequence: initial.publicationSequence,
+                    baselineGeneration: baseline.reconciliationGeneration,
+                    authorityHealthGeneration: authorityHealthGeneration,
+                    operationID: nil, eventRevisions: stale.revisions
+                ))
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.reconciliationGeneration)
+                XCTAssertEqual(manager.catalogPreparationWitness.health[stale.document.workspaceID], degraded.health)
             }
         }
     }
