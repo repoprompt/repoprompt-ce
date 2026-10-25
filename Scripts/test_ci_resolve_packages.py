@@ -11,6 +11,7 @@ from pathlib import Path
 import unittest
 from unittest import mock
 import ci_resolve_packages as resolver
+import ci_process_session as process_session
 
 
 class ResolutionTests(unittest.TestCase):
@@ -94,9 +95,20 @@ class ResolutionTests(unittest.TestCase):
 
     def test_process_inventory_failure_cannot_be_treated_as_a_retryable_timeout(self):
         process = mock.Mock(pid=123)
-        with mock.patch.object(resolver, 'session_process_groups', side_effect=RuntimeError('inventory failed')):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=RuntimeError('inventory failed')):
             with self.assertRaisesRegex(RuntimeError, 'inventory failed'):
                 resolver.terminate_resolution(process)
+
+    def test_empty_group_permission_error_requires_a_confirmed_empty_inventory(self):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=[{456}, set()]), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=PermissionError):
+            process_session.signal_session(123, signal.SIGKILL)
+
+    def test_live_group_permission_error_cannot_be_treated_as_successful_cleanup(self):
+        with mock.patch.object(process_session, 'session_process_groups', return_value={456}), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                process_session.signal_session(123, signal.SIGKILL)
 
     def test_slow_inventory_does_not_consume_signal_grace_period(self):
         process = mock.Mock(pid=123)
@@ -122,10 +134,10 @@ class ResolutionTests(unittest.TestCase):
             nonlocal clock
             clock += seconds
 
-        with mock.patch.object(resolver, 'session_process_groups', side_effect=inventory), \
-                mock.patch.object(resolver.os, 'killpg', side_effect=send_signal) as signals, \
-                mock.patch.object(resolver.time, 'monotonic', side_effect=lambda: clock), \
-                mock.patch.object(resolver.time, 'sleep', side_effect=sleep):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=inventory), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=send_signal) as signals, \
+                mock.patch.object(process_session.time, 'monotonic', side_effect=lambda: clock), \
+                mock.patch.object(process_session.time, 'sleep', side_effect=sleep):
             resolver.terminate_resolution(process)
 
         signals.assert_any_call(456, signal.SIGTERM)

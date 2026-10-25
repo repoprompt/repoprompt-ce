@@ -4,65 +4,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import os
-import signal
 import subprocess
 import time
-
-
-def session_process_groups(session_id: int) -> set[int]:
-    try:
-        listing = subprocess.run(
-            ['ps', '-U', str(os.getuid()), '-o', 'pid=,stat='],
-            check=True, capture_output=True, text=True, timeout=5,
-        )
-    except subprocess.SubprocessError as error:
-        raise RuntimeError('Cannot inventory dependency attempt processes; refusing to retry') from error
-    groups = set()
-    for line in listing.stdout.splitlines():
-        raw_pid, state = line.split(maxsplit=1)
-        if state.startswith('Z'):
-            continue
-        pid = int(raw_pid)
-        try:
-            if os.getsid(pid) == session_id:
-                groups.add(os.getpgid(pid))
-        except ProcessLookupError:
-            pass
-    return groups
+from ci_process_session import terminate_session
 
 
 def terminate_resolution(process: subprocess.Popen) -> None:
-    # Swift's Process creates a new process group for Git children. They remain
-    # in this attempt's private session, even after their parent has exited.
-    for sig, grace in ((signal.SIGTERM, 5), (signal.SIGKILL, 1)):
-        deadline = None
-        while True:
-            process.poll()
-            groups = session_process_groups(process.pid)
-            if not groups:
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired as error:
-                    raise RuntimeError('Dependency launcher has not exited; refusing to retry') from error
-                return
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            for group in groups:
-                try:
-                    os.killpg(group, sig)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    # Darwin may report EPERM for a group emptied since the scan.
-                    if group in session_process_groups(process.pid):
-                        raise
-            if deadline is None:
-                # Inventory can take longer than the kill grace. Start the clock
-                # after signaling, then always inventory again to confirm exit.
-                deadline = time.monotonic() + grace
-            time.sleep(0.05)
-    raise RuntimeError('Dependency attempt still has live processes; refusing to retry')
+    terminate_session(process)
 
 
 def run_resolution(command, *, cwd, check, timeout):
