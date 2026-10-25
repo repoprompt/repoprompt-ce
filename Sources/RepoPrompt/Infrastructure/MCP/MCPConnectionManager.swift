@@ -7894,6 +7894,18 @@ actor ServerNetworkManager {
             connectionLog("softDisconnectConnection: connection \(id) not found")
             return
         }
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("softDisconnectConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("softDisconnectConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
         connectionLog("Soft-disconnecting connection \(id) reason=\(reason.rawValue)")
         #if DEBUG
             debugRecordConnectionEvent("soft_disconnected", connectionID: id, reason: reason.rawValue)
@@ -7905,7 +7917,9 @@ actor ServerNetworkManager {
         )
         persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
         await connection.stop()
-        await removeConnection(id, context: closeContext)
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: true, context: closeContext
+        )
     }
 
     private func currentBootstrapReplacementConnectionID(forSessionToken token: String) -> UUID? {
