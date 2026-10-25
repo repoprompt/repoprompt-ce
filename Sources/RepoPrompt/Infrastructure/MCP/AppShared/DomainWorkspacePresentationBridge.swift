@@ -893,57 +893,83 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
-        // Capture provenance, not manager references, before yielding for CPU work. Cached local
-        // descendants are re-read only after that witness and the authority floors are revalidated.
-        let preparationWitness = manager.catalogPreparationWitness
+        // Canonical bytes belong to this immutable snapshot, not to the manager's local-edit
+        // witness. Keep completed decodes when startup adoption or an edit invalidates a reuse
+        // plan, then qualify the remaining cached rows again after every suspension. Every
+        // nonterminal pass prepares at least one previously unprepared record, so local churn
+        // cannot exhaust the authority refetch budget or cause an unbounded retry loop.
+        var preparedIDs: Set<UUID> = []
         var reusableIDs: Set<UUID> = []
-        var recordsToDecode: [DomainWorkspaceSnapshot] = []
         var failedIDs: Set<UUID> = []
-        for record in records {
-            let workspaceID = record.document.workspaceID
-            if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
-               let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
-               projectedAdoptionGenerations[workspaceID] == generation,
-               projectedModels[workspaceID] != nil,
-               manager.workspace(withID: workspaceID) != nil
-            {
-                reusableIDs.insert(workspaceID)
-            } else {
-                do {
-                    try manager.checkDomainWorkspaceCatalogRecordDecoding(record)
-                    recordsToDecode.append(record)
-                } catch {
-                    failedIDs.insert(workspaceID)
+        var nextModels: [UUID: WorkspaceModel] = [:]
+        while true {
+            guard isCurrentRun(runID) else { return .cancelled }
+            if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) {
+                return rejection
+            }
+            // Point outcomes can advance working/saved revisions without changing catalog
+            // revision. That is real authority supersession, unlike a local edit or adoption
+            // of this same snapshot, and still needs the existing bounded refetch.
+            let preparationWitness = manager.catalogPreparationWitness
+            if records.contains(where: { record in
+                guard let current = preparationWitness.revisions[record.document.workspaceID] else { return false }
+                return record.revisions.workingRevision < current.workingRevision
+                    || record.revisions.savedRevision < current.savedRevision
+            }) {
+                return .superseded
+            }
+            let canReuseCachedModels = cacheIsTrusted
+                && baselineGeneration == manager.domainCatalogReconciliationGeneration
+                && !manager.requiresFullCatalogReconciliation
+            reusableIDs.removeAll(keepingCapacity: true)
+            var recordsToDecode: [DomainWorkspaceSnapshot] = []
+            for record in records where !preparedIDs.contains(record.document.workspaceID) {
+                let workspaceID = record.document.workspaceID
+                if canReuseCachedModels, projectedDigests[workspaceID] == record.document.contentDigest,
+                   let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
+                   projectedAdoptionGenerations[workspaceID] == generation,
+                   projectedModels[workspaceID] != nil,
+                   manager.qualifiedDomainWorkspaceDescendant(record) != nil
+                {
+                    reusableIDs.insert(workspaceID)
+                } else {
+                    preparedIDs.insert(workspaceID)
+                    do {
+                        try manager.checkDomainWorkspaceCatalogRecordDecoding(record)
+                        recordsToDecode.append(record)
+                    } catch {
+                        failedIDs.insert(workspaceID)
+                    }
                 }
             }
-        }
-        var nextModels: [UUID: WorkspaceModel] = [:]
-        if !recordsToDecode.isEmpty {
+            if recordsToDecode.isEmpty {
+                break
+            }
             do {
                 let prepared = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode(recordsToDecode)
                 #if DEBUG
                     await catalogPreparationDidFinishForTesting?(prepared.wasOnMainThread)
                 #endif
                 guard isCurrentRun(runID) else { return .cancelled }
-                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
-                guard manager.catalogPreparationWitness == preparationWitness else {
-                    #if DEBUG
-                        AgentModePerfDiagnostics.increment("workspace.prepare.projectionDiscarded")
-                    #endif
-                    return .superseded
+                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) {
+                    return rejection
                 }
-                nextModels = prepared.models
-                failedIDs.formUnion(prepared.failedIDs)
-                // A point read may have adopted this exact document before this bridge had a cache.
-                // Keep its current local descendant, but only after a successful canonical decode
-                // and the unchanged preparation witness. A failed decode is never rescued here.
-                for record in recordsToDecode where nextModels[record.document.workspaceID] != nil {
-                    if let descendant = manager.qualifiedDomainWorkspaceDescendant(record) {
-                        nextModels[record.document.workspaceID] = descendant
+                #if DEBUG
+                    if manager.catalogPreparationWitness != preparationWitness {
+                        AgentModePerfDiagnostics.increment("workspace.prepare.projectionReplanned")
                     }
-                }
+                #endif
+                nextModels.merge(prepared.models) { _, prepared in prepared }
+                failedIDs.formUnion(prepared.failedIDs)
             } catch {
                 return .cancelled
+            }
+        }
+        // All local descendants are read after the final await. A failed canonical decode is
+        // never rescued by a local row, and no cached overlay survives a changed lineage or fence.
+        for record in records where nextModels[record.document.workspaceID] != nil {
+            if let descendant = manager.qualifiedDomainWorkspaceDescendant(record) {
+                nextModels[record.document.workspaceID] = descendant
             }
         }
         for workspaceID in reusableIDs {
