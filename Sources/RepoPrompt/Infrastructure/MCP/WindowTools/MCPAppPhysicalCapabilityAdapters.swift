@@ -160,10 +160,10 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ metadata: MCPRequestMetadata,
         _ toolName: String
     ) throws -> MCPResolvedTabContextSnapshot
-    typealias UpdateCurrentTabContext = @MainActor @Sendable (
+    typealias UpdateCurrentTabPrompt = @MainActor @Sendable (
         _ toolName: String,
-        _ mutation: (inout MCPTabContextSnapshot) -> Void
-    ) async throws -> Void
+        _ mutation: (inout String) -> Void
+    ) async throws -> String
     typealias SelectedRecordsForCurrentTabContext = @MainActor @Sendable (
         _ metadata: MCPRequestMetadata,
         _ lookupContextOverride: WorkspaceLookupContext?
@@ -415,7 +415,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
         let validateContextBuilderGitArtifactSelection: ValidateContextBuilderGitArtifactSelection
         let resolveTabContextSnapshot: ResolveTabContextSnapshot
-        let updateCurrentTabContext: UpdateCurrentTabContext
+        let updateCurrentTabPrompt: UpdateCurrentTabPrompt
         let selectedRecordsForCurrentTabContext: SelectedRecordsForCurrentTabContext
         let physicalSelectionForCurrentTabContext: PhysicalSelectionForCurrentTabContext
         let resolveSelectedFilesForCodeStructure: ResolveSelectedFilesForCodeStructure

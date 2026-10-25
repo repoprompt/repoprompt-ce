@@ -684,7 +684,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func pushVirtualContextToUI(_ context: MCPTabContextSnapshot) async {
+    func pushVirtualContextToUI(_ context: MCPTabContextSnapshot) async {
         // `commitTabContext` already recounts when it applies the active tab. Avoid a
         // duplicate immediate recount after the heavy file-selector projection.
         await commitTabContext(context)
@@ -3508,7 +3508,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func contextForCurrentRequest(toolName: String) async throws -> (UUID, MCPTabContextSnapshot) {
+    func contextForCurrentRequest(toolName: String) async throws -> (UUID, MCPTabContextSnapshot) {
         guard let connectionID = MCPInvocationContextBridge.current?.connectionID else {
             throw MCPError.invalidParams("No active connection for \(toolName)")
         }
@@ -4419,105 +4419,6 @@ extension MCPServerViewModel {
             MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
         }
         return .restored
-    }
-
-    @MainActor
-    func updateCurrentTabContext(
-        toolName: String,
-        mutation: (inout MCPTabContextSnapshot) -> Void
-    ) async throws {
-        var (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
-        let previousPrompt = context.promptText
-        mutation(&context)
-        if context.promptText != previousPrompt {
-            let (cleanPrompt, taskName) = stripTaskNameTag(from: context.promptText)
-            context.promptText = cleanPrompt
-            if let taskName,
-               !taskName.isEmpty
-            {
-                let sanitized = sanitizeTaskName(taskName)
-                if !sanitized.isEmpty {
-                    renameComposeTabIfDefault(tabID: context.tabID, newName: sanitized)
-                }
-            }
-        }
-        tabContextByConnectionID[connectionID] = context
-        await pushVirtualContextToUI(context)
-    }
-
-    private func stripTaskNameTag(from prompt: String) -> (cleanPrompt: String, taskName: String?) {
-        guard !prompt.isEmpty else {
-            return (prompt, nil)
-        }
-
-        // Pattern supports:
-        // 1. <taskname="value"/> - double-quoted, self-closing
-        // 2. <taskname='value'/> - single-quoted, self-closing
-        // 3. <taskname=value/>   - unquoted, self-closing
-        // 4. <taskname="value">  - double-quoted, not self-closing
-        // 5. <taskname='value'>  - single-quoted, not self-closing
-        // 6. <taskname=value>    - unquoted, not self-closing
-        let pattern = #"^[ \t]*<taskname=(?:"([^"]*)"|'([^']*)'|([^/>]+?))\s*/?>[ \t]*(?:\r?\n)?"#
-        guard let regex = try? NSRegularExpression(
-            pattern: pattern,
-            options: [.caseInsensitive, .anchorsMatchLines]
-        ) else {
-            return (prompt, nil)
-        }
-
-        let fullRange = NSRange(prompt.startIndex ..< prompt.endIndex, in: prompt)
-        let matches = regex.matches(in: prompt, options: [], range: fullRange)
-        guard !matches.isEmpty else {
-            return (prompt, nil)
-        }
-
-        var extractedName: String?
-        if let first = matches.first {
-            // Check capture groups 1-3 (double-quoted, single-quoted, unquoted)
-            for groupIndex in 1 ... 3 {
-                let range = first.range(at: groupIndex)
-                if range.location != NSNotFound,
-                   let nameRange = Range(range, in: prompt)
-                {
-                    let captured = String(prompt[nameRange])
-                    if !captured.isEmpty {
-                        extractedName = captured.trimmingCharacters(in: .whitespacesAndNewlines)
-                        break
-                    }
-                }
-            }
-        }
-
-        // Return original prompt unchanged, just extract the task name
-        return (prompt, extractedName)
-    }
-
-    private func sanitizeTaskName(_ rawName: String) -> String {
-        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-
-        let collapsed = trimmed
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-
-        let filtered = collapsed.filter { $0 != "\n" && $0 != "\r" && $0 != "\t" && !$0.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) }
-        guard !filtered.isEmpty else { return "" }
-
-        let maxLength = 80
-        if filtered.count > maxLength {
-            let end = filtered.index(filtered.startIndex, offsetBy: maxLength)
-            return String(filtered[..<end])
-        }
-        return filtered
-    }
-
-    @MainActor
-    private func renameComposeTabIfDefault(tabID: UUID, newName: String) {
-        guard let tab = workspaceManager?.composeTab(with: tabID),
-              tab.hasDefaultName,
-              tab.name != newName else { return }
-        promptVM.renameComposeTab(tabID, to: newName)
     }
 
     @MainActor
