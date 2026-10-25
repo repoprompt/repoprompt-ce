@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import codecs
 import hashlib
 import json
 import os
 import re
+import math
+import selectors
+import signal
+import time
 import subprocess
 import sys
 import tempfile
@@ -19,6 +24,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 from modularization_ci_artifact import validate as validate_ci_artifact
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, listing_digest, verify_execution
+import ci_process_session as process_session
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
 SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
@@ -764,25 +770,114 @@ def run_module_tests(
         return xctest_status or testing_status
 
 
+def suite_timeout_seconds(environment: Mapping[str, str]) -> float:
+    """Leave time for diagnostics/other suites before the hosted job's 30 minute limit."""
+    raw = environment.get('CI_SUITE_TIMEOUT_SECONDS', '900')
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ValueError('CI_SUITE_TIMEOUT_SECONDS must be finite and in (0, 1200]') from None
+    if not math.isfinite(seconds) or not 0 < seconds <= 1200:
+        raise ValueError('CI_SUITE_TIMEOUT_SECONDS must be finite and in (0, 1200]')
+    return seconds
+
+
 def execute_logged(command, cwd, environment, log_path: Path) -> tuple[int, str]:
-    """Keep full output even on success; never infer execution from a conductor highlight."""
+    """Capture output under a wall deadline, including silent/partial-line hangs.
+
+    Each suite owns a process session. Timeout is a failing attempt (124), never a retry
+    or a success receipt. Descendants cannot keep the output reader alive indefinitely.
+    """
+    seconds = suite_timeout_seconds(environment)  # Reject bad configuration before spawning.
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
+    chunks = []
+    last_started = 'no test case start observed'
+    pending_line = ''
     with log_path.open('a', encoding='utf-8') as log:
+        def emit(text):
+            nonlocal last_started, pending_line
+            chunks.append(text)
+            log.write(text)
+            log.flush()
+            print(text, end='', flush=True)
+            pending_line += text
+            while '\n' in pending_line:
+                line, pending_line = pending_line.split('\n', 1)
+                if 'Test Case ' in line and ' started' in line:
+                    last_started = line
+
         log.write('$ ' + ' '.join(command) + '\n')
+        log.flush()
         try:
             process = subprocess.Popen(list(command), cwd=cwd, env=dict(environment),
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
         except OSError as error:
-            log.write(str(error) + '\n')
-            return 127, str(error)
+            emit(str(error) + '\n')
+            return 127, ''.join(chunks)
         assert process.stdout is not None
-        for line in process.stdout:
-            lines.append(line)
-            log.write(line)
-            log.flush()
-            print(line, end='', flush=True)
-        return process.wait(), ''.join(lines)
+        deadline = time.monotonic() + seconds
+        timed_out = False
+        session_stopped = False
+
+        def stop_session():
+            nonlocal session_stopped
+            if not session_stopped:
+                process_session.terminate_session(process, escalation=((signal.SIGKILL, 1),))
+                session_stopped = True
+
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+        def terminate_runner(signum, _frame):
+            # SIGTERM's default action bypasses finally; unwind to kill the detached suite.
+            raise SystemExit(128 + signum)
+
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        try:
+            signal.signal(signal.SIGTERM, terminate_runner)
+            with process.stdout, selectors.DefaultSelector() as selector:
+                os.set_blocking(process.stdout.fileno(), False)
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map() or process.poll() is None:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        if not timed_out:
+                            emit(f'\n::error::Suite {command!r} exceeded {seconds:g}s; '
+                                 f'last started: {last_started}\n')
+                            timed_out = True
+                            process_session.signal_session(process.pid, signal.SIGTERM)
+                            deadline = time.monotonic() + 5
+                        else:
+                            stop_session()
+                            break
+                    for key, _ in selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
+                        data = os.read(key.fd, 65536)
+                        if data:
+                            emit(decoder.decode(data))
+                        else:
+                            selector.unregister(key.fileobj)
+                if timed_out:
+                    # Also kill descendants which closed stdout or survived their leader.
+                    stop_session()
+                    # Drain only bytes already available; never wait on a surviving pipe owner.
+                    for _ in range(16):
+                        try:
+                            data = os.read(process.stdout.fileno(), 65536)
+                        except BlockingIOError:
+                            break
+                        if not data:
+                            break
+                        emit(decoder.decode(data))
+                emit(decoder.decode(b'', final=True))
+            status = process.wait(timeout=5)
+            return (124 if timed_out else status), ''.join(chunks)
+        finally:
+            try:
+                with process_session.defer_cancellation_during_cleanup():
+                    stop_session()
+                    process.wait(timeout=5)
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def run_selected_suites(

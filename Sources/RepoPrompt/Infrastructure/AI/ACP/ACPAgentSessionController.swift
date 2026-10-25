@@ -249,11 +249,6 @@ actor ACPAgentSessionController {
         let name: String?
     }
 
-    private struct AutoApprovalSelection {
-        let optionID: String
-        let match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch
-    }
-
     private enum PermissionOptionPreference {
         case optionID(String)
         case kind(String)
@@ -337,7 +332,9 @@ actor ACPAgentSessionController {
     private var nextRequestID = 1
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
+    // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var permissionStorageKeyByApprovalID: [String: String] = [:]
     private var recentDevinToolCalls: [String: [String: Any]] = [:]
     private var recentDevinToolCallIDs: [String] = []
     private var activePromptTurnID: UUID?
@@ -1507,7 +1504,9 @@ actor ACPAgentSessionController {
         decision: AgentApprovalDecision,
         authorize: @MainActor @Sendable () async -> Bool
     ) async -> OverseerPermissionResponseResult {
-        guard let initial = pendingPermissionRequests[id] else { return .notSubmitted }
+        guard let storageKey = permissionStorageKeyByApprovalID[id],
+              let initial = pendingPermissionRequests[storageKey]
+        else { return .notSubmitted }
         let options = initial.options.map { (optionID: $0.optionID, kind: $0.kind) }
         let selectedOptionID: String?
         switch decision {
@@ -1524,7 +1523,11 @@ actor ACPAgentSessionController {
         case .acceptForSession, .acceptWithExecpolicyAmendment:
             return .noOneTimeOption
         }
-        guard await authorize(), let pending = pendingPermissionRequests[id] else { return .notSubmitted }
+        guard await authorize(),
+              permissionStorageKeyByApprovalID[id] == storageKey,
+              let pending = pendingPermissionRequests[storageKey],
+              pending.request.id == initial.request.id
+        else { return .notSubmitted }
         do {
             if let selectedOptionID {
                 try sendPermissionSelectionResponse(id: pending.rpcID, optionID: selectedOptionID)
@@ -1535,7 +1538,7 @@ actor ACPAgentSessionController {
                     "result": ["outcome": ["outcome": "cancelled"]]
                 ])
             }
-            pendingPermissionRequests.removeValue(forKey: id)
+            removePendingPermissionRequest(approvalID: id)
             return .submitted
         } catch {
             log("Failed to submit Overseer ACP permission response: \(error.localizedDescription)")
@@ -1543,11 +1546,32 @@ actor ACPAgentSessionController {
         }
     }
 
+    /// Applying full access to an already surfaced prompt uses the same per-request
+    /// policy as a new request. Ineligible prompts remain available for manual approval.
+    @discardableResult
+    func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
+        guard state == .promptRunning,
+              let storageKey = permissionStorageKeyByApprovalID[id],
+              let pending = pendingPermissionRequests[storageKey],
+              let optionID = fullAccessAutoApprovalOptionID(for: pending.options)
+        else { return false }
+        // No suspension between checking the current flag/request and sending: the
+        // actor owns both, so preference changes and cancellation cannot interleave.
+        do {
+            try sendPermissionSelectionResponse(id: pending.rpcID, optionID: optionID)
+            removePendingPermissionRequest(approvalID: id)
+            return true
+        } catch {
+            log("Failed to apply full access to pending ACP permission request: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func respondToPermissionRequest(
         id: String,
         decision: AgentApprovalDecision
     ) async {
-        guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
+        guard let pending = removePendingPermissionRequest(approvalID: id) else {
             return
         }
         let result: [String: Any] = switch decision {
@@ -1684,9 +1708,16 @@ actor ACPAgentSessionController {
         ])
     }
 
+    @discardableResult
+    private func removePendingPermissionRequest(approvalID: String) -> PendingPermissionRequest? {
+        guard let storageKey = permissionStorageKeyByApprovalID.removeValue(forKey: approvalID) else { return nil }
+        return pendingPermissionRequests.removeValue(forKey: storageKey)
+    }
+
     private func cancelPendingPermissionRequestsLocally() {
         let pending = pendingPermissionRequests.values
         pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
         for request in pending {
             do {
                 try sendJSONLine([
@@ -2181,6 +2212,17 @@ actor ACPAgentSessionController {
     }
 
     private func handlePermissionRequest(id: JSONRPCID, params: [String: Any]) {
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        default:
+            break
+        }
+        // A duplicate live wire ID is ambiguous even if it would be auto-approved.
+        guard pendingPermissionRequests[id.storageKey] == nil else {
+            handleProtocolViolation("Duplicate active ACP permission request ID")
+            return
+        }
         guard
             let sessionID = params["sessionId"] as? String,
             let toolCall = params["toolCall"] as? [String: Any]
@@ -2192,12 +2234,8 @@ actor ACPAgentSessionController {
         let cachedToolCall = recentDevinToolCalls[toolCallID] ?? [:]
         var resolvedToolCall = cachedToolCall
         resolvedToolCall.merge(toolCall) { _, requestValue in requestValue }
-        // The cached tool call is the authorization context auto-approval matches on
-        // (`_meta` RepoPrompt identity, `rawInput` server identifier). Trust it only
-        // when the request does not contradict it: a same-ID request that supplies its
-        // own identity fields must not inherit ANY of the earlier call's authorization
-        // evidence unless every supplied field is corroborated by the cache, so the
-        // whole cached entry is discarded on divergence or partial corroboration.
+        // Cached tool-call fields are presentation context, never approval authority.
+        // Discard them when the permission request supplies contradictory details.
         let identityKeys = ["title", "kind", "rawInput", "_meta"]
         let requestSuppliesIdentity = identityKeys.contains { toolCall[$0] != nil }
         let identityDiverges = identityKeys.contains { key in
@@ -2224,12 +2262,6 @@ actor ACPAgentSessionController {
             )
         }
 
-        let autoApprovalPayload = repoPromptPermissionAutoApprovalPayload(
-            toolTitle: toolTitle,
-            toolKind: toolKind,
-            toolCall: resolvedToolCall,
-            options: optionDictionaries
-        )
         let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
         let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
         let sessionApprovalScope: AgentApprovalSessionScope? = if provider.providerID == .grokBuild {
@@ -2238,8 +2270,9 @@ actor ACPAgentSessionController {
         } else {
             nil
         }
+        let approvalID = UUID().uuidString
         let request = AgentApprovalRequest(
-            requestID: .acp(id.displayValue),
+            requestID: .acp(approvalID),
             method: "session/request_permission",
             kind: approvalKind(for: toolKind),
             threadID: sessionID,
@@ -2265,24 +2298,10 @@ actor ACPAgentSessionController {
             )
         )
 
-        let devinAttestedToolName = provider.providerID == .devin
-            ? (resolvedToolCall["_meta"] as? [String: Any])?["cognition.ai/toolName"] as? String
-            : nil
-        if let autoApproval = autoApprovalSelection(
-            requestToolName: devinAttestedToolName ?? toolTitle,
-            requestToolNameIsProviderAttested: devinAttestedToolName != nil,
-            requestPayload: autoApprovalPayload,
-            options: options
-        ) {
-            do {
-                try sendPermissionSelectionResponse(id: id, optionID: autoApproval.optionID)
-                log("Auto-approved ACP permission request for \(toolTitle ?? toolCallID) via option \(autoApproval.optionID) matchSource=\(autoApproval.match.source.rawValue) normalizedTool=\(autoApproval.match.normalizedToolName ?? "nil") serverIdentifier=\(autoApproval.match.serverIdentifier ?? "nil")")
-                return
-            } catch {
-                log("Failed to auto-approve ACP permission request for \(toolTitle ?? toolCallID): \(error.localizedDescription)")
-            }
-        }
-
+        // Supported ACP contracts do not authenticate tool metadata as an invocation
+        // of our injected RepoPrompt server. Names, titles, arguments, and `_meta`
+        // (including Devin's cognition.ai/toolName) therefore require manual approval.
+        // Only the user's explicit full-access setting can select automatically below.
         if let fullAccessOptionID = fullAccessAutoApprovalOptionID(for: options) {
             do {
                 try sendPermissionSelectionResponse(id: id, optionID: fullAccessOptionID)
@@ -2293,11 +2312,12 @@ actor ACPAgentSessionController {
             }
         }
 
-        pendingPermissionRequests[id.displayValue] = PendingPermissionRequest(
+        pendingPermissionRequests[id.storageKey] = PendingPermissionRequest(
             rpcID: id,
             options: options,
             request: request
         )
+        permissionStorageKeyByApprovalID[approvalID] = id.storageKey
         emit(.approvalRequested(request))
     }
 
@@ -2525,6 +2545,12 @@ actor ACPAgentSessionController {
     }
 
     private func failPendingRequests(with error: Error) {
+        let permissions = pendingPermissionRequests.values
+        pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
+        for permission in permissions {
+            emit(.approvalCancelled(permission.request.requestID))
+        }
         let pending = pendingRequests.values
         pendingRequests.removeAll()
         for pendingRequest in pending {
@@ -4064,7 +4090,10 @@ actor ACPAgentSessionController {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
         case .cursor:
-            return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
+            // Full access auto-approves each request once; it must not persist a grant.
+            return ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
+            )
         case .openCode, .grokBuild, .antigravity, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`) and
             // Devin's is a launch-time `--permission-mode`; the controller never
@@ -4091,49 +4120,6 @@ actor ACPAgentSessionController {
         ]
     }
 
-    private func autoApprovalSelection(
-        requestToolName: String?,
-        requestToolNameIsProviderAttested: Bool,
-        requestPayload: [String: Any],
-        options: [PermissionOption]
-    ) -> AutoApprovalSelection? {
-        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ), isStrictACPRepoPromptPermissionMatch(
-            match,
-            requestToolName: requestToolName,
-            requestToolNameIsProviderAttested: requestToolNameIsProviderAttested,
-            requestPayload: requestPayload
-        )
-        else {
-            return nil
-        }
-
-        let selectedOptionID: String? = switch provider.providerID {
-        case .grokBuild:
-            // Strict RepoPrompt MCP auto-approval must remain genuinely one-time,
-            // even when Grok mislabels a broader option's ID or kind.
-            preferredAllowOptionID(for: options, sessionScoped: false)
-        case .devin:
-            safePermissionOptionsForAutoSelection(options).first(where: { $0.optionID == "allow_once" })?.optionID
-        case .openCode, .cursor, .antigravity:
-            optionID(
-                for: safePermissionOptionsForAutoSelection(options),
-                preferences: [
-                    .optionID("always"),
-                    .optionID("allow_always"),
-                    .kind("allow_always"),
-                    .optionID("once"),
-                    .optionID("allow_once"),
-                    .kind("allow_once")
-                ]
-            )
-        }
-        guard let selectedOptionID else { return nil }
-        return AutoApprovalSelection(optionID: selectedOptionID, match: match)
-    }
-
     /// Options that must never be picked by an automatic or fallback selection path.
     /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
     /// bare kind match would select it — it is excluded by explicit ID before any matching.
@@ -4141,75 +4127,6 @@ actor ACPAgentSessionController {
         options.filter { option in
             ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
         }
-    }
-
-    /// ACP permission requests carry no provider-attested MCP server identity for most hosts, so
-    /// RepoPrompt provenance is accepted only from (in order of trust):
-    /// - a host-supplied RepoPrompt server field;
-    /// - a provider-attested invocation name (Devin `cognition.ai/toolName`);
-    /// - a RepoPrompt-prefixed title/name, but only when the host classifies the call as an MCP-style
-    ///   `other` operation (or gives no kind). Hosts derive titles for built-in kinds such as `edit`,
-    ///   `read`, or `execute` from file paths and commands, so a title like `mcp__RepoPromptCE__git`
-    ///   on an `edit` request is argument-controlled text, not identity (#1243).
-    ///
-    /// Known residual: an `other`/unclassified request from a foreign MCP tool whose host title
-    /// spells a RepoPrompt-prefixed name still matches, because most ACP hosts provide no attested
-    /// server identity. Failing closed there would force manual approval of every RepoPrompt call
-    /// on OpenCode, Cursor, and Antigravity, so title fallback is kept intentionally.
-    private func isStrictACPRepoPromptPermissionMatch(
-        _ match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch,
-        requestToolName: String?,
-        requestToolNameIsProviderAttested: Bool,
-        requestPayload: [String: Any]
-    ) -> Bool {
-        if MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil {
-            return true
-        }
-        switch match.source {
-        case .serverIdentifier:
-            // A display label alone (e.g. `git (RepoPromptCE MCP Server)`) never suffices.
-            return false
-        case .topLevelToolName:
-            guard let requestToolName, MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(requestToolName) else {
-                return false
-            }
-            return requestToolNameIsProviderAttested || Self.acpKindAllowsTitleDerivedIdentity(requestPayload)
-        case .nestedToolName:
-            return MCPIntegrationHelper.repoPromptPermissionContainsServerPrefixedToolName(in: requestPayload)
-                && Self.acpKindAllowsTitleDerivedIdentity(requestPayload)
-        }
-    }
-
-    private static func acpKindAllowsTitleDerivedIdentity(_ requestPayload: [String: Any]) -> Bool {
-        guard let kind = (requestPayload["kind"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !kind.isEmpty
-        else {
-            return true
-        }
-        return kind == "other"
-    }
-
-    private func repoPromptPermissionAutoApprovalPayload(
-        toolTitle: String?,
-        toolKind: String?,
-        toolCall: [String: Any],
-        options: [[String: Any]]
-    ) -> [String: Any] {
-        var payload: [String: Any] = [
-            "toolCall": toolCall,
-            "options": options
-        ]
-        if let toolTitle, !toolTitle.isEmpty {
-            payload["title"] = toolTitle
-        }
-        if let toolKind, !toolKind.isEmpty {
-            payload["kind"] = toolKind
-        }
-        // `rawInput` is the tool's model-controlled arguments; it is deliberately not merged into
-        // the auto-approval payload so arguments can never supply RepoPrompt provenance (#1243).
-        return payload
     }
 
     private func serializeJSON(_ value: Any?) -> String? {
