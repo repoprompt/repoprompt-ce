@@ -1,4 +1,5 @@
 import RepoPromptSettingsCore
+import RepoPromptShared
 
 //
 //  WindowStateManager.swift
@@ -129,8 +130,7 @@ enum WindowSessionStore {
     static func sessionFileURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
         return base.appendingPathComponent("windowSessions.json")
     }
 }
@@ -177,6 +177,8 @@ actor WindowSessionDiskWriter {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         do {
+            try AppProfileLocations.current.validateMetadataFile(fileURL)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try encoder.encode(snapshot)
             try data.write(to: fileURL, options: .atomic)
         } catch {

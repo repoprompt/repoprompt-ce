@@ -8,7 +8,8 @@ observer — an **Auto-wake** — so the model learns about it without its user 
 This document covers the parts that are easy to break because their invariants are enforced in one
 file and depended on in another. For the tool contract a model sees, read the `agent_session_link`
 definition in `MCPDomainCanonicalToolDefinitions.swift`; for the guidance the model is taught, read
-`AgentSessionLinkPrompts.swift`.
+`AgentSessionLinkPrompts.swift`. For choosing child versus managed-lane control, binding recovery,
+exact prompt decisions, and validation receipts, see [Agent orchestration guidance](agent-orchestration-guidance.md).
 
 ## One request, one exact-target approval
 
@@ -76,6 +77,56 @@ immediately when that specific scope ends, including during asynchronous cleanup
 Valid committed scope/link rows restore normally. Failed continuity writes retain their existing
 honest pending/failed receipts; this flow does not strengthen a failed write into crash durability.
 
+## Delegation scope ending evidence
+
+Scope endings are app-owned diagnostic facts, not another authority. `scope_status` includes an
+`ending` object for known ended grants: `reason`, optional `at`, `initiator`, optional
+`actor_session_id`, `originating_scope_id`, and `originating_session_id`. Reasons are
+`user_revoked`, `grantee_released`, `session_deleted`, `expired`, `full_access_disabled`,
+`full_access_reconciled`, and `historical_unknown`. Explicit settings changes differ from a lazy
+full-access reconciliation. A cascade keeps its initiating scope/session, not an invented child actor.
+MCP actor/deleted-session identifiers are disclosed only when they identify the caller's grantee;
+the user-facing monitor resolves session display names instead of presenting raw UUIDs.
+`at` is when the owning transition was materialized, including recovery after an offline expiry;
+the grant's `expires_at` remains the scheduled deadline. Historical tombstones lacking evidence
+report an unknown initiator and no fabricated time. Existing history cannot explain the original
+unexpected ending retroactively.
+
+Ending evidence and the irreversible terminal identity share a continuity transaction. The first
+ending wins across later release/revoke calls, ancestor cascades, and operation retries. A terminal
+row wraps its original grant bytes for diagnostic status after restart; it is never reactivated.
+Old readers already ignore terminal payloads, and live grant payloads/schema are unchanged.
+Descendants known only to storage are terminalized in the same recursive transaction and inherit
+the initiating evidence. Explicit child transitions are written deepest-first to preserve their
+own evidence before an ancestor cascade. Session deletion also covers unloaded grants with the
+runtime's exact evidence, including its injected clock, typed `deletion_origin` (`user_ui`,
+`agent_cleanup`, `mcp_client`, `automatic_discard`, or `unknown`), and `file_removed` when known.
+Unspecified callers default to `unknown`, never the user. Real UI deletion commands explicitly set
+`user_ui`; MCP `close_tab` and external `cleanup_sessions` set `mcp_client`, retaining a routed agent
+caller when proven. `initiator` is `agent` for a proven routed caller, `mcp_client` for an external
+client, and `unknown` when provenance is absent. Legacy `compose_tab_batch` evidence identifies a
+mechanism, not a human actor, and now reports an unknown initiator. Keyboard close currently stashes
+rather than deletes a chat, so it does not produce a deletion ending.
+Already-absent files still commit a deletion fence; `file_removed: false` distinguishes that path.
+Agent cleanup retains its routed caller ID internally. Malformed optional evidence falls back to a
+plain deny tombstone rather than blocking the durable revocation queue.
+
+The monitor and per-grantee MCP history expose the latest 16 endings (dated entries first, UUID
+ascending as a deterministic tie-break). The runtime caches the per-grantee projection rather than
+decoding all history on every status/render. Only this 16-item projection is bounded: the backing
+`scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
+Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
+children) still record no ending evidence. Passive expiry projection can also hide a grant before
+lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+`record(id:)` remains authority-only; only status uses
+`statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
+scope UUID does not authorize reading its historical details. Scope status also reports continuity
+save state: a failed write still denies authority immediately in this process but must not claim
+that either the ending evidence or denial survived a crash. Shutdown itself is not revocation;
+compatible saved grants can restore. Mixed-profile legacy descriptions remain preserved for
+explicit user review rather than being represented as revoked grants. Guardrail admission or
+membership-proof failure refuses the operation and does not itself end its scope.
+
 ## Four owners, deliberately disjoint
 
 Nothing here has a single god object. Confusing these four is the most common way to introduce a
@@ -89,6 +140,14 @@ defect in this subsystem.
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
+
+`wait` accepts returned `wait_cursor` strings directly in `cursors`, without a separate session ID
+list. Existing `{session_id, cursor}` records remain valid and may be mixed with strings. The link
+authority resolves each opaque string only within the current caller's exact outbound grants;
+the string supplies no authority. The normal capability, lease, consent, and cursor-generation
+checks still apply. Unknown, expired, or foreign handles cannot select another caller's target.
+Explicit `session_id` and `session_ids` calls remain supported, and supplied cursor targets must
+agree with that selection.
 
 ## Passive retained user-input excerpts
 
@@ -276,10 +335,70 @@ the user's card.
 - **Leases are re-checked after every suspension** before the next mutation; a revocation that
   lands mid-batch stops the remaining items (`scope_revoked`). An unlink re-checks the lease and
   both endpoints' membership right before the bridge's Stop. Worktree binds and unbinds re-check the
-  lease and the target's membership right before the binding transition and again at its
-  `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
-  and provider-context invalidation after that fence, before it publishes.
+  lease and the target's membership throughout the binding transition, after recovery handoff,
+  provider-context invalidation, and root installation. `manage_worktree` retains the exact Manage
+  link generation and endpoint incarnations, and synchronously fences retirement and binding
+  assignment against revocation. The fence covers only the authority mutation, not settings writes
+  or UI publication. A refusal keeps the old binding; before retirement it restores the original
+  handoff, and after retirement it retains the restart handoff with a visible recovery note.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
+
+### Authorization ownership: Overseer full access versus restricted delegation
+
+`OverseerAuthorizationEngine` (`Runtime/Delegation/OverseerAuthorizationEngine*.swift`, one per
+`DelegationScopeRuntime`) is the single decision owner. It alone reads the master setting (the
+runtime's `isGlobalAutoApproveEnabled` input; production is the stored user setting) and never infers
+authority from arguments, prompt text, or the existence of a recorded grant. Callers resolve exact
+routing and execute what the engine admits.
+
+Every gate is typed and classified in `OverseerAuthorizationGate`:
+
+| Class | Gates | Full access |
+| --- | --- | --- |
+| Permission | `scopeCoverage`, `scopeCapability`, `allSessionsCapabilityCeiling`, `scopeMembership`, `confirmationRequirement`, `sessionQuota` (incl. `maxDepth`), `worktreeQuota`, `creatorPlacementForAccounting`, `scopeAnchorMoveRestriction`, `otherScopeMembershipMove`, `restrictedScopeNarrowing`, `creatorLaneQuota` (12 lanes per creator), `directChildOrCreatorOwnership`, `humanOnlyForAgent`, `linkRequired`, `observerMustBeCaller`, `linkCapabilityCeiling` | Waived |
+| Integrity | `callerIdentityAndRoute`, `targetExistence`, `selfTargetRule`, `explicitScopeInput` (unknown or another session's scope), `presentedConfirmationInput`, `canonicalMutationOwner` (one exact writer for the changed state), `organizationalStructure` (cycles, unresolvable/incomparable ancestry), `argumentsAndSelectors`, `idempotencyAndSingleApplication`, `transportIncarnation`, `operationalCapacity` (bounded in-flight tasks, ledgers, queues), `lifecycleAndCancellation`, `persistenceOutcome` | Enforced |
+
+Engine families: administration (`authorizeAdministration`: implicit full-access grant, explicit-scope
+pass then full-access fallback, independent card validation and single claim), creation
+(`+Creation`: guardrail scopes, joining counts, reservations, stamps, lane moves), execution
+checkpoints (`+Execution`: `checkpointTarget`, `permitsMember` vs the `isPlacedMember` placement
+fact, capability and link-ceiling checks, adoption/binding/depth quotas, reparent/adopt placement),
+and targets/links (`+Targets`: operation authorizer, worktree binding, cleanup, child-link
+eligibility, lane link requirement, catalog surface, full-access link source).
+
+Rules that keep it honest:
+
+- Agreeing workspace presentations remain replicated. Model, effort and worktree changes may use
+  their one independently proven bound payload owner without opening the target tab. Every bound
+  runtime counts, including a second one still loading; the selected owner must have current
+  metadata and restoration identity. Hosts pin that object and identity through preparation.
+  Presentation and organizational mutations retain their separate writer requirements.
+- A fully authorized group order, model or effort request that already matches current state
+  completes with `result: applied`, `state_satisfied: true`, and `changed_count: 0`. It is not a
+  refusal or a fabricated write. Failed, skipped, incomplete or control-blocked batches cannot
+  claim this result, and unchanged requests recheck current authority and expected-order input.
+- An explicit restricted `scope_id` the caller owns (live, revoked, or expired) never narrows full
+  access. A fully admitting live scope keeps its placement; otherwise the full-access grant authorizes
+  and is the placement, so no recovery call is needed. Unknown and foreign scope IDs stay
+  identity/input refusals that disclose nothing. A presented card is validated against the scope it
+  was issued for and claimed once.
+- Placement facts are never gates. Adoption stamps a scope consistent with placement; under full
+  access it stamps the full-access grant for a destination outside the admitted scope rather than
+  refusing.
+- Under full access a missing link is established through the delegated durable Add, sourced from
+  the full-access grant, so turning full access off revokes it with the grant. Existing user links
+  are never removed, downgraded, or upgraded.
+- A stored link capability is not a ceiling under full access. The engine issues revocable
+  `DomainAgentSessionLinkCapabilityElevation` evidence for the observer; the link authority reads it
+  at every fence (authorize, lease validation, managed disclosure, management send commit) and never
+  infers full access from grants or settings itself. The stored link is never upgraded. Every
+  restricted-mode engine evaluation revokes all elevations, and the setting's only writer (the
+  Settings toggle) reconciles on off, so an in-flight management lease fails its next fence.
+- `Scripts/overseer_authorization_guardrails.py` (self-tested, run by `make guardrails`) rejects raw
+  setting reads, the restricted scope authority, operation authorizer, placement/link/quota
+  algorithms, and gate consultations outside the engine files (`overseer_authorization_manifest.tsv`
+  is empty by design). `OverseerAuthorizationEngineTests` pins the classification and requires an
+  effect-level ON/OFF scenario for every permission gate.
 
 Scope/link/worktree continuity is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent). Persistence records user
@@ -318,6 +437,20 @@ the next pass reclassifies first. Only committed deletion removes the durable ro
 classifications end this launch's attempt without erasing continuity. An exhausted budget likewise
 leaves the intent dormant for the next launch.
 
+A waiting, not active, launch entry blocked by duplicate window incarnations stays waiting, including
+an exact close-parked entry rearmed by the existing close policy. Existing candidate/topology events
+reconsider it once both endpoints are unique, through the same readiness, hydration-proof and
+authorization fences; no timer or new grant path is involved. A transient, identifier-free notice
+explains the duplicate-window wait and clears when no waiting entry is blocked by duplicates.
+The notice is edge-triggered: Dismiss stays dismissed until the duplicate-blocked condition clears
+and returns. Transient incomplete-discovery and dirty-pass exits retain the last completed census,
+so they cannot remove/re-add the notice or reorder warnings. Lasting barriers (restoration not
+admitted, including dormant restoration, not ready, or frozen) clear the condition. A notice evicted
+by five other concurrent warnings is not republished until the condition clears and returns.
+This does not rearm an entry terminalized by a late-duplicate audit or an uncaptured lifecycle
+revocation. Terminal restoration warnings distinguish retained intent from removal for committed
+session deletion; a token-mismatched cleanup never claims removal.
+
 **Committed continuity survives restart or crash.** Scope, link-intent, and worktree transitions
 write affected SQLite rows and receipts atomically; no clean-shutdown marker or final snapshot is
 required. Live decisions and save acknowledgements are separate: pending/failed writes are not
@@ -339,6 +472,22 @@ bidirectional MainActor mapping fence. Controller/configuration/attempt ownershi
 acquisition and cancelled-before-dispatch tombstones remain independent hard gates. A real route
 failure still refuses or uses the existing bounded route recovery. Unknown, absent or stale tool names
 are not route failures and never trigger send-time controller recycling.
+
+The one permitted wait is on the route token itself, and only for a Claude controller the same send
+just launched (a fresh start after an app restart, or a recovery replacement): its `repoprompt-mcp`
+child may not yet have connected, passed the PID gate and admission, and committed the run mapping.
+`ServerNetworkManager.awaitAuthoritativeRunCatalogRouteToken` re-runs the strict token query, waking
+on a per-run route-change pulse (route commit, run mapping, cleanup/revoke) with a short poll as
+backstop; it never consults catalogs or the weaker `MCPRoutingWaiter` routed flag. The wait is bounded
+(about 10 s per controller, 15 s per send), abandoned as soon as the send's intent or controller
+ownership is lost, and a timed-out wait recycles at most once. A reused controller with a missing
+route still recycles immediately, and steering still fails closed with no wait and no recycle. Every
+route-recovery recycle re-arms the run's one-shot admission policy through the run's bootstrap lease
+(`MCPBootstrapLease.reinstallPolicyForReplacementProcess`), because the retired process's child
+consumed the original. When an initial run send is still refused (`[route:*]`, nothing dispatched),
+only the exact user row identified by its submission producer is withdrawn and its text restored to an
+empty composer, as Codex already does. Rowless Auto-wake and maintenance starts never infer a rollback
+row from transcript history, even if the last historical user row is unanswered.
 
 Prompt carry and wake admission read exact published membership and the claim epoch, not catalog
 freshness. Required rendered content, current authority, budget and provider acceptance still own
@@ -677,6 +826,10 @@ endpoints, the workspace, and admission synchronously; a run that settled during
 refused as `target_busy` rather than started from a deferred path.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
+ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
+response fails after the write (including Stop shutting down the transport), the batch is not
+restored or requeued, its transcript rows remain, and managed sinks settle as unconfirmed. A write
+alone is not proof of provider acceptance or successful completion.
 
 The provider sees a RepoPrompt-authored envelope with `delegation="user_delegated_management"`:
 direction from the user's delegated overseer, to be followed within the session's workspace and

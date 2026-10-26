@@ -53,7 +53,7 @@ Sources/
   RepoPromptProviderQuota/    # account quota values, injected acquisition coordination, cached consumer signals; no concrete IO
   RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
-  RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
+  RepoPromptWorkspaceCore/      # internal Foundation + Swift System workspace path values and deterministic policies
   RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
@@ -99,7 +99,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 ## Placement rules for new files
 
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
-- Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
+- Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket. Its only package dependency is the existing pinned Swift System `SystemPackage` product for native path representation; imports are restricted to Foundation and SystemPackage.
 - AppKit-free MCP runtime identity/lifecycle configuration, canonical tool names, capability/admission/client classification, normalized schema fingerprints, Sendable tool definitions/bindings, the actor registry, workspace/context document and journal persistence, revision/CAS/event publication, connection/context routing, and run-launch-token authority belong under `Sources/RepoPromptDomainRuntime`; owner tests belong under `Tests/RepoPromptDomainRuntimeTests`. Application-scoped app-settings and routing registration is process-lifetime composition owned: AppDelegate startup explicitly registers canonical bindings and starts transport independently of window count, while catalog readiness only observes the canonical registry with a bounded fail-closed wait. App-side window and active-context values are presentation affinity, never domain identity or mutation authority. `RepoPromptDomainRuntime` must contain no `@MainActor`, AppKit, SwiftUI, Combine, window, or view-model dependency.
 - Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Tests/RepoPromptCodeMapCoreTests`.
 - Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. CodeMap artifact CAS/catalog/manifests/leases and durable artifact storage live in `RepoPromptPersistence`; app source/capability convenience adapters validate authority before handing persistence neutral values. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
@@ -139,7 +139,7 @@ Exceptions must be explicit, narrow, and documented here before they become prec
 These files are intentionally compiled as app-integrated diagnostics and live under `Sources/RepoPrompt/Features/Diagnostics`:
 
 - `Features/Diagnostics/Benchmark`: the Settings-visible Repo Bench surface, including benchmark core, settings UI/view model, run store, reporting, and local rankings. If Repo Bench needs a headless/CI runner, create a separate executable-target plan rather than hiding target churn in this layout cleanup.
-- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics.
+- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics. Release admission timing is owned by the workspace runtime as documented below; this does not enable the DEBUG-only instrumentation in release.
 - `Features/Diagnostics/AgentMode/Stress`: debug-only Agent chat stress launch configuration, harness, overlay panel, and stress support extensions on `AgentModeViewModel`, launched with `-RP_AGENT_CHAT_STRESS` and `RP_AGENT_STRESS_*` environment variables.
 - `Features/Diagnostics/MCP`: hidden DEBUG MCP diagnostics, transport diagnostics, Sparkle diagnostics, and memory sampling exposed through `__repoprompt_debug_diagnostics` / legacy debug transport tools.
 - `Features/Diagnostics/Prompt`: DEBUG prompt/token recount event forwarding, selection signatures, and selected-path watchdog state surfaced through restore performance diagnostics.
@@ -147,6 +147,10 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `Features/Diagnostics/App`: app-wide font-scale metrics, workspace/window restore performance logging, and DEBUG root-load trace correlation (`WorkspaceRootLoadDiagnostics`) surfaced through restore/workspace loading diagnostics.
 
 ### Documented wiring exceptions outside Diagnostics
+
+- `Features/Workspaces/Runtime/WorkspaceAgentAdmissionTiming.swift` intentionally ships in release beside `WorkspaceAgentAdmissionCoordinator`: it is per-admission runtime bookkeeping, not a DEBUG harness. Admission callers must not depend upward on the Diagnostics feature. `WorkspaceManagerViewModel.withAgentSessionAdmission` is its automatic entry point, emitting `event=agentAdmission.slow` in the `WorkspaceAgentAdmission` OSLog category on scope exit at five seconds or more. Fresh/existing tab admission explicitly propagates its recorder; retained recovery and discard have distinct kinds. See [diagnostic fields and interpretation](../testing.md#agent-admission-slow-phase-diagnostics). This narrow placement exception does not move other app-integrated diagnostic harnesses out of Diagnostics.
+
+- `App/SessionAdminWindowsHosts.swift` owns the concrete session-administration adapters over open windows, saved-session preparation, and target-owned workspace/worktree routing. The feature retains its host protocols and operation handlers; the app-level adapters compose them with `WindowStatesManager`, `WindowState`, and the UI view models. Keep these concrete window dependencies out of feature service implementations.
 
 - `Features/AgentMode/Services/BecomeOverseerMCPToolService.swift` owns the targeted activation → approval → saved-session/link/task product flow. Its MCP adapter in `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` wires this feature service; keeping the flow in Infrastructure would invert its dependencies on Agent Mode's runtime and message digest. This is a narrow composition exception, not a placement rule for other transport-only MCP services.
 

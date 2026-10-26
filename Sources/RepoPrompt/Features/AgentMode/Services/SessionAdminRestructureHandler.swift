@@ -83,7 +83,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                     descendantsByAdoptee: descendantsByAdoptee,
                     runningSessionIDs: Set(items.map(\.sessionID).filter { context.projector.targetState(for: $0) == .running }),
                     memberDescendants: Set(descendantsByAdoptee.values.joined().filter {
-                        context.isMember($0, ofChainFrom: scope)
+                        context.isPlacedMember($0, ofChainFrom: scope)
                     })
                 ),
                 granteeSessionID: grantee,
@@ -113,18 +113,19 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             try SessionAdminArguments.requireOnly(["observer_session_id"], in: args, op: "link")
             // A scope only mints links its own grantee observes; links between two other members are
             // the user's to create (links are durable and outlive the scope).
-            if let caller = batch.request.caller.agentSessionID, try observer(of: batch) != caller {
+            if context.scopes.authorization.requiresScopeLinksObservedByCaller,
+               let caller = batch.request.caller.agentSessionID, try observer(of: batch) != caller
+            {
                 return SessionAdminReply.refused(
                     code: "observer_must_be_caller",
                     detail: "Under a delegation scope you can only create links you observe yourself; omit observer_session_id."
                 )
             }
             try context.requireMember(observer(of: batch), of: batch)
-            let minted = host.mintedLinkCapabilities
-            for record in context.scopeChain(of: batch.scope) {
-                if let missing = DomainDelegationScopeLinkPolicy.missingCapability(linkCapabilities: minted, grant: record.grant) {
-                    return try SessionAdminMCPToolService.deniedValue(.capabilityMissing(missing), sessionID: nil)
-                }
+            if let missing = context.scopes.authorization.linkCeilingMissingCapability(
+                minted: host.mintedLinkCapabilities, scope: batch.scope
+            ) {
+                return try SessionAdminMCPToolService.deniedValue(.capabilityMissing(missing), sessionID: nil)
             }
             return nil
         case .adminUnlink:
@@ -139,7 +140,10 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         case .adminAdopt:
             try SessionAdminArguments.requireOnly(["parent_session_id"], in: args, op: "adopt")
             let destination = try destination(of: batch, required: false)
-            try context.requireMember(destination, of: batch)
+            // Adoption stamps a scope onto the adoptees; the engine picks one consistent with placement.
+            guard adoptionStamp(batch, destination: destination) != nil else {
+                throw AgentSessionTargetOperationGuard.denialError(sessionID: destination)
+            }
             return try adoptRefusal(batch, destination: destination)
         case .adminAttenuate:
             try SessionAdminArguments.requireOnly(["capabilities", "guardrails"], in: args, op: "attenuate")
@@ -221,7 +225,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             let scope = batch.scope
             let sourceScopeID: UUID? = if case .session = scope.grant.kind { scope.id } else { nil }
             let outcome = await host.addLink(observer: observer, target: target, sourceScopeID: sourceScopeID) {
-                context.isStillAuthorized(lease, scope: scope) && context.isMember(observer, ofChainFrom: scope)
+                context.isStillAuthorized(lease, scope: scope) && context.permitsMember(observer, ofChainFrom: scope)
             }
             if outcome == .revoked { authorityLost = true }
             items.append(Self.linkItem(target, outcome))
@@ -253,7 +257,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             let context = context
             let scope = batch.scope
             let outcome = await host.stopLink(observer: observer, target: target) {
-                context.isStillAuthorized(lease, scope: scope) && context.isMember(observer, ofChainFrom: scope)
+                context.isStillAuthorized(lease, scope: scope) && context.permitsMember(observer, ofChainFrom: scope)
             }
             items.append(Self.linkItem(target, outcome))
         }
@@ -304,28 +308,23 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
     }
 
     /// `maxDepth` of every tree scope on the caller's chain that sets one.
-    private func depthLimits(_ batch: AgentSessionAdministrationAuthorizedBatch) -> [DomainDelegationTreeDepthLimit] {
-        context.scopeChain(of: batch.scope).compactMap { record in
-            guard case let .tree(root) = record.grant.kind, let maxDepth = record.grant.guardrails.maxDepth else { return nil }
-            return DomainDelegationTreeDepthLimit(rootSessionID: root, maxDepth: maxDepth)
-        }
-    }
-
-    /// Depth after moving `sessionID`'s subtree under `destination`; `nil` when within every limit.
+    /// Depth after moving `sessionID`'s subtree under `destination`
+    /// (`OverseerAuthorizationEngine.placementDepthDenial`); `nil` when permitted.
     private func depthRefusal(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         moving sessionID: UUID,
         destinationAncestry: DomainDelegationOrganizationalAncestry?
     ) throws -> Value? {
-        let limits = depthLimits(batch)
-        guard !limits.isEmpty else { return nil }
-        guard let destinationAncestry,
-              let height = context.projector.organizationalSubtree(of: sessionID)?.map(\.depth).max()
-        else { return SessionAdminReply.placementRefusal(.unresolved, sessionID: sessionID) }
-        guard let denial = DomainDelegationScopePlacementPolicy.depthViolation(
-            destinationAncestry: destinationAncestry, movedSubtreeHeight: height, limits: limits
-        ) else { return nil }
-        return try SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID)
+        switch context.scopes.authorization.placementDepthDenial(
+            scope: batch.scope, moving: sessionID, destinationAncestry: destinationAncestry, projector: context.projector
+        ) {
+        case nil:
+            nil
+        case .unresolved?:
+            SessionAdminReply.placementRefusal(.unresolved, sessionID: sessionID)
+        case let .exceeded(denial)?:
+            try SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID)
+        }
     }
 
     private func reparentRefusal(
@@ -337,7 +336,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         let chain = Set(context.scopeChain(of: batch.scope).map(\.id))
         let destinationAncestry = context.projector.organizationalAncestry(of: destination)
         for source in sources ?? batch.admittedSessionIDs {
-            if let denial = DomainDelegationScopePlacementPolicy.validateReparent(
+            if let denial = context.scopes.authorization.reparentPlacementDenial(
                 source: source,
                 destination: destination,
                 sourceAncestry: context.projector.organizationalAncestry(of: source),
@@ -365,7 +364,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         let destinationAncestry = context.projector.organizationalAncestry(of: destination)
         var moved: Set<UUID> = []
         for adoptee in adoptees ?? batch.admittedSessionIDs {
-            if context.isMember(adoptee, ofChainFrom: batch.scope) {
+            if context.scopes.authorization.adoptionRefusesPlacedAdoptee(adoptee, scope: batch.scope, projector: context.projector) {
                 return SessionAdminReply.refused(
                     code: "already_member",
                     detail: "This session is already in the scope; use reparent to move it.",
@@ -373,7 +372,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 )
             }
             let subtree = context.projector.organizationalSubtree(of: adoptee).map { Set($0.map(\.sessionID)) }
-            if let denial = DomainDelegationScopePlacementPolicy.validateAdopt(
+            if let denial = context.scopes.authorization.adoptPlacementDenial(
                 adoptee: adoptee,
                 destination: destination,
                 adopteeAncestry: context.projector.organizationalAncestry(of: adoptee),
@@ -393,31 +392,23 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         return try adoptionGuardrailRefusal(batch, moved: moved)
     }
 
-    /// `maxLiveSessions` / `maxWorktrees` against post-adopt membership: the scope's current usage
-    /// (with in-flight reservations) plus every session that would join. Unknown liveness counts as
-    /// live so the check only gets stricter.
+    /// Adoption quotas against post-adopt membership (`OverseerAuthorizationEngine.adoptionQuotaDenial`).
     private func adoptionGuardrailRefusal(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         moved: Set<UUID>
     ) throws -> Value? {
-        let joining = moved.filter { !context.isMember($0, ofChainFrom: batch.scope) }
-        let addedLive = joining.count { context.projector.knownProvenance(for: $0)?.isLive ?? true }
-        let addedWorktrees = joining.reduce(into: Set<String>()) {
-            $0.formUnion(context.projector.knownProvenance(for: $1)?.boundWorktreeIDs ?? [])
-        }.count
-        for record in context.scopeChain(of: batch.scope) {
-            guard let evidence = context.projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
-                return try SessionAdminMCPToolService.deniedValue(.usageProofMissing, sessionID: nil)
-            }
-            let usage = context.scopes.usageIncludingReservations(evidence)
-            if let denial = DomainDelegationScopePlacementPolicy.adoptionGuardrailViolation(
-                guardrails: record.grant.guardrails, usage: usage,
-                addedLiveSessions: addedLive, addedWorktrees: addedWorktrees
-            ) {
-                return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
-            }
-        }
-        return nil
+        guard let denial = context.scopes.authorization.adoptionQuotaDenial(
+            scope: batch.scope, moved: moved, projector: context.projector
+        ) else { return nil }
+        return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
+    }
+
+    /// The scope an adoption stamps (`OverseerAuthorizationEngine.adoptionStampScope`).
+    private func adoptionStamp(_ batch: AgentSessionAdministrationAuthorizedBatch, destination: UUID) -> DomainDelegationScopeRecord? {
+        guard let caller = batch.request.caller.agentSessionID else { return nil }
+        return context.scopes.authorization.adoptionStampScope(
+            admitted: batch.scope, callerSessionID: caller, destination: destination, projector: context.projector
+        )
     }
 
     private func reparent(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
@@ -429,8 +420,11 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
 
     private func adopt(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let destination = try destination(of: batch, required: false)
+        guard let stamp = adoptionStamp(batch, destination: destination) else {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: destination)
+        }
         return try await applyPlacement(
-            batch, destination: destination, stampScope: batch.scope.id, op: "adopt",
+            batch, destination: destination, stampScope: stamp.id, op: "adopt",
             reserve: { adoptee in self.adoptionReservation(batch, adoptee: adoptee) }
         ) { adoptee in
             // The card was approved against this state; anything that changed since is re-decided,
@@ -455,7 +449,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         adoptee: UUID
     ) -> DelegationScopeReservation {
         let moved = context.projector.organizationalSubtree(of: adoptee).map { $0.map(\.sessionID) } ?? [adoptee]
-        let joining = moved.filter { !context.isMember($0, ofChainFrom: batch.scope) }
+        let joining = moved.filter { !context.isPlacedMember($0, ofChainFrom: batch.scope) }
         return context.scopes.reserve(
             scopeIDs: context.scopeChain(of: batch.scope).map(\.id),
             sessions: joining.count { context.projector.knownProvenance(for: $0)?.isLive ?? true },
@@ -495,7 +489,14 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             }
             // Placement and membership may have moved since preflight (earlier items, other
             // callers); every write is decided against current state.
-            guard context.isMember(destination, ofChainFrom: batch.scope) else {
+            // A stamping adoption writes `batch.scope` onto the moved subtree, so its destination must be
+            // placed in that scope (placement consistency); a re-parent only needs permission to reach it.
+            let destinationOK = if let stampScope {
+                context.scopes.record(id: stampScope).map { context.isPlacedMember(destination, ofChainFrom: $0) } ?? false
+            } else {
+                context.permitsMember(destination, ofChainFrom: batch.scope)
+            }
+            guard destinationOK else {
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "destination_unavailable"))
                 continue
             }
@@ -506,7 +507,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 continue
             }
             // A re-parent source must still be a member at the write (an adoptee is not one yet).
-            if stampScope == nil, !context.isMember(source, ofChainFrom: batch.scope) {
+            if stampScope == nil, !context.permitsMember(source, ofChainFrom: batch.scope) {
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "source_unavailable"))
                 continue
             }

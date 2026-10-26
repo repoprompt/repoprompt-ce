@@ -19,9 +19,59 @@ package final class OverseerContinuityStore: @unchecked Sendable {
         self.profile = profile
     }
 
+    /// Read-only retention projection, never an authorization input. Unknown schemas/profiles
+    /// fail rather than silently returning no backing and allowing a snapshot to displace it.
+    package struct BackingIdentities {
+        package var sessions: Set<String> = []
+        package var workspaces: Set<String> = []
+        package init() {}
+    }
+
+    package func readOnlyBackingIdentities() throws -> BackingIdentities {
+        try acquireAccess()
+        defer { Self.accessLock.unlock() }
+        let handle = try FileHandle(forReadingFrom: databaseURL)
+        defer { try? handle.close() }
+        let header = try handle.read(upToCount: 100) ?? Data()
+        guard header.count == 100, header.prefix(16) == Data("SQLite format 3\0".utf8) else { throw OverseerContinuityError.invalidRecord }
+        // A read-only WAL connection may write shared-memory read marks. Never open it here.
+        guard header[18] != 2 else { throw OverseerContinuityError.unsupportedEngineSettings }
+        let db = try SessionCatalogDatabase(url: databaseURL, readOnly: true)
+        try db.execute("PRAGMA busy_timeout = 250")
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        let version = try Int(db.integer("PRAGMA user_version") ?? 0)
+        guard version == 1 else { throw OverseerContinuityError.incompatibleSchema(version) }
+        guard try db.rows("SELECT profile FROM profile_state WHERE singleton=1", map: { try SessionCatalogDatabase.string($0) }).first == profile else {
+            throw OverseerContinuityError.profileMismatch
+        }
+        var result = BackingIdentities()
+        _ = try db.rows("SELECT owner_id,anchor_id,workspace_id FROM continuity_rows WHERE terminal=0") { row in
+            for column in [Int32(0), 1] {
+                if let text = try? SessionCatalogDatabase.string(row, column: column), let id = UUID(uuidString: text) {
+                    result.sessions.insert(id.uuidString)
+                }
+            }
+            if let text = try? SessionCatalogDatabase.string(row, column: 2), let id = UUID(uuidString: text) {
+                result.workspaces.insert(id.uuidString)
+            }
+        }
+        return result
+    }
+
     private func acquireAccess() throws {
         guard Self.accessLock.lock(before: Date().addingTimeInterval(0.25)) else { throw OverseerContinuityError.writerBusy }
     }
+
+    #if DEBUG
+        /// Test-only: runs `body` while holding the existing process-local access ordering, acquired
+        /// through the same bounded admission as every store operation. Opens no database.
+        package func withAccessHeldForTesting<T>(_ body: () throws -> T) throws -> T {
+            try acquireAccess()
+            defer { Self.accessLock.unlock() }
+            return try body()
+        }
+    #endif
 
     private func connection() throws -> SessionCatalogDatabase {
         guard databaseURL.isFileURL, !profile.isEmpty else { throw OverseerContinuityError.unsafeLocation }
@@ -233,17 +283,32 @@ package final class OverseerContinuityStore: @unchecked Sendable {
             try put(row, revision: revision, db: db)
             return [row.id]
         case let .revokeScope(id):
+            return try apply(.endScope(id, .init(reason: .historicalUnknown), original: nil), revision: revision, db: db)
+        case let .endScope(id, ending, original):
+            if let original {
+                guard original.kind == .scope, original.id == id, !original.terminal else { throw OverseerContinuityError.invalidRecord }
+                if try db.integer("SELECT 1 FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) == nil {
+                    try put(original, revision: revision, db: db)
+                }
+            }
             let ids = try db.rows("WITH RECURSIVE descendants(id) AS (VALUES (?) UNION SELECT r.id FROM continuity_rows r JOIN descendants d ON r.parent_id=d.id WHERE r.kind='scope') SELECT id FROM descendants", [.text(id)]) { try SessionCatalogDatabase.string($0) }
             for id in ids {
-                try db.execute("INSERT INTO continuity_rows(kind,id,capabilities,payload,terminal,revision) VALUES ('scope',?,'[]',?,1,?) ON CONFLICT(kind,id) DO UPDATE SET terminal=1,revision=excluded.revision", [.text(id), .bytes(Data()), .integer(revision)])
+                // The first ending wins, including across retries and later ancestor cascades.
+                if try db.integer("SELECT terminal FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) == 1 { continue }
+                let payload = try db.rows("SELECT payload FROM continuity_rows WHERE kind='scope' AND id=?", [.text(id)]) { try SessionCatalogDatabase.data($0) }.first ?? Data()
+                let evidence = try JSONEncoder().encode(OverseerEndedScope(ending: ending, originalPayload: payload))
+                try db.execute("INSERT INTO continuity_rows(kind,id,capabilities,payload,terminal,revision) VALUES ('scope',?,'[]',?,1,?) ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload,terminal=1,revision=excluded.revision", [.text(id), .bytes(evidence), .integer(revision)])
             }
             return ids
         case let .deletedSession(id):
+            return try apply(.deletedSessionWithEvidence(id, .init(reason: .sessionDeleted, originatingSessionID: UUID(uuidString: id))), revision: revision, db: db)
+        case let .deletedSessionWithEvidence(id, ending):
+            guard ending.reason == .sessionDeleted, ending.originatingSessionID == UUID(uuidString: id) else { throw OverseerContinuityError.invalidRecord }
             try db.execute("INSERT INTO deleted_sessions VALUES (?,?) ON CONFLICT(id) DO NOTHING", [.text(id), .integer(revision)])
             let roots = try db.rows("SELECT id FROM continuity_rows WHERE kind='scope' AND (owner_id=? OR anchor_id=?)", [.text(id), .text(id)]) { try SessionCatalogDatabase.string($0) }
             var affected: [String] = []
             for root in roots {
-                affected += try apply(.revokeScope(root), revision: revision, db: db)
+                affected += try apply(.endScope(root, ending, original: nil), revision: revision, db: db)
             }
             try db.execute("UPDATE continuity_rows SET terminal=1,revision=? WHERE kind='link' AND (owner_id=? OR anchor_id=?)", [.integer(revision), .text(id), .text(id)])
             return affected
@@ -340,7 +405,7 @@ package final class OverseerContinuityStore: @unchecked Sendable {
                     id = row.id
                 case let .revokeScope(value): kind = .scope
                     id = value
-                case .remove, .deletedSession: throw OverseerContinuityError.invalidRecord
+                case .remove, .deletedSession, .deletedSessionWithEvidence, .endScope: throw OverseerContinuityError.invalidRecord
                 }
                 if try db.integer("SELECT 1 FROM continuity_rows WHERE kind=? AND id=?", [.text(kind.rawValue), .text(id)]) != nil {
                     outcome = "destination_wins"

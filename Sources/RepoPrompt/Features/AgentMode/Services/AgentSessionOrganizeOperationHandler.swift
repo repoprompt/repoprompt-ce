@@ -72,9 +72,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     private let backend: any AgentSessionOrganizingBackend
     private let isLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
+    private let isGroupOrderLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
     /// Whether the scope is still live and its whole chain holds `control`, for targets that turned
     /// out not to be idle when re-read.
     private let holdsControl: @MainActor (DomainDelegationScopeRecord) -> Bool
+    private let holdsObserve: @MainActor (DomainDelegationScopeRecord) -> Bool
     private let now: () -> Date
     private let makeToken: () -> String
     private var undoLedger: DomainAgentSessionAdministrationUndoLedger<AgentSessionOrganizeUndoPayload>
@@ -83,13 +85,17 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         backend: any AgentSessionOrganizingBackend,
         isLeaseCurrent: @escaping @MainActor (DomainDelegationScopeLease) -> Bool,
         holdsControl: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool,
+        holdsObserve: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool = { _ in false },
+        isGroupOrderLeaseCurrent: (@MainActor (DomainDelegationScopeLease) -> Bool)? = nil,
         now: @escaping () -> Date = Date.init,
         makeToken: @escaping () -> String = { UUID().uuidString },
         undoLifetime: TimeInterval = 15 * 60
     ) {
         self.backend = backend
         self.isLeaseCurrent = isLeaseCurrent
+        self.isGroupOrderLeaseCurrent = isGroupOrderLeaseCurrent ?? isLeaseCurrent
         self.holdsControl = holdsControl
+        self.holdsObserve = holdsObserve
         self.now = now
         self.makeToken = makeToken
         undoLedger = DomainAgentSessionAdministrationUndoLedger(lifetime: undoLifetime)
@@ -105,40 +111,124 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             return order
         case .adminReorderGroups:
-            guard let workspaceID = try AgentSessionAdminArguments.uuid(request.arguments, "workspace") else {
-                throw AgentSessionAdminArguments.invalid("reorder_groups requires workspace (workspace UUID).")
-            }
+            let (workspaceID, order) = try groupReorderArguments(request.arguments)
             guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
                 throw AgentSessionAdminEarlyResult(value: Self.workspaceNotLoaded(workspaceID))
             }
-            let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
-            /// Both refusals list the groups that exist and the exact call shape that reorders them.
-            func refusal(_ code: String, _ detail: String) -> AgentSessionAdminEarlyResult {
-                AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: code, fields: [
-                    "result": .string(code),
-                    "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                    "current_groups": .array(current.map(Value.string)),
-                    "detail": .string(detail),
-                    // Not runnable as-is: only the caller knows the order it wants.
-                    "next_step": .string("Call session_admin reorder_groups with workspace \(workspaceID.uuidString), expected_order set to current_groups exactly, and order set to those same names in the order you want.")
-                ]).filter { $0.key != "next_call" }))
-            }
-            guard request.arguments["order"] != nil else {
-                throw refusal("order_required", "reorder_groups needs order: the group names in their new order. current_groups is the present order; pass it as expected_order.")
-            }
-            let (_, order) = try groupReorderArguments(request.arguments)
             let named = Set(order)
             let members = entries.filter { named.contains($0.group) }.map(\.sessionID)
-            if members.isEmpty {
-                throw refusal("groups_not_found", "None of the named groups has a session in this workspace (a group exists only while a session carries it). Reorder groups from current_groups, using that list as expected_order.")
+            if entries.isEmpty, order.isEmpty, request.arguments["order"] != nil,
+               request.arguments["expected_order"] == nil
+            {
+                throw AgentSessionAdminArguments.invalid("reorder_groups requires expected_order.")
             }
-            return members
+            if entries.isEmpty, order.isEmpty,
+               let expected = try AgentSessionAdminArguments.strings(request.arguments, "expected_order"),
+               !expected.isEmpty
+            {
+                throw AgentSessionAdminEarlyResult(value: Self.orderingFailure(
+                    .orderSetMismatch, operation: request.operation.adminOperationName,
+                    arguments: request.arguments, scopeID: request.scopeID
+                ))
+            }
+            if entries.isEmpty, request.arguments["order"] == nil || !order.isEmpty {
+                // An empty workspace has no names to disclose or carriers to authorize. The
+                // follow-up with two empty arrays completes as no_matching_sessions, never applied.
+                throw AgentSessionAdminEarlyResult(value: recovery(
+                    request, workspaceID: workspaceID, order: [], expected: [],
+                    code: request.arguments["order"] == nil ? "order_required" : "groups_not_found"
+                ))
+            }
+            // Unknown names need the same authorized discovery as a missing order. Do not leak
+            // the workspace's current names from target derivation before the core admits them.
+            return members.isEmpty && !order.isEmpty ? entries.map(\.sessionID) : members
         default:
             return nil
         }
     }
 
     // MARK: - Cards and preview
+
+    /// Recovery discloses current group names only after authorization covers their carriers.
+    /// Incomplete arguments must not create a confirmation card or reach the mutating handler.
+    func preflight(_ batch: AgentSessionAdministrationAuthorizedBatch) throws -> Value? {
+        let request = batch.request
+        guard request.operation == .adminReorderGroups,
+              request.confirmationID == nil
+        else { return nil }
+        let (workspaceID, order): (UUID, [String])
+        do {
+            (workspaceID, order) = try groupReorderArguments(request.arguments)
+        } catch let early as AgentSessionAdminEarlyResult {
+            return early.value
+        }
+        guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
+            return Self.workspaceNotLoaded(workspaceID)
+        }
+        let named = Set(order)
+        let unknownGroups = !order.isEmpty && !entries.contains { named.contains($0.group) }
+        let affected = entries.filter { unknownGroups || named.contains($0.group) }.map(\.sessionID)
+        guard Set(affected).isSubset(of: Set(batch.admittedSessionIDs)) else {
+            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
+                "result": .string("groups_outside_scope"),
+                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
+            ]))
+        }
+        let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
+        if unknownGroups {
+            // A complete request for unknown names is discovery too: organize authority over
+            // carriers does not grant observe over their current names or the wider scope chain.
+            guard holdsObserve(batch.scope) else {
+                return try SessionAdminMCPToolService.deniedValue(.capabilityMissing(.observe), sessionID: nil)
+            }
+            return recovery(request, workspaceID: workspaceID, order: current, expected: current, code: "groups_not_found")
+        }
+        // Complete valid requests retain their ordinary preview/confirmation/mutation path.
+        guard request.arguments["order"] == nil || request.arguments["expected_order"] == nil else { return nil }
+        let expected = current.filter(named.contains)
+        if case let .failure(error) = DomainAgentSessionOrdering.permute(
+            current: current, expected: expected, desired: order, describe: { $0 }
+        ) {
+            return Self.orderingFailure(error, operation: request.operation.adminOperationName, arguments: request.arguments, scopeID: batch.scope.id)
+        }
+        return recovery(request, workspaceID: workspaceID, order: order, expected: expected, code: "order_required")
+    }
+
+    private func recovery(
+        _ request: AgentSessionAdministrationRequest, workspaceID: UUID,
+        order: [String], expected: [String], code: String
+    ) -> Value {
+        var arguments: [String: Value] = [
+            "op": .string("reorder_groups"),
+            "workspace": .string(workspaceID.uuidString),
+            "order": .array(order.map(Value.string)),
+            "expected_order": .array(expected.map(Value.string)),
+            "idempotency_key": .string("reorder_groups:\(UUID().uuidString)")
+        ]
+        if let scopeID = request.scopeID {
+            arguments["scope_id"] = .string(scopeID.uuidString)
+        }
+        // Preserve explicit selection and preview, but rederive implicit carriers on submission.
+        for key in ["session_id", "targets", "filter"] {
+            arguments[key] = request.arguments[key]
+        }
+        if request.preview {
+            arguments["preview"] = .bool(true)
+        }
+        return .object(SessionAdminReply.diagnostic(code: code, fields: [
+            "result": .string(code),
+            "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+            "current_groups": .array(expected.map(Value.string)),
+            "current_order": .array(expected.map(Value.string)),
+            "detail": .string(
+                order == expected
+                    ? "Submit next_call to apply this order; an already satisfied order succeeds with changed_count: 0. Edit order to request a rearrangement. expected_order still rejects intervening changes."
+                    : "Submit next_call to apply the supplied order. expected_order is the current relative order; intervening changes still conflict."
+            ),
+            "next_call": .object(["tool": .string("session_admin"), "arguments": .object(arguments)])
+        ]))
+    }
 
     func confirmationItems(
         for request: AgentSessionAdministrationRequest,
@@ -178,7 +268,10 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        let context = Context(batch: batch, leases: leases, isLeaseCurrent: isLeaseCurrent)
+        let context = Context(
+            batch: batch, leases: leases,
+            isLeaseCurrent: batch.request.operation == .adminReorderGroups ? isGroupOrderLeaseCurrent : isLeaseCurrent
+        )
         let args = batch.request.arguments
         switch batch.request.operation {
         case .adminRename:
@@ -199,7 +292,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             return try finish(context, payload: setGroup(context, group: normalizedGroupArgument(args)))
         case .adminReorderGroups:
-            return try reorderGroups(context, args: args)
+            return try await reorderGroups(context, args: args)
         case .adminArchive:
             return await finish(context, payload: archive(context))
         case .adminUnarchive:
@@ -399,7 +492,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         })
     }
 
-    private func reorderGroups(_ context: Context, args: [String: Value]) throws -> Value {
+    private func reorderGroups(_ context: Context, args: [String: Value]) async throws -> Value {
         let (workspaceID, order) = try groupReorderArguments(args)
         guard let expectedRaw = try AgentSessionAdminArguments.strings(args, "expected_order") else {
             throw AgentSessionAdminArguments.invalid("reorder_groups requires expected_order.")
@@ -424,6 +517,20 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         ) {
             return Self.orderingFailure(error, operation: context.batch.request.operation.adminOperationName, arguments: args, scopeID: context.batch.scope.id)
         }
+        guard affected.allSatisfy(context.isCurrent) else {
+            return Self.scopeNoLongerCurrent(context.batch.request.operation)
+        }
+        // A validated identity permutation succeeds without normalizing nil or inconsistent
+        // mirrored ranks. CAS and live authority still apply before acknowledging satisfaction.
+        if current.filter(Set(order).contains) == order {
+            for id in affected {
+                context.add(id, .unchanged)
+            }
+            context.extra["workspace_id"] = .string(workspaceID.uuidString)
+            context.extra["group_order"] = .array(order.map(Value.string))
+            context.extra[AgentSessionAdminRendering.stateSatisfiedKey] = .bool(true)
+            return finish(context, payload: nil)
+        }
         // The named groups' values are redistributed among them; only their carriers are written.
         let values = DomainAgentSessionSidebarGroup.redistributedOrders(
             desired: order,
@@ -439,10 +546,16 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         guard affected.allSatisfy(context.isCurrent) else {
             return Self.scopeNoLongerCurrent(context.batch.request.operation)
         }
-        let changed = writes.isEmpty ? [] : backend.setGroupOrderValues(writes)
+        let outcome = await backend.commitGroupOrderValues(
+            writes, workspaceID: workspaceID,
+            expected: Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }),
+            affectedSessionIDs: Set(affected), isAuthorized: context.isCurrent
+        )
+        let changed = outcome.changed
         for id in affected {
-            context.add(id, changed.contains(id) ? .changed : .unchanged)
+            context.add(id, outcome.failure != nil ? .failed : changed.contains(id) ? .changed : .unchanged, outcome.failure)
         }
+        recordGroupOrderWrite(outcome, context: context)
         context.extra["workspace_id"] = .string(workspaceID.uuidString)
         let after = backend.groupEntries(workspaceID: workspaceID) ?? []
         context.extra["group_order"] = .array(
@@ -590,10 +703,13 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     func performUndo(_ entry: UndoEntry, batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        let context = Context(batch: batch, leases: leases, isLeaseCurrent: isLeaseCurrent)
+        let context = Context(
+            batch: batch, leases: leases,
+            isLeaseCurrent: entry.operation == .adminReorderGroups ? isGroupOrderLeaseCurrent : isLeaseCurrent
+        )
         switch entry.payload {
         case let .fields(restores):
-            undoFields(restores, context: context)
+            await undoFields(restores, context: context)
         case let .unarchive(ids):
             let current = ids.filter(context.isCurrent)
             let outcome = await backend.unarchive(current, isAuthorized: context.isCurrent)
@@ -639,7 +755,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     /// One fresh read region, then bounded batches. CAS and each target's lease remain mandatory;
     /// pin mutations still use the shared PromptViewModel path, never direct field writes.
-    private func undoFields(_ restores: [AgentSessionOrganizeFieldRestore], context: Context) {
+    private func undoFields(_ restores: [AgentSessionOrganizeFieldRestore], context: Context) async {
         let states = backend.states(of: restores.map(\.sessionID))
         var pending: [AgentSessionOrganizeFieldRestore] = []
         var outcomes: [UUID: (AgentSessionAdminItemResult.Status, String?)] = [:]
@@ -704,7 +820,43 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let currentGroups = groups.filter { isCurrent($0.key) }
         if !currentGroups.isEmpty { changed.formUnion(backend.setGroups(currentGroups)) }
         let currentOrders = groupOrders.filter { isCurrent($0.key) }
-        if !currentOrders.isEmpty { changed.formUnion(backend.setGroupOrderValues(currentOrders)) }
+        if !currentOrders.isEmpty {
+            let byWorkspace = Dictionary(grouping: Array(currentOrders.keys), by: { states[$0]?.workspaceID })
+            for workspaceID in byWorkspace.keys.compactMap(\.self).sorted(by: { $0.uuidString < $1.uuidString }) {
+                var ids = Set(byWorkspace[workspaceID] ?? [])
+                guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
+                    for id in ids {
+                        outcomes[id] = (.failed, "workspace_not_loaded")
+                    }
+                    continue
+                }
+                // A preceding workspace commit can suspend. Re-prove each field's original CAS
+                // against this fresh snapshot before using its captured restore value.
+                let byID = Dictionary(entries.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+                for restore in pending where ids.contains(restore.sessionID) {
+                    guard case let .groupOrder(group, _, after) = restore.change,
+                          let current = byID[restore.sessionID], current.group == group, current.order == after
+                    else {
+                        outcomes[restore.sessionID] = (.skipped, "changed_since")
+                        ids.remove(restore.sessionID)
+                        continue
+                    }
+                }
+                guard !ids.isEmpty else { continue }
+                let result = await backend.commitGroupOrderValues(
+                    currentOrders.filter { ids.contains($0.key) }, workspaceID: workspaceID,
+                    expected: Set(entries.map { AgentSessionGroupOrderEntry(sessionID: $0.sessionID, group: $0.group, order: $0.order) }),
+                    affectedSessionIDs: ids, isAuthorized: context.isCurrent
+                )
+                changed.formUnion(result.changed)
+                recordGroupOrderWrite(result, context: context)
+                if let reason = result.failure {
+                    for id in ids {
+                        outcomes[id] = (.failed, reason)
+                    }
+                }
+            }
+        }
         for restore in restores where context.leases[restore.sessionID] != nil {
             let id = restore.sessionID
             let outcome = outcomes[id] ?? (changed.contains(id) ? (.changed, nil) : (.failed, "mutation_rejected"))
@@ -713,6 +865,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
     }
 
     // MARK: - Helpers
+
+    private func recordGroupOrderWrite(_ outcome: AgentSessionGroupOrderWriteOutcome, context: Context) {
+        if outcome.localChanges { context.extra["local_changes"] = .bool(true) }
+        if outcome.persistenceConfirmed { context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
+    }
 
     /// The schema advertises `group` as a plain string; an empty (or whitespace-only) string clears
     /// the group. A literal `null` is still tolerated for callers written against the earlier schema.
@@ -736,6 +893,19 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         guard let workspaceID = try AgentSessionAdminArguments.uuid(args, "workspace") else {
             throw AgentSessionAdminArguments.invalid("reorder_groups requires workspace (workspace UUID).")
         }
+        if args["expected_order"] != nil {
+            guard let expected = try AgentSessionAdminArguments.strings(args, "expected_order") else {
+                throw AgentSessionAdminArguments.invalid("expected_order must be an array of group names.")
+            }
+            _ = try expected.map(Self.groupName)
+        }
+        if args["order"] == nil {
+            guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
+                throw AgentSessionAdminEarlyResult(value: Self.workspaceNotLoaded(workspaceID))
+            }
+            // Derive carriers only for authorization; preflight supplies the recovery receipt.
+            return (workspaceID, DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) }))
+        }
         guard let order = try AgentSessionAdminArguments.strings(args, "order") else {
             throw AgentSessionAdminArguments.invalid("reorder_groups requires order (group names).")
         }
@@ -748,17 +918,21 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             "load_workspace": .bool(true),
             "detail": .string("Only sessions in a workspace an open window shows can be organized. Ask the user to open it.")
         ]
-        if let workspaceID { object["workspace_id"] = .string(workspaceID.uuidString) }
+        if let workspaceID {
+            object["workspace_id"] = .string(workspaceID.uuidString)
+        }
         return .object(SessionAdminReply.diagnostic(code: "workspace_not_loaded", fields: object))
     }
 
     static func orderingFailure(
-        _ error: DomainAgentSessionOrderingError, operation: String, arguments: [String: Value], scopeID: UUID
+        _ error: DomainAgentSessionOrderingError, operation: String, arguments: [String: Value], scopeID: UUID?
     ) -> Value {
         var fields: [String: Value] = [:]
         var next = arguments
         next["op"] = .string(operation)
-        next["scope_id"] = .string(scopeID.uuidString)
+        if let scopeID {
+            next["scope_id"] = .string(scopeID.uuidString)
+        }
         let code: String
         switch error {
         case let .expectedOrderMismatch(current):

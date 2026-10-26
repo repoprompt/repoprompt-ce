@@ -117,6 +117,63 @@ import XCTest
             XCTAssertEqual(fixture.rebindRecorder.count, 0)
         }
 
+        func testOracleSendLoadsImagesForStartsAndContinuationsOnOrdinaryAndAgentConnections() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let bytes = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
+            let imageURL = root.appendingPathComponent("fixture.png")
+            try bytes.write(to: imageURL)
+
+            for purpose in [MCPRunPurpose.unknown, .agentModeRun] {
+                for route: [String: Value] in [["new_chat": .bool(true)], ["chat_id": .string("existing-chat")], [:]] {
+                    let fixture = makeOracleSendFixture(stopAfterRoute: false, connectionID: UUID(), livePurpose: purpose)
+                    defer { fixture.cleanup() }
+                    let store = fixture.window.promptManager.workspaceFileContextStore
+                    let loaded = try await store.loadRoot(path: root.path, kind: .primaryWorkspace)
+                    addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+                    var args = route
+                    args["message"] = .string("inspect")
+                    args["images"] = .array([.object(["path": .string(imageURL.path), "title": .string("Fixture")])])
+
+                    _ = try await fixture.service.executeOracleSend(args: args, invocationContext: fixture.invocationContext)
+
+                    XCTAssertEqual(fixture.sendRecorder.calls.count, 1)
+                    let sent = try XCTUnwrap(fixture.sendRecorder.calls.first)
+                    XCTAssertNil(sent["images"], "Raw attachment paths must be consumed before dispatch")
+                    XCTAssertEqual(sent["new_chat"], route["new_chat"])
+                    XCTAssertEqual(sent["chat_id"], route["chat_id"])
+                    XCTAssertEqual(fixture.sendRecorder.images.first?.map(\.bytes), [bytes])
+                }
+            }
+        }
+
+        func testOracleSendRejectsInvalidImagesBeforeDispatch() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let outsidePath = root.deletingLastPathComponent().appendingPathComponent("outside-image.png").path
+            for (images, expectedError): (Value, String) in [
+                (.string("invalid"), "images must be an array"),
+                (.array([.object(["path": .string(outsidePath)])]), "images[0].path is outside the current workspace roots")
+            ] {
+                let fixture = makeOracleSendFixture(stopAfterRoute: false)
+                defer { fixture.cleanup() }
+                let store = fixture.window.promptManager.workspaceFileContextStore
+                let loaded = try await store.loadRoot(path: root.path, kind: .primaryWorkspace)
+                addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+                do {
+                    _ = try await fixture.service.executeOracleSend(args: [
+                        "message": .string("inspect"), "new_chat": .bool(true), "images": images
+                    ], invocationContext: fixture.invocationContext)
+                    XCTFail("Expected image validation failure")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains(expectedError), error.localizedDescription)
+                }
+                XCTAssertTrue(fixture.sendRecorder.calls.isEmpty)
+            }
+        }
+
         func testAgentModeOracleSendDoesNotCompatibilityRebind() async {
             let fixture = makeOracleSendFixture(connectionID: UUID(), livePurpose: .agentModeRun)
             defer { fixture.cleanup() }
@@ -511,8 +568,8 @@ import XCTest
                 rawExplicitTabID: { _ in nil },
                 sendStageProgress: { _, _, _, _ in },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
-                sendChat: { args, _, _ in
-                    sendRecorder.record(args)
+                sendChat: { args, _, context in
+                    sendRecorder.record(args, images: context?.transientImages ?? [])
                     return settledReply ?? [
                         "chat_id": .string("selected-chat"),
                         "response": .string("response")
@@ -680,9 +737,11 @@ import XCTest
     @MainActor
     private final class OracleSendArgsRecorder {
         private(set) var calls: [[String: Value]] = []
+        private(set) var images: [[AITransientImage]] = []
 
-        func record(_ args: [String: Value]) {
+        func record(_ args: [String: Value], images: [AITransientImage]) {
             calls.append(args)
+            self.images.append(images)
         }
     }
 
@@ -770,21 +829,21 @@ final class OracleImageContractTests: XCTestCase {
         ])))
     }
 
-    func testAskOracleImageDocumentationIsProviderNeutralAndMatchesLimits() throws {
+    func testOracleSendImageDocumentationIsProviderNeutralAndMatchesLimits() throws {
         XCTAssertEqual(OracleImageAttachmentLimits.production.maxCount, 10)
         XCTAssertEqual(OracleImageAttachmentLimits.production.maxBytesPerImage, 20 * 1024 * 1024)
         XCTAssertEqual(OracleImageAttachmentLimits.production.maxTotalBytes, 50 * 1024 * 1024)
-        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "ask_oracle"))
+        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "oracle_send"))
         let schema = try XCTUnwrap(canonical.inputSchema.objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         let canonicalArgument = try XCTUnwrap(properties["images"]?.objectValue?["description"]?.stringValue)
         let headlessDisclaimer = " Requires the app backend; the direct headless backend rejects `images`."
-        XCTAssertEqual(canonicalArgument, MCPOracleToolProvider.askOracleImagesArgumentDescription + headlessDisclaimer)
-        XCTAssertTrue(canonical.description.contains(MCPOracleToolProvider.askOracleImageUsageDescription + headlessDisclaimer))
+        XCTAssertEqual(canonicalArgument, MCPOracleToolProvider.oracleImagesArgumentDescription + headlessDisclaimer)
+        XCTAssertTrue(canonical.description.contains(MCPOracleToolProvider.oracleImageUsageDescription + headlessDisclaimer))
 
         let documentation = [
-            MCPOracleToolProvider.askOracleImageUsageDescription,
-            MCPOracleToolProvider.askOracleImagesArgumentDescription
+            MCPOracleToolProvider.oracleImageUsageDescription,
+            MCPOracleToolProvider.oracleImagesArgumentDescription
         ].joined(separator: " ")
 
         XCTAssertFalse(documentation.lowercased().contains("anthropic"))
@@ -792,14 +851,14 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertTrue(documentation.contains("20 MiB each"))
         XCTAssertTrue(documentation.contains("50 MiB total"))
         for description in [
-            MCPOracleToolProvider.askOracleImageUsageDescription,
-            MCPOracleToolProvider.askOracleImagesArgumentDescription
+            MCPOracleToolProvider.oracleImageUsageDescription,
+            MCPOracleToolProvider.oracleImagesArgumentDescription
         ] {
             XCTAssertTrue(description.contains("raw attachment-file bytes before provider encoding"))
             XCTAssertTrue(description.contains("provider or model may impose additional restrictions"))
             XCTAssertTrue(description.contains("do not guarantee full-request or model-context fit"))
         }
-        let usage = MCPOracleToolProvider.askOracleImageUsageDescription
+        let usage = MCPOracleToolProvider.oracleImageUsageDescription
         XCTAssertTrue(usage.contains("additional to pre-send text estimates and Context Builder text-selection budgets"))
         XCTAssertTrue(usage.contains("Originals, not transcript thumbnails, are sent to each Oracle lane"))
         XCTAssertTrue(usage.contains("group fan-out multiplies image usage/cost, not any one request's attachment cap"))
@@ -812,8 +871,8 @@ final class OracleImageContractTests: XCTestCase {
         // Images the user attached to the agent session are accepted at their exact path, so every
         // surface (app tool, canonical/headless definition, path field) must say so.
         for description in [
-            MCPOracleToolProvider.askOracleImageUsageDescription,
-            MCPOracleToolProvider.askOracleImagesArgumentDescription
+            MCPOracleToolProvider.oracleImageUsageDescription,
+            MCPOracleToolProvider.oracleImagesArgumentDescription
         ] {
             XCTAssertTrue(description.contains("image the user attached to this agent session"))
             XCTAssertTrue(description.contains("sibling attachments"))
@@ -841,10 +900,10 @@ final class OracleImageContractTests: XCTestCase {
         }
     }
 
-    func testAskOracleToolArgumentsAreRedactedBeforePersistence() throws {
+    func testOracleSendToolArgumentsAreRedactedBeforePersistence() throws {
         let raw = #"{"message":"inspect","images":[{"path":"/Users/secret.png","title":"Secret"}]}"#
         let item = AgentChatItem.toolCall(
-            name: "mcp__RepoPromptCE__ask_oracle",
+            name: "mcp__RepoPromptCE__oracle_send",
             argsJSON: raw
         )
 
@@ -912,7 +971,14 @@ final class OracleImageContractTests: XCTestCase {
             "RepoPromptCE_ask_oracle",
             "functions.ask_oracle",
             "other_server:ask_oracle",
-            "mcp__other__ask_oracle"
+            "mcp__other__ask_oracle",
+            "oracle_send",
+            "mcp__RepoPromptCE__oracle_send",
+            "RepoPromptCE__oracle_send",
+            "RepoPromptCE_oracle_send",
+            "functions.oracle_send",
+            "other_server:oracle_send",
+            "mcp__other__oracle_send"
         ]
         for name in oracleNames {
             let sanitized = try XCTUnwrap(
@@ -925,7 +991,7 @@ final class OracleImageContractTests: XCTestCase {
 
         // Non-oracle tools keep their arguments untouched.
         let unrelated = #"{"images":[{"path":"/tmp/not-an-oracle-image.png"}]}"#
-        for name in ["ask_oracle_extended", "oracle_send", "read_file"] {
+        for name in ["ask_oracle_extended", "oracle_send_extended", "read_file"] {
             XCTAssertEqual(
                 AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
                     toolName: name,

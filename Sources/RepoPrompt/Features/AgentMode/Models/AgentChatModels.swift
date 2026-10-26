@@ -152,19 +152,22 @@ enum AgentToolArgumentPersistencePolicy {
         return OracleImageToolArguments.removingImages(fromArgsJSON: argsJSON)
     }
 
-    /// Whether the tool name resolves to RepoPrompt's `ask_oracle`, using the canonical MCP
+    /// Whether the tool name resolves to an Oracle image send, using the canonical MCP
     /// name resolver plus a fail-closed suffix check for server prefixes the resolver does
     /// not own.
     private static func isOracleImageTool(_ toolName: String?) -> Bool {
         guard let toolName else { return false }
-        if MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) == "ask_oracle" {
+        let imageTools = ["ask_oracle", "oracle_send"]
+        if let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName), imageTools.contains(canonical) {
             return true
         }
         let lowered = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return lowered == "ask_oracle"
-            || lowered.hasSuffix("__ask_oracle")
-            || lowered.hasSuffix(":ask_oracle")
-            || lowered.hasSuffix(".ask_oracle")
+        return imageTools.contains { name in
+            lowered == name
+                || lowered.hasSuffix("__\(name)")
+                || lowered.hasSuffix(":\(name)")
+                || lowered.hasSuffix(".\(name)")
+        }
     }
 }
 
@@ -242,6 +245,13 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// their own transcript gets, and nothing else.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
 
+    /// Typed recovery record for a `.system` provider-thread recovery notice.
+    ///
+    /// `text` remains the user-facing notice; this record carries the structured transition
+    /// (reason, outcome, thread IDs) so the summary contract can keep it inspectable after
+    /// retention drops the row.
+    public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
@@ -263,7 +273,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         userInputOrigin: AgentUserInputOrigin? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         dispatchedProviderText: String? = nil,
-        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
+        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -289,6 +300,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.crossSessionAttribution = crossSessionAttribution
         self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
+        self.recoveryDiagnostic = recoveryDiagnostic
     }
 
     public var hasDisplayableAssistantBody: Bool {
@@ -306,6 +318,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
+        case recoveryDiagnostic
     }
 
     public init(from decoder: Decoder) throws {
@@ -342,6 +355,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
+        recoveryDiagnostic = try c.decodeIfPresent(
+            AgentTranscriptRecoveryDiagnostic.self,
+            forKey: .recoveryDiagnostic
+        )
     }
 
     // MARK: - Factory Methods
@@ -374,8 +391,20 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(kind: .toolResult, text: resultJSON, toolName: name, toolInvocationID: invocationID, toolArgsJSON: argsJSON, toolResultJSON: resultJSON, toolIsError: isError, sequenceIndex: sequenceIndex)
     }
 
-    public static func system(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
-        AgentChatItem(kind: .system, text: text, sequenceIndex: sequenceIndex)
+    public static func system(
+        _ text: String,
+        sequenceIndex: Int = 0,
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
+    ) -> AgentChatItem {
+        var item = AgentChatItem(kind: .system, text: text, sequenceIndex: sequenceIndex)
+        // The row is the identity authority: the diagnostic is re-keyed to it so any later
+        // summary extraction can rebuild the same row ID in compacted projections.
+        item.recoveryDiagnostic = recoveryDiagnostic.map { diagnostic in
+            var aligned = diagnostic
+            aligned.align(to: item.id, timestamp: item.timestamp, sequenceIndex: item.sequenceIndex)
+            return aligned
+        }
+        return item
     }
 
     /// The visible provenance row for one accepted automatic lane-update turn.
@@ -596,6 +625,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     /// Local-display lane labels for an accepted lane-update row. Persisted with the session file
     /// and nowhere else; see `AgentLaneUpdateDisplayAttribution`.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
+    /// Typed recovery record for a `.system` recovery notice row; bounded, payload-free.
+    public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -619,6 +650,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         crossSessionAttribution = item.crossSessionAttribution
         dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
+        recoveryDiagnostic = item.recoveryDiagnostic
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -695,7 +727,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
-            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
+            recoveryDiagnostic: recoveryDiagnostic
         )
     }
 
@@ -746,6 +779,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
+        case recoveryDiagnostic
     }
 
     public init(from decoder: Decoder) throws {
@@ -780,6 +814,10 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
+        recoveryDiagnostic = try container.decodeIfPresent(
+            AgentTranscriptRecoveryDiagnostic.self,
+            forKey: .recoveryDiagnostic
+        )
     }
 }
 

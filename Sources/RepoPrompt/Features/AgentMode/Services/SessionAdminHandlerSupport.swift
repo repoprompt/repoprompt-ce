@@ -14,15 +14,15 @@ struct SessionAdminHandlerContext {
     /// Presentation-only session titles for card items.
     var displayName: @MainActor (UUID) -> String? = { _ in nil }
 
-    /// The write-time authority check for one target: the lease is current **and** the target is
-    /// still a member of the whole scope chain (placement may have changed since the lease).
+    /// The write-time checkpoint for one target (`OverseerAuthorizationEngine.checkpointTarget`).
     func isStillAuthorized(
         _ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord,
-        requiresMutationOwner: Bool = true
+        requiresMutationOwner: Bool = true,
+        operation: DomainAgentSessionTargetOperation? = nil
     ) -> Bool {
-        !Task.isCancelled && scopes.isCurrent(lease)
-            && (!requiresMutationOwner || projector.pointResolutionState(for: lease.targetSessionID) != .replicated)
-            && isMember(lease.targetSessionID, ofChainFrom: scope)
+        scopes.authorization.checkpointTarget(
+            lease, scope: scope, projector: projector, requiresMutationOwner: requiresMutationOwner, operation: operation
+        )
     }
 
     /// The caller's scope and every ancestor scope.
@@ -30,22 +30,23 @@ struct SessionAdminHandlerContext {
         scopes.scopeChain(from: scope.id)
     }
 
-    func isMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
-        let chain = scopeChain(of: scope)
-        guard !chain.isEmpty else { return false }
-        return chain.allSatisfy { record in
-            guard let proof = projector.membershipProof(for: sessionID, in: record.grant) else { return false }
-            return DomainDelegationScopeAuthority.isValid(proof, for: record.grant, targetSessionID: sessionID)
-        }
+    /// Placement fact (never an authorization gate by itself): `sessionID` is placed in the chain.
+    func isPlacedMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.isPlacedMember(sessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    /// Permission: the operation may reach `sessionID` through `scope` (`scopeMembership`).
+    func permitsMember(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.permitsMember(sessionID, ofChainFrom: scope, projector: projector)
     }
 
     func memberships(of sessionID: UUID, inChainFrom scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeMembershipProof] {
         scopeChain(of: scope).compactMap { projector.membershipProof(for: sessionID, in: $0.grant) }
     }
 
-    /// Requires `sessionID` to be a member of the whole chain, else the uniform denial.
+    /// Requires the operation to be permitted to reach `sessionID`, else the uniform denial.
     func requireMember(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
-        guard isMember(sessionID, ofChainFrom: batch.scope) else {
+        guard permitsMember(sessionID, ofChainFrom: batch.scope) else {
             throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
         }
     }
@@ -162,8 +163,10 @@ enum SessionAdminReply {
         let committed = extra[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
             || items.contains { $0.fields[AgentSessionAdminRendering.committedChangesKey] == .bool(true) }
         object["result"] = .string(preview ? "preview" : AgentSessionAdminRendering.mutationResult(
-            statuses: statuses, requiresControl: !requiresControl.isEmpty, committedChanges: committed
+            statuses: statuses, requiresControl: !requiresControl.isEmpty, committedChanges: committed,
+            alreadySatisfied: statuses.count == items.count && extra[AgentSessionAdminRendering.stateSatisfiedKey] == .bool(true)
         ))
+        if object["result"] != .string("applied") { object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey) }
         if committed { object[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
         object["op"] = .string(op)
         object["items"] = .array(items.map(\.value))
@@ -196,6 +199,12 @@ enum SessionAdminReply {
             "The workspace or tab carrier changed before restoration. Inspect the session and resolve conflicting tab identities before retrying undo."
         case "persistence_rejected", "persistence_unconfirmed":
             "The local restore changed state but its workspace save was not acknowledged. Inspect the current session and resolve the save failure; do not blindly repeat the mutation."
+        case "workspace_writer_unavailable":
+            "The groups are readable, but no current workspace writer could accept their order. Ask the user to resolve the workspace's save or duplicate-binding conflict, then inspect the groups again."
+        case "group_state_changed", "group_projection_changed":
+            "The workspace's group carriers or presentation changed while this request ran. Inspect the current group order before submitting another change; any committed_changes reported here remain committed."
+        case "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete":
+            "The workspace owner could not confirm the complete group-order save. Inspect local_changes and committed_changes, resolve the workspace save failure, and read the current order before another mutation."
         case "no_change":
             "No item changed. Inspect current state before choosing another operation."
         default:
@@ -211,6 +220,10 @@ enum SessionAdminReply {
         if code == "target_busy" { result["retryable"] = .bool(true) }
         // Nothing failed, so there is no recovery call to suggest.
         if code == "no_change" { result.removeValue(forKey: "next_call") }
+        if ["workspace_writer_unavailable", "group_state_changed", "group_projection_changed", "group_persistence_rejected", "group_persistence_unconfirmed", "group_save_incomplete"].contains(code) {
+            result.removeValue(forKey: "next_call")
+            result["recovery"] = .string("manual")
+        }
         if let sessionID = sessionIDs.first,
            ["replicated_binding", "ambiguous_binding", "archived_carrier_unavailable", "not_restorable", "not_archived", "compose_flush_rejected", "workspace_changed", "target_changed", "tab_id_conflict", "persistence_rejected", "persistence_unconfirmed"].contains(code)
         {

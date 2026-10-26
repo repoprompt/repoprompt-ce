@@ -88,7 +88,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.isStillAuthorized(lease, scope: batch.scope) else {
+            guard !authorityLost, context.isStillAuthorized(lease, scope: batch.scope, operation: batch.request.operation) else {
                 authorityLost = true
                 items.append(.revoked(target))
                 continue
@@ -98,7 +98,9 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
                 continue
             }
             let context = context
-            let outcome = await effect(target) { context.isStillAuthorized(lease, scope: batch.scope) }
+            let outcome = await effect(target) {
+                context.isStillAuthorized(lease, scope: batch.scope, operation: batch.request.operation)
+            }
             switch outcome {
             case let .applied(changed, fields):
                 items.append(SessionAdminItemResult(
@@ -115,7 +117,10 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
                 ))
             }
         }
-        return SessionAdminReply.batch(op: op, items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview)
+        return SessionAdminReply.batch(
+            op: op, items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview,
+            extra: [AgentSessionAdminRendering.stateSatisfiedKey: .bool(true)]
+        )
     }
 
     // MARK: - Fork
@@ -181,7 +186,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         // The fork exists either way; only joining the scope needs live authority. An incomplete
         // first save cannot become a normal joined-scope success merely because placement can run.
         if creationFailure == nil, context.isStillAuthorized(lease, scope: batch.scope),
-           context.isMember(caller, ofChainFrom: batch.scope)
+           context.isPlacedMember(caller, ofChainFrom: batch.scope)
         {
             do {
                 let commit = try host.commitOrganizationalPlacement(

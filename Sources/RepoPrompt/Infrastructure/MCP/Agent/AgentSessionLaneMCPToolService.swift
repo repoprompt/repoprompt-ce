@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-/// Flat, bounded lane receipts. Allocation refusals never disclose a session ID.
+/// Flat, bounded lane receipts. Failed durable admission never starts a provider.
 enum AgentSessionLaneMCPToolService {
     typealias Destination = AgentSessionLaneDestination
 
@@ -86,7 +86,9 @@ enum AgentSessionLaneMCPToolService {
             let reason = receipt.reason ?? .admissionUnstable
             let hint = switch reason {
             case .destinationUnavailable:
-                "No unambiguous active destination was available, or it changed before allocation. Call manage_workspaces with action=list, open the intended workspace in a window, then retry create_lane with its UUID in workspace if more than one destination remains. No lane was allocated."
+                "No unambiguous active destination was available, or it changed before allocation. Open the intended workspace in the app, then retry create_lane with its UUID in workspace if more than one destination remains. No lane was allocated."
+            case .workspaceAdmissionRejected:
+                "Workspace admission did not complete. Resolve the reported workspace saving or recovery condition in the app. Retry the original idempotency_key only after recovery has completed; requesting scope or changing the key does not repair persistence."
             case .scopeDenied:
                 "The destination was resolved, but a live delegation scope's limit (sessions, depth or worktrees) or an unprovable session placement refused this creation. Lane creation needs no spawn capability. Call session_admin scope_status to see the limiting scope; if placement is unresolved, load or repair the affected sessions before retrying. No lane was allocated."
             case .persistenceUnavailable, .saveFailed:
@@ -111,15 +113,24 @@ enum AgentSessionLaneMCPToolService {
             var fields: [String: Value] = ["result": .string(reason.rawValue), "hint": .string(hint)]
             if case .creationRejected? = receipt.destinationFailure {
                 // The destination was fine; the app refused to create the session. The detail says why.
-                fields["hint"] = .string("The destination resolved, but the app refused to create the lane session; see detail. Retry with a new idempotency_key once that condition clears. No lane was allocated.")
-                fields["retryable"] = .bool(true)
+                fields["hint"] = .string("The destination resolved, but the app refused to create the lane session; see detail. Resolve that condition before retrying the original idempotency_key. No lane was allocated.")
+                fields["retryable"] = .bool(false)
+            }
+            if case let .admissionRejected(failure)? = receipt.destinationFailure {
+                appendAdmissionFailure(failure, to: &fields)
             }
             if let detail = receipt.refusalDetail { fields["detail"] = .string(detail) }
-            fields["subreason"] = .string(reason == .destinationUnavailable ? (receipt.destinationFailure ?? .destinationChanged).subreason : receipt.admissionSubreason ?? reason.rawValue)
+            if fields["subreason"] == nil {
+                fields["subreason"] = .string(reason == .destinationUnavailable ? (receipt.destinationFailure ?? .destinationChanged).subreason : receipt.admissionSubreason ?? reason.rawValue)
+            }
             if let stage = receipt.refusalStage { fields["stage"] = .string(stage) }
-            fields["next_call"] = reason == .destinationUnavailable
-                ? .object(["tool": .string("manage_workspaces"), "arguments": .object(["action": .string("list")])])
-                : .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+            // A recovery call must change the refusing condition. Neither scope discovery nor
+            // workspace listing repairs a save/host failure, and may be absent on this surface.
+            if reason == .denied {
+                fields["next_call"] = .object(["tool": .string("become_overseer"), "arguments": .object([:])])
+            } else if reason == .roleUnavailable {
+                fields["next_call"] = .object(["tool": .string("agent_manage"), "arguments": .object(["op": .string("list_agents")])])
+            }
             return .object(fields)
         }
         var fields: [String: Value] = [
@@ -139,11 +150,50 @@ enum AgentSessionLaneMCPToolService {
             fields["link_reason"] = .string(reason.rawValue)
         }
         if receipt.result == .creationIncomplete, let sessionID = receipt.sessionID {
-            fields["recovery_hint"] = .string(
-                "This key only replays this receipt. Retain \(sessionID.uuidString); after recovery, link it with ordinary add."
-            )
+            if case let .admissionRejected(failure)? = receipt.destinationFailure {
+                appendAdmissionFailure(failure, to: &fields)
+                fields["detail"] = .string(failure.detail)
+                fields["stage"] = .string("workspace_admission")
+                fields["recovery_hint"] = .string(
+                    "This key only replays this receipt. Complete workspace recovery in the app and inspect \(sessionID.uuidString); reuse that session if it remains. Allocate a replacement only after recovery confirms this identity was removed. No provider was started."
+                )
+            } else {
+                fields["recovery_hint"] = .string(
+                    "This key only replays this receipt. Retain \(sessionID.uuidString); after recovery, link it with ordinary add."
+                )
+            }
         }
         return .object(fields)
+    }
+
+    private static func appendAdmissionFailure(_ failure: AgentSessionLaneAdmissionFailure, to fields: inout [String: Value]) {
+        fields["retryable"] = .bool(false)
+        fields["save_result"] = .string(failure.saveResult)
+        fields["failure_category"] = .string(failure.category)
+        fields["working_committed"] = .bool(failure.workingCommitted)
+        fields["subreason"] = .string(failure.reason)
+        if let diagnostic = failure.domainDiagnostic {
+            fields["authority_diagnostic"] = .string(String(diagnostic.prefix(160)))
+        }
+        if let code = failure.domainErrorCode { fields["authority_error"] = .string(code) }
+        guard let retained = failure.retainedAdmission else { return }
+        fields["tab_id"] = .string(retained.identity.tabID.uuidString)
+        fields["workspace_id"] = .string(retained.identity.workspaceID.uuidString)
+        let recoveryState = switch retained.recovery {
+        case .recovered: "recovered"
+        case .alreadyRecovered: "already_recovered"
+        case .localOnly: "local_only"
+        case .ownershipChanged: "ownership_changed"
+        case .retryablePartial: "retryable_partial"
+        case .failed: "failed"
+        case .blockedManual: "blocked_manual"
+        }
+        fields["recovery_state"] = .string(recoveryState)
+        switch retained.recovery {
+        case let .failed(category), let .blockedManual(category):
+            fields["recovery_category"] = .string(category)
+        default: break
+        }
     }
 
     static func render(_ outcome: AgentSessionLaneRetireOutcome) -> Value {

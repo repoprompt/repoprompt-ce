@@ -361,11 +361,12 @@ struct AgentAutoEffortPill: View {
         .hoverTooltip(tooltip, .top)
         .accessibilityLabel("Auto effort")
         .accessibilityValue(tooltip)
-        .confirmationDialog("Enable Auto effort?", isPresented: $showingEnableConfirmation) {
-            Button("Enable Auto effort", action: onToggle)
+        .confirmationDialog("Enable Auto Effort?", isPresented: $showingEnableConfirmation) {
+            Button("Enable Auto Effort", action: onToggle)
+            Button("Privacy details…", action: onOpenSettings)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("For eligible user turns, the selected decision service receives a short, best-effort masked excerpt of your message, the selected model ID, effort choices, and any built-in workflow category. This includes first MCP starts and settled follow-ups, except starts already routed by Model Router. Masking may miss sensitive information. Workflow templates, files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. See Model Router Settings for the selected service's privacy policy.")
+            Text("For eligible turns, your selected decision service receives a short, best-effort masked excerpt of your message, the model ID, available effort levels, and any built-in workflow category. Masking can miss sensitive information. Files, tool results, and earlier conversation aren’t sent.")
         }
     }
 }

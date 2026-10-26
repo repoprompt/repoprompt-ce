@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
+import RepoPromptShared
 
 /// Overseer-only integration point for the independent app-wide profile-isolation work. This does
 /// not move any unrelated app data. Debug never writes the previously mixed/release legacy root.
@@ -25,11 +26,18 @@ enum OverseerLegacyPolicy {
 /// One typed adapter per legacy unit, all sharing one transactional database. Legacy sources are
 /// read-only; malformed/future rows and whole documents are archived, never moved or overwritten.
 final class OverseerContinuityRepository: @unchecked Sendable {
-    /// The only production path seam. When #1381 lands, compose `base` from
-    /// AppProfileLocations.current.applicationSupportRoot (or its filesystem identity),
-    /// for both the database and legacy input. No adapter owns a second path policy.
+    /// The only production path seam. No adapter owns a second profile policy.
+    /// XCTest keeps its private process directory rather than opening user authority.
+    static var productionProfile: String {
+        #if DEBUG
+            "repoprompt-ce-debug-overseer-v1"
+        #else
+            "repoprompt-ce-release-overseer-v1"
+        #endif
+    }
+
     static func production(fileManager: FileManager = .default) -> OverseerContinuityLocations {
-        let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        _ = fileManager // Kept for adapter call-site compatibility; profile locations own the path.
         #if DEBUG
             // An XCTest process must never read or write the signed-in user's real overseer state
             // (grants, links, worktree ownership). Use one private per-process directory instead.
@@ -38,15 +46,13 @@ final class OverseerContinuityRepository: @unchecked Sendable {
                 || NSClassFromString("XCTestCase") != nil
             let base = isUnitTestProcess
                 ? testProcessBase
-                : support.appendingPathComponent("RepoPrompt CE Debug", isDirectory: true)
-            let profile = "repoprompt-ce-debug-overseer-v1"
+                : AppProfileLocations.current.applicationSupportRoot
         #else
-            let base = support.appendingPathComponent("RepoPrompt CE", isDirectory: true)
-            let profile = "repoprompt-ce-release-overseer-v1"
+            let base = AppProfileLocations.current.applicationSupportRoot
         #endif
         return .init(
             databaseURL: base.appendingPathComponent("Overseer/continuity.sqlite"),
-            profile: profile,
+            profile: productionProfile,
             legacyDirectory: base
         )
     }
@@ -181,6 +187,42 @@ final class OverseerContinuityRepository: @unchecked Sendable {
             expiresAt: grant.guardrails.expiresAt,
             payload: encoder.encode(grant)
         )
+    }
+
+    /// Retention only. Decode the owning contracts without opening/migrating a store or
+    /// activating a grant. Unknown/malformed input aborts refresh with prior bytes intact.
+    static func legacyBackingIdentities(_ bytes: Data, kind: OverseerContinuityKind) throws -> OverseerContinuityStore.BackingIdentities {
+        struct Header: Decodable { let version: Int }
+        // Old envelopes may omit clean-shutdown bookkeeping. Read the owning grant
+        // model, not unrelated fields that the live legacy importer also ignores.
+        struct ScopeEnvelope: Decodable { let scopes: [DomainDelegationScopeGrant] }
+        let decoder = JSONDecoder()
+        let version = try decoder.decode(Header.self, from: bytes).version
+        let supported = kind == .scope ? DelegationScopeDocument.currentVersion : 1
+        guard (1 ... supported).contains(version) else { throw OverseerContinuityError.incompatibleSchema(version) }
+        var result = OverseerContinuityStore.BackingIdentities()
+        switch kind {
+        case .scope:
+            for grant in try decoder.decode(ScopeEnvelope.self, from: bytes).scopes {
+                result.sessions.insert(grant.granteeSessionID.uuidString)
+                switch grant.kind {
+                case let .session(id), let .tree(id): result.sessions.insert(id.uuidString)
+                case let .workspace(id): result.workspaces.insert(id.uuidString)
+                case .allSessions: break
+                }
+            }
+        case .link:
+            for link in try decoder.decode(AgentSessionOversightIntentDocument.self, from: bytes).links {
+                result.sessions.insert(link.observerSessionID.uuidString)
+                result.sessions.insert(link.targetSessionID.uuidString)
+            }
+        case .worktree:
+            decoder.dateDecodingStrategy = .iso8601
+            for record in try decoder.decode(WorktreeOwnershipDocument.self, from: bytes).worktrees {
+                if let id = record.createdBySessionID { result.sessions.insert(id.uuidString) }
+            }
+        }
+        return result
     }
 
     private static func legacyRows(_ bytes: Data, kind: OverseerContinuityKind) -> [OverseerLegacyRow] {

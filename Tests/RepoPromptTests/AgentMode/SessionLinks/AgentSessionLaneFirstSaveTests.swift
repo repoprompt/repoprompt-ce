@@ -21,25 +21,48 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         let root: URL
         let workspaceID: UUID
         let selection: AgentSessionLanePolicy.RoleSelection
+        let runtime: MCPDomainRuntime?
     }
 
-    private func withFixture(ephemeral: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
+    private func withFixture(
+        ephemeral: Bool = true,
+        runtimeBacked: Bool = false,
+        _ body: (Fixture) async throws -> Void
+    ) async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("lane-first-save-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let runtime: MCPDomainRuntime?
+        if runtimeBacked {
+            let authority = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "lane-admission",
+                storageDirectory: root.appendingPathComponent("authority", isDirectory: true),
+                workspaceStorageDirectory: root.appendingPathComponent("storage", isDirectory: true),
+                eventDirectory: root.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: root.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await authority.start()
+            runtime = authority
+        } else {
+            runtime = nil
+        }
         let previousStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
         if !ephemeral {
             UserDefaults.standard.set(root.appendingPathComponent("storage").path, forKey: "GlobalCustomStorageURL")
         }
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = runtime.map { WindowState(domainRuntime: $0) } ?? WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let cleanup: @MainActor () async -> Void = {
             window.beginClose()
+            await window.domainWorkspacePresentationBridgeForTesting?.stopAndJoinForTesting()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            if let runtime { _ = await runtime.shutdown() }
             if !ephemeral {
                 await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
                 if let previousStoragePath {
@@ -52,18 +75,31 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
         do {
             await window.workspaceManager.awaitInitialized()
-            let workspace = window.workspaceManager.createWorkspace(
-                name: "Lane first save \(UUID().uuidString.prefix(8))",
-                repoPaths: [root.path], ephemeral: ephemeral
-            )
-            await window.workspaceManager.switchWorkspace(
+            let workspace: WorkspaceModel
+            if runtimeBacked {
+                let creation = try window.workspaceManager.createPersistentWorkspace(
+                    name: "Lane first save \(UUID().uuidString.prefix(8))", repoPaths: [root.path]
+                )
+                workspace = try await creation.publishedWorkspace()
+            } else {
+                workspace = window.workspaceManager.createWorkspace(
+                    name: "Lane first save \(UUID().uuidString.prefix(8))",
+                    repoPaths: [root.path], ephemeral: ephemeral
+                )
+            }
+            let switched = await window.workspaceManager.switchWorkspace(
                 to: workspace, saveState: false, reason: "laneFirstSaveTest"
             )
+            if runtimeBacked, !switched.didSwitch {
+                XCTFail(switched.message ?? "The authority-backed fixture workspace did not activate")
+                throw CancellationError()
+            }
             let selection = try AgentSessionLanePolicy.resolveRole(
                 "pair", availability: .current, workspaceID: workspace.id
             )
             try await body(Fixture(
-                window: window, root: root, workspaceID: workspace.id, selection: selection
+                window: window, root: root, workspaceID: workspace.id, selection: selection,
+                runtime: runtime
             ))
         } catch {
             await cleanup()
@@ -96,10 +132,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         return previous
     }
 
-    private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
+    private func withSecondRegisteredWindow(
+        domainRuntime: MCPDomainRuntime? = nil,
+        _ body: (WindowState) async throws -> Void
+    ) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = domainRuntime.map { WindowState(domainRuntime: $0) } ?? WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         do {
@@ -230,7 +269,20 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 "op": .string("fork"), "session_id": .string(creatorID.uuidString), "idempotency_key": .string("limited-fork")
             ])
             XCTAssertEqual(forkRefusal.objectValue?["code"]?.stringValue, "placement_unresolved", "A capacity-proof refusal must not claim that session_admin disappeared")
+            XCTAssertNil(forkRefusal.objectValue?["next_call"], "Placement has no executable repair")
             XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.count, count)
+
+            // Live regression: with Overseer full access the same legacy limited grant and incomplete
+            // census no longer refuse; the identical create_lane allocates through the real bridge.
+            let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+            OverseerGlobalAutoApprove.isEnabled = { true }
+            defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+            let overridden = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "limited-full-access", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Full access lane", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: fixture.workspaceID.uuidString, callerWindowID: endpoint.windowID, callerWorkspaceID: endpoint.workspaceID) }
+            )
+            XCTAssertEqual(overridden.result, .created, "Full access must not be refused by delegated placement accounting: \(overridden)")
         }
     }
 
@@ -300,6 +352,315 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
 
     func testActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
         try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
+    }
+
+    func testFirstLaneAwaitsFullDocumentAdoptionBeforeProvisionalBinding() async throws {
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+        try await withFixture(ephemeral: false, runtimeBacked: true) { fixture in
+            let runtime = try XCTUnwrap(fixture.runtime)
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+            let manager = fixture.window.workspaceManager
+            let bridge = try XCTUnwrap(fixture.window.domainWorkspacePresentationBridgeForTesting)
+            let refreshed = await bridge.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            let beforeValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let before = try XCTUnwrap(beforeValue)
+            var peer = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
+            peer.name = "Peer document before admission"
+            let peerDocument = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: before.document.fileURL)
+
+            let projectionParked = expectation(description: "Peer document decoded before local adoption")
+            var allowPreparation = false
+            var releasePreparation: CheckedContinuation<Void, Never>?
+            bridge.catalogPreparationDidFinishForTesting = { _ in
+                guard !allowPreparation, releasePreparation == nil else { return }
+                await withCheckedContinuation { continuation in
+                    releasePreparation = continuation
+                    projectionParked.fulfill()
+                }
+            }
+            defer {
+                allowPreparation = true
+                bridge.catalogPreparationDidFinishForTesting = nil
+                releasePreparation?.resume()
+                releasePreparation = nil
+            }
+            let peerClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -990)
+            let peerSave = try await peerClient.saveFailClosed(
+                peerDocument, expectedWorkspaceRevision: before.revisions.workingRevision,
+                expectedContentDigest: before.document.contentDigest
+            )
+            XCTAssertEqual(peerSave.saved?.disposition, .applied)
+            await fulfillment(of: [projectionParked], timeout: 10)
+
+            var awaitedBeforeBinding = false
+            let admissionWorkspaceID = fixture.workspaceID
+            manager.installDomainCatalogRefresh(
+                request: { [weak bridge] in bridge?.requestCatalogRefresh(isRetry: $0) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge, weak manager] in
+                    guard let manager else { return false }
+                    awaitedBeforeBinding = true
+                    XCTAssertFalse(manager.hasAdoptedFullDocumentBaseline(
+                        workspaceID: admissionWorkspaceID, contentDigest: peerDocument.contentDigest
+                    ))
+                    XCTAssertFalse(manager.workspace(withID: admissionWorkspaceID)?.composeTabs.contains {
+                        $0.name == "Initial witness lane"
+                    } ?? false, "Complete adoption must precede the provisional binding")
+                    allowPreparation = true
+                    releasePreparation?.resume()
+                    releasePreparation = nil
+                    return await bridge?.refreshForAgentAdmission() ?? false
+                }
+            )
+            let lane = try await createLinkedLane(
+                fixture: fixture, overseer: linked, name: "Initial witness lane",
+                idempotencyKey: "initial-document-witness", omitWorkspaceSelector: true
+            )
+            XCTAssertTrue(awaitedBeforeBinding)
+            let savedValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let saved = try XCTUnwrap(savedValue)
+            XCTAssertNil(saved.revisions.dirtyRevision)
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+            XCTAssertEqual(canonical.name, peer.name)
+            XCTAssertEqual(canonical.composeTabs.filter { $0.activeAgentSessionID == lane.sessionID }.map(\.id), [lane.tabID])
+        }
+    }
+
+    func testSameWorkspacePeerSaveReconcilesAndCreatesTheSameProvisionalLane() async throws {
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+        try await withFixture(ephemeral: false, runtimeBacked: true) { fixture in
+            let runtime = try XCTUnwrap(fixture.runtime)
+            let linked = try await makeLinkedOverseer(fixture: fixture)
+            defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+            try await withSecondRegisteredWindow(domainRuntime: runtime) { peer in
+                let peerBridge = try XCTUnwrap(peer.domainWorkspacePresentationBridgeForTesting)
+                let peerObserver = DomainWorkspaceProjectionObserver(bridge: peerBridge)
+                let catalog = await runtime.workspaceStore.snapshot()
+                let peerReady = await peerObserver.waitForProjection(
+                    afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                )
+                _ = try XCTUnwrap(peerReady)
+                let shared = try XCTUnwrap(peer.workspaceManager.workspace(withID: fixture.workspaceID))
+                let switched = await peer.workspaceManager.switchWorkspace(to: shared, saveState: false, reason: "laneAdmissionPeer")
+                XCTAssertTrue(switched.didSwitch)
+                let peerBaseline = await peer.workspaceManager.pollAndSaveStateWithOutcomeAsync(workspaceID: shared.id)
+                XCTAssertTrue(peerBaseline.acceptedForLifecycleAdmission, "\(peerBaseline)")
+
+                let manager = fixture.window.workspaceManager
+                let ownerBridge = try XCTUnwrap(fixture.window.domainWorkspacePresentationBridgeForTesting)
+                let ownerObserver = DomainWorkspaceProjectionObserver(bridge: ownerBridge)
+                var provisional: (tabID: UUID, sessionID: UUID)?
+                var interposed = false
+                let peerTab = ComposeTabState(name: "Peer ordinary edit", promptText: "Keep the peer's saved draft")
+                let interpose: @MainActor @Sendable (UUID) async -> Void = { workspaceID in
+                    guard workspaceID == fixture.workspaceID, !interposed,
+                          let fresh = manager.workspace(withID: workspaceID)?.composeTabs.first(where: { $0.name == "Contended first lane" }),
+                          let sessionID = fresh.activeAgentSessionID,
+                          let peerIndex = peer.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
+                    else { return }
+                    interposed = true
+                    provisional = (fresh.id, sessionID)
+                    let beforeProjection = ownerBridge.projectionObservationStateForTesting.generation
+                    peer.workspaceManager.workspaces[peerIndex].name = "Peer saved workspace name"
+                    peer.workspaceManager.workspaces[peerIndex].composeTabs.append(peerTab)
+                    peer.workspaceManager.markWorkspaceDirty(workspaceID: workspaceID)
+                    let peerSave = await peer.workspaceManager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID)
+                    XCTAssertTrue(peerSave.acceptedForLifecycleAdmission, "\(peerSave)")
+                    let published = await runtime.workspaceStore.snapshot()
+                    let applied = await ownerObserver.waitForProjection(
+                        afterGeneration: beforeProjection, through: published.publicationSequence,
+                        requireCatalogApplication: true
+                    )
+                    XCTAssertNotNil(applied, "The stale save must resume after the real peer projection wins")
+                }
+                manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(interpose)
+                defer { manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil) }
+
+                let lane = try await createLinkedLane(
+                    fixture: fixture, overseer: linked, name: "Contended first lane",
+                    idempotencyKey: "same-workspace-conflict", omitWorkspaceSelector: true
+                )
+                let original = try XCTUnwrap(provisional)
+                XCTAssertTrue(interposed)
+                XCTAssertEqual(lane.tabID, original.tabID)
+                XCTAssertEqual(lane.sessionID, original.sessionID, "Convergence must not allocate a replacement identity")
+                let savedValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+                let saved = try XCTUnwrap(savedValue)
+                XCTAssertNil(saved.revisions.dirtyRevision)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: saved.document.fileURL))
+                for document in [canonical, disk] {
+                    XCTAssertEqual(document.name, "Peer saved workspace name")
+                    XCTAssertEqual(document.composeTabs.first { $0.id == peerTab.id }?.promptText, peerTab.promptText)
+                    XCTAssertEqual(document.composeTabs.filter { $0.activeAgentSessionID == lane.sessionID }.map(\.id), [lane.tabID])
+                    XCTAssertEqual(document.composeTabs.count(where: { $0.name == "Contended first lane" }), 1)
+                }
+                let session = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[lane.tabID])
+                XCTAssertNil(session.runID)
+                XCTAssertTrue(session.items.isEmpty)
+            }
+        }
+    }
+
+    private actor SavedPhaseInterposition {
+        private var claimed = false
+
+        func claim() -> Bool {
+            guard !claimed else { return false }
+            claimed = true
+            return true
+        }
+    }
+
+    func testPartiallyCommittedLaneUsesRecoveryWithoutAdmissionReplay() async throws {
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+        try await withFixture(ephemeral: false, runtimeBacked: true) { fixture in
+            let runtime = try XCTUnwrap(fixture.runtime)
+            let manager = fixture.window.workspaceManager
+            let bridge = try XCTUnwrap(fixture.window.domainWorkspacePresentationBridgeForTesting)
+            let initialSave = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: fixture.workspaceID)
+            XCTAssertTrue(initialSave.acceptedForLifecycleAdmission, "\(initialSave)")
+            var convergenceRefreshes = 0
+            manager.installDomainCatalogRefresh(
+                request: { [weak bridge] in bridge?.requestCatalogRefresh(isRetry: $0) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge] in
+                    convergenceRefreshes += 1
+                    return await bridge?.refreshForAgentAdmission() ?? false
+                }
+            )
+            var admissionReceipt: AgentAdmissionPersistenceReceipt?
+            fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting { _, receipt in
+                admissionReceipt = receipt
+                XCTAssertEqual(convergenceRefreshes, 0, "A partial canonical commit must bypass the pre-commit replay path")
+            }
+            defer { fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil) }
+            let interposition = SavedPhaseInterposition()
+            let admissionWorkspaceID = fixture.workspaceID
+            await runtime.workspaceStore.testSetBeforeSavedPersistence { workspaceID in
+                guard workspaceID == admissionWorkspaceID else { return }
+                do {
+                    let currentValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+                    let current = try XCTUnwrap(currentValue)
+                    var peer = try JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes)
+                    guard peer.composeTabs.contains(where: { $0.name == "Partial lane" }),
+                          await interposition.claim()
+                    else { return }
+                    peer.name = "Peer working revision"
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = .sortedKeys
+                    let document = try DomainWorkspaceDocument.decode(
+                        documentBytes: encoder.encode(peer), fileURL: current.document.fileURL
+                    )
+                    let outcome = await runtime.workspaceStore.execute(.init(
+                        operationID: UUID(), expectedWorkspaceRevision: current.revisions.workingRevision,
+                        conflictRecoveryPolicy: .failClosed, origin: .appPresentation(windowID: -991),
+                        command: .replaceWorkingDocument(document)
+                    ))
+                    XCTAssertEqual(outcome.disposition, .applied)
+                } catch {
+                    XCTFail("Could not interpose the real working commit: \(error)")
+                }
+            }
+            do {
+                _ = try await fixture.window.agentModeViewModel.mcpCreateOversightLane(
+                    creatorSessionID: UUID(), sessionName: "Partial lane", selection: fixture.selection,
+                    expectedWorkspaceID: fixture.workspaceID
+                )
+                XCTFail("The lost save phase must not publish a successful lane")
+            } catch {
+                // The typed host rejection is expected; the receipt below proves its persistence phase.
+            }
+            await runtime.workspaceStore.testSetBeforeSavedPersistence(nil)
+            let receipt = try XCTUnwrap(admissionReceipt)
+            XCTAssertTrue(receipt.outcome.workingCommitted)
+            XCTAssertEqual(receipt.outcome.domainErrorCode, .stateConflict)
+            XCTAssertEqual(receipt.outcome.domainDiagnostic, "durable_save_revision_mismatch")
+            guard case .canonicalWorking = receipt.commitEvidence else {
+                return XCTFail("The exact provisional identity must be routed through canonical recovery")
+            }
+        }
+    }
+
+    func testCancelledLaneRetainsSavedIdentityWhenRecoveryIsBlocked() async throws {
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+        try await withFixture(ephemeral: false, runtimeBacked: true) { fixture in
+            let runtime = try XCTUnwrap(fixture.runtime)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            var capturedIdentity: AgentProvisionalAdmissionIdentity?
+            prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting { identity, receipt in
+                capturedIdentity = identity
+                guard case .saved = receipt.commitEvidence else {
+                    return XCTFail("Cancellation must occur after the real durable binding save")
+                }
+                // Cancel the creation task itself at the real persistence boundary. The test
+                // task remains live to inspect the result and explicitly complete recovery.
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+            manager.setAgentAdmissionRecoveryFailureCategoryHandlerForTesting { _ in .authorityReadOnly }
+            let cleanup: @MainActor () async -> Void = {
+                prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil)
+                manager.setAgentAdmissionRecoveryFailureCategoryHandlerForTesting(nil)
+                if let identity = capturedIdentity {
+                    _ = await manager.retryRetainedProvisionalAgentAdmissionRecovery(recoveryID: identity.recoveryID)
+                }
+            }
+            do {
+                let creation = Task { @MainActor in
+                    try await fixture.window.agentModeViewModel.mcpCreateOversightLane(
+                        creatorSessionID: UUID(), sessionName: "Retained cancelled lane",
+                        selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+                    )
+                }
+                var admissionFailure: AgentSessionLaneAdmissionFailure?
+                do {
+                    _ = try await creation.value
+                    XCTFail("A retained cancelled admission cannot publish a usable lane")
+                } catch let AgentSessionLaneDestinationFailure.admissionRejected(failure) {
+                    admissionFailure = failure
+                } catch {
+                    XCTFail("Cancellation lost the retained admission evidence: \(error)")
+                }
+                let failure = try XCTUnwrap(admissionFailure)
+                let retained = try XCTUnwrap(failure.retainedAdmission)
+                let identity = try XCTUnwrap(capturedIdentity)
+                XCTAssertEqual(retained.identity, identity)
+                XCTAssertEqual(retained.recovery, .blockedManual(WorkspacePersistenceFailureCategory.authorityReadOnly.rawValue))
+                XCTAssertTrue(failure.workingCommitted)
+                XCTAssertEqual(WorkspaceAgentAdmissionCoordinator.shared.activeCount(for: fixture.workspaceID), 0)
+                XCTAssertTrue(manager.debugAgentAdmissionRecoveryOwns(identity))
+
+                let snapshotValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+                let snapshot = try XCTUnwrap(snapshotValue)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: snapshot.document.fileURL))
+                for workspace in [canonical, disk] {
+                    XCTAssertEqual(workspace.composeTabs.filter { $0.activeAgentSessionID == identity.sessionID }.map(\.id), [identity.tabID])
+                }
+                let session = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[identity.tabID])
+                XCTAssertEqual(session.activeAgentSessionID, identity.sessionID)
+                XCTAssertNil(session.runID)
+                XCTAssertTrue(session.items.isEmpty)
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+            if let identity = capturedIdentity {
+                XCTAssertFalse(manager.debugAgentAdmissionRecoveryOwns(identity))
+            }
+        }
     }
 
     private func exerciseActivatedFirstLaneFromAnotherWindow(toolbar: Bool) async throws {
@@ -2081,7 +2442,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         fixture: Fixture,
         overseer: LinkedOverseer,
         name: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        omitWorkspaceSelector: Bool = false
     ) async throws -> (sessionID: UUID, tabID: UUID) {
         let catalog = AgentAdvertisedModelCatalog.shared
         catalog.record([
@@ -2100,10 +2462,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             observerEndpoint: overseer.endpoint,
             request: AgentSessionLaneCreateRequest(
                 idempotencyKey: idempotencyKey, role: nil, modelID: "claudeCode:sonnet:high",
-                sessionName: name, workspaceSelector: workspace.id.uuidString,
+                sessionName: name, workspaceSelector: omitWorkspaceSelector ? nil : workspace.id.uuidString,
                 message: nil, workflowReference: nil
             ),
-            resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: workspace.id, workspaceName: workspace.name)) }
+            resolveDestination: {
+                AgentSessionLaneMCPToolService.resolveDestination(
+                    workspaceSelector: omitWorkspaceSelector ? nil : workspace.id.uuidString,
+                    callerWindowID: fixture.window.windowID, callerWorkspaceID: workspace.id
+                )
+            }
         )
         guard receipt.result == .created, receipt.linked, let sessionID = receipt.sessionID else {
             XCTFail("linked lane creation refused: \(String(describing: receipt.reason))")

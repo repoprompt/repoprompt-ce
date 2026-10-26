@@ -258,6 +258,7 @@ package struct MCPDomainProtectedMutationToolProvider {
             return result
         case let .execute(ticket):
             let commitState = DomainMutationCommitState()
+            let backendOwnsCommitFence = Self.backendOwnsCommitFence(operation)
             let admissionState = DomainMutationPhysicalAdmissionState(
                 operation: operation,
                 securityContext: securityContext,
@@ -272,8 +273,14 @@ package struct MCPDomainProtectedMutationToolProvider {
                     try await admissionState.admit(paths: paths, rootMappings: mappings)
                 },
                 physicalMutationGuard: {
-                    guard await commitState.hasBegunCommit() else { return nil }
-                    return try await admissionState.physicalMutationGuard()
+                    if await commitState.hasBegunCommit() {
+                        return try await admissionState.physicalMutationGuard()
+                    }
+                    // A backend that owns its commit fence evaluates admitted targets (and spawns
+                    // its final command) before reaching that fence; expose the admitted path
+                    // fence for revalidation without beginning the commit.
+                    guard backendOwnsCommitFence else { return nil }
+                    return try await admissionState.admittedPhysicalMutationGuard()
                 },
                 physicalMutationCapability: {
                     try await admissionState.physicalMutationCapability()
@@ -302,6 +309,20 @@ package struct MCPDomainProtectedMutationToolProvider {
                 return result
             } catch let error as DomainProtectedMutationError {
                 throw error
+            } catch let refusal as DomainMutationRefusedBeforeEffects {
+                do {
+                    try await Task.detached(priority: .utility) {
+                        try await journal.finishRefusedBeforeEffects(ticket)
+                    }.value
+                    MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+                } catch {
+                    // No effects occurred, but durable settlement could not be confirmed.
+                    MCPDomainProtectedMutationSettlementContext.report(.unknown, operationID: operationID)
+                    throw MCPError.internalError(
+                        "No backend effects occurred, but durable refusal settlement could not be confirmed. Inspect operation ID \(operationID) before retrying."
+                    )
+                }
+                throw refusal.underlying
             } catch {
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if didBeginCommit {
@@ -353,13 +374,22 @@ package struct MCPDomainProtectedMutationToolProvider {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
-        if operation.toolName == "manage_worktree" {
+        // Physical worktree operations resolve selectors (including absolute bound-worktree
+        // paths) in the backend. Authorize their canonical mapping at physical admission,
+        // not the untrusted spelling here. Non-physical operations retain this scope check.
+        if operation.toolName == "manage_worktree", !requiresPhysicalAdmission(operation) {
             insertAbsoluteRoot(
                 arguments["repo_root"]?.stringValue?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
         return roots
+    }
+
+    /// Operations whose backend invokes `willCommit` from its own final pre-mutation fence, after
+    /// deterministic preconditions, rather than before invoking the backend.
+    private static func backendOwnsCommitFence(_ operation: DomainProtectedMutationOperation) -> Bool {
+        operation.toolName == "manage_worktree" && operation.action == "create"
     }
 
     private static func requiresPhysicalAdmission(_ operation: DomainProtectedMutationOperation) -> Bool {
@@ -433,7 +463,9 @@ package struct MCPDomainProtectedMutationToolProvider {
     /// The label is safe to log; it never contains user content, file paths, or message text.
     private static func errorCategory(for error: Error?) -> String {
         guard let error else { return "cancelled" }
-        if MCPToolExecutionCancelledError.matches(error) { return "cancelled" }
+        if MCPToolExecutionCancelledError.matches(error) {
+            return "cancelled"
+        }
         switch error {
         case is DomainMutationPolicyError:
             return "policyError"
@@ -554,6 +586,12 @@ private actor DomainMutationPhysicalAdmissionState {
             try await DomainMutationPathFence.revalidate(pathFence)
         }
         try await journal.markCommitting(ticket)
+    }
+
+    /// The guard for already-admitted targets, or `nil` before any admission.
+    func admittedPhysicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {
+        guard pathFence != nil else { return nil }
+        return try physicalMutationGuard()
     }
 
     func physicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {

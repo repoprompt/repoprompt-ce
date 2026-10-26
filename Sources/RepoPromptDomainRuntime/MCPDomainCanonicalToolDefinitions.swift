@@ -1130,6 +1130,38 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseOracleImageAttachments)
             .map(advertiseWorktreeListPagination)
             .map(advertiseSessionDiscovery)
+            .map(advertiseAgentControlTaskRoles)
+    }
+
+    private static func advertiseAgentControlTaskRoles(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.agentRun || definition.name == MCPWindowToolName.agentManage,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"],
+              case var .object(modelID)? = properties["model_id"]
+        else { return definition }
+
+        let disclosure = "**App-backed sessions:** a compound `model_id` pins the exact target but assigns no task role to a fresh session, and `agent_explore` requires an `engineer`, `pair`, or `design` task role; start a child that will need Explore helpers with one of those role labels. To run a role on a specific model, set that role's default."
+        var description = definition.description
+        if definition.name == MCPWindowToolName.agentRun {
+            description = description
+                .replacingOccurrences(of: "effective global role-default mapping", with: "effective workspace or global role defaults")
+                .replacingOccurrences(of: "global role-default mapping", with: "effective workspace or global role defaults")
+                .replacingOccurrences(of: "\n\n**Parallel agents**:", with: "\n\n\(disclosure)\n\n**Parallel agents**:")
+            modelID["description"] = .string("[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via effective workspace or global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted. A compound model_id assigns no task role; see the tool description.")
+        } else {
+            let selectionDescription = disclosure.replacingOccurrences(
+                of: "a compound `model_id` pins the exact target but assigns no task role to a fresh session",
+                with: "on `create_session`, a compound `model_id` pins the exact target but assigns no task role to a fresh session"
+            ) + " Parented MCP sub-agents cannot use `create_session` or `resume_session`, whatever their role. On `resume_session`, a matching MCP control context keeps its task role even if `model_id` is supplied; otherwise a role label installs that role, and an omitted or compound `model_id` installs none."
+            description = description.replacingOccurrences(of: "\n\n**Operations**:", with: "\n\n\(selectionDescription)\n\n**Operations**:")
+            modelID["description"] = .string("[create_session, resume_session] Role label from list_agents task_labels (explore, engineer, pair, design — resolved via effective workspace or global role defaults), or an explicit compound model_id from list_agents agents[].models[].model_id. On create_session, a compound model_id assigns no task role. On resume_session, a matching MCP control context keeps its task role even if model_id is supplied; otherwise an omitted or compound model_id installs none. See the tool description.")
+        }
+        properties["model_id"] = .object(modelID)
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name, description: description, inputSchema: .object(schema),
+            annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+        )
     }
 
     private static func advertiseSessionDiscovery(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
@@ -1227,14 +1259,14 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
-    /// The vendored `ask_oracle` definition predates Oracle image attachments, so
+    /// The vendored Oracle send definitions predate image attachments, so
     /// canonicalization advertises the app-backend `images` contract here instead of
     /// re-vendoring the blob. The direct headless backend cannot resolve workspace
     /// images and rejects the argument at execution time rather than dropping it.
     private static func advertiseOracleImageAttachments(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        guard definition.name == MCPWindowToolName.askOracle,
+        guard [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend].contains(definition.name),
               case var .object(schema) = definition.inputSchema,
               case var .object(properties)? = schema["properties"],
               properties["images"] == nil
@@ -1264,7 +1296,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         schema["properties"] = .object(properties)
 
         var description = definition.description
-        let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."
+        let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."
         if !description.contains(imageUsage) {
             description += "\n\n\(imageUsage)"
         }
@@ -2270,6 +2302,46 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Extend the served wait contract without changing the historical schema migration anchors.
+    private enum AgentSessionLinkWaitCursorMigration {
+        static let description = AgentSessionLinkOverseerActivationGuidance.description.replacingOccurrences(
+            of: "- `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned. A multi-target result omits targets that became unavailable while waiting and lists them in `unavailable_session_ids`; refresh `list` before using them.",
+            with: "- `wait`: pass returned `wait_cursor` strings in `cursors`, without session IDs. Wait for change, idle, or sendable; managed prompts may appear. Unavailable targets are omitted and named in `unavailable_session_ids`; refresh `list` before using them."
+        )
+
+        static let inputSchema: Value = {
+            guard case var .object(schema) = AgentSessionLinkModelSelectionMigration.inputSchema,
+                  case var .object(properties)? = schema["properties"],
+                  case var .object(cursors)? = properties["cursors"],
+                  let previousItems = cursors["items"],
+                  case let .string(summary)? = schema["description"]
+            else { preconditionFailure("agent_session_link cursor migration requires the prior wait schema") }
+            cursors["description"] = .string("[wait] Returned wait_cursor strings and/or {session_id, cursor} records; max 32, no duplicate targets. No separate IDs required.")
+            cursors["items"] = .object([
+                "anyOf": .array([.object(["type": .string("string")]), previousItems])
+            ])
+            properties["cursors"] = .object(cursors)
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(summary.replacingOccurrences(
+                of: "wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.",
+                with: "wait: cursors alone, or session_id/session_ids with cursor(s)?; until?; timeout_seconds? Local input cancels older waits."
+            ))
+            return .object(schema)
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkOverseerActivationGuidance.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private enum AgentSessionLinkAutonomyContractState: String {
         case historicalIncomingOnly
         case historicalAutomatic
@@ -2475,10 +2547,66 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Wording-only projection. Keep prior migration anchors and every schema/authority unchanged.
+    private enum AgentSessionLinkDirectionGuidanceMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkWaitCursorMigration.description
+            let replacements = [
+                (
+                    "- `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: \"when_sendable\"`.",
+                    "- `send`: `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`; exact Manage grants use task framing."
+                ),
+                (
+                    "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.",
+                    "- `steer`: [manage] assign/resume, even idle; new `idempotency_key`. Pending prompts block steering. ACP live steering is supported."
+                )
+            ]
+            return replacements.reduce(previous) { text, replacement in
+                guard let revised = replacingOneExactLine(
+                    in: text, replacements: [(from: replacement.0, to: replacement.1)]
+                ) else { preconditionFailure("Expected one exact direction-guidance anchor") }
+                return revised
+            }
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description
+                && definition.inputSchema == AgentSessionLinkWaitCursorMigration.inputSchema
+        }
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkWaitCursorMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: definition.inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
+        if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) {
+            return definition
+        }
+        return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) {
+            return definition
+        }
+        return AgentSessionLinkWaitCursorMigration.applying(to: canonicalizeAgentSessionLinkBeforeWaitCursors(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeWaitCursors(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
         }
@@ -2489,7 +2617,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
+        !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+            && !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
+            && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
@@ -2513,7 +2643,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLinkBeforeRefusalSubreason(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkStopMigration.isCurrent(definition) {
             return AgentSessionLinkLaneOperationsMigration.apply(definition)
         }
@@ -2618,7 +2750,9 @@ package enum MCPDomainCanonicalToolDefinitions {
                     "agent_session_link canonical definition only partially carries request_attention"
                 )
             }
-            if descriptionWithCurrentList == definition.description { return definition }
+            if descriptionWithCurrentList == definition.description {
+                return definition
+            }
             return MCPDomainToolDefinition(
                 name: definition.name,
                 description: descriptionWithCurrentList,
@@ -2834,8 +2968,12 @@ package enum MCPDomainCanonicalToolDefinitions {
            queueClauseCount == 1,
            retiredTokenCount == 1
         {
-            if incomingOnlyCount == 1, automaticCount == 0 { return .historicalIncomingOnly }
-            if incomingOnlyCount == 0, automaticCount == 1 { return .historicalAutomatic }
+            if incomingOnlyCount == 1, automaticCount == 0 {
+                return .historicalIncomingOnly
+            }
+            if incomingOnlyCount == 0, automaticCount == 1 {
+                return .historicalAutomatic
+            }
             return .partial
         }
 
@@ -2890,6 +3028,14 @@ package enum MCPDomainCanonicalToolDefinitions {
 
         package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
             canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
+        }
+
+        package static func test_agentSessionLinkBeforeDirectionGuidanceDefinition() -> MCPDomainToolDefinition {
+            canonicalizeAgentSessionLinkBeforeDirectionGuidance(test_agentSessionLinkLegacyCurrentDefinition())
+        }
+
+        package static func test_agentSessionLinkPreviousCursorDefinition() -> MCPDomainToolDefinition {
+            canonicalizeAgentSessionLinkBeforeWaitCursors(test_agentSessionLinkLegacyCurrentDefinition())
         }
 
         package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {

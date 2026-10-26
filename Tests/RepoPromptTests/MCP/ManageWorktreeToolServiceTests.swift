@@ -297,6 +297,106 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
         XCTAssertEqual(probe.grantChecks, [targetSessionID])
     }
 
+    func testBindingAuthorityRetainsOriginalGrantInsteadOfAdoptingReplacement() async throws {
+        try await withWindow { window in
+            let observer = self.endpoint(sessionID: self.callerSessionID)
+            var generation = 1
+            var acquisitions = 0
+            let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+                targetSessionID: self.targetSessionID,
+                metadata: MCPRequestMetadata(connectionID: nil, clientName: nil, windowID: window.windowID, runPurpose: .agentModeRun),
+                targetWindow: window,
+                resolveSpawnParentSessionID: { _, _ in self.callerSessionID },
+                resolveObserverEndpoint: { _, _ in observer },
+                resolveTargetProvenance: { .known(targetSessionID: $0, parentSessionID: nil) },
+                hasManageGrant: { _, target in
+                    acquisitions += 1
+                    let capturedGeneration = generation
+                    return .init(revalidate: {
+                        guard generation == capturedGeneration else {
+                            throw AgentSessionTargetOperationGuard.denialError(sessionID: target)
+                        }
+                    })
+                }
+            )
+            try await authority.revalidate()
+            // The same UUIDs now have a replacement grant. It must not revive this operation.
+            generation += 1
+            await self.assertUniformDenial { try await authority.revalidate() }
+            XCTAssertEqual(acquisitions, 1)
+        }
+    }
+
+    func testDisablingFullAccessPreservesIndependentSpawnParentAuthorityOnly() async throws {
+        try await withWindow { window in
+            for isParent in [true, false] {
+                var fullAccess = true
+                let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+                scopes.isGlobalAutoApproveEnabled = { fullAccess }
+                let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+                    targetSessionID: self.targetSessionID,
+                    metadata: MCPRequestMetadata(connectionID: nil, clientName: nil, windowID: window.windowID, runPurpose: .agentModeRun),
+                    targetWindow: window,
+                    resolveSpawnParentSessionID: { _, _ in self.callerSessionID },
+                    resolveObserverEndpoint: { _, _ in nil },
+                    resolveTargetProvenance: { .known(targetSessionID: $0, parentSessionID: isParent ? self.callerSessionID : nil) },
+                    hasManageGrant: { _, _ in XCTFail("Full access must not acquire a link")
+                        return nil
+                    },
+                    authorizationEngine: scopes.authorization
+                )
+                fullAccess = false
+                var published = false
+                if isParent {
+                    try await authority.revalidate()
+                    try authority.commit { published = true }
+                    XCTAssertTrue(published)
+                } else {
+                    await self.assertUniformDenial { try await authority.revalidate() }
+                    XCTAssertThrowsError(try authority.commit { published = true })
+                    XCTAssertFalse(published)
+                }
+            }
+        }
+    }
+
+    func testDisablingFullAccessPreservesCapturedManageLink() async throws {
+        try await withWindow { window in
+            var fullAccess = true
+            var linkLive = true
+            var acquisitions = 0
+            let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            scopes.isGlobalAutoApproveEnabled = { fullAccess }
+            let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+                targetSessionID: self.targetSessionID,
+                metadata: MCPRequestMetadata(connectionID: nil, clientName: nil, windowID: window.windowID, runPurpose: .agentModeRun),
+                targetWindow: window,
+                resolveSpawnParentSessionID: { _, _ in self.callerSessionID },
+                resolveObserverEndpoint: { _, _ in self.endpoint(sessionID: self.callerSessionID) },
+                resolveTargetProvenance: { .known(targetSessionID: $0, parentSessionID: nil) },
+                hasManageGrant: { _, _ in
+                    acquisitions += 1
+                    return .init(revalidate: {
+                        guard linkLive else { throw AgentSessionTargetOperationGuard.denialError(sessionID: self.targetSessionID) }
+                    }, commit: { body in
+                        guard linkLive else { throw AgentSessionTargetOperationGuard.denialError(sessionID: self.targetSessionID) }
+                        try body()
+                    })
+                },
+                authorizationEngine: scopes.authorization
+            )
+            fullAccess = false
+            try await authority.revalidate()
+            var published = false
+            try authority.commit { published = true }
+            XCTAssertTrue(published)
+            linkLive = false
+            await self.assertUniformDenial { try await authority.revalidate() }
+            XCTAssertThrowsError(try authority.commit {})
+            XCTAssertEqual(acquisitions, 1)
+        }
+    }
+
     func testUnrelatedAgentSessionIsDeniedWithUniformNotFound() async throws {
         try await withWindow { window in
             // Linked without management (or not linked at all), and not the spawn parent.
@@ -352,7 +452,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
         managedTargets: Set<UUID> = [],
         probe: Probe = Probe()
     ) async throws {
-        try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+        _ = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
             targetSessionID: targetSessionID,
             metadata: MCPRequestMetadata(
                 connectionID: nil,
@@ -369,7 +469,8 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             },
             hasManageGrant: { endpoint, sessionID in
                 probe.grantChecks.append(sessionID)
-                return endpoint == observer && managedTargets.contains(sessionID)
+                guard endpoint == observer, managedTargets.contains(sessionID) else { return nil }
+                return .init(revalidate: {})
             }
         )
     }
@@ -636,6 +737,150 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        func testCreateRefusesExistingBranchAsNotAppliedAndFreshBranchCommitsAtBackendFence() async throws {
+            try await withProvider { fixture in
+                let base = try fixture.git.runGit(["rev-parse", "HEAD"], at: fixture.logical)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                _ = try fixture.git.runGit(["branch", "taken", base], at: fixture.logical)
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let registrationsBefore = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.logical)
+                let settlements = OSAllocatedUnfairLock<[DomainProtectedMutationSettlement]>(initialState: [])
+                do {
+                    _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                        settlements.withLock { $0.append(settlement) }
+                    }) {
+                        try await fixture.call([
+                            "op": .string("create"), "branch": .string("taken"), "base_ref": .string(base)
+                        ], includeWorktree: false)
+                    }
+                    XCTFail("Creating an existing branch must be refused")
+                } catch {
+                    XCTAssertNil(error as? DomainProtectedMutationError, "Refusal must not be indeterminate: \(error)")
+                    XCTAssertTrue(
+                        error.localizedDescription.contains("a branch named 'taken' already exists"),
+                        error.localizedDescription
+                    )
+                }
+                XCTAssertEqual(settlements.withLock { $0.last?.state }, .notApplied)
+                XCTAssertEqual(
+                    try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.logical),
+                    registrationsBefore
+                )
+
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("fresh"), "base_ref": .string(base)
+                ], includeWorktree: false)
+                let createdPath = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue?["path"]?.stringValue)
+                XCTAssertEqual(
+                    try fixture.git.runGit(["rev-parse", "HEAD"], at: URL(fileURLWithPath: createdPath))
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                    base
+                )
+                let journal = try await fixture.driver.fixture.runtime.mutationJournal.snapshot()
+                XCTAssertEqual(
+                    journal.recordSnapshots.map(\.status).sorted { $0.rawValue < $1.rawValue },
+                    [.applied, .failedBeforeCommit]
+                )
+            }
+        }
+
+        func testCreatePreservesAppliedBindingWhenRequiredPersistenceFails() async throws {
+            try await withProvider { fixture in
+                struct SaveFailure: Error {}
+                var saveAttempted = false
+                fixture.driver.window.agentModeViewModel.test_setAgentSessionSaver { _, _, _ in
+                    saveAttempted = true
+                    throw SaveFailure()
+                }
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("created-binding-save-failed"), "bind": .bool(true)
+                ], includeWorktree: false)
+                XCTAssertTrue(saveAttempted, "The real binding must reach its required persistence fence")
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue)
+                let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+                let binding = try XCTUnwrap(reply.objectValue?["binding"]?.objectValue)
+                XCTAssertEqual(binding["worktree_id"]?.stringValue, worktreeID)
+                XCTAssertEqual(fixture.session.worktreeBindings.first?.worktreeID, worktreeID)
+                let warning = try XCTUnwrap(reply.objectValue?["warning"]?.stringValue)
+                XCTAssertTrue(warning.contains("binding is currently applied"), warning)
+                XCTAssertTrue(warning.contains("persistence could not be confirmed"), warning)
+                XCTAssertFalse(warning.contains("no session binding was applied"), warning)
+                XCTAssertFalse(warning.contains("cleanup is manual"), warning)
+                XCTAssertNil(AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.records[worktreeID]?.releasedAt)
+            }
+        }
+
+        func testCreateKeepsDescriptorAndWorktreeWhenBindingIsRefused() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let original = fixture.session.worktreeBindings
+                fixture.session.runState = .running
+                defer { fixture.session.runState = .idle }
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("created-unbound"), "bind": .bool(true)
+                ], includeWorktree: false)
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue)
+                let path = try XCTUnwrap(created["path"]?.stringValue)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+                XCTAssertNil(reply.objectValue?["binding"])
+                let warning = try XCTUnwrap(reply.objectValue?["warning"]?.stringValue)
+                XCTAssertTrue(warning.contains("session binding failed"))
+                XCTAssertTrue(warning.contains("cleanup is manual"))
+                XCTAssertTrue(warning.contains(path))
+                XCTAssertTrue(fixture.session.items.contains { $0.text.contains(path) && $0.text.contains("cleanup is manual") })
+                let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+                let repositoryID = try XCTUnwrap(reply.objectValue?["repository"]?.objectValue?["repository_id"]?.stringValue)
+                XCTAssertNil(GlobalSettingsStore.shared.worktreeVisualIdentity(repositoryID: repositoryID, worktreeID: worktreeID))
+                XCTAssertNotNil(AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.records[worktreeID]?.releasedAt)
+            }
+        }
+
+        func testRelocatedSessionDefaultSelectorCreateIsCoveredByLogicalRootGrantOnly() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let bound = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                // A live run's grant covers the workspace's logical roots only, never the physical
+                // worktree its session is relocated to; omitting repo_root uses the bound root.
+                let logicalOnly: Set<String> = [fixture.logical.resolvingSymlinksInPath().path]
+                let reply = try await fixture.call(
+                    ["op": .string("create"), "branch": .string("relocated-fresh")],
+                    includeWorktree: false,
+                    includeRepoRoot: false,
+                    projectSession: true,
+                    authorizedCanonicalRoots: logicalOnly
+                )
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue?["path"]?.stringValue)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: created))
+                XCTAssertEqual(fixture.session.worktreeBindings, [bound])
+
+                // Unbinding by the default selector resolves the same logical root identity.
+                _ = try await fixture.call(
+                    ["op": .string("unbind")],
+                    includeWorktree: false,
+                    includeRepoRoot: false,
+                    projectSession: true,
+                    authorizedCanonicalRoots: logicalOnly
+                )
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+            }
+        }
+
         // MARK: - List paging through the provider boundary (#1091)
 
         func testListPagesNonPrunableWorktreesThroughProvider() async throws {
@@ -723,11 +968,13 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             func call(
                 _ extra: [String: Value],
                 includeWorktree: Bool = true,
+                includeRepoRoot: Bool = true,
                 projectSession: Bool = false,
-                runPurpose: MCPRunPurpose? = nil
+                runPurpose: MCPRunPurpose? = nil,
+                authorizedCanonicalRoots: Set<String>? = nil
             ) async throws -> Value {
                 var args = extra
-                args["repo_root"] = .string(logical.path)
+                if includeRepoRoot { args["repo_root"] = .string(logical.path) }
                 args["session_id"] = .string(sessionID.uuidString)
                 if includeWorktree { args["worktree"] = .string(physical.path) }
                 let metadata = MCPRequestMetadata(
@@ -742,7 +989,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     principal: security.principal,
                     connectionID: security.connectionID, connectionGeneration: security.connectionGeneration,
                     invocationID: UUID(), runtimeID: security.runtimeID, runtimeGeneration: security.runtimeGeneration,
-                    authorizedCanonicalRoots: security.authorizedCanonicalRoots,
+                    authorizedCanonicalRoots: authorizedCanonicalRoots ?? security.authorizedCanonicalRoots,
                     hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
                 )
                 return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {

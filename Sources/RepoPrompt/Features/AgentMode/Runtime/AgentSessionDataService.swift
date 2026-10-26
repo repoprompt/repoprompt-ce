@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 #if canImport(Darwin)
     import Darwin
 #else
@@ -17,133 +18,6 @@ enum AgentSessionDataError: Error {
     case saveFailed(Error)
     case sessionDeleted(UUID)
     case noActiveWorkspace
-}
-
-private actor AgentSessionDiskWriter {
-    private struct PendingWrite {
-        var pendingData: Data?
-        var isWriting: Bool
-        var waiters: [CheckedContinuation<Void, Error>]
-    }
-
-    private var pendingByURL: [URL: PendingWrite] = [:]
-    private var idleWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
-
-    #if DEBUG
-        private var beforeWriteHook: (@Sendable (URL) async -> Void)?
-    #endif
-
-    func enqueueAndWait(data: Data, url: URL) async throws {
-        let url = url.standardizedFileURL
-        try await withCheckedThrowingContinuation { continuation in
-            var pending = pendingByURL[url] ?? PendingWrite(
-                pendingData: nil,
-                isWriting: false,
-                waiters: []
-            )
-            pending.pendingData = data
-            pending.waiters.append(continuation)
-            let shouldStartWriter = !pending.isWriting
-            pending.isWriting = true
-            pendingByURL[url] = pending
-            if shouldStartWriter {
-                Task { await self.drainWrites(for: url) }
-            }
-        }
-    }
-
-    func waitUntilIdle(for url: URL) async {
-        let url = url.standardizedFileURL
-        guard pendingByURL[url] != nil else { return }
-        await withCheckedContinuation { continuation in
-            idleWaitersByURL[url, default: []].append(continuation)
-        }
-    }
-
-    /// Validates and conditionally commits one prepared rehome batch without suspending the actor.
-    /// A normal write already queued or in flight for any destination makes the batch fail closed.
-    func commitPreparedWorkspaceSessionSidecarBatch(
-        _ batch: WorkspaceSessionSidecarPreparedBatch
-    ) throws {
-        let sourceFolder = batch.sourceFolder.standardizedFileURL
-        if let pendingSourceURL = pendingByURL.keys.first(where: { url in
-            let url = url.standardizedFileURL
-            return url.deletingLastPathComponent() == sourceFolder
-                && url.lastPathComponent.hasPrefix(batch.filenamePrefix)
-                && url.pathExtension.lowercased() == "json"
-        }) {
-            throw WorkspaceSessionSidecarMigrationError.sourceWriteInProgress(pendingSourceURL)
-        }
-        for copy in batch.copies {
-            let destinationURL = copy.destinationURL.standardizedFileURL
-            guard pendingByURL[destinationURL] == nil else {
-                throw WorkspaceSessionSidecarMigrationError.destinationWriteInProgress(destinationURL)
-            }
-        }
-        try WorkspaceSessionSidecarMigration.commitPreparedBatch(batch)
-    }
-
-    /// Withdraws a committed batch on the same serialized boundary that published it, so a normal
-    /// save cannot interleave between the two.
-    func rollbackPreparedWorkspaceSessionSidecarBatch(
-        _ batch: WorkspaceSessionSidecarPreparedBatch
-    ) -> [URL] {
-        WorkspaceSessionSidecarMigration.rollbackPreparedBatch(batch)
-    }
-
-    #if DEBUG
-        func test_setBeforeWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
-            beforeWriteHook = hook
-        }
-    #endif
-
-    private func drainWrites(for url: URL) async {
-        var lastError: Error?
-        while true {
-            guard var pending = pendingByURL[url] else { return }
-            guard let data = pending.pendingData else {
-                pending.isWriting = false
-                let waiters = pending.waiters
-                pendingByURL.removeValue(forKey: url)
-                for waiter in waiters {
-                    if let lastError {
-                        waiter.resume(throwing: lastError)
-                    } else {
-                        waiter.resume(returning: ())
-                    }
-                }
-                let idleWaiters = idleWaitersByURL.removeValue(forKey: url) ?? []
-                for waiter in idleWaiters {
-                    waiter.resume()
-                }
-                return
-            }
-            pending.pendingData = nil
-            pendingByURL[url] = pending
-
-            #if DEBUG
-                if let beforeWriteHook {
-                    await beforeWriteHook(url)
-                }
-            #endif
-
-            let writeResult: Result<Void, Error> = await Task.detached(priority: .utility) {
-                do {
-                    try data.write(to: url, options: .atomic)
-                    return .success(())
-                } catch {
-                    return .failure(error)
-                }
-            }.value
-
-            switch writeResult {
-            case .success:
-                lastError = nil
-            case let .failure(error):
-                lastError = error
-            }
-        }
-    }
 }
 
 // MARK: - Agent Session Data Service
@@ -172,8 +46,7 @@ actor AgentSessionDataService {
     }
 
     static func defaultWorkspaceRootURL() -> URL {
-        MCPFilesystemConstants.identity.applicationSupportRootURL()
-            .appendingPathComponent("Workspaces", isDirectory: true)
+        AppProfileLocations.current.workspaceRoot
     }
 
     private let encoder = JSONEncoder()
@@ -188,7 +61,17 @@ actor AgentSessionDataService {
     }
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
+    private struct MetadataPublication {
+        var activeCount = 0
+        var latestSequence: UInt64 = 0
+    }
+
+    /// Retain ordering only while callbacks can overlap; settled session URLs leave no receipt state.
+    private var metadataPublicationsByURL: [URL: MetadataPublication] = [:]
+    /// Blocks new writes during reversible admission as well as after committed deletion.
     private var deletedSessionFileURLs: Set<URL> = []
+    /// Only an irreversible deletion may withdraw an already-admitted write and its metadata.
+    private var committedSessionDeletionFileURLs: Set<URL> = []
     /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
     private var deletionAttemptCountByFileURL: [URL: Int] = [:]
     #if DEBUG
@@ -196,6 +79,7 @@ actor AgentSessionDataService {
         private var workspaceRootOverrideForTesting: URL?
         private var testWorktreeMergeReconciliationHooks: AgentSessionWorktreeMergeReconciliationHooks?
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
+        private var testAfterSessionWriteHook: (@Sendable (URL) async -> Void)?
         private var testBeforeDeletionAdmissionHook: (@Sendable (URL) async -> Void)?
         /// Passive gate run inside `preparePersistedHydration` once the load result is known.
         private var testAfterHydrationPrepareHook: (@Sendable (UUID) async throws -> Void)?
@@ -517,19 +401,31 @@ actor AgentSessionDataService {
         )
     }
 
-    private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
+    private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws -> AgentSessionDiskWriter.Receipt? {
         try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+    }
+
+    private func finishMetadataPublication(for fileURL: URL) {
+        guard var publication = metadataPublicationsByURL[fileURL] else { return }
+        publication.activeCount -= 1
+        metadataPublicationsByURL[fileURL] = publication.activeCount == 0 ? nil : publication
+    }
+
+    private func acceptMetadataReceipt(_ receipt: AgentSessionDiskWriter.Receipt, fileURL: URL) -> Bool {
+        guard var publication = metadataPublicationsByURL[fileURL],
+              receipt.sequence >= publication.latestSequence
+        else { return false }
+        publication.latestSequence = receipt.sequence
+        metadataPublicationsByURL[fileURL] = publication
+        return true
     }
 
     /// Keep the original bytes before a load repair drops an invalid optional record.
     /// Failure aborts the load rather than silently destroying the only recovery copy.
     private func preserveMalformedSelfCompactRecord(_ data: Data, from fileURL: URL) throws {
         let directory = fileURL.deletingLastPathComponent().appendingPathComponent(".self-compact-recovery", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        try AppProfileLocations.current.validateMetadataFile(directory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let backupURL = directory.appendingPathComponent("\(fileURL.lastPathComponent).\(UUID().uuidString).original")
         try data.write(to: backupURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
@@ -566,32 +462,51 @@ actor AgentSessionDataService {
     ) async throws {
         let fileURL = fileURL.standardizedFileURL
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        metadataPublicationsByURL[fileURL, default: MetadataPublication()].activeCount += 1
+        defer { finishMetadataPublication(for: fileURL) }
         #if DEBUG
             if isLoadRepair, let testBeforeLoadRepairWriteHook {
                 await testBeforeLoadRepairWriteHook(fileURL)
             }
         #endif
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
-        try await writeDataAtomically(encodedData, to: fileURL)
+        let receipt = try await writeDataAtomically(encodedData, to: fileURL)
+        #if DEBUG
+            if let testAfterSessionWriteHook {
+                await testAfterSessionWriteHook(fileURL)
+            }
+        #endif
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
-        await upsertMetadataRecord(metadataRecord(from: session, fileURL: fileURL), folder: folder)
+        if let receipt {
+            let record = AgentSessionMetadataRecord.record(
+                from: session, fileURL: fileURL,
+                observedFileSize: receipt.observedFileSize,
+                observedFileModificationDate: receipt.observedFileModificationDate
+            )
+            await upsertMetadataRecord(record, folder: folder, fileURL: fileURL, receipt: receipt)
+        }
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
     }
 
     private func persistLoadedMetadataIfIndexPresent(
         _ session: AgentSession,
-        fileURL: URL
+        fileURL: URL,
+        observedData: Data
     ) async throws {
         let fileURL = fileURL.standardizedFileURL
         let folder = fileURL.deletingLastPathComponent()
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        metadataPublicationsByURL[fileURL, default: MetadataPublication()].activeCount += 1
+        defer { finishMetadataPublication(for: fileURL) }
         #if DEBUG
             if let testBeforeLoadRepairWriteHook {
                 await testBeforeLoadRepairWriteHook(fileURL)
             }
         #endif
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
-        await upsertMetadataRecordIfIndexPresent(session, fileURL: fileURL)
+        if let receipt = await diskWriter.metadataReceiptIfUnchanged(data: observedData, url: fileURL) {
+            await upsertMetadataRecordIfIndexPresent(session, fileURL: fileURL, receipt: receipt)
+        }
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
     }
 
@@ -755,8 +670,10 @@ actor AgentSessionDataService {
         normalized.schemaVersion = AgentSessionMetadataIndex.currentSchemaVersion
         normalized.entries = normalized.entries.sortedForAgentSessionMetadataIndex()
         let data = try encoder.encode(normalized)
+        let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         metadataIndexCacheByFolder[key] = normalized
-        try data.write(to: metadataIndexFileURL(forAgentSessionsFolder: folder), options: .atomic)
+        try data.write(to: fileURL, options: .atomic)
         #if DEBUG
             perfRecorder.durationEvent(
                 "cleanup.metadata.writeIndex",
@@ -769,7 +686,10 @@ actor AgentSessionDataService {
         #endif
     }
 
-    private func upsertMetadataRecord(_ record: AgentSessionMetadataRecord, folder: URL) async {
+    private func upsertMetadataRecord(
+        _ record: AgentSessionMetadataRecord, folder: URL, fileURL: URL,
+        receipt: AgentSessionDiskWriter.Receipt
+    ) async {
         do {
             let key = canonicalMetadataFolderKey(folder)
             var index: AgentSessionMetadataIndex = if let cached = metadataIndexCacheByFolder[key] {
@@ -779,6 +699,7 @@ actor AgentSessionDataService {
             } else {
                 AgentSessionMetadataIndex()
             }
+            guard acceptMetadataReceipt(receipt, fileURL: fileURL) else { return }
             index.entries.removeAll { existing in
                 existing.id == record.id || existing.filename == record.filename
             }
@@ -791,10 +712,17 @@ actor AgentSessionDataService {
         }
     }
 
-    private func upsertMetadataRecordIfIndexPresent(_ session: AgentSession, fileURL: URL) async {
+    private func upsertMetadataRecordIfIndexPresent(
+        _ session: AgentSession, fileURL: URL, receipt: AgentSessionDiskWriter.Receipt
+    ) async {
         let folder = fileURL.deletingLastPathComponent()
         guard var index = await readMetadataIndexIfAvailable(folder: folder) else { return }
-        let record = metadataRecord(from: session, fileURL: fileURL)
+        guard acceptMetadataReceipt(receipt, fileURL: fileURL) else { return }
+        let record = AgentSessionMetadataRecord.record(
+            from: session, fileURL: fileURL,
+            observedFileSize: receipt.observedFileSize,
+            observedFileModificationDate: receipt.observedFileModificationDate
+        )
         if let existing = index.entries.first(where: { $0.id == record.id }),
            existing.matchesIndexedSessionMetadata(record)
         {
@@ -1382,7 +1310,7 @@ actor AgentSessionDataService {
                     isLoadRepair: true
                 )
             } else {
-                try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL)
+                try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL, observedData: data)
             }
             return runtimeSession
         } catch {
@@ -1805,7 +1733,8 @@ actor AgentSessionDataService {
             do {
                 try await deleteSessionFileDurably(
                     sessionID: candidate.sessionID,
-                    fileURL: candidate.fileURL
+                    fileURL: candidate.fileURL,
+                    origin: .current
                 )
             } catch {
                 failures[candidate.tabID] = error
@@ -1821,26 +1750,19 @@ actor AgentSessionDataService {
         return failures
     }
 
-    /// Irreversible removal of one session file, bracketed by the durable-deletion reporter.
-    ///
-    /// Phase order is the contract:
-    ///
-    /// 1. **Begin** marks the session in-progress *before* waiting for pending writes or touching the
-    ///    file, so oversight already refuses it while the removal is in flight.
-    /// 2. **Failure** clears only this attempt and preserves durable intent — nothing was deleted.
-    /// 3. **Commit** happens on successful removal *or* an already-absent file, and before any later
-    ///    await, so no metadata cleanup, next batch file, or view-model teardown can run while the
-    ///    session still looks alive to oversight.
-    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL) async throws {
+    /// Admission precedes writer draining and irreversible removal. Failure clears only its own
+    /// attempt; successful removal or an already-absent file commits the permanent fence before
+    /// metadata cleanup or view-model teardown (see AgentSessionDeletionRegistry).
+    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL, origin: AgentSessionDeletionOrigin = .current) async throws {
         #if DEBUG
             if let testBeforeDeletionAdmissionHook {
                 await testBeforeDeletionAdmissionHook(fileURL)
             }
         #endif
-        // Admission must precede the local tombstone: post-write cleanup can remove a tombstoned
-        // file, so even that cleanup needs an attempt counted by the termination fence. Saves that
-        // enter during this hop are covered by the writer drain and the existing post-write checks.
-        let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
+        // Admission must precede the local save fence. Already-admitted writes are drained, but
+        // must remain durable while the destructive fence can still refuse this deletion.
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
+        let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID, origin: origin)
         deletedSessionFileURLs.insert(fileURL)
         deletionAttemptCountByFileURL[fileURL, default: 0] += 1
         #if DEBUG
@@ -1850,12 +1772,15 @@ actor AgentSessionDataService {
             }
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
+        var fileRemoved = false
         do {
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
             }
             if FileManager.default.fileExists(atPath: fileURL.path) {
+                try AppProfileLocations.current.validateMetadataFile(fileURL)
                 try FileManager.default.removeItem(at: fileURL)
+                fileRemoved = true
             }
         } catch {
             let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
@@ -1868,7 +1793,10 @@ actor AgentSessionDataService {
             await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
-        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
+        // Publish the irreversible fact before the reporter hop: a late admitted write must be
+        // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
+        committedSessionDeletionFileURLs.insert(fileURL)
+        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
         // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
     }
 
@@ -1877,7 +1805,8 @@ actor AgentSessionDataService {
         fileURL: URL,
         folder: URL
     ) async throws {
-        guard deletedSessionFileURLs.contains(fileURL) else { return }
+        guard committedSessionDeletionFileURLs.contains(fileURL) else { return }
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         try? FileManager.default.removeItem(at: fileURL)
         await removeMetadataRecords(
             matching: { $0.id == sessionID || $0.filename == fileURL.lastPathComponent },
@@ -1897,6 +1826,19 @@ actor AgentSessionDataService {
 
         func test_setBeforeSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) async {
             await diskWriter.test_setBeforeWriteHook(hook)
+        }
+
+        /// Holds a completed real write before its deletion/metadata completion checks.
+        func test_setAfterSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
+            testAfterSessionWriteHook = hook
+        }
+
+        func test_pendingSessionWriteCount(for fileURL: URL) async -> Int {
+            await diskWriter.test_pendingWriteCount(for: fileURL)
+        }
+
+        func test_pendingMetadataPublicationCount() -> Int {
+            metadataPublicationsByURL.count
         }
 
         func test_setBeforeDeletionAdmissionHook(_ hook: (@Sendable (URL) async -> Void)?) {
@@ -1958,6 +1900,7 @@ actor AgentSessionDataService {
     private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
+        try AppProfileLocations.current.validateMetadataFile(agentSessionsFolder)
 
         if !FileManager.default.fileExists(atPath: agentSessionsFolder.path) {
             try FileManager.default.createDirectory(at: agentSessionsFolder, withIntermediateDirectories: true)
@@ -1984,6 +1927,7 @@ actor AgentSessionDataService {
     /// Return the main folder for the workspace.
     private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
         let workspaceDir = resolvedWorkspaceFolderURL(for: workspace)
+        try AppProfileLocations.current.validateMetadataFile(workspaceDir)
         if !FileManager.default.fileExists(atPath: workspaceDir.path) {
             try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         }

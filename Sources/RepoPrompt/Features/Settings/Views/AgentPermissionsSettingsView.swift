@@ -211,7 +211,7 @@ struct AgentPermissionsSettingsView: View {
             .accessibilityIdentifier("agent-permissions-auto-approve-delegation")
             .onChange(of: autoApproveDelegationRequests) { _, isOn in
                 // Off means off: withdraw every global grant now, not on the next agent call.
-                if !isOn { AgentSessionLinkRuntimeBridge.shared.delegationScopes.reconcileGlobalAutoApprove() }
+                if !isOn { AgentSessionLinkRuntimeBridge.shared.delegationScopes.reconcileGlobalAutoApprove(userInitiated: true) }
             }
         }
     }

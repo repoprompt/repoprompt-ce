@@ -2,11 +2,123 @@
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
     @MainActor
     final class AgentAdmissionRecoveryTests: XCTestCase {
+        func testAdmissionTimingUsesRealFreshAndExistingTabSaveScopes() async throws {
+            for kind in [WorkspaceAgentAdmissionTiming.Kind.freshTab, .existingTab] {
+                let coordinator = WorkspaceAgentAdmissionCoordinator()
+                let fixture = try await establishCleanActiveWorkspaceBaseline(coordinator: coordinator)
+                let manager = fixture.manager
+                let workspaceID = fixture.workspaceA.id
+                var now = Duration.zero
+                var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+                var advancedSave = false
+                var snapshotReads = 0
+                manager.agentAdmissionTimingFactoryForTesting = {
+                    WorkspaceAgentAdmissionTiming(now: { now }, emit: { report in
+                        XCTAssertEqual(
+                            coordinator.activeCount(for: workspaceID),
+                            0,
+                            "The actual production path must emit after releasing its lease"
+                        )
+                        reports.append(report)
+                    })
+                }
+                manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting { id in
+                    snapshotReads += 1
+                    now += .seconds(2)
+                    return await fixture.client.canonicalWorkspaceSnapshot(id)
+                }
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor _, _, _ in
+                    guard !advancedSave,
+                          coordinator.activeCount(for: workspaceID) > 0
+                    else { return }
+                    advancedSave = true
+                    now += .seconds(44)
+                }
+                var viewModel: AgentModeViewModel?
+                do {
+                    if kind == .freshTab {
+                        let result = try await fixture.prompt.createDurableBackgroundAgentSessionTab(
+                            name: "Timing fixture", sessionID: UUID(), expectedWorkspaceID: workspaceID,
+                            lifecycleAuthority: AgentSessionLifecycleAuthority()
+                        )
+                        if case let .created(_, _, claim) = result {
+                            claim.markAccepted()
+                        } else {
+                            XCTFail("Fresh admission must commit: \(result)")
+                        }
+                    } else {
+                        let model = makeAgentModeViewModel(for: fixture)
+                        viewModel = model
+                        let target = try await model.mcpResolveOrCreateSessionTarget(
+                            tabID: fixture.leftTab.id, sessionID: nil, createIfNeeded: true,
+                            sessionName: "Timing fixture", expectedWorkspaceID: workspaceID
+                        )
+                        model.mcpAcceptSessionTarget(target)
+                    }
+                    XCTAssertTrue(advancedSave)
+                    let report = try XCTUnwrap(reports.first)
+                    XCTAssertEqual(reports.count, 1)
+                    XCTAssertEqual(report.context.kind, kind)
+                    XCTAssertEqual(report.outcome, .committed)
+                    XCTAssertEqual(report.slowestPhase, .save)
+                    XCTAssertEqual(
+                        report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.save.rawValue],
+                        44000,
+                        "Deleting the caller's save begin/end must break attribution"
+                    )
+                    XCTAssertEqual(report.saveAttempts, 1)
+                    XCTAssertEqual(
+                        report.counts[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue],
+                        snapshotReads,
+                        "A no-op write-baseline check must not count as another refresh"
+                    )
+                    XCTAssertEqual(report.totalMilliseconds, 44000 + Double(snapshotReads) * 2000)
+                } catch {
+                    await finishAdmissionTimingFixture(fixture, viewModel: viewModel, coordinator: coordinator)
+                    throw error
+                }
+                await finishAdmissionTimingFixture(fixture, viewModel: viewModel, coordinator: coordinator)
+            }
+        }
+
+        private func finishAdmissionTimingFixture(
+            _ fixture: Fixture,
+            viewModel: AgentModeViewModel?,
+            coordinator: WorkspaceAgentAdmissionCoordinator
+        ) async {
+            fixture.manager.agentAdmissionTimingFactoryForTesting = nil
+            fixture.manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting(nil)
+            fixture.manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            // Keep the cancelled producer handles so none can outlive this test's storage override.
+            let session = viewModel?.session(for: fixture.leftTab.id, createIfNeeded: false)
+            let loadTask = session?.persistedLoadTask
+            let saveTask = session?.saveDebounceTask
+            loadTask?.cancel()
+            saveTask?.cancel()
+            await viewModel?.prepareForWindowClose()
+            _ = await loadTask?.value
+            _ = await saveTask?.value
+            fixture.manager.prepareForWindowClose()
+            await fixture.manager.awaitOwnSavesForWindowClose()
+            await fixture.manager.debugDrainScheduledSaves()
+            await fixture.manager.debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: fixture.workspaceA.id)
+            // Each variant has its own authority; stop it before writing the next variant's index.
+            _ = await fixture.runtime.shutdown()
+            runtimes.removeAll { $0 === fixture.runtime }
+            managers.removeAll { $0 === fixture.manager }
+            let settled = coordinator.snapshot()
+            XCTAssertEqual(settled.activeAdmissionCount, 0)
+            XCTAssertEqual(settled.waiterCount, 0)
+            XCTAssertEqual(settled.provisionalSessionCount, 0)
+            XCTAssertEqual(settled.retainedRecoveryCount, 0)
+        }
+
         func testToolAdmissionPolicySnapshotPreservesTaskRoleMapping() {
             let cases: [(AgentModelCatalog.TaskLabelKind?, MCPClientTaskRole)] = [
                 (nil, .direct), (.explore, .explore), (.engineer, .engineer),
@@ -215,6 +327,7 @@ import XCTest
             originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("AgentAdmissionRecoveryTests-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
@@ -251,7 +364,7 @@ import XCTest
             var invoked = false
             do {
                 _ = try await fixture.manager.withAgentSessionAdmission(
-                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true
+                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true, kind: .freshTab
                 ) { invoked = true }
                 XCTFail("Dirty canonical state must reject admission")
             } catch {
@@ -276,7 +389,7 @@ import XCTest
             XCTAssertNil(save.after?.dirtyRevision)
             do {
                 _ = try await fixture.manager.withAgentSessionAdmission(
-                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true
+                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true, kind: .freshTab
                 ) { throw NSError(domain: "LaterRoutingBoundary", code: 91) }
                 XCTFail("Expected the distinct later failure")
             } catch {
@@ -703,9 +816,13 @@ import XCTest
             let store = fixture.client.store
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
                 if id == workspaceID {
                     awaitedOwnSaves.count = count
+                    now += .seconds(8)
                 }
             }
 
@@ -721,7 +838,8 @@ import XCTest
                 defer { agentStart.finished = true }
                 do {
                     _ = try await fixture.manager.withAgentSessionAdmission(
-                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true
+                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true,
+                        kind: .freshTab, timing: timing
                     ) { agentStart.count += 1 }
                     return nil
                 } catch {
@@ -742,7 +860,8 @@ import XCTest
             let discard = Task { @MainActor in
                 try await fixture.manager.withAgentSessionAdmission(
                     workspaceID: workspaceID,
-                    admissionID: identity.recoveryID
+                    admissionID: identity.recoveryID,
+                    kind: .discard
                 ) {
                     await fixture.manager.recoverProvisionalAgentSessionBinding(identity)
                 }
@@ -766,6 +885,17 @@ import XCTest
             XCTAssertNil(admissionError, "Agent start must await its own in-flight save, not reject it.")
             XCTAssertEqual(agentStart.count, 1)
             XCTAssertEqual(awaitedOwnSaves.count, 1)
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(report.slowestPhase, .save)
+            XCTAssertEqual(report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.save.rawValue], 8000)
+            XCTAssertEqual(
+                report.milliseconds[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue],
+                0,
+                "Real canonical refresh must exclude its nested own-save wait"
+            )
+            XCTAssertEqual(report.totalMilliseconds, 8000)
+            XCTAssertEqual(report.counts[WorkspaceAgentAdmissionTiming.Phase.refresh.rawValue], 1)
             try await assertCanonicalCleanContainingTab(fixture, workspaceID: workspaceID, tabID: backgroundTab.id)
             try await assertAdmissionPasses(fixture, workspaceID: workspaceID)
         }
@@ -876,7 +1006,7 @@ import XCTest
             let admission = Task { @MainActor () -> Error? in
                 do {
                     _ = try await fixture.manager.withAgentSessionAdmission(
-                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true
+                        workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true, kind: .freshTab
                     ) {}
                     return nil
                 } catch {
@@ -1522,11 +1652,18 @@ import XCTest
             }
             XCTAssertEqual(workingAttemptCount, 1)
             do {
-                _ = try await admissionTask.value
-                XCTFail("Cancellation must not return a provider-facing target")
-            } catch is CancellationError {
+                let result = try await admissionTask.value
+                if case let .recoveryRequired(retainedIdentity, _, _, recovery) = result {
+                    XCTAssertEqual(retainedIdentity, identity)
+                    guard case .retryablePartial = recovery else {
+                        await retryFence.release()
+                        return XCTFail("Cancellation must retain the incomplete recovery evidence")
+                    }
+                } else {
+                    XCTFail("Cancellation must return retained recovery evidence, never a provider-facing target")
+                }
             } catch {
-                XCTFail("Expected CancellationError, got \(error)")
+                XCTFail("Cancellation erased the retained recovery evidence: \(error)")
             }
             XCTAssertTrue(admissionCompleted)
             guard case .retryablePartial = recoveryOutcome else {
@@ -1712,11 +1849,15 @@ import XCTest
             admissionTask.cancel()
             await persistenceFence.release()
             do {
-                _ = try await admissionTask.value
-                XCTFail("Cancellation must not return a provider-facing target")
-            } catch is CancellationError {
+                let result = try await admissionTask.value
+                if case let .recoveryRequired(retainedIdentity, _, _, recovery) = result {
+                    XCTAssertEqual(retainedIdentity, admissionIdentity)
+                    XCTAssertEqual(recovery, .blockedManual(failureCategory))
+                } else {
+                    XCTFail("Cancellation must return retained recovery evidence, never a provider-facing target")
+                }
             } catch {
-                XCTFail("Expected CancellationError, got \(error)")
+                XCTFail("Cancellation erased the retained recovery evidence: \(error)")
             }
             await fulfillment(of: [recoveryCompleted], timeout: 5)
             guard let identity = admissionIdentity else {
@@ -1736,7 +1877,8 @@ import XCTest
 
             let leasedSave = try await fixture.manager.withAgentSessionAdmission(
                 workspaceID: fixture.workspaceA.id,
-                admissionID: UUID()
+                admissionID: UUID(),
+                kind: .freshTab
             ) {
                 await fixture.manager.persistAgentAdmission(
                     identity,
@@ -1924,11 +2066,15 @@ import XCTest
             admissionTask.cancel()
             await persistenceFence.release()
             do {
-                _ = try await admissionTask.value
-                XCTFail("Cancellation must not return a provider-facing target")
-            } catch is CancellationError {
+                let result = try await admissionTask.value
+                if case let .recoveryRequired(retainedIdentity, _, _, recovery) = result {
+                    XCTAssertEqual(retainedIdentity, admissionIdentity)
+                    XCTAssertEqual(recovery, .failed(.persistenceFailure))
+                } else {
+                    XCTFail("Cancellation must return retained recovery evidence, never a provider-facing target")
+                }
             } catch {
-                XCTFail("Expected CancellationError, got \(error)")
+                XCTFail("Cancellation erased the retained recovery evidence: \(error)")
             }
             await fulfillment(of: [retainedRecoveryCompleted], timeout: 5)
             guard let identity = admissionIdentity else {
@@ -3990,7 +4136,9 @@ import XCTest
             )
         }
 
-        private func makeFixture() async throws -> Fixture {
+        private func makeFixture(
+            coordinator: WorkspaceAgentAdmissionCoordinator = .shared
+        ) async throws -> Fixture {
             let sessionID = UUID()
             let provisional = ComposeTabState(
                 name: "Provisional",
@@ -4046,7 +4194,7 @@ import XCTest
             try await runtime.start()
             runtimes.append(runtime)
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -882)
-            let (manager, prompt) = makeManager(client: client)
+            let (manager, prompt) = makeManager(client: client, coordinator: coordinator)
             await manager.awaitInitialized()
             // Match production adoption before any recovery or later local mutation: authority
             // metadata alone does not prove that this manager installed the canonical document.
@@ -4084,8 +4232,10 @@ import XCTest
 
         /// Active, fully persisted workspace A: canonical clean, local state version saved, and no
         /// unsaved presentation publication.
-        private func establishCleanActiveWorkspaceBaseline() async throws -> Fixture {
-            let fixture = try await makeFixture()
+        private func establishCleanActiveWorkspaceBaseline(
+            coordinator: WorkspaceAgentAdmissionCoordinator = .shared
+        ) async throws -> Fixture {
+            let fixture = try await makeFixture(coordinator: coordinator)
             let workspaceID = fixture.workspaceA.id
             fixture.manager.activeWorkspace = fixture.workspaceA
             fixture.prompt.loadComposeTabsFromWorkspace(fixture.workspaceA)
@@ -4228,7 +4378,7 @@ import XCTest
             let manager = manager ?? fixture.manager
             var invoked = false
             _ = try await manager.withAgentSessionAdmission(
-                workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true
+                workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true, kind: .freshTab
             ) { invoked = true }
             XCTAssertTrue(invoked, file: file, line: line)
             let trace = await fixture.client.store.transitionDiagnostics(workspaceID)
@@ -4253,7 +4403,7 @@ import XCTest
             var invoked = false
             do {
                 _ = try await manager.withAgentSessionAdmission(
-                    workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true
+                    workspaceID: workspaceID, admissionID: UUID(), refreshCanonicalState: true, kind: .freshTab
                 ) { invoked = true }
                 XCTFail("Dirty canonical state must reject admission", file: file, line: line)
             } catch {
@@ -4585,7 +4735,8 @@ import XCTest
 
         private func makeManager(
             client: DomainWorkspaceAuthorityClient?,
-            windowID: Int = -882
+            windowID: Int = -882,
+            coordinator: WorkspaceAgentAdmissionCoordinator = .shared
         ) -> (WorkspaceManagerViewModel, PromptViewModel) {
             let keyManager = KeyManager(
                 secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
@@ -4607,6 +4758,7 @@ import XCTest
                 fileManager: fileManager,
                 promptViewModel: prompt,
                 domainWorkspaceAuthorityClient: client,
+                workspaceAgentAdmissionCoordinator: coordinator,
                 performInitialWorkspaceActivation: false
             )
             managers.append(manager)

@@ -61,7 +61,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             - `list`: refresh exact outbound targets and capabilities.
             - `poll`: snapshot sanitized target status, `idle_for_send`, context load, cursor, queued-send state, and a managed-only redacted `pending_interaction` when present.
-            - `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned. A multi-target result omits targets that became unavailable while waiting and lists them in `unavailable_session_ids`; refresh `list` before using them.
+            - `wait`: pass returned `wait_cursor` strings in `cursors`, without session IDs. Wait for change, idle, or sendable; managed prompts may appear. Unavailable targets are omitted and named in `unavailable_session_ids`; refresh `list` before using them.
             - `read`: page the redacted user-visible transcript; reuse `next_cursor` and re-anchor on `cursor_reset`.
             - `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: "when_sendable"`.
             - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.
@@ -92,7 +92,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 Pass `op` plus fields for that operation.
                 list: cursor?, max_items?
                 poll: exactly one of session_id/session_ids
-                wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.
+                wait: cursors alone, or session_id/session_ids with cursor(s)?; until?; timeout_seconds? Local input cancels older waits.
                 read: session_id, cursor?, from?, max_items?, max_output_bytes?
                 send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
                 cancel_pending_send: session_id, idempotency_key
@@ -116,14 +116,17 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     ),
                     "cursor": .string(description: "[list, wait, read] Opaque returned cursor; never edit or construct."),
                     "cursors": .array(
-                        description: "[wait] Returned per-target cursors for multi-target wait.",
-                        items: .object(
-                            properties: [
-                                "session_id": .string(description: "Target UUID for this cursor."),
-                                "cursor": .string(description: "Returned wait cursor.")
-                            ],
-                            required: ["session_id", "cursor"]
-                        )
+                        description: "[wait] Returned wait_cursor strings and/or {session_id, cursor} records; max 32, no duplicate targets. No separate IDs required.",
+                        items: .anyOf([
+                            .string(),
+                            .object(
+                                properties: [
+                                    "session_id": .string(description: "Target UUID for this cursor."),
+                                    "cursor": .string(description: "Returned wait cursor.")
+                                ],
+                                required: ["session_id", "cursor"]
+                            )
+                        ])
                     ),
                     "until": .string(description: "[wait] change (default), idle, or sendable. Use sendable before send; idle is insufficient.", enum: ["change", "idle", "sendable"]),
                     "timeout_seconds": .number(description: "[wait] Max seconds; default 60; 0 polls immediately."),

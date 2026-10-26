@@ -159,6 +159,100 @@ public actor VCSService {
         return nil
     }
 
+    /// Resolve a repository for an MCP read at an explicitly authorized workspace root.
+    /// Do not reuse unrestricted discovery caches or run parent-searching command fallbacks.
+    func resolveRepoForRead(at root: URL, authorizedRoots: [URL]) async -> VCSResolvedRepo? {
+        let rootPaths = authorizedRoots.map(\.path)
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(root.path, roots: rootPaths) else { return nil }
+        let jjDirectory = root.appendingPathComponent(".jj")
+        var jjIsDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: jjDirectory.path, isDirectory: &jjIsDirectory) {
+            guard jjIsDirectory.boolValue else { return nil }
+            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(jjDirectory.path, roots: rootPaths),
+                  Self.isJJRepositoryAuthorized(jjDirectory, roots: rootPaths)
+            else { return nil }
+            if await isJJAvailable() {
+                backendKindCache[root.standardizedFileURL.path] = .jujutsu
+                return VCSResolvedRepo(rootURL: root, backendKind: .jujutsu)
+            }
+        }
+        guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: authorizedRoots) else { return nil }
+        gitLayoutCache[root.standardizedFileURL.path] = layout
+        backendKindCache[root.standardizedFileURL.path] = .git
+        return VCSResolvedRepo(rootURL: root, backendKind: .git)
+    }
+
+    private static func isJJRepositoryAuthorized(_ jjDirectory: URL, roots: [String]) -> Bool {
+        let repoEntry = jjDirectory.appendingPathComponent("repo")
+        guard isScopedJJMetadataPath(repoEntry, roots: roots) else { return false }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repoEntry.path, isDirectory: &isDirectory) else { return false }
+        let repo: URL
+        if isDirectory.boolValue {
+            repo = repoEntry
+        } else {
+            // JJ resolves secondary-workspace pointers relative to .jj, without trimming bytes.
+            guard let path = readScopedMetadata(repoEntry, roots: roots) else { return false }
+            repo = path.hasPrefix("/") ? URL(fileURLWithPath: path) : jjDirectory.appendingPathComponent(path)
+        }
+        guard isScopedJJMetadataPath(repo, roots: roots),
+              FileManager.default.fileExists(atPath: repo.path, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return false }
+        let store = repo.resolvingSymlinksInPath().appendingPathComponent("store")
+        guard isScopedJJMetadataPath(store, roots: roots),
+              FileManager.default.fileExists(atPath: store.path, isDirectory: &isDirectory), isDirectory.boolValue,
+              let backend = readScopedMetadata(store.appendingPathComponent("type"), roots: roots)
+        else { return false }
+        // These are JJ's built-in disk backends. Unknown backend layouts have no read grant.
+        if backend == "Simple" { return true }
+        guard backend == "git",
+              let path = readScopedMetadata(store.appendingPathComponent("git_target"), roots: roots)
+        else { return false }
+        let target = path.hasPrefix("/") ? URL(fileURLWithPath: path) : store.appendingPathComponent(path)
+        guard isScopedJJMetadataPath(target, roots: roots),
+              FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+        else { return false }
+        if !isDirectory.boolValue {
+            // A colocated linked checkout may use its reciprocally registered .git file.
+            return target.lastPathComponent == ".git"
+                && GitRepositoryLayoutResolver.resolveForRead(
+                    atWorkTreeRoot: target.deletingLastPathComponent(),
+                    authorizedRoots: roots.map { URL(fileURLWithPath: $0) }
+                ) != nil
+        }
+        let commonFile = target.appendingPathComponent("commondir")
+        if FileManager.default.fileExists(atPath: commonFile.path) {
+            guard let commonPath = readScopedMetadata(commonFile, roots: roots, trimLineEndings: true) else { return false }
+            let common = commonPath.hasPrefix("/") ? URL(fileURLWithPath: commonPath) : target.appendingPathComponent(commonPath)
+            return isScopedJJMetadataPath(common, roots: roots)
+        }
+        return true
+    }
+
+    private static func isScopedJJMetadataPath(_ url: URL, roots: [String]) -> Bool {
+        // JJ metadata contains literal paths. Do not trim path whitespace or expand
+        // '~' as a selector: either would authorize a different filesystem entry.
+        let candidate = url.resolvingSymlinksInPath().standardizedFileURL.path
+        return roots.contains { path in
+            let root = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+            return candidate == root || candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        }
+    }
+
+    private static func readScopedMetadata(_ url: URL, roots: [String], trimLineEndings: Bool = false) -> String? {
+        guard isScopedJJMetadataPath(url, roots: roots),
+              let data = try? VCSMetadataFileReader.contents(of: url),
+              var text = String(data: data, encoding: .utf8)
+        else { return nil }
+        if trimLineEndings {
+            while text.last == "\r" || text.last == "\n" {
+                text.removeLast()
+            }
+        }
+        guard !text.isEmpty, !text.contains("\0"), !text.contains("\n"), !text.contains("\r") else { return nil }
+        return text
+    }
+
     /// Get the backend for a known repository root.
     /// Use this when you already know the repo root from a previous resolve call.
     ///

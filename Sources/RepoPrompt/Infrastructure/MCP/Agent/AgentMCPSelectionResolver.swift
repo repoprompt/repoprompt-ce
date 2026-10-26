@@ -171,6 +171,14 @@ enum AgentMCPSelectionResolver {
             }
             return (resolution.effective, resolution.modelParameters, !resolution.hasStoredOverride)
         }
+        if let stored = MCPAgentRoleDefaultsService.executableStoredSelection(
+            for: role,
+            overrides: GlobalSettingsStore.shared.mcpAgentRoleOverrides(workspaceID: workspaceID),
+            roleModelParameters: GlobalSettingsStore.shared.mcpAgentRoleModelParameters(workspaceID: workspaceID),
+            availability: availability
+        ), surface.allows(stored.selection.agent) {
+            return (stored.selection, stored.modelParameters, false)
+        }
         guard let fallback = AgentModelCatalog.resolveTaskLabelKind(role, availability: availability) else {
             return nil
         }

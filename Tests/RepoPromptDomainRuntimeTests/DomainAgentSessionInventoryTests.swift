@@ -31,7 +31,8 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         let unresolved = UUID(), healthy = UUID()
         let snapshot = DomainAgentSessionInventorySnapshot(
             records: [record(unresolved, loaded: false), record(healthy)], edges: [],
-            isComplete: true, recordsComplete: true, unresolvedSessions: [unresolved: "ambiguous_binding"]
+            isComplete: true, recordsComplete: true, unresolvedSessions: [unresolved: "ambiguous_binding"],
+            unresolvedDetails: [unresolved: "Competing workspace/tab carriers", healthy: "Must not survive"]
         )
         XCTAssertNil(snapshot.records[unresolved], "A saved row cannot replace an unresolved loaded identity")
         XCTAssertNotNil(snapshot.records[healthy])
@@ -41,11 +42,16 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         XCTAssertFalse(snapshot.isMissing(unresolved))
         let restricted = snapshot.restricted(to: [healthy])
         XCTAssertTrue(restricted.unresolvedSessions.isEmpty)
+        XCTAssertTrue(restricted.unresolvedDetails.isEmpty)
         XCTAssertEqual(restricted.unresolvedSessionCount, 1)
         XCTAssertTrue(restricted.knownSessionIDs.contains(unresolved))
         XCTAssertFalse(restricted.isMissing(unresolved))
         let disclosed = snapshot.restricted(to: [healthy, unresolved])
         XCTAssertEqual(disclosed.unresolvedSessions, [unresolved: "ambiguous_binding"])
+        XCTAssertEqual(disclosed.unresolvedDetails, [unresolved: "Competing workspace/tab carriers"])
+        let identityOnly = snapshot.restricted(to: [unresolved], includingUnresolvedDetails: false)
+        XCTAssertEqual(identityOnly.unresolvedSessions, [unresolved: "ambiguous_binding"])
+        XCTAssertTrue(identityOnly.unresolvedDetails.isEmpty)
     }
 
     // MARK: - Orphans

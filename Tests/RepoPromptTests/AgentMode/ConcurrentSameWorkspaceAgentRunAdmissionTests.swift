@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
@@ -385,6 +386,282 @@ import XCTest
             XCTAssertEqual(preparations, 1, "No real workspace mutation occurred; the two-attempt retry budget must remain unused")
         }
 
+        func testUnchangedGitModePublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: false)
+        }
+
+        func testChangedGitModePublicationStillInvalidatesAdmissionSavePreparation() async throws {
+            try await assertGitModePublicationDuringAdmissionSave(changesMode: true)
+        }
+
+        func testAgentAdmissionRetryPersistsPendingUIEditBeforeItsDeferredPublication() async throws {
+            try await assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: false)
+        }
+
+        func testAgentAdmissionRetryDoesNotRejectDeferredPublicationOfTheSameUIEdit() async throws {
+            try await assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: true)
+        }
+
+        private func assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: Bool) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let foregroundID = try XCTUnwrap(manager.activeWorkspace?.activeComposeTabID)
+            let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0)
+                let storedBefore = manager.workspace(withID: workspaceID)
+                if preparations == 1 {
+                    // The real UI action marks the workspace dirty synchronously; its model
+                    // snapshot is published separately. No stored bytes have changed yet.
+                    let versionBefore = manager.debugStateVersionForWorkspace(workspaceID)
+                    prompt.setActiveFilesTab(nextView, source: .user)
+                    XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(workspaceID), versionBefore)
+                    XCTAssertEqual(manager.workspace(withID: workspaceID), storedBefore)
+                } else if publishDeferredSnapshot {
+                    // A correct recapture already included this edit. Its deferred publication
+                    // must be a no-op, rather than spending the retry on the same change twice.
+                    manager.publishActiveComposeTabSnapshot(commitToMemory: true)
+                    XCTAssertEqual(manager.workspace(withID: workspaceID), storedBefore)
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(
+                window: fixture.window,
+                recorder: recorder,
+                validateBeforeProviderDispatch: { _ in
+                    XCTAssertFalse(
+                        manager.debugHasUnsavedWorkingPublication(fixture.workspaceID),
+                        "The successful retry must acknowledge the recaptured publication generation"
+                    )
+                }
+            ).execute(args: [
+                "op": .string("start"), "message": .string("capture the pending foreground edit"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let providerCount = await recorder.count()
+            XCTAssertEqual(providerCount, 1)
+            XCTAssertEqual(preparations, 2, "One actual UI edit requires only the existing one retry")
+            let canonicalValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let canonical = try XCTUnwrap(canonicalValue)
+            let canonicalWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: canonical.document.documentBytes)
+            let savedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            for workspace in [canonicalWorkspace, savedWorkspace] {
+                XCTAssertEqual(workspace.composeTabs.first { $0.id == foregroundID }?.activeSubView, nextView)
+            }
+            XCTAssertNil(canonical.revisions.dirtyRevision)
+            XCTAssertFalse(manager.debugHasUnsavedWorkingPublication(fixture.workspaceID))
+        }
+
+        func testSecondPendingUIEditStillExhaustsTheExistingSaveRetryBudget() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0)
+                let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+                prompt.setActiveFilesTab(nextView, source: .user)
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: fixture.workspaceID,
+                source: WorkspaceSaveSource("agentSessionLifecycleUIRecaptureTest")
+            )
+            XCTAssertEqual(
+                outcome,
+                .rejected(reason: "workspace_save_failed", category: .localSavePreparationRetryExhausted)
+            )
+            XCTAssertEqual(preparations, 2)
+        }
+
+        func testDirectModelSaveRetryDoesNotImportAnUnpublishedUIEdit() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let proposal = try XCTUnwrap(manager.activeWorkspace)
+            let foregroundID = try XCTUnwrap(proposal.activeComposeTabID)
+            let proposedView = proposal.composeTabs.first { $0.id == foregroundID }?.activeSubView
+            let nextView: FilesTab = proposedView == .selected ? .context : .selected
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                guard preparations == 1 else { return }
+                prompt.setActiveFilesTab(nextView, source: .user)
+                // Join the action's dirty-badge callback before the one retry begins.
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            _ = try await manager.saveWorkspaceToFileAsync(proposal, source: .directUnknown)
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            XCTAssertEqual(preparations, 2)
+            XCTAssertEqual(saved.composeTabs.first { $0.id == foregroundID }?.activeSubView, proposedView)
+            XCTAssertEqual(prompt.storedActiveSubView, nextView)
+        }
+
+        func testSaveRetryCannotAcknowledgePendingUIWhileItsSnapshotIsSuspended() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let foregroundID = try XCTUnwrap(manager.activeWorkspace?.activeComposeTabID)
+            let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+            let canonicalBefore = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                manager.setSnapshotsSuspended(true, forTabID: foregroundID)
+                prompt.setActiveFilesTab(nextView, source: .user)
+            }
+            defer {
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                manager.setSnapshotsSuspended(false, forTabID: foregroundID)
+            }
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: fixture.workspaceID,
+                source: WorkspaceSaveSource("agentSessionLifecycleSuspendedUIRecaptureTest")
+            )
+            XCTAssertEqual(outcome, .rejected(reason: "workspace_save_failed", category: .workspaceChanged))
+            XCTAssertEqual(preparations, 1, "A suspended capture must not prepare stale bytes as its retry")
+            let canonicalAfter = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            XCTAssertEqual(canonicalAfter?.document.contentDigest, canonicalBefore?.document.contentDigest)
+            XCTAssertEqual(canonicalAfter?.revisions, canonicalBefore?.revisions)
+            XCTAssertNotEqual(
+                manager.debugLastSavedVersionForWorkspace(fixture.workspaceID),
+                manager.debugStateVersionForWorkspace(fixture.workspaceID)
+            )
+            XCTAssertEqual(prompt.storedActiveSubView, nextView, "The refused capture must not reload over pending UI")
+        }
+
+        private func settleForegroundForSaveCapture(_ fixture: DurableAgentAdmissionFixture) async throws {
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            try prompt.loadComposeTabsFromWorkspace(XCTUnwrap(manager.activeWorkspace))
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            manager.publishActiveComposeTabSnapshot(commitToMemory: true)
+            try prompt.loadComposeTabsFromWorkspace(XCTUnwrap(manager.activeWorkspace))
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+
+        private func assertGitModePublicationDuringAdmissionSave(
+            changesMode: Bool,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            let gitViewModel = fixture.window.promptManager.gitViewModel
+            let initialMode = gitViewModel.gitDiffInclusionMode
+            trackCleanup {
+                gitViewModel.gitDiffInclusionMode = initialMode
+                await fixture.cleanup()
+            }
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            // The post-switch Git-data root starts expanded. Join that load and its
+            // foreground badge update before measuring invalidations caused by Git mode.
+            // Otherwise fixture normalization can consume the retry before this hook runs.
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            let workspace = try XCTUnwrap(manager.activeWorkspace, file: file, line: line)
+            prompt.loadComposeTabsFromWorkspace(workspace)
+            // The reload synchronously schedules (or coalesces into) the badge callback.
+            // This FIFO barrier joins it whether the normalized foreground is dirty or clean.
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            let initialTabs = workspace.composeTabs
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0, file: file, line: line)
+                // Settings sync can republish the same mode while document preparation
+                // is suspended. The control changes it once, then republishes that value
+                // on the retry; only the real transition may invalidate the capture.
+                let currentMode = gitViewModel.gitDiffInclusionMode
+                let publishedMode: GitDiffInclusionMode = changesMode && preparations == 1
+                    ? (currentMode == .all ? .none : .all)
+                    : currentMode
+                gitViewModel.gitDiffInclusionMode = publishedMode
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("Git mode publication during admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let observations = await recorder.observations()
+            XCTAssertEqual(observations.count, 1, file: file, line: line)
+            XCTAssertEqual(
+                preparations,
+                changesMode ? 2 : 1,
+                "Only a changed Git mode may consume the one allowed save retry",
+                file: file,
+                line: line
+            )
+            let observation = try XCTUnwrap(observations.first, file: file, line: line)
+            let pair = AdmissionIdentityPair(tabID: observation.tabID, sessionID: observation.sessionID)
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let canonical = try XCTUnwrap(snapshot, file: file, line: line)
+            let canonicalWorkspace = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: canonical.document.documentBytes
+            )
+            let savedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            assertExactAdmissionState(
+                in: canonicalWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+            assertExactAdmissionState(
+                in: savedWorkspace.composeTabs,
+                initialTabs: initialTabs,
+                acceptedPairs: [pair],
+                file: file,
+                line: line
+            )
+        }
+
         func testCanonicalAdmissionRefreshReResolvesWorkspaceAfterReorder() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -718,7 +995,8 @@ import XCTest
                 try await manager.withAgentSessionAdmission(
                     workspaceID: workspace.id,
                     admissionID: UUID(),
-                    refreshCanonicalState: true
+                    refreshCanonicalState: true,
+                    kind: .freshTab
                 ) {
                     operationRan = true
                 }
@@ -1671,18 +1949,76 @@ import XCTest
             let coordinator = WorkspaceAgentAdmissionCoordinator()
             let fixture = makeManagerFixture(coordinator: coordinator)
             defer { fixture.manager.prepareForWindowClose() }
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: {
+                XCTAssertEqual(coordinator.snapshot().activeAdmissionCount, 0, "Emit only after lease release")
+                reports.append($0)
+            })
 
             do {
                 _ = try await fixture.manager.withAgentSessionAdmission(
                     workspaceID: UUID(),
-                    admissionID: UUID()
+                    admissionID: UUID(),
+                    kind: .freshTab,
+                    timing: timing
                 ) {
+                    timing.begin(.save)
+                    defer { timing.end() }
+                    now += .seconds(44)
                     throw AdmissionTestError.expected
                 }
                 XCTFail("The controlled operation must throw.")
             } catch AdmissionTestError.expected {}
 
             XCTAssertEqual(coordinator.snapshot().trackedWorkspaceCount, 0)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(reports.first?.slowestPhase, .save)
+            XCTAssertEqual(reports.first?.totalMilliseconds, 44000)
+            XCTAssertEqual(reports.first?.holdMilliseconds, 44000)
+            XCTAssertEqual(reports.first?.outcome, .threw)
+        }
+
+        func testAdmissionTimingReportsKindOutcomeAndReleasedLeaseOnEveryExit() async throws {
+            let coordinator = WorkspaceAgentAdmissionCoordinator()
+            let fixture = makeManagerFixture(coordinator: coordinator)
+            defer { fixture.manager.prepareForWindowClose() }
+            let cases: [(WorkspaceAgentAdmissionTiming.Kind, WorkspaceAgentAdmissionTiming.Outcome)] = [
+                (.freshTab, .committed), (.existingTab, .rejected), (.recovery, .cancelled), (.discard, .threw)
+            ]
+            for (kind, outcome) in cases {
+                var now = Duration.zero
+                var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+                let workspaceID = UUID()
+                let admissionID = UUID()
+                let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: {
+                    XCTAssertEqual(coordinator.snapshot().activeAdmissionCount, 0)
+                    reports.append($0)
+                })
+                do {
+                    _ = try await fixture.manager.withAgentSessionAdmission(
+                        workspaceID: workspaceID, admissionID: admissionID, kind: kind,
+                        classifyOutcome: { (accepted: Bool) in accepted ? .committed : .rejected }, timing: timing
+                    ) {
+                        now += .seconds(6)
+                        if outcome == .cancelled { throw CancellationError() }
+                        if outcome == .threw { throw AdmissionTestError.expected }
+                        return outcome == .committed
+                    }
+                    XCTAssertTrue(outcome == .committed || outcome == .rejected)
+                } catch is CancellationError {
+                    XCTAssertEqual(outcome, .cancelled)
+                } catch AdmissionTestError.expected {
+                    XCTAssertEqual(outcome, .threw)
+                }
+                let report = try XCTUnwrap(reports.first)
+                XCTAssertEqual(reports.count, 1)
+                XCTAssertEqual(report.outcome, outcome)
+                XCTAssertEqual(report.context.kind, kind)
+                XCTAssertEqual(report.context.workspaceKey, WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID))
+                XCTAssertEqual(report.context.correlationKey, WorkspaceAgentAdmissionCoordinator.redactedID(admissionID))
+                XCTAssertTrue(report.logMessage.contains("kind=\(kind.rawValue) outcome=\(outcome.rawValue)"))
+            }
         }
 
         func testAgentAdmissionSaveRetriesOnceThenPersistsNewestState() async throws {
@@ -1978,7 +2314,7 @@ import XCTest
             let workspace = WorkspaceModel(
                 name: "Admission",
                 repoPaths: [],
-                customStoragePath: root,
+                customStoragePath: AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: root),
                 composeTabs: [tab],
                 activeComposeTabID: tab.id
             )
@@ -2078,6 +2414,20 @@ import XCTest
     }
 
     @MainActor
+    private func completeDurableAdmissionWindowSetup(_ window: WindowState) async throws {
+        // Switching starts an owned Git-data root load after foreground restoration.
+        // Admission begins only once that setup and its badge publication have finished.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+        // The reload schedules or coalesces the dirty-badge callback synchronously.
+        // FIFO ordering joins that specific callback before the fixture is returned.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    @MainActor
     private final class DistinctDurableAdmissionFixture {
         let first: DurableAdmissionWindow
         let second: DurableAdmissionWindow
@@ -2125,6 +2475,11 @@ import XCTest
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let firstWindow = WindowState(domainRuntime: firstRuntime)
             let secondWindow = WindowState(domainRuntime: secondRuntime)
+            for (label, window) in [("A", firstWindow), ("B", secondWindow)] {
+                window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                    print("WORKSPACE_SAVE_CONFLICT distinct-\(label) \(fields.sorted { $0.key < $1.key })")
+                }
+            }
             WindowStatesManager.shared.registerWindowState(firstWindow)
             WindowStatesManager.shared.registerWindowState(secondWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -2250,8 +2605,7 @@ import XCTest
                     switchResult.message ?? "distinct durable workspace did not become active"
                 )
             }
-            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            try await completeDurableAdmissionWindowSetup(window)
             _ = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
                 at: workspaceFileURL,
                 scheduleNormalizationWriteback: false
@@ -2363,8 +2717,7 @@ import XCTest
                         switchResult.message ?? "durable workspace did not become active"
                     )
                 }
-                let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-                window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+                try await completeDurableAdmissionWindowSetup(window)
                 let canonicalSnapshot = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                 let canonical = try XCTUnwrap(canonicalSnapshot)
                 guard canonical.health == .writable else {
@@ -2434,8 +2787,7 @@ import XCTest
                     switchResult.message ?? "peer durable workspace did not become active"
                 )
             }
-            let activeWorkspace = try XCTUnwrap(peer.workspaceManager.activeWorkspace)
-            peer.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            try await completeDurableAdmissionWindowSetup(peer)
             return peer
         }
 
@@ -2722,3 +3074,74 @@ import XCTest
         }
     }
 #endif
+
+@MainActor
+final class WorkspaceAgentAdmissionTimingTests: XCTestCase {
+    func testFortyFourSecondStallIsAttributedToEachExclusivePhase() throws {
+        for slowPhase in WorkspaceAgentAdmissionTiming.Phase.allCases {
+            var now = Duration.zero
+            var reports: [WorkspaceAgentAdmissionTiming.Report] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { reports.append($0) })
+            let workspaceID = UUID()
+            let admissionID = UUID()
+            timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: .freshTab)
+            now += slowPhase == .queueWait ? .seconds(44) : .seconds(1)
+            timing.acquired()
+            timing.begin(.refresh)
+            now += slowPhase == .refresh ? .seconds(44) : .seconds(1)
+            timing.begin(.catalogRefresh)
+            now += slowPhase == .catalogRefresh ? .seconds(44) : .seconds(1)
+            timing.end()
+            // Baseline adoption can refresh again, with save work nested inside that refresh.
+            timing.begin(.refresh)
+            timing.begin(.save)
+            now += slowPhase == .save ? .seconds(44) : .seconds(1)
+            timing.end()
+            timing.end()
+            timing.end()
+            now += slowPhase == .other ? .seconds(44) : .seconds(1)
+            timing.recordSaveAttempt()
+            timing.recordSaveAttempt()
+            timing.finish(outcome: .committed)
+
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(reports.count, 1)
+            XCTAssertEqual(report.slowestPhase, slowPhase)
+            XCTAssertEqual(report.milliseconds[slowPhase.rawValue], 44000)
+            XCTAssertEqual(report.totalMilliseconds, 48000)
+            XCTAssertEqual(report.holdMilliseconds, slowPhase == .queueWait ? 4000 : 47000)
+            XCTAssertEqual(report.counts, [1, 1, 1, 1, 1])
+            XCTAssertEqual(report.saveAttempts, 2)
+            XCTAssertEqual(report.context.workspaceKey, WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID))
+            XCTAssertEqual(report.context.correlationKey, WorkspaceAgentAdmissionCoordinator.redactedID(admissionID))
+            XCTAssertFalse(report.logMessage.contains(workspaceID.uuidString))
+            XCTAssertFalse(report.logMessage.contains(admissionID.uuidString))
+            XCTAssertTrue(report.logMessage.contains("slowest=\(slowPhase.name)"))
+        }
+    }
+
+    func testThresholdBoundaryAndRepeatedFinishEmitAtMostOneReport() {
+        for elapsed in [Duration.milliseconds(4999), .seconds(5)] {
+            var now = Duration.zero
+            var messages: [String] = []
+            let timing = WorkspaceAgentAdmissionTiming(now: { now }, emit: { messages.append($0.logMessage) })
+            let workspaceID = UUID()
+            let admissionID = UUID()
+            timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: .discard)
+            now = elapsed
+            timing.finish(outcome: .cancelled) // Includes cancellation before acquiring a lease.
+            timing.finish(outcome: .threw)
+            timing.acquired()
+            timing.begin(.save)
+            timing.end()
+            timing.finish(outcome: .committed)
+            if elapsed < .seconds(5) {
+                XCTAssertEqual(messages, [])
+            } else {
+                XCTAssertEqual(messages, [
+                    "event=agentAdmission.slow workspace=\(WorkspaceAgentAdmissionCoordinator.redactedID(workspaceID)) correlation=\(WorkspaceAgentAdmissionCoordinator.redactedID(admissionID)) kind=discard outcome=cancelled totalMS=5000.000 holdMS=0.000 slowest=queue_wait saveAttempts=0 queue_waitMS=5000.000 queue_waitCount=1 refreshMS=0.000 refreshCount=0 catalog_refreshMS=0.000 catalog_refreshCount=0 saveMS=0.000 saveCount=0 otherMS=0.000 otherCount=0"
+                ])
+            }
+        }
+    }
+}

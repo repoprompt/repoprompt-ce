@@ -1353,6 +1353,21 @@ actor ServerNetworkManager {
 
     private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
     private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
+
+    private struct AutomaticAgentAdmission {
+        enum Source {
+            case pendingPolicy(key: String, id: UUID)
+            case liveToken(String)
+        }
+
+        let runID: UUID
+        let authorityGeneration: UInt64
+        let observedHelperPID: Int
+        let source: Source
+    }
+
+    /// One initialize handoff only; never a standing connection/name grant.
+    private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
     private let terminalRecordClaimsByConnectionID = MCPDomainTerminalClaimRegistry<MCPTerminalRecord>()
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -1909,6 +1924,14 @@ actor ServerNetworkManager {
     private var runCatalogObservationByRunID: [UUID: RunCatalogObservation] = [:]
     private var runCatalogProjectionRevision: UInt64 = 0
     private var runCatalogWaitersByRunID: [UUID: [UUID: RunCatalogWaiter]] = [:]
+
+    /// Per-run "route may have changed" pulses for `awaitAuthoritativeRunCatalogRouteToken`.
+    ///
+    /// A pulse is only a hint to re-run the strict token query; it never carries or implies
+    /// authority. The generation closes the gap between a waiter's last query and its parking: a
+    /// pulse fired while the query was suspended advances it, so the waiter re-queries at once.
+    private var runRouteChangeGenerationByRunID: [UUID: UInt64] = [:]
+    private var runRouteChangeWaitersByRunID: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
 
     /// 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:] {
@@ -3317,7 +3340,7 @@ actor ServerNetworkManager {
         let (oversightEnabled, globalOverseer) = await MainActor.run {
             (
                 ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
-                OverseerGlobalAutoApprove.isEnabled()
+                OverseerAuthorizationEngine.current.listsFullOversightSurface
             )
         }
         guard let revalidatedRouteToken = await (
@@ -4450,6 +4473,99 @@ actor ServerNetworkManager {
         )
     }
 
+    /// Bounded wait for the exact server-owned route of one run.
+    ///
+    /// Re-runs the strict `authoritativeRunCatalogRouteToken` query until it yields a token, the
+    /// timeout elapses, or the calling task is cancelled; it never builds a token any other way.
+    /// Used only for a provider process the caller has just launched, whose RepoPrompt MCP child may
+    /// not yet have connected, passed the PID gate and admission, and committed its run mapping.
+    ///
+    /// This deliberately waits on route authority, never on tool-catalog freshness or the weaker
+    /// `MCPRoutingWaiter` routed flag: a stale catalog is a discovery fact and must not delay or
+    /// refuse a send (see `docs/architecture/agent-session-oversight-auto-wake.md`).
+    ///
+    /// Wakes on the per-run route-change pulse (route commit, run mapping, cleanup/revoke) and polls
+    /// every `runRouteChangePollInterval` as a backstop for mapping changes that do not pulse.
+    func awaitAuthoritativeRunCatalogRouteToken(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID,
+        timeout: TimeInterval
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(max(0, timeout) * 1000)))
+        while !Task.isCancelled {
+            // Sampled before the query so a pulse fired while it is suspended is never lost.
+            let generation = runRouteChangeGenerationByRunID[runID, default: 0]
+            if let token = await authoritativeRunCatalogRouteToken(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID
+            ) {
+                return token
+            }
+            let now = ContinuousClock.now
+            guard now < deadline, !Task.isCancelled else { return nil }
+            await awaitRunRouteChange(
+                runID: runID,
+                after: generation,
+                until: min(deadline, now.advanced(by: Self.runRouteChangePollInterval))
+            )
+        }
+        return nil
+    }
+
+    private static let runRouteChangePollInterval: Duration = .milliseconds(50)
+
+    /// Parks until this run's route-change pulse, `wakeAt`, or cancellation, whichever comes first.
+    private func awaitRunRouteChange(
+        runID: UUID,
+        after generation: UInt64,
+        until wakeAt: ContinuousClock.Instant
+    ) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                guard !Task.isCancelled,
+                      runRouteChangeGenerationByRunID[runID, default: 0] == generation
+                else {
+                    continuation.resume()
+                    return
+                }
+                runRouteChangeWaitersByRunID[runID, default: [:]][waiterID] = continuation
+                Task { [weak self] in
+                    try? await Task.sleep(until: wakeAt, clock: .continuous)
+                    await self?.resumeRunRouteChangeWaiter(runID: runID, waiterID: waiterID)
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.resumeRunRouteChangeWaiter(runID: runID, waiterID: waiterID)
+            }
+        }
+    }
+
+    private func resumeRunRouteChangeWaiter(runID: UUID, waiterID: UUID) {
+        guard let continuation = runRouteChangeWaitersByRunID[runID]?.removeValue(forKey: waiterID) else { return }
+        if runRouteChangeWaitersByRunID[runID]?.isEmpty == true {
+            runRouteChangeWaitersByRunID.removeValue(forKey: runID)
+        }
+        continuation.resume()
+    }
+
+    /// Wakes every route waiter for one run so it re-runs the strict token query. A hint only.
+    func signalRunRouteChanged(runID: UUID) {
+        runRouteChangeGenerationByRunID[runID, default: 0] &+= 1
+        guard let waiters = runRouteChangeWaitersByRunID.removeValue(forKey: runID) else { return }
+        for continuation in waiters.values {
+            continuation.resume()
+        }
+    }
+
+    /// Pulse entry point for MainActor run-mapping writers (`MCPServerViewModel`).
+    nonisolated static func noteRunRouteChanged(runID: UUID) {
+        Task { await ServerNetworkManager.shared.signalRunRouteChanged(runID: runID) }
+    }
+
     /// Rechecks committed route authority and, if it is absent, fences this run against
     /// any in-flight policy application before returning. The final actor-side route
     /// sample and fence installation share one actor turn; MainActor mapping checks are
@@ -4819,6 +4935,7 @@ actor ServerNetworkManager {
                 setConnectionRunID(runID, for: connectionID)
             }
             presentationWindowByRun[runID] = windowID
+            signalRunRouteChanged(runID: runID)
             return true
         }
 
@@ -4871,6 +4988,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             persistWindowBinding: persistWindowBinding
         )
+        signalRunRouteChanged(runID: runID)
         return true
     }
 
@@ -5312,6 +5430,9 @@ actor ServerNetworkManager {
             pendingPoliciesByClient[key]?.removeAll { $0.runID == runID }
             if pendingPoliciesByClient[key]?.isEmpty == true { pendingPoliciesByClient.removeValue(forKey: key) }
         }
+        // Mapping cleanup signals asynchronously. Bind that signal to the retiring waiter before
+        // any successor can register the same process run; an unqualified late signal could fail it.
+        let routingWaitGeneration = await MCPRoutingWaiter.generation(runID: runID)
         await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
@@ -5334,11 +5455,20 @@ actor ServerNetworkManager {
             }
             for window in windows {
                 if let connectionID = window.mcpServer.connectionID(forRunID: runID) {
-                    window.mcpServer.cleanupRunIDMapping(runID: runID, connectionID: connectionID)
+                    window.mcpServer.cleanupRunIDMapping(
+                        runID: runID, connectionID: connectionID,
+                        signalRoutingFailure: routingWaitGeneration != nil,
+                        routingWaitGeneration: routingWaitGeneration
+                    )
                     connectionLog("Cleaned up runID mapping for runID \(runID) in window \(window.windowID)")
                 }
             }
         }
+        // Wake route waiters so they observe the revocation now rather than at their next poll, then
+        // drop the run's pulse generation so the map stays bounded; a waiter parked after this
+        // falls back to its poll interval, which only delays a query that now finds no route.
+        signalRunRouteChanged(runID: runID)
+        runRouteChangeGenerationByRunID.removeValue(forKey: runID)
     }
 
     /// Explicitly clears cached run routing/policy state for any runs associated with a closed tab.
@@ -7400,6 +7530,7 @@ actor ServerNetworkManager {
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
             bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+            automaticAgentAdmissions.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -7703,6 +7834,20 @@ actor ServerNetworkManager {
             log.warning("terminateConnection: connection \(id) not found in connections dictionary")
             return
         }
+        // Registered connections always acquire their lifecycle generation before yielding.
+        // Revoke admission before transport closure becomes observable to a reentrant caller.
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("terminateConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("terminateConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
 
         let sem = semanticsOverride ?? defaultSemantics(for: reason)
         let sessionToken = capabilityTokenByConnection[id] ?? connection.capabilityToken
@@ -7745,8 +7890,10 @@ actor ServerNetworkManager {
         // 3. Terminate the connection (writes "killed" to meta.json for filesystem)
         await connection.terminate(reason: reason, message: message)
 
-        // 4. Clean up connection state
-        await removeConnection(id, context: closeContext)
+        // 4. Finish the same removal owner committed before transport termination.
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: false, context: closeContext
+        )
 
         connectionLog("Successfully terminated and removed connection \(id)")
 
@@ -7763,6 +7910,18 @@ actor ServerNetworkManager {
             connectionLog("softDisconnectConnection: connection \(id) not found")
             return
         }
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("softDisconnectConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("softDisconnectConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
         connectionLog("Soft-disconnecting connection \(id) reason=\(reason.rawValue)")
         #if DEBUG
             debugRecordConnectionEvent("soft_disconnected", connectionID: id, reason: reason.rawValue)
@@ -7774,7 +7933,9 @@ actor ServerNetworkManager {
         )
         persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
         await connection.stop()
-        await removeConnection(id, context: closeContext)
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: true, context: closeContext
+        )
     }
 
     private func currentBootstrapReplacementConnectionID(forSessionToken token: String) -> UUID? {
@@ -8419,6 +8580,7 @@ actor ServerNetworkManager {
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
         bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
+        automaticAgentAdmissions.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -8753,6 +8915,124 @@ actor ServerNetworkManager {
         return mutableArgs
     }
 
+    /// Admission-only exception for app-launched providers. The controller verifies the helper
+    /// executable; this actor rechecks the same observed peer against current run-owned evidence.
+    /// Claimed PIDs, names alone, and expected ancestry without a policy/token never authorize it.
+    /// The one-initialize proof must survive normal policy consumption; fallback cannot widen it.
+    func authorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) async -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        let deadline = Date().addingTimeInterval(2)
+        // Launchers register the parent PID just after Process.run(). The helper may win
+        // that race. Wait only while a PID-gated policy exists, using observed identity
+        // throughout; absence of proof never becomes approval when the bound expires.
+        repeat {
+            guard !Task.isCancelled,
+                  isCurrentConnection(connectionID, lifecycleGeneration: generation),
+                  bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+            else { return false }
+            if tryAuthorizeAutomaticAppManagedAgentAdmission(
+                connectionID: connectionID, clientName: clientName,
+                verifiedBundledHelperPID: verifiedBundledHelperPID
+            ) { return true }
+            guard hasPIDGatedPendingPolicy(for: clientName), Date() < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while true
+    }
+
+    private func tryAuthorizeAutomaticAppManagedAgentAdmission(
+        connectionID: UUID,
+        clientName: String,
+        verifiedBundledHelperPID: Int
+    ) -> Bool {
+        automaticAgentAdmissions.removeValue(forKey: connectionID)
+        guard let generation = connectionLifecycleGenerationByID[connectionID],
+              isCurrentConnection(connectionID, lifecycleGeneration: generation),
+              verifiedBundledHelperPID > 1,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+        else { return false }
+
+        func ownsLiveRun(_ runID: UUID) -> Bool {
+            guard runPolicyStateByRunID[runID] != nil,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  revocationFenceGenerationByRunID[runID] != authorityGeneration
+            else { return false }
+            let expectedPIDs = expectedAgentPIDs(for: clientName)
+                .intersection(expectedAgentPIDs(for: clientName, runID: runID))
+            return !expectedPIDs.isEmpty && isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(verifiedBundledHelperPID))
+        }
+
+        if let entry = oldestPendingPolicyEntry(for: clientName, where: { policy in
+            guard policy.requiresExpectedAgentPID,
+                  policy.reservationConnectionID == nil,
+                  let runID = policy.runID
+            else { return false }
+            return ownsLiveRun(runID)
+        }) {
+            // Do not let an old connection's token or mapping borrow a successor run's policy.
+            let boundRunID = runIDByConnectionID[connectionID]
+            let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+            let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+            guard let runID = entry.policy.runID,
+                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+                  boundRunID == nil || boundRunID == runID,
+                  affinity == nil || affinity?.runID == runID
+            else { return false }
+            automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+                runID: runID, authorityGeneration: authorityGeneration,
+                observedHelperPID: verifiedBundledHelperPID,
+                source: .pendingPolicy(key: entry.key, id: entry.policy.id)
+            )
+            return true
+        }
+
+        // Reconnects require the exact live capability token as well as current ancestry.
+        // An expected process alone cannot join an established run under a new token.
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        guard let sessionKey,
+              let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
+              admittedPolicyRunIDs.contains(affinity.runID),
+              ownsLiveRun(affinity.runID),
+              let authorityGeneration = runRoutingAuthorityGenerationByRunID[affinity.runID],
+              runIDByConnectionID[connectionID].map({ $0 == affinity.runID }) ?? true
+        else { return false }
+        automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
+            runID: affinity.runID, authorityGeneration: authorityGeneration,
+            observedHelperPID: verifiedBundledHelperPID, source: .liveToken(sessionKey)
+        )
+        return true
+    }
+
+    private func isCurrentAutomaticAgentAdmission(
+        _ proof: AutomaticAgentAdmission,
+        connectionID: UUID,
+        clientName: String,
+        requiresPendingPolicy: Bool
+    ) -> Bool {
+        guard runPolicyStateByRunID[proof.runID] != nil,
+              runRoutingAuthorityGenerationByRunID[proof.runID] == proof.authorityGeneration,
+              revocationFenceGenerationByRunID[proof.runID] != proof.authorityGeneration,
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == proof.observedHelperPID,
+              isExpectedAgentDescendant(clientName: clientName, clientPid: proof.observedHelperPID, runID: proof.runID) == true
+        else { return false }
+        switch proof.source {
+        case let .pendingPolicy(key, id):
+            guard requiresPendingPolicy else { return true }
+            pruneExpiredPolicies(for: clientName)
+            return pendingPoliciesByClient[key]?.contains {
+                $0.id == id && $0.runID == proof.runID && $0.reservationConnectionID == nil
+            } == true
+        case let .liveToken(token):
+            return (connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]) == token
+                && preferredLiveRunAffinity(for: clientName, sessionKey: token)?.runID == proof.runID
+                && admittedPolicyRunIDs.contains(proof.runID)
+        }
+    }
+
     /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
     private func completeApprovedAgentInitialization(
         clientName: String,
@@ -8762,6 +9042,10 @@ actor ServerNetworkManager {
         clientPid: Int,
         expectedLifecycleGeneration: UInt64
     ) async -> Bool {
+        let automaticAdmission = automaticAgentAdmissions.removeValue(forKey: connectionID)
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let readiness = await awaitAgentPolicyAdmissionIfNeeded(
             clientName: clientName,
             bootstrapClientName: bootstrapClientName,
@@ -8775,6 +9059,9 @@ actor ServerNetworkManager {
             return false
         }
 
+        if let automaticAdmission,
+           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
+        { return false }
         let policyOutcome = await applyPendingPolicyIfAvailable(
             clientName: clientName,
             connectionID: connectionID,
@@ -8789,6 +9076,14 @@ actor ServerNetworkManager {
             )
             pendingConnections.removeValue(forKey: connectionID)
             return false
+        }
+        if let automaticAdmission {
+            guard isCurrentAutomaticAgentAdmission(
+                automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+            ),
+                runIDByConnectionID[connectionID] == automaticAdmission.runID,
+                admittedPolicyRunIDs.contains(automaticAdmission.runID)
+            else { return false }
         }
         notifyConnectionWaiters(
             connectionID: connectionID,
@@ -11729,6 +12024,10 @@ actor ServerNetworkManager {
             runCatalogWaitersByRunID[runID]?.count ?? 0
         }
 
+        func debugRunRouteChangeWaiterCount(for runID: UUID) -> Int {
+            runRouteChangeWaitersByRunID[runID]?.count ?? 0
+        }
+
         func debugPublishRunCatalogObservation(
             routeToken: AgentSessionLinkRunCatalogRouteToken,
             hasAgentSessionLink: Bool?
@@ -12777,6 +13076,10 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             runID: policy.runID
         )
+        if let runID = policy.runID {
+            // The run's route is committed here; wake any bounded route waiter for it.
+            signalRunRouteChanged(runID: runID)
+        }
         if let pendingPolicyRunIDMappingToken {
             schedulePendingPolicyConnectionReplacement(
                 pendingPolicyRunIDMappingToken,
@@ -12847,6 +13150,9 @@ actor ServerNetworkManager {
 
         await updateRoutingRecordForConnection(connectionID, clientID: clientName)
         await notifyToolListChanged(connectionID: connectionID)
+        if let runID = policy.runID {
+            signalRunRouteChanged(runID: runID)
+        }
         return .applied(runID: policy.runID)
     }
 
@@ -16427,6 +16733,13 @@ actor ServerNetworkManager {
             .map { String(format: "%02x", $0) }
             .joined()
         return (fingerprint, nil)
+    }
+
+    /// Liveness fence for queued approval UI; process identity may be unavailable
+    /// even for a live connection, so a missing peer PID is not a close signal.
+    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
     }
 
     /// Returns the verified peer PID for a bootstrap socket connection, if available.

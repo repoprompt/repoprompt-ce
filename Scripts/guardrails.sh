@@ -9,6 +9,7 @@ cd "$ROOT_DIR"
 ./Scripts/swiftpm_notice_guardrails.sh
 ./Scripts/codex_vendor_guardrails.sh
 ./Scripts/headless_runtime_guardrails.sh
+python3 Scripts/overseer_authorization_guardrails.py
 ./Scripts/xcframework_declared_paths_guardrails.sh
 python3 Scripts/modularization_metrics.py check
 python3 Scripts/test_modularization_metrics.py

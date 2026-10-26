@@ -7,8 +7,8 @@ on:
       - main
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -118,7 +118,25 @@ jobs:
           if-no-files-found: warn
 
       - name: Gate compiler index ratchets on the built sources
+        id: compiler_index_gate
         run: python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json
+
+      - name: Capture failed compiler index graph
+        if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
+        run: |
+          mkdir -p .build/modularization
+          python3 Scripts/modularization_index_graph.py dump --output .build/modularization/index-failure-graph.json
+
+      - name: Retain failed compiler index diagnostics
+        if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-index-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/modularization/index-failure-graph.json
+            .build/modularization/app-source-sha256.json
+          if-no-files-found: error
+          retention-days: 3
 
       # All executor-parity module checks gate PRs before merge, on the same warm VM.
       - name: Run all app-free module parity tests
@@ -161,7 +179,7 @@ jobs:
           overwrite: true
           name: root-build-${{ github.run_id }}
           path: root-build.tar.gz
-          retention-days: 1
+          retention-days: 7
 
       # Keep binary artifacts main-scoped too; PRs restore without saving their own caches.
       - name: Save checksum-verified SwiftPM binary artifacts (main only)
@@ -240,7 +258,18 @@ jobs:
           BUILD_RESULT: ${{ needs.build-test-bundles.result }}
           SECRET_RESULT: ${{ needs.secret-scan.result }}
           SHARD_RESULT: ${{ needs.build-and-test.result }}
-        run: test "$BUILD_RESULT" = success && test "$SHARD_RESULT" = success && test "$SECRET_RESULT" = success
+        shell: bash
+        run: |
+          {
+            echo '## CI prerequisite results'
+            echo "- Build and Static Gates: $BUILD_RESULT"
+            echo "- Root test shards: $SHARD_RESULT"
+            echo "- Secret Scan: $SECRET_RESULT"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
+            echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
+            exit 1
+          fi
 
       - name: Download expected coverage
         uses: actions/download-artifact@v4

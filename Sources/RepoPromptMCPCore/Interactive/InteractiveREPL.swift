@@ -1065,7 +1065,7 @@ actor InteractiveREPL {
           \u{001B}[32mworkspace\u{001B}[0m create <name> --switch       Create workspace and switch to it
           \u{001B}[32mworkspace\u{001B}[0m create <name> --folder-path <path>  Create workspace with a root folder
           \u{001B}[32mwindows\u{001B}[0m                         List windows and context_id values
-          \u{001B}[32muse\u{001B}[0m <id>                        Bind a window for this REPL session
+          \u{001B}[32muse\u{001B}[0m <id>                        Bind that window's active tab for this REPL session
           \u{001B}[32mtabs\u{001B}[0m list                       List tabs via bind_context
           \u{001B}[32mworkspace\u{001B}[0m create <name>         Create new workspace
           \u{001B}[32mworkspace\u{001B}[0m add-folder <path>     Add folder to workspace
@@ -1089,7 +1089,7 @@ actor InteractiveREPL {
             JSON args: inline, @/path/file.json, @-, or path.json
 
           \u{001B}[32mwindows\u{001B}[0m                         List windows (multi-window only)
-          \u{001B}[32muse\u{001B}[0m <id>                        Select window (multi-window only)
+          \u{001B}[32muse\u{001B}[0m <id>                        Bind that window's active tab (multi-window only)
 
           \u{001B}[32msnapshot\u{001B}[0m <path>                 Save tool list to JSON
           \u{001B}[32mrefresh\u{001B}[0m                         Refresh tool list from server
@@ -1154,14 +1154,14 @@ actor InteractiveREPL {
         \u{001B}[1;31mMultiple RepoPrompt windows are open. Bind or disambiguate explicitly.\u{001B}[0m
 
         rpce-cli -e 'windows'                            \u{001B}[2mDiscover windows and context_id values\u{001B}[0m
-        rpce-cli \u{001B}[33m-w <id>\u{001B}[0m -e 'context'                    \u{001B}[2mBind a window for this invocation\u{001B}[0m
+        rpce-cli \u{001B}[33m-w <id>\u{001B}[0m -e 'context'                    \u{001B}[2mBind the window's active tab for this invocation\u{001B}[0m
         rpce-cli \u{001B}[33m--context-id <uuid>\u{001B}[0m -e 'context'        \u{001B}[2mBind a compose context directly\u{001B}[0m
         rpce-cli \u{001B}[33m-w <id> -t <tab-or-uuid>\u{001B}[0m -e 'context'   \u{001B}[2mResolve/bind a tab in one step\u{001B}[0m
 
         \u{001B}[2mAI agents SHOULD:
           1. Run 'windows' to discover available windows and context_id values
-          2. Prefer --context-id when targeting a specific compose context
-          3. Pass -w <id> when working at window scope only\u{001B}[0m
+          2. Prefer --context-id whenever the exact tab matters (e.g. other sessions share the window)
+          3. Use -w <id> alone only when that window's active tab is the tab you want\u{001B}[0m
 
         """
     }
