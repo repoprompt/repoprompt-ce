@@ -244,14 +244,37 @@ struct WorkspaceDefaultGitRepositoryElection {
         else {
             throw Failure.notLoaded(subject)
         }
-        guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: lookupRoot.standardizedFullPath)) else {
-            throw Failure.notGitRepository(subject)
+        let authorizedRoots = snapshot.lookupRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }
+        // Exact-root bounded discovery never searches arbitrary parents. A nested PRIMARY may use an
+        // enclosing checkout only when that enclosing root is independently declared and loaded too.
+        let declaredPaths = Set(snapshot.declaredRoots.map(\.path))
+        let enclosingRoots = snapshot.lookupRoots.filter {
+            $0.standardizedFullPath != lookupRoot.standardizedFullPath
+                && declaredPaths.contains($0.standardizedFullPath)
+                && GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                    lookupRoot.standardizedFullPath, roots: [$0.standardizedFullPath]
+                )
+        }.sorted {
+            let left = GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath)
+            let right = GitRepoRootAuthorization.canonicalPath($1.standardizedFullPath)
+            let leftDepth = left.split(separator: "/").count
+            let rightDepth = right.split(separator: "/").count
+            return leftDepth == rightDepth
+                ? $0.standardizedFullPath < $1.standardizedFullPath
+                : leftDepth > rightDepth
         }
-        return Selection(
-            repository: GitRepoDescriptor(rootURL: resolved.rootURL),
-            logicalRoot: logicalRoot,
-            origin: .declaredPrimary
-        )
+        for candidate in [lookupRoot] + enclosingRoots {
+            if let resolved = await vcsService.resolveRepoForRead(
+                at: URL(fileURLWithPath: candidate.standardizedFullPath), authorizedRoots: authorizedRoots
+            ) {
+                return Selection(
+                    repository: GitRepoDescriptor(rootURL: resolved.rootURL),
+                    logicalRoot: logicalRoot,
+                    origin: .declaredPrimary
+                )
+            }
+        }
+        throw Failure.notGitRepository(subject)
     }
 
     private func electSoleBinding(
@@ -271,7 +294,10 @@ struct WorkspaceDefaultGitRepositoryElection {
         else {
             throw Failure.notLoaded(subject)
         }
-        guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: physicalRoot.standardizedFullPath)) else {
+        guard let resolved = await vcsService.resolveRepoForRead(
+            at: URL(fileURLWithPath: physicalRoot.standardizedFullPath),
+            authorizedRoots: snapshot.lookupRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }
+        ) else {
             throw Failure.notGitRepository(subject)
         }
         let repository = GitRepoDescriptor(rootURL: resolved.rootURL)

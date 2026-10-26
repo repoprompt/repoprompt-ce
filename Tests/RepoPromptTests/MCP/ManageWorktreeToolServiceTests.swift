@@ -5,6 +5,7 @@ import os
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import XCTest
 
 @MainActor
@@ -1693,6 +1694,151 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     security: security
                 ))
             }
+        }
+    }
+
+    @MainActor
+    final class GitDefaultElectionReadAuthorizationTests: XCTestCase {
+        func testChildOnlyWorkspaceRefusesEnclosingRepositoryForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.childOnly)
+        }
+
+        func testNestedRepositoryUsesItsOwnDataForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.nestedRepository)
+        }
+
+        func testLinkedWorktreeUsesItsOwnDataForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.linkedWorktree)
+        }
+
+        func testNestedPrimaryCanUseIndependentlyDeclaredEnclosingRepository() async throws {
+            try await assertReadElection(.declaredParent)
+        }
+
+        func testNestedPrimaryPrefersNearestAuthorizedAncestorDespiteLongerOuterAlias() async throws {
+            let git = try ReviewGitRepositoryFixture()
+            defer { git.cleanup() }
+            let outer = git.sandbox.appendingPathComponent("real")
+            let inner = outer.appendingPathComponent("project")
+            let primary = inner.appendingPathComponent("src")
+            try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+            try Self.makeRepository(git, at: outer, name: "parent")
+            try Self.makeRepository(git, at: inner, name: "child")
+            let outerAlias = git.sandbox.appendingPathComponent("longer-spelling-for-the-more-distant-ancestor")
+            let innerAlias = git.sandbox.appendingPathComponent("i")
+            try FileManager.default.createSymbolicLink(at: outerAlias, withDestinationURL: outer)
+            try FileManager.default.createSymbolicLink(at: innerAlias, withDestinationURL: inner)
+            let roots = [primary, outerAlias, innerAlias].map {
+                WorkspaceRootRef(id: UUID(), name: $0.lastPathComponent, fullPath: $0.path)
+            }
+            let snapshot = WorkspaceDefaultGitRepositoryElection.Snapshot(
+                workspaceID: UUID(), declaredRepoPaths: roots.map(\.fullPath),
+                bindingSource: .init(activeAgentSessionID: nil, worktreeBindingState: .notApplicable),
+                lookupContext: .visibleWorkspace, lookupRoots: roots
+            )
+            let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: VCSService()).elect(in: snapshot)
+            XCTAssertEqual(
+                GitRepoRootAuthorization.canonicalPath(selection.repository.rootPath),
+                GitRepoRootAuthorization.canonicalPath(inner.path)
+            )
+            XCTAssertEqual(selection.logicalRoot, roots[0], "Retain PRIMARY's logical attribution")
+        }
+
+        private enum Layout {
+            case childOnly, nestedRepository, linkedWorktree, declaredParent
+        }
+
+        /// Exercise the real window Git tool binding with only declared roots in the read grant.
+        /// Parent-only branch/file/commit witnesses catch status, diff, and log disclosure independently.
+        private func assertReadElection(_ layout: Layout) async throws {
+            let rootNames = layout == .declaredParent ? ["parent/child", "parent"] : ["parent/child"]
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: rootNames) { driver in
+                let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                defer { git.cleanup() }
+                let child = try URL(fileURLWithPath: XCTUnwrap(driver.fixture.rootPaths.first), isDirectory: true)
+                let parent = child.deletingLastPathComponent()
+                try Self.makeRepository(git, at: parent, name: "parent")
+                switch layout {
+                case .nestedRepository:
+                    try Self.makeRepository(git, at: child, name: "child")
+                case .linkedWorktree:
+                    try FileManager.default.removeItem(at: child.appendingPathComponent("README.md"))
+                    _ = try git.runGit(["worktree", "add", "-b", "child-main", child.path, "HEAD"], at: parent)
+                    try git.write("tracked\n", to: "child-marker.txt", at: child)
+                    _ = try git.runGit(["add", "child-marker.txt"], at: child)
+                    try git.commit("CHILD_ONLY_ELECTION_SUBJECT", at: child)
+                    try git.write("tracked\nchanged\n", to: "child-marker.txt", at: child)
+                case .childOnly, .declaredParent:
+                    break
+                }
+                let tools = await driver.window.mcpServer.windowMCPTools
+                let binding = try XCTUnwrap(tools.first { $0.name == "git" }).domainBinding()
+                let runtime = try XCTUnwrap(driver.fixture.runtime)
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    tabContextHint: MCPTabContextHint(tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID)
+                )
+                let invocation = ToolInvocationContext.trustedLocal(toolName: "git", metadata: metadata)
+                let security = DomainToolInvocationSecurityContext(
+                    principal: DomainClientPrincipal(
+                        principalID: UUID(), stableKey: "git-election-read-test", displayName: "test",
+                        kind: .runScoped, assurance: .hostLaunchToken, processID: 42, runID: UUID(), provider: "test"
+                    ),
+                    connectionID: UUID(), connectionGeneration: 1, invocationID: UUID(),
+                    runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
+                    authorizedCanonicalRoots: Set(driver.fixture.rootPaths.map {
+                        URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+                    }),
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["git"]
+                )
+                let expected = layout == .declaredParent ? "parent" : "child"
+                for selector: String? in [nil, "@current"] {
+                    for op in ["status", "diff", "log"] {
+                        var args: [String: Value] = ["op": .string(op)]
+                        if let selector { args["repo_root"] = .string(selector) }
+                        if op == "diff" { args["detail"] = .string("files") }
+                        if op == "log" { args["count"] = .int(1) }
+                        do {
+                            let reply = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
+                                try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                            }
+                            let text = try String(decoding: JSONEncoder().encode(reply), as: UTF8.self)
+                            if layout == .childOnly {
+                                XCTAssertFalse(text.contains("parent-marker.txt"), text)
+                                XCTAssertFalse(text.contains("PARENT_ONLY_ELECTION_SUBJECT"), text)
+                                XCTFail("Child-only workspace must refuse parent \(op), selector \(selector ?? "omitted"): \(text)")
+                            } else {
+                                switch op {
+                                case "status":
+                                    XCTAssertEqual(reply.objectValue?["status"]?.objectValue?["branch"]?.stringValue, "\(expected)-main", text)
+                                    XCTAssertTrue(text.contains("\(expected)-marker.txt"), text)
+                                case "diff":
+                                    XCTAssertTrue(text.contains("\(expected)-marker.txt"), text)
+                                default:
+                                    XCTAssertTrue(text.contains("\(expected.uppercased())_ONLY_ELECTION_SUBJECT"), text)
+                                }
+                                if expected == "child" {
+                                    XCTAssertFalse(text.contains("parent-marker.txt"), text)
+                                    XCTAssertFalse(text.contains("PARENT_ONLY_ELECTION_SUBJECT"), text)
+                                }
+                            }
+                        } catch {
+                            guard layout == .childOnly else { throw error }
+                            XCTAssertTrue(error.localizedDescription.contains("no default Git repository"), "\(error)")
+                            XCTAssertFalse(error.localizedDescription.contains("PARENT_ONLY_ELECTION_SUBJECT"), "\(error)")
+                        }
+                    }
+                }
+            }
+        }
+
+        private static func makeRepository(_ git: ReviewGitRepositoryFixture, at root: URL, name: String) throws {
+            try git.initializeRepository(at: root)
+            try git.write("tracked\n", to: "\(name)-marker.txt", at: root)
+            _ = try git.runGit(["add", "-A"], at: root)
+            try git.commit("\(name.uppercased())_ONLY_ELECTION_SUBJECT", at: root)
+            _ = try git.runGit(["branch", "-m", "\(name)-main"], at: root)
+            try git.write("tracked\nchanged\n", to: "\(name)-marker.txt", at: root)
         }
     }
 #endif
