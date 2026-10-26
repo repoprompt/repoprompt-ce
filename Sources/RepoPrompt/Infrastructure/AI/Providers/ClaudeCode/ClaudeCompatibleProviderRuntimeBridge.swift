@@ -7,6 +7,7 @@ typealias ClaudeCompatiblePluginID = RepoPromptClaudeCompatibleProvider.ClaudeCo
 typealias ClaudeCompatiblePluginBackendID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendID
 typealias ClaudeCompatiblePluginRuntimeMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeMode
 typealias ClaudeCompatiblePluginToolContext = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleToolContext
+typealias ClaudeCompatibleBackendLimits = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendLimits
 typealias ClaudeCompatiblePluginBackendConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendConfig
 typealias ClaudeCompatiblePluginBackendAuth = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendAuth
 typealias ClaudeCompatiblePluginBackendModelBehavior = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendModelBehavior
@@ -94,7 +95,10 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             displayName: normalized.normalizedDisplayName,
             baseURL: normalized.normalizedBaseURL ?? normalized.baseURL,
             auth: pluginAuth(from: normalized.auth),
-            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior)
+            modelBehavior: pluginModelBehavior(from: normalized.modelBehavior),
+            requestTimeoutMilliseconds: normalized.requestTimeoutMilliseconds,
+            contextWindowTokens: normalized.contextWindowTokens,
+            httpCredentialConsentEndpoint: normalized.httpCredentialConsentEndpoint
         )
     }
 
@@ -187,8 +191,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String,
         selectedBackendModelID: String? = nil
-    ) -> [String: String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
+    ) throws -> [String: String] {
+        try RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: pluginBackendConfig(from: config),
             apiKey: apiKey,
             selectedBackendModelID: selectedBackendModelID

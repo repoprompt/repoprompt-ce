@@ -4,36 +4,56 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import os
 import signal
 import subprocess
 import time
+from ci_process_session import defer_cancellation_during_cleanup, terminate_session
+
+
+def terminate_resolution(process: subprocess.Popen) -> None:
+    terminate_session(process)
 
 
 def run_resolution(command, *, cwd, check, timeout):
-    # SwiftPM may spawn git/download children. Kill the whole attempt on timeout,
-    # not just its launcher, before the next attempt touches the same scratch path.
-    process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    process = None
+    pending_cancellation = None
+    timeout_error = None
+
+    def cancel_resolution(signum, _frame):
+        nonlocal pending_cancellation
+        if pending_cancellation is None:
+            pending_cancellation = signum
+        # Popen may already have launched the child without returning its handle.
+        # Defer until ownership is recorded; masking here would also mask the child.
+        if process is not None:
+            if pending_cancellation == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + pending_cancellation)
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
     try:
-        status = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        signal.signal(signal.SIGTERM, cancel_resolution)
+        signal.signal(signal.SIGINT, cancel_resolution)
+        process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+        if pending_cancellation is not None:
+            cancel_resolution(pending_cancellation, None)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # A timeout is retryable only after cleanup. A first cancellation
+            # during that cleanup must abort instead of being hidden by this error.
+            timeout_error = error
+    finally:
+        try:
+            if process is not None:
+                with defer_cancellation_during_cleanup():
+                    terminate_resolution(process)
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                # Darwin may report EPERM for an emptied group after TERM. Never
-                # suppress a denied kill while the launcher is still alive.
-                if process.poll() is None:
-                    raise
-            process.wait()
-        raise
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    if timeout_error is not None:
+        raise timeout_error
     return subprocess.CompletedProcess(command, status)
 
 
@@ -54,6 +74,8 @@ def resolve(root: Path, scratch_path: str | None = None, *, attempts: int = 3,
         try:
             status = run(command, cwd=root, check=False, timeout=timeout).returncode
         except subprocess.TimeoutExpired:
+            print(f'::warning::Dependency resolution attempt {attempt} timed out after {timeout}s; '
+                  'all attempt processes were stopped', flush=True)
             status = 124
         if status == 0:
             return 0

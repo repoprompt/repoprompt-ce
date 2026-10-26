@@ -1071,6 +1071,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
+    private let automaticModelPollingEnabled: Bool
     private let perfRecorder: any AgentModePerfRecording
     private var hasPreparedForWindowClose = false
 
@@ -1084,6 +1085,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
         codexModelPollingService: CodexModelPollingService = .shared,
+        automaticModelPollingEnabled: Bool = true,
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.promptManager = promptManager
@@ -1092,6 +1094,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
+        self.automaticModelPollingEnabled = automaticModelPollingEnabled
         self.perfRecorder = perfRecorder
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
@@ -1300,6 +1303,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func updateDynamicModelPolling(startCursorPolling: Bool = true) {
+        guard automaticModelPollingEnabled, !hasPreparedForWindowClose else { return }
         updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)

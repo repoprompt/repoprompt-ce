@@ -432,7 +432,10 @@ struct SettingsView: View {
                 workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
                 settingsManager: windowState.settingsManager,
-                onNavigate: { tab in selectedTab = tab }
+                onNavigate: { tab in selectedTab = tab },
+                repromptCurrentProvider: { [weak agentModeVM = windowState.agentModeViewModel] in
+                    agentModeVM?.activeSession?.selectedAgent ?? agentModeVM?.selectedAgent
+                }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentPermissions:

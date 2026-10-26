@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
@@ -696,7 +697,7 @@ struct AgentManageMCPToolService {
             name: "include_file_contents",
             defaultValue: false
         )
-        let outputPath = normalizedString(args["output_path"])
+        let outputPath = try AgentHandoffOutputFile.pathArgument(args["output_path"])
         let inline = try parseBool(
             args["inline"],
             name: "inline",
@@ -812,7 +813,12 @@ struct AgentManageMCPToolService {
             result["handoff_xml"] = .string(handoffXML)
         }
         if let outputPath {
-            let writeResult = try await writeHandoffPayload(handoffXML, to: outputPath, overwrite: overwrite)
+            let writeResult = try await AgentHandoffOutputFile.write(
+                handoffXML,
+                to: outputPath,
+                overwrite: overwrite,
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+            )
             result["output_path"] = .string(writeResult.path)
             result["bytes_written"] = .int(writeResult.bytes)
         }
@@ -1270,6 +1276,11 @@ struct AgentManageMCPToolService {
         // Collection operations authorize every target before any mutation or data return, so a
         // partially applied cleanup can never leak that one of the requested UUIDs exists.
         let cleanupCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        let deletionOrigin: AgentSessionDeletionOrigin = if case let .agentSession(callerID) = cleanupCaller {
+            .agentCleanup(callerID)
+        } else {
+            .mcpClient()
+        }
         /// Deletion is human-only unless the user explicitly enabled full access. Neither spawn
         /// provenance nor an ordinary scope/link can supply this exception. Check before lookup.
         func requireCurrentCleanupAuthority(for sessionID: UUID) async throws {
@@ -1296,9 +1307,7 @@ struct AgentManageMCPToolService {
                 }
             }
         }
-        /// Agent callers' authority (full access, routed caller, connection, workspace, self-target)
-        /// can end while deletion waits for admission and writer draining. Re-prove all of it at
-        /// the storage commit point itself, not only before entering deletion.
+        /// Re-prove agent authority at disk commit, after admission/writer draining can suspend.
         func destructiveCommitFence(for sessionID: UUID) -> (@Sendable () async -> Bool)? {
             guard case .agentSession = cleanupCaller else { return nil }
             return { @MainActor in
@@ -1501,13 +1510,11 @@ struct AgentManageMCPToolService {
             var mutationStarted = false
             var durableDeletionCommitted = false
             var providerCleanupOutcome: ProviderConversationCleanupOutcome?
-            // The production deletion paths already report through `AgentSessionDataService`, but
-            // this service's dependencies are injectable, so it brackets its own boundary too. Both
-            // phases are idempotent, and a duplicate commit cannot downgrade an existing tombstone.
+            // Bracket injectable deletion dependencies too; duplicate commit cannot reopen a tombstone.
             var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
             do {
                 let attempt = try await AgentSessionDurableDeletionReporter
-                    .beginDurableDeletion(sessionID: sessionID)
+                    .beginDurableDeletion(sessionID: sessionID, origin: deletionOrigin)
                 deletionAttempt = attempt
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
@@ -1531,7 +1538,9 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID, openTabID: openTabID)
                     mutationStarted = true
                     providerCleanupOutcome = try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                        try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
+                            try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                        }
                     }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
@@ -1559,7 +1568,9 @@ struct AgentManageMCPToolService {
                     try requireInactiveCleanupTarget(sessionID)
                     mutationStarted = true
                     try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
-                        try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                        try await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
+                            try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                        }
                     }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
@@ -1904,67 +1915,6 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("\(name) must be an integer.")
         }
         return min(max(parsed, minValue), maxValue)
-    }
-
-    private func writeHandoffPayload(
-        _ payload: String,
-        to rawPath: String,
-        overwrite: Bool
-    ) async throws -> (path: String, bytes: Int) {
-        let url = try resolveSafeOutputURL(rawPath, paramName: "output_path")
-        let data = Data(payload.utf8)
-        let bytes = data.count
-        try await Task.detached(priority: .utility) {
-            let fileManager = FileManager.default
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    throw MCPError.invalidParams("output_path points to a directory: \(url.path)")
-                }
-                if !overwrite {
-                    throw MCPError.invalidParams("output_path already exists and overwrite=false: \(url.path)")
-                }
-            }
-            let parent = url.deletingLastPathComponent()
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-            let options: Data.WritingOptions = overwrite ? [.atomic] : [.withoutOverwriting]
-            do {
-                try data.write(to: url, options: options)
-            } catch {
-                if !overwrite, fileManager.fileExists(atPath: url.path) {
-                    throw MCPError.invalidParams("output_path already exists and overwrite=false: \(url.path)")
-                }
-                throw error
-            }
-        }.value
-        return (url.path, bytes)
-    }
-
-    private func resolveSafeOutputURL(_ rawPath: String, paramName: String) throws -> URL {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw MCPError.invalidParams("\(paramName) must not be empty.")
-        }
-        guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "\0\n\r")) == nil else {
-            throw MCPError.invalidParams("\(paramName) must be a single filesystem path.")
-        }
-
-        let path: String
-        if trimmed == "~" {
-            path = FileManager.default.homeDirectoryForCurrentUser.path
-        } else if trimmed.hasPrefix("~/") {
-            path = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(trimmed.dropFirst(2)))
-                .path
-        } else if trimmed.hasPrefix("~") {
-            throw MCPError.invalidParams("\(paramName) supports '~' or '~/' only; use an absolute path otherwise.")
-        } else {
-            path = trimmed
-        }
-        guard path.hasPrefix("/") else {
-            throw MCPError.invalidParams("\(paramName) must be absolute. CLI shorthand resolves relative paths before calling MCP.")
-        }
-        return URL(fileURLWithPath: path).standardizedFileURL
     }
 
     /// Resolves agent, model, and reasoning effort from pre-resolved selection + raw args.

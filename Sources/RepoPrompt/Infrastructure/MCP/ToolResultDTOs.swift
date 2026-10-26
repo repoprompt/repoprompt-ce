@@ -320,6 +320,7 @@ enum ToolResultDTOs {
         enum IndexState: String, Codable {
             case complete
             case indexing
+            case stopped
         }
 
         enum UnresolvedReason: String, Codable {
@@ -346,6 +347,9 @@ enum ToolResultDTOs {
             let state: IndexState
             let indexed: UInt64
             let total: UInt64
+            var reason: String?
+            var attempted: Int?
+            var limit: Int?
         }
 
         struct SeedDTO: Codable, Equatable {
@@ -889,7 +893,7 @@ enum ToolResultDTOs {
     /// - totalLinesChanged – sum of absolute line deltas across all committed chunks.
     /// - totalChunks       – number of diff chunks applied.
     struct EditSummary: Codable, Equatable {
-        let status: String // "success", "partial", "failed"
+        let status: String // "success", "partial", "failed", "no_change"
         let editsRequested: Int
         let editsApplied: Int
         let addedLines: Int?

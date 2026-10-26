@@ -1,6 +1,29 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptPersistence
 import RepoPromptShared
+
+/// Provenance follows the admitted deletion attempt, including dependency-injected callers.
+struct AgentSessionDeletionOrigin: Equatable {
+    let kind: OverseerScopeEnding.DeletionOrigin
+    let actorSessionID: UUID?
+    static let unknown = Self(kind: .unknown, actorSessionID: nil)
+    static func mcpClient(_ caller: UUID? = nil) -> Self {
+        .init(kind: .mcpClient, actorSessionID: caller)
+    }
+
+    static let userUI = Self(kind: .userUI, actorSessionID: nil)
+    static let automaticDiscard = Self(kind: .automaticDiscard, actorSessionID: nil)
+    static let composeTabBatch = Self(kind: .composeTabBatch, actorSessionID: nil)
+    static func agentCleanup(_ caller: UUID) -> Self {
+        .init(kind: .agentCleanup, actorSessionID: caller)
+    }
+
+    static let currentTaskLocal = BoxedTaskLocal<Self>(.unknown)
+    static var current: Self {
+        currentTaskLocal.get()
+    }
+}
 
 /// Process-owned record of which agent sessions are being, or have been, durably deleted.
 ///
@@ -50,6 +73,7 @@ final class AgentSessionDeletionRegistry {
     struct AttemptToken: Equatable {
         let sessionID: UUID
         let attemptID: UUID
+        var origin: AgentSessionDeletionOrigin = .unknown
     }
 
     private var statesBySession: [UUID: State] = [:]
@@ -72,7 +96,7 @@ final class AgentSessionDeletionRegistry {
     /// deleting caller return — and go on to metadata cleanup, the next batch file, or view-model
     /// teardown — while the runtime authority for that UUID was still live and its saved intent
     /// still on disk.
-    var commitObserver: (@MainActor (UUID) async -> Void)?
+    var commitObserver: (@MainActor (UUID, AgentSessionDeletionOrigin, Bool?) async -> Void)?
     /// Fired on every transition so candidate eligibility and launch reconciliation can re-read.
     var changeObserver: (@MainActor () -> Void)?
 
@@ -121,12 +145,12 @@ final class AgentSessionDeletionRegistry {
     /// a permanent tombstone back to a reversible in-progress mark.
     /// Throws `CancellationError` after termination closes admission; no token is admitted then.
     @discardableResult
-    func beginDurableDeletion(sessionID: UUID) throws -> AttemptToken {
+    func beginDurableDeletion(sessionID: UUID, origin: AgentSessionDeletionOrigin = .current) throws -> AttemptToken {
         guard terminationFreezeAllowsRestoration == nil else { throw CancellationError() }
         if let reason = scopePersistenceUnavailableReason {
             throw AdmissionError.scopePersistenceUnavailable(reason)
         }
-        let token = AttemptToken(sessionID: sessionID, attemptID: UUID())
+        let token = AttemptToken(sessionID: sessionID, attemptID: UUID(), origin: origin)
         activeAttemptIDsBySession[sessionID, default: []].insert(token.attemptID)
         guard statesBySession[sessionID] != .committed else { return token }
         statesBySession[sessionID] = .inProgress(attemptID: token.attemptID)
@@ -164,7 +188,7 @@ final class AgentSessionDeletionRegistry {
     /// Whatever the observer does with the news — revoking authority, removing durable intent,
     /// terminalizing launch entries — a failure there cannot pretend the deletion rolled back, so
     /// this method has no failure channel to offer it.
-    func didCommitDurableDeletion(_ token: AttemptToken) async {
+    func didCommitDurableDeletion(_ token: AttemptToken, fileRemoved: Bool? = nil) async {
         if statesBySession[token.sessionID] == .committed {
             await commitTasksBySession[token.sessionID]?.value
             activeAttemptIDsBySession[token.sessionID]?.remove(token.attemptID)
@@ -189,7 +213,7 @@ final class AgentSessionDeletionRegistry {
         let observer = commitObserver
         let changeObserver = changeObserver
         let task = Task { @MainActor in
-            await observer?(token.sessionID)
+            await observer?(token.sessionID, token.origin, fileRemoved)
             changeObserver?()
         }
         commitTasksBySession[token.sessionID] = task
@@ -305,16 +329,16 @@ final class AgentSessionDeletionRegistry {
 /// registry has to be MainActor-isolated because everything that consumes it — candidate
 /// construction, the runtime bridge, the launch coordinator — already is.
 enum AgentSessionDurableDeletionReporter {
-    static func beginDurableDeletion(sessionID: UUID) async throws -> AgentSessionDeletionRegistry.AttemptToken {
-        try await MainActor.run { try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: sessionID) }
+    static func beginDurableDeletion(sessionID: UUID, origin: AgentSessionDeletionOrigin = .current) async throws -> AgentSessionDeletionRegistry.AttemptToken {
+        try await MainActor.run { try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: sessionID, origin: origin) }
     }
 
     static func didFailDurableDeletion(_ token: AgentSessionDeletionRegistry.AttemptToken) async {
         await MainActor.run { AgentSessionDeletionRegistry.shared.didFailDurableDeletion(token) }
     }
 
-    static func didCommitDurableDeletion(_ token: AgentSessionDeletionRegistry.AttemptToken) async {
-        await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(token)
+    static func didCommitDurableDeletion(_ token: AgentSessionDeletionRegistry.AttemptToken, fileRemoved: Bool? = nil) async {
+        await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(token, fileRemoved: fileRemoved)
     }
 }
 

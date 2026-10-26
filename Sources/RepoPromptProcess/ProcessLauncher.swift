@@ -46,6 +46,13 @@ package enum ProcessLauncherError: Error {
 package typealias ProviderProcessLaunchPolicy = RepoPromptShared.ProviderProcessLaunchPolicy
 
 package enum ProcessLauncher {
+    #if DEBUG
+        package static let onSpawnedOutputWritersForTestingTaskLocal = BoxedTaskLocal<(@Sendable (Int32, Int32) -> Void)?>(nil)
+        package static var onSpawnedOutputWritersForTesting: (@Sendable (Int32, Int32) -> Void)? {
+            onSpawnedOutputWritersForTestingTaskLocal.get()
+        }
+    #endif
+
     package enum Purpose: Equatable {
         case tool
         case provider
@@ -58,6 +65,7 @@ package enum ProcessLauncher {
         workingDirectory: String?,
         purpose: Purpose = .provider,
         allowsProviderProcessLaunchForTesting: Bool = false,
+        mergeStandardError: Bool = false,
         terminalDescriptor: Int32? = nil
     ) throws -> SpawnedProcess {
         try spawn(
@@ -66,6 +74,7 @@ package enum ProcessLauncher {
             environment: environment,
             workingDirectory: workingDirectory,
             initializationFailure: nil,
+            mergeStandardError: mergeStandardError,
             terminalDescriptor: terminalDescriptor,
             purpose: purpose,
             allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
@@ -112,6 +121,7 @@ package enum ProcessLauncher {
         environment: [String: String],
         workingDirectory: String?,
         initializationFailure: InitializationFailure?,
+        mergeStandardError: Bool = false,
         terminalDescriptor: Int32? = nil,
         purpose: Purpose,
         allowsProviderProcessLaunchForTesting: Bool
@@ -208,7 +218,10 @@ package enum ProcessLauncher {
 
         try checkFileAction("adddup2(stdin)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stdinPipe[0], STDIN_FILENO))
         try checkFileAction("adddup2(stdout)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stdoutPipe[1], STDOUT_FILENO))
-        try checkFileAction("adddup2(stderr)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stderrPipe[1], STDERR_FILENO))
+        // Combined capture must share the child's actual pipe, preserving write order.
+        // The returned stderr reader is an empty, independently owned pipe in this mode.
+        let stderrWriter = mergeStandardError ? stdoutPipe[1] : stderrPipe[1]
+        try checkFileAction("adddup2(stderr)", result: posix_spawn_file_actions_adddup2(&fileActions, terminalDescriptor ?? stderrWriter, STDERR_FILENO))
         try checkFileAction("addclose(stdin write)", result: posix_spawn_file_actions_addclose(&fileActions, stdinPipe[1]))
         try checkFileAction("addclose(stdout read)", result: posix_spawn_file_actions_addclose(&fileActions, stdoutPipe[0]))
         try checkFileAction("addclose(stderr read)", result: posix_spawn_file_actions_addclose(&fileActions, stderrPipe[0]))
@@ -347,6 +360,10 @@ package enum ProcessLauncher {
             closePipe(&stderrPipe)
             throw ProcessLauncherError.spawnFailed(errno: spawnResult)
         }
+
+        #if DEBUG
+            onSpawnedOutputWritersForTesting?(stdoutPipe[1], stderrWriter)
+        #endif
 
         close(stdinPipe[0])
         close(stdoutPipe[1])

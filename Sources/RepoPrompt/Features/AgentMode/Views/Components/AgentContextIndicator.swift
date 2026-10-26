@@ -9,6 +9,7 @@ struct AgentContextIndicator: View {
     let contextWindowTokens: Int?
     let usedTokens: Int?
     let sourceLabel: String?
+    let awaitingPostCompactionUsage: Bool
     let style: Style
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
@@ -22,6 +23,7 @@ struct AgentContextIndicator: View {
         let used = last > 0 ? last : total
         usedTokens = used > 0 ? used : nil
         sourceLabel = nil
+        awaitingPostCompactionUsage = contextUsage?.awaitingPostCompactionUsage == true
         self.style = style
     }
 
@@ -29,11 +31,13 @@ struct AgentContextIndicator: View {
         contextWindowTokens: Int?,
         usedTokens: Int?,
         sourceLabel: String? = nil,
+        awaitingPostCompactionUsage: Bool = false,
         style: Style = .compact
     ) {
         self.contextWindowTokens = contextWindowTokens
         self.usedTokens = usedTokens
         self.sourceLabel = sourceLabel
+        self.awaitingPostCompactionUsage = awaitingPostCompactionUsage
         self.style = style
     }
 
@@ -52,6 +56,7 @@ struct AgentContextIndicator: View {
     }
 
     private var tooltipText: String {
+        if awaitingPostCompactionUsage { return "Awaiting post-compaction usage" }
         guard let used = contextUsedPercent else {
             if let usedTokens {
                 return "Used tokens: \(Self.formatTokens(usedTokens))"
@@ -77,10 +82,18 @@ struct AgentContextIndicator: View {
     }
 
     var body: some View {
-        if usedTokens != nil || contextWindowTokens != nil {
+        if usedTokens != nil || contextWindowTokens != nil || awaitingPostCompactionUsage {
             switch style {
             case .compact:
-                contextRing(size: 18, lineWidth: 2.5)
+                HStack(spacing: 4) {
+                    contextRing(size: 18, lineWidth: 2.5)
+                    if awaitingPostCompactionUsage {
+                        Text("Pending")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .hoverTooltip(tooltipText, .top)
             case .labeled:
                 HStack(spacing: 8) {
                     contextRing(size: 24, lineWidth: 3)
@@ -119,7 +132,7 @@ struct AgentContextIndicator: View {
                     style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
                 )
                 .rotationEffect(.degrees(-90))
-            Text("\(Int(used.rounded()))")
+            Text(contextUsedPercent == nil ? "?" : "\(Int(used.rounded()))")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: size * 0.36, weight: .medium))
                 .foregroundStyle(warningColor)
         }

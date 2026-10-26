@@ -151,8 +151,13 @@ package actor CLIEnvironmentCache {
         arguments: [String],
         environment: [String: String],
         enableLogging: Bool,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        beforeStdoutRead: (@Sendable () -> Void)? = nil,
+        beforeStderrRead: (@Sendable () -> Void)? = nil,
+        beforeDrain: (@Sendable () -> Void)? = nil,
+        onPipeClosed: (@Sendable () -> Void)? = nil
     ) -> [String: String]? {
+        guard !Task.isCancelled else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
         process.arguments = arguments
@@ -162,39 +167,28 @@ package actor CLIEnvironmentCache {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        let out = stdoutPipe.fileHandleForReading
-        let err = stderrPipe.fileHandleForReading
-        var stdoutAccum = Data()
-        var stderrAccum = Data()
-        let group = DispatchGroup()
-        let chunkSize = 64 * 1024
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            defer { group.leave() }
-            while true {
-                guard let chunk = try? out.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                stdoutAccum.append(chunk)
-            }
-        }
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            defer { group.leave() }
-            while true {
-                guard let chunk = try? err.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                stderrAccum.append(chunk)
-            }
-        }
+        let stdoutCapture = ShellOutputCapture(
+            fileHandle: stdoutPipe.fileHandleForReading,
+            beforeRead: beforeStdoutRead,
+            onClosed: onPipeClosed
+        )
+        let stderrCapture = ShellOutputCapture(
+            fileHandle: stderrPipe.fileHandleForReading,
+            beforeRead: beforeStderrRead,
+            onClosed: onPipeClosed
+        )
         defer {
-            out.closeFile()
-            err.closeFile()
-            group.wait()
+            stdoutCapture.stop()
+            stderrCapture.stop()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
         }
         let terminationGroup = DispatchGroup()
         terminationGroup.enter()
         process.terminationHandler = { _ in
             terminationGroup.leave()
         }
-        var timedOut = false
+        let captureDeadline = DispatchTime.now() + timeout
         do {
             log("Running: \(shell) \(arguments.joined(separator: " "))", enabled: enableLogging)
             try process.run()
@@ -203,8 +197,7 @@ package actor CLIEnvironmentCache {
             log("Failed to run login shell: \(error)", enabled: enableLogging)
             return nil
         }
-        if terminationGroup.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
+        if terminationGroup.wait(timeout: captureDeadline) == .timedOut {
             log("Login shell capture timed out after \(timeout)s; terminating process", enabled: enableLogging)
             if process.isRunning {
                 process.terminate()
@@ -213,11 +206,19 @@ package actor CLIEnvironmentCache {
             if terminationGroup.wait(timeout: killDeadline) == .timedOut {
                 log("Login shell did not exit after SIGTERM; sending SIGKILL", enabled: enableLogging)
                 kill(process.processIdentifier, SIGKILL)
-                terminationGroup.wait()
+                _ = terminationGroup.wait(timeout: .now() + loginShellTerminationGraceInterval)
             }
+            return nil
         }
-        process.waitUntilExit()
-        if timedOut {
+        // A child can exit while either reader still has buffered bytes. Parse only
+        // after both drains finish, under the same deadline as the shell itself.
+        // DispatchIO can stop a drain if a shell descendant keeps its writer open.
+        beforeDrain?()
+        guard let stdoutAccum = stdoutCapture.drainedData(deadline: captureDeadline),
+              let stderrAccum = stderrCapture.drainedData(deadline: captureDeadline),
+              !Task.isCancelled
+        else {
+            log("Login shell output did not finish before the capture deadline", enabled: enableLogging)
             return nil
         }
         log("Login shell exit status: \(process.terminationStatus)", enabled: enableLogging)
@@ -351,6 +352,29 @@ package actor CLIEnvironmentCache {
         static func test_pathLooksInsufficient(_ value: String?) -> Bool {
             pathLooksInsufficient(value)
         }
+
+        static func test_captureEnvironment(
+            shell: String = "/bin/sh",
+            arguments: [String],
+            environment: [String: String] = [:],
+            timeout: TimeInterval = 5,
+            beforeStdoutRead: (@Sendable () -> Void)? = nil,
+            beforeStderrRead: (@Sendable () -> Void)? = nil,
+            beforeDrain: (@Sendable () -> Void)? = nil,
+            onPipeClosed: (@Sendable () -> Void)? = nil
+        ) -> [String: String]? {
+            captureEnvironment(
+                shell: shell,
+                arguments: arguments,
+                environment: environment,
+                enableLogging: false,
+                timeout: timeout,
+                beforeStdoutRead: beforeStdoutRead,
+                beforeStderrRead: beforeStderrRead,
+                beforeDrain: beforeDrain,
+                onPipeClosed: onPipeClosed
+            )
+        }
     #endif
 
     private static func composeShellCommandEnvironment(from env: [String: String], shell: String) -> [String: String] {
@@ -381,5 +405,53 @@ package actor CLIEnvironmentCache {
     private static func userLoginShell() -> String? {
         guard let passwdPointer = getpwuid(getuid()), let shellPointer = passwdPointer.pointee.pw_shell else { return nil }
         return String(cString: shellPointer)
+    }
+}
+
+/// Owns a pipe until DispatchIO relinquishes it, including when a descendant
+/// retains the write end after the login shell exits. Buffer access stays on one
+/// serial queue; a completed drain is the only path that exposes its contents.
+final class ShellOutputCapture: @unchecked Sendable {
+    private let channel: DispatchIO
+    private let queue = DispatchQueue(label: "RepoPromptProcess.loginShellOutput", qos: .userInitiated)
+    private let completion = DispatchGroup()
+    private var data = Data()
+    private var readError: Int32 = 0
+
+    init(
+        fileHandle: FileHandle,
+        beforeRead: (@Sendable () -> Void)? = nil,
+        onReadSubmitted: (@Sendable () -> Void)? = nil,
+        onClosed: (@Sendable () -> Void)? = nil
+    ) {
+        channel = DispatchIO(type: .stream, fileDescriptor: fileHandle.fileDescriptor, queue: queue) { _ in
+            try? fileHandle.close()
+            onClosed?()
+        }
+        completion.enter()
+        queue.async { [self] in
+            beforeRead?()
+            channel.read(offset: 0, length: Int.max, queue: queue) { [self] done, chunk, error in
+                if let chunk {
+                    data.append(contentsOf: chunk)
+                }
+                if error != 0 {
+                    readError = error
+                }
+                if done {
+                    completion.leave()
+                }
+            }
+            onReadSubmitted?()
+        }
+    }
+
+    func drainedData(deadline: DispatchTime) -> Data? {
+        guard completion.wait(timeout: deadline) == .success else { return nil }
+        return queue.sync { readError == 0 ? data : nil }
+    }
+
+    func stop() {
+        channel.close(flags: .stop)
     }
 }
