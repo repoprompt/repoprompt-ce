@@ -578,20 +578,12 @@ actor AgentSessionOversightIntentStore {
     }
 
     #if DEBUG
-        /// Test-only: waits until every queued operation has left the outbox through the store's own
-        /// drain and retry schedule. Unlike `serializationBarrier`, which deliberately awaits only the
-        /// current attempt (termination must not wait on an unbounded retry loop), this follows a
-        /// retryable failure such as bounded-admission `writerBusy` into its scheduled retry. It adds
-        /// no attempt of its own; a store whose failures persist keeps this waiting.
-        func test_awaitOutboxSettled() async {
-            while true {
-                if let saving {
-                    await saving.value
-                    continue
-                }
-                guard !pending.isEmpty, let retry else { return }
-                await retry.value
-            }
+        /// Read-only test observation seam: the store's own task currently responsible for queued
+        /// operations — the in-flight drain, or, while operations remain queued after a retryable
+        /// failure, the scheduled retry. `nil` when nothing is queued or no attempt is scheduled.
+        /// Starts, retries, and mutates nothing; `serializationBarrier` semantics are unchanged.
+        var test_outboxProgressTask: Task<Void, Never>? {
+            saving ?? (pending.isEmpty ? nil : retry)
         }
     #endif
 }

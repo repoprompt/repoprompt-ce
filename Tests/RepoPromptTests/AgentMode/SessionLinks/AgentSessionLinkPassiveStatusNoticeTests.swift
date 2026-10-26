@@ -1082,7 +1082,7 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertEqual(reducer.snapshot.entries.count, 16)
     }
 
-    func testQuietCyclesDoNotReRepresentOverflowedOrdinaryCoverageOrRearmFailedWake() throws {
+    func testQuietCyclesDoNotReRepresentOverflowedOrdinaryCoverageOrRearmFailedWake() {
         var reducer = makeReducer()
         let lanes = 0 ..< 18
         func all(_ status: Status, _ proof: AgentRunQuietFacts) -> [Reducer.Sample] {

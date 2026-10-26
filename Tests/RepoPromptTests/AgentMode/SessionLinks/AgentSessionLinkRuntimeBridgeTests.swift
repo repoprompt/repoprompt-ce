@@ -7921,10 +7921,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return directory
     }
 
+    /// Durable read-back must follow a retryable save failure (for example bounded-admission
+    /// `writerBusy` under CI load) into the store's own scheduled retry. The production
+    /// `serializationBarrier` deliberately awaits only the current attempt so termination never
+    /// waits on a retry loop. This adds no attempt: it awaits the store's own tasks until nothing
+    /// queued remains scheduled, and a store whose failures persist keeps it waiting.
+    private func awaitOutboxSettled(_ store: AgentSessionOversightIntentStore) async {
+        while let task = await store.test_outboxProgressTask {
+            await task.value
+        }
+    }
+
     private func savedLaneIntents(in directory: URL) async -> [AgentSessionOversightIntent] {
-        // Durable read-back must follow a retryable save failure into the store's own retry; the
-        // termination barrier alone returns after the current attempt (CI writerBusy contention).
-        await laneIntentStores[directory]?.test_awaitOutboxSettled()
+        if let store = laneIntentStores[directory] { await awaitOutboxSettled(store) }
         let restored = AgentSessionOversightIntentStore(
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.backupsDirectoryName),
