@@ -464,6 +464,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         case processCrash = "process_crash"
         case timeout
         case agentError = "agent_error"
+        case resumeTimedOut = "resume_timed_out"
         case resumeHistoryTooLarge = "resume_history_too_large"
         case cancelled
 
@@ -477,6 +478,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             guard let text = statusText?.lowercased(), !text.isEmpty else { return .agentError }
             if ["cancelled", "canceled", "interrupted", "aborted"].contains(where: text.contains) {
                 return .cancelled
+            }
+            if text.hasPrefix("codex native resume failed:"),
+               text.contains("no new thread was started"),
+               ["timed out", "timeout", "deadline exceeded", "took too long"].contains(where: text.contains)
+            {
+                return .resumeTimedOut
             }
             if ["timed out", "timeout", "deadline exceeded", "took too long"].contains(where: text.contains) {
                 return .timeout

@@ -244,12 +244,16 @@ final class GitProcessPipeDrainTests: XCTestCase {
 
         func testDriverQueryFailurePreservesOnlyBoundedRedactedDiagnostics() async throws {
             let stderr = Data(("fatal: bad config line 42 in file /secret/path?token=private\n" + String(repeating: "sensitive-value\n", count: 2000)).utf8)
-            let diagnostic = GitReadSafety.driverQueryFailure(exitCode: 128, stderr: stderr)
-            XCTAssertTrue(diagnostic.contains("exit 128"))
-            XCTAssertTrue(diagnostic.contains("bad config line 42"))
-            XCTAssertLessThan(diagnostic.utf8.count, 1024)
-            for secret in ["/secret", "private", "sensitive-value"] {
-                XCTAssertFalse(diagnostic.contains(secret))
+            for diagnostic in [
+                GitReadSafety.driverQueryFailure(exitCode: 128, stderr: stderr),
+                GitReadSafety.ownershipProbeFailure(exitCode: 128, stderr: stderr)
+            ] {
+                XCTAssertTrue(diagnostic.contains("exit 128"))
+                XCTAssertTrue(diagnostic.contains("bad config line 42"))
+                XCTAssertLessThan(diagnostic.utf8.count, 1024)
+                for secret in ["/secret", "private", "sensitive-value"] {
+                    XCTAssertFalse(diagnostic.contains(secret))
+                }
             }
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
@@ -265,7 +269,8 @@ final class GitProcessPipeDrainTests: XCTestCase {
                 } catch {
                     let message = error.localizedDescription
                     XCTAssertTrue(message.contains("bad config line 1"), message)
-                    XCTAssertTrue(message.contains("git config exit"), message)
+                    XCTAssertTrue(message.contains(spool ? "git config exit" : "Git ownership probe exit"), message)
+                    XCTAssertLessThan(message.utf8.count, 1024)
                     XCTAssertFalse(message.contains(fixture.sandbox.path))
                     XCTAssertFalse(message.contains("invalid-secret-payload"))
                 }
@@ -297,7 +302,9 @@ final class GitProcessPipeDrainTests: XCTestCase {
                 let expected = try fixture.runGit(args, at: repo)
                 let (output, _, code) = try await service.runGitDataForTesting(args, at: repo, env: ["HOME": fixture.sandbox.path])
                 XCTAssertEqual(code, 0)
-                XCTAssertEqual(String(decoding: output, as: UTF8.self), expected)
+                let reportedPath = String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                let reportedURL = reportedPath.hasPrefix("/") ? URL(fileURLWithPath: reportedPath) : repo.appendingPathComponent(reportedPath)
+                XCTAssertEqual(reportedURL.standardizedFileURL, hook.standardizedFileURL)
                 let path = expected.trimmingCharacters(in: .whitespacesAndNewlines)
                 let resolved = path.hasPrefix("/") ? URL(fileURLWithPath: path) : repo.appendingPathComponent(path)
                 XCTAssertEqual(resolved.standardizedFileURL, hook.standardizedFileURL)

@@ -394,7 +394,7 @@ import XCTest
                     entered.fulfill()
                     await gate.wait()
                 }
-                fixture.startOwnedTask {
+                let reorder = fixture.startOwnedTask {
                     await fixture.manager.moveActiveWorkspaceRoot(path: fixture.rootPaths[1], direction: .up, visibleRootOrder: fixture.rootPaths)
                     done.fulfill()
                 }
@@ -404,20 +404,32 @@ import XCTest
                 let envelope = try XCTUnwrap(captured)
                 XCTAssertEqual(envelope.conflictRecoveryPolicy, .failClosed)
                 let client = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -945)
-                _ = try await client.replaceWorking(
-                    before.model,
-                    fileURL: fixture.workspaceURL,
+                // Reserve the ID without introducing an independent writer/projection. The
+                // seed file is not key-sorted: re-encoding its equal model changes the digest
+                // and can asynchronously replace the optimistic dateModified during capture.
+                let reserved = try await client.replaceWorkingFailClosed(
+                    before.canonical.document,
                     expectedWorkspaceRevision: before.canonical.revisions.workingRevision,
                     operationID: envelope.operationID
                 )
+                XCTAssertEqual(reserved.disposition, .unchanged)
+                XCTAssertEqual(reserved.workspace, before.canonical)
+                let catalog = await client.snapshot()
+                XCTAssertEqual(catalog.publicationSequence, before.publicationSequence, "Collision setup must not enqueue a separate projection")
                 gate.release()
                 try await fixture.awaitGateEvent(done)
+                await reorder.value
+                let issue = try XCTUnwrap(fixture.manager.domainWorkspaceAuthorityIssue)
+                XCTAssertEqual(issue.kind, .commandFailure)
+                XCTAssertEqual(issue.diagnostic, "operation_id_reused_with_different_command")
                 let after = try await fixture.capturePassive()
+                XCTAssertEqual(after.canonical, before.canonical)
+                XCTAssertEqual(after.diskBytes, before.diskBytes)
                 assertPassiveConvergence(after, paths: fixture.rootPaths)
                 await assertAdmission(fixture, capture: after)
                 XCTAssertEqual(after.primaryRoots.map(\.id), before.primaryRoots.map(\.id))
                 XCTAssertEqual(fixture.manager.debugRepoPathBaselineForWorkspace(fixture.workspace.id), fixture.rootPaths)
-                XCTAssertNotNil(fixture.manager.domainWorkspaceAuthorityIssue)
+                XCTAssertEqual(fixture.manager.domainWorkspaceAuthorityIssue, issue)
             }
         }
 
@@ -1002,9 +1014,35 @@ import XCTest
                 let tabID = try XCTUnwrap(fixture.workspace.activeComposeTabID)
                 fixture.manager.setSnapshotsSuspended(snapshotsSuspended, forTabID: tabID)
                 defer { fixture.manager.setSnapshotsSuspended(false, forTabID: tabID) }
+                let baselineSelection = try XCTUnwrap(fixture.manager.workspace(withID: fixture.workspace.id)?.composeTabs.first { $0.id == tabID }).selection
+                XCTAssertEqual(baselineSelection.selectedPaths, [selected])
                 let schedule = SaveSchedule(fixture: fixture)
+                let selectionObserved = XCTestExpectation(description: "unload selection reached the deferred observer")
+                let selectionCommitted = XCTestExpectation(description: "unload selection committed to the stored tab")
+                var observedSelection = false
+                var committedSelectionPublications = 0
+                fixture.manager.selectionObservationDidFinish = { [weak schedule] selection in
+                    guard selection.isEmpty, !observedSelection else { return }
+                    observedSelection = true
+                    schedule?.record("unload-selection-observed")
+                    selectionObserved.fulfill()
+                }
+                let tabObserver = fixture.manager.composeTabSnapshotPublisher(for: tabID).sink { [weak fixture, weak schedule] snapshot in
+                    guard let fixture, snapshot.selection.isEmptyForSelectedFileTree,
+                          fixture.manager.workspace(withID: fixture.workspace.id)?.composeTabs.first(where: { $0.id == tabID })?.selection.isEmptyForSelectedFileTree == true
+                    else { return }
+                    committedSelectionPublications += 1
+                    if committedSelectionPublications == 1 {
+                        schedule?.record("unload-selection-committed")
+                        selectionCommitted.fulfill()
+                    }
+                }
                 let selectionObserver = fixture.files.$selectedFiles.dropFirst().sink { _ in schedule.record("selection-emission") }
-                defer { selectionObserver.cancel() }
+                defer {
+                    fixture.manager.selectionObservationDidFinish = nil
+                    selectionObserver.cancel()
+                    tabObserver.cancel()
+                }
                 fixture.manager.markWorkspaceDirty()
                 fixture.manager.resetWorkspaceSaveDiagnosticsForTesting()
                 fixture.manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remaining in
@@ -1029,11 +1067,27 @@ import XCTest
                     schedule.record("removal-returned")
                 }
                 try await fixture.awaitGateEvent(schedule.unloadDirty)
+                // The immediate dirty mark and deferred tab commit are independent owners.
+                // Keep the old save held until the selection owner has run; admission below
+                // must not be allowed to repair a stale selection checkpoint.
+                try await fixture.awaitGateEvent(selectionObserved)
+                if !snapshotsSuspended {
+                    try await fixture.awaitGateEvent(selectionCommitted)
+                }
                 schedule.record("release-old-save")
                 schedule.oldSaveGate.release()
                 try await fixture.perform("late prepared save completed") { await oldSave.value }
                 let after = try await fixture.capturePassive()
                 assertPassiveConvergence(after, paths: [fixture.rootPaths[0]])
+                let canonicalModel = try JSONDecoder().decode(WorkspaceModel.self, from: after.canonical.document.documentBytes)
+                for model in [after.model, canonicalModel, after.disk] {
+                    let tab = try XCTUnwrap(model.composeTabs.first { $0.id == tabID })
+                    if snapshotsSuspended {
+                        XCTAssertEqual(tab.selection, baselineSelection, "Suspension must prevent importing transient UI selection")
+                    } else {
+                        XCTAssertTrue(tab.selection.isEmptyForSelectedFileTree, "The old save must persist the committed unload selection before admission")
+                    }
+                }
                 await assertAdmission(fixture, capture: after)
                 XCTAssertTrue(fixture.files.selectedFiles.isEmpty)
                 let retry = try XCTUnwrap(schedule.events.first { $0.name == "old-save-retry" })
@@ -1041,9 +1095,17 @@ import XCTest
                 let names = schedule.events.map(\.name)
                 assertEventOrder(["old-save-prepared", "root-assigned", "selection-emission", "unload-dirty", "release-old-save", "old-save-resumed", "old-save-retry", "old-save-returned"], in: names)
                 let captures = fixture.manager.workspaceSaveDiagnosticsForTesting(workspaceID: fixture.workspace.id).capturePublicationCount
-                if snapshotsSuspended { XCTAssertEqual(captures, 0) }
-                else { XCTAssertGreaterThan(captures, 0) }
-                print("ISSUE944 chronology=afterDirty snapshotsSuspended=\(snapshotsSuspended) capturePublications=\(captures) events=\(names.joined(separator: ","))")
+                if snapshotsSuspended {
+                    XCTAssertEqual(captures, 0)
+                    XCTAssertEqual(committedSelectionPublications, 0)
+                } else {
+                    // Save capture preserves canonical/stored selection; its publication count
+                    // can legitimately be zero. Require positive proof from the actual selection
+                    // commit owner instead, plus the verified canonical/disk assertions above.
+                    XCTAssertGreaterThan(committedSelectionPublications, 0)
+                    assertEventOrder(["unload-dirty", "unload-selection-observed", "unload-selection-committed", "release-old-save"], in: names)
+                }
+                print("ISSUE944 chronology=afterDirty snapshotsSuspended=\(snapshotsSuspended) capturePublications=\(captures) selectionCommitPublications=\(committedSelectionPublications) events=\(names.joined(separator: ","))")
             }
         }
 

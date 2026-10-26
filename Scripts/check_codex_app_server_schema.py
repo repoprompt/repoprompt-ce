@@ -899,6 +899,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        from generate_codex_mcp_import_schema import check_or_generate
+        check_or_generate(check=True)
         contract = load_json(args.contract)
         validate_contract(contract)
         minimum_version = parse_version(
@@ -964,7 +966,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{counts['responsePaths']} response paths"
         )
         return 0
-    except GateError as exc:
+    except (GateError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

@@ -2002,6 +2002,7 @@ final class AgentTabSession: ObservableObject {
         codexAnonymousActiveTurn = nil
         codexRoutingObservedTurnID = nil
         codexPendingSteerLifecycleReconciliation = nil
+        codexNativeStartupDisposition = nil
         var turnEpoch: AgentRunTurnEpoch?
         if var context = mcpControlContext {
             turnEpoch = context.preparedEpoch ?? context.currentEpoch

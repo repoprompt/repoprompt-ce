@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -6,6 +7,133 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testBackgroundPromptAppendUsesCurrentTextWithoutRefreshingTheStaleBinding() async throws {
+        let fixture = try await makePromptMutationFixture(name: "shared-background-prompt")
+        let server = fixture.window.mcpServer
+        let activeTabID = fixture.window.promptManager.activeComposeTabID
+        let activePrompt = fixture.window.promptManager.promptText
+        XCTAssertNotEqual(activeTabID, fixture.tabID)
+        try fixture.updateStoredPrompt("X0")
+        try fixture.bindPromptConnection(fixture.connectionID)
+        let otherConnectionID = UUID()
+        try fixture.bindPromptConnection(otherConnectionID)
+
+        let otherReply = try await fixture.mutatePrompt(connectionID: otherConnectionID) { $0 = "Y1" }
+        XCTAssertEqual(otherReply, "Y1")
+        XCTAssertEqual(fixture.boundContext?.promptText, "X0", "The first connection must remain stale before append")
+        let appendReply = try await fixture.mutatePrompt(connectionID: fixture.connectionID) { $0 += "+X" }
+
+        XCTAssertEqual(appendReply, "Y1+X")
+        XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: fixture.identity)?.promptText, "Y1+X")
+        let freshConnectionID = UUID()
+        try fixture.bindPromptConnection(freshConnectionID)
+        XCTAssertEqual(server.tabContextByConnectionID[freshConnectionID]?.promptText, "Y1+X")
+        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, activeTabID)
+        XCTAssertEqual(fixture.window.promptManager.promptText, activePrompt)
+    }
+
+    func testOrdinaryPromptMutationsPreserveCurrentMetaPromptsAndOtherTabFields() async throws {
+        let fixture = try await makePromptMutationFixture(name: "prompt-field-ownership")
+        let cachedMetaPromptID = UUID()
+        let currentMetaPromptIDs = [UUID(), UUID()]
+        let cases: [(name: String, expected: String, mutation: (inout String) -> Void)] = [
+            ("set", "Replacement", { $0 = "Replacement" }),
+            ("append", "Y1+X", { $0 += "+X" }),
+            ("clear", "", { $0 = "" })
+        ]
+        for testCase in cases {
+            try fixture.updateStoredPrompt("X0", metaPromptIDs: [cachedMetaPromptID])
+            try fixture.bindPromptConnection(fixture.connectionID)
+            var current = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+            current.promptText = "Y1"
+            current.selectedMetaPromptIDs = currentMetaPromptIDs
+            current.selection = StoredSelection(selectedPaths: [fixture.fileB.path])
+            current.contextOverrides.useOverridePrompt = true
+            current.contextOverrides.overridePromptText = "Keep this override"
+            XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(current, inWorkspaceID: fixture.workspaceID))
+            XCTAssertEqual(fixture.boundContext?.selectedMetaPromptIDs, [cachedMetaPromptID])
+            XCTAssertEqual(fixture.boundContext?.promptText, "X0")
+
+            let reply = try await fixture.mutatePrompt(
+                connectionID: fixture.connectionID,
+                mutation: testCase.mutation
+            )
+
+            let stored = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+            XCTAssertEqual(reply, testCase.expected, testCase.name)
+            XCTAssertEqual(stored.promptText, testCase.expected, testCase.name)
+            XCTAssertEqual(stored.selectedMetaPromptIDs, currentMetaPromptIDs, testCase.name)
+            XCTAssertEqual(stored.selection, current.selection, testCase.name)
+            XCTAssertEqual(stored.contextOverrides, current.contextOverrides, testCase.name)
+        }
+    }
+
+    func testActivePromptAppendUsesPendingEditorTextAndKeepsCanonicalMetaPrompts() async throws {
+        let fixture = try await makePromptMutationFixture(name: "active-prompt-owner")
+        await fixture.window.promptManager.switchComposeTab(fixture.tabID)
+        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabID)
+        let metaPromptIDs = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity)).selectedMetaPromptIDs
+        try fixture.updateStoredPrompt("Stored", metaPromptIDs: metaPromptIDs)
+        try fixture.bindPromptConnection(fixture.connectionID)
+        fixture.window.promptManager.promptText = "Pending editor text"
+        XCTAssertEqual(fixture.boundContext?.promptText, "Stored")
+
+        let reply = try await fixture.mutatePrompt(connectionID: fixture.connectionID) { $0 += "+MCP" }
+
+        XCTAssertEqual(reply, "Pending editor text+MCP")
+        XCTAssertEqual(fixture.window.promptManager.promptText, "Pending editor text+MCP")
+        let stored = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+        XCTAssertEqual(stored.promptText, "Pending editor text+MCP")
+        XCTAssertEqual(stored.selectedMetaPromptIDs, metaPromptIDs)
+    }
+
+    func testRunScopedPromptMutationRetainsItsFrozenPromptSemantics() async throws {
+        let fixture = try await makePromptMutationFixture(name: "frozen-prompt-owner")
+        try fixture.updateStoredPrompt("Frozen")
+        _ = try fixture.installContext(selection: .init())
+        try fixture.updateStoredPrompt("Newer ordinary prompt")
+        XCTAssertEqual(fixture.boundContext?.runID, fixture.runID)
+
+        let reply = try await fixture.mutatePrompt(connectionID: fixture.connectionID) { $0 += "+Run" }
+
+        XCTAssertEqual(reply, "Frozen+Run")
+        XCTAssertEqual(fixture.boundContext?.promptText, "Frozen+Run")
+        XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: fixture.identity)?.promptText, "Frozen+Run")
+    }
+
+    func testOrdinaryPromptMutationRejectsAStaleBindingToARemovedTab() async throws {
+        let fixture = try await makePromptMutationFixture(name: "removed-prompt-target")
+        try fixture.updateStoredPrompt("Existing prompt")
+        try fixture.bindPromptConnection(fixture.connectionID)
+        let manager = fixture.window.workspaceManager
+        let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+        manager.workspaces[workspaceIndex].composeTabs.removeAll { $0.id == fixture.tabID }
+        let survivingTabs = manager.workspaces[workspaceIndex].composeTabs
+        let activePrompt = fixture.window.promptManager.promptText
+        var mutationWasCalled = false
+
+        do {
+            _ = try await fixture.mutatePrompt(connectionID: fixture.connectionID) {
+                mutationWasCalled = true
+                $0 += "+Must not commit"
+            }
+            XCTFail("A removed target must not report a successful prompt write")
+        } catch let error as MCPError {
+            guard case let .invalidParams(message) = error else {
+                XCTFail("Unexpected prompt mutation error: \(error)")
+                return
+            }
+            let unwrappedMessage = try XCTUnwrap(message)
+            XCTAssertTrue(unwrappedMessage.contains("bound tab is no longer available"), unwrappedMessage)
+        }
+
+        XCTAssertFalse(mutationWasCalled)
+        XCTAssertNil(manager.composeTab(for: fixture.identity))
+        XCTAssertEqual(manager.workspaces[workspaceIndex].composeTabs, survivingTabs)
+        XCTAssertEqual(fixture.boundContext?.promptText, "Existing prompt")
+        XCTAssertEqual(fixture.window.promptManager.promptText, activePrompt)
+    }
+
     func testCursorInitializeNamePromotesQueuedDiscoveryContext() async throws {
         let fixture = try await makeFixture(name: "cursor-initialize-name")
         defer { fixture.cleanup() }
@@ -54,9 +182,9 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                 toolName: "prompt",
                 metadata: fixture.metadata
             )
-            try await MCPInvocationContextBridge.withInvocation(invocation) {
-                try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
-                    $0.promptText = prompt
+            _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                try await fixture.window.mcpServer.updateCurrentTabPrompt(toolName: "prompt") {
+                    $0 = prompt
                 }
             }
 
@@ -88,9 +216,9 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                 toolName: "prompt",
                 metadata: fixture.metadata
             )
-            try await MCPInvocationContextBridge.withInvocation(invocation) {
-                try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
-                    $0.promptText = prompt
+            _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                try await fixture.window.mcpServer.updateCurrentTabPrompt(toolName: "prompt") {
+                    $0 = prompt
                 }
             }
 
@@ -394,6 +522,16 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.canonicalSelection, newer)
     }
 
+    private func makePromptMutationFixture(name: String) async throws -> Fixture {
+        let fixture = try await makeFixture(name: name)
+        addTeardownBlock { @MainActor in
+            await fixture.window.tearDown()
+            fixture.cleanup()
+        }
+        await fixture.window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+        return fixture
+    }
+
     private func makeFixture(name: String, tabName: String? = nil, domainRuntime: MCPDomainRuntime? = nil) async throws -> Fixture {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -465,6 +603,38 @@ private struct Fixture {
             mirrorToUIIfActive: false
         )
         XCTAssertEqual(canonicalSelection, selection)
+    }
+
+    func updateStoredPrompt(_ prompt: String, metaPromptIDs: [UUID]? = nil) throws {
+        var tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        tab.promptText = prompt
+        if let metaPromptIDs {
+            tab.selectedMetaPromptIDs = metaPromptIDs
+        }
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID))
+    }
+
+    func bindPromptConnection(_ connectionID: UUID) throws {
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "prompt-mutation-test",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+    }
+
+    func mutatePrompt(
+        connectionID: UUID,
+        mutation: (inout String) -> Void
+    ) async throws -> String {
+        let invocation = ToolInvocationContext.trustedLocal(
+            toolName: "prompt",
+            metadata: .init(connectionID: connectionID, clientName: "prompt-mutation-test", windowID: window.windowID)
+        )
+        return try await MCPInvocationContextBridge.withInvocation(invocation) {
+            try await window.mcpServer.updateCurrentTabPrompt(toolName: "prompt", mutation: mutation)
+        }
     }
 
     func installContext(selection: StoredSelection) throws -> MCPServerViewModel.TabContextSnapshot {

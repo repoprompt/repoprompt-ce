@@ -119,7 +119,7 @@ extension MCPServerViewModel {
             let publishedOverlay = publishedEntryResultsOverlay(
                 collections: collections,
                 base: [:],
-                includeSliceDisplayTokens: true
+                describesActiveTab: true
             )
             let published = promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
                 for: effectiveSelection,
@@ -179,7 +179,7 @@ extension MCPServerViewModel {
         let publishedOverlay = publishedEntryResultsOverlay(
             collections: collections,
             base: cachedEvaluation.entryResultsByFileID,
-            includeSliceDisplayTokens: false
+            describesActiveTab: false
         )
         let signature = virtualTokenSignature(
             context: context,
@@ -272,23 +272,41 @@ extension MCPServerViewModel {
         )
     }
 
+    /// Overlays the window token counter's latest published per-file values, which describe the
+    /// active tab. For any other tab, only values that tab can share are borrowed: never slice
+    /// display counts, and full counts only when the active publication measured them.
     @MainActor
     private func publishedEntryResultsOverlay(
         collections: SelectionReplyAssembler.SelectionCollections,
         base: [UUID: PromptEntriesEvaluation.EntryResult],
-        includeSliceDisplayTokens: Bool
+        describesActiveTab: Bool
     ) -> (
         entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult],
         reliableFileIDs: Set<UUID>
     ) {
         var entryResults = base
         var reliableFileIDs = Set<UUID>()
+        let activeEntryMetrics = describesActiveTab
+            ? nil
+            : promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
+                for: nil,
+                scheduleRefreshIfNeeded: false
+            ).entryMetricsSnapshot
         for entry in collections.selected {
             let renderMode: PromptEntriesEvaluation.RenderMode = entry.ranges?.isEmpty == false ? .slice : .full
-            if renderMode == .slice, !includeSliceDisplayTokens {
+            if renderMode == .slice, !describesActiveTab {
                 if entryResults[entry.file.id]?.renderMode == .slice {
                     reliableFileIDs.insert(entry.file.id)
                 }
+                continue
+            }
+            // An unmeasured active full count is a placeholder. The entry keeps its own evaluation,
+            // which stays pending when its content is not loaded.
+            if let activeEntryMetrics,
+               !Self.publishedFullCountIsMeasured(
+                   activeEntryMetrics.metricsByStandardizedFullPath[entry.file.standardizedFullPath]
+               )
+            {
                 continue
             }
             guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
@@ -324,6 +342,19 @@ extension MCPServerViewModel {
             reliableFileIDs.insert(entry.file.id)
         }
         return (entryResults, reliableFileIDs)
+    }
+
+    /// A published full count is measured only when its publication loaded the file, which full and
+    /// sliced renders record as a line count. Codemap renders never load content, and an unread full
+    /// render records no line count, so their published full counts are placeholders.
+    private static func publishedFullCountIsMeasured(_ metric: PromptContextEntryMetric?) -> Bool {
+        guard let metric else { return false }
+        switch metric.renderMode {
+        case .full, .slice:
+            return metric.includedLineCount != nil
+        case .codemap:
+            return false
+        }
     }
 
     private static func orderedIncompleteComponents(

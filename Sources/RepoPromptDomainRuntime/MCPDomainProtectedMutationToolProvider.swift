@@ -309,6 +309,20 @@ package struct MCPDomainProtectedMutationToolProvider {
                 return result
             } catch let error as DomainProtectedMutationError {
                 throw error
+            } catch let refusal as DomainMutationRefusedBeforeEffects {
+                do {
+                    try await Task.detached(priority: .utility) {
+                        try await journal.finishRefusedBeforeEffects(ticket)
+                    }.value
+                    MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+                } catch {
+                    // No effects occurred, but durable settlement could not be confirmed.
+                    MCPDomainProtectedMutationSettlementContext.report(.unknown, operationID: operationID)
+                    throw MCPError.internalError(
+                        "No backend effects occurred, but durable refusal settlement could not be confirmed. Inspect operation ID \(operationID) before retrying."
+                    )
+                }
+                throw refusal.underlying
             } catch {
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if didBeginCommit {

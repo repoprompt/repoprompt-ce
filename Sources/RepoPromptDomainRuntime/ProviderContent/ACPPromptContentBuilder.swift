@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 import UniformTypeIdentifiers
 
 package enum ACPPromptContentBuilder {
@@ -51,14 +52,13 @@ package enum ACPPromptContentBuilder {
     private static func imageBlock(for attachment: AgentImageAttachment) throws -> [String: Any]? {
         switch attachment.source {
         case let .localFile(rawPath):
-            let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !path.isEmpty else { return nil }
-            let url = URL(fileURLWithPath: path).standardizedFileURL
+            let url: URL
             let data: Data
             do {
+                url = try localImageFileURL(exactPath: rawPath)
                 data = try Data(contentsOf: url)
             } catch {
-                throw Error.unreadableLocalImage(path)
+                throw Error.unreadableLocalImage(rawPath)
             }
             return [
                 "type": "image",
@@ -76,6 +76,18 @@ package enum ACPPromptContentBuilder {
                 "uri": urlString
             ]
         }
+    }
+
+    /// The Codable attachment format also permits legacy CWD-relative native paths.
+    /// This platform bridge validates native text without trimming, URL decoding,
+    /// home expansion or lexical dot/symlink resolution.
+    private static func localImageFileURL(exactPath: String) throws -> URL {
+        let platformPath: String = if exactPath.hasPrefix("/") {
+            try WorkspaceAbsolutePath.nativeText(exactPath).utf8ForPlatform()
+        } else {
+            try WorkspaceRelativePath.nativeText(exactPath).utf8ForPlatform()
+        }
+        return URL(fileURLWithPath: platformPath)
     }
 
     private static func mimeType(forPathExtension pathExtension: String?, fallbackTitle: String?) -> String {

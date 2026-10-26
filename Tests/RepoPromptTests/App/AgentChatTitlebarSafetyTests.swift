@@ -2,6 +2,8 @@ import AppKit
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 import XCTest
 
@@ -649,6 +651,102 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             XCTAssertNotNil(fixture.tab(fixture.tabBID))
             XCTAssertNil(fixture.viewModel.explicitActiveSessionID(for: fixture.tabAID))
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+        }
+    }
+
+    func testDeletionEntryPointsPersistTheirActualOrigin() async throws {
+        for entry in ["titlebar", "sidebar", "unspecified", "mcp_close", "agent_close", "mcp_cleanup"] {
+            try await withFixture { fixture in
+                let directory = fixture.rootURL.appendingPathComponent("scope-history")
+                let store = DelegationScopeStore(fileURL: directory.appendingPathComponent("scopes.json"), backupsDirectoryURL: directory, mode: .enabled)
+                let scopeID = UUID()
+                let grant = DomainDelegationScopeGrant(id: scopeID, granteeSessionID: fixture.sessionAID, kind: .tree(rootSessionID: fixture.sessionAID), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+                let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+                await runtime.bootstrap(store: store)
+                XCTAssertEqual(store.record(operationID: UUID(), grants: [grant], revoked: []), .applied)
+                let registry = AgentSessionDeletionRegistry.shared
+                let previousObserver = registry.commitObserver
+                registry.commitObserver = { id, origin, removed in
+                    runtime.revokeAll(involving: id, origin: origin, fileRemoved: removed)
+                    await previousObserver?(id, origin, removed)
+                }
+                defer {
+                    registry.commitObserver = previousObserver
+                    runtime.freezeForTermination()
+                }
+                var expectedOrigin: OverseerScopeEnding.DeletionOrigin = .unknown
+                var expectedInitiator = "unknown"
+                var actor: UUID?
+                switch entry {
+                case "titlebar":
+                    expectedOrigin = .userUI
+                    expectedInitiator = "user"
+                    let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+                    await fixture.window.deleteAgentChatFromTitlebar(target: target)
+                case "sidebar":
+                    expectedOrigin = .userUI
+                    expectedInitiator = "user"
+                    await fixture.viewModel.performSidebarBulkAction(.delete, origin: .command, commandProgressPlacement: .row, targets: .init(workspaceID: fixture.workspaceID, activeDeleteTabIDs: [fixture.tabAID], archivedDeleteTargets: [], stashTabIDs: [], pinTabIDs: [], unpinTabIDs: []), promptManager: fixture.window.promptManager)
+                case "mcp_close", "agent_close":
+                    expectedOrigin = .mcpClient
+                    expectedInitiator = entry == "agent_close" ? "agent" : "mcp_client"
+                    let connection = UUID()
+                    if entry == "agent_close" {
+                        await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: connection)
+                        actor = fixture.viewModel.sessions[fixture.tabBID]?.activeAgentSessionID
+                        fixture.window.mcpServer.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
+                    }
+                    defer { fixture.window.mcpServer.tabContextByConnectionID.removeValue(forKey: connection) }
+                    let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+                    await service.prepareDomainTools()
+                    let tools = await service.tools
+                    let tool = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+                    let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_workspaces", metadata: .init(connectionID: connection, clientName: "deletion-origin-test", windowID: fixture.window.windowID, runPurpose: entry == "agent_close" ? .agentModeRun : nil))
+                    do {
+                        _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                            try await tool(["action": .string("close_tab"), "window_id": .int(fixture.window.windowID), "tab": .string(fixture.tabAID.uuidString), "allow_active": .bool(true)])
+                        }
+                    } catch {
+                        await ServerNetworkManager.shared.setRunPurpose(.unknown, for: connection)
+                        throw error
+                    }
+                    await ServerNetworkManager.shared.setRunPurpose(.unknown, for: connection)
+                case "mcp_cleanup":
+                    fixture.sessionA.isMCPOriginated = true
+                    expectedOrigin = .mcpClient
+                    expectedInitiator = "mcp_client"
+                    let connection = UUID()
+                    let service = AgentManageMCPToolService(toolName: MCPWindowToolName.agentManage, captureRequestMetadata: { .init(connectionID: connection, clientName: "external-cleanup", windowID: fixture.window.windowID) }, requireTargetWindow: { fixture.window }, resolveSpawnSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in nil }, bindCurrentRequestToTab: { _, _ in })
+                    let result = try await service.execute(args: ["op": .string("cleanup_sessions"), "session_ids": .array([.string(fixture.sessionAID.uuidString)])])
+                    XCTAssertEqual(result.objectValue?["deleted_count"], .int(1), "\(result)")
+                default:
+                    await fixture.window.promptManager.closeComposeTab(fixture.tabAID)
+                }
+                await runtime.flushPersistence()
+                _ = store.loadForLaunch()
+                let ending = try XCTUnwrap(store.endedScopes[scopeID]?.ending, entry)
+                XCTAssertEqual(ending.deletionOrigin, expectedOrigin, entry)
+                XCTAssertEqual(ending.initiator, expectedInitiator, entry)
+                XCTAssertEqual(ending.actorSessionID, actor, entry)
+                XCTAssertNotNil(ending.fileRemoved, entry)
+            }
+        }
+    }
+
+    func testKeyboardCloseStashesWithoutEndingScopeOrDeletingSession() async throws {
+        try await withFixture { fixture in
+            let registry = AgentSessionDeletionRegistry.shared
+            let previous = registry.commitObserver
+            var deleted: [UUID] = []
+            registry.commitObserver = { id, origin, removed in
+                deleted.append(id)
+                await previous?(id, origin, removed)
+            }
+            defer { registry.commitObserver = previous }
+            await fixture.window.closeActiveComposeTabFromShortcut()?.value
+            XCTAssertNil(fixture.tab(fixture.tabAID))
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains { $0.tab.id == fixture.tabAID } == true)
+            XCTAssertFalse(deleted.contains(fixture.sessionAID), "Keyboard close archives; it must not invent a scope ending")
         }
     }
 

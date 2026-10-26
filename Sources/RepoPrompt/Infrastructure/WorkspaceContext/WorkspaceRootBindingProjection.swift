@@ -931,13 +931,17 @@ struct WorkspaceRootBindingProjectionMaterializer {
             )
             return projection
         } catch {
-            await store.releaseSessionWorktreeOwnership(ownerID: preparation.sessionID)
+            _ = await store.releaseSessionWorktreeOwnership(ifOwnedBy: preparation.ownership.token)
             throw error
         }
     }
 
     func abort(_ preparation: WorkspaceRootBindingProjectionPreparation) async {
         await store.abortSessionWorktreeOwnership(preparation.ownership)
+    }
+
+    func release(ifOwnedBy token: WorkspaceSessionWorktreeOwnershipToken) async {
+        _ = await store.releaseSessionWorktreeOwnership(ifOwnedBy: token)
     }
 
     func release(sessionID: UUID) async {

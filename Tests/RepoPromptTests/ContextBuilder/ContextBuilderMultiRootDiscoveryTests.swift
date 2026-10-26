@@ -1596,4 +1596,278 @@ import XCTest
             }
         }
     }
+
+    /// Context Builder results account tokens for their own result tab, not the window's active tab.
+    @MainActor
+    final class ContextBuilderResultTokenAttributionTests: XCTestCase {
+        func testBackgroundResultLineRangeIsAccountedFromResultTab() async throws {
+            try await withDriver { driver in
+                let path = Self.sharedPath(driver)
+                let backgroundTabID = try await driver.installAdditionalTab(name: "Attribution")
+                let baseline = try await Self.prepareActiveTab(driver, selecting: path)
+                let activeInfo = try XCTUnwrap(baseline.info, "The active tab must publish per-file tokens for the shared file")
+                XCTAssertEqual(activeInfo.count, activeInfo.fullCount, "The active tab selects the shared file in full")
+                XCTAssertGreaterThan(activeInfo.fullCount, 100)
+
+                let result = try await Self.runContextBuilder(driver, onTab: backgroundTabID) { child in
+                    try await Self.call(child, "read_file", ["path": .string(path)])
+                    try await Self.call(child, "manage_selection", [
+                        "op": .string("add"),
+                        "slices": .array([.object([
+                            "path": .string(path),
+                            "ranges": .array([.object(["start_line": .int(1), "end_line": .int(2)])])
+                        ])])
+                    ])
+                    try await Self.call(child, "prompt", ["op": .string("set"), "text": .string(Self.resultPrompt)])
+                }
+
+                XCTAssertEqual(result.activeTabIDAtRender, driver.tabID, "The result must render while another tab is active")
+                XCTAssertEqual(result.renderedSelection, result.committed.tab.selection)
+                XCTAssertEqual(result.fileCount, 1)
+                let row = try XCTUnwrap(result.reply.files?.first)
+                XCTAssertEqual(result.reply.files?.count, 1)
+                XCTAssertEqual(row.renderMode, "slice")
+
+                let accounting = try XCTUnwrap(result.reply.tokenAccounting)
+                XCTAssertTrue(Self.resultTabSources.contains(accounting.source), "Accounting source: \(accounting.source)")
+                XCTAssertNotEqual(row.tokens, activeInfo.count, "The slice row reused the active tab's full-file display count")
+                XCTAssertLessThan(row.tokens, activeInfo.fullCount / 4, "A two-line slice must not be accounted as the full file")
+                if accounting.incompleteComponents?.contains("files") != true {
+                    XCTAssertGreaterThan(row.tokens, 0, "A complete slice row needs its own token count")
+                }
+                XCTAssertFalse(result.selectionText.contains("from active_tab_published"), result.selectionText)
+            }
+        }
+
+        /// Prompt-attribution regression for two tabs with the same whole selection and different
+        /// prompts. Unfixed, the result reported the active tab's prompt tokens under a `stale` label;
+        /// the settled `fresh` label depends on recount timing, so it is neither reproduced nor asserted.
+        func testBackgroundResultWithEqualSelectionReportsResultTabPromptTokens() async throws {
+            try await withDriver { driver in
+                let path = Self.sharedPath(driver)
+                let backgroundTabID = try await driver.installAdditionalTab(name: "Attribution")
+                let baseline = try await Self.prepareActiveTab(driver, selecting: path)
+                let promptVM = driver.window.mcpServer.promptVM
+                let resultPromptTokens = Self.promptTokens(Self.resultPrompt, promptVM: promptVM)
+                XCTAssertNotEqual(resultPromptTokens, Self.promptTokens(Self.activePrompt, promptVM: promptVM))
+
+                let result = try await Self.runContextBuilder(driver, onTab: backgroundTabID) { child in
+                    try await Self.call(child, "read_file", ["path": .string(path)])
+                    try await Self.call(child, "manage_selection", [
+                        "op": .string("set"), "paths": .array([.string(path)]), "mode": .string("full")
+                    ])
+                    try await Self.call(child, "prompt", ["op": .string("set"), "text": .string(Self.resultPrompt)])
+                }
+
+                XCTAssertEqual(result.activeTabIDAtRender, driver.tabID, "The result must render while another tab is active")
+                XCTAssertEqual(result.committed.tab.selection, baseline.selection, "Both tabs hold the same whole selection")
+                XCTAssertEqual(result.renderedSelection, result.committed.tab.selection)
+                XCTAssertEqual(result.fileCount, 1)
+
+                let accounting = try XCTUnwrap(result.reply.tokenAccounting)
+                XCTAssertTrue(Self.resultTabSources.contains(accounting.source), "Accounting source: \(accounting.source)")
+                XCTAssertEqual(result.reply.tokenStats?.prompt, resultPromptTokens, "The prompt component must describe the result tab")
+                XCTAssertFalse(result.selectionText.contains("from active_tab_published"), result.selectionText)
+            }
+        }
+
+        /// An active publication that could not load a file carries a placeholder full count for it.
+        /// A background result must not present that placeholder as a complete count of its own.
+        func testBackgroundResultDoesNotAcceptActiveTabPlaceholderFullCount() async throws {
+            try await withDriver { driver in
+                let path = Self.sharedPath(driver)
+                let backgroundTabID = try await driver.installAdditionalTab(name: "Attribution")
+                // Unreadable before anything loads it, so neither tab ever holds the file's content.
+                try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+                defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path) }
+                let baseline = try await Self.prepareActiveTab(driver, selecting: path)
+                let activeInfo = try XCTUnwrap(baseline.info, "The active tab must publish per-file tokens for the shared file")
+                let activeMetric = try XCTUnwrap(baseline.metric, "The active tab must publish an entry metric for the shared file")
+                XCTAssertEqual(activeMetric.renderMode, .full)
+                XCTAssertNil(activeMetric.includedLineCount, "The active publication never loaded the shared file")
+                XCTAssertEqual(activeInfo.fullCount, 0, "The active full count is the unread placeholder")
+
+                let result = try await Self.runContextBuilder(driver, onTab: backgroundTabID) { child in
+                    try await Self.call(child, "manage_selection", [
+                        "op": .string("set"), "paths": .array([.string(path)]), "mode": .string("full")
+                    ])
+                    try await Self.call(child, "prompt", ["op": .string("set"), "text": .string(Self.resultPrompt)])
+                }
+
+                XCTAssertEqual(result.activeTabIDAtRender, driver.tabID, "The result must render while another tab is active")
+                XCTAssertEqual(result.renderedSelection, result.committed.tab.selection)
+                XCTAssertEqual(result.fileCount, 1)
+                let row = try XCTUnwrap(result.reply.files?.first)
+                XCTAssertEqual(result.reply.files?.count, 1)
+                XCTAssertEqual(row.renderMode, "full")
+
+                let accounting = try XCTUnwrap(result.reply.tokenAccounting)
+                XCTAssertTrue(Self.resultTabSources.contains(accounting.source), "Accounting source: \(accounting.source)")
+                XCTAssertEqual(
+                    accounting.incompleteComponents?.contains("files"),
+                    true,
+                    "Without the file's content its count must stay pending, not take the active placeholder"
+                )
+            }
+        }
+
+        func testActiveTabResultKeepsActivePublishedAccounting() async throws {
+            try await withDriver { driver in
+                let path = Self.sharedPath(driver)
+                XCTAssertEqual(driver.window.mcpServer.promptVM.activeComposeTabID, driver.tabID)
+
+                let result = try await Self.runContextBuilder(driver, onTab: driver.tabID) { child in
+                    try await Self.call(child, "read_file", ["path": .string(path)])
+                    try await Self.call(child, "manage_selection", [
+                        "op": .string("set"), "paths": .array([.string(path)]), "mode": .string("full")
+                    ])
+                    try await Self.call(child, "prompt", ["op": .string("set"), "text": .string(Self.resultPrompt)])
+                }
+
+                XCTAssertEqual(result.activeTabIDAtRender, driver.tabID)
+                XCTAssertEqual(result.renderedSelection, result.committed.tab.selection)
+                XCTAssertEqual(result.reply.tokenAccounting?.source, "active_tab_published")
+                XCTAssertTrue(result.selectionText.contains("from active_tab_published"), result.selectionText)
+            }
+        }
+
+        // MARK: - Fixture
+
+        private static let resultTabSources: Set = ["bound_tab_cached_state", "bound_tab_cache"]
+        private static let resultPrompt = "Result tab prompt."
+        private static let activePrompt = Array(
+            repeating: "Active tab prompt words that a background result must never report as its own.",
+            count: 40
+        ).joined(separator: " ")
+        /// Long enough that a two-line slice and the full file have clearly different token counts.
+        private static let sharedFileContent = (1 ... 80)
+            .map { "fixture line \($0): shared attribution content that only a full-file selection includes." }
+            .joined(separator: "\n")
+
+        private struct ActiveBaseline {
+            let selection: StoredSelection
+            let info: TokenInfo?
+            let metric: PromptContextEntryMetric?
+        }
+
+        private struct RenderedResult {
+            let reply: ToolResultDTOs.SelectionReply
+            let renderedSelection: StoredSelection
+            let activeTabIDAtRender: UUID?
+            let committed: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
+            let fileCount: Int?
+            let selectionText: String
+        }
+
+        @MainActor
+        private final class ReplyCapture {
+            var rendered: [(selection: StoredSelection, reply: ToolResultDTOs.SelectionReply, activeTabID: UUID?)] = []
+        }
+
+        private func withDriver(
+            _ body: @escaping (ContextBuilderMultiRootDiscoveryDriver) async throws -> Void
+        ) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                routedRuntime: true,
+                readmeContent: Self.sharedFileContent,
+                body
+            )
+        }
+
+        private static func sharedPath(_ driver: ContextBuilderMultiRootDiscoveryDriver) -> String {
+            driver.fixture.rootPaths[0] + "/README.md"
+        }
+
+        /// Selects the shared file in full on the window's active tab and publishes a complete
+        /// baseline for that tab, whose per-file and prompt values a background result could borrow.
+        private static func prepareActiveTab(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            selecting path: String
+        ) async throws -> ActiveBaseline {
+            let promptVM = driver.window.mcpServer.promptVM
+            XCTAssertEqual(driver.manager.activeWorkspaceID, driver.fixture.workspace.id)
+            XCTAssertEqual(promptVM.activeComposeTabID, driver.tabID)
+            XCTAssertTrue(promptVM.resolvePromptContext().includeUserPrompt)
+
+            await driver.files.selectFiles(withPaths: [path])
+            promptVM.promptText = activePrompt
+            let counter = promptVM.tokenCountingViewModel
+            await counter.forceImmediateRecount()
+
+            let selection = counter.currentExpectedSelectionForPublishedSnapshot()
+            XCTAssertEqual(selection.selectedPaths, [path])
+            let published = counter.latestPublishedTokenSnapshot(for: nil, scheduleRefreshIfNeeded: false)
+            XCTAssertTrue(published.isComplete)
+            return ActiveBaseline(
+                selection: selection,
+                info: counter.latestPublishedTokenInfo(forFullPath: path),
+                metric: published.entryMetricsSnapshot.metricsByStandardizedFullPath[path]
+            )
+        }
+
+        private static func promptTokens(_ text: String, promptVM: PromptViewModel) -> Int {
+            TokenCalculationService.calculateComponentBreakdown(
+                promptText: text,
+                selectedInstructionsText: "",
+                fileTreeText: "",
+                gitDiffText: nil,
+                metadataText: nil,
+                duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop
+            ).promptDisplay
+        }
+
+        private static func runContextBuilder(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            onTab tabID: UUID,
+            discovery: @escaping (ContextBuilderMultiRootDiscoveryDriver.RoutedConnection) async throws -> Void
+        ) async throws -> RenderedResult {
+            let server = driver.window.mcpServer
+            let capture = ReplyCapture()
+            server.setContextBuilderSelectionReplyObserverForTesting { selection, _, reply in
+                capture.rendered.append((selection, reply, server.promptVM.activeComposeTabID))
+            }
+            defer { server.setContextBuilderSelectionReplyObserverForTesting(nil) }
+
+            let context = try await driver.resolve(tabID: tabID)
+            let parent = try await driver.fixture.perform("invoking Agent Mode connection") {
+                try await driver.connectInvokingAgent(context)
+            }
+            driver.streamBody = { runID in
+                let child = try await driver.connectChild(runID: runID)
+                try await discovery(child)
+            }
+            let reply = try await driver.fixture.perform("context_builder result") {
+                try await driver.invoke(using: parent)
+            }
+            let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+            XCTAssertNotEqual(reply.isError, true, text)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            XCTAssertEqual(json["status"] as? String, "completed")
+            XCTAssertEqual(json["context_id"] as? String, tabID.uuidString)
+            let committed = try XCTUnwrap(driver.committed)
+            XCTAssertEqual(committed.identity.tabID, tabID)
+            XCTAssertEqual(capture.rendered.count, 1)
+            let rendered = try XCTUnwrap(capture.rendered.first)
+            return RenderedResult(
+                reply: rendered.reply,
+                renderedSelection: rendered.selection,
+                activeTabIDAtRender: rendered.activeTabID,
+                committed: committed,
+                fileCount: json["file_count"] as? Int,
+                selectionText: json["selection"] as? String ?? ""
+            )
+        }
+
+        @discardableResult
+        private static func call(
+            _ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection,
+            _ tool: String,
+            _ arguments: [String: Value]
+        ) async throws -> String {
+            let reply = try await connection.client.callTool(name: tool, arguments: arguments)
+            let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+            XCTAssertNotEqual(reply.isError, true, "\(tool): \(text)")
+            return text
+        }
+    }
 #endif

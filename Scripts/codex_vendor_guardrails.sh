@@ -64,7 +64,6 @@ for path in \
     ThirdPartyLicenses/codex/LICENSE \
     ThirdPartyLicenses/codex/NOTICE \
     ThirdPartyLicenses/codex/README.md \
-    ThirdPartyLicenses/codex/ZSH-LICENCE \
     ThirdPartyLicenses/codex/SHA256SUMS; do
     [[ -f "$path" ]] || fail "Missing Codex legal inventory file: $path"
 done
@@ -84,8 +83,6 @@ done
 
 grep -F "## OpenAI Codex" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the OpenAI Codex section"
-grep -F "codex-resources/zsh/bin/zsh" THIRD_PARTY_NOTICES.md >/dev/null ||
-    fail "THIRD_PARTY_NOTICES.md is missing the bundled Zsh notice"
 grep -F "codex-resources/voice/" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled voice-runtime notice"
 codex_manifest_version="$(python3 Scripts/codex_runtime_artifact.py manifest-version)"

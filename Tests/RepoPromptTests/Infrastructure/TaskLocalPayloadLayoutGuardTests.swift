@@ -103,6 +103,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         assertPointerSizedCarrier(ServerNetworkManager.currentExplicitWindowRoutingHintTaskLocal)
         assertPointerSizedCarrier(MCPInvocationContextBridge.currentTaskLocal)
         assertPointerSizedCarrier(AgentSelfMCPCallOrigin.currentTaskLocal)
+        assertPointerSizedCarrier(AgentSessionDeletionOrigin.currentTaskLocal)
         assertPointerSizedCarrier(AgentSessionLinkWaitCallOrigin.currentTaskLocal)
         assertPointerSizedCarrier(EditFlowPerf.currentLifecycleCorrelationTaskLocal)
         assertPointerSizedCarrier(EditFlowPerf.currentFileSystemPublicationCorrelationTaskLocal)

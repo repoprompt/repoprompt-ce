@@ -50,3 +50,44 @@ final class HiddenSessionSlicePathIndexTests: XCTestCase {
         UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, UInt8(value >> 8), UInt8(value & 255)))
     }
 }
+
+@MainActor
+final class HiddenSessionAppliedIndexHotPathTests: XCTestCase {
+    func testIrrelevantEventsDoNotEnumerateRootRecords() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let ordinary = try await store.loadRoot(path: directory.path)
+        let hiddenDirectory = directory.appendingPathComponent("hidden")
+        try FileManager.default.createDirectory(at: hiddenDirectory, withIntermediateDirectories: true)
+        let hidden = try await store.loadRoot(path: hiddenDirectory.path, kind: .sessionWorktree)
+        addTeardownBlock {
+            await store.unloadRoot(id: hidden.id)
+            await store.unloadRoot(id: ordinary.id)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let viewModel = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+        let hiddenLifetime = try await store.rootLifetimeIDForTesting(rootID: hidden.id)
+        let ordinaryLifetime = try await store.rootLifetimeIDForTesting(rootID: ordinary.id)
+        await store.resetFilesInRootRequestCountForTesting()
+        await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
+
+        for event in [
+            WorkspaceAppliedIndexBatchEvent(rootID: ordinary.id, rootPath: ordinary.fullPath, generation: 1, rootLifetimeID: ordinaryLifetime),
+            WorkspaceAppliedIndexBatchEvent(rootID: hidden.id, rootPath: directory.path, generation: 1, rootLifetimeID: hiddenLifetime),
+            WorkspaceAppliedIndexBatchEvent(rootID: hidden.id, rootPath: hidden.fullPath, generation: 1, rootLifetimeID: hiddenLifetime),
+            WorkspaceAppliedIndexBatchEvent(rootID: hidden.id, rootPath: hidden.fullPath, generation: 1, rootLifetimeID: hiddenLifetime)
+        ] {
+            await viewModel.applyWorkspaceAppliedIndexEventForTesting(event)
+        }
+
+        let enumerations = await store.fileEnumerationRequestCountForTesting()
+        let lookups = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+        XCTAssertEqual(enumerations, 0)
+        XCTAssertEqual(lookups.rootSnapshots, 0)
+        // The empty first hidden event must advance handled generation: its replay
+        // should be rejected before even a targeted lookup.
+        XCTAssertEqual(lookups.lookupRequests, 1)
+        XCTAssertEqual(lookups.requestedRecords, 0)
+    }
+}

@@ -18,7 +18,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
     func testHandoffOwnsItsImagesBeforeFirstSaveAndKeepsThemAfterParentDeletion() async throws {
         try await withFixture(bindSource: false) { fixture in
-            let (store, attachment, parentImage) = try installHandoffImage(fixture)
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
             let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
             let originalBytes = try Data(contentsOf: parentImage)
@@ -77,7 +77,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
     func testHandoffWithMissingImageFailsBeforePublishingOrSavingChildTranscript() async throws {
         try await withFixture(bindSource: false) { fixture in
-            let (store, attachment, parentImage) = try installHandoffImage(fixture)
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
             try FileManager.default.removeItem(at: parentImage)
             let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
             var child: AgentModeViewModel.TabSession?
@@ -115,7 +115,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
     func testHandoffRejectsStorageRootChangeDuringImageCopyWithoutRebindingTheChild() async throws {
         try await withFixture(bindSource: false) { fixture in
-            let (store, attachment, parentImage) = try installHandoffImage(fixture)
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
             let manager = fixture.window.workspaceManager
             // Keep the test persistence override, but resolve it from the live workspace just as
             // production does. A custom storage update does not replace the session binding.
@@ -1210,7 +1210,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
     }
 
-    private func installHandoffImage(_ fixture: Fixture) throws -> (AgentSessionAttachmentStore, AgentImageAttachment, URL) {
+    private func installHandoffImage(_ fixture: Fixture) async throws -> (AgentSessionAttachmentStore, AgentImageAttachment, URL) {
         let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
         let folder = WorkspaceSessionSidecarMigration.workspaceDirectory(
             for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
@@ -1225,6 +1225,15 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         let attachment = AgentImageAttachment(id: attachmentID, source: .localFile(path: image.path), title: "Handoff image")
         fixture.sourceSession.appendItem(.user("Look at this image", attachments: [attachment]))
         fixture.sourceSession.appendItem(.assistant("Image received"))
+        // A hydrated source hands off from its structured transcript; appended live items reach it
+        // through the scheduled derived-transcript refresh. Own that refresh so the appended rows
+        // are valid Handoff cutoffs before any test selects one.
+        await fixture.viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: fixture.sourceTabID)
+        let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+        XCTAssertNotNil(
+            fixture.viewModel.resolvedHandoffSourceTranscript(for: fixture.sourceSession, upToItemID: cutoff),
+            "precondition: the appended image turn must be a valid Handoff cutoff"
+        )
         return (store, attachment, image)
     }
 

@@ -1,11 +1,200 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
 import XCTest
 
 #if DEBUG
     @MainActor
     final class MCPReadAutoSelectionRecoveryIntegrationTests: XCTestCase {
+        func testFileActionsCreatePreservesNewerBoundSelectionAndForegroundSlices() async throws {
+            try await assertCreatedFileUsesLatestBoundSelection(toolName: MCPWindowToolName.fileActions)
+        }
+
+        func testApplyEditsCreatePreservesBoundSelectionAndForegroundSlices() async throws {
+            try await assertCreatedFileUsesLatestBoundSelection(toolName: MCPWindowToolName.applyEdits)
+        }
+
+        private func assertCreatedFileUsesLatestBoundSelection(toolName: String) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let context = fixture.contextA
+                let manager = context.window.workspaceManager
+                let server = context.window.mcpServer
+                let coordinator = context.window.selectionCoordinator
+                let identity = WorkspaceSelectionIdentity(workspaceID: context.workspaceID, tabID: context.tabID)
+                let addedElsewhere = context.rootURL.appendingPathComponent("AddedElsewhere.swift")
+                let foregroundFile = context.rootURL.appendingPathComponent("Foreground.swift")
+                let manualCodemap = context.rootURL.appendingPathComponent("ManualCodemap.swift")
+                let createdFile = context.rootURL.appendingPathComponent("CreatedByMCP.swift")
+                var endpoint: PersistentMCPTestEndpoint?
+                do {
+                    for file in [addedElsewhere, foregroundFile, manualCodemap] {
+                        _ = try await context.window.workspaceFileContextStore.createFile(
+                            rootID: context.rootID,
+                            relativePath: file.lastPathComponent,
+                            content: "let first = 1\nlet second = 2\n"
+                        )
+                    }
+                    try await fixture.registerDomainWorkspace(context)
+                    try await Self.activateWorkspace(context)
+                    let initial = StoredSelection(
+                        selectedPaths: [context.fileURL.path],
+                        manualCodemapPaths: [manualCodemap.path],
+                        slices: [context.fileURL.path: [LineRange(start: 1, end: 1)]],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await coordinator.persistSelection(initial, for: identity, source: .mcpTabContext)
+                    let caller = try await Self.makeBoundEndpoint(
+                        label: "create-\(toolName)",
+                        fixture: fixture,
+                        requiredToolNames: [toolName]
+                    )
+                    endpoint = caller
+                    let background = await context.window.promptManager.createBackgroundComposeTab(
+                        strategy: .blank, name: "Foreground"
+                    )
+                    let foreground = try XCTUnwrap(background)
+                    await context.window.promptManager.switchComposeTab(foreground.id)
+                    let foregroundIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: context.workspaceID, tabID: foreground.id
+                    )
+                    let foregroundSelection = StoredSelection(
+                        selectedPaths: [foregroundFile.path],
+                        slices: [foregroundFile.path: [LineRange(start: 2, end: 2)]],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await coordinator.persistSelection(
+                        foregroundSelection, for: foregroundIdentity, source: .mcpTabContext
+                    )
+                    let foregroundUIPaths = Set(context.window.workspaceFilesViewModel.selectedFiles.map(\.fullPath))
+
+                    var latest = try XCTUnwrap(manager.composeTab(for: identity))
+                    latest.selection = StoredSelection(
+                        selectedPaths: [context.fileURL.path, addedElsewhere.path],
+                        manualCodemapPaths: initial.manualCodemapPaths,
+                        slices: initial.slices,
+                        codemapAutoEnabled: false
+                    )
+                    XCTAssertTrue(manager.updateComposeTabStoredOnly(latest, inWorkspaceID: context.workspaceID))
+                    XCTAssertFalse(try XCTUnwrap(
+                        server.tabContextByConnectionID[caller.connectionID]
+                    ).selection.selectedPaths.contains(addedElsewhere.path))
+
+                    let arguments: [String: Any] = toolName == MCPWindowToolName.fileActions
+                        ? ["action": "create", "path": createdFile.path, "content": "let created = true\n"]
+                        : ["path": createdFile.path, "rewrite": "let created = true\n", "on_missing": "create"]
+                    let reply = try await caller.callTool(name: toolName, arguments: arguments)
+                    XCTAssertFalse(reply.rawJSON.contains("\"isError\":true"), reply.rawJSON)
+                    let text = try Self.toolResultText(reply)
+                    XCTAssertFalse(text.contains("not confirmed"), text)
+                    XCTAssertEqual(try String(contentsOf: createdFile, encoding: .utf8), "let created = true\n")
+                    let expected = StoredSelection(
+                        selectedPaths: latest.selection.selectedPaths + [createdFile.path],
+                        manualCodemapPaths: initial.manualCodemapPaths,
+                        slices: initial.slices,
+                        codemapAutoEnabled: false
+                    )
+                    XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: identity)).selection, expected)
+                    XCTAssertEqual(
+                        try XCTUnwrap(manager.composeTab(for: foregroundIdentity)).selection,
+                        foregroundSelection
+                    )
+                    XCTAssertEqual(manager.activeWorkspace?.activeComposeTabID, foreground.id)
+                    XCTAssertEqual(
+                        Set(context.window.workspaceFilesViewModel.selectedFiles.map(\.fullPath)),
+                        foregroundUIPaths
+                    )
+                    XCTAssertEqual(
+                        server.tabContextByConnectionID[caller.connectionID]?.selection,
+                        expected
+                    )
+                    await Self.cleanupEndpoint(caller, manager: fixture.networkManager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if let endpoint { await Self.cleanupEndpoint(endpoint, manager: fixture.networkManager) }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testCreatedFileSelectionRejectsReboundConnectionWithoutRedirectingOrRemovingFile() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let context = fixture.contextA
+                let server = context.window.mcpServer
+                let manager = context.window.workspaceManager
+                var endpoint: PersistentMCPTestEndpoint?
+                do {
+                    try await fixture.registerDomainWorkspace(context)
+                    try await Self.activateWorkspace(context)
+                    let caller = try await Self.makeBoundEndpoint(label: "rebound-create", fixture: fixture)
+                    endpoint = caller
+                    let metadata = MCPServerViewModel.RequestMetadata(
+                        connectionID: caller.connectionID, clientName: nil, windowID: context.window.windowID
+                    )
+                    let (resolved, lookup) = try await server.resolveMutationFileToolContext(
+                        from: metadata, toolName: MCPWindowToolName.fileActions
+                    )
+                    let createdPath = context.rootURL.appendingPathComponent("CreatedBeforeRebind.swift")
+                    _ = try await context.window.workspaceFileContextStore.createFile(
+                        rootID: context.rootID,
+                        relativePath: createdPath.lastPathComponent,
+                        content: "let durable = true\n"
+                    )
+                    let record = await context.window.workspaceFileContextStore.lookupFiles(
+                        atPaths: [createdPath.path], rootScope: lookup.rootScope
+                    )[createdPath.path]
+                    let file = try XCTUnwrap(record)
+                    let createdTab = await context.window.promptManager.createBackgroundComposeTab(
+                        strategy: .blank, name: "Replacement binding"
+                    )
+                    let replacement = try XCTUnwrap(createdTab)
+                    await context.window.promptManager.switchComposeTab(replacement.id)
+                    try server.bindTabForConnection(
+                        connectionID: caller.connectionID,
+                        clientName: caller.clientName,
+                        tabID: replacement.id,
+                        workspaceID: context.workspaceID,
+                        windowID: context.window.windowID
+                    )
+                    let originalIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: context.workspaceID, tabID: context.tabID
+                    )
+                    let replacementIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: context.workspaceID, tabID: replacement.id
+                    )
+                    let originalSelection = try XCTUnwrap(manager.composeTab(for: originalIdentity)).selection
+                    let replacementSelection = try XCTUnwrap(manager.composeTab(for: replacementIdentity)).selection
+                    let warning = await server.selectCreatedFile(
+                        file, resolvedContext: resolved, metadata: metadata, lookupContext: lookup
+                    )
+                    XCTAssertTrue(try XCTUnwrap(warning).contains("selection was not confirmed"))
+                    XCTAssertEqual(try String(contentsOf: createdPath, encoding: .utf8), "let durable = true\n")
+                    XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: originalIdentity)).selection, originalSelection)
+                    XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: replacementIdentity)).selection, replacementSelection)
+                    XCTAssertEqual(manager.activeWorkspace?.activeComposeTabID, replacement.id)
+                    await Self.cleanupEndpoint(caller, manager: fixture.networkManager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if let endpoint { await Self.cleanupEndpoint(endpoint, manager: fixture.networkManager) }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testBackgroundReadSelectionDoesNotBlockLaterDrainsOrChangeForegroundSelection() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(
@@ -167,7 +356,8 @@ import XCTest
 
         private static func makeBoundEndpoint(
             label: String,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            requiredToolNames: Set<String> = [MCPWindowToolName.readFile, MCPWindowToolName.manageSelection]
         ) async throws -> PersistentMCPTestEndpoint {
             let manager = fixture.networkManager
             let clientName = "read-recovery-\(label)-\(UUID().uuidString)"
@@ -175,7 +365,7 @@ import XCTest
                 label: label,
                 networkManager: manager,
                 clientName: clientName,
-                requiredToolNames: [MCPWindowToolName.readFile, MCPWindowToolName.manageSelection]
+                requiredToolNames: requiredToolNames
             )
             await manager.debugSetDomainPeerIdentityForTesting(
                 connectionID: endpoint.connectionID,
@@ -194,16 +384,20 @@ import XCTest
         }
 
         private static func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
+            let manager = context.window.workspaceManager
             let workspace = try XCTUnwrap(
-                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+                manager.workspaces.first { $0.id == context.workspaceID }
             )
-            await context.window.workspaceManager.switchWorkspace(
+            await manager.switchWorkspace(
                 to: workspace,
                 saveState: false,
                 reason: "MCPReadAutoSelectionRecoveryIntegrationTests"
             )
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            let activeWorkspace = try XCTUnwrap(manager.activeWorkspace)
+            XCTAssertEqual(activeWorkspace.id, context.workspaceID)
             context.window.promptManager.loadComposeTabsFromWorkspace(
-                workspace,
+                activeWorkspace,
                 syncPromptText: true
             )
         }

@@ -633,6 +633,133 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty)
     }
 
+    func testConfiguredSaveAcknowledgesOnlyItsCurrentStoragePlacement() async throws {
+        for changesPlacement in [false, true] {
+            let fixture = try await makeFixture()
+            let gate = TestReleaseFence(name: "configured payload before storage placement change")
+            let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").resolvingSymlinksInPath().standardizedFileURL
+            var captured: AgentSessionCreationHandle?
+            fixture.vm.test_afterFreshForegroundSessionCreation = { captured = $0 }
+            await fixture.writer.test_setBeforeSessionWriteHook { url in
+                guard url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path == sessionFolder.path else { return }
+                await gate.enterAndWait()
+            }
+            let creation = Task { @MainActor in await fixture.vm.createAndActivateSessionTab() }
+            registerGatedCreationCleanup(fixture, gate: gate, creation: creation)
+            guard await gate.waitUntilEntered() else { return }
+            let handle = try XCTUnwrap(captured)
+            let sessionID = try XCTUnwrap(handle.session.activeAgentSessionID)
+            let sourceRevision = handle.session.sourceItemsRevision
+            let saveGeneration = handle.session.saveRequestGeneration
+            let workspaceIndex = try XCTUnwrap(fixture.manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            let destinationRoot = changesPlacement
+                ? fixture.root.appendingPathComponent("relocated", isDirectory: true)
+                : fixture.root.appendingPathComponent(".", isDirectory: true)
+            fixture.manager.workspaces[workspaceIndex].name = "Renamed while saving"
+            fixture.manager.workspaces[workspaceIndex].customStoragePath = destinationRoot
+            XCTAssertTrue(fixture.vm.sessions[handle.session.tabID] === handle.session)
+            XCTAssertEqual(handle.session.currentRestorationBindingToken, handle.bindingToken)
+            XCTAssertEqual(handle.session.sourceItemsRevision, sourceRevision)
+            XCTAssertEqual(handle.session.saveRequestGeneration, saveGeneration)
+            fixture.vm.test_afterFreshForegroundSessionCreation = nil
+            await fixture.writer.test_setBeforeSessionWriteHook(nil)
+            gate.release()
+            let result = await creation.value
+
+            let originalURL = sessionFile(root: fixture.root, sessionID: sessionID)
+            let originalBytes = try Data(contentsOf: originalURL)
+            let payload = try JSONDecoder().decode(AgentSession.self, from: originalBytes)
+            XCTAssertEqual(payload.id, sessionID, "The original placement really committed a payload")
+            XCTAssertEqual(payload.composeTabID, handle.session.tabID)
+            if changesPlacement {
+                XCTAssertNil(result, "An old-root write cannot acknowledge the current storage placement")
+                XCTAssertTrue(handle.session.isDirty)
+                XCTAssertTrue(handle.session.qualifiedRestorationReadiness.isCreating)
+                XCTAssertFalse(handle.session.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertNotNil(handle.session.operationAdmissionFailureMessage)
+                let destinationURL = sessionFile(root: destinationRoot, sessionID: sessionID)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: destinationURL.path))
+                let retry = try XCTUnwrap(fixture.vm.captureSessionCreationRetry(for: handle.session))
+                let retried = await fixture.vm.retrySessionInitialSave(retry)
+                XCTAssertTrue(retried, "The same prepared configuration can be saved at its current placement")
+                XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes, "Do not delete or rewrite the already committed old-root file")
+                let currentPayload = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: destinationURL))
+                XCTAssertEqual(currentPayload.id, sessionID)
+                XCTAssertEqual(currentPayload.composeTabID, handle.session.tabID)
+            } else {
+                XCTAssertEqual(result, handle.session.tabID, "A rename and normalized path with the same placement must still acknowledge")
+            }
+            XCTAssertFalse(handle.session.isDirty)
+            XCTAssertEqual(handle.session.qualifiedRestorationReadiness, .authoritative(handle.bindingToken, .freshBindingDurablyCreated))
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
+    func testOrdinarySaveAtOldStoragePlacementLeavesCurrentSessionDirtyUntilResaved() async throws {
+        let fixture = try await makeFixture()
+        let created = await fixture.vm.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(created)
+        let session = try XCTUnwrap(fixture.vm.sessions[tabID])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let binding = try XCTUnwrap(session.currentRestorationBindingToken)
+        let localItem = AgentChatItem.user("Keep this local message at the current placement", sequenceIndex: 0)
+        session.appendItem(localItem)
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        let originalURL = sessionFile(root: fixture.root, sessionID: sessionID)
+        let destinationRoot = fixture.root.appendingPathComponent("relocated", isDirectory: true)
+        let destinationURL = sessionFile(root: destinationRoot, sessionID: sessionID)
+        let firstWrite = TestReleaseFence(name: "ordinary save at original storage placement")
+        let retryWrite = TestReleaseFence(name: "ordinary retry at current storage placement")
+        await fixture.writer.test_setBeforeSessionWriteHook { url in
+            if url.standardizedFileURL == originalURL.standardizedFileURL {
+                await firstWrite.enterAndWait()
+            } else if url.standardizedFileURL == destinationURL.standardizedFileURL {
+                // An automatic retry must not repair the state before the first result is asserted.
+                await retryWrite.enterAndWait()
+            }
+        }
+        let saving = Task { @MainActor in
+            await fixture.vm.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
+        }
+        addTeardownBlock { @MainActor in
+            await fixture.writer.test_setBeforeSessionWriteHook(nil)
+            firstWrite.release()
+            retryWrite.release()
+            _ = await saving.value
+            let scheduled = session.saveDebounceTask
+            scheduled?.cancel()
+            session.saveDebounceTask = nil
+            await scheduled?.value
+        }
+        guard await firstWrite.waitUntilEntered() else { return }
+        let workspaceIndex = try XCTUnwrap(fixture.manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+        fixture.manager.workspaces[workspaceIndex].customStoragePath = destinationRoot
+        XCTAssertEqual(session.currentRestorationBindingToken, binding)
+        firstWrite.release()
+        let result = await saving.value
+        guard case .failure = result else { return XCTFail("The completed old-root write must defer current-placement success") }
+        XCTAssertTrue(session.isDirty)
+        XCTAssertEqual(session.items.map(\.id), [localItem.id])
+        XCTAssertEqual(try readPayload(fixture, sessionID: sessionID).toLiveItems().map(\.id), [localItem.id])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationURL.path))
+
+        await fixture.writer.test_setBeforeSessionWriteHook(nil)
+        let scheduled = session.saveDebounceTask
+        scheduled?.cancel()
+        session.saveDebounceTask = nil
+        retryWrite.release()
+        await scheduled?.value
+        let retried = await fixture.vm.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
+        guard case .success = retried else { return XCTFail("The current placement must remain saveable: \(retried)") }
+        XCTAssertFalse(session.isDirty)
+        XCTAssertEqual(session.currentRestorationBindingToken, binding)
+        let currentPayload = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: destinationURL))
+        XCTAssertEqual(currentPayload.toLiveItems().map(\.id), [localItem.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
     func testConfigurationMutationDuringWriterAwaitCannotAcknowledgeOrReplacePreparedPayload() async throws {
         guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else {
             return XCTFail("This regression requires persistence enabled")

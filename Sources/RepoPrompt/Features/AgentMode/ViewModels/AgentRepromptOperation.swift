@@ -161,6 +161,7 @@ final class AgentRepromptOperation {
     private func receive(_ body: String, callRevision: UInt64) throws {
         guard !Task.isCancelled, !isClosed, self.callRevision == callRevision,
               phase == .generating || phase == .refining, validate() else { throw CancellationError() }
+        guard !body.isEmpty, body != lastGeneratedText else { return }
         pendingBody = body
         lastGeneratedText = body
         guard publicationTask == nil else { return }
@@ -184,17 +185,35 @@ final class AgentRepromptOperation {
         store.draftUpdate = .init(operationID: id, tabID: sourceTabID, revision: publicationRevision, text: text)
     }
 
+    /// Native editing takes ownership before a keystroke or marked text can race another chunk.
+    /// Keep the visible draft in place; its synchronous editor echo records the new generation.
+    @discardableResult
+    func beginUserEditing() -> Bool {
+        guard !isClosed else { return false }
+        hasUserEdits = true
+        guard validate() else { return false }
+        callRevision &+= 1
+        task?.cancel()
+        task = nil
+        publicationTask?.cancel()
+        publicationTask = nil
+        pendingBody = nil
+        autoSendConsumed = true
+        if store.pendingQuestions != nil { store.pendingQuestions = nil }
+        if store.autoSendRequest != nil { store.autoSendRequest = nil }
+        if store.presentation?.error != nil { store.presentation?.error = nil }
+        if phase != .completed { setPhase(.completed) }
+        onEdit?()
+        return true
+    }
+
     func noteUserMutation(text: String, generation: UInt64) {
-        guard !isClosed, !isPublishing else { return }
-        if phase == .completed {
-            store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
-            hasUserEdits = text != lastGeneratedText
-            expectedDraft = text
-            expectedDraftGeneration = generation
-            onEdit?()
-        } else if text != expectedDraft || generation != expectedDraftGeneration {
-            invalidate(reason: "The draft changed during preparation.")
-        }
+        guard !isClosed, !isPublishing,
+              text != expectedDraft || generation != expectedDraftGeneration else { return }
+        expectedDraft = text
+        expectedDraftGeneration = generation
+        store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
+        _ = beginUserEditing()
     }
 
     func updateDraft(questionID: String, draft: AgentAskUserDraft) {
@@ -240,7 +259,7 @@ final class AgentRepromptOperation {
     func consumeAutoSend(_ request: AgentRepromptUIStore.AutoSendRequest) -> Bool {
         guard request.operationID == id, request.tabID == sourceTabID, !autoSendConsumed else { return false }
         autoSendConsumed = true
-        return mode == .sendAutomatically && !hadQuestions && !usedOriginal && !Self.startsWithProviderCommand(expectedDraft) && phase == .completed
+        return mode == .sendAutomatically && !hadQuestions && !usedOriginal && !hasUserEdits && !Self.startsWithProviderCommand(expectedDraft) && phase == .completed
             && request.operationID == id && request.tabID == sourceTabID
             && request.text == expectedDraft && request.text == lastGeneratedText
             && request.generation == expectedDraftGeneration && validate()
@@ -257,6 +276,26 @@ final class AgentRepromptOperation {
         if mode == .sendAutomatically, !hadQuestions, !Self.startsWithProviderCommand(expectedDraft), !isClosed {
             store.autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
         }
+    }
+
+    /// Explicit keyboard override: freeze exactly what is visible, without another model call.
+    /// Cancel and revision-fence streaming before the fresh composer claim can be acquired.
+    func useCurrentDraft(_ text: String) {
+        // A reviewed draft already owns its exact generation and speculative routing work.
+        // Sending it is not an edit, nor an explicit choice to send the original.
+        guard validate(), phase != .completed else { return }
+        callRevision &+= 1
+        task?.cancel()
+        task = nil
+        publicationTask?.cancel()
+        publicationTask = nil
+        pendingBody = nil
+        store.pendingQuestions = nil
+        store.autoSendRequest = nil
+        usedOriginal = text == rawDraft
+        install(text)
+        setPhase(.completed)
+        onEdit?()
     }
 
     func useOriginal() {
@@ -301,6 +340,7 @@ final class AgentRepromptOperation {
         validationTask?.cancel()
         validationTask = nil
         if restoreOriginal, candidate == expectedDraft { install(rawDraft) }
+        if recover { store.rememberCancelledDraft(tabID: sourceTabID, text: currentDraft()) }
         task = nil
         observations.removeAll()
         store.pendingQuestions = nil
