@@ -198,11 +198,16 @@ package actor DomainStandaloneScopeCoordinator {
         let requestedRoots = Set(state.workingDirectories.map {
             $0.standardizedFileURL.resolvingSymlinksInPath().path
         })
-        let matches = catalog.workspaces.compactMap { workspace -> DomainContextIdentity? in
-            let workspaceRoots = Set(workspace.document.metadata.repoPaths.map {
+        let exactMatches = catalog.workspaces.filter { workspace in
+            requestedRoots == Set(workspace.document.metadata.repoPaths.map {
                 URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
             })
-            guard requestedRoots == workspaceRoots else { return nil }
+        }
+        let candidates = Self.deferringRetiredDuplicates(exactMatches)
+        // Deferral may resolve the set only to one workspace, as `working_dirs` requires; it never feeds the
+        // context fallback below with a set that was still ambiguous.
+        guard candidates.count == exactMatches.count || candidates.count == 1 else { return }
+        let matches = candidates.compactMap { workspace -> DomainContextIdentity? in
             if let activeContextID = workspace.document.metadata.activeContextID,
                workspace.contexts.contains(where: { $0.metadata.identity.contextID == activeContextID })
             {
@@ -220,6 +225,21 @@ package actor DomainStandaloneScopeCoordinator {
             binding: .context(context, explicit: false),
             operationID: UUID()
         )
+    }
+
+    /// Shared by initial binding and headless `working_dirs`: drops an exact-root match retired by duplicate cleanup
+    /// (`consolidatedIntoWorkspaceID`) while its canonical is itself a non-retired match. Every other match, visible
+    /// or hidden, is kept, so genuine duplicates stay ambiguous.
+    package static func deferringRetiredDuplicates(
+        _ exactRootMatches: [DomainWorkspaceSnapshot]
+    ) -> [DomainWorkspaceSnapshot] {
+        let canonicalIDs = Set(exactRootMatches
+            .filter { $0.document.metadata.consolidatedIntoWorkspaceID == nil }
+            .map(\.document.workspaceID))
+        return exactRootMatches.filter { workspace in
+            guard let canonicalID = workspace.document.metadata.consolidatedIntoWorkspaceID else { return true }
+            return !canonicalIDs.contains(canonicalID)
+        }
     }
 
     private static func validateWorkingDirectories(_ directories: [URL]) throws -> [URL] {

@@ -659,7 +659,7 @@ actor MCPCommandRunner {
             bind_context op=bind context_id=<uuid>
                                           Bind to a specific compose tab (sticky)
             bind_context op=bind window_id=<id>
-                                          Set window affinity (follows whichever tab is active)
+                                          Bind that window's active tab (sticky; later tab switches don't move it)
             bind_context op=bind working_dirs="/path/to/project"
                                           Bind by matching working directory to a tab
             bind_context op=bind working_dirs="..." create_if_missing=true
@@ -710,7 +710,8 @@ actor MCPCommandRunner {
               (mode, result, winner_session_id, pending_session_ids).
             Multi-poll returns poll metadata plus a snapshots array.
             Responses include failure_reason on failed/cancelled runs
-              (process_crash, timeout, agent_error, resume_history_too_large, cancelled).
+              (process_crash, timeout, agent_error, resume_timed_out,
+              resume_history_too_large, cancelled).
             MCP-started orchestrate runs can dispatch sub-agents;
               sub-agents cannot recursively start additional agent runs.
 
@@ -861,14 +862,14 @@ actor MCPCommandRunner {
         Multiple RepoPrompt windows are open. Bind or disambiguate explicitly.
 
         rpce-cli -e 'windows'                         Discover windows and context_id values
-        rpce-cli -w <id> -e 'context'                 Bind a window for this invocation
+        rpce-cli -w <id> -e 'context'                 Bind the window's active tab for this invocation
         rpce-cli --context-id <uuid> -e 'context'     Bind a specific compose context
         rpce-cli -w <id> -t <tab-or-uuid> -e 'context' Resolve/bind a tab in one step
 
         AI agents SHOULD:
           1. Run 'windows' to discover available windows and context_id values
-          2. Prefer --context-id when targeting a specific compose context
-          3. Pass -w <id> when working at window scope only
+          2. Prefer --context-id whenever the exact tab matters (e.g. other sessions share the window)
+          3. Use -w <id> alone only when that window's active tab is the tab you want
 
         """
     }

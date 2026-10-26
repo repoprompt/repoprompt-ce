@@ -118,7 +118,25 @@ jobs:
           if-no-files-found: warn
 
       - name: Gate compiler index ratchets on the built sources
+        id: compiler_index_gate
         run: python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json
+
+      - name: Capture failed compiler index graph
+        if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
+        run: |
+          mkdir -p .build/modularization
+          python3 Scripts/modularization_index_graph.py dump --output .build/modularization/index-failure-graph.json
+
+      - name: Retain failed compiler index diagnostics
+        if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-index-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/modularization/index-failure-graph.json
+            .build/modularization/app-source-sha256.json
+          if-no-files-found: error
+          retention-days: 3
 
       # All executor-parity module checks gate PRs before merge, on the same warm VM.
       - name: Run all app-free module parity tests

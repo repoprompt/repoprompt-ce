@@ -191,6 +191,8 @@ actor GitService {
     }
 
     private enum GitProcessRepositoryBinding {
+        /// Deliberate app discovery only; MCP root grants use scoped layout resolution.
+        case discovery
         case inferred
         case exactObjectRead(GitRepositoryLayout)
         case exactWorktree(GitRepositoryLayout)
@@ -660,7 +662,8 @@ actor GitService {
     func findGitRoot(from path: URL) async throws -> URL? {
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--show-toplevel"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
 
         guard exitCode == 0 else {
@@ -689,7 +692,8 @@ actor GitService {
         }
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--is-bare-repository"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
         guard exitCode == 0 else {
             // `rev-parse` has no repository context to inspect when this structured probe
@@ -7666,16 +7670,31 @@ actor GitService {
             environment["GIT_OPTIONAL_LOCKS"] = "0"
         }
 
+        var readBinding: GitReadRepositoryBinding?
         switch repositoryBinding {
+        case .discovery:
+            // Native discovery retains Git's ownership checks and may search parents.
+            // Never use it to authorize an MCP data read or reuse ambient selectors.
+            environment.merge(env) { _, new in new }
+            environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
         case .inferred:
-            // For gitfile worktrees, inject GIT_DIR and GIT_WORK_TREE to ensure
-            // git commands operate in the correct context.
-            // Skip for commands that don't need repo context (e.g., --no-index diffs).
-            if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+            if requiresRepoContext, Self.isVerifiedReadOnlyGitOperation(args) {
+                guard let layout = getLayout(for: repoURL) else {
+                    return (Data(), Data("Repository metadata is missing at the requested Git read root.".utf8), 128)
+                }
+                readBinding = try GitReadRepositoryBinding(layout: layout)
+                environment.merge(env) { _, new in new }
+                environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
                 environment["GIT_DIR"] = layout.gitDir.path
                 environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+            } else {
+                // Preserve the existing explicit binding for gitfile mutations.
+                if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+                    environment["GIT_DIR"] = layout.gitDir.path
+                    environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+                }
+                environment.merge(env) { _, new in new }
             }
-            environment.merge(env) { _, new in new }
         case let .exactObjectRead(layout):
             environment.merge(env) { _, new in new }
             environment = Self.capabilityBoundObjectReadEnvironment(
@@ -7692,7 +7711,7 @@ actor GitService {
 
         let budgetURL = budgetRepoURL ?? repoURL
         let repositoryKey = switch repositoryBinding {
-        case .inferred:
+        case .discovery, .inferred:
             getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
                 ?? budgetURL.standardizedFileURL.path
         case let .exactObjectRead(layout):
@@ -7707,18 +7726,43 @@ actor GitService {
         )
         do {
             try Task.checkCancellation()
+            if let readBinding {
+                // Explicit GIT_DIR skips Git's native ownership check. Probe the
+                // exact checkout first, without ambient repository selectors, then
+                // keep the captured metadata binding for the actual data command.
+                let probe = try await runAdmittedGitData(
+                    readBinding.ownershipProbeArguments,
+                    at: readBinding.layout.workTreeRoot,
+                    environment: readBinding.ownershipProbeEnvironment(environment),
+                    stdin: nil,
+                    diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
+                    processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                    stdoutByteLimit: 4096,
+                    stderrByteLimit: stderrByteLimit,
+                    admissionPriority: admissionPriority,
+                    commandFamily: .repositoryRead,
+                    commandTimeout: commandTimeout,
+                    readBinding: readBinding
+                )
+                if probe.2 != 0 {
+                    throw GitError(message: GitReadSafety.ownershipProbeFailure(exitCode: probe.2, stderr: probe.1))
+                }
+                try readBinding.validateOwnershipProbe(String(decoding: probe.0, as: UTF8.self))
+                try Task.checkCancellation()
+            }
             let result = try await runAdmittedGitData(
                 args,
                 at: repoURL,
                 environment: environment,
                 stdin: stdin,
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
-                processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                processQueueWaitMicroseconds: readBinding.map { _ in 0 } ?? lease.queueWaitMicroseconds,
                 stdoutByteLimit: stdoutByteLimit,
                 stderrByteLimit: stderrByteLimit,
                 admissionPriority: admissionPriority,
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
-                commandTimeout: commandTimeout
+                commandTimeout: commandTimeout,
+                readBinding: readBinding
             )
             await processAdmissionController.release(lease)
             return result
@@ -8225,7 +8269,8 @@ actor GitService {
         stderrByteLimit: Int?,
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily,
-        commandTimeout: Duration
+        commandTimeout: Duration,
+        readBinding: GitReadRepositoryBinding? = nil
     ) async throws -> (Data, Data, Int32) {
         let (args, environment) = try await preparePassiveGitRead(
             args, at: repoURL, environment: environment,
@@ -8309,6 +8354,7 @@ actor GitService {
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
                     try physicalMutationGuard?.revalidate()
+                    try readBinding?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority

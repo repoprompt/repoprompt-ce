@@ -5866,13 +5866,33 @@ final class AgentSessionLinkRuntimeBridge {
     /// Final fence for one management operation: the lease re-validated inside the authority (exact
     /// generation, both endpoints, and the `.manage` capability still on the grant), then deletion
     /// state and both live endpoints' eligibility.
-    private func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
-        guard !isFrozenForTermination,
-              lease.capability == .manage,
-              await authority.validate(lease: lease) == nil,
-              !isFrozenForTermination,
-              let host
-        else { return false }
+    /// Worktree mutations retain this exact lease through provider/root preparation suspensions.
+    func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
+        guard await authority.validate(lease: lease) == nil else { return false }
+        return managementLeaseEndpointsAreStillAuthorized(lease)
+    }
+
+    func managementCommitAuthorization(for lease: DomainAgentSessionLinkLease) async -> DomainAgentSessionLinkCommitAuthorization? {
+        guard lease.capability == .manage else { return nil }
+        return await authority.commitAuthorization(for: lease)
+    }
+
+    /// No suspension is permitted between live endpoint validation and the authority-fenced body.
+    func withManagementCommitAuthorization(
+        _ authorization: DomainAgentSessionLinkCommitAuthorization,
+        commit: @MainActor () throws -> Void
+    ) throws {
+        // Reconcile the owner before reading its live elevation/consent inputs in the fence.
+        // Endpoint eligibility can itself consult the owner, so it also precedes that read.
+        delegationScopes.reconcileGlobalAutoApprove()
+        guard managementLeaseEndpointsAreStillAuthorized(authorization.lease) else {
+            throw DomainAgentSessionLinkError.endpointInvalidated
+        }
+        try authorization.withAuthorization(commit)
+    }
+
+    private func managementLeaseEndpointsAreStillAuthorized(_ lease: DomainAgentSessionLinkLease) -> Bool {
+        guard !isFrozenForTermination, lease.capability == .manage, let host else { return false }
         guard managementEndpointsAreEligible(
             observerEndpoint: lease.observer,
             targetEndpoint: lease.target,
@@ -6511,7 +6531,8 @@ final class AgentSessionLinkRuntimeBridge {
     func authorizeTarget(
         operation: DomainAgentSessionTargetOperation,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
+        targetSessionID: UUID,
+        allowLinkEstablishment: Bool = true
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
         // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
         delegationScopes.reconcileGlobalAutoApprove()
@@ -6535,6 +6556,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             lease = value
         case .failure(.noActiveLink):
+            guard allowLinkEstablishment else { return .failure(.denied) }
             // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
             guard let established = await establishFullAccessLink(
                 operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID

@@ -383,8 +383,8 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// a payload, not an identifier.
     public static let maximumIdentifierLength = 64
     /// Upper bound for the machine-stable reason/outcome tokens. Tokens are wire
-    /// identifiers and share the identifier budget; the longest token a producer
-    /// emits today is `repeatedResumeTimeout` (21 characters).
+    /// identifiers and share the identifier budget, including recovery reasons
+    /// retained from older app versions.
     public static let maximumTokenLength = maximumIdentifierLength
     /// Upper bound for diagnostics carried by a single turn summary. This is a
     /// malformed-payload guard, not a producer bound: a turn can emit multiple
@@ -400,6 +400,7 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     public static let freshThreadStartedOutcome = "freshThreadStarted"
     public static let resumeStoppedOutcome = "resumeStopped"
     public static let resumeFrameTooLargeReason = "resumeFrameTooLarge"
+    public static let resumeTimedOutReason = "resumeTimedOut"
 
     /// Identity of the originating recovery row. Compacted projections reuse it as the
     /// rebuilt row's ID so dedup and `up_to_item_id` cutoff handling stay stable.

@@ -394,6 +394,185 @@ import XCTest
             try await assertGitModePublicationDuringAdmissionSave(changesMode: true)
         }
 
+        func testAgentAdmissionRetryPersistsPendingUIEditBeforeItsDeferredPublication() async throws {
+            try await assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: false)
+        }
+
+        func testAgentAdmissionRetryDoesNotRejectDeferredPublicationOfTheSameUIEdit() async throws {
+            try await assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: true)
+        }
+
+        private func assertAdmissionRetryCapturesPendingUIEdit(publishDeferredSnapshot: Bool) async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let foregroundID = try XCTUnwrap(manager.activeWorkspace?.activeComposeTabID)
+            let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0)
+                let storedBefore = manager.workspace(withID: workspaceID)
+                if preparations == 1 {
+                    // The real UI action marks the workspace dirty synchronously; its model
+                    // snapshot is published separately. No stored bytes have changed yet.
+                    let versionBefore = manager.debugStateVersionForWorkspace(workspaceID)
+                    prompt.setActiveFilesTab(nextView, source: .user)
+                    XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(workspaceID), versionBefore)
+                    XCTAssertEqual(manager.workspace(withID: workspaceID), storedBefore)
+                } else if publishDeferredSnapshot {
+                    // A correct recapture already included this edit. Its deferred publication
+                    // must be a no-op, rather than spending the retry on the same change twice.
+                    manager.publishActiveComposeTabSnapshot(commitToMemory: true)
+                    XCTAssertEqual(manager.workspace(withID: workspaceID), storedBefore)
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(
+                window: fixture.window,
+                recorder: recorder,
+                validateBeforeProviderDispatch: { _ in
+                    XCTAssertFalse(
+                        manager.debugHasUnsavedWorkingPublication(fixture.workspaceID),
+                        "The successful retry must acknowledge the recaptured publication generation"
+                    )
+                }
+            ).execute(args: [
+                "op": .string("start"), "message": .string("capture the pending foreground edit"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let providerCount = await recorder.count()
+            XCTAssertEqual(providerCount, 1)
+            XCTAssertEqual(preparations, 2, "One actual UI edit requires only the existing one retry")
+            let canonicalValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let canonical = try XCTUnwrap(canonicalValue)
+            let canonicalWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: canonical.document.documentBytes)
+            let savedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            for workspace in [canonicalWorkspace, savedWorkspace] {
+                XCTAssertEqual(workspace.composeTabs.first { $0.id == foregroundID }?.activeSubView, nextView)
+            }
+            XCTAssertNil(canonical.revisions.dirtyRevision)
+            XCTAssertFalse(manager.debugHasUnsavedWorkingPublication(fixture.workspaceID))
+        }
+
+        func testSecondPendingUIEditStillExhaustsTheExistingSaveRetryBudget() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0)
+                let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+                prompt.setActiveFilesTab(nextView, source: .user)
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: fixture.workspaceID,
+                source: WorkspaceSaveSource("agentSessionLifecycleUIRecaptureTest")
+            )
+            XCTAssertEqual(
+                outcome,
+                .rejected(reason: "workspace_save_failed", category: .localSavePreparationRetryExhausted)
+            )
+            XCTAssertEqual(preparations, 2)
+        }
+
+        func testDirectModelSaveRetryDoesNotImportAnUnpublishedUIEdit() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let proposal = try XCTUnwrap(manager.activeWorkspace)
+            let foregroundID = try XCTUnwrap(proposal.activeComposeTabID)
+            let proposedView = proposal.composeTabs.first { $0.id == foregroundID }?.activeSubView
+            let nextView: FilesTab = proposedView == .selected ? .context : .selected
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                guard preparations == 1 else { return }
+                prompt.setActiveFilesTab(nextView, source: .user)
+                // Join the action's dirty-badge callback before the one retry begins.
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            _ = try await manager.saveWorkspaceToFileAsync(proposal, source: .directUnknown)
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+                at: fixture.workspaceFileURL,
+                scheduleNormalizationWriteback: false
+            )
+            XCTAssertEqual(preparations, 2)
+            XCTAssertEqual(saved.composeTabs.first { $0.id == foregroundID }?.activeSubView, proposedView)
+            XCTAssertEqual(prompt.storedActiveSubView, nextView)
+        }
+
+        func testSaveRetryCannotAcknowledgePendingUIWhileItsSnapshotIsSuspended() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            try await settleForegroundForSaveCapture(fixture)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let foregroundID = try XCTUnwrap(manager.activeWorkspace?.activeComposeTabID)
+            let nextView: FilesTab = prompt.storedActiveSubView == .selected ? .context : .selected
+            let canonicalBefore = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            var preparations = 0
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                guard workspaceID == fixture.workspaceID else { return }
+                preparations += 1
+                manager.setSnapshotsSuspended(true, forTabID: foregroundID)
+                prompt.setActiveFilesTab(nextView, source: .user)
+            }
+            defer {
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                manager.setSnapshotsSuspended(false, forTabID: foregroundID)
+            }
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: fixture.workspaceID,
+                source: WorkspaceSaveSource("agentSessionLifecycleSuspendedUIRecaptureTest")
+            )
+            XCTAssertEqual(outcome, .rejected(reason: "workspace_save_failed", category: .workspaceChanged))
+            XCTAssertEqual(preparations, 1, "A suspended capture must not prepare stale bytes as its retry")
+            let canonicalAfter = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            XCTAssertEqual(canonicalAfter?.document.contentDigest, canonicalBefore?.document.contentDigest)
+            XCTAssertEqual(canonicalAfter?.revisions, canonicalBefore?.revisions)
+            XCTAssertNotEqual(
+                manager.debugLastSavedVersionForWorkspace(fixture.workspaceID),
+                manager.debugStateVersionForWorkspace(fixture.workspaceID)
+            )
+            XCTAssertEqual(prompt.storedActiveSubView, nextView, "The refused capture must not reload over pending UI")
+        }
+
+        private func settleForegroundForSaveCapture(_ fixture: DurableAgentAdmissionFixture) async throws {
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            try prompt.loadComposeTabsFromWorkspace(XCTUnwrap(manager.activeWorkspace))
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            manager.publishActiveComposeTabSnapshot(commitToMemory: true)
+            try prompt.loadComposeTabsFromWorkspace(XCTUnwrap(manager.activeWorkspace))
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+
         private func assertGitModePublicationDuringAdmissionSave(
             changesMode: Bool,
             file: StaticString = #filePath,
@@ -2235,6 +2414,20 @@ import XCTest
     }
 
     @MainActor
+    private func completeDurableAdmissionWindowSetup(_ window: WindowState) async throws {
+        // Switching starts an owned Git-data root load after foreground restoration.
+        // Admission begins only once that setup and its badge publication have finished.
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+        // The reload schedules or coalesces the dirty-badge callback synchronously.
+        // FIFO ordering joins that specific callback before the fixture is returned.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    @MainActor
     private final class DistinctDurableAdmissionFixture {
         let first: DurableAdmissionWindow
         let second: DurableAdmissionWindow
@@ -2412,8 +2605,7 @@ import XCTest
                     switchResult.message ?? "distinct durable workspace did not become active"
                 )
             }
-            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            try await completeDurableAdmissionWindowSetup(window)
             _ = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
                 at: workspaceFileURL,
                 scheduleNormalizationWriteback: false
@@ -2525,8 +2717,7 @@ import XCTest
                         switchResult.message ?? "durable workspace did not become active"
                     )
                 }
-                let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-                window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+                try await completeDurableAdmissionWindowSetup(window)
                 let canonicalSnapshot = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                 let canonical = try XCTUnwrap(canonicalSnapshot)
                 guard canonical.health == .writable else {
@@ -2596,8 +2787,7 @@ import XCTest
                     switchResult.message ?? "peer durable workspace did not become active"
                 )
             }
-            let activeWorkspace = try XCTUnwrap(peer.workspaceManager.activeWorkspace)
-            peer.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            try await completeDurableAdmissionWindowSetup(peer)
             return peer
         }
 

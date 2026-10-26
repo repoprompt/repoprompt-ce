@@ -335,9 +335,12 @@ the user's card.
 - **Leases are re-checked after every suspension** before the next mutation; a revocation that
   lands mid-batch stops the remaining items (`scope_revoked`). An unlink re-checks the lease and
   both endpoints' membership right before the bridge's Stop. Worktree binds and unbinds re-check the
-  lease and the target's membership right before the binding transition and again at its
-  `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
-  and provider-context invalidation after that fence, before it publishes.
+  lease and the target's membership throughout the binding transition, after recovery handoff,
+  provider-context invalidation, and root installation. `manage_worktree` retains the exact Manage
+  link generation and endpoint incarnations, and synchronously fences retirement and binding
+  assignment against revocation. The fence covers only the authority mutation, not settings writes
+  or UI publication. A refusal keeps the old binding; before retirement it restores the original
+  handoff, and after retirement it retains the restart handoff with a visible recovery note.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
 ### Authorization ownership: Overseer full access versus restricted delegation

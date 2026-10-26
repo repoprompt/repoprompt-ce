@@ -708,7 +708,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         try Task.checkCancellation()
                         let selection = resultTab.selection
                         let reply = try await dependencies.execution.buildTabSelectionReply(
-                            selection,
+                            resultTab,
+                            resolvedIdentity.workspaceID,
                             false,
                             .relative,
                             .auto,
