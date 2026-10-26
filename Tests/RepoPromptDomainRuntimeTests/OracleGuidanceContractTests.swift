@@ -9,10 +9,10 @@ final class OracleGuidanceContractTests: XCTestCase {
             let manifest = (0 ..< count).map { index in
                 "- \(index == 0 ? "Oracle" : "Oracle \(index + 1)") — `model-\(index)` — Completed — chat ID `chat-\(index)`"
             }.joined(separator: "\n")
-            // Pre-change caller-facing bytes. This detects inadvertent framing or policy edits.
+            // Current caller-facing bytes, including the Agent Mode run-scope sentence. This detects inadvertent framing or policy edits.
             let expected = """
             **Reconciling these Oracle lanes**
-            \(count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane.
+            \(count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane. In Agent Mode, follow-ups and `oracle_chat_log` reads work only from the run that created these chats.
             - Read every lane through the end-of-group marker (`End of Oracle group: \(count) lanes above.`). If the marker or a lane is missing, page the export or try the read-only `oracle_chat_log` with that lane's chat ID. Logs may be scoped or clipped; report any remaining gap. Do not start a follow-up just to retrieve prior text.
             - Reconcile by evidence, not lane order, answer length, or model identity: check material single-lane and conflicting claims against the code, and report unresolved disagreements. A failed or partial lane is incomplete evidence.
             - Before synthesizing, inventory every material claim from every lane, including single-lane claims. Merge only exact duplicates, retaining all source lanes. Begin your answer with `**Oracle reconciliation**`, state how many lanes completed and name any that did not. For every inventory item, give its source lanes, checked evidence, and exactly one disposition: `accepted`, `rejected`, or `unresolved`. Never silently omit an item.

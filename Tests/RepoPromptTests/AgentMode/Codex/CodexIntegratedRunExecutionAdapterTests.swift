@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
+import Security
 import XCTest
 
 @MainActor
@@ -94,6 +95,142 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
     override func tearDown() {
         CodexComputerUseWorkflow.setEnabledForTesting(nil)
         super.tearDown()
+    }
+
+    func testRuntimeEligibilityDependsOnSignatureNotBuildModeOrProvenance() {
+        // Same decision for packaged release, local production, debug and external paths.
+        for path in ["/release/bin/codex", "/local-production/bin/codex", "/debug/bin/codex", "/local/codex"] {
+            let executable = URL(fileURLWithPath: path)
+            for trusted in [true, false] {
+                let message = CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: executable) { url, requirement in
+                    XCTAssertEqual(url, executable)
+                    XCTAssertEqual(requirement, "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\"")
+                    return trusted
+                }
+                XCTAssertEqual(message, trusted ? nil : CodexComputerUseWorkflow.runtimeRequirementMessage)
+            }
+        }
+        XCTAssertNotNil(CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: URL(fileURLWithPath: "/nonexistent/codex")))
+    }
+
+    func testAdmissionCoalescesAsyncChecksCachesSuccessAndRetriesOnlyExplicitly() async throws {
+        var loads = 0
+        var release: CheckedContinuation<String?, Never>?
+        let probe = CodexComputerUseWorkflow.RuntimeAdmissionPreflight(load: {
+            loads += 1
+            if loads == 1 { return "transient version-probe failure" }
+            return await withCheckedContinuation { continuation in
+                release = continuation
+            }
+        })
+        XCTAssertEqual(probe.cachedMessage, CodexComputerUseWorkflow.checkingRuntimeMessage)
+        let failure = await probe.check()
+        XCTAssertEqual(failure, "transient version-probe failure")
+        XCTAssertEqual(probe.cachedMessage, failure)
+        probe.startIfNeeded()
+        XCTAssertEqual(loads, 1, "UI reads must not retry failed probes")
+        let retry = Task { await probe.check() }
+        try await AsyncTestWait.waitUntil("runtime admission reaches suspended check", timeout: 3) { release != nil }
+        // MainActor remains responsive while the shared preflight is suspended.
+        XCTAssertEqual(probe.cachedMessage, failure)
+        var secondCallerEntered = false
+        let coalesced = Task {
+            secondCallerEntered = true
+            return await probe.check()
+        }
+        try await AsyncTestWait.waitUntil("second MainActor caller enters the shared check", timeout: 3) { secondCallerEntered }
+        XCTAssertEqual(loads, 2, "Both callers must share the still-suspended load")
+        release?.resume(returning: nil)
+        let retryMessage = await retry.value
+        let coalescedMessage = await coalesced.value
+        XCTAssertNil(retryMessage)
+        XCTAssertNil(coalescedMessage)
+        XCTAssertNil(probe.cachedMessage)
+        let cached = await probe.check()
+        XCTAssertNil(cached)
+        XCTAssertEqual(loads, 2, "Successful admission must not repeatedly resolve or hash the runtime")
+    }
+
+    func testPreflightUsesCapturedInterpreterEnvironmentAndChecksSignatureOffMain() async throws {
+        let bin = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bin) }
+        let node = bin.appendingPathComponent("node")
+        let codex = bin.appendingPathComponent("codex")
+        try "#!/bin/sh\necho 'codex-cli 0.159.0'\n".write(to: node, atomically: true, encoding: .utf8)
+        try "#!/usr/bin/env node\n".write(to: codex, atomically: true, encoding: .utf8)
+        for url in [node, codex] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let result = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            await CodexComputerUseWorkflow.preflightRuntimeRequirement(
+                inheritedEnvironment: ["HOME": bin.path, "PATH": "/usr/bin:/bin"],
+                shellEnvironmentProvider: { _, _ in
+                    CLIEnvironmentSnapshot(environment: ["HOME": bin.path, "PATH": bin.path], source: .capturedLoginShell)
+                },
+                launchSnapshot: .init(selection: .external(path: codex.path)),
+                signatureProbe: { url in
+                    XCTAssertFalse(Thread.isMainThread)
+                    XCTAssertEqual(url, codex.resolvingSymlinksInPath())
+                    return "signature-probe-reached"
+                }
+            )
+        }
+        XCTAssertEqual(result, "signature-probe-reached", "The version probe must find its interpreter through captured shell PATH")
+    }
+
+    func testOpenAISigningRequirementParses() {
+        var requirement: SecRequirement?
+        XCTAssertEqual(SecRequirementCreateWithString(CodexComputerUseWorkflow.openAISigningRequirement as CFString, [], &requirement), errSecSuccess)
+        XCTAssertNotNil(requirement)
+    }
+
+    func testCachedVendorExecutableSatisfiesRealSigningRequirementWhenOptedIn() async throws {
+        guard let cacheRoot = ProcessInfo.processInfo.environment["REPOPROMPT_CODEX_CACHE_ROOT"] else {
+            throw XCTSkip("Opt in by setting REPOPROMPT_CODEX_CACHE_ROOT to the cached .build/codex-runtime directory")
+        }
+        let target = try XCTUnwrap(CodexRuntimeAuthority.currentArchitectureTarget)
+        let executable = URL(fileURLWithPath: cacheRoot).appendingPathComponent(CodexRuntimeAuthority.bundledVersion.description).appendingPathComponent(target).appendingPathComponent("bin/codex")
+        guard FileManager.default.fileExists(atPath: executable.path) else {
+            throw XCTSkip("No cached vendor executable at \(executable.path); this test never downloads or runs Codex")
+        }
+        let message = await Task.detached(priority: .utility) {
+            CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: executable)
+        }.value
+        XCTAssertNil(message, "Cached official Codex must pass the production static-code validator")
+    }
+
+    func testRuntimeRequirementRejectsArmingEvenWithCompanionPresent() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        let (viewModel, session) = makeAdmissionFixture()
+        let message = CodexComputerUseWorkflow.runtimeRequirementMessage
+        var controllerCreated = false
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { _, _, _, _, _, _, _, _ in
+                controllerCreated = true
+                XCTFail("Rejected runtime must not launch")
+                return self.makeController(options: .agentModeDefault())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false,
+            computerUseRuntimeUnavailableMessage: { message },
+            computerUseCompanionReady: { true }, computerUseReservedEntryExists: { false },
+            codexHookApprovalSettings: GlobalSettingsStore.shared
+        )
+        coordinator.attach(viewModel: viewModel)
+        XCTAssertEqual(coordinator.nativeSlashCommandAvailabilityMessage(.computerUse, argumentsText: "", session: session), message)
+        let requestID = UUID()
+        session.codexComputerUseArmingRequestID = requestID
+        do {
+            try await coordinator.armCodexComputerUse(session: session, requestID: requestID)
+            XCTFail("Unverified Codex must be refused before arming")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, message)
+        }
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertNil(session.codexController)
+        XCTAssertFalse(controllerCreated)
     }
 
     func testDefaultsOptInAndDisable() throws {
@@ -205,6 +342,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
                     try FDWriteSupport.writeAll(frame, to: descriptor)
                     recorder.record(frame)
                 },
+                computerUseRuntimeUnavailableMessage: { _ in nil },
                 processEnvironmentBuilder: { _ in
                     ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
                 }, runtimeStatePreparer: { _ in },
@@ -300,6 +438,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
                     try FDWriteSupport.writeAll(frame, to: descriptor)
                     recorder.record(frame)
                 },
+                computerUseRuntimeUnavailableMessage: { _ in nil },
                 processEnvironmentBuilder: { _ in
                     ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
                 }, runtimeStatePreparer: { _ in },
@@ -510,6 +649,39 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         }
     }
 
+    func testArmedSpawnRejectsUnverifiedResolvedExecutableBeforeLaunching() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("mock-codex")
+        let marker = root.appendingPathComponent("spawned")
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex 0.159.0'; exit 0; fi\nprintf spawned > '\(marker.path)'\nexit 42\n"
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        let client = CodexAppServerClient(
+            computerUseRuntimeUnavailableMessage: { url in
+                XCTAssertEqual(url, executable)
+                return CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: url, signatureValidator: { _, _ in false })
+            },
+            processEnvironmentBuilder: { _ in
+                ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
+            },
+            runtimeStatePreparer: { _ in },
+            launchSnapshot: .init(selection: .external(path: executable.path)),
+            provisionsRepoPromptMCPOnStart: false
+        )
+        await client.updateProcessLaunchPolicy(featurePolicy: .resolved(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: true), modelReasoningSummary: nil)
+        do {
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
+            XCTFail("Unverified executable must not start an armed app-server")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, CodexComputerUseWorkflow.runtimeRequirementMessage)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        await client.stop()
+    }
+
     func testOrdinaryProcessLaunchDoesNotRereadOwnedComputerUseConfiguration() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("off-start-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -528,6 +700,9 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
         let client = CodexAppServerClient(
             processSpawnPreparation: { try Data([0xFF]).write(to: configURL) },
+            computerUseRuntimeUnavailableMessage: { _ in XCTFail("Unarmed starts must not probe Computer Use signatures")
+                return nil
+            },
             processEnvironmentBuilder: { _ in
                 ProcessEnvironmentResult(environment: environment, launchContext: .detect(from: environment), shellEnvironmentSource: .capturedLoginShell)
             },
@@ -632,7 +807,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
     }
 
     private func makeCoordinator(ready: Bool = true, collision: Bool = false) -> CodexAgentModeCoordinator {
-        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
+        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
     }
 }
 

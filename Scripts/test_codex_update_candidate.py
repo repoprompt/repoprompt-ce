@@ -24,7 +24,7 @@ import test_codex_runtime_artifact as artifact_fixtures
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "Scripts" / "codex_update_candidate.py"
 BASELINE = ROOT / "Vendor" / "Codex" / "manifest.json"
-VERSION = "0.160.0"
+VERSION = "0.165.0"
 TAG = f"rust-v{VERSION}"
 TARGETS = (
     ("aarch64-apple-darwin", "arm64"),
@@ -257,7 +257,7 @@ EOF
             "minimumExternalVersion",
             "License and NOTICE review",
             "Manual approval and soak",
-            "0.159.0",
+            "0.164.0",
             str(self.lipo),
             str(self.codesign),
         ):
@@ -418,7 +418,7 @@ EOF
 
         not_newer = self._run(
             self.temp / "not-newer",
-            selector=("--version", "0.159.0"),
+            selector=("--version", "0.164.0"),
             expected=1,
         )
         self.assertIn("must be newer", not_newer.stderr)

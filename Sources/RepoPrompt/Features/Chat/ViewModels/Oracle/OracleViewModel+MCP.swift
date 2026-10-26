@@ -321,7 +321,9 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         ) else {
-            throw ChatToolError.invalidParams("Chat with ID '\(rawID)' belongs to a different Agent Mode owner")
+            throw ChatToolError.invalidParams(
+                Self.oracleOwnerRefusalMessage(chatID: rawID, session: session, agentModeSessionID: agentModeSessionID)
+            )
         }
         return session
     }
@@ -536,6 +538,34 @@ extension OracleViewModel {
             agentModeRunID: agentModeRunID,
             allowUnownedLegacy: false
         )
+    }
+
+    /// Text for a chat refused by ``sessionMatchesOracleOwnerForExplicitContinuation``. It changes
+    /// only the message: a chat stamped with the caller's own Agent session can differ only in its
+    /// run, so that case names the run limit and the next step. Every other mismatch keeps the
+    /// generic text and reveals nothing about another owner.
+    static func oracleOwnerRefusalMessage(
+        chatID: String,
+        session: ChatSession,
+        agentModeSessionID: UUID?
+    ) -> String {
+        guard let agentModeSessionID, session.agentModeSessionID == agentModeSessionID else {
+            return "Chat with ID '\(chatID)' belongs to a different Agent Mode owner"
+        }
+        return "Chat with ID '\(chatID)' belongs to this Agent session but not to its current run. "
+            + "Oracle chats can be continued or read only from the run that created them, and the run can change, "
+            + "for example after Stop, Clear chat, or an app relaunch. "
+            + "Start a new Oracle chat (new_chat: true) and restate the context you need."
+    }
+
+    /// `oracle_chat_log` text when the tab has no chat the caller may read without a `chat_id`.
+    static func oracleChatLogNoEligibleChatMessage(agentModeSessionID: UUID?, agentModeRunID: UUID?) -> String {
+        guard agentModeSessionID != nil || agentModeRunID != nil else {
+            return "No chats found in the current tab"
+        }
+        return "No Oracle chats from this Agent session's current run were found in the current tab. "
+            + "oracle_chat_log cannot read chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) "
+            + "or from another Agent session; start a new Oracle chat instead."
     }
 
     private static func oracleOwnerRank(
@@ -1149,7 +1179,13 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(normalizedChatID)' belongs to a different Agent Mode owner")
+                throw ChatToolError.invalidParams(
+                    Self.oracleOwnerRefusalMessage(
+                        chatID: normalizedChatID,
+                        session: found,
+                        agentModeSessionID: agentModeSessionID
+                    )
+                )
             }
             guard let loaded = await ensureSessionLoadedForBackground(found) else {
                 throw ChatToolError.internalError("Failed to load chat session '\(normalizedChatID)'")
@@ -1163,7 +1199,12 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             ) else {
-                throw ChatToolError.invalidParams("No chats found in the current tab")
+                throw ChatToolError.invalidParams(
+                    Self.oracleChatLogNoEligibleChatMessage(
+                        agentModeSessionID: agentModeSessionID,
+                        agentModeRunID: agentModeRunID
+                    )
+                )
             }
             guard let loaded = await ensureSessionLoadedForBackground(preferredSession) else {
                 throw ChatToolError.internalError("Failed to load the preferred chat for the current tab")

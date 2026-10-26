@@ -27,6 +27,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         _ plans: [[WedgeFakeCodexController.Response]],
         mcpServerEnabler: @escaping @MainActor @Sendable () async -> Bool = { true },
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
+        runtimeUnavailableMessage: @escaping () -> String? = { nil },
+        runtimePreflight: (() async -> String?)? = nil,
         companionReady: @escaping () -> Bool = { true },
         freshSession: Bool = false,
         shouldManageCodexTooling: Bool = true,
@@ -44,6 +46,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             },
             mcpServerEnabler: mcpServerEnabler,
             testCodexManagedAuthRecovery: authRecovery,
+            testCodexComputerUseRuntimeUnavailableMessage: runtimeUnavailableMessage,
+            testCodexComputerUseRuntimePreflight: runtimePreflight,
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
             testCodexLeaseRoutingTimeoutMs: 5000,
@@ -77,6 +81,54 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             session: session,
             factory: factory
         )
+    }
+
+    func testComposerRechecksEligibilityAfterSuspendedRuntimePreflight() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(false)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        var release: CheckedContinuation<String?, Never>?
+        let fixture = makeFixture([], runtimePreflight: {
+            await withCheckedContinuation { continuation in
+                release = continuation
+            }
+        }, freshSession: true)
+        var prompted = false
+        let arming = Task {
+            await fixture.viewModel.armComputerUseForLocalUser(session: fixture.session, confirmOptIn: {
+                prompted = true
+                return true
+            })
+        }
+        try await AsyncTestWait.waitUntil("composer runtime preflight reaches suspension", timeout: 3) { release != nil }
+        XCTAssertNotNil(fixture.session.codexComputerUseArmingRequestID)
+        fixture.session.parentSessionID = UUID()
+        release?.resume(returning: nil)
+        let message = await arming.value
+        XCTAssertEqual(message, CodexComputerUseWorkflow.ineligibleMessage)
+        XCTAssertFalse(prompted)
+        XCTAssertNil(fixture.session.codexComputerUseArmingRequestID)
+        XCTAssertNil(fixture.session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(fixture.factory.controllers.isEmpty)
+    }
+
+    func testRuntimeRejectionPrecedesComposerOptInAndSessionCreation() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(false)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([], runtimeUnavailableMessage: { CodexComputerUseWorkflow.runtimeRequirementMessage }, freshSession: true)
+        let session = fixture.session
+        let bindingBefore = session.persistentSessionBindingIdentity
+        var prompted = false
+        let result = await fixture.viewModel.armComputerUseForLocalUser(session: session, confirmOptIn: {
+            prompted = true
+            return true
+        })
+        XCTAssertEqual(result, CodexComputerUseWorkflow.runtimeRequirementMessage)
+        XCTAssertFalse(prompted)
+        XCTAssertFalse(CodexComputerUseWorkflow.isEnabled)
+        XCTAssertEqual(session.persistentSessionBindingIdentity, bindingBefore)
+        XCTAssertNil(session.codexComputerUseArmingRequestID)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(fixture.factory.controllers.isEmpty)
     }
 
     func testRequiredRepoPromptDiscoveryFailureIsVisibleAndTerminatesBeforeDispatch() async throws {
@@ -552,7 +604,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     func testLocalComputerUseComposerFirstSendArmsOnlyFreshDestinationAndStartsProvider() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-        let fixture = try makeSubmissionFixture()
+        let preflight = CodexComputerUseWorkflow.RuntimeAdmissionPreflight(load: { nil })
+        XCTAssertEqual(preflight.cachedMessage, CodexComputerUseWorkflow.checkingRuntimeMessage)
+        let fixture = try makeSubmissionFixture(runtimeUnavailableMessage: { preflight.cachedMessage }, runtimePreflight: { await preflight.check() })
         let vm = fixture.viewModel
         let source = fixture.session
         let destinationTabID = UUID()
@@ -745,8 +799,11 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         return sessionID
     }
 
-    private func makeSubmissionFixture() throws -> Fixture {
-        let fixture = makeFixture([[.success("submission-thread")]], freshSession: true, shouldManageCodexTooling: false)
+    private func makeSubmissionFixture(
+        runtimeUnavailableMessage: @escaping () -> String? = { nil },
+        runtimePreflight: (() async -> String?)? = nil
+    ) throws -> Fixture {
+        let fixture = makeFixture([[.success("submission-thread")]], runtimeUnavailableMessage: runtimeUnavailableMessage, runtimePreflight: runtimePreflight, freshSession: true, shouldManageCodexTooling: false)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let suiteName = "CodexResumeWedge.composer.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1112,7 +1169,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
             codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            shouldManageCodexTooling: false, computerUseCompanionReady: { true },
+            shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false },
             codexHookApprovalSettings: GlobalSettingsStore.shared
         )
@@ -1146,7 +1203,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 if routeChecks == 2 { await gate.enterAndWait() }
                 return routeOwned
             },
-            shouldManageCodexTooling: true, computerUseCompanionReady: { true },
+            shouldManageCodexTooling: true, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false }, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
         coordinator.attach(viewModel: fixture.viewModel)

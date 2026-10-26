@@ -1,5 +1,5 @@
 {
-  "codexVersion": "0.159.0",
+  "codexVersion": "0.164.0",
   "definitions": {
     "AppToolApproval": {
       "enum": [
@@ -11,6 +11,13 @@
       "type": "string"
     },
     "LegacyAppPathString": {
+      "type": "string"
+    },
+    "McpEmaTokenEndpointAuthMethod": {
+      "enum": [
+        "client_secret_basic",
+        "client_secret_post"
+      ],
       "type": "string"
     },
     "McpServerAuth": {
@@ -76,6 +83,13 @@
         },
         "client_secret": {
           "type": "string"
+        },
+        "token_endpoint_auth_method": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpEmaTokenEndpointAuthMethod"
+            }
+          ]
         }
       },
       "type": "object"
@@ -286,5 +300,5 @@
       ]
     }
   },
-  "source": "https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/core/config.schema.json"
+  "source": "https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/core/config.schema.json"
 }

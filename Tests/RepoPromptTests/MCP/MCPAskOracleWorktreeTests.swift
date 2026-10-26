@@ -208,6 +208,54 @@ import XCTest
                 )
             )
         }
+
+        func testOracleOwnerRefusalNamesTheRunLimitOnlyForTheCallersOwnAgentSession() {
+            let sessionID = UUID()
+            let runID = UUID()
+            let earlierRun = ChatSession(agentModeSessionID: sessionID, agentModeRunID: UUID())
+            let sessionOnlyStamp = ChatSession(agentModeSessionID: sessionID)
+            let otherSession = ChatSession(agentModeSessionID: UUID(), agentModeRunID: runID)
+            let generic = "Chat with ID 'c1' belongs to a different Agent Mode owner"
+
+            for chat in [earlierRun, sessionOnlyStamp] {
+                XCTAssertFalse(
+                    OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                        chat,
+                        agentModeSessionID: sessionID,
+                        agentModeRunID: runID
+                    )
+                )
+                let message = OracleViewModel.oracleOwnerRefusalMessage(
+                    chatID: "c1",
+                    session: chat,
+                    agentModeSessionID: sessionID
+                )
+                XCTAssertTrue(
+                    message.hasPrefix("Chat with ID 'c1' belongs to this Agent session but not to its current run."),
+                    message
+                )
+                XCTAssertTrue(message.contains("Start a new Oracle chat (new_chat: true)"), message)
+            }
+            XCTAssertEqual(
+                OracleViewModel.oracleOwnerRefusalMessage(chatID: "c1", session: otherSession, agentModeSessionID: sessionID),
+                generic
+            )
+            XCTAssertEqual(
+                OracleViewModel.oracleOwnerRefusalMessage(chatID: "c1", session: earlierRun, agentModeSessionID: nil),
+                generic
+            )
+
+            XCTAssertEqual(
+                OracleViewModel.oracleChatLogNoEligibleChatMessage(agentModeSessionID: nil, agentModeRunID: nil),
+                "No chats found in the current tab"
+            )
+            let scoped = OracleViewModel.oracleChatLogNoEligibleChatMessage(
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID
+            )
+            XCTAssertTrue(scoped.hasPrefix("No Oracle chats from this Agent session's current run"), scoped)
+            XCTAssertTrue(scoped.contains("oracle_chat_log cannot read chats from an earlier run"), scoped)
+        }
     }
 #endif
 

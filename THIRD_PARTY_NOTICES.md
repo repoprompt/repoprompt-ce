@@ -16,15 +16,12 @@ the downloaded asset checksum and provenance are recorded under
 
 ## OpenAI Codex
 
-RepoPrompt CE bundles the complete official OpenAI Codex 0.159.0 standalone
+RepoPrompt CE bundles the complete official OpenAI Codex 0.164.0 standalone
 package for the selected macOS architecture. Codex is licensed under the
 Apache License, Version 2.0. Its copied license and notice are included under
 [`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/), and the exact release
 archives, checksums, layouts, architectures, and upstream macOS signing
 identities are pinned in [`Vendor/Codex/manifest.json`](Vendor/Codex/manifest.json).
-The complete Codex package also contains Zsh 5.9 at
-`codex-resources/zsh/bin/zsh`; its upstream licence is copied as
-[`ThirdPartyLicenses/codex/ZSH-LICENCE`](ThirdPartyLicenses/codex/ZSH-LICENCE).
 Codex 0.156.0 adds a native voice runtime under `codex-resources/voice/` with
 separate GStreamer, GLib, Opus, PCRE2/SLJIT, libffi, proxy-libintl, and zlib
 components. Their exact packaged notice, source provenance, and licences are
