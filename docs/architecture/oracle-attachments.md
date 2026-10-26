@@ -29,49 +29,31 @@ no default values, so adding a kind breaks every row's initializer until each ro
 | OpenAI Responses | native | native document | inlined | refused | none enforced |
 | OpenAI Chat Completions | native | refused | inlined | refused | none enforced |
 | Custom OpenAI-compatible | native | refused | inlined | refused | none enforced |
-| Claude Code | native | refused | inlined | path mention | none enforced |
-| Codex | native | refused | inlined | path mention | none enforced |
-| ACP agent | native | refused | inlined | path mention | none enforced |
-| Grok Build | refused | refused | inlined | path mention | none enforced |
+| Claude Code | native | refused | inlined | refused | none enforced |
+| Codex | native | refused | inlined | refused | none enforced |
+| ACP agent | native | refused | inlined | refused | none enforced |
+| Grok Build | refused | refused | inlined | refused | none enforced |
 
-Every image, PDF and text cell is grounded in encoder code that exists. Widen one only after a live
-smoke proves delivery: Claude stream-json documents and ACP embedded resources are unproven. Text is
-inlined on every route because inlining needs no transport support.
-
-The Binary column is the one cell that is not about an encoder. The four routes that run on this
-machine (Claude Code, Codex, ACP, Grok Build) can open a file themselves, so a binary such as a zip is
-delivered as `.pathMention`: one inline text line naming the file, its size, and its absolute path,
-which rides the existing `.inlineText` delivery and needs no encoder support. The four network routes
-have no wire shape for arbitrary bytes and a local path means nothing to them, so a binary stays
-refused there, by name. The mention is deliberately not a fenced block, and the planner never reads
-the file's bytes for it. No zip is parsed, and `AttachmentClassifier` still sniffs a zip as `.binary`.
-
-## The path rule
-
-`OracleAttachment` used to be path-free. The rule is now narrower, not absent: it may carry an optional
-absolute `localPath`, set by the loader from the physical path it actually opened (the file the MCP
-`path` argument or the Agent Mode managed copy resolved to). The path exists so a local route can tell
-its agent where the file is. Bytes and paths are never persisted (the type is not `Codable`), the path
-is never displayed, and the path never reaches a network route: those routes refuse a binary before any
-text is built, and no other kind renders the path. A relative path is never accepted, and a path with
-a control character is dropped so it cannot break out of its one line. A binary with no usable path on
-a path-mention route is refused with its own reason (`binaryHasNoLocalPath`) rather than dropped.
+Every cell is grounded in encoder code that exists. Widen one only after a live smoke proves
+delivery. Binary is refused on every route, including the local ones: the Claude Code, Codex, ACP and
+Grok Build Oracle one-shots deliberately run without file tools (no Read/Bash, no shell, an empty
+MCP configuration), so naming a path would admit a file the model can never open. Claude stream-json
+documents and ACP embedded resources are unproven. Text is inlined on every route because inlining
+needs no transport support.
 
 ## Planning and refusal
 
 `AttachmentPlanner.plan` is pure: a set plus a route in, `[PlannedAttachment]` or
-`AttachmentAdmissionError` out. A single decision switch maps kind and capability to a delivery or a
-refusal reason. A request containing one file the route cannot carry is refused
+`AttachmentAdmissionError` out. A request containing one file the route cannot carry is refused
 whole, naming each failing file and the reason. Nothing is silently dropped, because a dropped
 attachment reads to the user as a model that ignored their file.
 
 ## Agent Mode is not an Oracle route
 
-The eight rows describe Oracle one-shot encoders: a request where bytes ride the wire, a mention names
-a local path, or the request is refused. Agent Mode is an interactive agent that can read files from disk. It sends native
+The eight rows describe Oracle one-shot encoders: a tool-less request where bytes ride the wire or the
+request is refused. Agent Mode is an interactive agent that can read files from disk. It sends native
 images where the transport advertises image input, and every other attachment reaches the agent as an
-`@path` reference (or a listed path) in the message text, so a zip reaches Claude Code, Codex, ACP and
-Grok Build sessions as a line containing its absolute path. Agent Mode never calls the planner, so its tiles make no
+`@path` reference in the message text. Agent Mode never calls the planner, so its tiles make no
 delivery claim and show no capability refusal. A refusal is real only where `AttachmentPlanner.plan`
 runs: Oracle sends and the one-shot providers.
 
@@ -85,10 +67,8 @@ main actor. Two attachments are the same file only when file name, size and cont
 `AttachmentPresentation.make` maps persisted facts (kind, file name, byte count, preview
 availability) to face, title, caption, badge, status, and accessibility label. One `AttachmentTile`
 renders it at both geometries, 76x52 in the Agent Mode strip and 48x48 in the Oracle transcript chip.
-No view branches on kind, extension, or MIME type. Badges and the type named in a tile's caption come from `UTType`, so a dropped `report.zip` reads as a
-ZIP archive and there is no hand-written extension list. The pre-send route warning is derived from the
-same capability row as the planner, so it appears for a binary on the network routes and not on the
-local ones. PDF previews are page 1 rendered to the same bounded JPEG as an image
+No view branches on kind, extension, or MIME type. Badges come from `UTType`, so there is no
+hand-written extension list. PDF previews are page 1 rendered to the same bounded JPEG as an image
 preview; a file that cannot be rendered yields no preview rather than a failure.
 
 ## Frozen formats

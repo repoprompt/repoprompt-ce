@@ -682,7 +682,6 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         case image
         case document
         case inlineText
-        case pathMention
     }
 
     private enum Reach {
@@ -790,52 +789,12 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         }
     }
 
-    func testNoNetworkRequestBodyContainsTheAbsolutePathItsAttachmentsCarry() throws {
-        let png = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "diagram.png", title: nil, localPath: Self.zipPath)
-        let csv = OracleAttachment(
-            payload: .text("a,b\n1,2\n", Data("a,b\n1,2\n".utf8)),
-            fileName: "data.csv",
-            title: nil,
-            localPath: Self.zipPath
-        )
-        let pdf = OracleAttachment(payload: .pdf(Self.pdfBytes()), fileName: "report.pdf", title: nil, localPath: Self.zipPath)
-
-        let bodies = try [
-            Self.json(AnthropicProvider.makeMessages(for: Self.message([png, csv, pdf]))),
-            Self.json(Self.message([png, csv]).openAIChatMessages(embedSystemPrompt: false)),
-            Self.json(Self.message([png, csv, pdf]).openAIResponsesInput())
-        ].map { try String(decoding: JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
-        for body in bodies {
-            XCTAssertTrue(body.contains("data.csv"), "the request must actually carry the attachments")
-            XCTAssertFalse(body.contains(Self.zipPath), body)
-        }
-    }
-
-    func testEveryNetworkRouteRefusesTheZipByNameWithoutEchoingItsPath() {
-        let zip = Self.zipAttachment()
-        let message = Self.message([zip])
-        let failures: [Error?] = [
-            Self.failure { _ = try AnthropicProvider.makeMessages(for: message) },
-            Self.failure { _ = try message.openAIChatMessages(embedSystemPrompt: false) },
-            Self.failure { _ = try message.openAIResponsesInput() }
-        ]
-        for failure in failures {
-            guard let error = failure as? AttachmentAdmissionError else {
-                XCTFail("expected an admission refusal, got \(String(describing: failure))")
-                continue
-            }
-            XCTAssertTrue(error.localizedDescription.contains("report.zip"), error.localizedDescription)
-            XCTAssertTrue(error.localizedDescription.contains("cannot carry a binary attachment"), error.localizedDescription)
-            XCTAssertFalse(error.localizedDescription.contains(Self.zipPath), error.localizedDescription)
-        }
-    }
-
     private static func promised(by row: AttachmentRouteCapability, kind: AttachmentKind) -> Emitted? {
         switch kind {
         case .image: row.image == .nativeImage ? .image : nil
         case .pdf: row.pdf == .nativeDocument ? .document : nil
         case .text: row.text == .inlineText ? .inlineText : nil
-        case .binary: row.binary == .pathMention ? .pathMention : nil
+        case .binary: nil
         }
     }
 
@@ -848,28 +807,8 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         case .text:
             OracleAttachment(payload: .text("a,b\n1,2\n", Data("a,b\n1,2\n".utf8)), fileName: "data.csv", title: nil)
         case .binary:
-            zipAttachment()
+            OracleAttachment(payload: .binary(Data([0, 1, 2, 3])), fileName: "blob.bin", title: nil)
         }
-    }
-
-    private static func failure(of body: () throws -> Void) -> Error? {
-        do { try body() } catch { return error }
-        return nil
-    }
-
-    private static let zipPath = "/Users/example/project/agent_attachments/report.zip"
-
-    private static func zipAttachment() -> OracleAttachment {
-        OracleAttachment(
-            payload: .binary(Data([0x50, 0x4B, 0x03, 0x04, 0, 0, 0, 0])),
-            fileName: "report.zip",
-            title: nil,
-            localPath: zipPath
-        )
-    }
-
-    private static func isPathMention(_ text: String) -> Bool {
-        text.contains("Attached file: report.zip") && text.contains(zipPath)
     }
 
     private static func pdfBytes(extra: Int = 0) -> Data {
@@ -925,7 +864,6 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
             default:
                 let text = (part["text"] as? String) ?? ""
                 if text.contains("Attached file: data.csv"), text.contains("a,b\n1,2") { emitted.insert(.inlineText) }
-                if isPathMention(text) { emitted.insert(.pathMention) }
             }
         }
         return emitted
@@ -948,7 +886,6 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
             emitted.insert(.image)
         }
         if isInlineBlock(turn.text) { emitted.insert(.inlineText) }
-        if isPathMention(turn.text) { emitted.insert(.pathMention) }
         return emitted
     }
 
@@ -993,10 +930,7 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         await provider.dispose()
 
         let seen = try String(contentsOf: root.appendingPathComponent("prompt-seen"), encoding: .utf8)
-        var emitted = Set<Emitted>()
-        if isInlineBlock(seen) { emitted.insert(.inlineText) }
-        if isPathMention(seen) { emitted.insert(.pathMention) }
-        return emitted
+        return isInlineBlock(seen) ? [.inlineText] : []
     }
 }
 

@@ -50,25 +50,9 @@ enum AttachmentTestFixtures {
         return data
     }
 
-    static let zipPath = "/Users/example/project/agent_attachments/report.zip"
-    static let zipBytes = Data([0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00])
-
-    static func attachment(
-        _ payload: AttachmentPayload,
-        fileName: String,
-        title: String? = nil,
-        localPath: String? = nil
-    ) -> OracleAttachment {
-        OracleAttachment(payload: payload, fileName: fileName, title: title, localPath: localPath)
+    static func attachment(_ payload: AttachmentPayload, fileName: String, title: String? = nil) -> OracleAttachment {
+        OracleAttachment(payload: payload, fileName: fileName, title: title)
     }
-
-    static func zipAttachment(title: String? = nil, localPath: String? = zipPath) -> OracleAttachment {
-        attachment(.binary(zipBytes), fileName: "report.zip", title: title, localPath: localPath)
-    }
-
-    /// The routes whose binary rung is a path mention, and the network routes that refuse binaries.
-    static let localRoutes: [AttachmentRoute] = [.claudeCodeStreamJSON, .codexAppServer, .acp, .grokBuild]
-    static let networkRoutes: [AttachmentRoute] = [.anthropicMessages, .openAIResponses, .openAIChat, .customOpenAI]
 
     static func textAttachment(_ text: String, fileName: String, title: String? = nil) -> OracleAttachment {
         attachment(.text(text, Data(text.utf8)), fileName: fileName, title: title)

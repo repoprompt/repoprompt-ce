@@ -11,7 +11,6 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
         case image
         case document
         case inlineText
-        case pathMention
     }
 
     private enum Reach {
@@ -56,43 +55,6 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
             }
         }
         XCTAssertEqual(exercised, 3 * AttachmentKind.allCases.count)
-    }
-
-    func testBinaryRungIsPathMentionOnExactlyTheFourLocalRoutes() {
-        XCTAssertEqual(Set(AttachmentTestFixtures.localRoutes + AttachmentTestFixtures.networkRoutes).count, AttachmentRoute.allCases.count)
-        for route in AttachmentTestFixtures.localRoutes {
-            XCTAssertEqual(AttachmentRouteCapability.capability(for: route).binary, .pathMention, "\(route)")
-        }
-        for route in AttachmentTestFixtures.networkRoutes {
-            XCTAssertEqual(AttachmentRouteCapability.capability(for: route).binary, .unsupported, "\(route)")
-        }
-    }
-
-    func testCustomOpenAIRequestNeverContainsAnAbsolutePathCarriedByItsAttachments() async throws {
-        let path = AttachmentTestFixtures.zipPath
-        let carried = [
-            AttachmentTestFixtures.attachment(.image(.png, Data([1, 2, 3])), fileName: "diagram.png", localPath: path),
-            AttachmentTestFixtures.attachment(.text("a,b\n1,2\n", Data("a,b\n1,2\n".utf8)), fileName: "data.csv", localPath: path)
-        ]
-        let message = AIMessage(
-            systemPrompt: "",
-            conversationMessages: [ConversationEntry(role: .user, content: "Question")],
-            attachments: carried,
-            temperature: nil,
-            promptSectionsOrder: [],
-            disabledPromptSections: []
-        )
-        let body = try String(decoding: JSONEncoder().encode(CustomOpenAIMessageBuilder.messages(for: message)), as: UTF8.self)
-        XCTAssertTrue(body.contains("data.csv"))
-        XCTAssertFalse(body.contains(path), body)
-
-        do {
-            _ = try await Self.customOpenAI([AttachmentTestFixtures.zipAttachment()] + carried)
-            XCTFail("Custom OpenAI must refuse the zip")
-        } catch let error as AttachmentAdmissionError {
-            XCTAssertTrue(error.localizedDescription.contains("report.zip"))
-            XCTAssertFalse(error.localizedDescription.contains(path))
-        }
     }
 
     func testMixedSetsDeliverWhatTheRowCarriesAndRefuseOnlyTheRest() async throws {
@@ -142,7 +104,7 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
         case .image: row.image == .nativeImage ? .image : nil
         case .pdf: row.pdf == .nativeDocument ? .document : nil
         case .text: row.text == .inlineText ? .inlineText : nil
-        case .binary: row.binary == .pathMention ? .pathMention : nil
+        case .binary: nil
         }
     }
 
@@ -159,16 +121,12 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
         case .text:
             AttachmentTestFixtures.textAttachment("a,b\n1,2\n", fileName: "data.csv")
         case .binary:
-            AttachmentTestFixtures.zipAttachment()
+            AttachmentTestFixtures.attachment(.binary(Data([0, 1, 2, 3])), fileName: "blob.bin")
         }
     }
 
     private static func isInlineBlock(_ text: String) -> Bool {
         text.contains("Attached file: data.csv") && text.contains("a,b\n1,2")
-    }
-
-    private static func isPathMention(_ text: String) -> Bool {
-        text.contains("Attached file: report.zip") && text.contains(AttachmentTestFixtures.zipPath)
     }
 
     private static func customOpenAI(_ attachments: [OracleAttachment]) async throws -> Set<Emitted> {
@@ -200,10 +158,7 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
 
     private static func grokBuild(_ attachments: [OracleAttachment]) async throws -> Set<Emitted> {
         let body = try AttachmentEncoding.textOnlyBody(for: attachments, route: .grokBuild, body: "Question")
-        var emitted = Set<Emitted>()
-        if isInlineBlock(body) { emitted.insert(.inlineText) }
-        if isPathMention(body) { emitted.insert(.pathMention) }
-        return emitted
+        return isInlineBlock(body) ? [.inlineText] : []
     }
 
     private static func emitted(fromParts parts: [[String: Any]]) -> Set<Emitted> {
@@ -213,9 +168,7 @@ final class AttachmentRouteEncoderMatrixTests: XCTestCase {
             case "image", "image_url": emitted.insert(.image)
             case "document", "file": emitted.insert(.document)
             default:
-                let text = (part["text"] as? String) ?? ""
-                if isInlineBlock(text) { emitted.insert(.inlineText) }
-                if isPathMention(text) { emitted.insert(.pathMention) }
+                if isInlineBlock((part["text"] as? String) ?? "") { emitted.insert(.inlineText) }
             }
         }
         return emitted

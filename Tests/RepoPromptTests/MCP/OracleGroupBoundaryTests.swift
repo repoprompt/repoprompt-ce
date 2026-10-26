@@ -917,11 +917,8 @@ final class OracleAttachmentContractTests: XCTestCase {
         XCTAssertTrue(description.contains("PDFs are sent as documents only where"))
         XCTAssertFalse(description.contains("PDFs are sent as documents."))
 
-        XCTAssertTrue(capabilities.contains { $0.binary == .pathMention })
-        XCTAssertTrue(capabilities.contains { $0.binary == .unsupported })
-        XCTAssertTrue(description.contains("where the model runs as a local agent it is given the file's absolute path"))
-        XCTAssertTrue(description.contains("every other transport refuses them"))
-        XCTAssertFalse(description.contains("Any other file kind is refused."))
+        XCTAssertTrue(capabilities.allSatisfy { $0.binary == .unsupported })
+        XCTAssertFalse(description.contains("other binary files"))
     }
 
     func testRawAttachmentsAtOracleDispatchAreAnInternalInvariantFailure() {

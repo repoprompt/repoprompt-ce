@@ -1484,25 +1484,6 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
         )
     }
 
-    func testZipAttachmentReachesEveryLocalAgentAsALineContainingItsAbsolutePath() {
-        let viewModel = makeViewModel()
-        let path = "/tmp/agent_attachments/9F2C.zip"
-        let zip = AgentFileAttachment(
-            source: .localFile(path: path),
-            title: "report.zip",
-            kind: .binary,
-            fileName: "report.zip",
-            byteCount: 8
-        )
-        for agent in [AgentProviderKind.claudeCode, .codexExec, .grokBuild, .devin, .openCode, .cursor] {
-            let rendered = viewModel.renderProviderMessage(text: "unzip it", attachments: [zip], agent: agent)
-            XCTAssertTrue(
-                rendered.split(separator: "\n").contains { $0.contains(path) },
-                "\(agent): \(rendered)"
-            )
-        }
-    }
-
     func testOracleAuthorizedAttachmentPathsAreSessionScopedManagedFiles() {
         let viewModel = makeViewModel()
         let tabID = UUID()

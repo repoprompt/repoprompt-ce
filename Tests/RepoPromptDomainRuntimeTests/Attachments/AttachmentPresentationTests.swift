@@ -1,6 +1,5 @@
 import Foundation
 import RepoPromptDomainRuntime
-import UniformTypeIdentifiers
 import XCTest
 
 final class AttachmentPresentationTests: XCTestCase {
@@ -56,30 +55,6 @@ final class AttachmentPresentationTests: XCTestCase {
         XCTAssertEqual(tile.badge, "ZIP")
     }
 
-    func testBinaryTileNamesItsTypeFromTheExtensionAndFallsBackWithoutOne() throws {
-        let zip = make(.binary, "report.zip", preview: .unavailable)
-        let description = try XCTUnwrap(UTType(filenameExtension: "zip")?.localizedDescription)
-        XCTAssertEqual(zip.caption?.hasPrefix(description), true, "\(String(describing: zip.caption))")
-        XCTAssertTrue(zip.accessibilityLabel.contains(description), zip.accessibilityLabel)
-
-        let anonymous = make(.binary, "LICENSE", preview: .unavailable)
-        XCTAssertEqual(anonymous.caption?.hasPrefix("File"), true, "\(String(describing: anonymous.caption))")
-        XCTAssertNil(anonymous.badge)
-    }
-
-    func testBinaryTileWarnsOnNetworkRoutesAndNotOnLocalOnes() {
-        for route in AttachmentTestFixtures.networkRoutes {
-            guard case let .refused(reason) = make(.binary, "report.zip", preview: .unavailable, route: route).status else {
-                XCTFail("\(route) must warn about a binary")
-                continue
-            }
-            XCTAssertTrue(reason.contains("cannot carry a binary attachment"), reason)
-        }
-        for route in AttachmentTestFixtures.localRoutes {
-            XCTAssertEqual(make(.binary, "report.zip", preview: .unavailable, route: route).status, .ready, "\(route)")
-        }
-    }
-
     func testRefusedFileCarriesTheRefusalReasonOnItsTile() throws {
         let tile = make(.pdf, "spec.pdf", preview: .available, route: .openAIChat)
         guard case let .refused(reason) = tile.status else { return XCTFail("expected refusal, got \(tile.status)") }
@@ -122,7 +97,7 @@ final class AttachmentPresentationTests: XCTestCase {
             (.image, AttachmentTestFixtures.attachment(.image(.png, Data([1])), fileName: "a.png")),
             (.pdf, AttachmentTestFixtures.attachment(.pdf(AttachmentTestFixtures.pdfBytes()), fileName: "a.pdf")),
             (.text, AttachmentTestFixtures.textAttachment("hello", fileName: "a.txt")),
-            (.binary, AttachmentTestFixtures.attachment(.binary(Data([0, 1])), fileName: "a.bin", localPath: "/tmp/a.bin"))
+            (.binary, AttachmentTestFixtures.attachment(.binary(Data([0, 1])), fileName: "a.bin"))
         ]
         for route in AttachmentRoute.allCases {
             for (kind, attachment) in samples {

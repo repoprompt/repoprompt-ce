@@ -19,7 +19,7 @@ package enum OracleAttachmentContract {
     private static let bytesPerMiB = 1_048_576
 
     package static func retiredArgumentMessage(toolName: String) -> String {
-        "\(toolName) no longer accepts `\(retiredArgumentName)`. Pass `\(argumentName): [{\(pathField), \(titleField)?}]` instead; it takes images, PDFs, text files, and other files."
+        "\(toolName) no longer accepts `\(retiredArgumentName)`. Pass `\(argumentName): [{\(pathField), \(titleField)?}]` instead; it takes images, PDFs, and text files."
     }
 
     package static func headlessUnsupportedMessage() -> String {
@@ -159,7 +159,7 @@ package enum OracleAttachmentContract {
         case .image: coverage { $0.image != .unsupported }
         case .pdf: coverage { $0.pdf != .unsupported }
         case .text: coverage { $0.text != .unsupported }
-        case .binary: coverage { $0.binary != .unsupported }
+        case .binary: coverage { _ in false }
         }
     }
 
@@ -169,7 +169,7 @@ package enum OracleAttachmentContract {
             case .image: "images (PNG, JPEG, GIF, WebP)"
             case .pdf: "PDFs"
             case .text: "UTF-8 text files"
-            case .binary: "other files such as archives"
+            case .binary: "other binary files"
             }
         }
         switch names.count {
@@ -190,8 +190,7 @@ package enum OracleAttachmentContract {
             case (.pdf, _): sentences.append("PDFs are sent as documents only where the model's transport accepts native documents.")
             case (.text, .every): sentences.append("Text files are inlined into the request.")
             case (.text, _): sentences.append("Text files are inlined into the request where the model's transport accepts inline text.")
-            case (.binary, .every): sentences.append("Other files are never sent as bytes: the agent is given the file's absolute path and size to open itself.")
-            case (.binary, _): sentences.append("Other files are never sent as bytes: where the model runs as a local agent it is given the file's absolute path and size to open itself, and every other transport refuses them.")
+            case (.binary, _): break
             }
         }
         if coverage(for: .binary) == .none {

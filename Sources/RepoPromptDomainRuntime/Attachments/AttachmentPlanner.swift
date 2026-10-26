@@ -20,7 +20,6 @@ package struct PlannedAttachment: Equatable {
 
 package enum AttachmentRefusalReason: Error, Equatable {
     case routeCannotCarry
-    case binaryHasNoLocalPath
     case textExceedsInlineLimit(byteCount: Int, limit: Int)
 }
 
@@ -39,9 +38,6 @@ package struct AttachmentRefusal: Equatable {
         switch reason {
         case .routeCannotCarry:
             "\(routeDisplayName) cannot carry \(Self.kindNoun(kind)) attachment. Remove it, or choose a model that can carry it."
-        case .binaryHasNoLocalPath:
-            "\(routeDisplayName) can only point its agent at a binary attachment by absolute path, and this one has none. "
-                + "Attach it from a file on disk."
         case let .textExceedsInlineLimit(byteCount, limit):
             "text file is \(Self.kibibytes(byteCount)) KiB, over the "
                 + "\(Self.kibibytes(limit)) KiB inline limit for \(routeDisplayName). "
@@ -151,14 +147,8 @@ package enum AttachmentPlanner {
                 fileName: attachment.fileName,
                 title: attachment.normalizedTitle
             )))
-        case let .binary(data):
-            guard let path = attachment.localPath else { return .failure(.binaryHasNoLocalPath) }
-            return .success(.inlineText(AttachmentInlineText.renderPathMention(
-                fileName: attachment.fileName,
-                title: attachment.normalizedTitle,
-                byteCount: data.count,
-                absolutePath: path
-            )))
+        case .binary:
+            return .failure(.routeCannotCarry)
         }
     }
 
@@ -191,7 +181,6 @@ package enum AttachmentPlanner {
             }
         case .binary:
             switch capability.binary {
-            case .pathMention: nil
             case .unsupported: .routeCannotCarry
             }
         }

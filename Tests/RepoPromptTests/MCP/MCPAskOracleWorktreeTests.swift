@@ -365,27 +365,6 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         XCTAssertEqual(images.first?.bytes, Self.pngData)
     }
 
-    func testBinaryFileCarriesItsAbsolutePhysicalPathAndNoPathIsInvented() throws {
-        let logicalRoot = testRoot.appendingPathComponent("logical", isDirectory: true)
-        let physicalRoot = testRoot.appendingPathComponent("worktree", isDirectory: true)
-        try FileManager.default.createDirectory(at: logicalRoot, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: physicalRoot, withIntermediateDirectories: true)
-        let zip = Data([0x50, 0x4B, 0x03, 0x04, 0, 0, 0, 0])
-        try zip.write(to: physicalRoot.appendingPathComponent("bundle.zip"))
-
-        let loaded = try XCTUnwrap(OracleAttachmentLoader().load(
-            requests: [.init(index: 0, path: logicalRoot.appendingPathComponent("bundle.zip").path, title: nil)],
-            authority: authority(logical: logicalRoot, physical: physicalRoot)
-        ).first)
-
-        XCTAssertEqual(loaded.kind, .binary)
-        XCTAssertEqual(loaded.fileName, "bundle.zip")
-        let path = try XCTUnwrap(loaded.localPath)
-        XCTAssertTrue(path.hasPrefix("/"))
-        XCTAssertTrue(path.hasSuffix("/worktree/bundle.zip"), path)
-        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), zip)
-    }
-
     func testRejectsNonCanonicalOutsideAndSymlinkPathsWithoutLeakingThem() throws {
         let imageURL = testRoot.appendingPathComponent("image.png")
         try Self.pngData.write(to: imageURL)
