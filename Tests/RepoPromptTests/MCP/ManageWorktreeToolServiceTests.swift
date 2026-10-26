@@ -1045,6 +1045,8 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
 
         func testElectionRefusesNonGitPrimaryWithoutFallingBackToGitSibling() async throws {
             try await withElectionFixture(gitRootIndices: [1, 2]) { fixture in
+                // An enclosing repository is outside the declared roots and cannot supply the default either.
+                try fixture.repos.initializeRepository(at: fixture.alpha.deletingLastPathComponent())
                 let unqualifiedCalls: [(String, [String: Value])] = [
                     ("git", ["op": .string("status")]),
                     ("git", ["op": .string("log"), "count": .int(1)]),

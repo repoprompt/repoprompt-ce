@@ -970,21 +970,6 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         }
     }
 
-    /// Recheck metadata authorization after selection, including explicit linked-worktree selectors.
-    private func authorizedRepositoryContext(
-        repo: GitRepoDescriptor,
-        logicalRoot: WorkspaceRootRef?,
-        discovery: DiscoveryContext
-    ) async throws -> RepositoryContext {
-        guard await vcsService.resolveRepoForRead(
-            at: repo.rootURL,
-            authorizedRoots: discovery.visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]
-        ) != nil else {
-            throw MCPError.invalidParams("Repository metadata is not authorized for this worktree request.")
-        }
-        return RepositoryContext(repo: repo, logicalRoot: logicalRoot, discovery: discovery)
-    }
-
     private func captureDiscovery(invocationContext: ToolInvocationContext) async throws -> DiscoveryContext {
         guard let workspaceManager = dependencies.context.workspaceManager,
               let activeWorkspace = workspaceManager.activeWorkspace
@@ -1021,6 +1006,20 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             visibleRoots: visibleRoots,
             lookupContext: lookupContext
         )
+    }
+
+    private func authorizedRepositoryContext(
+        repo: GitRepoDescriptor,
+        logicalRoot: WorkspaceRootRef?,
+        discovery: DiscoveryContext
+    ) async throws -> RepositoryContext {
+        guard await vcsService.resolveRepoForRead(
+            at: repo.rootURL,
+            authorizedRoots: discovery.visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]
+        ) != nil else {
+            throw MCPError.invalidParams("Repository metadata is not authorized for this worktree request.")
+        }
+        return RepositoryContext(repo: repo, logicalRoot: logicalRoot, discovery: discovery)
     }
 
     /// The repository named by `repo_key` or `repo_root`, or nil when neither is present. Only a relative
@@ -1103,13 +1102,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 return try await (worktree, owningRepository(of: worktree, discovery: discovery))
             } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
                 let selection = try await electDefaultRepository(discovery)
+                let context = try await authorizedRepositoryContext(repo: selection.repository, logicalRoot: selection.logicalRoot, discovery: discovery)
                 let worktree = try await resolver.resolveWorktree(
                     selector: selector,
                     repo: selection.repository,
                     allRepos: discovery.allRepos,
                     authorizedRoots: discovery.visibleRoots
                 )
-                return try await (worktree, authorizedRepositoryContext(repo: selection.repository, logicalRoot: selection.logicalRoot, discovery: discovery))
+                return (worktree, context)
             }
         } catch let error as GitRepoTargetResolverError {
             throw MCPError.invalidParams(error.message)

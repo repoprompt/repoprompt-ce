@@ -822,8 +822,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeUISyncSuppressionDepth > 0
     }
 
-    private var lastProcessedTabID: UUID?
-
     /// Last `AgentSessionRunState` the sidebar attention system observed for
     /// each tab. Used to detect *transitions* (not steady-state) so we only
     /// raise an unseen badge when the run state actually moves into a
@@ -4838,7 +4836,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return
         }
-        lastProcessedTabID = nil
         let targetTabID = pendingTabIDForLoad ?? currentTabID
         #if DEBUG
             let targetTabIDForLog = targetTabID?.uuidString.prefix(8).description ?? "nil"
@@ -5065,9 +5062,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             pendingTabIDForLoad = tabID
             return
         }
-
-        guard lastProcessedTabID != tabID else { return }
-        lastProcessedTabID = tabID
 
         guard let session = session(for: tabID, createIfNeeded: false) else {
             if workspaceSwitchInFlight,
@@ -16572,7 +16566,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         persistedLoadAttemptByTabID.removeAll()
         persistedLoadProducerByTabID.removeAll()
         activeTranscriptPresentationScope = nil
-        lastProcessedTabID = nil
         if workspace == nil {
             workspaceSwitchInFlight = false
             clearBindings()
@@ -17066,7 +17059,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard workspaceManager?.isSwitchingWorkspace != true else {
             return false
         }
-        lastProcessedTabID = nil
         onTabChanged(targetTabID)
         return true
     }
@@ -24564,10 +24556,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let activeTabID = currentTabID
         if activeTabID.map(affectedTabIDs.contains) == true {
-            lastProcessedTabID = nil
             onTabChanged(activeTabID)
         } else if activeTabID == nil, !affectedTabIDs.isEmpty {
-            lastProcessedTabID = nil
             onTabChanged(nil)
         }
         syncSidebarUIState(refresh: true, reason: .sessionIndex)
@@ -24603,10 +24593,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #endif
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
-        let wasCurrentTab = currentTabID == tabID
-        if wasCurrentTab {
-            lastProcessedTabID = nil
-        }
         if let sessionID {
             liveSession?.saveDebounceTask?.cancel()
             liveSession?.saveDebounceTask = nil
