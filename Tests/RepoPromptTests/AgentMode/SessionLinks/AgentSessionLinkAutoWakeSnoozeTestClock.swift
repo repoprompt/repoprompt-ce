@@ -40,7 +40,9 @@ final class AgentSessionLinkAutoWakeSnoozeTestClock {
         AgentSessionLinkAutoWakeSnoozeClock(
             now: { MainActor.assumeIsolated { self.instant } },
             wallNow: { MainActor.assumeIsolated { self.wallNow } },
-            sleepUntil: { deadline in try await self.sleep(until: deadline) }
+            // Register in the arming task's first MainActor job, without an intermediate
+            // nonisolated closure hop that could let a poll observe only some registrations.
+            sleepUntil: { @MainActor deadline in try await self.sleep(until: deadline) }
         )
     }
 

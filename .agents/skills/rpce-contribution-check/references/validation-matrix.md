@@ -18,7 +18,7 @@ After timing initialization, `pr-ready` makes a best-effort attempt to write a l
 | Changed boundary | Focused / PR-ready evidence |
 | --- | --- |
 | `Scripts/conductor.py`, conductor/preflight control-plane tests, the contribution preflight script or timing helper, or `Makefile` conductor wiring | `make conductor-selftest`; included in `pr-ready` for these paths. |
-| Hosted app-test CI runner boundary (`.github/workflows/ci.yml`, `Scripts/ci_app_test_runner.py`, `Scripts/test_ci_app_test_runner.py`) | `make ci-app-test-runner-selftest`; included in `pr-ready` for these paths. Hosted CI follow-up is still required for real macOS runner/process behavior. |
+| Hosted app-test CI runner and process supervision (`.github/workflows/ci.yml`, `Scripts/ci_app_test_runner.py`, `Scripts/ci_process_session.py`, `Scripts/ci_resolve_packages.py`, and their selftests) | `make ci-app-test-runner-selftest`; included in `pr-ready` for these paths. Hosted CI follow-up is still required for real macOS runner/process behavior. |
 | Swift files | `make dev-lint`; included in `pr-ready` for Swift paths. Run `make dev-format` first when formatting mutation is intended. |
 | Root app source, root tests, or shared root-test support | Use the smallest focused `make dev-test FILTER=<Suite>` during iteration. Full `make dev-test` is the PR-ready/full local lane when required and is included in `pr-ready` for `Sources/RepoPrompt/`, `Tests/RepoPrompt*Tests/`, or `Tests/RepoPromptTestSupport/`. |
 | Provider package source or tests | `make dev-provider-test`; included in `pr-ready` for provider-package paths. |

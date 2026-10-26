@@ -244,7 +244,10 @@ struct WorkspaceDefaultGitRepositoryElection {
         else {
             throw Failure.notLoaded(subject)
         }
-        guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: lookupRoot.standardizedFullPath)) else {
+        guard let resolved = await vcsService.resolveRepoForRead(
+            at: URL(fileURLWithPath: lookupRoot.standardizedFullPath),
+            authorizedRoots: snapshot.lookupRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }
+        ) else {
             throw Failure.notGitRepository(subject)
         }
         return Selection(
@@ -271,7 +274,10 @@ struct WorkspaceDefaultGitRepositoryElection {
         else {
             throw Failure.notLoaded(subject)
         }
-        guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: physicalRoot.standardizedFullPath)) else {
+        guard let resolved = await vcsService.resolveRepoForRead(
+            at: URL(fileURLWithPath: physicalRoot.standardizedFullPath),
+            authorizedRoots: snapshot.lookupRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }
+        ) else {
             throw Failure.notGitRepository(subject)
         }
         let repository = GitRepoDescriptor(rootURL: resolved.rootURL)

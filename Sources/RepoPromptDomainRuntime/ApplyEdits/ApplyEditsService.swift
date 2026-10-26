@@ -22,7 +22,8 @@ package struct ApplyEditsService {
         let previewResult = try await preview(request, options: options)
         let result = previewResult.result
 
-        if result.editsApplied > 0 {
+        let hasNetChange = previewResult.originalText.map { !$0.utf8.elementsEqual(result.updatedText.utf8) } ?? true
+        if result.editsApplied > 0, hasNetChange {
             try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.ApplyEdits.hostWrite,
                 EditFlowPerf.Dimensions(fileBytes: result.updatedText.utf8.count, appliedCount: result.editsApplied)

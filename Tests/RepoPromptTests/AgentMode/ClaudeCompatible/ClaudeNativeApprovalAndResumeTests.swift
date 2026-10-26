@@ -124,14 +124,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(everythingAged.freshness, .resetPassed, "the 5-hour reset has passed with nothing newer")
     }
 
-    func testCLIUsageWeeklyReadingInformsBalancingWithinOneHour() throws {
+    func testCLIUsageWeeklyReadingInformsBalancingWithinSixHours() throws {
         let date = Date(timeIntervalSince1970: 1_900_000_000)
         let snapshot = try cliPlanUsageSnapshot(observedAt: date)
         let recent = ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(40 * 60))
         XCTAssertTrue(recent.known)
-        XCTAssertNotNil(recent.weeklyPace)
+        XCTAssertNotNil(recent.weeklySparePace)
         XCTAssertEqual(recent.weeklyHeadroom, 95)
-        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(3601)).known, "weekly routing evidence is capped at one hour")
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(6 * 3600 + 1)).known, "weekly routing evidence is capped at six hours")
     }
 
     func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {

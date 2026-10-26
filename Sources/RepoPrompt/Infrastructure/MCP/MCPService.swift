@@ -31,6 +31,7 @@ actor MCPService: Sendable {
         var isRunning: Bool
         var pendingClientID: String?
         var pendingApprovalGeneration: UInt64?
+        var pendingApprovalExecutablePath: String?
         var diagnostics: MCPDiagnostics
     }
 
@@ -153,8 +154,8 @@ actor MCPService: Sendable {
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
-            await controller.setApprovalCallback { [weak self] clientID, generation in
-                await self?.setPendingApproval(clientID, generation: generation)
+            await controller.setApprovalCallback { [weak self] clientID, generation, executablePath in
+                await self?.setPendingApproval(clientID, generation: generation, executablePath: executablePath)
             }
             await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
@@ -313,9 +314,10 @@ actor MCPService: Sendable {
         /// Sets the pending-approval client and broadcasts the snapshot without
         /// going through the controller callback, so tests can exercise the
         /// per-subscriber state fan-out directly.
-        func setPendingApprovalForTesting(_ clientID: String?, generation: UInt64? = nil) {
+        func setPendingApprovalForTesting(_ clientID: String?, generation: UInt64? = nil, executablePath: String? = nil) {
             state.pendingClientID = clientID
             state.pendingApprovalGeneration = generation
+            state.pendingApprovalExecutablePath = executablePath
             yieldState()
         }
     #endif
@@ -357,17 +359,24 @@ actor MCPService: Sendable {
         guard state.pendingApprovalGeneration == generation else { return }
         // Clear before the controller activates the next queued request; clearing
         // afterward would erase that next prompt, including a same-name peer.
-        state.pendingClientID = nil
-        state.pendingApprovalGeneration = nil
-        yieldState()
+        clearPendingApproval(generation: generation)
         await controller.resolvePendingApproval(allow: allow, generation: generation)
     }
 
+    func clearPendingApproval(generation: UInt64) {
+        guard state.pendingApprovalGeneration == generation else { return }
+        state.pendingClientID = nil
+        state.pendingApprovalGeneration = nil
+        state.pendingApprovalExecutablePath = nil
+        yieldState()
+    }
+
     /// Controller → Service callback - called when a new client requests approval
-    private func setPendingApproval(_ clientID: String?, generation: UInt64) {
+    private func setPendingApproval(_ clientID: String?, generation: UInt64, executablePath: String?) {
         mcpServiceLog("Setting pending approval for client: \(clientID ?? "nil")")
         state.pendingClientID = clientID
         state.pendingApprovalGeneration = generation
+        state.pendingApprovalExecutablePath = executablePath
         yieldState()
     }
 

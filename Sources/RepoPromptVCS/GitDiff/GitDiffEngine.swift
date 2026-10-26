@@ -346,10 +346,9 @@ package actor GitDiffEngine {
         let discoveryPathspecs = pathspecs.map {
             GitDiffPathNormalization.gitDiscoveryPathspecs(from: $0, repoRootPath: repoURL.path)
         }
-        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { rawPath in
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !(trimmed as NSString).expandingTildeInPath.hasPrefix("/")
-        } ?? false
+        // Match GitDiffPathNormalization: only a raw leading slash denotes an
+        // absolute input. Relative whitespace and tilde are authored Git syntax.
+        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { !$0.hasPrefix("/") } ?? false
         let scope: GitDiffScope = hasPathspecs ? .selected : .all
         let requestedPaths = hasPathspecs ? normalizedPathspecs : nil
 
@@ -372,9 +371,10 @@ package actor GitDiffEngine {
             at: repoURL
         )
 
-        // Keep backend-agnostic filtering as a defensive projection boundary.
-        let filtered: [VCSUncommittedFile] = if hasUserAuthoredRelativePathspecs {
-            // Git is authoritative for user-authored relative pathspec glob/magic semantics.
+        // Git has already constrained discovery using its own pathspec semantics. Re-matching
+        // normalized names against authored spellings (including ./ and ../) can discard matches.
+        // Retain the existing defensive projection for other backends.
+        let filtered: [VCSUncommittedFile] = if backend.kind == .git || hasUserAuthoredRelativePathspecs {
             changedFiles
         } else if let normalizedPathspecs, !normalizedPathspecs.isEmpty {
             filterByPathspecs(changedFiles, pathspecs: normalizedPathspecs)
@@ -577,9 +577,8 @@ package actor GitDiffEngine {
         case let .uncommitted(base):
             let backend = await vcsService.backend(forRepoRoot: repoURL)
             let normalizedBase = backend.normalizeBaseRef(base)
-            if await isRemoteBranch(normalizedBase, repoURL: repoURL) {
-                try? await backend.fetch(at: repoURL)
-            }
+            // Diff generation reads existing tracking refs; fetching is an
+            // explicitly requested network operation, never a read side effect.
             let fingerprint = try await backend.getStatusFingerprint(at: repoURL, baseRef: normalizedBase)
             let cacheKey = CacheKey(
                 repoPath: repoURL.path,
@@ -653,9 +652,8 @@ package actor GitDiffEngine {
         case let .uncommittedMergeBase(base):
             let backend = await vcsService.backend(forRepoRoot: repoURL)
             let normalizedBase = backend.normalizeBaseRef(base)
-            if await isRemoteBranch(normalizedBase, repoURL: repoURL) {
-                try? await backend.fetch(at: repoURL)
-            }
+            // Diff generation reads existing tracking refs; fetching is an
+            // explicitly requested network operation, never a read side effect.
             let fingerprint = try await backend.getStatusFingerprint(at: repoURL, baseRef: normalizedBase)
             let cacheKey = CacheKey(
                 repoPath: repoURL.path,
@@ -843,11 +841,5 @@ package actor GitDiffEngine {
 
     private func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
         GitDiffPathNormalization.gitRelativePaths(from: absolutePaths, repoRootPath: repoRootPath)
-    }
-
-    private func isRemoteBranch(_ branchName: String, repoURL: URL) async -> Bool {
-        guard branchName != "HEAD", !branchName.isEmpty else { return false }
-        let backend = await vcsService.backend(forRepoRoot: repoURL)
-        return await backend.hasRemoteTrackingRef(named: branchName, at: repoURL)
     }
 }

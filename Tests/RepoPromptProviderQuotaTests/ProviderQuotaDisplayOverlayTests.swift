@@ -65,7 +65,7 @@ final class ProviderQuotaDisplayOverlayTests: XCTestCase {
 
     func testBalancingNeverSeesSDKDataAndStaleCLIStaysUnknown() throws {
         let base = cli(fiveHour: 20, weekly: 10, observedAt: t0)
-        let later = t0.addingTimeInterval(2 * 3600)
+        let later = t0.addingTimeInterval(7 * 3600)
         let overlay = try sdk([("five_hour", 0.3, nil), ("seven_day", 0.12, nil)], observedAt: later)
         XCTAssertFalse(ProviderUsageBalancePolicy.reading(overlay, now: later).known, "SDK telemetry is not routing evidence")
         XCTAssertFalse(ProviderUsageBalancePolicy.reading(base, now: later).known, "the service snapshot stays unknown when stale")

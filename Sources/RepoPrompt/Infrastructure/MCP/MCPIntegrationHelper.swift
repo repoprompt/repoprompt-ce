@@ -231,6 +231,15 @@ enum MCPIntegrationHelper {
         return repoPromptServerIdentifiers.contains(lowered)
     }
 
+    static func isComputerUseServerIdentifier(_ rawValue: String) -> Bool {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "_", with: "-") == computerUseMCPServerName
+    }
+
+    /// Reserved app-owned identities must never be populated from user-controlled definitions.
+    static func isReservedMCPServerIdentifier(_ rawValue: String) -> Bool {
+        isRepoPromptServerIdentifier(rawValue) || isComputerUseServerIdentifier(rawValue)
+    }
+
     private static let repoPromptServerIdentifiers: Set<String> = [
         repoPromptMCPServerName.lowercased(),
         RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName.lowercased()
@@ -325,8 +334,7 @@ enum MCPIntegrationHelper {
         else { return nil }
         let server = remainder[..<separator.lowerBound]
         let tool = remainder[separator.upperBound...]
-        let isCompanionServer = server == computerUseMCPServerName
-            || server == computerUseMCPServerName.replacingOccurrences(of: "-", with: "_")
+        let isCompanionServer = isComputerUseServerIdentifier(String(server))
         guard !tool.isEmpty, isCompanionServer else { return nil }
         return String(tool)
     }

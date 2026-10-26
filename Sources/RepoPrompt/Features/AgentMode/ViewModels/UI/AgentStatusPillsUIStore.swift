@@ -30,6 +30,16 @@ struct AgentAutoEffortPillProps: Equatable {
     let feedback: AutoEffortTurnFeedback?
 }
 
+struct AgentRepromptPillProps: Equatable {
+    var isOn = false
+    var isAvailable = false
+    var isPreparing = false
+    var modelDisplayName: String?
+    var providerID: String?
+    var requiresDisclosure = false
+    var unavailableReason: String?
+}
+
 struct AgentStatusPillsSnapshot: Equatable {
     let currentTabID: UUID?
     let selectedWorkflow: AgentWorkflowDefinition?
@@ -49,6 +59,7 @@ struct AgentStatusPillsSnapshot: Equatable {
     /// It lives in this snapshot so the pill row never has to observe the full view model; the link
     /// bridge owns the values and republishes them from authority change events.
     let monitor: AgentMonitorPillProps
+    var reprompt = AgentRepromptPillProps()
 
     static let empty = AgentStatusPillsSnapshot(
         currentTabID: nil,

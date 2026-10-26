@@ -297,7 +297,7 @@ struct AgentRuntimeSidebarView: View {
 
     /// Estimates used tokens from the agent transcript character count when codex usage isn't available.
     private var estimatedUsedTokens: Int? {
-        runtimeVM.snapshot.usedTokens ?? runtimeVM.snapshot.estimatedTranscriptTokens
+        runtimeVM.snapshot.displayUsedTokens
     }
 
     private var contextWindowTokens: Int {
@@ -306,13 +306,12 @@ struct AgentRuntimeSidebarView: View {
 
     @ViewBuilder
     private var contextUsageSection: some View {
-        if let usedTokens = estimatedUsedTokens {
+        if estimatedUsedTokens != nil || runtimeVM.snapshot.awaitingPostCompactionUsage {
             AgentContextIndicator(
                 contextWindowTokens: contextWindowTokens,
-                usedTokens: usedTokens,
-                sourceLabel: runtimeVM.snapshot.usedTokens != nil
-                    ? runtimeVM.snapshot.usageSource.label
-                    : "Estimated",
+                usedTokens: estimatedUsedTokens,
+                sourceLabel: runtimeVM.snapshot.displayUsageLabel,
+                awaitingPostCompactionUsage: runtimeVM.snapshot.awaitingPostCompactionUsage,
                 style: .labeled
             )
             .sidebarCard()
