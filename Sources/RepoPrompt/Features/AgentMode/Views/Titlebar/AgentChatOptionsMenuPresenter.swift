@@ -121,7 +121,12 @@ private final class AgentChatOptionsMenuItem: NSMenuItem {
         super.init(title: title, action: #selector(performHandler(_:)), keyEquivalent: "")
         target = self
         image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-        attributedTitle = NSAttributedString(string: GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title(title, for: shortcutName))
+        // Keep `title` the plain action name and show the current assignment as a native key
+        // equivalent so AppKit renders and announces it as a shortcut. This transient pop-up menu is
+        // never part of `NSApp.mainMenu`, the only menu the recorder scans for conflicts, so it
+        // reserves no keys. While the menu tracks, KeyboardShortcuts' event-tracking monitor
+        // consumes registered shortcuts first, so a press still dispatches exactly once.
+        setShortcut(KeyboardShortcuts.getShortcut(for: shortcutName))
     }
 
     @available(*, unavailable)

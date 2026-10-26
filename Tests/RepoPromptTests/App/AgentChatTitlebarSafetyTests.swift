@@ -1791,8 +1791,32 @@ final class KeyboardShortcutCoverageTests: XCTestCase {
         XCTAssertEqual(calls, ["pin", "rename", "stash", "handoff", "id", "delete"])
         AgentChatShortcutAction.copySessionID.perform(snapshot: .init(target: target, isPinned: false), actions: actions)
         XCTAssertEqual(calls.count, 6)
-        let menu = AgentChatOptionsMenuPresenter.makeMenu(snapshot: snapshot, actions: actions)
-        XCTAssertTrue(menu.items.allSatisfy(\.keyEquivalent.isEmpty))
-        XCTAssertEqual(menu.items[0].attributedTitle?.string, GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title("Pin", for: .pinAgentSession))
+    }
+
+    func testSessionMenuKeepsPlainTitlesAndShowsCurrentBindingAsNativeKeyEquivalent() {
+        let originalPin = KeyboardShortcuts.getShortcut(for: .pinAgentSession)
+        let originalDelete = KeyboardShortcuts.getShortcut(for: .deleteAgentSession)
+        defer {
+            KeyboardShortcuts.setShortcut(originalPin, for: .pinAgentSession)
+            KeyboardShortcuts.setShortcut(originalDelete, for: .deleteAgentSession)
+        }
+        let remapped = KeyboardShortcuts.Shortcut(.p, modifiers: [.command, .control])
+        KeyboardShortcuts.setShortcut(remapped, for: .pinAgentSession)
+        KeyboardShortcuts.setShortcut(nil, for: .deleteAgentSession)
+        let target = AgentChatOptionsMenuTarget(windowID: 7, workspaceID: UUID(), tabID: UUID(), agentSessionID: UUID(), tabName: "Captured")
+        let noop: (AgentChatOptionsMenuTarget) -> Void = { _ in }
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: .init(target: target, isPinned: false),
+            actions: .init(togglePin: noop, rename: noop, stash: noop, copyHandoffPrompt: noop, copySessionID: { _ in }, delete: noop)
+        )
+
+        // Titles stay the plain action names; the binding lives only in the key equivalent.
+        XCTAssertEqual(menu.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
+        XCTAssertTrue(menu.items.allSatisfy { $0.attributedTitle == nil })
+        XCTAssertEqual(menu.items[0].keyEquivalent, remapped.nsMenuItemKeyEquivalent)
+        XCTAssertEqual(menu.items[0].keyEquivalentModifierMask, [.command, .control])
+        // An unassigned action shows no key equivalent.
+        XCTAssertEqual(menu.items[5].keyEquivalent, "")
+        XCTAssertEqual(menu.items[5].keyEquivalentModifierMask, [])
     }
 }
