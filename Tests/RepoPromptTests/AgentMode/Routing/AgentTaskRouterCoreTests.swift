@@ -133,7 +133,8 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == "gpt-6-luna"
         }))
         XCTAssertEqual(lunaCandidate.utilityTier, "gpt-6-luna")
-        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("efficient, high-volume"))
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("light, high-volume"))
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("not intended for substantive implementation"))
         XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.10 input / $0.50 output"))
         XCTAssertNil(lunaCandidate.target.reasoningEffortRaw)
         XCTAssertFalse(lunaCandidate.descriptor.targetDescription.contains("Effort:"))
