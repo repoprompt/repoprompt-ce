@@ -686,37 +686,124 @@ final class AgentSessionMetadataCommitTests: XCTestCase {
         XCTAssertEqual(publicationCount, 0)
     }
 
-    func testFailedNewerWriteDoesNotSuppressTheSuccessfulOlderReceipt() async throws {
+    func testCoalescedWriterReturnsReceiptOnlyToTheCommittedOwner() async throws {
         let fixture = try makeFixture()
-        let fence = TestReleaseFence(name: "successful write before a failed successor")
+        let writer = AgentSessionDiskWriter()
+        let fence = TestReleaseFence(name: "first coalesced write")
+        let fileURL = fixture.storageURL.appendingPathComponent("coalesced.json")
+        await writer.test_setBeforeWriteHook { url in
+            guard url == fileURL.standardizedFileURL else { return }
+            await fence.enterAndWait()
+        }
+        let first = Task { try await writer.enqueueAndWait(data: Data("first".utf8), url: fileURL) }
+        addTeardownBlock {
+            fence.release()
+            _ = await first.result
+        }
+        guard await fence.waitUntilEntered() else { return }
+        let winningData = Data("winning coalesced payload".utf8)
+        let second = Task { try await writer.enqueueAndWait(data: winningData, url: fileURL) }
+        addTeardownBlock {
+            fence.release()
+            _ = await second.result
+        }
+        try await AsyncTestWait.waitUntil("both coalesced writes admitted") {
+            await writer.test_pendingWriteCount(for: fileURL) == 2
+        }
+        let independentURL = fixture.storageURL.appendingPathComponent("independent.json")
+        let independentReceipt = try await writer.enqueueAndWait(data: Data("independent".utf8), url: independentURL)
+        XCTAssertNotNil(independentReceipt)
+        XCTAssertEqual(try Data(contentsOf: independentURL), Data("independent".utf8))
+        fence.release()
+        let firstReceipt = try await first.value
+        let winningReceipt = try await second.value
+        XCTAssertNil(firstReceipt, "A superseded caller has no metadata publication authority")
+        let receipt = try XCTUnwrap(winningReceipt)
+        XCTAssertEqual(try Data(contentsOf: fileURL), winningData)
+        XCTAssertEqual(receipt.observedFileSize, Int64(winningData.count))
+        let signature = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+        XCTAssertEqual(receipt.observedFileModificationDate, signature.contentModificationDate)
+    }
+
+    func testCommittedWriteKeepsItsReceiptWhenSuccessorFailsInTheSameDrain() async throws {
+        let fixture = try makeFixture()
+        let firstFence = TestReleaseFence(name: "A before disk")
+        let secondFence = TestReleaseFence(name: "B after A committed, before disk")
+        let publicationFence = TestReleaseFence(name: "receipt before metadata publication")
+        let fileURL = try await fixture.service.saveAgentSession(fixture.session, for: fixture.workspace)
+        await fixture.service.test_setBeforeSessionWriteHook { _ in await firstFence.enterAndWait() }
         var session = fixture.session
-        let fileURL = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
-        await fixture.service.test_setAfterSessionWriteHook { _ in await fence.enterAndWait() }
         session.name = "Last successful write"
+        let messageDate = Date(timeIntervalSinceReferenceDate: 300)
+        session.items = [AgentChatItemPersist(from: AgentChatItem(
+            timestamp: messageDate, kind: .user, text: "Committed message"
+        ))]
         let successfulPayload = session
         let successful = Task { try await fixture.service.saveAgentSession(successfulPayload, for: fixture.workspace) }
         addTeardownBlock {
-            fence.release()
+            firstFence.release()
+            secondFence.release()
+            publicationFence.release()
             _ = await successful.result
+            await fixture.service.test_setBeforeSessionWriteHook(nil)
             await fixture.service.test_setAfterSessionWriteHook(nil)
         }
-        guard await fence.waitUntilEntered() else { return }
-        await fixture.service.test_setAfterSessionWriteHook(nil)
+        guard await firstFence.waitUntilEntered() else { return }
+        await fixture.service.test_setBeforeSessionWriteHook { _ in await secondFence.enterAndWait() }
+        var failedSession = session
+        failedSession.name = "Must not be indexed"
+        failedSession.items = []
+        let failedPayload = failedSession
+        let failed = Task { try await fixture.service.saveAgentSession(failedPayload, for: fixture.workspace) }
+        addTeardownBlock {
+            firstFence.release()
+            secondFence.release()
+            publicationFence.release()
+            _ = await failed.result
+        }
+        try await AsyncTestWait.waitUntil("A and B admitted to the same drain") {
+            await fixture.service.test_pendingSessionWriteCount(for: fileURL) == 2
+        }
+        firstFence.release()
+        guard await secondFence.waitUntilEntered() else { return }
+        let committedData = try Data(contentsOf: fileURL)
+        let committed = try JSONDecoder().decode(AgentSession.self, from: committedData)
+        XCTAssertEqual(committed.name, successfulPayload.name, "A physically committed before B starts")
         let backupURL = fixture.storageURL.appendingPathComponent("successful-session-backup.json")
         try FileManager.default.moveItem(at: fileURL, to: backupURL)
         try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: false)
-        var failedPayload = session
-        failedPayload.name = "Must not be indexed"
-        do {
-            _ = try await fixture.service.saveAgentSession(failedPayload, for: fixture.workspace)
-            XCTFail("Replacing a directory with session data must fail")
-        } catch {}
+        try Data("block atomic replacement".utf8).write(to: fileURL.appendingPathComponent("sentinel"))
+        let obstructedWaiterCount = await fixture.service.test_pendingSessionWriteCount(for: fileURL)
+        XCTAssertEqual(obstructedWaiterCount, 2, "The obstruction must not hide the admitted drain")
+        // Hold successful callbacks until the original committed inode is restored. B must fail
+        // a real atomic replacement; neither caller has left this disk-writer drain yet.
+        await fixture.service.test_setAfterSessionWriteHook { _ in await publicationFence.enterAndWait() }
+        secondFence.release()
+        try await AsyncTestWait.waitUntil("same drain finished before restoring A") {
+            await fixture.service.test_pendingSessionWriteCount(for: fileURL) == 0
+        }
         try FileManager.default.removeItem(at: fileURL)
         try FileManager.default.moveItem(at: backupURL, to: fileURL)
-        fence.release()
-        _ = try await successful.value
-
-        try await assertStoredAndIndexed(session, fileURL: fileURL, fixture: fixture)
+        XCTAssertEqual(try Data(contentsOf: fileURL), committedData)
+        publicationFence.release()
+        switch await failed.result {
+        case .success:
+            XCTFail("Replacing a directory with session data must fail")
+        case let .failure(error):
+            XCTAssertEqual((error as NSError).domain, NSCocoaErrorDomain)
+            XCTAssertEqual((error as NSError).code, CocoaError.fileWriteUnknown.rawValue)
+        }
+        switch await successful.result {
+        case let .success(savedURL):
+            XCTAssertEqual(savedURL, fileURL)
+        case let .failure(error):
+            XCTFail("A committed successfully and must not receive B's error: \(error)")
+        }
+        XCTAssertEqual(try Data(contentsOf: fileURL), committedData, "No caller may replace restored A during publication")
+        try await assertStoredAndIndexed(
+            session, fileURL: fileURL, fixture: fixture,
+            expectedItemCount: 1, expectedLastUserMessageAt: messageDate
+        )
         let publicationCount = await fixture.service.test_pendingMetadataPublicationCount()
         XCTAssertEqual(publicationCount, 0)
     }
@@ -753,6 +840,14 @@ final class AgentSessionMetadataCommitTests: XCTestCase {
         let fast = try await fixture.service.fastMetadataRecordsIfAvailable(for: fixture.workspace)
         let record = try XCTUnwrap(fast?.records.first { $0.id == expected.id }, file: file, line: line)
         XCTAssertEqual(record.name, expected.name, file: file, line: line)
+        let expectedRecord = AgentSessionMetadataRecord.record(
+            from: stored, fileURL: fileURL, observedFileSize: nil, observedFileModificationDate: nil
+        )
+        XCTAssertEqual(record.savedAt, stored.savedAt, file: file, line: line)
+        XCTAssertEqual(record.transcriptProjectionCounts, expectedRecord.transcriptProjectionCounts, file: file, line: line)
+        XCTAssertEqual(record.transcriptTurnCount, expectedRecord.transcriptTurnCount, file: file, line: line)
+        XCTAssertEqual(record.firstActivityAt, expectedRecord.firstActivityAt, file: file, line: line)
+        XCTAssertEqual(record.lastActivityAt, expectedRecord.lastActivityAt, file: file, line: line)
         if let expectedItemCount {
             XCTAssertEqual(stored.itemCount, expectedItemCount, file: file, line: line)
             XCTAssertEqual(record.itemCount, expectedItemCount, file: file, line: line)
@@ -765,6 +860,13 @@ final class AgentSessionMetadataCommitTests: XCTestCase {
         let index = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: Data(contentsOf: indexURL))
         let diskRecord = index.entries.first { $0.id == expected.id }
         XCTAssertEqual(diskRecord?.name, expected.name, file: file, line: line)
+        XCTAssertEqual(diskRecord?.savedAt, stored.savedAt, file: file, line: line)
+        XCTAssertEqual(diskRecord?.transcriptProjectionCounts, expectedRecord.transcriptProjectionCounts, file: file, line: line)
+        XCTAssertEqual(diskRecord?.transcriptTurnCount, expectedRecord.transcriptTurnCount, file: file, line: line)
+        XCTAssertEqual(diskRecord?.firstActivityAt, expectedRecord.firstActivityAt, file: file, line: line)
+        XCTAssertEqual(diskRecord?.lastActivityAt, expectedRecord.lastActivityAt, file: file, line: line)
+        XCTAssertEqual(diskRecord?.observedFileSize, Int64(data.count), file: file, line: line)
+        XCTAssertEqual(diskRecord?.observedFileModificationDate, signature.contentModificationDate, file: file, line: line)
         if let expectedItemCount {
             XCTAssertEqual(diskRecord?.itemCount, expectedItemCount, file: file, line: line)
             XCTAssertEqual(diskRecord?.lastUserMessageAt, expectedLastUserMessageAt, file: file, line: line)
