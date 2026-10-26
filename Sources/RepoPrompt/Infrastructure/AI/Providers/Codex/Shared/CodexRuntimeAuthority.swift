@@ -7,7 +7,7 @@ import RepoPromptProcess
 /// users may explicitly select an absolute executable in Settings; ordinary environment and PATH
 /// lookup are intentionally not runtime authorities.
 enum CodexRuntimeAuthority {
-    static let bundledVersion = Version(major: 0, minor: 159, patch: 0)
+    static let bundledVersion = Version(major: 0, minor: 164, patch: 0)
     static let minimumExternalVersion = Version(major: 0, minor: 149, patch: 0)
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
