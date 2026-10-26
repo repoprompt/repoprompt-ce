@@ -1800,7 +1800,7 @@ actor AgentSessionDataService {
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
-        // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
+        finishDeletionAttempt(for: fileURL, committed: true)
     }
 
     private func discardSaveIfSessionWasDeleted(
