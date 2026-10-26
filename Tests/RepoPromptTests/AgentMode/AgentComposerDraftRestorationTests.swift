@@ -346,7 +346,7 @@ final class AgentAttachmentIntakeTests: XCTestCase {
             case "cleared selection": gate.selectedTabID = nil
             case "different selection": gate.selectedTabID = UUID()
             case "replaced session":
-                viewModel.sessions.removeValue(forKey: tabID)
+                viewModel.test_removeSession(tabID: tabID)
                 _ = viewModel.session(for: tabID)
             case "rebound session": session.testInstallPersistentSessionBinding(sessionID: UUID())
             case "cycled binding": session.testInstallPersistentSessionBinding(sessionID: nil)

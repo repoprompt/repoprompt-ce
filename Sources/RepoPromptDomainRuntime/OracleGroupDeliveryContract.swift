@@ -48,7 +48,7 @@ package enum OracleGroupDeliveryContract {
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
         var lines = [
             "**Reconciling these Oracle lanes**",
-            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane.",
+            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane. In Agent Mode, follow-ups and `oracle_chat_log` reads work only from the run that created these chats.",
             "- Read every lane through the end-of-group marker (`\(endMarkerText(laneCount: ordered.count))`). If the marker or a lane is missing, page the export or try the read-only `oracle_chat_log` with that lane's chat ID. Logs may be scoped or clipped; report any remaining gap. Do not start a follow-up just to retrieve prior text.",
             effectiveReconciliationGuidance(reconciliationGuidance),
             "",

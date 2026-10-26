@@ -229,7 +229,7 @@ struct CodexProviderToolsRuntimeSection: View {
             ProviderRuntimeSubsection(title: "Optional Codex Features") {
                 ProviderRuntimeToggleRow(
                     title: "Computer Use",
-                    description: "Use /computer-use in direct Codex sessions with the installed Computer Use companion. Off by default. Grant Screen Recording and Accessibility permissions in macOS when prompted.",
+                    description: "Use /computer-use in direct Codex sessions with the installed Computer Use companion and an OpenAI-signed Codex executable. Re-signed runtimes may fail companion authentication; select a local runtime under Codex CLI → Advanced and restart if needed. Off by default. Grant Screen Recording and Accessibility permissions in macOS when prompted.",
                     isOn: tools.computerUseEnabled,
                     onChange: { onApplyMutation(.computerUse(enabled: $0)) }
                 )
