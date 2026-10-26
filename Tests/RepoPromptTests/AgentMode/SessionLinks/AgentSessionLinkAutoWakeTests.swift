@@ -6661,6 +6661,17 @@ extension AgentSessionLinkAutoWakeTests {
         let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
         guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("readiness grant failed") }
+        // The link-time seed carries no paired proof, and first paired facts baseline a new lane.
+        // Settle the lane's paired resting baseline before the target runs; otherwise whether the
+        // owed run is visible depends on whether a refresh happened to sample it mid-run.
+        var targetSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        bridge.test_onPassiveSample = { sample in
+            if sample.targetSessionID == target.sessionID { targetSamples.append(sample) }
+        }
+        await bridge.test_settleTargetPublications()
+        await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+        XCTAssertEqual(targetSamples.last?.status, .idle)
+        XCTAssertEqual(targetSamples.last?.runFacts, .zero, "the observer must hold the lane's paired resting baseline")
         observer.session.oversight.autoWakeOnUpdates = true
         observer.session.isPreparingInitialWorktree = true
         let replay = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)

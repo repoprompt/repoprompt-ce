@@ -1082,6 +1082,45 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertEqual(reducer.snapshot.entries.count, 16)
     }
 
+    func testFirstPairedFactsAtSettlementBaselineSilentlyWhilePairedRestingBaselineOwesTheRun() throws {
+        // Unpaired seed: the first paired facts arrive already settled, so they are the baseline.
+        var unpaired = makeReducer()
+        unpaired.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
+        observe(&unpaired, .idle, facts(1, 1))
+        XCTAssertTrue(unpaired.snapshot.entries.isEmpty, "unknown is never zero; first paired facts baseline")
+        XCTAssertEqual(unpaired.deliveredRunThrough(for: sample(0, status: .idle).reference), 1)
+
+        // A paired resting baseline makes the same settled ordinary run owed and routine-eligible.
+        var paired = makeReducer()
+        paired.enable(samples: [sample(0, status: .idle, runFacts: facts(0, 0))], linkSetRevision: 1)
+        observe(&paired, .idle, facts(1, 1))
+        let owed = try XCTUnwrap(paired.snapshot.entries.first)
+        XCTAssertEqual(owed.ordinaryThrough, 1)
+        XCTAssertTrue(owed.isRoutineWakeEligible)
+    }
+
+    func testMissedOrdinaryRunCoalescesALaterRealCompletionFirstToFinal() throws {
+        // Missed running frame: the settled ordinary run is idle -> idle coverage, and a later real
+        // running -> idle keeps that first-to-final origin while still admitting.
+        var missed = makeReducer()
+        missed.enable(samples: [sample(0, status: .idle, runFacts: facts(0, 0))], linkSetRevision: 1)
+        observe(&missed, .idle, facts(1, 1))
+        observe(&missed, .running, facts(1, 1))
+        observe(&missed, .idle, facts(1, 1))
+        let coalesced = try XCTUnwrap(missed.snapshot.entries.first)
+        XCTAssertEqual(transition(coalesced), "idle->idle")
+        XCTAssertTrue(coalesced.isRoutineWakeEligible)
+
+        // Observed running frame: the same ordinary run is a running -> idle completion edge.
+        var observed = makeReducer()
+        observed.enable(samples: [sample(0, status: .idle, runFacts: facts(0, 0))], linkSetRevision: 1)
+        observe(&observed, .running, facts(0, 0))
+        observe(&observed, .idle, facts(1, 1))
+        let edge = try XCTUnwrap(observed.snapshot.entries.first)
+        XCTAssertEqual(transition(edge), "running->idle")
+        XCTAssertTrue(edge.isRoutineWakeEligible)
+    }
+
     func testQuietCyclesDoNotReRepresentOverflowedOrdinaryCoverageOrRearmFailedWake() {
         var reducer = makeReducer()
         let lanes = 0 ..< 18
