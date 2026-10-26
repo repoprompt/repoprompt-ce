@@ -17,15 +17,17 @@ class OpenAIProvider: AIProvider {
     // Instance-level cache
     private let cachedApiKey: String?
     private let cachedBaseURL: URL?
+    private let httpCredentialConsentEndpoint: String?
     private var failedSetup: Bool = false
     private let configuredMaxTokens: Int? // Add property to store configured max tokens
     private let overrideVersion: String? // Add property for API version override
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
 
-    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil) {
+    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, httpCredentialConsentEndpoint: String? = nil) {
         cachedApiKey = apiKey
         cachedBaseURL = baseURL
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
         self.configuredMaxTokens = configuredMaxTokens
         self.overrideVersion = overrideVersion
         self.includeUsageInStream = includeUsageInStream
@@ -41,10 +43,11 @@ class OpenAIProvider: AIProvider {
     }
 
     /// Get service using cached values
-    open func getService() -> OpenAIService {
+    open func getService() throws -> OpenAIService {
         let apiKey = cachedApiKey ?? ""
 
         if let baseURL = cachedBaseURL {
+            try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 21600 // 6 hours
             configuration.timeoutIntervalForResource = 21600 // 6 hours
@@ -317,7 +320,7 @@ class OpenAIProvider: AIProvider {
             parameters.temperature = messageTemperature
         }
 
-        let service = getService()
+        let service = try getService()
         let stream = try await service.startStreamedChat(parameters: parameters)
 
         return AsyncThrowingStream { continuation in
@@ -382,7 +385,7 @@ class OpenAIProvider: AIProvider {
         model: AIModel, // Keep model parameter for clarity and potential future use
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
-        let service = getService()
+        let service = try getService()
         let parameters = buildForegroundResponseParameters(
             aiMessage,
             model: model,
@@ -448,7 +451,7 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = getService()
+        let service = try getService()
         let parameters = buildForegroundResponseParameters(
             aiMessage,
             model: model,
@@ -515,7 +518,7 @@ class OpenAIProvider: AIProvider {
             parameters.temperature = messageTemperature
         }
 
-        let service = getService()
+        let service = try getService()
         let response = try await service.startChat(parameters: parameters)
 
         // Extract token usage if available
@@ -806,7 +809,7 @@ extension OpenAIProvider: ResponsesJobProvider {
     }
 
     func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = getService()
+        let service = try getService()
 
         // Use polling instead of SSE for more reliable background job monitoring
         return AsyncThrowingStream { continuation in

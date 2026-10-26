@@ -1624,9 +1624,9 @@ final class AgentSessionLinkRuntimeBridge {
         // Awaited by the registry rather than spawned: the deleting caller must not proceed to
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
         // still live and its saved rows still on disk.
-        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID in
+        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID, origin, fileRemoved in
             guard let self else { return }
-            await handleCommittedSessionDeletion(sessionID)
+            await handleCommittedSessionDeletion(sessionID, origin: origin, fileRemoved: fileRemoved)
             self.host?.agentSessionLinkForgetDeletedSubagent(sessionID)
         }
         AgentSessionDeletionRegistry.shared.changeObserver = { [weak self] in
@@ -2393,12 +2393,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// of that UUID in any window may still be read through a grant. Only then is durable intent
     /// removed, and a disk failure there is recorded as a warning rather than pretending the deletion
     /// rolled back.
-    private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
+    private func handleCommittedSessionDeletion(_ sessionID: UUID, origin: AgentSessionDeletionOrigin, fileRemoved: Bool?) async {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         // Revoke synchronously before the first suspension. The deletion registry retains its
         // commit task through this callback, so an overlapping quit cannot seal stale scope intent.
-        delegationScopes.revokeAll(involving: sessionID)
+        delegationScopes.revokeAll(involving: sessionID, origin: origin, fileRemoved: fileRemoved)
         await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
@@ -5866,13 +5866,33 @@ final class AgentSessionLinkRuntimeBridge {
     /// Final fence for one management operation: the lease re-validated inside the authority (exact
     /// generation, both endpoints, and the `.manage` capability still on the grant), then deletion
     /// state and both live endpoints' eligibility.
-    private func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
-        guard !isFrozenForTermination,
-              lease.capability == .manage,
-              await authority.validate(lease: lease) == nil,
-              !isFrozenForTermination,
-              let host
-        else { return false }
+    /// Worktree mutations retain this exact lease through provider/root preparation suspensions.
+    func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
+        guard await authority.validate(lease: lease) == nil else { return false }
+        return managementLeaseEndpointsAreStillAuthorized(lease)
+    }
+
+    func managementCommitAuthorization(for lease: DomainAgentSessionLinkLease) async -> DomainAgentSessionLinkCommitAuthorization? {
+        guard lease.capability == .manage else { return nil }
+        return await authority.commitAuthorization(for: lease)
+    }
+
+    /// No suspension is permitted between live endpoint validation and the authority-fenced body.
+    func withManagementCommitAuthorization(
+        _ authorization: DomainAgentSessionLinkCommitAuthorization,
+        commit: @MainActor () throws -> Void
+    ) throws {
+        // Reconcile the owner before reading its live elevation/consent inputs in the fence.
+        // Endpoint eligibility can itself consult the owner, so it also precedes that read.
+        delegationScopes.reconcileGlobalAutoApprove()
+        guard managementLeaseEndpointsAreStillAuthorized(authorization.lease) else {
+            throw DomainAgentSessionLinkError.endpointInvalidated
+        }
+        try authorization.withAuthorization(commit)
+    }
+
+    private func managementLeaseEndpointsAreStillAuthorized(_ lease: DomainAgentSessionLinkLease) -> Bool {
+        guard !isFrozenForTermination, lease.capability == .manage, let host else { return false }
         guard managementEndpointsAreEligible(
             observerEndpoint: lease.observer,
             targetEndpoint: lease.target,
@@ -6511,7 +6531,8 @@ final class AgentSessionLinkRuntimeBridge {
     func authorizeTarget(
         operation: DomainAgentSessionTargetOperation,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
+        targetSessionID: UUID,
+        allowLinkEstablishment: Bool = true
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
         // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
         delegationScopes.reconcileGlobalAutoApprove()
@@ -6535,6 +6556,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             lease = value
         case .failure(.noActiveLink):
+            guard allowLinkEstablishment else { return .failure(.denied) }
             // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
             guard let established = await establishFullAccessLink(
                 operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID

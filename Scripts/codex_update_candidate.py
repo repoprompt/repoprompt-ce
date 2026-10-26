@@ -593,7 +593,7 @@ def render_report(
             "## 6. License and NOTICE review",
             "",
             "- Compare upstream `LICENSE` and `NOTICE` at the candidate tag with `ThirdPartyLicenses/codex/`.",
-            "- Recheck the packaged Zsh licence, refresh the flat legal `SHA256SUMS`, and review `THIRD_PARTY_NOTICES.md`.",
+            "- Recheck packaged third-party licences against the candidate inventory, refresh the flat legal `SHA256SUMS`, and review `THIRD_PARTY_NOTICES.md`.",
             "- Artifact verification does not approve legal-text changes.",
             "",
             "## 7. External override floor policy",

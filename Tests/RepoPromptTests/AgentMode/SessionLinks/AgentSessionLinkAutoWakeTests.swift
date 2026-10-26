@@ -4581,9 +4581,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let gate = AutoWakeCatalogAuthorityGate()
         let cleanup = registry.commitObserver
-        registry.commitObserver = { sessionID in
+        registry.commitObserver = { sessionID, origin, fileRemoved in
             _ = await gate.requirement()
-            await cleanup?(sessionID)
+            await cleanup?(sessionID, origin, fileRemoved)
         }
         let token = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }

@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.159.0
+Debug and release packaging include the complete official OpenAI Codex 0.164.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.159.0` release](https://github.com/openai/codex/releases/tag/rust-v0.159.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.159.0/codex-package_SHA256SUMS),
+official [`rust-v0.164.0` release](https://github.com/openai/codex/releases/tag/rust-v0.164.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.164.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -113,12 +113,15 @@ External version validation uses the captured launch environment, including its 
 search path.
 RepoPrompt rejects custom executables older than 0.149.0, the last proven external
 compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.159.0: the bounded 0.159.0 app-server projection passes unchanged from the
-0.156.1 contract at 45 methods, 193 parameter paths, and 93 response paths, and no new outgoing
-request requires 0.159.0. Bundled and external runtimes both use
+pin at 0.164.0: the bounded app-server projection passes unchanged at 47 methods,
+217 parameter paths, and 125 response paths, and this bundle rotation adds no new
+outgoing request requirement. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
+
+For the opt-in user MCP snapshot import and its isolation/permission contract, see
+[Codex user MCP import](architecture/codex-user-mcp-import.md).
 
 Within that isolated `config.toml`, RepoPrompt owns the
 `[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output
@@ -129,10 +132,11 @@ instead of guessing when the code-mode policy is ambiguous, uses dotted or inlin
 definitions that would redefine the owned table/keys, or uses
 `non_prefixed_mcp_tool_names`.
 
-The standalone package also contains the upstream Zsh executable at
-`codex-resources/zsh/bin/zsh`. Its exact Zsh 5.9 licence is included as
-[`ThirdPartyLicenses/codex/ZSH-LICENCE`](../ThirdPartyLicenses/codex/ZSH-LICENCE)
-and is covered by the packaged legal inventory checksum contract.
+The 0.164.0 standalone packages no longer contain bundled Zsh. The reviewed
+rotation removes its three layout entries, Mach-O/signing inventory entry, and
+obsolete licence. Both architectures retain the native voice runtime and its
+complete legal inventory. Future unreviewed layout drift still fails the guarded
+candidate tool.
 
 To diagnose acquisition independently of a build, run:
 
@@ -140,7 +144,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.159.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.164.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -186,13 +190,13 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.159.0 pin remains authoritative
+0.164.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.159.0 rotation is verified Codex 0.156.1
-(`rust-v0.156.1`; arm64 package archive SHA-256
-`fea42f9625091f011e38f059da974d52e57ba31831648bb1c7f0b1a385fde547`, x86_64
-package archive SHA-256 `618dbcd55419fa041871f777a14b107ceb3fe2d339ef81e21e6ab5374420dc71`).
+The known-good rollback for the 0.164.0 rotation is Codex 0.159.0
+(`rust-v0.159.0`; arm64 package archive SHA-256
+`7748d07d7921a67b91d015e9d0f43177c675977e67f955b2f8fb96dc880dd5d7`, x86_64
+package archive SHA-256 `ab64d30288454124c7c15abd81672a9dfda7e3e723d76c4cfa6c0aba4b439017`).
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 
@@ -675,14 +679,20 @@ LOCAL_SIGNING_IDENTITY_SHA256=<64-hex-fingerprint> \
 The versioned registry is stored at
 `~/Library/Application Support/RepoPrompt CE/local-signing-identity-v1.json`
 with owner-only directory and file permissions. It records the exact
-certificate fingerprint and local secure-storage service generation. After a
+certificate fingerprint and signing compatibility generation. After a
 fingerprint is registered, a missing, expired, or private-keyless identity is a
 hard failure; the installer never silently adopts or mints a replacement.
-Packaging embeds the registered fingerprint and service generation in signed
+Packaging embeds the registered fingerprint and compatibility generation in signed
 bundle metadata, verifies the packaged leaf certificate, and prints both the
 fingerprint and extracted designated requirement before replacing the installed
 app. Repeated installs with the same registry therefore retain the same
-designated requirement and Keychain service.
+designated requirement. This continuity is for signing only: local self-signed
+builds use process-local, in-memory secure storage. Provider keys and secure
+permission changes must be re-entered after each launch. They do not read, write,
+delete, or migrate credentials in an earlier local Keychain service; those items
+remain untouched with their previous access conditions; this change does not
+protect secrets already stored by earlier local builds. Official Developer ID
+storage is unchanged.
 
 Rotation is deliberately explicit. To mint and register a new identity:
 
@@ -692,17 +702,12 @@ ROTATE_LOCAL_SIGNING_IDENTITY=1 \
 ```
 
 To rotate to another existing exact-name identity, combine rotation with
-`LOCAL_SIGNING_IDENTITY_SHA256`. Each local Keychain service name is scoped by
-both the registered certificate fingerprint and generation. First registration
-uses a high-entropy generation
-so deleting and recreating the registry cannot predictably reconnect to an old
-service; rotation increments the recorded generation instead of
-overwriting the prior service, and registry loss cannot route a different
-certificate into an earlier identity's service. Secrets in the prior
-local generation are not copied and are inaccessible to the newly signed app;
-the prior certificate and service remain available for rollback or manual
-re-entry. If app replacement or the atomic registry update fails, the installer
-restores the prior app and leaves the prior registry authoritative.
+`LOCAL_SIGNING_IDENTITY_SHA256`. The registry retains its fingerprint and
+generation metadata for compatibility with earlier installations; neither grants
+persistent secret access. Rotation does not copy or delete any earlier local
+Keychain items or remove the prior certificate. If app replacement or the atomic
+registry update fails, the installer restores the prior app and leaves the prior
+registry authoritative.
 
 This path is intentionally separate from public distribution. The resulting app
 is host-native, self-signed, not notarized, must not be uploaded to GitHub

@@ -67,10 +67,13 @@ class AIProviderFactory {
             let raw = UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
             let split = OpenAIURLHelper.splitBaseURLAndVersion(raw)
             let baseURL = split.base
+            if let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, baseURL == nil {
+                throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+            }
             let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
             let finalVersion = storedVersion ?? split.version
             let serviceTier = UserDefaults.standard.string(forKey: "openAIServiceTier")
-            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier)
+            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, httpCredentialConsentEndpoint: UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint"))
         case .ollama:
             let baseURL = ollamaURL ?? URL(string: "http://localhost:11434")!
             return OllamaProvider(baseURL: baseURL)
@@ -121,9 +124,12 @@ class AIProviderFactory {
             } else {
                 // Legacy fallback: config might still have version in URL
                 let split = OpenAIURLHelper.splitBaseURLAndVersion(config.url)
-                baseStr = split.base?.absoluteString ?? config.url
+                guard let base = split.base else { throw ProviderEndpointConsent.ValidationError.invalidEndpoint }
+                baseStr = base.absoluteString
                 version = split.version
             }
+
+            try ProviderEndpointConsent.validate(baseStr, credentialBearing: ProviderEndpointConsent.hasCredentials(apiKey: key, customHeaders: config.headers), consentEndpoint: config.httpCredentialConsentEndpoint)
 
             // Read the configured maxTokens, defaulting as before
             var configuredMaxTokens = config.maxTokens ?? 8192
@@ -146,7 +152,8 @@ class AIProviderFactory {
                     baseURL: baseURL,
                     configuredMaxTokens: configuredMaxTokens,
                     overrideVersion: version,
-                    includeUsageInStream: false
+                    includeUsageInStream: false,
+                    httpCredentialConsentEndpoint: config.httpCredentialConsentEndpoint
                 )
             }
 
@@ -159,7 +166,8 @@ class AIProviderFactory {
                 customHeaders: config.headers,
                 configuredMaxTokens: configuredMaxTokens,
                 includeContentTypeHeader: config.includeContentTypeHeader,
-                apiVersion: version
+                apiVersion: version,
+                httpCredentialConsentEndpoint: config.httpCredentialConsentEndpoint
             )
         }
     }

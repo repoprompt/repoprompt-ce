@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import io
+import contextlib
 import hashlib
 import json
 import os
+import signal
+import socket
+import time
 import tarfile
 import subprocess
 import sys
@@ -32,6 +36,270 @@ def setUpModule() -> None:
 
 def tearDownModule() -> None:
     runner.read_inherited_storage_preference = _REAL_INHERITED_STORAGE_READER
+
+
+class LoggedSuiteDeadlineTests(unittest.TestCase):
+    def assert_process_stopped(self, pid):
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+        self.assertFalse(result.stderr, 'process inspection must succeed: ' + result.stderr)
+        self.assertTrue(result.returncode != 0 or result.stdout.strip().startswith('Z'), result.stdout)
+
+    def run_logged(self, source, *, seconds='1'):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'suite.log'
+            started = time.monotonic()
+            command = [sys.executable, '-u', '-c', source]
+            with contextlib.redirect_stdout(io.StringIO()):
+                status, transcript = runner.execute_logged(
+                    command, None, {**os.environ, 'CI_SUITE_TIMEOUT_SECONDS': seconds}, log,
+                )
+            self.assertEqual(log.read_text(), '$ ' + ' '.join(command) + '\n' + transcript)
+            self.assertLess(time.monotonic() - started, 10)
+            return status, transcript
+
+    def test_silent_suite_has_a_wall_deadline(self):
+        status, transcript = self.run_logged('import time; time.sleep(60)')
+        self.assertEqual(status, 124)
+        self.assertIn('exceeded 1s', transcript)
+        self.assertIn('no test case start observed', transcript)
+
+    def test_timeout_reports_last_start_and_kills_pipe_holding_descendant(self):
+        # Foundation Process children own a process group but share their parent's session.
+        source = '''
+import os, signal, sys, time
+pid = os.fork()
+if pid == 0:
+    os.setpgrp()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print('grandchild=' + str(os.getpid()), flush=True)
+    while True: signal.pause()
+print('leader=' + str(os.getpid()), flush=True)
+print("Test Case '-[Fixture testHung]' started.", flush=True)
+print('partial output', end='', flush=True)
+while True: signal.pause()
+'''
+        status, transcript = self.run_logged(source)
+        self.assertEqual(status, 124)
+        self.assertIn("last started: Test Case '-[Fixture testHung]' started.", transcript)
+        self.assertIn('partial output', transcript)
+        for line in transcript.splitlines():
+            if line.startswith(('leader=', 'grandchild=')):
+                pid = int(line.split('=')[1])
+                # A killed orphan can briefly remain a zombie pending init's reap;
+                # it must never be executing or retain the group's output pipe.
+                self.assert_process_stopped(pid)
+
+    def test_ordinary_exit_stops_own_group_descendant_without_signaling_another_session(self):
+        source = '''
+import os, signal
+reader, writer = os.pipe()
+if os.fork() == 0:
+    os.close(reader)
+    os.setpgrp()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print('grandchild=' + str(os.getpid()), flush=True)
+    os.close(1)
+    os.close(2)
+    os.write(writer, b'ready')
+    os.close(writer)
+    while True: signal.pause()
+os.close(writer)
+os.read(reader, 5)
+os.close(reader)
+os._exit(7)
+'''
+        unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                     start_new_session=True)
+        child_pid = None
+        try:
+            status, transcript = self.run_logged(source)
+            child_pid = int(next(line.split('=')[1] for line in transcript.splitlines()
+                                 if line.startswith('grandchild=')))
+            self.assertEqual(status, 7)
+            self.assertIsNone(unrelated.poll(), 'a suite must not signal another session')
+            self.assert_process_stopped(child_pid)
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=5)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, 9)
+                except ProcessLookupError:
+                    pass
+
+    def test_leader_exit_does_not_disable_deadline_for_inherited_pipe(self):
+        status, transcript = self.run_logged('''
+import os, signal
+if os.fork() == 0:
+    os.setpgrp()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True: signal.pause()
+os._exit(0)
+''')
+        self.assertEqual(status, 124)
+        self.assertIn('exceeded 1s', transcript)
+
+    def test_ordinary_exit_preserves_status_stdout_stderr_and_partial_line(self):
+        status, transcript = self.run_logged(
+            "import sys; print('stdout', flush=True); print('stderr', file=sys.stderr, flush=True); "
+            "sys.stdout.write('tail'); sys.exit(7)", seconds='5')
+        self.assertEqual(status, 7)
+        self.assertEqual(transcript, 'stdout\nstderr\ntail')
+
+    def test_runner_sigterm_cleans_up_detached_suite_and_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'suite.log'
+            source = '''
+import os, signal
+pid = os.fork()
+if pid == 0:
+    os.setpgrp()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print('grandchild=' + str(os.getpid()), flush=True)
+    while True: signal.pause()
+print('leader=' + str(os.getpid()), flush=True)
+while True: signal.pause()
+'''
+            wrapper = (
+                'import ci_app_test_runner as r, os; from pathlib import Path; '
+                f'r.execute_logged({[sys.executable, "-u", "-c", source]!r}, None, '
+                f'dict(os.environ), Path({str(log)!r}))'
+            )
+            process = subprocess.Popen(
+                [sys.executable, '-c', wrapper], cwd=SCRIPT_DIR,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            try:
+                # Every child prints before parking. A bounded pipe wait, not a timing sleep.
+                import selectors
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    observed = ''
+                    deadline = time.monotonic() + 5
+                    while 'grandchild=' not in observed or 'leader=' not in observed:
+                        self.assertGreater(deadline, time.monotonic(), observed)
+                        for key, _ in selector.select(max(0, deadline - time.monotonic())):
+                            observed += os.read(key.fd, 65536).decode()
+                process.terminate()
+                output, _ = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 143, observed + output)
+                for line in observed.splitlines():
+                    if line.startswith(('leader=', 'grandchild=')):
+                        self.assert_process_stopped(line.split('=')[1])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+
+    def test_repeated_cancellation_cannot_interrupt_owned_session_cleanup(self):
+        cases = ((True, signal.SIGTERM, 143), (True, signal.SIGINT, 143),
+                 (False, signal.SIGTERM, 143), (False, signal.SIGINT, 130))
+        for already_cancelling, repeated_signal, expected_status in cases:
+            with self.subTest(already_cancelling=already_cancelling, repeated_signal=repeated_signal), \
+                    tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / 'suite.log'
+                control, barrier = socket.socketpair()
+                control.settimeout(5)
+                source = (
+                    "import os, signal; print('leader=' + str(os.getpid()), flush=True); "
+                    "os.close(1); os.close(2); " + ("signal.pause()" if already_cancelling else "os._exit(7)")
+                )
+                wrapper = f'''
+import ci_app_test_runner as runner, os, socket
+from pathlib import Path
+barrier = socket.socket(fileno={barrier.fileno()})
+inventory = runner.process_session.session_process_groups
+def gated_inventory(session_id):
+    runner.process_session.session_process_groups = inventory
+    barrier.sendall(b'R')
+    barrier.recv(1)
+    return inventory(session_id)
+runner.process_session.session_process_groups = gated_inventory
+runner.execute_logged({[sys.executable, '-u', '-c', source]!r}, None,
+                      dict(os.environ), Path({str(log)!r}))
+'''
+                process = subprocess.Popen([sys.executable, '-c', wrapper], cwd=SCRIPT_DIR,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           pass_fds=(barrier.fileno(),))
+                barrier.close()
+                child_pid = None
+                try:
+                    import selectors
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(process.stdout, selectors.EVENT_READ)
+                        observed = b''
+                        deadline = time.monotonic() + 5
+                        while b'\n' not in observed:
+                            self.assertGreater(deadline, time.monotonic(), observed)
+                            for key, _ in selector.select(max(0, deadline - time.monotonic())):
+                                observed += os.read(key.fd, 65536)
+                    child_pid = int(observed.split(b'leader=')[1].splitlines()[0])
+                    if already_cancelling:
+                        process.terminate()
+                    self.assertEqual(control.recv(1), b'R')
+                    os.kill(process.pid, repeated_signal)
+                    control.sendall(b'G')
+                    output, _ = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, expected_status, observed + output)
+                    self.assert_process_stopped(child_pid)
+                finally:
+                    control.close()
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+                    if child_pid is not None:
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_timed_out_suite_removes_stale_success_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / 'shard-1.json'
+            receipt.write_text('stale success')
+            command = (sys.executable, '-c', 'import time; time.sleep(60)')
+            with mock.patch.object(runner, 'command_for_suite', return_value=command), \
+                    mock.patch.dict(os.environ, {'CI_SUITE_TIMEOUT_SECONDS': '0.1'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = runner.run_selected_suites(
+                    ['Fixture.Suite'], swift_binary='unused', cwd=None,
+                    bundle_selection=runner.BundleSelection(None, {}, None),
+                    sandbox_root=root / 'sandbox', suite_methods={'Fixture.Suite': ['Fixture.Suite/testHung']},
+                    receipt_path=receipt, output=io.StringIO(),
+                )
+            self.assertEqual(status, 124)
+            self.assertFalse(receipt.exists(), 'a timeout must never attest successful execution')
+            self.assertIn('exceeded 0.1s', receipt.with_suffix('.log').read_text())
+
+    def test_invalid_deadline_is_rejected_before_spawn(self):
+        for value in ('0', '-1', 'nan', 'inf', '1201', 'not-a-number'):
+            with self.subTest(value=value), mock.patch.object(runner.subprocess, 'Popen') as spawn:
+                with self.assertRaisesRegex(ValueError, 'CI_SUITE_TIMEOUT_SECONDS'):
+                    runner.execute_logged(['unused'], None, {'CI_SUITE_TIMEOUT_SECONDS': value}, Path('unused'))
+                spawn.assert_not_called()
+
+    def test_unverified_cleanup_stops_the_shard_without_a_success_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / 'shard-1.json'
+            receipt.write_text('stale success')
+            with mock.patch.object(runner, 'command_for_suite',
+                                   return_value=(sys.executable, '-c', 'pass')) as commands, \
+                    mock.patch.object(runner.process_session, 'session_process_groups',
+                                      side_effect=RuntimeError('inventory failed')), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'inventory failed'):
+                    runner.run_selected_suites(
+                        ['Fixture.First', 'Fixture.Second'], swift_binary='unused', cwd=None,
+                        bundle_selection=runner.BundleSelection(None, {}, None),
+                        sandbox_root=root / 'sandbox',
+                        suite_methods={'Fixture.First': ['Fixture.First/testClean'],
+                                       'Fixture.Second': ['Fixture.Second/testClean']},
+                        receipt_path=receipt, output=io.StringIO(),
+                    )
+            commands.assert_called_once()
+            self.assertFalse(receipt.exists())
 
 
 class InheritedStoragePreferenceTests(unittest.TestCase):

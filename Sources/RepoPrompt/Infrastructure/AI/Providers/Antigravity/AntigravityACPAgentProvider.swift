@@ -39,7 +39,8 @@ struct AntigravityACPAgentProvider: ACPAgentProvider {
             environment: environment,
             workingDirectory: request.workspacePath,
             additionalPathHints: ["~/.local/bin", "/usr/local/bin"],
-            enableDebugLogging: false
+            enableDebugLogging: false,
+            explicitEnvironmentKeys: Set(environment.keys)
         )
     }
 
