@@ -3349,24 +3349,47 @@ import XCTest
                     try f.writeDocument(model)
                 }
             }) { f in
-                let (canonicalWindow, canonicalManager, _, _) = await f.makeWindowWithHeldInitialProjection()
-                let (duplicateWindow, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
-                // Cleanup owns exact workspace snapshots, not Chat's asynchronous blank-session
-                // restoration. Keep that unrelated writer behind a fixture-owned boundary.
+                // Cleanup owns exact workspace snapshots, not implicit Chat restoration. Own
+                // both entry points before either window can yield: the tab listener bypasses
+                // the workspace-load publication gate and can also create a blank session.
                 let chatRestoreGate = f.makeGate()
                 let chatRestoreEntered = Signal("canonical Chat restore held until cleanup completes")
                 let canonicalID = canonical.id
-                let oracle = duplicateWindow.oracleViewModel
-                oracle.workspaceChatSessionLoadBeforePublicationForTesting = { id, _ in
-                    guard id == canonicalID else { return }
-                    await chatRestoreGate.wait { chatRestoreEntered.fire() }
+                @MainActor func holdChatRestoration(_ oracle: OracleViewModel, signalCanonicalEntry: Bool) {
+                    oracle.disableActiveComposeTabChangedListenerForTesting()
+                    oracle.workspaceChatSessionLoadBeforePublicationForTesting = { id, _ in
+                        await chatRestoreGate.wait {
+                            if signalCanonicalEntry, id == canonicalID { chatRestoreEntered.fire() }
+                        }
+                    }
+                }
+                let (canonicalWindow, canonicalManager, _, _) = await f.makeWindowWithHeldInitialProjection {
+                    holdChatRestoration($0, signalCanonicalEntry: false)
+                }
+                let (duplicateWindow, manager, _, _) = await f.makeWindowWithHeldInitialProjection {
+                    holdChatRestoration($0, signalCanonicalEntry: true)
                 }
                 defer {
-                    // Revoke held publications before releasing them on every exit. Their
-                    // existing generation fence must reject them before any stored-tab write.
-                    oracle.invalidateWorkspaceChatSessionLoads()
-                    oracle.workspaceChatSessionLoadBeforePublicationForTesting = nil
+                    // Revoke every held publication before releasing it on every exit. The
+                    // existing generation fence rejects it before any stored-tab write.
+                    for oracle in [canonicalWindow.oracleViewModel, duplicateWindow.oracleViewModel] {
+                        oracle.invalidateWorkspaceChatSessionLoads()
+                        oracle.workspaceChatSessionLoadBeforePublicationForTesting = nil
+                    }
                     chatRestoreGate.release()
+                }
+                // The post-switch Git-data root auto-expands in the UI. A later token/selection
+                // read can commit that expansion to the canonical tab during sidecar preparation.
+                // Hold only that root's UI handoff; fixture shutdown closes/cancels the windows,
+                // releases its gates, and joins the tracked loads before removing storage.
+                let gitDataGate = f.makeGate()
+                let canonicalGitDataPath = canonicalManager.workspaceDirectory(for: canonical)
+                    .appendingPathComponent("_git_data", isDirectory: true).standardizedFileURL.path
+                for window in [canonicalWindow, duplicateWindow] {
+                    await window.workspaceFileContextStore.setRootLoadWillReturnHandlerForTesting { path, _ in
+                        guard path == canonicalGitDataPath else { return }
+                        await gitDataGate.wait()
+                    }
                 }
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 let models = try f.decoded(snapshot)
@@ -6000,7 +6023,7 @@ import XCTest
         // MARK: Construction
 
         /// Production composition with its sole bridge; no NSWindow, registration, or server.
-        func makeWindow() -> WindowState {
+        func makeWindow(configureOracle: (@MainActor (OracleViewModel) -> Void)? = nil) -> WindowState {
             let window = WindowState(
                 contextBuilderProviderFactory: { _, _, _, _ in
                     UnsupportedHeadlessAgentProvider(reason: "NewWindowInitialSelection fixture never streams")
@@ -6010,6 +6033,7 @@ import XCTest
                 codexModelPollingService: polling,
                 loadStoredAPISettingsDataOnInit: false
             )
+            configureOracle?(window.oracleViewModel)
             guard let bridge = window.domainWorkspacePresentationBridgeForTesting else {
                 preconditionFailure("Window fixture requires a domain workspace presentation bridge")
             }
@@ -6046,10 +6070,10 @@ import XCTest
 
         /// Real Window with startup Default resolution held and its sole Bridge stopped/joined, so DEBUG
         /// seams are installed before the restarted Bridge's first projection.
-        func makeWindowWithHeldInitialProjection() async -> (
+        func makeWindowWithHeldInitialProjection(configureOracle: (@MainActor (OracleViewModel) -> Void)? = nil) async -> (
             WindowState, WorkspaceManagerViewModel, ChooserRecorder, ProjectionEventRecorder
         ) {
-            let window = makeWindow()
+            let window = makeWindow(configureOracle: configureOracle)
             _ = holdInitialResolution(window.workspaceManager)
             let chooser = makeChooserRecorder(manager: window.workspaceManager)
             await window.joinDomainWorkspaceBridgeForTesting()
