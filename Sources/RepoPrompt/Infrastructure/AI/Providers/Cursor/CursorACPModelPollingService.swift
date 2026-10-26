@@ -5,7 +5,7 @@ protocol CursorACPModelDiscoveryClient: Sendable {
 }
 
 struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
@@ -14,16 +14,9 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
     init(
         providerFactory: @escaping ProviderFactory = { agent, modelString in
             if agent == .cursor {
-                return CursorACPAgentProvider(
-                    config: CursorAgentConfig(
-                        enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-                        modelString: modelString,
-                        includeRepoPromptMCPServer: false,
-                        cleanupProjectMCPApproval: false
-                    )
-                )
+                return Self.makeCursorProvider(modelString: modelString)
             }
-            return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -31,6 +24,23 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
     ) {
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
+    }
+
+    #if DEBUG
+        static func test_makeCursorProvider(modelString: String?) -> CursorACPAgentProvider {
+            makeCursorProvider(modelString: modelString)
+        }
+    #endif
+
+    private static func makeCursorProvider(modelString: String?) -> CursorACPAgentProvider {
+        CursorACPAgentProvider(
+            config: CursorAgentConfig(
+                enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+                modelString: modelString,
+                includeRepoPromptMCPServer: false,
+                cleanupProjectMCPApproval: false
+            )
+        )
     }
 
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
@@ -43,7 +53,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = providerFactory(.cursor, preferredModel) else { return nil }
+        guard let provider = try await providerFactory(.cursor, preferredModel) else { return nil }
         let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
@@ -54,8 +64,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            try? await controller.setSessionModel(preferredModel)
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .cursor)
+            let snapshot = try await controller.cursorAvailableModelCatalog()
             await controller.shutdown()
             return snapshot
         } catch {
@@ -86,7 +95,13 @@ actor CursorACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Bool, Never>?
+    struct RefreshResult {
+        let isReady: Bool
+        let advertisedCount: Int?
+        let errorMessage: String?
+    }
+
+    private var inFlightRefresh: Task<RefreshResult, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     #if DEBUG
         private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -104,7 +119,9 @@ actor CursorACPModelPollingService {
     }
 
     func latestSnapshot() async -> Snapshot? {
-        if let latest { return latest }
+        if let latest {
+            return latest
+        }
         return await registrySnapshotAfterWarmingStore()
     }
 
@@ -165,7 +182,11 @@ actor CursorACPModelPollingService {
 
     @discardableResult
     func refreshNow(workspacePath: String?) async -> Bool {
-        guard !isShutdown else { return false }
+        await refreshCatalog(workspacePath: workspacePath).isReady
+    }
+
+    func refreshCatalog(workspacePath: String?) async -> RefreshResult {
+        guard !isShutdown else { return .init(isReady: false, advertisedCount: nil, errorMessage: "Cursor discovery is stopped.") }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
             #if DEBUG
@@ -237,27 +258,27 @@ actor CursorACPModelPollingService {
         }
     #endif
 
-    private func performRefresh() async -> Bool {
-        guard !isShutdown else { return false }
+    private func performRefresh() async -> RefreshResult {
+        guard !isShutdown else { return .init(isReady: false, advertisedCount: nil, errorMessage: "Cursor discovery is stopped.") }
         if let existing = inFlightRefresh {
             return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task<Bool, Never> { [weak self, workspacePath] in
-            guard let self else { return false }
+        let task = Task<RefreshResult, Never> { [weak self, workspacePath] in
+            guard let self else { return .init(isReady: false, advertisedCount: nil, errorMessage: nil) }
             do {
                 let discovered = try await client.discoverModels(workspacePath: workspacePath)
-                guard !Task.isCancelled else { return false }
+                guard !Task.isCancelled else { return .init(isReady: false, advertisedCount: nil, errorMessage: nil) }
                 if let discovered {
                     await applyRefreshResult(discovered)
-                } else {
-                    await publishLiveReadinessWithoutModels()
+                    return .init(isReady: true, advertisedCount: discovered.options.count, errorMessage: nil)
                 }
-                return true
+                await publishLiveReadinessWithoutModels()
+                return .init(isReady: true, advertisedCount: nil, errorMessage: "Cursor returned no model metadata. Previous models were kept.")
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
-                return false
+                return .init(isReady: false, advertisedCount: nil, errorMessage: error.localizedDescription)
             }
         }
         inFlightRefresh = task

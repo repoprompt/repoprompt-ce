@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 // MARK: - Bundle helpers
@@ -42,7 +43,8 @@ private let bootstrapLog: Logger = {
 actor BootstrapSocketConnectionManager: MCPServerConnection {
     private let connectionID: UUID
     private let sessionToken: String
-    private let clientPid: Int
+    private let claimedClientPID: Int
+    private let observedKernelPeerPID: Int?
     private let _clientName: String?
     private let purpose: MCPRunPurpose
     private let server: MCP.Server
@@ -64,9 +66,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         sessionToken
     }
 
-    /// Verified peer PID for this connection (from the bootstrap socket).
-    func peerPID() -> Int {
-        clientPid
+    /// Kernel-observed peer PID for this connection. A client-declared PID is never returned here.
+    func peerPID() -> Int? {
+        observedKernelPeerPID
+    }
+
+    /// Client-declared handshake PID retained only for compatibility diagnostics and admission heuristics.
+    func claimedPID() -> Int {
+        claimedClientPID
     }
 
     private var healthMonitoringTask: Task<Void, Never>?
@@ -74,12 +81,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     private var state: ConnectionStateSnapshot = .connecting
     private var isClosing = false
     private var handshakeComplete = false
+    private var clientCapabilities: MCP.Client.Capabilities?
     private var startupFailureTransportSnapshot: MCPTransportCloseSnapshot?
 
     init(
         connectionID: UUID,
         sessionToken: String,
         clientPid: Int,
+        observedKernelPeerPID: Int? = nil,
         clientName: String?,
         purpose: MCPRunPurpose,
         codeMapsDisabled: Bool,
@@ -89,7 +98,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     ) throws {
         self.connectionID = connectionID
         self.sessionToken = sessionToken
-        self.clientPid = clientPid
+        claimedClientPID = clientPid
+        self.observedKernelPeerPID = observedKernelPeerPID
         _clientName = clientName
         self.purpose = purpose
         self.parentManager = parentManager
@@ -151,10 +161,11 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
             await registerHandlers()
 
             mcpConnectionLog("BootstrapSocketConnectionManager: starting MCP server...")
-            try await server.start(transport: transport) { [weak self] clientInfo, _ in
+            try await server.start(transport: transport) { [weak self] clientInfo, capabilities in
                 mcpConnectionLog("BootstrapSocketConnectionManager: received client info: \(clientInfo.name)")
                 guard let self else { throw MCPError.connectionClosed }
 
+                await recordClientCapabilities(capabilities)
                 let approved = await approvalHandler(clientInfo)
                 if !approved {
                     throw MCPError.connectionClosed
@@ -178,6 +189,37 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     func startupFailureTransportCloseSnapshot() -> MCPTransportCloseSnapshot? {
         startupFailureTransportSnapshot
+    }
+
+    func supportsFormElicitation() -> Bool {
+        clientCapabilities?.elicitation?.form != nil
+    }
+
+    func requestFormElicitation(
+        message: String,
+        requestedSchema: Elicitation.RequestSchema
+    ) async throws -> CreateElicitation.Result {
+        guard supportsFormElicitation(), !isClosing else {
+            throw MCPError.invalidRequest("Client did not negotiate form elicitation")
+        }
+        return try await server.requestElicitation(
+            message: message,
+            requestedSchema: requestedSchema,
+            mode: .form
+        )
+    }
+
+    func cancelFormElicitation() async {
+        guard !isClosing else { return }
+        await parentManager.terminateConnection(
+            connectionID,
+            reason: .runCancelled,
+            message: "The pending elicitation was cancelled."
+        )
+    }
+
+    private func recordClientCapabilities(_ capabilities: MCP.Client.Capabilities) {
+        clientCapabilities = capabilities
     }
 
     #if DEBUG
@@ -281,19 +323,34 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         updateState(.cancelled)
     }
 
-    func abortForExecutionWatchdog() async {
+    func abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext) async {
         if !isClosing {
             mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
-            await sendTerminateNotification(
-                reason: .toolExecutionWatchdog,
-                message: "Unresponsive tool execution exceeded the watchdog deadline"
-            )
+            // Establish terminal ownership before the first await so ordinary
+            // shutdown cannot race the watchdog's ingress snapshot.
             isClosing = true
             healthMonitoringTask?.cancel()
             healthMonitoringTask = nil
             closeWatchTask?.cancel()
             closeWatchTask = nil
         }
+
+        // An ordinary stop may already have marked this connection closing while
+        // awaiting an uncooperative handler. Its socket can still be live, so the
+        // transport's nonisolated entry seals outstanding IDs before it waits for
+        // the actor to finish any ordinary response write. Repeated calls remain
+        // idempotent through the transport ledger.
+        let terminateControlFrame = encodedTerminateNotification(
+            reason: .toolExecutionWatchdog,
+            message: MCPExecutionWatchdogTerminalContext.message
+        )
+        let deliveredErrorCount = await transport.sendExecutionWatchdogTerminalErrors(
+            context: context,
+            trailingControlFrame: terminateControlFrame
+        )
+        mcpConnectionLog(
+            "Delivered \(deliveredErrorCount) watchdog JSON-RPC terminal error(s) for bootstrap connection \(connectionID)"
+        )
 
         // Delivery must stop immediately even if ordinary shutdown has already
         // started and is blocked on the uncooperative handler.
@@ -331,21 +388,26 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     }
 
     private func sendTerminateNotification(reason: TerminationReason, message: String?) async {
-        guard handshakeComplete else { return }
-        let notification = RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
-            reason: reason,
-            message: message
-        )
-        guard let data = notification.encodedJSONLine() else {
-            bootstrapLog.warning("Failed to encode terminate notification")
-            return
-        }
+        guard let data = encodedTerminateNotification(reason: reason, message: message) else { return }
 
         do {
             try await transport.send(data)
         } catch {
             bootstrapLog.debug("Failed to send terminate notification: \(error)")
         }
+    }
+
+    private func encodedTerminateNotification(reason: TerminationReason, message: String?) -> Data? {
+        guard handshakeComplete else { return nil }
+        let notification = RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+            reason: reason,
+            message: message
+        )
+        guard let data = notification.encodedJSONLine() else {
+            bootstrapLog.warning("Failed to encode terminate notification")
+            return nil
+        }
+        return data
     }
 
     /// Sends a progress notification to the CLI.

@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 enum GitTargetEvidenceFamily: UInt8, Equatable {
     case treeDelta = 1
@@ -31,7 +33,7 @@ struct GitTargetEvidenceFileSystemIdentity: Equatable {
             throw GitTargetEvidenceManifestError.invalidConfiguration
         }
         canonicalPathBytes = pathBytes
-        device = UInt64(status.st_dev)
+        device = safeDeviceID(status.st_dev)
         inode = UInt64(status.st_ino)
     }
 }

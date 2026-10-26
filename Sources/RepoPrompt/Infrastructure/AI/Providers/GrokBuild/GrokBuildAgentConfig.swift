@@ -1,0 +1,63 @@
+import Foundation
+
+/// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
+struct GrokBuildAgentConfig {
+    /// Process-local MCP import isolation shared by Grok's ACP and one-shot launch adapters.
+    static let importIsolationEnvironment: [String: String] = [
+        "GROK_CLAUDE_MCPS_ENABLED": "0",
+        "GROK_CURSOR_MCPS_ENABLED": "0"
+    ]
+
+    /// Disable Grok-owned background features for host-managed Agent Mode, discovery and model polling.
+    static let managedBackgroundFeatureEnvironment: [String: String] = [
+        "GROK_MEMORY": "0",
+        "GROK_SUBAGENTS": "0",
+        "GROK_WORKFLOWS": "0",
+        "GROK_AUTO_WAKE": "0"
+    ]
+
+    let commandName: String
+    let additionalPathHints: [String]
+    let enableDebugLogging: Bool
+    let modelString: String?
+    let includeRepoPromptMCPServer: Bool
+    /// Provider-native full-access intent; when true the provider launches
+    /// `grok agent --always-approve --no-leader stdio`. Interactive runs may also carry the
+    /// intent via `ACPRunRequest.autoApproveAllToolPermissions`; the provider ORs both.
+    let alwaysApproveTools: Bool
+    /// Context Builder discovery restricts the native tool profile to MCP discovery/dispatch.
+    /// Other callers retain their native profile by default.
+    let discoveryMode: Bool
+    /// Grok (xAI) API key resolved asynchronously at provider-construction time from
+    /// the existing `.grokAPI` KeyManager account. `makeLaunchConfiguration` is
+    /// synchronous while the keychain is not, so resolution happens upstream
+    /// (`ACPAgentProviderFactory`). nil means "no stored key" — Grok's own credential
+    /// precedence (`~/.grok/auth.json`, config.toml) still applies.
+    let apiKey: String?
+    /// Process-local background-feature policy. Empty leaves the ACP caller's background
+    /// policy unchanged; managed callers, including discovery, opt in explicitly.
+    /// One-shot is a separate path that never reads this field.
+    let backgroundFeatureEnvironment: [String: String]
+
+    init(
+        commandName: String = "grok",
+        additionalPathHints: [String] = CLIPathHints.grokBuild,
+        enableDebugLogging: Bool = false,
+        modelString: String? = nil,
+        includeRepoPromptMCPServer: Bool = true,
+        alwaysApproveTools: Bool = false,
+        discoveryMode: Bool = false,
+        apiKey: String? = nil,
+        backgroundFeatureEnvironment: [String: String] = [:]
+    ) {
+        self.commandName = commandName
+        self.additionalPathHints = additionalPathHints
+        self.enableDebugLogging = enableDebugLogging
+        self.modelString = modelString
+        self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
+        self.alwaysApproveTools = alwaysApproveTools
+        self.discoveryMode = discoveryMode
+        self.apiKey = apiKey
+        self.backgroundFeatureEnvironment = backgroundFeatureEnvironment
+    }
+}

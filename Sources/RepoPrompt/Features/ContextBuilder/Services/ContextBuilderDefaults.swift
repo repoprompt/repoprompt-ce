@@ -1,40 +1,7 @@
 import Foundation
-import RepoPromptShared
+import RepoPromptSettingsCore
 
-/// Controls how Context Builder handles the user's original prompt
-enum PromptEnhancementMode: String, Codable, CaseIterable {
-    case fullRewrite // Agent rewrites prompt from discoveries
-    case augment // Preserve original + add context
-    case preserve // Don't touch the prompt at all
-}
-
-/// Centralized default values for Context Builder.
-/// Update these values to change defaults across the entire app.
-enum ContextBuilderDefaults {
-    // MARK: - Token Budgets
-
-    /// Default token budget for discovery runs (UI slider default)
-    static let discoveryTokenBudget: Int = 160_000
-
-    /// Default token budget for plan generation
-    static let planTokenBudget: Int = 120_000
-
-    // MARK: - Enhancement Mode
-
-    /// Default prompt enhancement mode
-    static let enhancementMode: PromptEnhancementMode = .fullRewrite
-
-    // MARK: - Clarifying Questions
-
-    /// Whether clarifying questions are allowed by default (UI-triggered discovery)
-    static let allowClarifyingQuestions: Bool = true
-
-    /// Whether clarifying questions are allowed for MCP-triggered discovery
-    static let allowClarifyingQuestionsForMCP: Bool = false
-
-    /// Default timeout (in seconds) for user responses to clarifying questions
-    static let questionTimeoutSeconds = MCPTimeoutPolicy.askUserDefaultTimeoutSeconds
-
+extension ContextBuilderDefaults {
     /// Report-only watchdog for a live run that has not yet opened its owned MCP connection.
     static let mcpRoutingWatchdogSeconds: TimeInterval = 30
 
@@ -51,9 +18,4 @@ enum ContextBuilderDefaults {
 
     /// Bounded handoff after response-drain failure while orderly peer-EOF teardown publishes final context ownership.
     static let peerEOFDetachmentHandoffTimeoutSeconds: TimeInterval = 10
-
-    // MARK: - Plan Generation
-
-    /// Whether to auto-generate a plan after Context Builder completes
-    static let autoGeneratePlan: Bool = false
 }

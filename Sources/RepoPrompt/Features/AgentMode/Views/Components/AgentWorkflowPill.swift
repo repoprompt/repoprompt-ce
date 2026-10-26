@@ -1,3 +1,4 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Workflow Pill
@@ -6,6 +7,7 @@ import SwiftUI
 /// Collapsed: shows current selection or generic "Workflow" label.
 /// Clicking opens a popover with workflow options (two-pane when custom workflows exist).
 struct AgentWorkflowPill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     @ObservedObject var workflowStore: AgentWorkflowStore = .shared
     let windowID: Int
@@ -24,7 +26,7 @@ struct AgentWorkflowPill: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.workflow")
+            let _ = perfRecorder.increment("ui.body.statusPills.workflow")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let height = AgentPillMetrics.height()

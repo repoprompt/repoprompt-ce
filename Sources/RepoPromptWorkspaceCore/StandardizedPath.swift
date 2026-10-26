@@ -3,9 +3,14 @@ import Foundation
 private let standardizedPathSlashTrim = CharacterSet(charactersIn: "/")
 
 package enum StandardizedPath {
+    /// Returns a native Swift string. `standardizingPath` hands back a lazily bridged
+    /// `NSPathStore2`, and every later comparison or hash of a bridged string goes through
+    /// `NSString` and Unicode normalization; catalog sorts were two orders of magnitude slower.
     @inline(__always)
     package static func absolute(_ path: String) -> String {
-        (path as NSString).standardizingPath
+        var standardized = (path as NSString).standardizingPath
+        standardized.makeContiguousUTF8()
+        return standardized
     }
 
     @inline(__always)

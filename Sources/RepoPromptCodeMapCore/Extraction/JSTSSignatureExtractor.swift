@@ -49,7 +49,11 @@ enum JSTSSignatureExtractor {
         case .statementLike:
             extractStatementSignature(line)
         }
-        let normalized = normalizeSingleLine(result)
+        let normalized = normalizeSingleLine(
+            result,
+            perfStats: perfStats,
+            perfOptions: perfOptions
+        )
         if perfOptions.enabled {
             perfStats?.jstsSignatureDuration += (CFAbsoluteTimeGetCurrent() - start)
         }
@@ -426,7 +430,98 @@ enum JSTSSignatureExtractor {
         return trimmed
     }
 
-    private static func normalizeSingleLine(_ line: String) -> String {
+    static func normalizeSingleLine(
+        _ line: String,
+        perfStats: CodeMapPerformanceCollector? = nil,
+        perfOptions: CodeMapPerfOptions = .disabled
+    ) -> String {
+        let asciiStart = perfOptions.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        var needsRewrite = false
+        var previousWasWhitespace = true
+        var asciiByteCount = 0
+        var lastByte: UInt8?
+
+        for byte in line.utf8 {
+            if byte >= 0x80 {
+                let legacyStart = perfOptions.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                let normalized = normalizeSingleLineLegacy(line)
+                if perfOptions.collectCounters {
+                    perfStats?.jstsNormalizationUnicodeFallbackCount += 1
+                }
+                if perfOptions.enabled {
+                    perfStats?.jstsNormalizationLegacyFallbackDuration +=
+                        CFAbsoluteTimeGetCurrent() - legacyStart
+                }
+                return normalized
+            }
+
+            asciiByteCount += 1
+            lastByte = byte
+            let isWhitespace = byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+            if isWhitespace {
+                if previousWasWhitespace || byte != 0x20 {
+                    needsRewrite = true
+                }
+                previousWasWhitespace = true
+            } else {
+                previousWasWhitespace = false
+            }
+        }
+
+        if asciiByteCount > 0, previousWasWhitespace {
+            needsRewrite = true
+        }
+        if lastByte == 0x3B {
+            needsRewrite = true
+        }
+
+        guard needsRewrite else {
+            if perfOptions.collectCounters {
+                perfStats?.jstsNormalizationASCIINoOpCount += 1
+            }
+            if perfOptions.enabled {
+                perfStats?.jstsNormalizationASCIIFastPathDuration +=
+                    CFAbsoluteTimeGetCurrent() - asciiStart
+            }
+            return line
+        }
+
+        var normalizedUTF8: [UInt8] = []
+        normalizedUTF8.reserveCapacity(asciiByteCount)
+        var pendingWhitespace = false
+        for byte in line.utf8 {
+            let isWhitespace = byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+            if isWhitespace {
+                if !normalizedUTF8.isEmpty {
+                    pendingWhitespace = true
+                }
+            } else {
+                if pendingWhitespace {
+                    normalizedUTF8.append(0x20)
+                    pendingWhitespace = false
+                }
+                normalizedUTF8.append(byte)
+            }
+        }
+        if normalizedUTF8.last == 0x3B {
+            normalizedUTF8.removeLast()
+            if normalizedUTF8.last == 0x20 {
+                normalizedUTF8.removeLast()
+            }
+        }
+
+        let normalized = String(decoding: normalizedUTF8, as: UTF8.self)
+        if perfOptions.collectCounters {
+            perfStats?.jstsNormalizationASCIIRewriteCount += 1
+        }
+        if perfOptions.enabled {
+            perfStats?.jstsNormalizationASCIIFastPathDuration +=
+                CFAbsoluteTimeGetCurrent() - asciiStart
+        }
+        return normalized
+    }
+
+    static func normalizeSingleLineLegacy(_ line: String) -> String {
         var out = ""
         out.reserveCapacity(line.count)
         var previousWasWhitespace = true

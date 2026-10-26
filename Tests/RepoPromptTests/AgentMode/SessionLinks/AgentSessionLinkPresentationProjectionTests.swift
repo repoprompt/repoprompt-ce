@@ -1,0 +1,1121 @@
+import Combine
+import Foundation
+@testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import XCTest
+
+/// Exact projection storage is the presentation truth for overseer role surfaces.
+///
+/// These tests stay at the live view-model boundary because the ordering contract spans the map
+/// mutation, status-pill publication, and raw notification observed by sidebar and window-title UI.
+@MainActor
+final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
+    private var retainedViewModels: [AgentModeViewModel] = []
+    private var retainedWorkspaces: [WorkspaceManagerViewModel] = []
+
+    override func tearDown() {
+        retainedViewModels.removeAll()
+        retainedWorkspaces.removeAll()
+        super.tearDown()
+    }
+
+    private struct Fixture {
+        let viewModel: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let tabID: UUID
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 81,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        retainedViewModels.append(viewModel)
+        retainedWorkspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "Overseer projection publication"
+        ))
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        return try Fixture(
+            viewModel: viewModel,
+            session: session,
+            tabID: tabID,
+            endpoint: AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        )
+    }
+
+    private func props(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        outboundCount: Int = 1,
+        inboundCount: Int = 0
+    ) -> AgentMonitorPillProps {
+        AgentMonitorPillProps(
+            sessionID: endpoint.sessionID,
+            outbound: (0 ..< outboundCount).map { index in
+                let targetSessionID = UUID()
+                return AgentMonitorPillProps.Outbound(
+                    linkID: UUID(),
+                    generation: UInt64(index + 1),
+                    targetSessionID: targetSessionID,
+                    targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(
+                        sessionID: targetSessionID
+                    ),
+                    displayName: "Target \(index)",
+                    providerDisplayName: "Codex CLI",
+                    locationLabel: "worktree/\(index)",
+                    status: .idle
+                )
+            },
+            inbound: (0 ..< inboundCount).map { index in
+                let observerSessionID = UUID()
+                return AgentMonitorPillProps.Inbound(
+                    linkID: UUID(),
+                    generation: UInt64(index + 1),
+                    observerSessionID: observerSessionID,
+                    observerEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(
+                        sessionID: observerSessionID
+                    ),
+                    displayName: "Observer \(index)",
+                    providerDisplayName: "Claude Code"
+                )
+            },
+            recentNotices: [],
+            canAddReason: nil
+        )
+    }
+
+    func testCandidateIdentityWorkIsLinearAndSidebarReadsValidateOneTab() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        // Exercise the real candidate producer, not a mock host's outer read count. Fixture setup
+        // is outside the measured reads; no candidate/row read may hydrate or change model bindings.
+        for count in [32, 200] {
+            var workspace = try XCTUnwrap(manager.activeWorkspace)
+            workspace.composeTabs = (0 ..< count).map { index in
+                var tab = ComposeTabState(id: UUID(), name: "Chat \(index)")
+                tab.activeAgentSessionID = UUID()
+                return tab
+            }
+            manager.workspaces = [workspace]
+            for tab in workspace.composeTabs {
+                let session = fixture.viewModel.session(for: tab.id)
+                session.selectedAgent = .claudeCode
+                session.hasLoadedPersistedState = true
+            }
+            let modelBefore = manager.workspaces
+            manager.test_lifecycleBindingTabValidationCount = 0
+            let candidates = fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false)
+            XCTAssertEqual(candidates.count, count)
+            XCTAssertEqual(
+                manager.test_lifecycleBindingTabValidationCount,
+                count,
+                "One current-model tab validation per candidate, independent of its array position"
+            )
+            let last = try XCTUnwrap(candidates.last)
+            manager.test_lifecycleBindingTabValidationCount = 0
+            XCTAssertEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ), last.domainEndpoint)
+            XCTAssertFalse(fixture.viewModel.agentSessionLinkIsOverseer(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ))
+            XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ))
+            XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 3)
+            XCTAssertEqual(manager.workspaces, modelBefore, "Reads must neither rebuild nor mutate bindings")
+        }
+    }
+
+    func testLifecycleIndexPreservesFirstExactMatchAcrossDuplicatesAndNestedEdits() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        let original = try XCTUnwrap(manager.activeWorkspace)
+        let sessionID = fixture.endpoint.sessionID
+        var mismatched = original.composeTabs[0]
+        mismatched.activeAgentSessionID = UUID()
+        var first = WorkspaceModel(name: "First", repoPaths: [], ephemeralFlag: true)
+        first.composeTabs = [mismatched, original.composeTabs[0], original.composeTabs[0]]
+        // Repeated workspace IDs must not inherit model-routing's ambiguous/last-wins semantics.
+        var wrongIncarnation = first
+        wrongIncarnation.composeTabs = [mismatched]
+        manager.workspaces = [wrongIncarnation, first, original]
+
+        func assertMatchesScan(file: StaticString = #filePath, line: UInt = #line) {
+            let expected = manager.workspaces.first { workspace in
+                workspace.composeTabs.contains { $0.id == fixture.tabID && $0.activeAgentSessionID == sessionID }
+            }?.id
+            XCTAssertEqual(fixture.viewModel.agentSessionLifecycleIdentity(
+                tabID: fixture.tabID, expectedSessionID: sessionID
+            )?.workspaceID, expected, file: file, line: line)
+        }
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, first.id)
+        manager.workspaces.swapAt(1, 2)
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, original.id)
+        manager.workspaces[1].composeTabs.removeAll()
+        assertMatchesScan()
+        manager.workspaces[2].composeTabs.remove(at: 1)
+        assertMatchesScan()
+        manager.workspaces[2].composeTabs[1].activeAgentSessionID = UUID()
+        assertMatchesScan()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        manager.workspaces = [original]
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.endpoint)
+    }
+
+    func testIndexedIdentityReadsLiveGenerationsAndDoesNotHydrateRemovedBindings() async throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        let original = manager.workspaces
+        fixture.session.hasLoadedPersistedState = false
+        let cold = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
+        XCTAssertFalse(cold.hasLoadedPersistedState)
+        XCTAssertEqual(cold.domainEndpoint, fixture.endpoint)
+        XCTAssertFalse(fixture.session.hasLoadedPersistedState)
+        XCTAssertNil(fixture.session.persistedLoadTask)
+
+        // A synchronous model index must never cache session generations across an authority hop.
+        let beforeHop = fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+        await Task.yield()
+        fixture.session.beginPersistentBindingTransition()
+        let transitioned = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        XCTAssertNotEqual(transitioned, beforeHop)
+        XCTAssertEqual(transitioned.bindingTransitionGeneration, fixture.session.bindingTransitionGeneration)
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: nil, on: fixture.session, updateWorkspaceMetadata: false
+        )
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: fixture.endpoint.sessionID, on: fixture.session, updateWorkspaceMetadata: false
+        )
+        let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        XCTAssertEqual(rebound.persistentBindingGeneration, fixture.session.persistentSessionBindingIdentity?.generation)
+        XCTAssertNotEqual(rebound.persistentBindingGeneration, fixture.endpoint.persistentBindingGeneration)
+        manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        manager.workspaces = original
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), rebound)
+        fixture.viewModel.test_removeSession(tabID: fixture.tabID)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false).isEmpty)
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+    }
+
+    func testActivationRetirementSettersPublishOnceWithoutLinkOrWakeEvents() async throws {
+        let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousSink }
+        for mutation in ["mcp-origin", "parent", "creator", "mcp-control", "transition", "binding"] {
+            let fixture = try makeFixture()
+            let expected = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+            )
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkActivateOverseer(for: fixture.endpoint, expected: expected))
+            var retiredSessionIDs: [UUID] = []
+            let retired = expectation(description: "One retirement for \(mutation)")
+            let unrelated = expectation(description: "Unrelated oversight does not retire activation")
+            unrelated.isInverted = true
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                unrelated.fulfill()
+            }
+            var projectionNotifications = 0
+            let subscription = NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange, object: fixture.viewModel
+            ).sink { _ in projectionNotifications += 1 }
+            fixture.session.oversight.autoWakeOnUpdates.toggle()
+            await fulfillment(of: [unrelated], timeout: 0.1)
+            XCTAssertTrue(retiredSessionIDs.isEmpty, "unrelated oversight writes must not emit retirement")
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                retired.fulfill()
+            }
+            switch mutation {
+            case "mcp-origin": fixture.session.isMCPOriginated = true
+            case "parent": fixture.session.parentSessionID = UUID()
+            case "creator": fixture.session.createdByOverseerSessionID = UUID()
+            case "mcp-control":
+                let registration = await AgentRunSessionStore.register(sessionID: fixture.endpoint.sessionID)
+                fixture.session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                    sessionID: fixture.endpoint.sessionID, activationID: UUID(), registration: registration,
+                    currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                    originatingConnectionID: nil,
+                    interactionTransport: .mcp(sessionID: fixture.endpoint.sessionID, originatingConnectionID: nil),
+                    suppressUserNotifications: true, forceAutoEditEnabled: false,
+                    autoEditEnabledBeforeOverride: fixture.session.autoEditEnabled, taskLabelKind: .explore
+                )
+            case "transition":
+                let generation = fixture.session.beginPersistentBindingTransition()
+                fixture.session.finishPersistentBindingTransition(generation: generation)
+            default:
+                fixture.session.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
+                    tabID: fixture.tabID, sessionID: fixture.endpoint.sessionID
+                ))
+            }
+            await fulfillment(of: [retired], timeout: 1)
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], mutation)
+            XCTAssertNil(fixture.session.oversight.overseerActivation)
+            // Discovery is notified synchronously; the pill repaint is deferred past the setter.
+            try await AsyncTestWait.waitUntil("retired pill repaint for \(mutation)", timeout: 10) {
+                fixture.viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation == nil
+            }
+            let replay = expectation(description: "Nil clears and unrelated writes do not replay")
+            replay.isInverted = true
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
+                replay.fulfill()
+            }
+            fixture.session.oversight.overseerActivation = nil
+            fixture.session.oversight.overseerActivation = nil
+            fixture.session.oversight.autoWakeOnUpdates.toggle()
+            await fulfillment(of: [replay], timeout: 0.1)
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], "nil clears and unrelated writes do not replay")
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(projectionNotifications, 0, "activation loss is not a link/prompt inventory publication")
+            if fixture.session.mcpControlContext != nil {
+                await fixture.viewModel.mcpDeactivateControlContext(sessionID: fixture.endpoint.sessionID, cleanupSessionStore: true)
+            }
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    func testRetiredSessionCallbackRetiresDiscoveryWithoutRepaintingReplacementOwner() async throws {
+        let fixture = try makeFixture()
+        let expected = AgentSessionOverseerBootstrapState(
+            sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+        )
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkActivateOverseer(for: fixture.endpoint, expected: expected))
+        let successor = AgentTabSession(tabID: fixture.tabID)
+        successor.selectedAgent = .claudeCode
+        successor.hasLoadedPersistedState = true
+        successor.installPersistentSessionBinding(fixture.session.persistentSessionBindingIdentity)
+        successor.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(successor.permitsBoundOperationAndSave)
+        fixture.viewModel.test_installLiveSession(successor)
+        fixture.viewModel.syncStatusPillsUIState()
+        let snapshot = fixture.viewModel.ui.statusPills.snapshot
+        let revision = fixture.viewModel.ui.statusPills.revision
+        let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousSink }
+        let retiredAdvertisement = expectation(description: "Discovery retires the outgoing endpoint despite replacement")
+        var retiredSessionIDs: [UUID] = []
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+            retiredSessionIDs.append(sessionID)
+            retiredAdvertisement.fulfill()
+        }
+        fixture.session.parentSessionID = UUID()
+        await fulfillment(of: [retiredAdvertisement], timeout: 1)
+        // The deferred repaint hop was enqueued on the main actor before this one; MainActor jobs run
+        // FIFO, so awaiting it proves the hop ran and was fenced off the replacement owner.
+        await Task { @MainActor in }.value
+        XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID])
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot, snapshot)
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.revision, revision)
+        XCTAssertEqual(snapshot.monitor.overseerBootstrapState?.sessionIdentity, ObjectIdentifier(successor))
+        XCTAssertNil(snapshot.monitor.overseerBootstrapState?.activation)
+    }
+
+    func testProjectionOverlayPreservesLinkedSummary() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        let stored = try XCTUnwrap(fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint])
+        XCTAssertTrue(try XCTUnwrap(stored.outbound.first).isAutoWakeEffectivelySelected)
+        XCTAssertEqual(stored.outbound.map(\.targetEndpoint), published.outbound.map(\.targetEndpoint))
+        XCTAssertEqual(stored.outbound.map(\.displayName), published.outbound.map(\.displayName))
+    }
+
+    func testProjectionPublicationStoresAndSynchronizesBeforeOneOwnerScopedNotification() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        var notifications: [Notification] = []
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: fixture.viewModel
+        ).sink { notification in
+            notifications.append(notification)
+            let stored = fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+            XCTAssertEqual(stored?.endpoint, fixture.endpoint)
+            XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+            // Queue and bootstrap presentation are derived live, not stored in the bridge projection.
+            var expectedDisplay = stored
+            expectedDisplay?.pendingUpdates = .empty
+            expectedDisplay?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+            )
+            XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor, expectedDisplay)
+        }
+
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        XCTAssertEqual(
+            Notification.Name.agentSessionLinkOverseerProjectionDidChange.rawValue,
+            "RepoPrompt.agentSessionLinkOverseerProjectionDidChange"
+        )
+        XCTAssertEqual(notifications.count, 1)
+        XCTAssertTrue((notifications.first?.object as? AgentModeViewModel) === fixture.viewModel)
+        XCTAssertNil(notifications.first?.userInfo)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testRoutineIntervalWritesSynchronizeStatusPillsWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        // Match the cached and live master values; this test changes only the interval.
+        fixture.session.oversight.autoWakeOnUpdates = false
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 0),
+            to: fixture.endpoint
+        )
+        XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabID)
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
+        for (enabled, seconds) in [(true, 3600), (false, 10800)] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetRoutineWakeInterval(
+                enabled: enabled,
+                seconds: seconds,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.routineWakeIntervalEnabled, enabled)
+            XCTAssertEqual(displayed.routineWakeIntervalSeconds, seconds)
+            XCTAssertFalse(displayed.autoWakeOnUpdatesEnabled)
+        }
+    }
+
+    func testPeriodicIdleWritesSynchronizeStatusPillsWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        for (enabled, seconds) in [(true, 7200), (false, 21600)] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetPeriodicIdleWake(
+                enabled: enabled,
+                seconds: seconds,
+                for: fixture.endpoint
+            ))
+            fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.periodicIdleWakeEnabled, enabled)
+            XCTAssertEqual(displayed.periodicIdleWakeIntervalSeconds, seconds)
+            XCTAssertFalse(displayed.routineWakeIntervalEnabled)
+            XCTAssertEqual(displayed.routineWakeIntervalSeconds, 300)
+        }
+    }
+
+    func testMasterWritesSynchronizeLivePolicyWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.autoWakeOnUpdatesEnabled)
+
+        for enabled in [true, false] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+                enabled,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.autoWakeOnUpdatesEnabled, enabled)
+            XCTAssertEqual(try XCTUnwrap(displayed.outbound.first).isAutoWakeEffectivelySelected, enabled)
+            // A late projection cannot overwrite a newer saved preference.
+            fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+            XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor.autoWakeOnUpdatesEnabled, enabled)
+        }
+    }
+
+    func testGranularWritesSynchronizeLivePolicyWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let targetSessionID = try XCTUnwrap(published.outbound.first).targetSessionID
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        for selection: Set<UUID> in [[targetSessionID], []] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs(
+                selection,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.autoWakeTargetSessionIDs, selection)
+            XCTAssertFalse(displayed.autoWakeOnUpdatesEnabled)
+            XCTAssertEqual(
+                try XCTUnwrap(displayed.outbound.first).isAutoWakeEffectivelySelected,
+                selection.contains(targetSessionID)
+            )
+        }
+    }
+
+    func testEqualProjectionReplacementPublishesNothing() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        var notificationCount = 0
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: fixture.viewModel
+        ).sink { _ in notificationCount += 1 }
+
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        XCTAssertEqual(notificationCount, 0)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testReplacementBatchRemovesSupersededIncarnationBeforeItsSingleNotification() throws {
+        let fixture = try makeFixture()
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint),
+            to: fixture.endpoint
+        )
+        fixture.session.beginPersistentBindingTransition()
+        let replacement = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        XCTAssertNotEqual(replacement, fixture.endpoint)
+
+        var notificationCount = 0
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: fixture.viewModel
+        ).sink { _ in
+            notificationCount += 1
+            XCTAssertEqual(Set(fixture.viewModel.monitorPillPropsByEndpoint.keys), [replacement])
+        }
+
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: replacement),
+            to: replacement
+        )
+
+        XCTAssertEqual(notificationCount, 1)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testPruneRemovesEveryStaleProjectionBeforeOneNotification() throws {
+        let fixture = try makeFixture()
+        let first = DomainAgentSessionLinkEndpointIdentity(
+            windowID: fixture.endpoint.windowID,
+            workspaceID: fixture.endpoint.workspaceID,
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 0
+        )
+        let second = DomainAgentSessionLinkEndpointIdentity(
+            windowID: fixture.endpoint.windowID,
+            workspaceID: fixture.endpoint.workspaceID,
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 0
+        )
+        fixture.viewModel.monitorPillPropsByEndpoint = [
+            first: props(endpoint: first),
+            second: props(endpoint: second)
+        ]
+
+        var notificationCount = 0
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: fixture.viewModel
+        ).sink { notification in
+            notificationCount += 1
+            XCTAssertTrue(fixture.viewModel.monitorPillPropsByEndpoint.isEmpty)
+            XCTAssertNil(notification.userInfo)
+        }
+
+        fixture.viewModel.agentSessionLinkPruneProjections()
+
+        XCTAssertEqual(notificationCount, 1)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testChildAndMCPOriginEligibilityChangesNotifyAfterStorageWithoutStatusChurn() throws {
+        let fixture = try makeFixture()
+        let previous = AgentSessionLinkCandidateReadinessSignal.onChange
+        defer { AgentSessionLinkCandidateReadinessSignal.onChange = previous }
+        var observed: [String] = []
+        AgentSessionLinkCandidateReadinessSignal.onChange = {
+            observed.append("\(fixture.session.parentSessionID != nil):\(fixture.session.isMCPOriginated)")
+        }
+        fixture.session.parentSessionID = UUID()
+        fixture.session.parentSessionID = UUID() // Still a child: eligibility did not change.
+        fixture.session.parentSessionID = nil
+        fixture.session.isMCPOriginated = true
+        fixture.session.isMCPOriginated = true
+        fixture.session.isMCPOriginated = false
+        fixture.session.runState = .running
+        XCTAssertEqual(observed, ["true:false", "false:false", "false:true", "false:false"])
+    }
+
+    func testSidebarMenuIdentityRejectsWrongSessionAndRebindBeforeCatalogAvailability() throws {
+        let fixture = try makeFixture()
+        XCTAssertEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID), fixture.endpoint)
+        XCTAssertNil(fixture.viewModel.agentSidebarOversightTargetEndpoint(tabID: fixture.tabID, expectedSessionID: UUID()))
+        XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(tabID: fixture.tabID, expectedSessionID: UUID()))
+        // Stored projections cannot fabricate choices before a coherent bridge catalog exists.
+        fixture.viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
+        XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID))
+        fixture.session.beginPersistentBindingTransition()
+        XCTAssertNotEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID), fixture.endpoint)
+        XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID))
+    }
+
+    func testHUDOversightRolesCountExactProjectionAndFailClosedAfterRebind() throws {
+        let fixture = try makeFixture()
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1),
+            to: fixture.endpoint
+        )
+        let role = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(role.overseeingCount, 3)
+        XCTAssertTrue(role.isOverseen)
+        let row = AgentModeViewModel.SidebarSession(
+            id: fixture.tabID, tabID: fixture.tabID, title: "Controller", lastUserMessageAt: nil,
+            activityDate: Date(timeIntervalSince1970: 100), isPinned: false, sessionID: fixture.endpoint.sessionID,
+            parentSessionID: nil, depth: 4, isMCPControlled: false
+        )
+        let items = AgentNavigationHUDSnapshotBuilder.currentWindowItems(
+            rows: [row], currentTabID: nil, windowID: fixture.endpoint.windowID,
+            workspaceID: fixture.endpoint.workspaceID, workspaceTitle: "Workspace", windowTitle: "Window",
+            oversightRoleByTabID: fixture.viewModel.agentSessionLinkOversightRoles(for: [row])
+        )
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(item.overseenSessionCount, 3)
+        XCTAssertTrue(item.isOverseen)
+        XCTAssertEqual(item.overseenSessionCount, role.overseeingCount)
+        XCTAssertEqual(item.isOverseen, role.isOverseen)
+        XCTAssertTrue(item.accessibilityStatusText.contains("Overseeing 3"))
+        XCTAssertTrue(item.accessibilityStatusText.contains("Overseen by another session"))
+        for token in ["overseer", "overseeing", "overseen"] {
+            XCTAssertTrue(AgentSessionSearchMatcher.matches(query: .parse(token), fields: item.searchFields))
+        }
+        let wrongSession = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: UUID())
+        XCTAssertEqual(wrongSession.overseeingCount, 0)
+        XCTAssertFalse(wrongSession.isOverseen)
+        fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint] = props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1)
+        let unstamped = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(unstamped.overseeingCount, 0)
+        XCTAssertFalse(unstamped.isOverseen)
+        let unstampedBulk = fixture.viewModel.agentSessionLinkOversightRoles(for: [row])[fixture.tabID]
+        XCTAssertEqual(unstampedBulk?.overseeingCount, 0)
+        XCTAssertEqual(unstampedBulk?.isOverseen, false)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1), to: fixture.endpoint
+        )
+        fixture.session.beginPersistentBindingTransition()
+        let stale = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(stale.overseeingCount, 0)
+        XCTAssertFalse(stale.isOverseen)
+        let staleBulk = fixture.viewModel.agentSessionLinkOversightRoles(for: [row])[fixture.tabID]
+        XCTAssertEqual(staleBulk?.overseeingCount, 0)
+        XCTAssertEqual(staleBulk?.isOverseen, false)
+    }
+
+    func testHUDRoleProjectionParityAcrossWorkspacesAndDuplicateRows() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(fixture.viewModel.workspaceManager)
+        let otherTabID = UUID()
+        // A recovered tab ID with a different session must not shadow its exact owner.
+        manager.workspaces.insert(WorkspaceModel(
+            name: "Other workspace", repoPaths: [], ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: fixture.tabID, name: "Stale duplicate", activeAgentSessionID: UUID()),
+                ComposeTabState(id: otherTabID, name: "Other tab")
+            ], activeComposeTabID: otherTabID
+        ), at: 0)
+        let originalWorkspace = manager.activeWorkspace
+        manager.activeWorkspace = manager.workspaces[0]
+        let otherSession = fixture.viewModel.session(for: otherTabID)
+        otherSession.selectedAgent = .claudeCode
+        otherSession.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(otherSession))
+        manager.activeWorkspace = originalWorkspace
+        let otherEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: otherTabID)
+        XCTAssertNotEqual(otherEndpoint.workspaceID, fixture.endpoint.workspaceID)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 2), to: fixture.endpoint
+        )
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: otherEndpoint, outboundCount: 0, inboundCount: 1), to: otherEndpoint
+        )
+        let rows = [fixture.endpoint, otherEndpoint, fixture.endpoint].map { endpoint in
+            AgentModeViewModel.SidebarSession(
+                id: endpoint.tabID, tabID: endpoint.tabID, title: "Session", lastUserMessageAt: nil,
+                activityDate: Date(timeIntervalSince1970: 100), isPinned: false, sessionID: endpoint.sessionID,
+                parentSessionID: nil, depth: 0, isMCPControlled: false
+            )
+        }
+        let roles = fixture.viewModel.agentSessionLinkOversightRoles(for: rows)
+        for endpoint in [fixture.endpoint, otherEndpoint] {
+            let scalar = fixture.viewModel.agentSessionLinkOversightRole(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID)
+            let bulk = try XCTUnwrap(roles[endpoint.tabID])
+            XCTAssertEqual(bulk.overseeingCount, scalar.overseeingCount)
+            XCTAssertEqual(bulk.isOverseen, scalar.isOverseen)
+        }
+        XCTAssertEqual(roles[fixture.tabID]?.overseeingCount, 2)
+        XCTAssertEqual(roles[otherTabID]?.isOverseen, true)
+    }
+
+    func testHUDIgnoresNonRoleProjectionPublicationsButRefreshesRoleChanges() async throws {
+        let fixture = try makeFixture()
+        let row = AgentModeViewModel.SidebarSession(
+            id: fixture.tabID, tabID: fixture.tabID, title: "Controller", lastUserMessageAt: nil,
+            activityDate: Date(timeIntervalSince1970: 100), isPinned: false, sessionID: fixture.endpoint.sessionID,
+            parentSessionID: nil, depth: 0, isMCPControlled: false
+        )
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 2), to: fixture.endpoint
+        )
+        let hud = AgentNavigationHUDViewModel()
+        var loads = 0
+        hud.present(mode: .allAgents) { mode, _ in
+            loads += 1
+            return AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: AgentNavigationHUDSnapshotBuilder.currentWindowItems(
+                rows: [row], currentTabID: nil, windowID: fixture.endpoint.windowID,
+                workspaceID: fixture.endpoint.workspaceID, workspaceTitle: "Workspace", windowTitle: "Window",
+                oversightRoleByTabID: fixture.viewModel.agentSessionLinkOversightRoles(for: [row])
+            ))
+        }
+        await hud.test_waitForSnapshot()
+        var notifications = 0
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange, object: fixture.viewModel
+        ).sink { _ in
+            notifications += 1
+            hud.refreshOversightRoles(from: fixture.viewModel)
+        }
+        for _ in 0 ..< 5 {
+            // New props/link payloads trigger the broad notification, but leave roles unchanged.
+            fixture.viewModel.agentSessionLinkPublishProjection(
+                props(endpoint: fixture.endpoint, outboundCount: 2), to: fixture.endpoint
+            )
+        }
+        await hud.test_waitForSnapshot()
+        XCTAssertEqual(notifications, 5)
+        XCTAssertEqual(loads, 1)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1), to: fixture.endpoint
+        )
+        await hud.test_waitForSnapshot()
+        XCTAssertEqual(loads, 2)
+        XCTAssertEqual(hud.snapshot.items.first?.overseenSessionCount, 3)
+        XCTAssertEqual(hud.snapshot.items.first?.isOverseen, true)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testExactRoleAccessorsFailClosedForInboundWrongSessionAndStaleIncarnation() throws {
+        let fixture = try makeFixture()
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint),
+            to: fixture.endpoint
+        )
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkIsOverseer(
+            tabID: fixture.tabID,
+            expectedSessionID: fixture.endpoint.sessionID
+        ))
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkIsOverseer(tabID: fixture.tabID))
+
+        // The exact map key alone is not enough: the stored value must prove it was addressed to
+        // the same incarnation. This deliberately bypasses the production publisher, which stamps
+        // the key onto the value, to pin the accessor's fail-closed guard.
+        fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint] = props(endpoint: fixture.endpoint)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkIsOverseer(tabID: fixture.tabID))
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint),
+            to: fixture.endpoint
+        )
+
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkIsOverseer(
+            tabID: fixture.tabID,
+            expectedSessionID: UUID()
+        ))
+
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 0, inboundCount: 1),
+            to: fixture.endpoint
+        )
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkIsOverseer(tabID: fixture.tabID))
+
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint),
+            to: fixture.endpoint
+        )
+        fixture.session.beginPersistentBindingTransition()
+        XCTAssertFalse(
+            fixture.viewModel.agentSessionLinkIsOverseer(tabID: fixture.tabID),
+            "a rebound incarnation must not inherit the retired endpoint's role"
+        )
+    }
+}
+
+/// Projection storage rebuilds the status-pill snapshot only when the published monitor is stale
+/// for the current tab; every changed transaction still posts its single owner-scoped notification.
+@MainActor
+final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
+    private var retainedViewModels: [AgentModeViewModel] = []
+    private var retainedWorkspaces: [WorkspaceManagerViewModel] = []
+
+    override func tearDown() {
+        retainedViewModels.removeAll()
+        retainedWorkspaces.removeAll()
+        super.tearDown()
+    }
+
+    private struct Fixture {
+        let viewModel: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let tabID: UUID
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 83,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        retainedViewModels.append(viewModel)
+        retainedWorkspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "Status pill sync scope"
+        ))
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        let fixture = try Fixture(
+            viewModel: viewModel,
+            session: session,
+            tabID: tabID,
+            endpoint: AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        )
+        XCTAssertEqual(viewModel.currentTabID, tabID)
+        return fixture
+    }
+
+    /// An exact endpoint in the same window that is not the current tab.
+    private func nonCurrentEndpoint(_ fixture: Fixture) -> DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: fixture.endpoint.windowID,
+            workspaceID: fixture.endpoint.workspaceID,
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 0
+        )
+    }
+
+    private func props(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        outboundCount: Int = 1
+    ) -> AgentMonitorPillProps {
+        AgentMonitorPillProps(
+            sessionID: endpoint.sessionID,
+            outbound: (0 ..< outboundCount).map { index in
+                let targetSessionID = UUID()
+                return AgentMonitorPillProps.Outbound(
+                    linkID: UUID(),
+                    generation: UInt64(index + 1),
+                    targetSessionID: targetSessionID,
+                    targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(
+                        sessionID: targetSessionID
+                    ),
+                    displayName: "Target \(index)",
+                    providerDisplayName: "Codex CLI",
+                    locationLabel: "worktree/\(index)",
+                    status: .idle
+                )
+            },
+            inbound: [],
+            recentNotices: [],
+            canAddReason: nil
+        )
+    }
+
+    private func observeNotifications(
+        _ viewModel: AgentModeViewModel,
+        onPost: @escaping () -> Void = {}
+    ) -> (AnyCancellable, () -> Int) {
+        var count = 0
+        let cancellable = NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: viewModel
+        ).sink { _ in
+            count += 1
+            onPost()
+        }
+        return (cancellable, { count })
+    }
+
+    func testNonCurrentEndpointChangesSkipStatusPillRebuildButKeepOneNotificationEach() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
+        let snapshotBefore = viewModel.ui.statusPills.snapshot
+        let revisionBefore = viewModel.ui.statusPills.revision
+        let (cancellable, notificationCount) = observeNotifications(viewModel)
+        viewModel.test_statusPillsSnapshotBuildCount = 0
+
+        let others = (0 ..< 3).map { _ in nonCurrentEndpoint(fixture) }
+        for (index, endpoint) in others.enumerated() {
+            viewModel.agentSessionLinkPublishProjection(props(endpoint: endpoint), to: endpoint)
+            XCTAssertEqual(notificationCount(), index + 1)
+        }
+        // A second, different projection for an already stored non-current endpoint is also a
+        // changed transaction that must notify without rebuilding.
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: others[0], outboundCount: 2), to: others[0])
+
+        XCTAssertEqual(viewModel.test_statusPillsSnapshotBuildCount, 0)
+        XCTAssertEqual(notificationCount(), others.count + 1)
+        XCTAssertEqual(Set(viewModel.monitorPillPropsByEndpoint.keys), Set(others + [fixture.endpoint]))
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot, snapshotBefore)
+        XCTAssertEqual(viewModel.ui.statusPills.revision, revisionBefore)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testCurrentEndpointChangeRebuildsOnceBeforeItsNotification() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        let published = props(endpoint: fixture.endpoint, outboundCount: 2)
+        var monitorAtNotification: AgentMonitorPillProps?
+        let (cancellable, notificationCount) = observeNotifications(viewModel) {
+            monitorAtNotification = viewModel.ui.statusPills.snapshot.monitor
+        }
+        viewModel.test_statusPillsSnapshotBuildCount = 0
+
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        XCTAssertEqual(viewModel.test_statusPillsSnapshotBuildCount, 1)
+        XCTAssertEqual(notificationCount(), 1)
+        let stored = viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+        XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+        var expected = stored
+        expected?.pendingUpdates = .empty
+        expected?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+            sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+        )
+        XCTAssertNotNil(expected)
+        XCTAssertEqual(monitorAtNotification, expected)
+        XCTAssertEqual(monitorAtNotification?.outbound.count, 2)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    /// One queued status edge for the observer's first outbound row, as the passive reducer would
+    /// publish it after a target transition.
+    private func passiveSnapshot(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        row: AgentMonitorPillProps.Outbound
+    ) -> AgentSessionLinkPassiveStatusNotices.Snapshot {
+        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
+        return AgentSessionLinkPassiveStatusNotices.Snapshot(
+            observerEndpoint: observer,
+            queueEpoch: UUID(),
+            queueRevision: 1,
+            linkSetRevision: 1,
+            isEnabled: true,
+            isDeliverable: true,
+            entries: [
+                AgentSessionLinkPassiveStatusNotices.PendingEntry(
+                    reference: reference,
+                    targetEndpoint: row.targetEndpoint,
+                    targetSessionID: row.targetSessionID,
+                    displayName: row.displayName,
+                    fromStatus: .running,
+                    toStatus: .idle,
+                    observedAt: Date(timeIntervalSince1970: 0),
+                    idleForSend: true,
+                    latestVisibleAssistantPreview: "Done.",
+                    changeSequence: 1,
+                    edgeSequence: 1
+                )
+            ],
+            attentionRequests: [],
+            unacknowledgedOverflowCount: 0,
+            overflowProduced: 0,
+            autoWakeLanes: [
+                AgentSessionLinkPassiveStatusNotices.AutoWakeLane(
+                    reference: reference,
+                    targetEndpoint: row.targetEndpoint,
+                    targetSessionID: row.targetSessionID,
+                    isEffectivelySelected: false
+                )
+            ]
+        )
+    }
+
+    /// The pending-updates section is derived from the passive queue, which changes without any link
+    /// projection change. Its own publication must refresh the on-screen observer's pill.
+    func testPassiveNoticePublishForCurrentObserverRefreshesStatusPills() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        let pendingBefore = viewModel.ui.statusPills.snapshot.monitor.pendingUpdates
+
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        viewModel.test_flushPendingUIRefresh()
+
+        let fresh = viewModel.makeStatusPillsSnapshot()
+        XCTAssertEqual(fresh.monitor.pendingUpdates?.updateCount, 1)
+        XCTAssertNotEqual(fresh.monitor.pendingUpdates, pendingBefore)
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot, fresh)
+    }
+
+    /// Before projection-scoped syncing, an unrelated endpoint's projection change incidentally
+    /// repaired a stale pending-updates section. The on-screen pill must not depend on that.
+    func testPassiveNoticeFreshnessDoesNotDependOnUnrelatedProjectionChanges() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+        viewModel.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot.monitor.pendingUpdates?.updateCount, 1)
+        XCTAssertEqual(viewModel.ui.statusPills.snapshot, viewModel.makeStatusPillsSnapshot())
+    }
+
+    /// The notification contract: whenever projection storage changes, the published monitor is
+    /// already current for anyone reading it from the notification — even when an independent
+    /// current-tab presentation change (here a queued passive update) is still waiting on its own
+    /// coalesced UI refresh.
+    func testUnrelatedProjectionNotificationSeesQueuedCurrentObserverUpdate() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let row = try XCTUnwrap(published.outbound.first)
+        viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            passiveSnapshot(observer: fixture.endpoint, row: row),
+            to: fixture.endpoint
+        )
+        var observed: (published: AgentMonitorPillProps, live: AgentMonitorPillProps)?
+        let (cancellable, notificationCount) = observeNotifications(viewModel) {
+            observed = (viewModel.ui.statusPills.snapshot.monitor, viewModel.currentMonitorPillProps())
+        }
+
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+
+        XCTAssertEqual(notificationCount(), 1)
+        let atNotification = try XCTUnwrap(observed)
+        XCTAssertEqual(atNotification.live.pendingUpdates?.updateCount, 1)
+        XCTAssertEqual(atNotification.published, atNotification.live)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    /// A rebind makes the tab's current incarnation one with no stored projection yet. A notification
+    /// for an unrelated endpoint must not let the pill keep presenting the retired incarnation's rows.
+    func testUnrelatedProjectionNotificationAfterRebindDoesNotExposeRetiredIncarnation() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
+        viewModel.test_flushPendingUIRefresh()
+        fixture.session.beginPersistentBindingTransition()
+        let replacement = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: fixture.tabID)
+        XCTAssertNotEqual(replacement, fixture.endpoint)
+        var observed: (published: AgentMonitorPillProps, live: AgentMonitorPillProps)?
+        let (cancellable, _) = observeNotifications(viewModel) {
+            observed = (viewModel.ui.statusPills.snapshot.monitor, viewModel.currentMonitorPillProps())
+        }
+
+        let other = nonCurrentEndpoint(fixture)
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+
+        let atNotification = try XCTUnwrap(observed)
+        XCTAssertTrue(atNotification.live.outbound.isEmpty)
+        XCTAssertEqual(atNotification.published, atNotification.live)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    func testStatusPillSnapshotStaysCurrentAcrossProjectionAndPolicyMutations() throws {
+        let fixture = try makeFixture()
+        let viewModel = fixture.viewModel
+        let other = nonCurrentEndpoint(fixture)
+        fixture.session.oversight.autoWakeOnUpdates = false
+
+        func assertCurrent(_ step: String, file: StaticString = #filePath, line: UInt = #line) {
+            XCTAssertEqual(
+                viewModel.ui.statusPills.snapshot,
+                viewModel.makeStatusPillsSnapshot(),
+                "status pills stale after \(step)",
+                file: file,
+                line: line
+            )
+        }
+
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
+        assertCurrent("current endpoint publish")
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other), to: other)
+        assertCurrent("non-current endpoint publish")
+        viewModel.agentSessionLinkPublishProjection(props(endpoint: other, outboundCount: 3), to: other)
+        assertCurrent("non-current endpoint republish")
+        XCTAssertTrue(viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: fixture.endpoint))
+        assertCurrent("Auto-wake master write")
+        XCTAssertTrue(viewModel.agentSessionLinkSetRoutineWakeInterval(
+            enabled: true,
+            seconds: 3600,
+            for: fixture.endpoint
+        ))
+        assertCurrent("routine interval write")
+        viewModel.agentSessionLinkApplyPersistencePresentation(
+            AgentSessionOversightPersistencePresentation(availability: .ready)
+        )
+        assertCurrent("persistence presentation")
+        viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 2),
+            to: fixture.endpoint
+        )
+        assertCurrent("current endpoint republish")
+        viewModel.agentSessionLinkPruneProjections()
+        XCTAssertNil(viewModel.monitorPillPropsByEndpoint[other])
+        XCTAssertNotNil(viewModel.monitorPillPropsByEndpoint[fixture.endpoint])
+        assertCurrent("prune of non-current stale endpoint")
+    }
+}

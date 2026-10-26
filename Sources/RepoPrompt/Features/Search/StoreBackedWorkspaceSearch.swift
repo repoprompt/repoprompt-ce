@@ -1,5 +1,12 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptShared
+import RepoPromptWorkspaceCore
+
+protocol WorkspaceSearchReadinessProviding: AnyObject {
+    @MainActor func waitForSearchReadiness(timeout: Duration) async throws -> WorkspaceSearchReadinessTicket
+    func validateSearchReadiness(_ ticket: WorkspaceSearchReadinessTicket) throws
+}
 
 enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
     case worktreeScopeUnavailable(missingPhysicalRootPaths: [String])
@@ -73,7 +80,7 @@ enum StoreBackedWorkspaceSearch {
         allowLiteralUnescapeFallback: Bool = true,
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         store: WorkspaceFileContextStore,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: (any WorkspaceSearchReadinessProviding)?
     ) async throws -> SearchResults {
         try await FileSystemService.withContentReadForegroundActivity(kind: .storeBackedSearch) {
             #if DEBUG
@@ -259,7 +266,7 @@ enum StoreBackedWorkspaceSearch {
         rootScope: WorkspaceLookupRootScope,
         store: WorkspaceFileContextStore,
         fileSearchActor: FileSearchActor,
-        workspaceManager: WorkspaceManagerViewModel?,
+        workspaceManager: (any WorkspaceSearchReadinessProviding)?,
         readinessTicket: WorkspaceSearchReadinessTicket?
     ) async throws -> SearchResults {
         let entryPerfState = EditFlowPerf.begin(
@@ -494,7 +501,7 @@ enum StoreBackedWorkspaceSearch {
         _ rootScope: WorkspaceLookupRootScope,
         store: WorkspaceFileContextStore,
         readinessTicket: WorkspaceSearchReadinessTicket? = nil,
-        workspaceManager: WorkspaceManagerViewModel? = nil
+        workspaceManager: (any WorkspaceSearchReadinessProviding)? = nil
     ) async throws {
         let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.rootScopeAvailabilityGate)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.rootScopeAvailabilityGate, perfState) }
@@ -518,7 +525,7 @@ enum StoreBackedWorkspaceSearch {
 
     private static func acquireSearchReadiness(
         store: WorkspaceFileContextStore,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: (any WorkspaceSearchReadinessProviding)?
     ) async throws -> WorkspaceSearchReadinessTicket? {
         let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.workspaceReadinessAcquireGate)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.workspaceReadinessAcquireGate, perfState) }
@@ -538,7 +545,7 @@ enum StoreBackedWorkspaceSearch {
         #endif
         let ticket: WorkspaceSearchReadinessTicket
         do {
-            ticket = try await workspaceManager.awaitWorkspaceSearchReadiness(timeout: timeout)
+            ticket = try await workspaceManager.waitForSearchReadiness(timeout: timeout)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as WorkspaceSearchReadinessWaitError {
@@ -557,7 +564,7 @@ enum StoreBackedWorkspaceSearch {
     private static func ensureVisibleWorkspaceLoaded(
         store: WorkspaceFileContextStore,
         readinessTicket: WorkspaceSearchReadinessTicket?,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: (any WorkspaceSearchReadinessProviding)?
     ) async throws {
         let roots = await store.rootRefs(scope: .visibleWorkspace)
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
@@ -569,7 +576,7 @@ enum StoreBackedWorkspaceSearch {
 
     private static func validateSearchReadiness(
         _ ticket: WorkspaceSearchReadinessTicket?,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: (any WorkspaceSearchReadinessProviding)?
     ) async throws {
         guard let ticket else { return }
         let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.workspaceReadinessValidationGate)
@@ -578,7 +585,7 @@ enum StoreBackedWorkspaceSearch {
             preconditionFailure("A workspace readiness ticket requires its issuing manager")
         }
         do {
-            try workspaceManager.validateWorkspaceSearchReadinessSnapshot(ticket)
+            try workspaceManager.validateSearchReadiness(ticket)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as WorkspaceSearchReadinessWaitError {

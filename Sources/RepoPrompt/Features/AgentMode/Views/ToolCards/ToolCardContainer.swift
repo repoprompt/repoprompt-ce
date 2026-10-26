@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Void) {
@@ -349,17 +350,15 @@ struct StaticToolCardContainer<Content: View>: View {
     }
 
     var body: some View {
-        Group {
-            if let onTap, headerTrailingView == nil {
-                Button(action: onTap) {
-                    cardBody
-                }
-                .buttonStyle(.plain)
-            } else if let onTap {
-                cardBodyWithLeadingTap(onTap)
-            } else {
+        if let onTap, headerTrailingView == nil {
+            Button(action: onTap) {
                 cardBody
             }
+            .buttonStyle(.plain)
+        } else if let onTap {
+            cardBodyWithLeadingTap(onTap)
+        } else {
+            cardBody
         }
     }
 

@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Popover for picking every sub-agent / role model choice in Agent Mode:
@@ -203,6 +204,36 @@ struct AgentModelsPopoverView: View {
     }
 
     private var contextBuilderPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            contextBuilderModelTrigger
+            if let providerID = promptViewModel.contextBuilderAgent.acpProviderID {
+                // Captured target; `setContextBuilderModelParameter` re-checks it against live
+                // state (including the scope) before writing.
+                let expectedModelRaw = promptViewModel.contextBuilderAgentModelRaw
+                let expectedScope = editingScope
+                ACPModelParameterProbeView(
+                    modelRaw: expectedModelRaw,
+                    providerID: providerID,
+                    probeContext: .resolved(promptViewModel.activeWorkspaceRootPath),
+                    pinnedValueRaw: promptViewModel.contextBuilderThinkingParameterValueRaw
+                ) { configID, value in
+                    promptViewModel.setContextBuilderModelParameter(
+                        ACPModelParameterSelection.thinkingPin(
+                            configID: configID,
+                            valueRaw: value,
+                            providerID: providerID,
+                            modelRaw: expectedModelRaw
+                        ),
+                        expectedProviderID: providerID,
+                        expectedModelRaw: expectedModelRaw,
+                        expectedScope: expectedScope
+                    )
+                }
+            }
+        }
+    }
+
+    private var contextBuilderModelTrigger: some View {
         StableMenuButton(
             items: contextBuilderAgentModelMenuItems,
             triggerStyle: .plain
@@ -241,26 +272,21 @@ struct AgentModelsPopoverView: View {
         }
     }
 
-    private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
+    /// Internal so behavioral tests can invoke the same menu actions as the popover.
+    func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: promptViewModel.cursorContextBuilderMenuItems(options: promptViewModel.contextBuilderModelOptions(for: agent)))
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: promptViewModel.contextBuilderModelOptions(for: agent),
                 selectedAgent: promptViewModel.contextBuilderAgent,
                 selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
             ) { selectedAgent, selectedOption in
-                let identity = currentOperationIdentity
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 promptViewModel.commitContextBuilderSettings()
-                DispatchQueue.main.async {
-                    guard let identity else { return }
-                    RecommendationApplyNotification.post(
-                        sourceWorkspaceID: identity.sourceWorkspaceID,
-                        agentModelsScope: identity.scope,
-                        includesPresetExposure: false
-                    )
-                }
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
@@ -375,6 +401,44 @@ struct AgentModelsPopoverView: View {
                     )
                 }
                 .layoutPriority(1)
+
+                if let providerID = resolution.effective.agent.acpProviderID {
+                    // Capture the write target at render time; the closure re-checks it against
+                    // LIVE host state before writing, so a stale menu (e.g. a scope switch while
+                    // it was open) cannot write to the old scope or a changed model.
+                    let expectedScope = editingScope
+                    let expectedModelRaw = resolution.effective.modelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(promptViewModel.activeWorkspaceRootPath),
+                        pinnedValueRaw: resolution.thinkingParameterValueRaw
+                    ) { configID, value in
+                        guard editingScope == expectedScope,
+                              let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                              live.effective.agent.acpProviderID == providerID,
+                              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                                  live.effective.modelRaw,
+                                  providerID: providerID
+                              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                                  expectedModelRaw,
+                                  providerID: providerID
+                              )
+                        else { return }
+                        MCPAgentRoleDefaultsService.setModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: live.effective.modelRaw
+                            ),
+                            for: live.role,
+                            displayed: live.effective,
+                            scope: editingScope
+                        )
+                        bumpRoleDefaults()
+                    }
+                }
             }
 
             roleDefaultPinState(for: resolution)
@@ -417,6 +481,9 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
+        let expectedScope = editingScope
+        let expected = resolution.effective
+        let pins = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
@@ -425,8 +492,31 @@ struct AgentModelsPopoverView: View {
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
                 flattenSingleCodexGroups: true,
-                groupOpenCode: false
+                cursorSelections: pins,
+                onSelectCursorParameter: { option, parameter in
+                    guard editingScope == expectedScope,
+                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
+                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
+                    MCPAgentRoleDefaultsService.setModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]), for: resolution.role,
+                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
+                    )
+                    bumpRoleDefaults()
+                },
+                onClearCursorParameter: { option, identity in
+                    guard editingScope == expectedScope,
+                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
+                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
+                    MCPAgentRoleDefaultsService.setModelParameter(
+                        existing.filter { $0.identity != identity }, for: resolution.role,
+                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
+                    )
+                    bumpRoleDefaults()
+                }
             ) { selectedAgent, selectedOption in
+                guard editingScope == expectedScope else { return }
                 let selection = AgentModelCatalog.NormalizedAgentSelection(
                     agent: selectedAgent,
                     modelRaw: selectedOption.rawValue

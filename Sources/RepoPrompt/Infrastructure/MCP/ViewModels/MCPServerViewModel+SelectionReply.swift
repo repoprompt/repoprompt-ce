@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptSettingsCore
 
 extension MCPServerViewModel {
     enum SelectionReplyIngressPolicy: Equatable {
@@ -25,7 +27,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func canonicalSelectionReadSnapshot(
-        for context: TabScopedContext
+        for context: MCPTabContextSnapshot
     ) -> CanonicalSelectionReadSnapshot? {
         guard let manager = workspaceManager else { return nil }
 
@@ -50,12 +52,12 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func stabilizedVirtualSelection(for context: TabScopedContext) async -> StoredSelection {
+    func stabilizedVirtualSelection(for context: MCPTabContextSnapshot) async -> StoredSelection {
         await stabilizedVirtualContext(for: context).selection
     }
 
     @MainActor
-    func stabilizedVirtualContext(for context: TabScopedContext) async -> TabScopedContext {
+    func stabilizedVirtualContext(for context: MCPTabContextSnapshot) async -> MCPTabContextSnapshot {
         // For any tab-bound virtual context (including runs), prefer latest stored tab selection.
         // This prevents resurrecting stale slices from the run snapshot after the user clears them.
         guard let canonical = canonicalSelectionReadSnapshot(for: context) else { return context }
@@ -67,9 +69,8 @@ extension MCPServerViewModel {
 
     @MainActor
     func stabilizedSelectionReadSnapshot(
-        _ resolved: ResolvedTabContextSnapshot
-    ) throws -> ResolvedTabContextSnapshot {
-        guard !resolved.usesActiveTabCompatibility else { return resolved }
+        _ resolved: MCPResolvedTabContextSnapshot
+    ) throws -> MCPResolvedTabContextSnapshot {
         guard let canonical = canonicalSelectionReadSnapshot(for: resolved.snapshot) else {
             throw StabilizedSelectionReadSnapshotError.canonicalTabUnavailable(
                 workspaceID: resolved.snapshot.workspaceID,
@@ -197,7 +198,7 @@ extension MCPServerViewModel {
         for selection: StoredSelection,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
-        context: TabScopedContext
+        context: MCPTabContextSnapshot
     ) async -> String? {
         switch resolvedContext.gitInclusion {
         case .none:
@@ -235,7 +236,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func buildVirtualTokenBreakdown(
-        for context: TabScopedContext,
+        for context: MCPTabContextSnapshot,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
         codemapFiles: [WorkspaceFileRecord],
@@ -279,7 +280,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func buildVirtualSelectionTokenStats(
-        for context: TabScopedContext,
+        for context: MCPTabContextSnapshot,
         filesReply: ToolResultDTOs.SelectedFilesReply,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
@@ -340,7 +341,7 @@ extension MCPServerViewModel {
         viewMode: String?,
         codeMapUsageOverride: CodeMapUsage?,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace,
-        virtualContext: TabScopedContext? = nil,
+        virtualContext: MCPTabContextSnapshot? = nil,
         reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
         await buildTabSelectionReply(
@@ -366,7 +367,7 @@ extension MCPServerViewModel {
         extraInvalid: [String] = [],
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
-        virtualContext: TabScopedContext? = nil,
+        virtualContext: MCPTabContextSnapshot? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         ingressPolicy: SelectionReplyIngressPolicy = .awaitPending,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
@@ -414,7 +415,7 @@ extension MCPServerViewModel {
         extraInvalid: [String] = [],
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
-        virtualContext: TabScopedContext? = nil,
+        virtualContext: MCPTabContextSnapshot? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         ingressPolicy: SelectionReplyIngressPolicy = .awaitPending,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
@@ -483,7 +484,7 @@ extension MCPServerViewModel {
             onto: ordinaryCollections
         )
         let resolvedPromptContext = promptVM.resolvePromptContext()
-        let accountingContext = virtualContext ?? TabContextSnapshot(
+        let accountingContext = virtualContext ?? MCPTabContextSnapshot(
             tabID: promptVM.activeComposeTabID ?? UUID(),
             windowID: windowID,
             workspaceID: workspaceManager?.activeWorkspace?.id,
@@ -501,7 +502,7 @@ extension MCPServerViewModel {
             collections: collections,
             resolvedContext: resolvedPromptContext,
             lookupContext: lookupContext,
-            activeTabCompatibility: useActivePublishedSnapshot,
+            presentationActiveContext: useActivePublishedSnapshot,
             allowActivePublishedSnapshotRefresh: codemapPresentationOverride == nil,
             allowVirtualTokenRefresh: codemapPresentationOverride == nil
         )
@@ -678,13 +679,11 @@ extension MCPServerViewModel {
         display: FilePathDisplay,
         extraInvalid: [String] = [],
         viewMode: String? = nil,
-        resolvedContext: ResolvedTabContextSnapshot,
+        resolvedContext: MCPResolvedTabContextSnapshot,
         lookupContext: WorkspaceLookupContext
     ) async -> ToolResultDTOs.SelectionReply {
         var context = resolvedContext.snapshot
-        if !resolvedContext.usesActiveTabCompatibility {
-            context = await stabilizedVirtualContext(for: context)
-        }
+        context = await stabilizedVirtualContext(for: context)
         return await buildTabSelectionReply(
             from: context.selection,
             includeBlocks: includeBlocks,
@@ -692,7 +691,7 @@ extension MCPServerViewModel {
             extraInvalid: extraInvalid,
             viewMode: viewMode,
             codeMapUsageOverride: .auto,
-            virtualContext: resolvedContext.usesActiveTabCompatibility ? nil : context,
+            virtualContext: context,
             lookupContextOverride: lookupContext,
             ingressPolicy: .alreadyAwaited
         )
@@ -706,7 +705,7 @@ extension MCPServerViewModel {
         extraInvalid: [String] = [],
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
-        virtualContext: TabScopedContext?,
+        virtualContext: MCPTabContextSnapshot?,
         lookupContext: WorkspaceLookupContext,
         reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
@@ -731,7 +730,7 @@ extension MCPServerViewModel {
         )
     }
 
-    func selectedFilesWithStats(resolvedContext: ResolvedTabContextSnapshot) async -> ToolResultDTOs.SelectedFilesReply {
+    func selectedFilesWithStats(resolvedContext: MCPResolvedTabContextSnapshot) async -> ToolResultDTOs.SelectedFilesReply {
         // Get user's effective copy preset mode for projection
         let copyUsage = await MainActor.run { promptVM.effectiveCopyCodeMapUsage() }
         let userPresetState = await MainActor.run { (copyUsage != .auto || promptVM.codeMapsGloballyDisabled) ? buildUserPresetState() : nil }

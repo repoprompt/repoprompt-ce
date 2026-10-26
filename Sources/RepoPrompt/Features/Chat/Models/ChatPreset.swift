@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 /// Chat modes available for Oracle/chat presets.
 enum ChatPresetMode: String, CaseIterable {

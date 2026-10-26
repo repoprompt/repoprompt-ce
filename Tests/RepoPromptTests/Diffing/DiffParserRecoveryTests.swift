@@ -1,4 +1,6 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptVCS
 import XCTest
 
 final class DiffParserRecoveryTests: XCTestCase {

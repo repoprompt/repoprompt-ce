@@ -1,5 +1,7 @@
 import Combine
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -69,9 +71,10 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
         XCTAssertTrue(viewModel.applyActionScopeLabels.contains("Agent Models: Global settings"))
         XCTAssertTrue(viewModel.applyActionScopeLabels.contains("MCP Presets: Global settings"))
 
+        let recommended = try recommendedOpenAIModelRaw(from: fixture.engine)
         viewModel.applyAllRecommendations()
 
-        XCTAssertEqual(fixture.store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile().planningModelRaw, recommended)
         XCTAssertEqual(
             fixture.store.workspaceAgentModelsProfile(for: workspace.id)?.planningModelRaw,
             sentinel
@@ -131,12 +134,13 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
         XCTAssertEqual(viewModel.agentModelsScopeLabel, "Agent Models: Workspace — Scoped Project")
         XCTAssertTrue(viewModel.canApplyRecommendations)
 
+        let recommended = try recommendedOpenAIModelRaw(from: fixture.engine)
         viewModel.applyAllRecommendations()
 
         XCTAssertEqual(fixture.store.globalAgentModelsProfile().planningModelRaw, sentinel)
         XCTAssertEqual(
             fixture.store.workspaceAgentModelsProfile(for: workspace.id)?.planningModelRaw,
-            AIModel.gpt54Pro.rawValue
+            recommended
         )
         XCTAssertEqual(receivedNotifications.count, 2)
         let workspaceNotification = try XCTUnwrap(receivedNotifications.first { notification in
@@ -163,7 +167,7 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
     func testPresetOnlyWorkspaceTargetNotifiesGlobalScope() throws {
         let fixture = try makeFixture()
         let workspace = WorkspaceModel(name: "Preset Project", repoPaths: [])
-        let recommended = AIModel.gpt54Pro.rawValue
+        let recommended = try recommendedOpenAIModelRaw(from: fixture.engine)
         fixture.store.setWorkspaceAgentModelsProfile(
             workspaceID: workspace.id,
             profile: AgentModelsSettingsProfile(
@@ -252,6 +256,7 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
         XCTAssertEqual(viewModel.agentModelsScopeLabel, "Agent Models: Workspace — Second")
         XCTAssertTrue(viewModel.canApplyRecommendations)
 
+        let recommended = try recommendedOpenAIModelRaw(from: fixture.engine)
         viewModel.applyAllRecommendations()
 
         XCTAssertEqual(fixture.store.globalAgentModelsProfile().planningModelRaw, sentinel)
@@ -261,8 +266,16 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
         )
         XCTAssertEqual(
             fixture.store.workspaceAgentModelsProfile(for: second.id)?.planningModelRaw,
-            AIModel.gpt54Pro.rawValue
+            recommended
         )
+    }
+
+    private func recommendedOpenAIModelRaw(from engine: AutoRecommendationEngine) throws -> String {
+        let recommendations = engine.computeRecommendations(
+            for: AgentModelsOperationIdentity(sourceWorkspaceID: UUID(), scope: .global),
+            enabledProviders: [.openAI]
+        )
+        return try XCTUnwrap(recommendations.chatModel?.openAIOption?.modelString)
     }
 
     private func makeFixture() throws -> (
@@ -290,6 +303,7 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
                 fileURL: temp.appendingPathComponent("Settings/globalSettings.json")
             )
         )
+        store.installApplicationEventBridge()
         store.setGlobalRecommendationProviderFilter([.openAI])
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())

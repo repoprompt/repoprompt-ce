@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  WorkspaceSetupView.swift
 //  RepoPrompt

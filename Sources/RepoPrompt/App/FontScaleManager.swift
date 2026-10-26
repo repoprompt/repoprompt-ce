@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Centralised manager for app-wide font scaling.
@@ -19,7 +20,9 @@ final class FontScaleManager: ObservableObject {
     /// Whether font scaling changes are currently frozen (e.g., during AI streaming)
     private(set) var isFrozen = false
 
-    private static let externalChangeNotificationRawName = "com.repoprompt.fontScaleDidChange"
+    /// Cross-process Darwin notification name shared by every running app instance.
+    /// Pinned by `ModularizationCompatibilityGoldenTests`.
+    static let externalChangeNotificationRawName = "com.repoprompt.fontScaleDidChange"
     private static let externalChangeNotificationName = CFNotificationName(externalChangeNotificationRawName as CFString)
 
     private let store: GlobalSettingsStore

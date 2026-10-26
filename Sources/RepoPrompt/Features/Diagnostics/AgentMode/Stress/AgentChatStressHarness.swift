@@ -1425,7 +1425,7 @@
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: windowID,
-                workspacePath: configuration.workspaceRootPaths.first
+                workspacePaths: .uniform(configuration.workspaceRootPaths.first)
             )
             let recorder = PersistedCodexFixtureEventRecorder()
             let eventTask = Task {

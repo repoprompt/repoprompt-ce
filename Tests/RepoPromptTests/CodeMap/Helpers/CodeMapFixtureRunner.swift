@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptWorkspaceCore
 
 enum CodeMapFixtureRunner {
     static func expectedFileTree() -> String {

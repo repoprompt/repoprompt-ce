@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 enum WorkspaceRootTargetSeedPlanTestSupport {
     struct Fixture {

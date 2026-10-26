@@ -15,8 +15,8 @@ enum WorkspaceCodemapArtifactDemandUnavailableReason: Equatable {
     case rootNotLoaded
     case fileNotCataloged
     case unsupportedFileType
-    case gitTerminal(WorkspaceCodemapGitTerminalUnavailableReason)
-    case gitTransient(WorkspaceCodemapGitTransientUnavailableReason)
+    case rootTerminal(WorkspaceCodemapRootTerminalUnavailableReason)
+    case rootTransient(WorkspaceCodemapRootTransientUnavailableReason)
     case demandUnavailable(WorkspaceCodemapBindingDemandUnavailableReason)
     case busy(retryAfterMilliseconds: Int?)
     case rejected(WorkspaceCodemapBindingDemandRejection)

@@ -6,6 +6,14 @@ on:
     branches:
       - main
 
+# Only first-attempt automatic main pushes supersede each other. Explicit
+# dispatches and reruns retain their own groups so a later push or manual request
+# cannot replace those requested builds.
+concurrency:
+  group: >-
+    release-candidate-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' }}
+
 permissions:
   contents: read
 
@@ -30,7 +38,7 @@ jobs:
             "Release-candidate packaged app" \
             ".build/release/RepoPrompt-artifact-manifest.json"
       - name: Upload release-candidate artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: RepoPrompt-CE-release-candidate
           path: dist/*

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentExecutionLocationProps: Equatable {
     let tabID: UUID
@@ -12,6 +13,33 @@ struct AgentExecutionLocationProps: Equatable {
     let disabledReason: String?
 }
 
+struct AgentModelRouterPillProps: Equatable {
+    let isOn: Bool
+    let isAvailable: Bool
+    let isRouting: Bool
+    let disabledReason: String?
+    /// Usage balancing is independent of Jev; the router pill surfaces it as a badge.
+    let routedModelDisplayName: String?
+    var usageBalancing = false
+}
+
+struct AgentAutoEffortPillProps: Equatable {
+    let isOn: Bool
+    let isAvailable: Bool
+    let isJudging: Bool
+    let feedback: AutoEffortTurnFeedback?
+}
+
+struct AgentRepromptPillProps: Equatable {
+    var isOn = false
+    var isAvailable = false
+    var isPreparing = false
+    var modelDisplayName: String?
+    var providerID: String?
+    var requiresDisclosure = false
+    var unavailableReason: String?
+}
+
 struct AgentStatusPillsSnapshot: Equatable {
     let currentTabID: UUID?
     let selectedWorkflow: AgentWorkflowDefinition?
@@ -21,9 +49,17 @@ struct AgentStatusPillsSnapshot: Equatable {
     let runState: AgentSessionRunState
     let autoEditEnabled: Bool
     let interviewFirst: Bool
+    let modelRouter: AgentModelRouterPillProps
+    let autoEffort: AgentAutoEffortPillProps
     let executionLocation: AgentExecutionLocationProps?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
+    /// Cross-window oversight projection for the tab currently on screen.
+    ///
+    /// It lives in this snapshot so the pill row never has to observe the full view model; the link
+    /// bridge owns the values and republishes them from authority change events.
+    let monitor: AgentMonitorPillProps
+    var reprompt = AgentRepromptPillProps()
 
     static let empty = AgentStatusPillsSnapshot(
         currentTabID: nil,
@@ -34,14 +70,29 @@ struct AgentStatusPillsSnapshot: Equatable {
         runState: .idle,
         autoEditEnabled: ApplyEditsApprovalStore.globalDefaultAutoEditEnabled(),
         interviewFirst: false,
+        modelRouter: AgentModelRouterPillProps(
+            isOn: false,
+            isAvailable: false,
+            isRouting: false,
+            disabledReason: "Configure Model Router in Settings.",
+            routedModelDisplayName: nil
+        ),
+        autoEffort: AgentAutoEffortPillProps(
+            isOn: false,
+            isAvailable: false,
+            isJudging: false,
+            feedback: nil
+        ),
         executionLocation: nil,
         activeAgentSessionID: nil,
-        activeRunID: nil
+        activeRunID: nil,
+        monitor: .empty
     )
 }
 
 @MainActor
 final class AgentStatusPillsUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentStatusPillsSnapshot
     @Published private(set) var revision: UInt64 = 0
 
@@ -52,20 +103,20 @@ final class AgentStatusPillsUIStore: ObservableObject {
     func update(_ nextSnapshot: AgentStatusPillsSnapshot) {
         guard snapshot != nextSnapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("statusPills", published: false)
+                perfRecorder.recordStoreUpdate("statusPills", published: false)
             #endif
             return
         }
         snapshot = nextSnapshot
         revision &+= 1
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "statusPills",
                 published: true,
                 details: [
                     "revision": String(revision),
                     "runState": String(describing: snapshot.runState),
-                    "tabID": AgentModePerfDiagnostics.shortID(snapshot.currentTabID)
+                    "tabID": perfRecorder.shortID(snapshot.currentTabID)
                 ]
             )
         #endif

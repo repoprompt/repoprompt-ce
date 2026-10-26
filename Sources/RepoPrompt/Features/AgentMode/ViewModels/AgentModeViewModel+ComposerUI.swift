@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
     func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
@@ -19,7 +21,21 @@ extension AgentModeViewModel {
             return makeRunCancelTarget(tabID: tabID, session: session)
         }()
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let acpControls = acpModelParameterControls(session: session)
+        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
+        // not unlock a model/configuration already captured by that run.
+        let acpRunLocksModelControls = session?.runState.isActive == true
+            && (selectedAgent == .cursor || !acpControls.isEmpty)
+        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
+        let selectedRouterServiceID = routerControlsFreshTask
+            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
+        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        let autoEffortServiceName = autoEffortConfiguration.enabled
+            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
+            : nil
         return AgentComposerProps(
+            computerUse: computerUseComposerProps(session: session),
             currentTabID: tabID,
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
@@ -33,17 +49,22 @@ extension AgentModeViewModel {
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
             isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled,
+            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: hasAvailableAgentProviders,
             canSendWithCurrentProvider: canSendWithCurrentProvider,
+            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
+            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
+            automaticRouterServiceName: automaticRouterServiceName,
+            autoEffortServiceName: autoEffortServiceName,
             unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            acpModelParameterControls: acpControls,
             availableAgents: availableAgents,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
@@ -54,14 +75,83 @@ extension AgentModeViewModel {
         )
     }
 
+    /// Pure presentation: no companion lookup, configuration IO, or permission probing.
+    func computerUseComposerProps(session: AgentTabSession?) -> AgentComputerUseComposerProps {
+        guard let session, session.selectedAgent == .codexExec, session.parentSessionID == nil,
+              sessions[session.tabID] === session,
+              !session.bindingTransitionInProgress else { return .hidden }
+        return .init(
+            isVisible: true,
+            isOn: session.isCodexComputerUseArmed,
+            isBusy: session.codexComputerUseArmingRequestID != nil || !session.codexComputerUseOwnershipTransitionHolds.isEmpty
+        )
+    }
+
+    private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+        guard let providerID = selectedAgent.acpProviderID else { return [] }
+        // Pure projection over the held demand-scoped observation (OpenCode) or the
+        // runtime Cursor snapshot. Never invent choices or launch discovery here. While the OpenCode observation
+        // is loading/failed/has no usable parameters, this yields no parameter set, so the
+        // effort control is omitted while model selection, permissions, and submission stay
+        // usable. Every returned choice renders, including a one-option menu.
+        // Unwrap the KEY itself and pass its possibly-nil workspacePath separately: optional
+        // chaining (`key?.workspacePath`) would collapse "resolution failed" (no key) into
+        // "resolved nil-workspace" (key with workspacePath: nil). A held nil-workspace
+        // observation resolves only via a constructed nil-workspace key, while a failed
+        // authority resolution withholds the control entirely.
+        let workspacePath: String?
+        if providerID == .openCode {
+            guard let key = openCodeParameterDiscoveryKey(session: session, modelRaw: selectedModelRaw) else {
+                return []
+            }
+            workspacePath = key.workspacePath
+        } else if let session {
+            workspacePath = try? effectiveWorkspacePath(for: session)
+        } else {
+            workspacePath = workspacePathProvider()
+        }
+        let resolved = ACPModelParameterResolver.resolve(
+            providerID: providerID,
+            selectedModelRaw: selectedModelRaw,
+            persistedSelections: session?.acpModelParameterSelections ?? [],
+            workspacePath: workspacePath,
+            openCodeParameters: providerID == .openCode ? openCodeModelParameterObservation : nil
+        )
+        return resolved.map { parameter in
+            .init(
+                providerID: providerID,
+                kind: parameter.definition.kind,
+                baseModelRaw: parameter.baseModelRaw,
+                configID: parameter.definition.configID,
+                displayName: parameter.definition.displayName,
+                selectedValueRaw: parameter.selectedChoice.rawValue,
+                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? []).last {
+                    $0.identity == ACPModelParameterIdentity(providerID: providerID, baseModelRaw: parameter.baseModelRaw, kind: parameter.definition.kind)
+                }?.valueRaw,
+                selectedDisplayName: parameter.selectedChoice.displayName,
+                choices: parameter.definition.choices,
+                openCodeDiscoveryKey: providerID == .openCode ? openCodeModelParameterObservation?.key : nil
+            )
+        }
+    }
+
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
-        let resolvedSession = session ?? self.session(for: tabID)
+        let resolvedSession: TabSession
+        if let heldSession = session ?? sessions[tabID] {
+            resolvedSession = heldSession
+        } else {
+            // Saved-session activation owns materialization. Repainting a composer during
+            // recovery must not recreate a detached runtime from its still-visible carrier.
+            guard explicitActiveSessionID(for: tabID) == nil else { return nil }
+            resolvedSession = self.session(for: tabID)
+        }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil
         }
-        guard !resolvedSession.isComposerSubmissionInFlight,
+        guard resolvedSession.restorationAdmissionFailureMessage == nil,
+              !resolvedSession.isComposerSubmissionInFlight,
               !resolvedSession.isPreparingInitialWorktree,
               !resolvedSession.isChangingExecutionLocation
         else { return nil }
@@ -100,16 +190,18 @@ extension AgentModeViewModel {
     }
 
     func syncComposerUIState(tabID: UUID? = nil) {
+        invalidateRepromptIfNeeded()
         #if DEBUG
             test_syncComposerCallCount += 1
         #endif
+        reconcileOpenCodeModelParameterObservation()
         ui.composer.update(makeComposerProps(tabID: tabID))
     }
 
     func syncAllActiveUIState(tabID: UUID? = nil) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment("ui.syncAllActiveUIState", tabID: tabID)
-            AgentModePerfDiagnostics.event("ui.syncAllActiveUIState", tabID: tabID)
+            perfRecorder.increment("ui.syncAllActiveUIState", tabID: tabID)
+            perfRecorder.event("ui.syncAllActiveUIState", tabID: tabID)
         #endif
         syncComposerUIState(tabID: tabID)
         syncStatusPillsUIState()
@@ -127,8 +219,8 @@ extension AgentModeViewModel {
     func syncActiveUIState(tabID: UUID? = nil, invalidation: ActiveUIInvalidation) {
         guard !invalidation.isEmpty else { return }
         #if DEBUG
-            AgentModePerfDiagnostics.increment("ui.syncActiveUIState", tabID: tabID)
-            AgentModePerfDiagnostics.event(
+            perfRecorder.increment("ui.syncActiveUIState", tabID: tabID)
+            perfRecorder.event(
                 "ui.syncActiveUIState",
                 tabID: tabID,
                 fields: [

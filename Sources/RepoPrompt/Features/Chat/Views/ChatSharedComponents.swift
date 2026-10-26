@@ -7,9 +7,11 @@
 
 import AppKit
 import QuartzCore
+import RepoPromptInstrumentation
 import SwiftUI
 
 struct LoadingIndicatorWithStop: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let isHovered: Bool
     let source: CancelButtonSource
 
@@ -30,16 +32,16 @@ struct LoadingIndicatorWithStop: View {
     private func recordAppear() {
         #if DEBUG
             let sourceName = source.rawValue
-            AgentModePerfDiagnostics.increment(AgentModePerfDiagnostics.counterKey("cancelSpinner.appear", source: sourceName))
-            AgentModePerfDiagnostics.event("cancelSpinner.appear", fields: ["source": sourceName])
+            perfRecorder.increment(perfRecorder.counterKey("cancelSpinner.appear", source: sourceName))
+            perfRecorder.event("cancelSpinner.appear", fields: ["source": sourceName])
         #endif
     }
 
     private func recordDisappear() {
         #if DEBUG
             let sourceName = source.rawValue
-            AgentModePerfDiagnostics.increment(AgentModePerfDiagnostics.counterKey("cancelSpinner.disappear", source: sourceName))
-            AgentModePerfDiagnostics.event("cancelSpinner.disappear", fields: ["source": sourceName])
+            perfRecorder.increment(perfRecorder.counterKey("cancelSpinner.disappear", source: sourceName))
+            perfRecorder.event("cancelSpinner.disappear", fields: ["source": sourceName])
         #endif
     }
 }

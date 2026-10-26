@@ -16,6 +16,7 @@ LOCAL_SIGNING_IDENTITY_REGISTRY_PATH="${LOCAL_SIGNING_IDENTITY_REGISTRY_PATH:-$H
 LOCAL_SIGNING_IDENTITY_SHA256="${LOCAL_SIGNING_IDENTITY_SHA256:-}"
 ROTATE_LOCAL_SIGNING_IDENTITY="${ROTATE_LOCAL_SIGNING_IDENTITY:-0}"
 LOCAL_SIGNING_IDENTITY_TOOL="$ROOT_DIR/Scripts/local_signing_identity.py"
+FULL_XCODE_RESOLVER="$ROOT_DIR/Scripts/resolve_full_xcode_developer_dir.sh"
 TMP_DIR=""
 STAGED_DIR=""
 STAGED_APP=""
@@ -204,6 +205,11 @@ for command in codesign ditto openssl plutil python3 security shasum swift; do
     require_command "$command"
 done
 [[ -f "$LOCAL_SIGNING_IDENTITY_TOOL" ]] || fail "Missing local signing identity tool: $LOCAL_SIGNING_IDENTITY_TOOL"
+[[ -x "$FULL_XCODE_RESOLVER" ]] || fail "Missing full-Xcode resolver: $FULL_XCODE_RESOLVER"
+
+DEVELOPER_DIR="$("$FULL_XCODE_RESOLVER")"
+export DEVELOPER_DIR
+printf 'Local production Xcode developer directory: %s\n' "$DEVELOPER_DIR"
 
 LOGIN_KEYCHAIN="$(security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
 [[ -n "$LOGIN_KEYCHAIN" && -f "$LOGIN_KEYCHAIN" ]] || fail "Could not resolve the user's default login keychain."
@@ -242,8 +248,8 @@ REGISTRY_NEEDS_WRITE="$(json_field "$PLAN_PATH" registryNeedsWrite)"
 
 if [[ "$IDENTITY_ACTION" == "mint" ]]; then
     if [[ "$ROTATE_LOCAL_SIGNING_IDENTITY" == "1" || "$ROTATE_LOCAL_SIGNING_IDENTITY" == "true" ]]; then
-        printf 'WARNING: Rotating the local signing identity makes secrets in the prior local secure-storage generation inaccessible to the new app.\n' >&2
-        printf 'WARNING: The prior certificate and Keychain service are preserved for rollback; values are not copied automatically.\n' >&2
+        printf 'WARNING: Rotating the local signing identity changes signing continuity; local builds use in-memory secure storage.\n' >&2
+        printf 'WARNING: The prior certificate is preserved for rollback. Earlier Keychain items remain untouched with their previous access conditions; they are not copied or protected by this change.\n' >&2
     fi
     mint_local_identity
     inventory_local_identities "$INVENTORY_AFTER"
@@ -260,8 +266,8 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(plan["candidate"], handle)
 PY
     if [[ "$IDENTITY_ACTION" == "rotate" ]]; then
-        printf 'WARNING: Rotating the local signing identity makes secrets in the prior local secure-storage generation inaccessible to the new app.\n' >&2
-        printf 'WARNING: The prior certificate and Keychain service are preserved for rollback; values are not copied automatically.\n' >&2
+        printf 'WARNING: Rotating the local signing identity changes signing continuity; local builds use in-memory secure storage.\n' >&2
+        printf 'WARNING: The prior certificate is preserved for rollback. Earlier Keychain items remain untouched with their previous access conditions; they are not copied or protected by this change.\n' >&2
     fi
 fi
 
@@ -270,7 +276,7 @@ SELECTED_CERTIFICATE_SHA256="$(json_field "$SELECTED_CANDIDATE_PATH" sha256)"
 LOCAL_SIGNING_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$SIGN_IDENTITY\""
 printf 'Local signing identity action: %s\n' "$IDENTITY_ACTION"
 printf 'Selected local certificate SHA-256: %s\n' "$SELECTED_CERTIFICATE_SHA256"
-printf 'Selected local secure-storage generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Selected local signing compatibility generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
 
 LOCAL_SELF_SIGNED_RELEASE=1 \
     LOCAL_SIGNING_CERTIFICATE_SHA1="$SIGN_IDENTITY" \
@@ -279,8 +285,7 @@ LOCAL_SELF_SIGNED_RELEASE=1 \
     SIGN_IDENTITY="$SIGN_IDENTITY" \
     "$ROOT_DIR/Scripts/package_app.sh" release
 
-BUILD_DIR="$(swift build -c release --show-bin-path)"
-SOURCE_APP="$BUILD_DIR/$APP_NAME.app"
+SOURCE_APP="$ROOT_DIR/.build/release/$APP_NAME.app"
 [[ -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $SOURCE_APP"
 [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-self-signed" ]] ||
     fail "Packaged app is missing the local self-signed signing-mode marker."
@@ -352,5 +357,6 @@ APP_INSTALLED=0
 
 printf 'Installed local self-signed production app: %s\n' "$LOCAL_PRODUCTION_APP"
 printf 'Registered local signing fingerprint: %s\n' "$SELECTED_CERTIFICATE_SHA256"
-printf 'Local secure-storage service generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Local signing compatibility generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Local self-signed builds use in-memory secure storage; re-enter provider keys and secure permission changes after each launch. Existing Keychain items are left untouched.\n'
 printf 'This app is local-only, not notarized, and must not be distributed or uploaded to GitHub Releases.\n'

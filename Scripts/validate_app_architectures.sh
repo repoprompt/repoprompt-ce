@@ -39,7 +39,10 @@ require_arches() {
         fail "$LABEL rejected $path: expected architectures $expected, got ${actual:-<none>}"
 }
 
-MAIN="$APP_BUNDLE/Contents/MacOS/RepoPrompt"
+MAIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null)" ||
+    fail "could not read CFBundleExecutable from $APP_BUNDLE"
+[[ -n "$MAIN_NAME" && "$MAIN_NAME" != */* ]] || fail "invalid CFBundleExecutable: $MAIN_NAME"
+MAIN="$APP_BUNDLE/Contents/MacOS/$MAIN_NAME"
 HELPER="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 require_regular_executable "$MAIN"
 require_regular_executable "$HELPER"

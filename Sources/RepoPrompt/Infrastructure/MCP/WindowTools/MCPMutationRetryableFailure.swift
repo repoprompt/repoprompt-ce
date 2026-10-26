@@ -48,7 +48,7 @@ struct MCPMutationRetryableFailure: Error, Equatable {
     }
 
     static func unresolvedRouteFailure(
-        for snapshot: MCPServerViewModel.TabContextSnapshot
+        for snapshot: MCPTabContextSnapshot
     ) -> MCPMutationRetryableFailure? {
         guard snapshot.activeAgentSessionID != nil else { return nil }
         guard case .unhydrated = snapshot.worktreeBindingState else { return nil }

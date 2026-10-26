@@ -1,8 +1,14 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 struct AgentStatusPillsRow: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let computerUse: AgentComputerUseComposerProps
+    let computerUseTarget: AgentComposerSubmitTarget?
+    let toggleComputerUse: (UUID, ObjectIdentifier) async -> Void
+    let openContextDrawerFiles: () -> Void
     @ObservedObject var oracleViewModel: OracleViewModel
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -13,9 +19,20 @@ struct AgentStatusPillsRow: View {
         statusPillsUI.snapshot
     }
 
+    private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
+        NotificationCenter.default.post(
+            name: .showModelRouterSettingsTab,
+            object: nil,
+            userInfo: [
+                "windowID": windowID,
+                "agentDecisionsSection": section
+            ]
+        )
+    }
+
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPillsRow")
+            let _ = perfRecorder.increment("ui.body.statusPillsRow")
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
@@ -39,10 +56,52 @@ struct AgentStatusPillsRow: View {
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )
 
+                AgentMonitorPill(statusPillsUI: statusPillsUI)
+
                 AgentInterviewPill(
                     isOn: snapshot.interviewFirst,
                     onToggle: { agentModeVM.toggleInterviewFirst() }
                 )
+
+                AgentRepromptPill(
+                    props: snapshot.reprompt,
+                    store: agentModeVM.repromptUIStore,
+                    viewModel: agentModeVM,
+                    setEnabled: { agentModeVM.setRepromptEnabled($0, acknowledgingProviderID: $1) },
+                    openSettings: {
+                        NotificationCenter.default.post(name: .showAgentModelsSettingsTab, object: nil, userInfo: ["windowID": windowID])
+                    }
+                )
+
+                AgentModelRouterPill(
+                    props: snapshot.modelRouter,
+                    onToggle: { agentModeVM.toggleGlobalModelRouter() },
+                    onOpenSettings: { openAgentDecisionsSettings(section: .modelRouter) }
+                )
+
+                AgentAutoEffortPill(
+                    props: snapshot.autoEffort,
+                    onToggle: { agentModeVM.toggleAutoEffort() },
+                    onOpenSettings: { openAgentDecisionsSettings(section: .autoEffort) }
+                )
+
+                if computerUse.isVisible, let target = computerUseTarget,
+                   target.route == .existingAgentSession
+                {
+                    AgentIconTogglePill(
+                        systemImage: "desktopcomputer",
+                        isOn: computerUse.isOn,
+                        isBusy: computerUse.isBusy,
+                        onToggle: {
+                            Task { await toggleComputerUse(target.tabID, target.expectedSourceTabSessionIdentity) }
+                        }
+                    )
+                    .disabled(computerUse.isBusy)
+                    .hoverTooltip("Computer Use \(computerUse.isOn ? "on" : "off") for this chat", .top)
+                    .accessibilityLabel("Computer Use \(computerUse.isOn ? "on" : "off") for this chat")
+                    .accessibilityValue(computerUse.isOn ? "On" : "Off")
+                    .accessibilityAddTraits(computerUse.isOn ? .isSelected : [])
+                }
 
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
                     AgentStagedSlashCommandPill(staged: stagedSlashCommand)
@@ -64,6 +123,11 @@ struct AgentStatusPillsRow: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 6) {
+                // Value-only input: quota updates re-render the pill, never this row.
+                if let usageTarget = ProviderQuotaSettingsTarget(agent: snapshot.selectedAgent) {
+                    AgentUsageLimitsPill(target: usageTarget, windowID: windowID)
+                }
+
                 AgentOraclePill(
                     oracleViewModel: oracleViewModel,
                     windowID: windowID,
@@ -74,6 +138,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentContextPill(
                     promptManager: promptManager,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     selectionCoordinator: selectionCoordinator,
                     runtimeVM: runtimeVM,
                     currentTabID: snapshot.currentTabID,

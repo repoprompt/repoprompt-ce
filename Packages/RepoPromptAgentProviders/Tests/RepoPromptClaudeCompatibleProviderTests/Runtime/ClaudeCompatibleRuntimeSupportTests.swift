@@ -2,6 +2,59 @@
 import XCTest
 
 final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
+    func testCustomBackendPersistsAndAppliesRequestLimits() throws {
+        let preset = ClaudeCompatibleBackendConfig(
+            id: .custom, isEnabled: true, displayName: "Local", baseURL: "http://127.0.0.1:8000",
+            auth: .anthropicAPIKey, modelBehavior: .claudeSlotMapping(.init(haiku: "qwen", sonnet: "qwen", opus: "qwen")),
+            requestTimeoutMilliseconds: nil, contextWindowTokens: nil
+        )
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(preset)) as? [String: Any])
+        document["requestTimeoutMilliseconds"] = 600_000
+        document["contextWindowTokens"] = 262_144
+        let config = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+        let restored = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(config))
+        let overridden = restored.normalized.withSlotOverride(slot: "sonnet", backendModelID: "other")
+        let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: overridden, apiKey: "dummy")
+        XCTAssertEqual(environment["API_TIMEOUT_MS"], "600000")
+        XCTAssertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144")
+        XCTAssertNil(environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+
+        for invalid in [0, -1] {
+            document["requestTimeoutMilliseconds"] = invalid
+            document["contextWindowTokens"] = invalid
+            let invalidConfig = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+            XCTAssertFalse(invalidConfig.isValid)
+            let invalidEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalidConfig, apiKey: "dummy")
+            XCTAssertNil(invalidEnvironment["API_TIMEOUT_MS"])
+            XCTAssertNil(invalidEnvironment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
+        }
+        for window in [32768, 262_144, 1_000_000] {
+            document["contextWindowTokens"] = window
+            document["requestTimeoutMilliseconds"] = Int(Int32.max)
+            let bounded = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+            XCTAssertTrue(bounded.isValid)
+            let limits = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: bounded, apiKey: "dummy")
+            XCTAssertEqual(limits["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], String(window))
+            XCTAssertEqual(limits["API_TIMEOUT_MS"], "2147483647")
+            XCTAssertNil(limits["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        }
+        for timeout in [600, 999, Int(Int32.max) + 1] {
+            document["requestTimeoutMilliseconds"] = timeout
+            let invalid = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+            XCTAssertFalse(invalid.isValid)
+            XCTAssertNil(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: invalid, apiKey: "dummy")["API_TIMEOUT_MS"])
+        }
+        document["requestTimeoutMilliseconds"] = 1000
+        document["contextWindowTokens"] = Int(Int32.max) + 1
+        let tooLarge = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONSerialization.data(withJSONObject: document))
+        XCTAssertFalse(tooLarge.isValid)
+        XCTAssertNil(try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: tooLarge, apiKey: "dummy")["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
+        let legacy = try JSONDecoder().decode(ClaudeCompatibleBackendConfig.self, from: JSONEncoder().encode(preset))
+        let legacyEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: legacy, apiKey: "dummy")
+        XCTAssertNil(legacyEnvironment["API_TIMEOUT_MS"])
+        XCTAssertNil(legacyEnvironment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
+    }
+
     func testRuntimeLaunchAndHeadlessSmokesPromptEnvironmentAndModels() async throws {
         let decorated = ClaudeCompatiblePromptDelivery.decoratedUserMessage(
             "Do the work",
@@ -30,9 +83,10 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
             displayName: " Claude Code GLM ",
             baseURL: " https://api.z.ai/api/anthropic ",
             auth: .anthropicAuthToken,
-            modelBehavior: .claudeSlotMapping(.init(haiku: " h ", sonnet: " s ", opus: " o "))
+            modelBehavior: .claudeSlotMapping(.init(haiku: " h ", sonnet: " s ", opus: " o ")),
+            requestTimeoutMilliseconds: nil, contextWindowTokens: nil
         )
-        let environment = ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
+        let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "secret")
         XCTAssertEqual(config.normalizedDisplayName, "Claude Code GLM")
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
         XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "secret")
@@ -43,14 +97,14 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(environment["ANTHROPIC_DEFAULT_OPUS_MODEL"], "o")
         XCTAssertEqual(ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config), ["ANTHROPIC_API_KEY"])
 
-        let oneMillionEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let oneMillionEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-5.2[1m]"
         )
         XCTAssertEqual(oneMillionEnvironment["API_TIMEOUT_MS"], "3000000")
         XCTAssertEqual(oneMillionEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
-        let haikuEnvironment = ClaudeCompatibleBackendEnvironmentBuilder.environment(
+        let haikuEnvironment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: ClaudeCompatibleBackendID.glmZAI.defaultPreset,
             apiKey: "secret",
             selectedBackendModelID: "glm-4.5-air"
@@ -68,7 +122,8 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
                         displayName: "CC Zai",
                         baseURL: "https://api.z.ai/api/anthropic",
                         auth: .anthropicAuthToken,
-                        modelBehavior: .claudeSlotMapping(.init(haiku: "glm-haiku", sonnet: "glm-sonnet", opus: "glm-opus"))
+                        modelBehavior: .claudeSlotMapping(.init(haiku: "glm-haiku", sonnet: "glm-sonnet", opus: "glm-opus")),
+                        requestTimeoutMilliseconds: nil, contextWindowTokens: nil
                     )
                 case .kimi:
                     .init(
@@ -77,7 +132,8 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
                         displayName: "CC Moonshot",
                         baseURL: "https://api.kimi.com/coding/",
                         auth: .anthropicAPIKey,
-                        modelBehavior: .noModel
+                        modelBehavior: .noModel,
+                        requestTimeoutMilliseconds: nil, contextWindowTokens: nil
                     )
                 case .custom:
                     ClaudeCompatibleBackendID.custom.defaultPreset
@@ -165,13 +221,96 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.defaultModelRaw, "opus")
         XCTAssertEqual(claude.options.first?.rawValue, "default")
         XCTAssertEqual(claude.options.first?.isPlaceholderDefault, true)
+        XCTAssertEqual(claude.options.map(\.rawValue), [
+            "default",
+            "fable",
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "opus[1m]",
+            "opus",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "sonnet",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "haiku",
+            "claude-haiku-4-5"
+        ])
         XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(claude.options.contains { $0.rawValue == "opus[1m]" && $0.supportedEffortLevels.contains("xhigh") })
+        let opus55 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-opus-5-5" })
+        XCTAssertEqual(opus55.displayName, "Opus 5.5")
+        XCTAssertEqual(opus55.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        let opus5 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-opus-5" })
+        XCTAssertEqual(opus5.displayName, "Opus 5")
+        XCTAssertEqual(opus5.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        let opus48 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-opus-4-8" })
+        XCTAssertEqual(opus48.displayName, "Opus 4.8")
+        XCTAssertEqual(opus48.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertFalse(opus48.isProviderDefault)
+        let sonnet55 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-sonnet-5-5" })
+        XCTAssertEqual(sonnet55.displayName, "Sonnet 5.5")
+        XCTAssertEqual(sonnet55.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertFalse(sonnet55.isProviderDefault)
+        let mythos51 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-mythos-5-1" })
+        XCTAssertEqual(mythos51.displayName, "Mythos 5.1 (Restricted)")
+        XCTAssertEqual(mythos51.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertFalse(mythos51.isProviderDefault)
+        XCTAssertNotEqual(claude.defaultModelRaw, "claude-mythos-5-1")
         let sonnet5 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-sonnet-5" })
         XCTAssertEqual(sonnet5.displayName, "Sonnet 5")
-        XCTAssertEqual(sonnet5.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
+        XCTAssertEqual(sonnet5.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
 
         let expandedClaude = ClaudeCompatibleModelCatalog.snapshot(pluginID: .claudeCode)
+        XCTAssertEqual(
+            expandedClaude.options.filter { $0.rawValue.hasPrefix("claude-opus-5-5:") }.map(\.rawValue),
+            [
+                "claude-opus-5-5:low",
+                "claude-opus-5-5:medium",
+                "claude-opus-5-5:high",
+                "claude-opus-5-5:xhigh",
+                "claude-opus-5-5:max"
+            ]
+        )
+        XCTAssertEqual(
+            expandedClaude.options.filter { $0.rawValue.hasPrefix("claude-opus-5:") }.map(\.rawValue),
+            [
+                "claude-opus-5:low",
+                "claude-opus-5:medium",
+                "claude-opus-5:high",
+                "claude-opus-5:xhigh",
+                "claude-opus-5:max"
+            ]
+        )
+        XCTAssertEqual(
+            expandedClaude.options.filter { $0.rawValue.hasPrefix("claude-opus-4-8:") }.map(\.rawValue),
+            [
+                "claude-opus-4-8:low",
+                "claude-opus-4-8:medium",
+                "claude-opus-4-8:high",
+                "claude-opus-4-8:xhigh",
+                "claude-opus-4-8:max"
+            ]
+        )
+        XCTAssertFalse(expandedClaude.options.contains { $0.rawValue == "claude-opus-4-8[1m]" })
+        XCTAssertFalse(expandedClaude.options.contains { $0.rawValue.hasPrefix("claude-opus-4-8[1m]:") })
+        XCTAssertEqual(
+            expandedClaude.options.filter { $0.rawValue.hasPrefix("claude-sonnet-5-5:") }.map(\.rawValue),
+            [
+                "claude-sonnet-5-5:low",
+                "claude-sonnet-5-5:medium",
+                "claude-sonnet-5-5:high",
+                "claude-sonnet-5-5:xhigh",
+                "claude-sonnet-5-5:max"
+            ]
+        )
         XCTAssertTrue(expandedClaude.options.contains { $0.rawValue == "claude-sonnet-5:max" })
         XCTAssertTrue(expandedClaude.options.contains { $0.rawValue == "claude-sonnet-5:xhigh" })
 
@@ -185,8 +324,8 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(zai.options.first { $0.rawValue == "glm-5-turbo" }?.displayName, "GLM 5 Turbo")
         XCTAssertEqual(zai.options.first { $0.rawValue == "glm-5.1" }?.displayName, "GLM 5.1")
         XCTAssertEqual(zai.options.first { $0.rawValue == "haiku" }?.supportedEffortLevels, ["low", "medium", "high", "max"])
-        XCTAssertEqual(zai.options.first { $0.rawValue == "sonnet" }?.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
-        XCTAssertEqual(zai.options.first { $0.rawValue == "opus" }?.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
+        XCTAssertEqual(zai.options.first { $0.rawValue == "sonnet" }?.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertEqual(zai.options.first { $0.rawValue == "opus" }?.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
         XCTAssertEqual(zai.options.first { $0.isProviderDefault }?.rawValue, "sonnet")
 
         let expandedZai = ClaudeCompatibleModelCatalog.snapshot(pluginID: .zaiClaudeCode)
@@ -209,6 +348,11 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("sonnet:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("glm-5.2[1m]:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("opus:xhigh"), "opus")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:max"), "claude-opus-5-5")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:xhigh"), "claude-opus-5-5")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5:max"), "claude-opus-5")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-4-8:max"), "claude-opus-4-8")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5:xhigh"), "claude-opus-5")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-sonnet-5:xhigh"), "claude-sonnet-5")
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedGLMModel("glm-4.5-air", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "haiku")
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedGLMModel("glm-4.7", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "haiku")
@@ -248,7 +392,8 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
                 haiku: "glm-4.5-air",
                 sonnet: "glm-5.2[1m]",
                 opus: "glm-5.2"
-            ))
+            )),
+            requestTimeoutMilliseconds: nil, contextWindowTokens: nil
         )
         let resolver = ClaudeCompatibleLaunchEnvironmentResolver(
             backendConfigProvider: { id in

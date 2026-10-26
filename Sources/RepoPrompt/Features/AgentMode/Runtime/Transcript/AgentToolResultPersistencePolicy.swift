@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct AgentSanitizedToolResult: Equatable {
     let text: String
@@ -48,12 +49,16 @@ enum AgentToolResultSanitizationPurpose {
     case persistentStorage
 }
 
+/// Durable tool-result persistence for every ACP provider. The `cursorACP*` symbols are
+/// named for the first provider that used them; recognition is content-based on the
+/// canonical `acp_status` payload produced by `ACPToolUpdateResultAdapter`, so Cursor,
+/// Grok Build, and future ACP providers share this policy.
 enum AgentToolResultPersistencePolicy {
     static let maxPersistedToolSummaryBytes = 2048
     private static let cursorACPPersistedDiffBytesLimit = 1200
     private static let cursorACPFallbackPersistedDiffBytesLimit = 600
-    private static let cursorACPGeneratedDiffInputBytesLimit = 16384
-    private static let cursorACPGeneratedDiffInputLineLimit = 800
+    private static let cursorACPGeneratedDiffInputBytesLimit = ACPToolUpdateResultAdapter.generatedDiffInputBytesLimit
+    private static let cursorACPGeneratedDiffInputLineLimit = ACPToolUpdateResultAdapter.generatedDiffInputLineLimit
     private static let promptExportFileMetadataLimit = 12
 
     static func sanitizeItem(_ item: AgentChatItem) -> AgentChatItem {
@@ -552,6 +557,9 @@ enum AgentToolResultPersistencePolicy {
         sanitizeTranscriptForPersistenceWithMetrics(transcript).transcript
     }
 
+    /// - Parameter context: Leave `nil` or supply a context created with
+    ///   `cachesToolExecutions: false`. A context with execution caching enabled can
+    ///   hand a repeated activity ID a cached execution derived from another activity.
     static func sanitizeTranscriptForPersistenceWithMetrics(
         _ transcript: AgentTranscript,
         context: AgentToolResultProcessingContext? = nil
@@ -561,7 +569,10 @@ enum AgentToolResultPersistencePolicy {
             previousSanitizedTranscript: nil,
             reusablePrefixTurnCount: nil,
             preservedVisibleToolResultRowIDs: [],
-            context: context,
+            // A fresh per-pass context memoizes repeated JSON parses within this single
+            // snapshot walk. Item-ID execution caching stays disabled so a repeated ID
+            // cannot hand one activity a cached execution derived from another.
+            context: context ?? AgentToolResultProcessingContext(cachesToolExecutions: false),
             purpose: .persistentStorage
         )
     }
@@ -2165,15 +2176,85 @@ enum AgentToolResultPersistencePolicy {
         }
 
         if let branch = ContextBuilderFollowUpBranch.select(responseType: responseType),
-           let reply = boundedContextBuilderReply(rawObject[branch.rawValue] as? [String: Any])
+           let rawReply = rawObject[branch.rawValue] as? [String: Any],
+           let reply = boundedContextBuilderReply(rawReply)
         {
             object[branch.rawValue] = reply
+            if let digest = oracleGroupDigest(from: rawReply) {
+                var withDigest = object
+                withDigest[branch.rawValue] = reply.merging(digest) { current, _ in current }
+                if let json = jsonString(from: withDigest), !exceedsPersistedToolSummaryBudget(json) {
+                    return json
+                }
+            }
         }
 
         guard let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) else {
             return minimalResultJSON(statusWord: statusWord, normalizedToolName: "context_builder")
         }
         return json
+    }
+
+    /// Bounded multi-lane Oracle group facts (no lane responses) so archived cards
+    /// can still show lane coverage. Returns nil for single-lane results.
+    static func oracleGroupDigest(from rawObject: [String: Any]?) -> [String: Any]? {
+        guard let rawObject,
+              let rawLanes = rawObject["oracle_results"] as? [[String: Any]],
+              let oracleCount = intValue(rawObject, keys: ["oracle_count"]),
+              oracleCount == rawLanes.count,
+              rawLanes.count > 1,
+              rawLanes.count <= 8
+        else { return nil }
+        var lanes: [[String: Any]] = []
+        var seenIndices = Set<Int>()
+        for rawLane in rawLanes {
+            guard let laneIndex = intValue(rawLane, keys: ["lane_index"]),
+                  (0 ..< oracleCount).contains(laneIndex),
+                  seenIndices.insert(laneIndex).inserted,
+                  let role = smallStringValue(rawLane, keys: ["role"]),
+                  role == (laneIndex == 0 ? "primary" : "additional"),
+                  let chatID = smallStringValue(rawLane, keys: ["chat_id"]),
+                  let modelID = smallStringValue(rawLane, keys: ["model_id"]),
+                  let status = smallStringValue(rawLane, keys: ["status"])
+            else { return nil }
+            var lane: [String: Any] = [
+                "lane_index": laneIndex,
+                "role": role,
+                "chat_id": chatID,
+                "model_id": modelID,
+                "status": status
+            ]
+            if let rawProfile = rawLane["execution_profile"] as? [String: Any],
+               let profileProvider = smallStringValue(rawProfile, keys: ["provider_id"]),
+               let profileModel = smallStringValue(rawProfile, keys: ["model_id"])
+            {
+                lane["execution_profile"] = ["provider_id": profileProvider, "model_id": profileModel]
+            }
+            if let rawError = rawLane["error"] as? [String: Any],
+               let code = smallStringValue(rawError, keys: ["code"])
+            {
+                let message = trimmedStorageString(stringValue(rawError, keys: ["message"])) ?? code
+                var boundedMessage = message.count <= 96 ? message : String(message.prefix(95)) + "…"
+                if OracleLaneError.indicatesTimeout(code: code, message: message),
+                   !OracleLaneError.indicatesTimeout(code: code, message: boundedMessage)
+                {
+                    boundedMessage = "Timed out: " + String(message.prefix(84)) + "…"
+                }
+                lane["error"] = ["code": code, "message": boundedMessage]
+            }
+            lanes.append(lane)
+        }
+        var digest: [String: Any] = [
+            "oracle_count": oracleCount,
+            "oracle_results": lanes
+        ]
+        if let groupID = smallStringValue(rawObject, keys: ["oracle_group_id"]) {
+            digest["oracle_group_id"] = groupID
+        }
+        if let groupStatus = smallStringValue(rawObject, keys: ["status"]) {
+            digest["status"] = groupStatus
+        }
+        return digest
     }
 
     private static func boundedContextBuilderReply(_ rawReply: [String: Any]?) -> [String: Any]? {
@@ -2226,6 +2307,19 @@ enum AgentToolResultPersistencePolicy {
         }
         if let summaryText = oracleChatSummaryText(from: object) {
             object["summary_text"] = summaryText
+        }
+        if stringValue(rawObject, keys: ["status"]) == "partial_failure" {
+            // Keep the canonical incomplete group outcome even if lane detail exceeds the budget.
+            object["status"] = "partial_failure"
+        }
+        if let digest = oracleGroupDigest(from: rawObject) {
+            var withDigest = object
+            withDigest["oracle_count"] = digest["oracle_count"]
+            withDigest["oracle_results"] = digest["oracle_results"]
+            withDigest["oracle_group_id"] = digest["oracle_group_id"]
+            if let json = jsonString(from: withDigest), !exceedsPersistedToolSummaryBudget(json) {
+                return json
+            }
         }
         if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
             return json

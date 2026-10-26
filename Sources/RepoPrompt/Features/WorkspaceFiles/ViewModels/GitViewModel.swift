@@ -1,21 +1,12 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import SwiftUI
-
-enum GitDiffInclusionMode: String, CaseIterable, Codable {
-    case none
-    case selectedFiles
-    case all
-
-    var displayName: String {
-        switch self {
-        case .none: "None"
-        case .selectedFiles: "Selected"
-        case .all: "All"
-        }
-    }
-}
 
 @MainActor
 final class GitViewModel: ObservableObject {
@@ -117,11 +108,13 @@ final class GitViewModel: ObservableObject {
     #endif
 
     private var resolvedStateTask: Task<Void, Never>?
+    private var resolvedStateGeneration: Int = 0
     private var latestStatusGeneration: Int = 0
     private var latestStatusRootPath: String?
     private var currentGitRootPath: String?
 
     private var unstagedFileSearchIndex: [(file: VCSUncommittedFile, pathKey: String)] = []
+    private var selectedChangedAbsolutePaths: Set<String> = []
 
     // Cache for git diffs to avoid regenerating for token counting
     private var cachedDiff: String?
@@ -192,13 +185,10 @@ final class GitViewModel: ObservableObject {
 
         reconcileSelectedDiffBranchIfInvalid()
 
-        // Update selection states when files change
         if filesChanged {
             invalidateDiffCache()
-            scheduleResolvedStateRebuild(for: snapshot)
-        } else if isPopoverVisible {
-            updateFileSelectionStates()
         }
+        scheduleResolvedStateRebuild(for: snapshot)
     }
 
     private struct ResolvedStateInput {
@@ -209,6 +199,8 @@ final class GitViewModel: ObservableObject {
 
     private struct ResolvedStateOutput {
         let fileSelectionStates: [String: Bool]
+        let changedAbsolutePaths: Set<String>
+        let selectedAbsolutePaths: Set<String>
     }
 
     private func scheduleResolvedStateRebuild(for snapshot: GitStatusActor.GitStatusSnapshot) {
@@ -222,6 +214,13 @@ final class GitViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
+    private func supersedeResolvedStateRebuild() -> Int {
+        resolvedStateGeneration &+= 1
+        resolvedStateTask?.cancel()
+        return resolvedStateGeneration
+    }
+
     private func scheduleResolvedStateRebuild(
         baseRootPath: String?,
         unstagedRelativePaths: [String],
@@ -229,11 +228,11 @@ final class GitViewModel: ObservableObject {
         generation: Int,
         rootPath: String?
     ) {
-        resolvedStateTask?.cancel()
+        let rebuildGeneration = supersedeResolvedStateRebuild()
 
-        guard let fileManager else { return }
-        guard let baseRootPath, !unstagedRelativePaths.isEmpty else {
+        guard let fileManager, let baseRootPath else {
             fileSelectionStates = [:]
+            selectedChangedAbsolutePaths = []
             return
         }
 
@@ -244,38 +243,71 @@ final class GitViewModel: ObservableObject {
             selectedAbsolutePaths: selectedAbsPaths
         )
 
-        resolvedStateTask = Task.detached(priority: .userInitiated) { [input, generation, rootPath, selectedRootPath] in
-            if Task.isCancelled { return }
+        resolvedStateTask = Task.detached(
+            priority: .userInitiated
+        ) { [input, generation, rebuildGeneration, rootPath, selectedRootPath] in
+            if Task.isCancelled {
+                return
+            }
             let output = Self.buildResolvedState(input: input)
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             await MainActor.run { [weak self] in
-                guard let self else { return }
                 guard !Task.isCancelled else { return }
-                guard generation == latestStatusGeneration else { return }
-                if let rootPath {
-                    guard rootPath == latestStatusRootPath else { return }
-                }
-                if let selectedRootPath {
-                    guard selectedRootPath == selectedRootFolder?.fullPath else { return }
-                }
-
-                fileSelectionStates = output.fileSelectionStates
+                self?.publishResolvedState(
+                    output,
+                    statusGeneration: generation,
+                    rebuildGeneration: rebuildGeneration,
+                    rootPath: rootPath,
+                    selectedRootPath: selectedRootPath
+                )
             }
         }
     }
 
-    private nonisolated static func buildResolvedState(input: ResolvedStateInput) -> ResolvedStateOutput {
-        let selectedAbs = Set(input.selectedAbsolutePaths.map { normalizeForComparison($0) })
-        var states: [String: Bool] = [:]
-        states.reserveCapacity(input.unstagedRelativePaths.count)
-
-        for relativePath in input.unstagedRelativePaths {
-            let abs = normalizedAbsolutePath(for: relativePath, baseRootPath: input.baseRootPath)
-            states[relativePath] = selectedAbs.contains(abs)
+    private func publishResolvedState(
+        _ output: ResolvedStateOutput,
+        statusGeneration: Int,
+        rebuildGeneration: Int,
+        rootPath: String?,
+        selectedRootPath: String?
+    ) {
+        guard rebuildGeneration == resolvedStateGeneration else { return }
+        guard statusGeneration == latestStatusGeneration else { return }
+        if let rootPath {
+            guard rootPath == latestStatusRootPath else { return }
+        }
+        if let selectedRootPath {
+            guard selectedRootPath == selectedRootFolder?.fullPath else { return }
         }
 
-        return ResolvedStateOutput(fileSelectionStates: states)
+        fileSelectionStates = output.fileSelectionStates
+        reconcileTrackedSelectedChangedPaths(
+            changedAbsolutePaths: output.changedAbsolutePaths,
+            selectedAbsolutePaths: output.selectedAbsolutePaths
+        )
+    }
+
+    private nonisolated static func buildResolvedState(input: ResolvedStateInput) -> ResolvedStateOutput {
+        let selectedAbsolutePaths = Set(input.selectedAbsolutePaths.map { normalizeForComparison($0) })
+        var states: [String: Bool] = [:]
+        var changedAbsolutePaths = Set<String>()
+        states.reserveCapacity(input.unstagedRelativePaths.count)
+        changedAbsolutePaths.reserveCapacity(input.unstagedRelativePaths.count)
+
+        for relativePath in input.unstagedRelativePaths {
+            let absolutePath = normalizedAbsolutePath(for: relativePath, baseRootPath: input.baseRootPath)
+            changedAbsolutePaths.insert(absolutePath)
+            states[relativePath] = selectedAbsolutePaths.contains(absolutePath)
+        }
+
+        return ResolvedStateOutput(
+            fileSelectionStates: states,
+            changedAbsolutePaths: changedAbsolutePaths,
+            selectedAbsolutePaths: selectedAbsolutePaths
+        )
     }
 
     private func setupModeObservers() {
@@ -324,6 +356,15 @@ final class GitViewModel: ObservableObject {
 
     private func setupFileManagerObservers(_ fileManager: WorkspaceFilesViewModel?) {
         guard let fileManager else { return }
+
+        fileManager.$selectedFiles
+            .dropFirst()
+            .sink { [weak self] selectedFiles in
+                guard let self else { return }
+                supersedeResolvedStateRebuild()
+                reconcileTrackedSelectedChangedPaths(selectedFiles: selectedFiles)
+            }
+            .store(in: &cancellables)
 
         // Observe file manager selection changes only when popover is visible
         fileManager.$selectedFiles
@@ -449,7 +490,9 @@ final class GitViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
-                    if self == nil { break }
+                    if self == nil {
+                        break
+                    }
                     continue
                 }
                 let detections = await refreshGitContexts(request.rootPaths)
@@ -492,11 +535,13 @@ final class GitViewModel: ObservableObject {
 
     func shutdownForWindowClose() async {
         prepareForWindowClose()
+        await statusActor.shutdown()
         let tasks = pendingWindowCloseTasks
         for task in tasks {
             await task.value
         }
         pendingWindowCloseTasks.removeAll()
+        await statusActor.invalidateUntrackedStats()
     }
 
     #if DEBUG
@@ -515,6 +560,42 @@ final class GitViewModel: ObservableObject {
         func test_installGitContextRefreshTask(_ task: Task<Void, Never>) {
             precondition(testWindowCloseTask == nil)
             testWindowCloseTask = task
+        }
+
+        var test_trackedSelectedChangedAbsolutePaths: Set<String> {
+            selectedChangedAbsolutePaths
+        }
+
+        var test_resolvedStateGeneration: Int {
+            resolvedStateGeneration
+        }
+
+        func test_publishSelectedChangedProjection(
+            changedAbsolutePaths: Set<String>,
+            selectedAbsolutePaths: Set<String>,
+            rebuildGeneration: Int
+        ) {
+            publishResolvedState(
+                ResolvedStateOutput(
+                    fileSelectionStates: [:],
+                    changedAbsolutePaths: changedAbsolutePaths,
+                    selectedAbsolutePaths: selectedAbsolutePaths
+                ),
+                statusGeneration: latestStatusGeneration,
+                rebuildGeneration: rebuildGeneration,
+                rootPath: latestStatusRootPath,
+                selectedRootPath: selectedRootFolder?.fullPath
+            )
+        }
+
+        func test_applyStatusSnapshot(_ snapshot: GitStatusActor.GitStatusSnapshot) async {
+            apply(snapshot)
+            await resolvedStateTask?.value
+        }
+
+        func test_rebuildSelectionProjection() async {
+            updateFileSelectionStates()
+            await resolvedStateTask?.value
         }
 
     #endif
@@ -681,6 +762,7 @@ final class GitViewModel: ObservableObject {
         let resolvedPath = getResolvedPath(for: relativePath)
         fileManager.selectPath(resolvedPath, kind: nil)
 
+        selectedChangedAbsolutePaths.insert(resolvedPath)
         fileSelectionStates[relativePath] = true
 
         if gitDiffInclusionMode == .selectedFiles {
@@ -694,6 +776,7 @@ final class GitViewModel: ObservableObject {
         let resolvedPath = getResolvedPath(for: relativePath)
         fileManager.deselectPath(resolvedPath, kind: nil)
 
+        selectedChangedAbsolutePaths.remove(resolvedPath)
         fileSelectionStates[relativePath] = false
 
         if gitDiffInclusionMode == .selectedFiles {
@@ -703,6 +786,14 @@ final class GitViewModel: ObservableObject {
 
     func isFileSelected(_ relativePath: String) -> Bool {
         fileSelectionStates[relativePath] ?? false
+    }
+
+    var hasCurrentSelectedChangedFiles: Bool {
+        !selectedChangedPaths().absolute.isEmpty
+    }
+
+    var hasTrackedSelectedChangedFiles: Bool {
+        !selectedChangedAbsolutePaths.isEmpty || hasCurrentSelectedChangedFiles
     }
 
     private func updateFileSelectionStates() {
@@ -719,6 +810,26 @@ final class GitViewModel: ObservableObject {
     func refreshSelectionStatesIfNeeded() {
         guard isGitActive, isPopoverVisible else { return }
         updateFileSelectionStates()
+    }
+
+    private func reconcileTrackedSelectedChangedPaths(
+        changedAbsolutePaths: Set<String>,
+        selectedAbsolutePaths: Set<String>
+    ) {
+        selectedChangedAbsolutePaths = changedAbsolutePaths.intersection(selectedAbsolutePaths)
+    }
+
+    private func reconcileTrackedSelectedChangedPaths(selectedFiles: [FileViewModel]) {
+        let changedAbsolutePaths = Set(unstagedFiles.map { getResolvedPath(for: $0.path) })
+        let selectedAbsolutePaths = Set(selectedFiles.map { Self.normalizeForComparison($0.fullPath) })
+        reconcileTrackedSelectedChangedPaths(
+            changedAbsolutePaths: changedAbsolutePaths,
+            selectedAbsolutePaths: selectedAbsolutePaths
+        )
+    }
+
+    private func syncTrackedSelectedChangedPathsFromCurrentSnapshot() {
+        reconcileTrackedSelectedChangedPaths(selectedFiles: fileManager?.selectedFiles ?? [])
     }
 
     // MARK: - Public accessors for artifact publishing
@@ -839,7 +950,8 @@ final class GitViewModel: ObservableObject {
         rootUpdateTask?.cancel()
         unstagedFiles = []
         fileSelectionStates = [:]
-        resolvedStateTask?.cancel()
+        selectedChangedAbsolutePaths.removeAll()
+        supersedeResolvedStateRebuild()
         latestStatusGeneration = 0
         latestStatusRootPath = nil
         currentGitRootPath = nil
@@ -905,6 +1017,7 @@ final class GitViewModel: ObservableObject {
 
         await fileManager.selectFiles(withPaths: resolvedPaths, allowEmpty: false, clear: false)
 
+        selectedChangedAbsolutePaths.formUnion(Set(resolvedPaths))
         updateFileSelectionStates()
 
         if gitDiffInclusionMode == .selectedFiles {
@@ -922,6 +1035,7 @@ final class GitViewModel: ObservableObject {
 
         await fileManager.selectFiles(withPaths: resolvedPaths, allowEmpty: false, clear: false)
 
+        selectedChangedAbsolutePaths.formUnion(Set(resolvedPaths))
         updateFileSelectionStates()
         if gitDiffInclusionMode == .selectedFiles {
             invalidateDiffCache()
@@ -937,6 +1051,7 @@ final class GitViewModel: ObservableObject {
 
         await fileManager.selectFiles(withPaths: resolvedPaths, allowEmpty: false, clear: true)
 
+        selectedChangedAbsolutePaths = Set(resolvedPaths)
         updateFileSelectionStates()
 
         if gitDiffInclusionMode == .selectedFiles {
@@ -952,6 +1067,7 @@ final class GitViewModel: ObservableObject {
         let resolved = unstagedFiles.map { getResolvedPath(for: $0.path) }
         await fileManager.deselectFiles(withPaths: resolved)
 
+        selectedChangedAbsolutePaths.subtract(Set(resolved))
         updateFileSelectionStates()
         if gitDiffInclusionMode == .selectedFiles {
             invalidateDiffCache()
@@ -968,6 +1084,30 @@ final class GitViewModel: ObservableObject {
 
         await fileManager.deselectFiles(withPaths: resolved)
 
+        selectedChangedAbsolutePaths.subtract(Set(resolved))
+        updateFileSelectionStates()
+        if gitDiffInclusionMode == .selectedFiles {
+            invalidateDiffCache()
+        }
+    }
+
+    func clearSelectedChangedFilesFromFileManager() async {
+        syncTrackedSelectedChangedPathsFromCurrentSnapshot()
+        let resolved = selectedChangedAbsolutePaths.sorted()
+
+        selectedChangedAbsolutePaths.removeAll()
+        fileSelectionStates = fileSelectionStates.mapValues { _ in false }
+        guard let fileManager, !resolved.isEmpty else {
+            if gitDiffInclusionMode == .selectedFiles {
+                invalidateDiffCache()
+            }
+            return
+        }
+
+        isBulkSelectionRunning = true
+        defer { isBulkSelectionRunning = false }
+
+        await fileManager.deselectFiles(withPaths: resolved)
         updateFileSelectionStates()
         if gitDiffInclusionMode == .selectedFiles {
             invalidateDiffCache()

@@ -146,6 +146,10 @@ struct AIModelDropdown: View {
                         items: group.models.map(aiModelMenuItem)
                     )
                 }
+            } else if provider == .cursor {
+                aiModelCursorMenuItems(for: models)
+            } else if provider == .devin {
+                aiModelDevinMenuItems(for: models)
             } else if provider == .openCode {
                 AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)
@@ -156,6 +160,59 @@ struct AIModelDropdown: View {
                 models.map(aiModelMenuItem)
             }
             return [.submenu(AIProviderType.displayName(for: provider), items: providerItems)]
+        }
+    }
+
+    /// Cursor stores its official bracket override in the existing model-string destination.
+    func aiModelCursorMenuItems(for models: [AIModel]) -> [StableMenuItem] {
+        let expectedRaw = destination.currentRawValue
+        let expectedWorkspace = promptViewModel.currentWorkspaceID
+        let selectedName = AIModel.fromModelName(expectedRaw)?.modelName ?? ""
+        let selected = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedName)
+        return models.map { model in
+            guard let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: model.modelName)?.definition(kind: .thinking),
+                  CursorAIModelCatalog.ModelSpecifier.canEncode(definition.configID) else { return aiModelMenuItem(model) }
+            let saved = selected?.baseModelRaw == model.modelName ? selected : nil
+            let specifier = saved ?? (try? CursorAIModelCatalog.ModelSpecifier(raw: model.modelName))
+            guard let specifier else { return aiModelMenuItem(model) }
+            let apply: (String) -> Void = { raw in
+                guard destination.currentRawValue == expectedRaw,
+                      promptViewModel.currentWorkspaceID == expectedWorkspace else { return }
+                destination.apply(AIModel.cursorCustom(name: raw).rawValue)
+            }
+            var items: [StableMenuItem] = [.action("Select Model", isSelected: selectedName == model.modelName) { apply(model.modelName) }]
+            if let cleared = specifier.replacing(configID: definition.configID, valueRaw: nil) {
+                items.append(.action("Use Runtime Default", isSelected: saved != nil && !specifier.overrides.contains(where: { $0.configID == definition.configID })) { apply(cleared) })
+            }
+            items.append(contentsOf: definition.choices.compactMap { choice in
+                guard let raw = specifier.replacing(configID: definition.configID, valueRaw: choice.rawValue) else { return nil }
+                return .action(choice.displayName, isSelected: saved?.overrides.contains(where: { $0.configID == definition.configID && $0.valueRaw == choice.rawValue }) == true) {
+                    guard let current = try? CursorAIModelCatalog.ModelSpecifier(raw: raw),
+                          (try? current.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))) != nil else { return }
+                    apply(raw)
+                }
+            })
+            return .submenu(model.displayName, items: items)
+        }
+    }
+
+    /// Devin family → effort submenus, in the catalog's advertised effort order.
+    private func aiModelDevinMenuItems(for models: [AIModel]) -> [StableMenuItem] {
+        let catalog = DevinModelCatalog.current
+        let modelsByRaw = Dictionary(models.map { ($0.modelName.lowercased(), $0) }) { first, _ in first }
+        let catalogOptions = catalog.entries.map(\.option).filter { modelsByRaw[$0.rawValue.lowercased()] != nil }
+        let unknownOptions = models.filter { catalog.entry(matching: $0.modelName) == nil }.map {
+            AgentModelOption(rawValue: $0.modelName, displayName: $0.displayName, description: nil, isDefault: false)
+        }
+        return catalog.menuGroups(for: catalogOptions + unknownOptions).flatMap { group -> [StableMenuItem] in
+            let items = group.entries.compactMap { entry -> StableMenuItem? in
+                guard let model = modelsByRaw[entry.option.rawValue.lowercased()] else { return nil }
+                guard group.rendersAsSubmenu, let effort = entry.effortDisplayName else { return aiModelMenuItem(model) }
+                return .action(effort, isSelected: model.rawValue == destination.currentRawValue) {
+                    destination.apply(model.rawValue)
+                }
+            }
+            return group.rendersAsSubmenu ? [.submenu(group.displayName, items: items)] : items
         }
     }
 

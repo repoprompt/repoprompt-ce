@@ -1,5 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {
     nonisolated static let codeMapsGloballyDisabledMCPMessage = "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
@@ -56,7 +60,7 @@ extension MCPServerViewModel {
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
     func selectedRecordsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> [WorkspaceFileRecord] {
         do {
@@ -83,7 +87,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollections(
-        for context: TabContextSnapshot,
+        for context: MCPTabContextSnapshot,
         codeMapUsageOverride: CodeMapUsage? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> SelectionReplyAssembler.SelectionCollections {
@@ -106,9 +110,19 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
-        if let frozenLookupContext = context.frozenLookupContext {
-            return frozenLookupContext
+    func lookupContext(for context: MCPTabContextSnapshot) async -> WorkspaceLookupContext {
+        if let authority = context.frozenFileToolAuthority,
+           let workspaceManager
+        {
+            do {
+                try await authority.validate(
+                    workspaceManager: workspaceManager,
+                    store: promptVM.workspaceFileContextStore
+                )
+                return authority.lookupContext
+            } catch {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
         }
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(
@@ -121,10 +135,10 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollectionsForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> SelectionReplyAssembler.SelectionCollections {
-        let metadata: RequestMetadata = if let metadataOverride {
+        let metadata: MCPRequestMetadata = if let metadataOverride {
             metadataOverride
         } else {
             await captureRequestMetadata()
@@ -132,7 +146,6 @@ extension MCPServerViewModel {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: "selection",
-            policy: .allowLegacyImplicitRouting,
             startMirroring: false
         )
         let stabilized = try stabilizedSelectionReadSnapshot(resolved)
@@ -144,11 +157,11 @@ extension MCPServerViewModel {
 
     @MainActor
     func physicalSelectionForCurrentTabContext(
-        metadataOverride: RequestMetadata? = nil,
+        metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> StoredSelection {
         do {
-            let metadata: RequestMetadata = if let metadataOverride {
+            let metadata: MCPRequestMetadata = if let metadataOverride {
                 metadataOverride
             } else {
                 await captureRequestMetadata()
@@ -156,7 +169,6 @@ extension MCPServerViewModel {
             let resolved = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: "selection",
-                policy: .allowLegacyImplicitRouting,
                 startMirroring: false
             )
             let stabilized = try stabilizedSelectionReadSnapshot(resolved)
@@ -260,10 +272,7 @@ extension MCPServerViewModel {
     }
 
     enum SelectionReplyAssembler {
-        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy(
-            maximumReadinessRounds: 1,
-            maximumTotalWait: .zero
-        )
+        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy.default
 
         struct SelectedEntry {
             let entry: ResolvedPromptFileEntry
@@ -498,11 +507,11 @@ extension MCPServerViewModel {
             switch reason {
             case .unsupportedFileType:
                 .unmapped(terminal: true)
-            case .gitTerminal:
+            case .rootTerminal:
                 .unmapped(terminal: true)
             case let .demandUnavailable(reason):
                 demandUnavailableDisposition(reason)
-            case .rootNotLoaded, .fileNotCataloged, .gitTransient, .busy,
+            case .rootNotLoaded, .fileNotCataloged, .rootTransient, .busy,
                  .rejected, .routeConflict, .registrationFailed, .runtimeFailure,
                  .staleCurrentness, .cancelled:
                 .pending
@@ -532,125 +541,42 @@ extension MCPServerViewModel {
             _ coverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
         ) -> [UUID: CodemapIssueDisposition] {
             var dispositions: [UUID: CodemapIssueDisposition] = [:]
-
-            func merged(
-                _ existing: CodemapIssueDisposition?,
-                _ next: CodemapIssueDisposition
-            ) -> CodemapIssueDisposition {
-                guard let existing else { return next }
-                switch (existing, next) {
-                case (.unmapped(terminal: true), _), (_, .unmapped(terminal: true)):
-                    return .unmapped(terminal: true)
-                case (.pending, _), (_, .pending):
-                    return .pending
-                case (.unmapped, .unmapped):
-                    return .unmapped(terminal: false)
-                }
-            }
-
             func record(_ fileID: UUID, _ disposition: CodemapIssueDisposition) {
-                dispositions[fileID] = merged(dispositions[fileID], disposition)
+                let existing = dispositions[fileID]
+                switch (existing, disposition) {
+                case (.unmapped(terminal: true), _), (_, .unmapped(terminal: true)):
+                    dispositions[fileID] = .unmapped(terminal: true)
+                case (.pending, _), (_, .pending):
+                    dispositions[fileID] = .pending
+                default:
+                    dispositions[fileID] = disposition
+                }
             }
-
-            func recordPending(_ fileID: UUID) {
-                record(fileID, .pending)
+            let issues: [WorkspaceCodemapAutomaticSelectionIssue] = switch coverage {
+            case .ok: []
+            case let .partial(value), let .pending(value), let .unavailable(value): value
             }
-
-            func recordUnavailable(
-                _ fileID: UUID,
-                _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
-            ) {
-                record(fileID, unavailableDisposition(reason))
-            }
-
-            func recordSourceIssue(_ issue: WorkspaceCodemapAutomaticSelectionSourceIssue) {
+            for issue in issues {
                 switch issue {
-                case let .outsideRootScope(source):
+                case let .sourceOutsideRootScope(source), let .sourceExcluded(source),
+                     let .sourceFenced(source):
                     record(source.fileID, .unmapped(terminal: true))
-                case let .notCataloged(source), let .notDemanded(source),
-                     let .staleCatalogGeneration(source, _):
-                    recordPending(source.fileID)
-                case let .pending(source, _):
-                    recordPending(source.fileID)
-                case let .unavailable(source, reason):
-                    recordUnavailable(source.fileID, reason)
-                }
-            }
-
-            func recordTargetIssue(_ issue: WorkspaceCodemapAutomaticSelectionTargetIssue) {
-                switch issue {
-                case let .notCataloged(_, fileID), let .staleGeneration(_, fileID, _):
-                    recordPending(fileID)
-                case let .logicalPathUnavailable(_, fileID):
+                case let .sourceNotCataloged(source), let .sourcePending(source),
+                     let .sourceNotIndexed(source), let .sourceGenerationChanged(source, _):
+                    record(source.fileID, .pending)
+                case let .targetNotCataloged(_, fileID), let .targetGenerationChanged(_, fileID),
+                     let .targetDemandPending(_, fileID):
+                    record(fileID, .pending)
+                case let .targetLogicalPathUnavailable(_, fileID):
                     record(fileID, .unmapped(terminal: true))
-                }
-            }
-
-            func recordPartialReason(_ reason: WorkspaceCodemapAutomaticSelectionPartialReason) {
-                switch reason {
-                case .graph:
-                    break
-                case let .source(issue):
-                    recordSourceIssue(issue)
-                case let .sourceDemandTimedOut(source):
-                    recordPending(source.fileID)
-                case let .candidateUnavailable(_, fileID, reason):
-                    recordUnavailable(fileID, reason)
-                }
-            }
-
-            func recordPendingReason(_ reason: WorkspaceCodemapAutomaticSelectionPendingReason) {
-                switch reason {
-                case let .sourceDemand(source, _), let .sourceBusy(source, _):
-                    recordPending(source.fileID)
-                case let .candidateDemand(_, fileID, _), let .candidateBusy(_, fileID, _):
-                    recordPending(fileID)
-                case .manifestAdmission, .graphRebuild:
+                case let .targetDemandUnavailable(_, fileID, reason):
+                    record(fileID, unavailableDisposition(reason))
+                case .emptySources, .rootEpochChanged, .rootScopeChanged, .graphNotInitialized,
+                     .updatesPending, .reconciling, .graphUnavailable, .graphRevoked,
+                     .receiptInvalid, .budget:
                     break
                 }
             }
-
-            func recordUnavailableReason(_ reason: WorkspaceCodemapAutomaticSelectionUnavailableReason) {
-                switch reason {
-                case .noReadySources, .graph:
-                    break
-                case let .candidate(_, fileID, reason):
-                    recordUnavailable(fileID, reason)
-                }
-            }
-
-            func recordStaleReason(_ reason: WorkspaceCodemapAutomaticSelectionStaleReason) {
-                switch reason {
-                case let .sourceStateChanged(source), let .sourceCatalogGeneration(source, _):
-                    recordPending(source.fileID)
-                case let .targetStateChanged(issue):
-                    recordTargetIssue(issue)
-                case .rootEpochNotCurrent, .rootScopeChanged, .coverageProof, .graph,
-                     .publicationReceipt:
-                    break
-                }
-            }
-
-            switch coverage {
-            case .complete:
-                break
-            case let .partial(_, reasons):
-                reasons.forEach(recordPartialReason)
-            case let .provisional(_, pending, partial):
-                pending.forEach(recordPendingReason)
-                partial.forEach(recordPartialReason)
-            case .incomplete:
-                break
-            case let .pending(reasons):
-                reasons.forEach(recordPendingReason)
-            case let .unavailable(reason):
-                recordUnavailableReason(reason)
-            case let .stale(reason):
-                recordStaleReason(reason)
-            case .busy, .budget:
-                break
-            }
-
             return dispositions
         }
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     /// Debug-only root-load trace correlation for workspace restore metrics.
@@ -97,6 +98,16 @@ import Foundation
             let context = contextsByStandardizedPath[standardizedPath]?.last?.context
             lock.unlock()
             return context
+        }
+    }
+
+    struct AppWorkspaceRootLoadFieldProvider: WorkspaceRootLoadFieldProviding {
+        func rootRecordCreatedFields(forPath path: String) -> [String: String] {
+            WorkspaceRootLoadDiagnostics.rootRecordCreatedFields(forPath: path)
+        }
+
+        func firstPreparedChunkFields(forPath path: String) -> [String: String] {
+            WorkspaceRootLoadDiagnostics.firstPreparedChunkFields(forPath: path)
         }
     }
 #endif

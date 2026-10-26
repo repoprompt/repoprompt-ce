@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 struct HistoryExecutionBudget: Equatable {
     let maxTurns: Int
@@ -205,10 +206,8 @@ enum HistoryMCPToolService {
                 firstActivityAt: iso8601DateTime.string(from: r.firstActivityAt ?? r.activityDate),
                 lastActivityAt: iso8601DateTime.string(from: r.lastActivityAt ?? r.savedAt),
                 activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
-                // `turn_count` here is the projected visible item/row count (itemCount), not raw
-                // transcript turns; `time` calendar groups and `get_session.total_turns` count
-                // real turns. Kept as-is for `list_sessions` API stability (see spec).
-                turnCount: r.itemCount,
+                turnCount: r.transcriptTurnCount,
+                projectedItemCount: r.itemCount,
                 toolCallCount: r.toolCallCount,
                 filesTouched: cappedFilesTouched,
                 filesTouchedCount: filesTouched.count,
@@ -346,10 +345,29 @@ enum HistoryMCPToolService {
                         : "This session file exceeds the safe history read limit."
                 ))
             }
+            if case .sessionAuthorityViolation = error {
+                return .error(HistoryErrorReply(error: error.localizedDescription, retryable: false))
+            }
             throw error
         }
         let transcript = loaded.transcript
         let sessionName = loaded.name ?? record?.name ?? ""
+        let tokenUsageSummary = HistoryGetSessionReply.TokenUsageSummaryDTO(
+            providerInputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.promptTokens },
+            providerOutputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.completionTokens },
+            estimatedToolInputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.estimatedToolInputTokens },
+            estimatedToolOutputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.estimatedToolOutputTokens },
+            attributedRunCount: Set(loaded.providerTokenUsageByTurn.compactMap(\.runID)).count,
+            unattributedUsageCount: loaded.providerTokenUsageByTurn.count(where: { $0.runID == nil }),
+            codexLastContextTokens: loaded.codexLastTotalTokens,
+            codexTotalTokens: loaded.codexTotalTotalTokens
+        )
+        let tokenUsageByTurnID = Dictionary(
+            grouping: loaded.providerTokenUsageByTurn.compactMap { usage in
+                usage.turnID.map { ($0, usage) }
+            },
+            by: { $0.0 }
+        ).mapValues { $0.map(\.1) }
         let totalTurns = transcript.turns.count
         guard totalTurns > 0 else {
             return .getSession(HistoryGetSessionReply(
@@ -362,6 +380,7 @@ enum HistoryMCPToolService {
                 truncated: false,
                 scanTruncated: lookupDiagnostics.isEmpty ? nil : true,
                 scanDiagnostics: nonEmptyScanDiagnostics(lookupDiagnostics),
+                tokenUsageSummary: tokenUsageSummary,
                 turns: []
             ))
         }
@@ -407,6 +426,7 @@ enum HistoryMCPToolService {
                 turn,
                 turnIndex: turnIndex,
                 roles: roles,
+                tokenUsage: tokenUsageByTurnID[turn.id] ?? [],
                 remainingChars: &remainingChars,
                 requestBudget: requestBudget
             )
@@ -434,6 +454,7 @@ enum HistoryMCPToolService {
             truncated: replyTruncated,
             scanTruncated: lookupDiagnostics.isEmpty ? nil : true,
             scanDiagnostics: nonEmptyScanDiagnostics(lookupDiagnostics),
+            tokenUsageSummary: tokenUsageSummary,
             turns: turnDTOs
         ))
     }
@@ -531,7 +552,8 @@ enum HistoryMCPToolService {
                 transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -611,19 +633,34 @@ enum HistoryMCPToolService {
                 // Search summary text fields. conclusionText is the full (non-truncated)
                 // conclusion and is preferred when available (full/condensed tiers).
                 // compactConclusionText is the truncated fallback for summary/archived tiers
-                // where conclusionText is nilled out during compaction.
+                // where conclusionText is nilled out during compaction. Recovery
+                // diagnostics are included so a demoted turn's recovery notice stays
+                // findable after its `.system` row is trimmed.
                 if sourceFilter != "activities", let summary = turn.summary {
                     let conclusionText = summary.conclusionText ?? summary.compactConclusionText
+                    // Only diagnostics whose live `.system` row has been trimmed need the
+                    // summary carrier — a retained row already matches the activity scan,
+                    // so including it here would double-count on full-tier turns.
+                    let retainedActivityIDs = Set(turn.allActivities.map(\.id))
+                    let diagnosticsText = summary.normalizedRecoveryDiagnostics
+                        .filter { !retainedActivityIDs.contains($0.id) }
+                        .map(\.text)
+                        .joined(separator: "\n")
                     let summaryTexts: [(String, String)] = [
                         (conclusionText ?? "", "conclusion"),
                         (summary.middleSummaryText ?? "", "middleSummaryText"),
-                        (summary.requestText ?? "", "requestText")
+                        (summary.requestText ?? "", "requestText"),
+                        (diagnosticsText ?? "", "recoveryDiagnostic")
                     ]
 
                     for (text, field) in summaryTexts where !text.isEmpty {
                         if text.lowercased().contains(queryLower) {
                             let snippet = extractSnippet(text: text, query: queryLower)
-                            let roleString = field == "requestText" ? "user" : "assistant"
+                            let roleString = switch field {
+                            case "requestText": "user"
+                            case "recoveryDiagnostic": "system"
+                            default: "assistant"
+                            }
                             let timestamp = turn.startedAt
                             let match = HistorySearchMatch(
                                 sessionID: session.record.id,
@@ -862,7 +899,8 @@ enum HistoryMCPToolService {
                         for: session.record,
                         sessionID: session.record.id,
                         workspaceDir: session.workspaceDir,
-                        requestBudget: requestBudget
+                        requestBudget: requestBudget,
+                        workspaceLocation: session.registeredLocation
                     )
                 } catch is CancellationError {
                     throw CancellationError()
@@ -896,13 +934,15 @@ enum HistoryMCPToolService {
                 let transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
                 enriched.append(
                     HistoryFilteredSessionRecord(
                         record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
                         workspaceName: session.workspaceName,
-                        workspaceDir: session.workspaceDir
+                        workspaceDir: session.workspaceDir,
+                        registeredLocation: session.registeredLocation
                     )
                 )
                 sessionsScanned += 1
@@ -947,7 +987,7 @@ enum HistoryMCPToolService {
         switch error {
         case .sessionFileNotFound:
             return sessionReadFailureDiagnostic(phase: phase)
-        case .transcriptDecodingFailed:
+        case .transcriptDecodingFailed, .sessionAuthorityViolation:
             return sessionReadFailureDiagnostic(phase: phase, retryable: false)
         case let .workBudgetExceeded(diagnostic):
             return diagnostic
@@ -1097,7 +1137,8 @@ enum HistoryMCPToolService {
                 transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -1140,9 +1181,6 @@ enum HistoryMCPToolService {
                 let start = turn.startedAt
                 if let dateFrom, start < dateFrom { continue }
                 if let dateTo, start > dateTo { continue }
-                let end = turn.completedAt ?? turn.lastActivityAt ?? start
-                guard end >= start else { continue }
-
                 // The turn (and its tool calls) belong to the group it started in.
                 guard let startGroup = groupBounds(for: start) else { continue }
                 turnsByKey[startGroup.key, default: 0] += 1
@@ -1172,16 +1210,19 @@ enum HistoryMCPToolService {
                     toolCallsByKey[startGroup.key, default: 0] += fallbackToolCalls
                 }
 
-                // Clip the interval to each group boundary it spans, so a cross-boundary
-                // turn contributes only its in-boundary portion to each group (a point
-                // turn — end == start — is attributed as-is). Without clipping, a turn
-                // that spans a boundary is fully attributed to its start's group and can
-                // overlap a turn in the next group, double-counting the overlap.
-                if end == start {
-                    intervalsByKey[startGroup.key, default: []].append((start, end))
-                } else {
-                    var cursor = start
-                    while cursor < end {
+                // Treat each observed request/provider/activity timestamp as a point of work.
+                // The idle threshold then decides which gaps are active, including gaps inside
+                // one long-lived turn. Using the full turn boundary here made approval waits and
+                // resumed multi-day turns look continuously active.
+                for interval in AgentSessionMetadataRecord.activityIntervals(from: turn) {
+                    if interval.start == interval.end {
+                        guard let group = groupBounds(for: interval.start) else { continue }
+                        intervalsByKey[group.key, default: []].append(interval)
+                        continue
+                    }
+
+                    var cursor = interval.start
+                    while cursor < interval.end {
                         collectionUnitsProcessed += 1
                         if collectionUnitsProcessed.isMultiple(of: 64),
                            let diagnostic = try await cooperativeCollectionCheckpoint(
@@ -1195,13 +1236,14 @@ enum HistoryMCPToolService {
                             budgetStopped = true
                             break
                         }
-                        guard let g = groupBounds(for: cursor) else { break }
-                        let clippedEnd = min(end, g.end)
-                        intervalsByKey[g.key, default: []].append((cursor, clippedEnd))
-                        cursor = g.end
+                        guard let group = groupBounds(for: cursor) else { break }
+                        let clippedEnd = min(interval.end, group.end)
+                        intervalsByKey[group.key, default: []].append((cursor, clippedEnd))
+                        cursor = clippedEnd
                     }
                     if budgetStopped { break }
                 }
+                if budgetStopped { break }
             }
 
             if budgetStopped { break calendarLoop }
@@ -1360,7 +1402,7 @@ enum HistoryMCPToolService {
         case "duration":
             { $0.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) > $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
         case "turn_count":
-            { $0.record.itemCount > $1.record.itemCount }
+            { $0.record.transcriptTurnCount > $1.record.transcriptTurnCount }
         case "last_activity":
             fallthrough
         default:
@@ -1436,10 +1478,10 @@ enum HistoryMCPToolService {
         }
         if let sortKeys { sortKeys(&orderedKeys) }
 
-        return orderedKeys.map { key in
-            let sessionsInGroup = grouped[key]!
+        return orderedKeys.compactMap { key in
+            guard let sessionsInGroup = grouped[key] else { return nil }
             let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
-            let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
+            let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.transcriptTurnCount }
             let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
             return HistoryTimeReply.GroupDTO(
@@ -1454,7 +1496,7 @@ enum HistoryMCPToolService {
                             sessionID: s.record.id.uuidString,
                             sessionName: s.record.name,
                             activeDurationSeconds: s.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
-                            turnCount: s.record.itemCount
+                            turnCount: s.record.transcriptTurnCount
                         )
                     }
                     : nil
@@ -1531,6 +1573,7 @@ enum HistoryMCPToolService {
         _ turn: AgentTranscriptTurn,
         turnIndex: Int,
         roles: Set<String>,
+        tokenUsage: [AgentTokenUsagePersist],
         remainingChars: inout Int,
         requestBudget: HistoryRequestBudget
     ) async throws -> (
@@ -1554,15 +1597,46 @@ enum HistoryMCPToolService {
             requestText = nil
         }
 
+        // Recovery diagnostics ride the summary projection: they are emitted under the
+        // "summary" role for non-full tiers, independent of `isStructurallyCompacted`, so
+        // a demoted turn that still retains its conclusion exposes the notice too.
+        if turn.retentionTier != .full, roles.contains("summary") {
+            let diagnostics = turn.summary?.normalizedRecoveryDiagnostics ?? []
+            let rendersConclusion = turn.isStructurallyCompacted
+                ? historySummaryText(turn.summary) != nil
+                : roles.contains("assistant") && turn.conclusionActivityID != nil
+            let diagnosticEntryLimit = maxGetSessionEntriesPerTurn - (rendersConclusion ? 1 : 0)
+            for diagnostic in diagnostics where remainingChars > 0 {
+                if entries.count >= diagnosticEntryLimit {
+                    entriesOmitted += 1
+                    turnTruncated = true
+                    continue
+                }
+                appendGetSessionEntry(
+                    role: "summary",
+                    text: diagnostic.text,
+                    perEntryMaxChars: AgentTranscriptRecoveryDiagnostic.maximumTextLength,
+                    entries: &entries,
+                    remainingChars: &remainingChars,
+                    turnTruncated: &turnTruncated
+                )
+            }
+        }
+
         if turn.isStructurallyCompacted, roles.contains("summary"), let summaryText = historySummaryText(turn.summary), remainingChars > 0 {
-            appendGetSessionEntry(
-                role: "summary",
-                text: summaryText,
-                perEntryMaxChars: 2000,
-                entries: &entries,
-                remainingChars: &remainingChars,
-                turnTruncated: &turnTruncated
-            )
+            if entries.count >= maxGetSessionEntriesPerTurn {
+                entriesOmitted += 1
+                turnTruncated = true
+            } else {
+                appendGetSessionEntry(
+                    role: "summary",
+                    text: summaryText,
+                    perEntryMaxChars: 2000,
+                    entries: &entries,
+                    remainingChars: &remainingChars,
+                    turnTruncated: &turnTruncated
+                )
+            }
         }
 
         for (activityIndex, activity) in turn.allActivities.enumerated() {
@@ -1622,6 +1696,20 @@ enum HistoryMCPToolService {
                 toolCallSummary: roles.contains("tool")
                     ? nil
                     : getSessionToolCallSummary(counts: toolCounts, order: toolOrder),
+                runIDs: Array(Set(turn.responseSpans.compactMap(\.runID))).map(\.uuidString).sorted(),
+                tokenUsage: tokenUsage.map {
+                    HistoryGetSessionReply.TokenUsageDTO(
+                        runID: $0.runID?.uuidString,
+                        turnID: $0.turnID?.uuidString,
+                        inputTokens: $0.promptTokens,
+                        outputTokens: $0.completionTokens,
+                        contextUsedTokens: $0.contextUsedTokens,
+                        estimatedUserInputTokens: $0.estimatedUserInputTokens,
+                        estimatedToolInputTokens: $0.estimatedToolInputTokens,
+                        estimatedToolOutputTokens: $0.estimatedToolOutputTokens,
+                        timestamp: iso8601DateTime.string(from: $0.timestamp)
+                    )
+                },
                 entries: entries,
                 truncated: turnTruncated,
                 entriesOmitted: entriesOmitted > 0 ? entriesOmitted : nil

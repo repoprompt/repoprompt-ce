@@ -137,53 +137,6 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    // MARK: - Dart
-
-    nonisolated(unsafe) static let dartVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
-    (?xm)
-    ^
-    (?:
-     (?:final|const)\s+
-     ([A-Za-z_]\w*(?:<[^>]+>)?\??)
-     \s+([A-Za-z_]\w*)
-     |
-     ([A-Za-z_]\w*(?:<[^>]+>)?\??)
-     \s+([A-Za-z_]\w*)
-    )
-    """#)
-
-    nonisolated(unsafe) static let dartFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
-    (?xm)
-    ^\s*
-    (?:
-    	([A-Za-z_][A-Za-z0-9_<>,\?\s]*?)   # group(1) => return type
-    	\s+
-    )?
-    ([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?) # group(2) => function or named constructor
-    \s*\(
-    	([^)]*)?                       # group(3) => (partial) parameter list, may span lines
-    .*$
-    """#)
-
-    nonisolated(unsafe) static let dartFactoryRegex: Regex<AnyRegexOutput> = try! Regex(#"""
-    (?xm)
-    ^\s*
-    factory\s+
-    ([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)   # group(1) => factory name
-    \s*\(
-       ([^)]*)
-    \)
-    """#)
-
-    nonisolated(unsafe) static let dartGetterSetterRegex: Regex<AnyRegexOutput> = try! Regex(#"""
-    (?xm)
-    ^\s*
-    (?:([A-Za-z_][A-Za-z0-9_<>\?]+)\s+)?   # group(1) => optional return type
-    (get|set)\s+
-    ([A-Za-z_]\w*)                          # group(3) => name
-    (?:\s*\(([^)]*)\))?                   # group(4) => optional params (setter)
-    """#)
-
     // MARK: - C
 
     nonisolated(unsafe) static let cVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
@@ -664,20 +617,6 @@ enum LanguageTypeExtractor {
                     result["name"] = name
                 }
                 return result.isEmpty ? nil : result
-            }
-            return nil
-
-        case .dart:
-            if let m = line.firstMatch(of: dartVariableRegex) {
-                // group(1,2) or group(3,4)
-                if let type = capture(m, at: 1), let name = capture(m, at: 2) {
-                    return ["type": type, "name": name]
-                } else if m.output.count >= 5,
-                          let type = capture(m, at: 3),
-                          let name = capture(m, at: 4)
-                {
-                    return ["type": type, "name": name]
-                }
             }
             return nil
 
@@ -1367,53 +1306,6 @@ enum LanguageTypeExtractor {
             }
             return nil
 
-        case .dart:
-            if let m = line.firstMatch(of: dartGetterSetterRegex) {
-                var result = [String: String]()
-                if let val = capture(m, at: 1) {
-                    result["returnType"] = val
-                }
-                if let val = capture(m, at: 3) {
-                    result["name"] = val
-                }
-                if let val = capture(m, at: 4) {
-                    result["paramList"] = val
-                }
-                return result.thenParseParameters(language: language)
-            }
-            if let m = line.firstMatch(of: dartFactoryRegex) {
-                var result = [String: String]()
-                if let val = capture(m, at: 1) {
-                    result["name"] = val.split(separator: ".").last.map(String.init) ?? val
-                }
-                if let val = capture(m, at: 2) {
-                    result["paramList"] = val
-                }
-                return result.thenParseParameters(language: language)
-            }
-            if let m = line.firstMatch(of: dartFunctionRegex) {
-                var result = [String: String]()
-
-                // returnType in group(1)
-                if let val = capture(m, at: 1) {
-                    result["returnType"] = val
-                }
-
-                // function name in group(2)
-                if let val = capture(m, at: 2) {
-                    result["name"] = val
-                }
-
-                // parameter list in group(3)
-                if let val = capture(m, at: 3) {
-                    result["paramList"] = val
-                }
-
-                // Then parse paramList into parameterTypes
-                return result.thenParseParameters(language: language)
-            }
-            return nil
-
         case .python:
             if let m = line.firstMatch(of: pythonFunctionRegex) {
                 // Typed regex: (wholeMatch, funcName, paramList, returnType?)
@@ -1791,179 +1683,6 @@ enum LanguageTypeExtractor {
         return results
     }
 
-    fileprivate static func parseDartParameterList(_ paramList: String) -> [String] {
-        let chunks = splitDartParameters(paramList)
-        var results = [String]()
-
-        for chunk in chunks {
-            var cleaned = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleaned.isEmpty { continue }
-
-            while cleaned.hasPrefix("{") || cleaned.hasPrefix("[") {
-                cleaned.removeFirst()
-                cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            while cleaned.hasSuffix("}") || cleaned.hasSuffix("]") {
-                cleaned.removeLast()
-                cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-
-            let modifiers = ["required", "final", "const", "covariant", "late"]
-            var trimmed = cleaned
-            var foundModifier = true
-            while foundModifier {
-                foundModifier = false
-                for mod in modifiers {
-                    if trimmed.hasPrefix("\(mod) ") {
-                        trimmed = trimmed.dropFirst(mod.count + 1).trimmingCharacters(in: .whitespaces)
-                        foundModifier = true
-                        break
-                    }
-                }
-            }
-
-            let withoutDefault = splitDartDefault(trimmed)
-            let withoutDefaultTrimmed = withoutDefault.trimmingCharacters(in: .whitespacesAndNewlines)
-            if withoutDefaultTrimmed.hasPrefix("this.") || withoutDefaultTrimmed.hasPrefix("super.") {
-                results.append("untyped")
-                continue
-            }
-
-            let tokens = splitTopLevelTokens(withoutDefaultTrimmed)
-            if tokens.count >= 2 {
-                let typePart = tokens.dropLast().joined(separator: " ")
-                if !typePart.isEmpty {
-                    results.append(typePart)
-                } else {
-                    results.append("untyped")
-                }
-            } else if tokens.count == 1 {
-                results.append("untyped")
-            }
-        }
-
-        return results.filter { !$0.isEmpty }
-    }
-
-    fileprivate static func splitDartParameters(_ paramList: String) -> [String] {
-        var results: [String] = []
-        var current = ""
-        var parenDepth = 0
-        var bracketDepth = 0
-        var braceDepth = 0
-        var angleDepth = 0
-        var inString: Character? = nil
-        var escaped = false
-
-        for ch in paramList {
-            if let stringDelimiter = inString {
-                current.append(ch)
-                if escaped {
-                    escaped = false
-                } else if ch == "\\" {
-                    escaped = true
-                } else if ch == stringDelimiter {
-                    inString = nil
-                }
-                continue
-            }
-
-            if ch == "\"" || ch == "'" {
-                inString = ch
-                current.append(ch)
-                continue
-            }
-
-            switch ch {
-            case "(":
-                parenDepth += 1
-            case ")":
-                parenDepth = max(0, parenDepth - 1)
-            case "[":
-                bracketDepth += 1
-            case "]":
-                bracketDepth = max(0, bracketDepth - 1)
-            case "{":
-                braceDepth += 1
-            case "}":
-                braceDepth = max(0, braceDepth - 1)
-            case "<":
-                angleDepth += 1
-            case ">":
-                angleDepth = max(0, angleDepth - 1)
-            case ",":
-                if parenDepth == 0, bracketDepth == 0, braceDepth == 0, angleDepth == 0 {
-                    results.append(current)
-                    current = ""
-                    continue
-                }
-            default:
-                break
-            }
-            current.append(ch)
-        }
-
-        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            results.append(current)
-        }
-        return results
-    }
-
-    fileprivate static func splitDartDefault(_ param: String) -> String {
-        var parenDepth = 0
-        var bracketDepth = 0
-        var braceDepth = 0
-        var angleDepth = 0
-        var inString: Character? = nil
-        var escaped = false
-
-        for (idx, ch) in param.enumerated() {
-            if let stringDelimiter = inString {
-                if escaped {
-                    escaped = false
-                } else if ch == "\\" {
-                    escaped = true
-                } else if ch == stringDelimiter {
-                    inString = nil
-                }
-                continue
-            }
-
-            if ch == "\"" || ch == "'" {
-                inString = ch
-                continue
-            }
-
-            switch ch {
-            case "(":
-                parenDepth += 1
-            case ")":
-                parenDepth = max(0, parenDepth - 1)
-            case "[":
-                bracketDepth += 1
-            case "]":
-                bracketDepth = max(0, bracketDepth - 1)
-            case "{":
-                braceDepth += 1
-            case "}":
-                braceDepth = max(0, braceDepth - 1)
-            case "<":
-                angleDepth += 1
-            case ">":
-                angleDepth = max(0, angleDepth - 1)
-            case "=":
-                if parenDepth == 0, bracketDepth == 0, braceDepth == 0, angleDepth == 0 {
-                    let cutoff = param.index(param.startIndex, offsetBy: idx)
-                    return String(param[..<cutoff]).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            default:
-                break
-            }
-        }
-
-        return param
-    }
-
     fileprivate static func splitTopLevelTokens(_ text: String) -> [String] {
         var tokens: [String] = []
         var current = ""
@@ -2148,9 +1867,6 @@ private extension [String: String] {
                 result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
             case .ts, .tsx:
                 let paramTypes = LanguageTypeExtractor.parseTSParameterList(trimmedList)
-                result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
-            case .dart:
-                let paramTypes = LanguageTypeExtractor.parseDartParameterList(trimmedList)
                 result["parameterTypes"] = paramTypes.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", ")
             default:
                 let paramTypes = LanguageTypeExtractor.parseCStyleParameterList(trimmedList)

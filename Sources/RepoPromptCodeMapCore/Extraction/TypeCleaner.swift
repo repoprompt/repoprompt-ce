@@ -39,9 +39,6 @@ enum TypeCleaner {
         static let javaPrims: Set<String> = [
             "int", "float", "double", "boolean", "char", "short", "long", "byte", "string", "void"
         ]
-        static let dartPrims: Set<String> = [
-            "int", "double", "bool", "boolean", "num", "string", "object", "dynamic"
-        ]
         static let cPrims: Set<String> = [
             "int", "char", "short", "long", "bool", "float", "double", "void", "size_t", "wchar_t"
         ]
@@ -741,7 +738,7 @@ enum TypeCleaner {
     private static func removeComments(from type: String, language: LanguageType) -> String {
         var cleaned = type
         switch language {
-        case .swift, .js, .c_sharp, .c, .rust, .cpp, .go, .java, .dart, .ts, .tsx, .php:
+        case .swift, .js, .c_sharp, .c, .rust, .cpp, .go, .java, .ts, .tsx, .php:
             cleaned = removeBlockComments(from: cleaned)
         case .python, .ruby:
             break
@@ -1388,9 +1385,6 @@ enum TypeCleaner {
         case .java:
             return TypeCleanerSets.javaPrims.contains(lower)
 
-        case .dart:
-            return TypeCleanerSets.dartPrims.contains(lower)
-
         case .c, .cpp:
             return TypeCleanerSets.cPrims.contains(lower)
 
@@ -1431,9 +1425,6 @@ enum TypeCleaner {
 
         case .java:
             return TypeCleanerSets.universalContainers.contains(lower) || TypeCleanerSets.javaContainers.contains(lower)
-
-        case .dart:
-            return TypeCleanerSets.universalContainers.contains(lower) || ["map", "list", "set"].contains(lower)
 
         case .c, .cpp:
             return TypeCleanerSets.universalContainers.contains(lower) || TypeCleanerSets.cppContainers.contains(lower)

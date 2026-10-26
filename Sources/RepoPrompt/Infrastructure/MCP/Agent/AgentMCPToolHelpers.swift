@@ -53,6 +53,26 @@ enum AgentMCPToolHelpers {
         }
     }
 
+    // MARK: - Int parsing
+
+    /// Converts a model-supplied double to an `Int` without trapping.
+    ///
+    /// `Int(someDouble)` is a runtime trap for non-finite values and for magnitudes outside `Int`'s
+    /// representable range. That is reachable from ordinary tool arguments: the MCP `Value` decoder
+    /// falls back to `.double` for any JSON numeral that does not fit `Int` (`1e300`,
+    /// `99999999999999999999`), and no schema validation runs between the transport and these
+    /// services. Saturating at the bounds lets each caller's own clamp or validation handle the
+    /// value instead of crashing the app.
+    static func saturatingInt(fromDouble value: Double) -> Int? {
+        guard value.isFinite else { return nil }
+        let truncated = value.rounded(.towardZero)
+        // `Double(Int.max)` rounds up to 2^63, so `>=` is the correct out-of-range test; `Int.min`
+        // is exactly representable, so `<=` saturates it without excluding the valid value.
+        if truncated >= Double(Int.max) { return Int.max }
+        if truncated <= Double(Int.min) { return Int.min }
+        return Int(truncated)
+    }
+
     // MARK: - Timeout parsing
 
     /// Parses a timeout in seconds from int, double, or string Value representations.

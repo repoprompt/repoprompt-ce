@@ -126,6 +126,11 @@ struct APISettingsView: View {
                     )
 
                     if showOpenAIAdvanced {
+                        ProviderHTTPConsentView(endpoint: viewModel.openAIConsentURL, consentEndpoint: Binding(
+                            get: { viewModel.openAIHTTPConsentEndpoint },
+                            set: { viewModel.setOpenAIHTTPConsent($0) }
+                        ))
+                        .disabled(isLoadingOpenAIBaseURL || isLoadingOpenAI)
                         apiKeySection(
                             title: "OpenAI Base URL",
                             key: $viewModel.openAIBaseURL,
@@ -213,6 +218,7 @@ struct APISettingsView: View {
                     deleteAction: deleteGrokKey,
                     isLoading: isLoadingGrok,
                     infoURL: "https://console.x.ai/",
+                    caption: "Also passed to Grok Build for Agent Mode, Context Builder, Oracle and Chat, and model discovery (including Connect), even when you're signed in with grok login. Grok chooses which credential each request uses; requests to the xAI API that use the key are billed to the xAI API account.",
                     availableModels: viewModel.availableGrokModels,
                     selectedModel: $viewModel.grokCustomModel
                 )
@@ -636,6 +642,21 @@ struct APISettingsView: View {
                     TextField("https://example.openai.azure.com", text: $viewModel.azureBaseURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
+                ProviderHTTPConsentView(endpoint: viewModel.azureConsentURL, consentEndpoint: Binding(
+                    get: { viewModel.azureHTTPConsentEndpoint },
+                    set: { endpoint in
+                        Task {
+                            isLoadingAzure = true
+                            defer { isLoadingAzure = false }
+                            do { try await viewModel.setAzureHTTPConsent(endpoint) }
+                            catch {
+                                alertMessage = "Could not update HTTP consent: \(error.localizedDescription)"
+                                showAlert = true
+                            }
+                        }
+                    }
+                ))
+                .disabled(isLoadingAzure)
 
                 HStack {
                     Text("API Version")

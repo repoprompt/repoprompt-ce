@@ -14,7 +14,7 @@ struct UnknownToolResultCard: View {
         if let subtitle = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.inlineSubtitle {
             return subtitle
         }
-        guard let obj = ToolRawJSON.object(from: item.toolResultJSON) else { return nil }
+        guard let obj = ToolJSON.rawObject(from: item.toolResultJSON) else { return nil }
         if let status = ToolRawJSON.string(obj, key: "status"), !status.isEmpty {
             return status
         }

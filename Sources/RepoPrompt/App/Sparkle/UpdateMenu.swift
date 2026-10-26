@@ -17,21 +17,30 @@ struct UpdateMenu: Commands {
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
-            // If an update is already known, offer a one-click "Install Update…"
             if let availableUpdate = sparkleManager.availableUpdate {
-                Button(availableUpdate.menuInstallTitle) {
-                    sparkleManager.installUpdate() // always installs the latest
+                if sparkleManager.canInstallAvailableUpdate {
+                    Button(availableUpdate.menuInstallTitle) {
+                        sparkleManager.installUpdate()
+                    }
+                    .keyboardShortcut("u", modifiers: [.command, .option])
+                } else if sparkleManager.manualUpdateDownloadURL != nil {
+                    Button(availableUpdate.menuManualDownloadTitle) {
+                        sparkleManager.performAvailableUpdateAction()
+                    }
+                    .keyboardShortcut("u", modifiers: [.command, .option])
                 }
-                .keyboardShortcut("u", modifiers: [.command, .option])
-
-                // Otherwise present a single "Check for Updates…" entry that triggers
-                // the same helper the Settings view calls (no incremental chaining).
             } else {
-                Button("Check for Updates…") {
-                    sparkleManager.checkForUpdates() // jumps straight to latest
+                Button(sparkleManager.updateCheckMenuTitle) {
+                    sparkleManager.checkForUpdates()
                 }
-                .disabled(!sparkleManager.canCheckForUpdates) // honour Sparkle’s state
+                .disabled(!sparkleManager.canInitiateUpdateCheck)
                 .keyboardShortcut("u", modifiers: [.command, .option])
+            }
+
+            if sparkleManager.migrationRecoveryDownloadsURL != nil {
+                Button("Stable releases / recovery downloads…") {
+                    sparkleManager.openMigrationRecoveryDownloads()
+                }
             }
 
             Divider()

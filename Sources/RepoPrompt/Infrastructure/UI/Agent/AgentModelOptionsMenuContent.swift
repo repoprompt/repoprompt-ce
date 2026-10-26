@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 enum AgentModelSelectionWarningVisuals {
@@ -6,7 +7,23 @@ enum AgentModelSelectionWarningVisuals {
     static let warningColor = Color.orange
 
     static func showsWarning(agent: AgentProviderKind, rawModel: String?) -> Bool {
-        agent == .codexExec && CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+        agent == .codexExec && (
+            CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+                || isUltrafast(agent: agent, rawModel: rawModel)
+        )
+    }
+
+    static func isUltrafast(agent: AgentProviderKind, rawModel: String?) -> Bool {
+        agent == .codexExec && CodexModelSpecifier(raw: rawModel).appServerServiceTierParam
+            == CodexServiceTierVariantCatalog.ultrafastServiceTier
+    }
+
+    static func color(agent: AgentProviderKind, rawModel: String?) -> Color {
+        isUltrafast(agent: agent, rawModel: rawModel) ? .purple : warningColor
+    }
+
+    static func tooltip(agent: AgentProviderKind, rawModel: String?) -> String {
+        isUltrafast(agent: agent, rawModel: rawModel) ? "Ultrafast Codex model selected." : warningTooltip
     }
 
     static func stableMenuImageSystemName(agent: AgentProviderKind, rawModel: String?) -> String? {
@@ -14,12 +31,26 @@ enum AgentModelSelectionWarningVisuals {
     }
 
     static func stableMenuStyle(agent: AgentProviderKind, rawModel: String?) -> StableMenuItemStyle {
-        showsWarning(agent: agent, rawModel: rawModel) ? .warning : .normal
+        if isUltrafast(agent: agent, rawModel: rawModel) { return .tinted(.systemPurple) }
+        return showsWarning(agent: agent, rawModel: rawModel) ? .warning : .normal
     }
 
     static func codexGroupShowsWarning(_ group: AgentModelCatalog.CodexMenuGroup) -> Bool {
         showsWarning(agent: .codexExec, rawModel: group.baseModelID) ||
             group.options.contains { showsWarning(agent: .codexExec, rawModel: $0.rawValue) }
+    }
+}
+
+struct AgentModelSpeedIcon: View {
+    let agent: AgentProviderKind
+    let rawModel: String
+    var font: Font = .caption
+
+    var body: some View {
+        Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+            .font(font)
+            .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agent, rawModel: rawModel))
+            .accessibilityHidden(true)
     }
 }
 
@@ -33,13 +64,11 @@ struct AgentModelSelectionSummaryLabel: View {
         let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: rawModel)
         HStack(spacing: 4) {
             if showsWarning {
-                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                    .font(iconFont)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                AgentModelSpeedIcon(agent: agentKind, rawModel: rawModel, font: iconFont)
             }
             if showsWarning {
                 Text(title)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agentKind, rawModel: rawModel))
             } else {
                 Text(title)
             }
@@ -70,7 +99,8 @@ struct AgentModelOptionsMenuContent: View {
                 } label: {
                     warningAwareMenuLabel(
                         title: group.displayName,
-                        showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group)
+                        showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group),
+                        rawModel: group.baseModelID
                     )
                 }
             }
@@ -88,6 +118,35 @@ struct AgentModelOptionsMenuContent: View {
                     }
                 } else if let option = group.options.first {
                     modelOptionButton(option)
+                }
+            }
+        } else if agentKind == .cursor {
+            ForEach(options, id: \.rawValue) { option in
+                if let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: option.rawValue)?.definition(kind: .thinking) {
+                    Menu(option.displayName) {
+                        modelOptionButton(option, title: "Use Runtime Default")
+                        ForEach(definition.choices, id: \.rawValue) { choice in
+                            if let effortOption = AgentModelCatalog.cursorEffortOption(option, configID: definition.configID, valueRaw: choice.rawValue) {
+                                modelOptionButton(effortOption, title: choice.displayName)
+                            }
+                        }
+                    }
+                } else {
+                    modelOptionButton(option)
+                }
+            }
+        } else if agentKind == .devin {
+            ForEach(Array(DevinModelCatalog.current.menuGroups(for: options).enumerated()), id: \.offset) { _, group in
+                if group.rendersAsSubmenu {
+                    Menu(group.displayName) {
+                        ForEach(group.entries, id: \.option.rawValue) { entry in
+                            modelOptionButton(entry.option, title: entry.effortDisplayName)
+                        }
+                    }
+                } else {
+                    ForEach(group.entries, id: \.option.rawValue) { entry in
+                        modelOptionButton(entry.option)
+                    }
                 }
             }
         } else if agentKind == .openCode {
@@ -123,6 +182,8 @@ struct AgentModelOptionsMenuContent: View {
 
     private func modelOptionButton(_ option: AgentModelOption, title: String? = nil) -> some View {
         Button {
+            if agentKind == .cursor, !AgentModelCatalog.cursorSelectionIsAvailable(option.rawValue) { return }
+
             AgentModelCatalog.updateLastUsedEffortIfEncoded(
                 agentKind: agentKind,
                 rawModel: option.rawValue
@@ -131,7 +192,7 @@ struct AgentModelOptionsMenuContent: View {
         } label: {
             let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: option.rawValue)
             HStack {
-                warningAwareMenuLabel(title: title ?? option.displayName, showsWarning: showsWarning)
+                warningAwareMenuLabel(title: title ?? option.displayName, showsWarning: showsWarning, rawModel: option.rawValue)
                 if selectedAgent == agentKind, AgentModelCatalog.modelOptionIsSelected(
                     optionRaw: option.rawValue,
                     selectedRaw: selectedModelRaw,
@@ -148,15 +209,14 @@ struct AgentModelOptionsMenuContent: View {
         ClaudeModelSpecifier(raw: option.rawValue).effortLevel?.displayName ?? option.displayName
     }
 
-    private func warningAwareMenuLabel(title: String, showsWarning: Bool) -> some View {
+    private func warningAwareMenuLabel(title: String, showsWarning: Bool, rawModel: String) -> some View {
         HStack(spacing: 4) {
             if showsWarning {
-                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                AgentModelSpeedIcon(agent: agentKind, rawModel: rawModel)
             }
             if showsWarning {
                 Text(title)
-                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    .foregroundStyle(AgentModelSelectionWarningVisuals.color(agent: agentKind, rawModel: rawModel))
             } else {
                 Text(title)
             }
@@ -176,6 +236,9 @@ enum AgentModelStableMenuItems {
         includePlaceholderDefault: Bool = true,
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
+        cursorSelections: [ACPModelParameterSelection] = [],
+        onSelectCursorParameter: ((AgentModelOption, ACPModelParameterSelection) -> Void)? = nil,
+        onClearCursorParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> StableMenuItem {
         StableMenuItem.submenu(
@@ -188,6 +251,9 @@ enum AgentModelStableMenuItems {
                 includePlaceholderDefault: includePlaceholderDefault,
                 flattenSingleCodexGroups: flattenSingleCodexGroups,
                 groupOpenCode: groupOpenCode,
+                cursorSelections: cursorSelections,
+                onSelectCursorParameter: onSelectCursorParameter,
+                onClearCursorParameter: onClearCursorParameter,
                 onSelect: onSelect
             )
         )
@@ -201,6 +267,9 @@ enum AgentModelStableMenuItems {
         includePlaceholderDefault: Bool = true,
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
+        cursorSelections: [ACPModelParameterSelection] = [],
+        onSelectCursorParameter: ((AgentModelOption, ACPModelParameterSelection) -> Void)? = nil,
+        onClearCursorParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> [StableMenuItem] {
         if agentKind == .codexExec {
@@ -224,6 +293,31 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+        if agentKind == .cursor, let onSelectCursorParameter {
+            return cursorModelItems(
+                options: visibleOptions,
+                selectedModelRaw: selectedAgent == .cursor ? selectedModelRaw : "",
+                selections: cursorSelections,
+                onSelectModel: { onSelect(.cursor, $0) },
+                onSelectParameter: onSelectCursorParameter,
+                onClearParameter: onClearCursorParameter
+            )
+        }
+        if agentKind == .devin {
+            return DevinModelCatalog.current.menuGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.entries.map { entry in
+                    modelItem(
+                        entry.option,
+                        title: group.rendersAsSubmenu ? entry.effortDisplayName : nil,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                return group.rendersAsSubmenu ? [.submenu(group.displayName, items: items)] : items
+            }
         }
         if agentKind == .openCode, groupOpenCode {
             return AgentModelCatalog.openCodeMenu(for: visibleOptions).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
@@ -249,6 +343,57 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+    }
+
+    /// Base model → advertised effort. The owner applies the model and pin together;
+    /// menu construction never synthesizes wire values or changes saved intent.
+    static func cursorModelItems(
+        options: [AgentModelOption],
+        selectedModelRaw: String,
+        selections: [ACPModelParameterSelection],
+        onSelectModel: @escaping (AgentModelOption) -> Void,
+        onSelectParameter: @escaping (AgentModelOption, ACPModelParameterSelection) -> Void,
+        onClearParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil
+    ) -> [StableMenuItem] {
+        options.map { option in
+            guard let resolved = ACPModelParameterResolver.resolve(
+                providerID: .cursor,
+                selectedModelRaw: option.rawValue,
+                persistedSelections: selections
+            ).first(where: { $0.definition.kind == .thinking }) else {
+                return .action(option.displayName, isSelected: option.rawValue == selectedModelRaw) {
+                    onSelectModel(option)
+                }
+            }
+            let identity = ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: resolved.baseModelRaw, kind: .thinking)
+            let saved = selections.last { $0.identity == identity }
+            var items: [StableMenuItem] = [.action("Select Model", isSelected: option.rawValue == selectedModelRaw) {
+                onSelectModel(option)
+            }]
+            if let onClearParameter {
+                items.append(.action("Use Runtime Default", isSelected: option.rawValue == selectedModelRaw && saved == nil) {
+                    onClearParameter(option, identity)
+                })
+            }
+            items.append(contentsOf: resolved.definition.choices.map { choice in
+                .action(
+                    choice.displayName,
+                    isSelected: option.rawValue == selectedModelRaw && choice.rawValue == saved?.valueRaw
+                ) {
+                    guard let current = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: option.rawValue)?.definition(kind: .thinking),
+                          current.configID == resolved.definition.configID,
+                          current.choices.contains(where: { $0.rawValue == choice.rawValue }) else { return }
+                    onSelectParameter(option, ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: resolved.baseModelRaw,
+                        kind: .thinking,
+                        configID: resolved.definition.configID,
+                        valueRaw: choice.rawValue
+                    ))
+                }
+            })
+            return .submenu(option.displayName, items: items)
         }
     }
 
@@ -288,7 +433,7 @@ enum AgentModelStableMenuItems {
             return StableMenuItem.submenu(
                 group.displayName,
                 imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
-                style: showsWarning ? .warning : .normal,
+                style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agentKind, rawModel: group.baseModelID),
                 items: group.options.map { option in
                     modelItem(
                         option,

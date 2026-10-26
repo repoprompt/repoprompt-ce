@@ -1,12 +1,38 @@
 import Darwin
 import Foundation
+import os
+import RepoPromptFoundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 actor ACPAgentSessionController {
+    /// A successful pipe write is not provider acceptance or turn completion. It only proves
+    /// that retrying after a lost response could duplicate input. Independent of controller
+    /// teardown so the caller can classify an interrupted, dequeued steering batch.
+    final class PromptWriteReceipt: Sendable {
+        private let written = OSAllocatedUnfairLock(initialState: false)
+
+        var wasWritten: Bool {
+            written.withLock { $0 }
+        }
+
+        fileprivate func noteWritten() {
+            written.withLock { $0 = true }
+        }
+    }
+
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
+        let operationalSeconds: TimeInterval
+
+        init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
+            self.bootstrapSeconds = bootstrapSeconds
+            self.operationalSeconds = operationalSeconds
+        }
 
         static let `default` = RequestTimeouts(
-            bootstrapSeconds: 30
+            bootstrapSeconds: 30,
+            operationalSeconds: 30
         )
     }
 
@@ -34,6 +60,31 @@ actor ACPAgentSessionController {
         case closed
         case failed
     }
+
+    /// The slash commands a live ACP session currently advertises through `available_commands_update`.
+    ///
+    /// Scoped to the provider session that advertised them: each update replaces the whole list, and
+    /// the snapshot is dropped when a session starts opening and whenever the controller enters
+    /// `.failed`, `.closing`, or `.closed`. Names are stored without a leading `/`.
+    struct AdvertisedCommands: Equatable {
+        let sessionID: String
+        let names: Set<String>
+    }
+
+    /// Why an advertised provider command was refused before anything was written to the provider.
+    struct ProviderCommandRefusal: LocalizedError, Equatable {
+        let reason: String
+        /// False when the refusal is because this controller can no longer run turns (not open, no
+        /// process), so its owner should retire it as after any failed turn.
+        let sessionIsUsable: Bool
+
+        var errorDescription: String? {
+            reason
+        }
+    }
+
+    /// The caller's task was cancelled before an advertised provider command was written.
+    struct ProviderCommandCancelledBeforeSend: Error {}
 
     struct BootstrapResult {
         let sessionID: String
@@ -192,17 +243,21 @@ actor ACPAgentSessionController {
     private struct PermissionOption {
         let optionID: String
         let kind: String
-    }
-
-    private struct AutoApprovalSelection {
-        let optionID: String
-        let match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch
+        /// The agent's own wording for this option. Agents that advertise several
+        /// distinctly-worded choices are unreadable without it, because the approval
+        /// card has no other source for what an option actually means.
+        let name: String?
     }
 
     private enum PermissionOptionPreference {
         case optionID(String)
         case kind(String)
     }
+
+    /// Written only from the actor; read synchronously by admission checks that cannot await. The
+    /// actor-isolated `promptAdvertisedCommand` re-reads it, together with the live session state,
+    /// in the same synchronous step that writes the prompt.
+    private nonisolated let advertisedCommandsState = OSAllocatedUnfairLock<AdvertisedCommands?>(initialState: nil)
 
     private var eventsContinuation: AsyncStream<NormalizedAgentRuntimeEvent>.Continuation?
     private var eventsStream: AsyncStream<NormalizedAgentRuntimeEvent>
@@ -215,8 +270,10 @@ actor ACPAgentSessionController {
     }
 
     private let provider: any ACPAgentProvider
+    private let allowsProviderProcessLaunchForTesting: Bool
     private let runRequest: ACPRunRequest
     private let launchConfiguration: ACPLaunchConfiguration
+    private let launchedPermissionMode: String?
     private let sessionConfiguration: ACPSessionConfiguration
     private let mcpClientNameHint: String?
     private let logPrefix: String
@@ -232,7 +289,30 @@ actor ACPAgentSessionController {
         private var debugConfigurationMutationPostcheckResumeWaiters: [CheckedContinuation<Void, Never>] = []
     #endif
 
-    private var state: State = .idle
+    private var state: State = .idle {
+        didSet {
+            // A controller that can no longer run turns advertises nothing, whichever path retired it
+            // (prompt or protocol failure, process exit, shutdown).
+            switch state {
+            case .failed, .closing, .closed:
+                clearAdvertisedCommands()
+            case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+                break
+            }
+        }
+    }
+
+    /// Provider-owned execution readiness, independent of the app's published run state.
+    var hasExecutionInFlight: Bool {
+        if activePromptTurnID != nil { return true }
+        switch state {
+        case .launching, .initialized, .openingSession, .promptRunning, .closing:
+            return true
+        case .idle, .sessionOpen, .failed, .closed:
+            return false
+        }
+    }
+
     private var process: SpawnedProcess?
     private var stdoutChannel: FileHandleChunkChannel?
     private var stderrChannel: FileHandleChunkChannel?
@@ -252,7 +332,11 @@ actor ACPAgentSessionController {
     private var nextRequestID = 1
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
+    // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var permissionStorageKeyByApprovalID: [String: String] = [:]
+    private var recentDevinToolCalls: [String: [String: Any]] = [:]
+    private var recentDevinToolCallIDs: [String] = []
     private var activePromptTurnID: UUID?
     private var activePromptOpenCodeStderrError: String?
     #if DEBUG
@@ -267,8 +351,17 @@ actor ACPAgentSessionController {
     private var didEmitTerminal = false
     private var eventStreamFinished = false
     private var loadSessionSupported = false
+    private var promptImagesSupported = false
     private var discoveredSessionModels: ACPDiscoveredSessionModels?
     private var sessionModelConfigOptionID: String?
+    /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
+    /// advertised no modern `configOptions` model selector, so model application flows
+    /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
+    private var sessionModelDirectSelectionSupported = false
+    /// True only when `discoveredSessionModels` was parsed from THIS session's live
+    /// session/new|load response. Post-mutation state updates never promote warmed
+    /// registry data to live authority — effort-bearing selections require this.
+    private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
@@ -283,13 +376,53 @@ actor ACPAgentSessionController {
         private let rawACPCaptureURL: URL?
     #endif
 
+    func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
+        discoveredSessionModels
+    }
+
+    func cursorAvailableModelCatalog() async throws -> ACPDiscoveredSessionModels {
+        guard provider.providerID == .cursor else {
+            throw ControllerError.requestFailed("Cursor model catalog is only available for Cursor ACP sessions.")
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        let response = try await sendRequest(method: "cursor/list_available_models", params: [:])
+        guard let rawModels = response["models"] as? [[String: Any]] else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response missing models")
+        }
+
+        var options: [AgentModelOption] = []
+        var parameterSets: [ACPModelParameterSet] = []
+        for rawModel in rawModels {
+            guard let option = parseDiscoveredConfigModelOption(from: rawModel) else { continue }
+            options.append(option)
+            guard let configOptions = rawModel["configOptions"] as? [[String: Any]] else { continue }
+            parameterSets.append(contentsOf: parseModelParameterSets(
+                from: configOptions,
+                baseModelRaw: option.rawValue
+            ))
+        }
+        let mergedOptions = mergeModelOptions(options)
+        guard !mergedOptions.isEmpty else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response has no usable models")
+        }
+        return ACPDiscoveredSessionModels(
+            options: mergedOptions,
+            currentModelRaw: discoveredSessionModels?.currentModelRaw,
+            modelParameterSets: parameterSets
+        )
+    }
+
     init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
         diagnosticSink: DiagnosticSink? = nil,
-        requestTimeouts: RequestTimeouts = .default
+        requestTimeouts: RequestTimeouts = .default,
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) throws {
         self.provider = provider
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         providerSessionIdentity = ACPProviderSessionIdentity(
             providerID: provider.providerID,
             loadSessionID: runRequest.resumeSessionID,
@@ -303,6 +436,10 @@ actor ACPAgentSessionController {
         try Self.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
+        launchedPermissionMode = Self.normalizedLaunchPermissionMode(
+            runRequest.launchPermissionMode,
+            providerID: provider.providerID
+        )
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
         mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
@@ -328,6 +465,24 @@ actor ACPAgentSessionController {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
+    /// Whether a provider session is live right now — open or running a turn — as opposed to
+    /// starting up, closed, or never begun. Busy still counts as live; turn admission is a
+    /// separate question from whether the session exists at all.
+    var hasLiveProviderSession: Bool {
+        (state == .sessionOpen || state == .promptRunning) && process != nil && sessionID != nil
+    }
+
+    /// Whether this controller can never run another turn (failed, closing, closed, or without a
+    /// process), as opposed to being merely busy with one.
+    var isRetired: Bool {
+        switch state {
+        case .failed, .closing, .closed:
+            true
+        case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+            process == nil
+        }
+    }
+
     func isCompatibleWith(request: ACPRunRequest) -> Bool {
         guard let providerID = request.agentKind.acpProviderID,
               provider.providerID == providerID,
@@ -335,11 +490,47 @@ actor ACPAgentSessionController {
         else {
             return false
         }
+        // A provider-native launch-time permission flag (Devin `--permission-mode`) is baked
+        // into the running process's argv; compare its normalized launched value so later
+        // request-carrier changes cannot drift the reuse key from the process.
+        if provider.providerID == .devin {
+            guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(
+                request.launchPermissionMode
+            ) else {
+                return false
+            }
+        }
+        guard launchedPermissionMode == Self.normalizedLaunchPermissionMode(
+            request.launchPermissionMode,
+            providerID: provider.providerID
+        ) else {
+            return false
+        }
+        if provider.providerID == .grokBuild {
+            // Grok full access is a launch flag and "default" sends no model RPC, so a live
+            // process can never move between permission profiles or back to the provider
+            // default: those transitions must build a fresh controller.
+            guard runRequest.autoApproveAllToolPermissions == request.autoApproveAllToolPermissions else {
+                return false
+            }
+            guard normalizedModelString(runRequest.modelString) == normalizedModelString(request.modelString) else {
+                return false
+            }
+            return true
+        }
         // Selection changes are already blocked/managed by the agent-mode UI while
         // a run is active. For live steering, controller identity + provider +
         // workspace are the safety boundary; model aliases/defaults/discovered
         // current-model values should not prevent session/cancel from being sent.
         return true
+    }
+
+    private static func normalizedLaunchPermissionMode(
+        _ mode: String?,
+        providerID: ACPProviderID
+    ) -> String? {
+        guard providerID == .devin else { return mode }
+        return DevinAgentToolPreferences.PermissionLevel.from(cliPermissionMode: mode).cliPermissionMode
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -354,8 +545,41 @@ actor ACPAgentSessionController {
         autoApproveAllToolPermissions = enabled
     }
 
+    #if DEBUG
+        private var testRejectNextTurnPreparation = false
+        private var testHoldNextSteeringInterrupt = false
+        private var testSteeringInterruptEntered = false
+        private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
+        private var testSteeringInterruptGate: CheckedContinuation<Void, Never>?
+
+        func test_rejectNextTurnPreparation() {
+            testRejectNextTurnPreparation = true
+        }
+
+        func test_holdNextSteeringInterrupt() {
+            testHoldNextSteeringInterrupt = true
+            testSteeringInterruptEntered = false
+        }
+
+        func test_waitForSteeringInterruptEntry() async {
+            if testSteeringInterruptEntered { return }
+            await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
+        }
+
+        func test_releaseSteeringInterrupt() {
+            testSteeringInterruptGate?.resume()
+            testSteeringInterruptGate = nil
+        }
+    #endif
+
     @discardableResult
     func prepareForNextTurn() -> Bool {
+        #if DEBUG
+            if testRejectNextTurnPreparation {
+                testRejectNextTurnPreparation = false
+                return false
+            }
+        #endif
         guard state == .sessionOpen, process != nil, sessionID != nil else { return false }
         didEmitTerminal = false
         eventStreamFinished = false
@@ -367,6 +591,8 @@ actor ACPAgentSessionController {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
+        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        promptImagesSupported = false
         state = .launching
         log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
@@ -408,7 +634,9 @@ actor ACPAgentSessionController {
                 command: resolvedCommand,
                 arguments: launchConfiguration.arguments,
                 environment: environment,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                purpose: .provider,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
             )
         } catch {
             await recordRunLaunchContract(
@@ -452,6 +680,16 @@ actor ACPAgentSessionController {
 
         log("ACP initialize")
         diagnose(.phaseStarted("initialize"))
+        var clientCapabilities: [String: Any] = [
+            "fs": [
+                "readTextFile": false,
+                "writeTextFile": false
+            ],
+            "terminal": false
+        ]
+        if provider.supportsParameterizedModelPicker {
+            clientCapabilities["_meta"] = ["parameterizedModelPicker": true]
+        }
         let initializeResponse = try await sendRequest(
             method: "initialize",
             params: [
@@ -460,13 +698,7 @@ actor ACPAgentSessionController {
                     "name": "RepoPrompt",
                     "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
                 ],
-                "clientCapabilities": [
-                    "fs": [
-                        "readTextFile": false,
-                        "writeTextFile": false
-                    ],
-                    "terminal": false
-                ]
+                "clientCapabilities": clientCapabilities
             ]
         )
         diagnose(.phaseCompleted("initialize"))
@@ -489,11 +721,23 @@ actor ACPAgentSessionController {
 
         let capabilities = initializeResponse["agentCapabilities"] as? [String: Any] ?? [:]
         loadSessionSupported = capabilities["loadSession"] as? Bool ?? false
+        let promptCapabilities = capabilities["promptCapabilities"] as? [String: Any]
+        let imageCapability = promptCapabilities?["image"] as? NSNumber
+        promptImagesSupported = imageCapability.map {
+            CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+        } ?? false
 
         state = .openingSession
         log("Opening ACP session")
         logSessionMCPInjection()
         let openSessionResult = try await openSession()
+        if let notification = sessionConfiguration.postOpenNotification {
+            try sendJSONLine([
+                "jsonrpc": "2.0",
+                "method": notification.method,
+                "params": notification.params.mapValues { $0.toAny() }
+            ])
+        }
         sessionID = openSessionResult.sessionID
         state = .sessionOpen
 
@@ -514,9 +758,24 @@ actor ACPAgentSessionController {
         providerSessionIdentity
     }
 
+    /// Whether the live provider session `sessionID` currently advertises the slash command `name`
+    /// (given without its leading `/`). A snapshot from any other session never answers. Matching is
+    /// deliberately exact and case-sensitive: a differently spelled command is not the one admitted.
+    nonisolated func advertisesCommand(_ name: String, inProviderSession sessionID: String) -> Bool {
+        advertisedCommandsState.withLock { snapshot in
+            guard let snapshot, snapshot.sessionID == sessionID else { return false }
+            return snapshot.names.contains(name)
+        }
+    }
+
+    nonisolated func currentAdvertisedCommands() -> AdvertisedCommands? {
+        advertisedCommandsState.withLock { $0 }
+    }
+
     func prompt(
         _ message: AgentMessage,
-        request overrideRunRequest: ACPRunRequest? = nil
+        request overrideRunRequest: ACPRunRequest? = nil,
+        writeReceipt: PromptWriteReceipt? = nil
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
@@ -524,7 +783,61 @@ actor ACPAgentSessionController {
         if state == .promptRunning, activePromptTurnID != nil {
             throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
         }
+        try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest, writeReceipt: writeReceipt)
+    }
+
+    /// Sends exactly `/<name>` to the idle session that still advertises it. The run's current
+    /// request must remain compatible with the live process, including its launch-time permission
+    /// mode. All checks and the prompt write run on this actor without an intervening suspension;
+    /// refusal writes nothing and retains a usable controller. No provider framing or model RPC.
+    func promptAdvertisedCommand(
+        _ name: String,
+        expectedSessionID: String,
+        request overrideRunRequest: ACPRunRequest? = nil
+    ) async throws {
+        guard !Task.isCancelled else { throw ProviderCommandCancelledBeforeSend() }
+        guard state == .sessionOpen || state == .promptRunning, process != nil, let sessionID else {
+            throw ProviderCommandRefusal(reason: "The provider session is no longer open.", sessionIsUsable: false)
+        }
+        guard state == .sessionOpen, activePromptTurnID == nil else {
+            throw ProviderCommandRefusal(reason: "The provider session is running a turn.", sessionIsUsable: true)
+        }
+        guard sessionID == expectedSessionID else {
+            throw ProviderCommandRefusal(reason: "The provider session changed.", sessionIsUsable: true)
+        }
+        guard advertisesCommand(name, inProviderSession: sessionID) else {
+            throw ProviderCommandRefusal(
+                reason: "The provider session no longer advertises /\(name).",
+                sessionIsUsable: true
+            )
+        }
+        guard isCompatibleWith(request: effectivePromptRunRequest(override: overrideRunRequest)) else {
+            throw ProviderCommandRefusal(
+                reason: "The current request is incompatible with the live provider process.",
+                sessionIsUsable: true
+            )
+        }
+        try await submitPromptTurn(
+            .providerCommand("/\(name)"),
+            sessionID: sessionID,
+            overrideRunRequest: overrideRunRequest
+        )
+    }
+
+    private enum PromptPayload {
+        case message(AgentMessage)
+        case providerCommand(String)
+    }
+
+    private func submitPromptTurn(
+        _ payload: PromptPayload,
+        sessionID: String,
+        overrideRunRequest: ACPRunRequest?,
+        writeReceipt: PromptWriteReceipt? = nil
+    ) async throws {
         suppressSessionLoadReplayUpdates = false
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
         resetActivePromptTrace()
@@ -532,9 +845,24 @@ actor ACPAgentSessionController {
         log("Submitting ACP prompt")
         diagnose(.phaseStarted("prompt"))
         let response: [String: Any]
+        var refusedUnsupportedImages = false
         do {
             let promptRequest = effectivePromptRunRequest(override: overrideRunRequest)
-            let promptBlocks = try provider.buildPromptBlocks(for: message, request: promptRequest)
+            if case let .message(message) = payload,
+               !promptImagesSupported,
+               !message.transientImages.isEmpty || !promptRequest.attachments.isEmpty
+            {
+                refusedUnsupportedImages = true
+                throw AIProviderError.invalidConfiguration(
+                    detail: "The connected ACP provider did not advertise image input. Retry without images or use an image-capable provider."
+                )
+            }
+            let promptBlocks: [[String: Any]] = switch payload {
+            case let .message(message):
+                try provider.buildPromptBlocks(for: message, request: promptRequest)
+            case let .providerCommand(text):
+                try ACPPromptContentBuilder.blocks(text: text, attachments: [])
+            }
             #if DEBUG
                 if isRawACPCaptureEnabled {
                     capturePromptTraceEvent(
@@ -550,12 +878,17 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
+            // A provider command is admitted against the current request before the write above.
+            if case .message = payload {
+                try validatePromptModelParameterSelections(promptRequest)
+            }
             response = try await sendRequest(
                 method: "session/prompt",
                 params: [
                     "sessionId": sessionID,
                     "prompt": promptBlocks
-                ]
+                ],
+                onWritten: { writeReceipt?.noteWritten() }
             )
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -585,6 +918,11 @@ actor ACPAgentSessionController {
                 }
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
+            // Local admission refused before construction or transport; the connection is intact.
+            if refusedUnsupportedImages {
+                if state == .promptRunning { state = .sessionOpen }
+                throw error
+            }
             if error is CancellationError {
                 throw error
             }
@@ -637,14 +975,18 @@ actor ACPAgentSessionController {
         settlePromptTurn(promptTurnID, result: .success(()))
     }
 
-    func setSessionModel(_ rawModel: String) async throws {
+    /// Apply a selected model. `forceRPC` bypasses the same-model no-op skip for providers that
+    /// only advertise model-scoped parameter metadata (e.g. OpenCode `effort`) *after* a model
+    /// set; callers with pending parameter selections pass `true` so the metadata is advertised
+    /// before the selections are applied.
+    func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
-            try await setSessionModelSerialized(rawModel)
+            try await setSessionModelSerialized(rawModel, forceRPC: forceRPC)
         }
     }
 
-    private func setSessionModelSerialized(_ rawModel: String) async throws {
+    private func setSessionModelSerialized(_ rawModel: String, forceRPC: Bool = false) async throws {
         guard let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
@@ -655,9 +997,154 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            if provider.providerID == .grokBuild, sessionModelConfigOptionID == nil {
+                // Direct (SessionModelState) path: no modern selector was advertised, so
+                // model application flows through the provider-owned RPC.
+                guard sessionModelDirectSelectionSupported,
+                      let directProvider = provider as? ACPDirectSessionModelProvider
+                else {
+                    throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
+                }
+                let (matchedOption, snapshotOptions, matchedLiveSnapshot) = try canonicalDirectSessionModelOption(model)
+                // Effort-compound selections (`grok-4.6-low`) decompose against the
+                // advertised option set — never by suffix guessing — into the base option
+                // plus an explicit effort. Bare raws resolve to the model's advertised
+                // default effort so a bare pick after a variant pick resets effort instead
+                // of silently keeping the previous one.
+                guard let decomposition = GrokBuildModelSpecifier.decompose(
+                    raw: matchedOption.rawValue,
+                    options: snapshotOptions
+                ) else {
+                    throw ControllerError.requestFailed("Grok Build model '\(model)' is not in the discovered model set. Refresh Grok Build models and retry.")
+                }
+                let baseModel = decomposition.base.rawValue
+                // "Effort-capable but default unknown" is not "effort-free": a bare pick on
+                // such a model could silently keep whatever effort is active. Require an
+                // explicit variant instead of guessing.
+                if decomposition.explicitEffort == nil,
+                   !decomposition.base.supportedReasoningEfforts.isEmpty,
+                   decomposition.base.defaultReasoningEffort == nil
+                {
+                    throw ControllerError.requestFailed(
+                        "Grok Build model '\(baseModel)' advertises reasoning efforts but no authoritative default; choose an explicit effort (e.g. \(baseModel)-high)."
+                    )
+                }
+                let resolvedEffort = decomposition.explicitEffort ?? decomposition.base.defaultReasoningEffort
+                // Fail closed on unadvertised efforts before any RPC: grok silently ignores
+                // unknown efforts while still acknowledging the base model, so an effort
+                // outside the base option's advertised list must never leave the client.
+                // Effort authority must also come from the LIVE session: a warmed-registry
+                // fallback can carry efforts the provider has since removed, and the wire
+                // would still Ok the base. Model-only requests may use the warmed snapshot
+                // because the echoed base id confirms them.
+                if let resolvedEffort {
+                    guard decomposition.base.supportedReasoningEfforts.contains(resolvedEffort) else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build model '\(baseModel)' does not advertise reasoning effort '\(resolvedEffort.rawValue)'."
+                        )
+                    }
+                    guard matchedLiveSnapshot else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build effort selection requires the live session model set. Refresh Grok Build models and retry."
+                        )
+                    }
+                }
+                let canonicalModel = GrokBuildModelSpecifier(
+                    baseModel: baseModel,
+                    reasoningEffort: resolvedEffort
+                ).compoundRaw
+                // A nil resolved effort means "no effort mutation requested" (effort-free
+                // model), not "no active effort" — it always no-ops when the base matches.
+                let effortAlreadyMatches = resolvedEffort.map {
+                    normalizedDirectEffort(discoveredSessionModels?.currentEffortRaw) == normalizedDirectEffort($0.rawValue)
+                } ?? true
+                if discoveredSessionModels?.currentModelRaw == baseModel, effortAlreadyMatches {
+                    return
+                }
+                let selectionRequest = directProvider.makeDirectModelSelectionRequest(
+                    sessionID: sessionID,
+                    baseModelRaw: baseModel,
+                    reasoningEffortRaw: resolvedEffort?.rawValue
+                )
+                // A rejected direct selection preserves the session's current model. Grok
+                // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
+                // the Err variant is a failure even though the RPC itself succeeded. Fail
+                // closed: only an `Ok` echoing the requested base model may update local
+                // model authority — missing, malformed, or mismatched acknowledgements leave
+                // the session's real current model unknown, so local state must not move.
+                let selectionBaselineSequence = inboundMessageSequence
+                let selectionResponse: RequestResponse
+                do {
+                    selectionResponse = try await sendRequestResponse(
+                        method: selectionRequest.method,
+                        params: selectionRequest.params
+                    )
+                } catch {
+                    // A throw here (timeout, EOF, cancellation, decode failure) is also an
+                    // ambiguous post-dispatch outcome: the request may have been applied.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw error
+                }
+                let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
+                let hasOk = modelOutcome?.keys.contains("Ok") == true
+                let hasErr = modelOutcome?.keys.contains("Err") == true
+                if hasErr, !hasOk {
+                    // An exclusive Err is a confirmed rejection: the session's current model
+                    // is untouched, so local authority stays valid.
+                    let modelError = modelOutcome?["Err"] ?? "unknown"
+                    throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
+                }
+                guard !hasErr,
+                      hasOk,
+                      let confirmedModel = modelOutcome?["Ok"] as? String,
+                      confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
+                else {
+                    // Ambiguous post-send outcome (missing/malformed/mixed/mismatched ack):
+                    // the server may or may not have applied anything, and neither the
+                    // requested nor the prior model is confirmed. Invalidate current
+                    // model/effort authority so stale state can never short-circuit a
+                    // corrective selection; the advertised options remain live and valid.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw ControllerError.protocolViolation(
+                        "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
+                    )
+                }
+                #if DEBUG
+                    await debugSuspendConfigurationMutationPostcheckIfNeeded()
+                #endif
+                // Never overwrite a different-base report that arrived after this acknowledgement.
+                if let reported = discoveredSessionModels,
+                   reported.currentModelRaw != baseModel,
+                   let reportSequence = reported.currentEffortInboundSequence,
+                   reportSequence > selectionResponse.inboundSequence
+                {
+                    throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(baseModel)'")
+                }
+                // The selection was already validated as a snapshot member; never append
+                // recovery options here — an appended compound would lack effortVariant
+                // provenance and later read back as a real base.
+                let updatedOptions = discoveredSessionModels?.options
+                    ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
+                    ?? []
+                // The Ok confirms only the base. Preserve effort only from a report that
+                // arrived after dispatch and names this acknowledged base; a newer model-only
+                // or mode-only snapshot cannot turn old effort into fresh confirmation.
+                let reported = discoveredSessionModels
+                let hasFreshEffortReport = reported?.currentModelRaw == baseModel
+                    && reported?.currentEffortInboundSequence.map { $0 > selectionBaselineSequence } == true
+                let updated = ACPDiscoveredSessionModels(
+                    options: updatedOptions,
+                    currentModelRaw: baseModel,
+                    currentEffortRaw: hasFreshEffortReport ? reported?.currentEffortRaw : nil
+                )
+                discoveredSessionModels = updated
+                publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
+                return
             }
             if provider.providerID == .cursor,
                normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
@@ -665,33 +1152,167 @@ actor ACPAgentSessionController {
             {
                 return
             }
-            guard let sessionModelConfigOptionID else {
-                throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
-            }
-            guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
-                throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
-            }
-            let configValue = try canonicalSessionModelValue(mappedConfigValue)
-            if configValue != model {
-                log("Mapping selected model \(model) to ACP config value \(configValue)")
-            }
-            if discoveredSessionModels?.currentModelRaw == configValue {
+            if provider.providerID == .devin,
+               let entry = DevinModelCatalog.current.entry(matching: model),
+               let thinking = entry.thinking
+            {
+                // Devin ACP rejects effort-encoded IDs as `model` values: select the advertised
+                // family model, then its `thought_level`. The choice is validated against the
+                // live session's definition, so an unadvertised effort fails before any prompt.
+                try await setSessionModelViaConfigOptionsRPC(entry.advertisedModelRaw, sessionID: sessionID, forceRPC: forceRPC)
+                try Task.checkCancellation()
+                let report = try await applySessionModelParameterSelectionsSerialized([
+                    ACPModelParameterSelection(
+                        providerID: .devin,
+                        baseModelRaw: entry.advertisedModelRaw,
+                        kind: .thinking,
+                        configID: thinking.configID,
+                        valueRaw: thinking.choiceRaw
+                    )
+                ])
+                try report.validateNoSkippedSelections()
                 return
             }
-            let response = try await sendRequestResponse(
-                method: "session/set_config_option",
-                params: [
-                    "sessionId": sessionID,
-                    "configId": sessionModelConfigOptionID,
-                    "value": configValue
-                ]
-            )
-            try await applyVerifiedConfigOptionsMutationResponse(
-                response,
-                requiredModeValue: nil,
-                requiredModelValue: configValue
+            try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: forceRPC)
+        }
+    }
+
+    /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
+    /// match against the live session snapshot first, then the warmed persisted registry
+    /// (a `session/load` response may legitimately omit model metadata on some providers).
+    private func canonicalDirectSessionModelOption(
+        _ requestedValue: String
+    ) throws -> (option: AgentModelOption, options: [AgentModelOption], matchedLiveSnapshot: Bool) {
+        if let live = discoveredSessionModels {
+            if let match = live.option(matching: requestedValue) {
+                return (match, live.options, sessionModelSnapshotHasLiveAuthority)
+            }
+            throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
+        }
+        if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
+           let match = warmed.option(matching: requestedValue)
+        {
+            return (match, warmed.options, false)
+        }
+        throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
+    }
+
+    private func normalizedDirectEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.lowercased()
+    }
+
+    /// Clears current model/effort authority after an ambiguous `session/set_model` outcome
+    /// (post-dispatch throw, or a missing/malformed/mixed/mismatched acknowledgement). The
+    /// advertised options stay — they came from the live session or warmed registry and are
+    /// still the valid advertisement — but nothing about the session's current model or
+    /// effort is confirmed anymore. Works for warmed-only sessions too (discoveredSessionModels
+    /// may be nil there), and never promotes warmed data to live authority.
+    private func invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: [AgentModelOption]) {
+        let options = discoveredSessionModels?.options ?? snapshotOptions
+        guard !options.isEmpty else { return }
+        let cleared = ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: nil,
+            currentEffortRaw: nil
+        )
+        discoveredSessionModels = cleared
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(cleared)
+    }
+
+    /// Discovers the model-scoped configuration a provider only advertises after a model
+    /// set (OpenCode's `effort` selector), by forcing one verified model-selector mutation
+    /// and returning the refreshed session snapshot.
+    ///
+    /// The forced RPC is the point: OpenCode's bootstrap `session/new` advertises only the
+    /// `model` and `mode` selectors, so skipping a "no-op" model set when the requested model
+    /// is already current would return bootstrap metadata unchanged and hide `effort`
+    /// entirely. The response flows through the same verified mutation path as interactive
+    /// selection — there is no second, unverified writer.
+    func discoverSessionModelParameters(for modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await discoverSessionModelParametersSerialized(modelRaw)
+        }
+    }
+
+    private func discoverSessionModelParametersSerialized(_ modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard state == .sessionOpen else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            throw ControllerError.requestFailed("ACP provider does not advertise a parameterized model picker.")
+        }
+        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            throw ControllerError.requestFailed("Session model parameter discovery requires a non-empty model.")
+        }
+        if let sessionModelFailureReason {
+            throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+        }
+        // Force the selector RPC even when the requested model is already current — see the
+        // doc comment on the public operation.
+        try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: true)
+        guard let snapshot = discoveredSessionModels,
+              let currentModelRaw = snapshot.currentModelRaw
+        else {
+            throw ControllerError.protocolViolation("Session model parameter discovery produced no session snapshot.")
+        }
+        // Never return metadata belonging to a different model than the one requested.
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(currentModelRaw, providerID: provider.providerID)
+            == ACPModelParameterIdentity.canonicalBaseModelRaw(model, providerID: provider.providerID)
+        else {
+            throw ControllerError.protocolViolation(
+                "Session model parameter discovery confirmed a different model than requested '\(model)'."
             )
         }
+        return snapshot
+    }
+
+    /// Sends one verified model-selector mutation over `session/set_config_option` using the
+    /// selector ID parsed from `session/new` (`sessionModelConfigOptionID`).
+    ///
+    /// `forceRPC: true` sends the selector RPC even when the requested value already matches
+    /// the session's current model. Interactive selection callers pass `false` to keep the
+    /// no-op fast path; model-parameter discovery passes `true` because providers like
+    /// OpenCode only advertise model-scoped config options (e.g. `effort`) in response to a
+    /// model set, so skipping the RPC would leave discovery blind.
+    private func setSessionModelViaConfigOptionsRPC(
+        _ model: String,
+        sessionID: String,
+        forceRPC: Bool
+    ) async throws {
+        guard let sessionModelConfigOptionID else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
+        }
+        guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
+        }
+        let configValue = try canonicalSessionModelValue(mappedConfigValue)
+        if configValue != model {
+            log("Mapping selected model \(model) to ACP config value \(configValue)")
+        }
+        if !forceRPC, discoveredSessionModels?.currentModelRaw == configValue {
+            return
+        }
+        let response = try await sendRequestResponse(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionID,
+                "configId": sessionModelConfigOptionID,
+                "value": configValue
+            ]
+        )
+        try await applyVerifiedConfigOptionsMutationResponse(
+            response,
+            requiredModeValue: nil,
+            requiredModelValue: configValue
+        )
     }
 
     func setSessionMode(_ modeID: String) async throws {
@@ -699,6 +1320,131 @@ actor ACPAgentSessionController {
             guard let self else { throw CancellationError() }
             try await setSessionModeSerialized(modeID)
         }
+    }
+
+    /// Cursor persists bracket overrides in existing model strings; ACP requires separate exact model/config calls.
+    func applyCursorModelSelection(
+        _ raw: String,
+        overrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
+    ) async throws {
+        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
+        try await setSessionModel(specifier.baseModelRaw)
+        var encoded = raw
+        for override in overrides {
+            guard let updated = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).replacing(configID: override.configID, valueRaw: override.valueRaw) else {
+                throw CursorAIModelCatalog.ModelSpecifier.invalid(override.configID)
+            }
+            encoded = updated
+        }
+        let values = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).selections(in: currentDiscoveredSessionModels())
+        let selections = values.map {
+            ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw)
+        }
+        let report = try await applySessionModelParameterSelections(selections)
+        try report.validateNoSkippedSelections()
+    }
+
+    func applySessionModelParameterSelections(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await applySessionModelParameterSelectionsSerialized(selections)
+        }
+    }
+
+    private func applySessionModelParameterSelectionsSerialized(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            return .init(applied: [], skipped: selections)
+        }
+
+        let normalized = ACPModelParameterSelection.normalized(selections).sorted {
+            if $0.kind.sortOrder != $1.kind.sortOrder {
+                return $0.kind.sortOrder < $1.kind.sortOrder
+            }
+            return $0.configID < $1.configID
+        }
+        typealias PendingSelection = (
+            selection: ACPModelParameterSelection,
+            currentModelRaw: String,
+            definition: ACPModelParameterDefinition,
+            choice: ACPModelParameterChoice
+        )
+        var pending: [PendingSelection] = []
+        var alreadyCurrent: [ACPModelParameterSelection] = []
+        var skipped: [ACPModelParameterSelection] = []
+
+        // Resolve the complete batch before sending any parameter mutation. A stale or
+        // unsupported selection makes the run fail closed; applying earlier valid entries first
+        // would leave the provider partially configured even though no prompt is submitted.
+        for selection in normalized {
+            guard selection.providerID == provider.providerID,
+                  let models = discoveredSessionModels,
+                  let currentModel = models.currentModelRaw,
+                  let parameterSet = models.modelParameterSets.first(where: {
+                      ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          $0.baseModelRaw,
+                          providerID: provider.providerID
+                      ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          currentModel,
+                          providerID: provider.providerID
+                      )
+                  }),
+                  let definition = parameterSet.definition(kind: selection.kind),
+                  selection.identity == ACPModelParameterIdentity(
+                      providerID: provider.providerID,
+                      baseModelRaw: parameterSet.baseModelRaw,
+                      kind: definition.kind
+                  ),
+                  let choice = definition.choice(matching: selection.valueRaw)
+            else {
+                skipped.append(selection)
+                continue
+            }
+            if definition.currentValueRaw == choice.rawValue {
+                alreadyCurrent.append(selection)
+            } else {
+                pending.append((selection, currentModel, definition, choice))
+            }
+        }
+
+        guard skipped.isEmpty else {
+            return .init(applied: [], alreadyCurrent: alreadyCurrent, skipped: skipped)
+        }
+
+        var applied: [ACPModelParameterSelection] = []
+        for resolved in pending {
+            let response = try await sendRequestResponse(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": resolved.definition.configID,
+                    "value": resolved.choice.rawValue
+                ]
+            )
+            try await applyVerifiedConfigOptionsMutationResponse(
+                response,
+                requiredModeValue: nil,
+                requiredModelValue: nil,
+                requiredParameter: (resolved.definition.configID, resolved.choice.rawValue)
+            )
+            applied.append(.init(
+                providerID: resolved.selection.providerID,
+                baseModelRaw: resolved.currentModelRaw,
+                kind: resolved.selection.kind,
+                configID: resolved.definition.configID,
+                valueRaw: resolved.choice.rawValue
+            ))
+        }
+        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: [])
     }
 
     private func setSessionModeSerialized(_ modeID: String) async throws {
@@ -739,11 +1485,93 @@ actor ACPAgentSessionController {
         )
     }
 
+    enum OverseerPermissionResponseResult: Equatable {
+        case submitted
+        /// The request vanished or authorization failed at the final check. Nothing was sent.
+        case notSubmitted
+        /// No genuine one-time option exists for the requested decision. Nothing was sent.
+        case noOneTimeOption
+        case failed
+    }
+
+    /// Explicit observer answer under **Answer prompts**, strictly scoped to this one request.
+    ///
+    /// Accept selects only a genuine one-time allow option; decline selects only a one-time reject
+    /// and otherwise reports `cancelled`, never a persistent reject; cancel reports `cancelled`.
+    /// Session-wide decisions are refused. `authorize` is the final suspension point before sending.
+    func respondToPermissionRequestForOverseer(
+        id: String,
+        decision: AgentApprovalDecision,
+        authorize: @MainActor @Sendable () async -> Bool
+    ) async -> OverseerPermissionResponseResult {
+        guard let storageKey = permissionStorageKeyByApprovalID[id],
+              let initial = pendingPermissionRequests[storageKey]
+        else { return .notSubmitted }
+        let options = initial.options.map { (optionID: $0.optionID, kind: $0.kind) }
+        let selectedOptionID: String?
+        switch decision {
+        case .accept:
+            guard let optionID = ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: options,
+                providerID: provider.providerID
+            ) else { return .noOneTimeOption }
+            selectedOptionID = optionID
+        case .decline:
+            selectedOptionID = ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: options)
+        case .cancel:
+            selectedOptionID = nil
+        case .acceptForSession, .acceptWithExecpolicyAmendment:
+            return .noOneTimeOption
+        }
+        guard await authorize(),
+              permissionStorageKeyByApprovalID[id] == storageKey,
+              let pending = pendingPermissionRequests[storageKey],
+              pending.request.id == initial.request.id
+        else { return .notSubmitted }
+        do {
+            if let selectedOptionID {
+                try sendPermissionSelectionResponse(id: pending.rpcID, optionID: selectedOptionID)
+            } else {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": pending.rpcID.jsonValue,
+                    "result": ["outcome": ["outcome": "cancelled"]]
+                ])
+            }
+            removePendingPermissionRequest(approvalID: id)
+            return .submitted
+        } catch {
+            log("Failed to submit Overseer ACP permission response: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    /// Applying full access to an already surfaced prompt uses the same per-request
+    /// policy as a new request. Ineligible prompts remain available for manual approval.
+    @discardableResult
+    func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
+        guard state == .promptRunning,
+              let storageKey = permissionStorageKeyByApprovalID[id],
+              let pending = pendingPermissionRequests[storageKey],
+              let optionID = fullAccessAutoApprovalOptionID(for: pending.options)
+        else { return false }
+        // No suspension between checking the current flag/request and sending: the
+        // actor owns both, so preference changes and cancellation cannot interleave.
+        do {
+            try sendPermissionSelectionResponse(id: pending.rpcID, optionID: optionID)
+            removePendingPermissionRequest(approvalID: id)
+            return true
+        } catch {
+            log("Failed to apply full access to pending ACP permission request: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func respondToPermissionRequest(
         id: String,
         decision: AgentApprovalDecision
     ) async {
-        guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
+        guard let pending = removePendingPermissionRequest(approvalID: id) else {
             return
         }
         let result: [String: Any] = switch decision {
@@ -753,20 +1581,15 @@ actor ACPAgentSessionController {
                     "outcome": "cancelled"
                 ]
             ]
-        case .accept:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: false)
-                ]
-            ]
-        case .acceptForSession, .acceptWithExecpolicyAmendment:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: true)
-                ]
-            ]
+        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment:
+            if let optionID = preferredAllowOptionID(
+                for: pending.options,
+                sessionScoped: decision != .accept
+            ) {
+                ["outcome": ["outcome": "selected", "optionId": optionID]]
+            } else {
+                ["outcome": ["outcome": "cancelled"]]
+            }
         case .decline:
             if let optionID = preferredRejectOptionID(for: pending.options) {
                 [
@@ -824,6 +1647,15 @@ actor ACPAgentSessionController {
         guard sessionID != nil else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
+        #if DEBUG
+            if testHoldNextSteeringInterrupt {
+                testHoldNextSteeringInterrupt = false
+                testSteeringInterruptEntered = true
+                testSteeringInterruptEntryWaiter?.resume()
+                testSteeringInterruptEntryWaiter = nil
+                await withCheckedContinuation { testSteeringInterruptGate = $0 }
+            }
+        #endif
         log("ACP steering interrupt requested state=\(state.rawValue) hasActiveTurn=\(activePromptTurnID != nil)")
 
         if let promptTurnID = activePromptTurnID {
@@ -876,9 +1708,16 @@ actor ACPAgentSessionController {
         ])
     }
 
+    @discardableResult
+    private func removePendingPermissionRequest(approvalID: String) -> PendingPermissionRequest? {
+        guard let storageKey = permissionStorageKeyByApprovalID.removeValue(forKey: approvalID) else { return nil }
+        return pendingPermissionRequests.removeValue(forKey: storageKey)
+    }
+
     private func cancelPendingPermissionRequestsLocally() {
         let pending = pendingPermissionRequests.values
         pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
         for request in pending {
             do {
                 try sendJSONLine([
@@ -981,6 +1820,9 @@ actor ACPAgentSessionController {
         #endif
         guard state != .closed, state != .closing else { return }
         state = .closing
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
+        promptImagesSupported = false
         log("Shutting down ACP controller")
 
         await cancelPrompt()
@@ -1011,6 +1853,8 @@ actor ACPAgentSessionController {
         process = nil
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -1067,12 +1911,16 @@ actor ACPAgentSessionController {
     private func startProcessWaitTask(for process: SpawnedProcess) {
         processWaitTask = Task { [weak self] in
             guard let self else { return }
-            let result = try? await ProcessTermination.waitForTermination(
-                pid: process.pid,
-                processGroupID: process.processGroupID,
-                timeout: nil
-            )
-            await handleProcessExit(result?.exitCode ?? 0, timedOut: result?.timedOut ?? false)
+            do {
+                let result = try await ProcessTermination.waitForTermination(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID,
+                    timeout: nil
+                )
+                await handleProcessExit(result.exitCode, timedOut: result.timedOut)
+            } catch {
+                await handleProcessWaitFailure(error)
+            }
         }
     }
 
@@ -1087,15 +1935,51 @@ actor ACPAgentSessionController {
         stderrFramer.feed(data) { lineData in
             guard
                 let trimmed = trimmedASCIIWhitespace(lineData),
-                let text = String(data: trimmed, encoding: .utf8),
-                !text.isEmpty
+                let rawText = String(data: trimmed, encoding: .utf8),
+                !rawText.isEmpty
             else { return }
+            let text = Self.strippingANSIEscapeSequences(from: rawText)
+            guard !text.isEmpty else { return }
             stderrLineCount += 1
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
+            guard provider.shouldEmitStderrLine(text) else { return }
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
+    }
+
+    /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
+    /// `[2m…[0m` artifacts in the transcript.
+    private static func strippingANSIEscapeSequences(from text: String) -> String {
+        guard text.contains("\u{1B}") else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var iterator = text.makeIterator()
+        while let character = iterator.next() {
+            guard character == "\u{1B}" else {
+                result.append(character)
+                continue
+            }
+            // Skip a CSI sequence: ESC [ parameters…final-byte (@–~).
+            guard let opener = iterator.next(), opener == "[" else { continue }
+            while let byte = iterator.next() {
+                if ("@" ... "~").contains(byte) {
+                    break
+                }
+            }
+        }
+        return result
+    }
+
+    /// The caller must first route server requests and exhaust owned-request correlation.
+    /// Known maintenance replies are ignored regardless of their payload or protocol version.
+    nonisolated static func isRecognizedUnmatchedResponse(
+        _ json: [String: Any],
+        provider: any ACPAgentProvider
+    ) -> Bool {
+        guard let id = json["id"] as? String, !json.keys.contains("method") else { return false }
+        return provider.recognizesUnmatchedResponseID(id)
     }
 
     private func handleJSONLine(_ lineData: Data) {
@@ -1140,6 +2024,10 @@ actor ACPAgentSessionController {
                 } else {
                     pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
                 }
+                return
+            }
+            if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
+                log("Ignored provider-recognized unmatched ACP response provider=\(provider.providerID.rawValue) id=\(id.displayValue).")
                 return
             }
             diagnose(.unmatchedResponse(id: id.displayValue, line: rawLine))
@@ -1198,6 +2086,12 @@ actor ACPAgentSessionController {
             )
         #endif
 
+        // Captured before load-replay suppression and normalization (which drops the update): a
+        // replayed advertisement still describes the commands this live session accepts.
+        if (update["sessionUpdate"] as? String)?.lowercased() == "available_commands_update" {
+            recordAdvertisedCommands(paramsSessionID: params["sessionId"] as? String, update: update)
+        }
+
         if update["sessionUpdate"] as? String == "config_option_update" {
             handleConfigOptionUpdateNotification(
                 paramsSessionID: params["sessionId"] as? String,
@@ -1221,6 +2115,34 @@ actor ACPAgentSessionController {
             return
         }
 
+        if provider.providerID == .devin, let toolCallID = update["toolCallId"] as? String {
+            switch update["sessionUpdate"] as? String {
+            case "tool_call":
+                if recentDevinToolCalls[toolCallID] == nil {
+                    recentDevinToolCallIDs.append(toolCallID)
+                }
+                recentDevinToolCalls[toolCallID] = update
+                if recentDevinToolCallIDs.count > 64 {
+                    recentDevinToolCalls.removeValue(forKey: recentDevinToolCallIDs.removeFirst())
+                }
+            case "tool_call_update":
+                if let status = update["status"] as? String,
+                   ["completed", "failed", "cancelled"].contains(status)
+                {
+                    recentDevinToolCalls.removeValue(forKey: toolCallID)
+                    recentDevinToolCallIDs.removeAll { $0 == toolCallID }
+                } else if update["title"] != nil || update["kind"] != nil || update["_meta"] != nil {
+                    if recentDevinToolCalls[toolCallID] != nil {
+                        recentDevinToolCalls[toolCallID] = update
+                    }
+                } else if let rawInput = update["rawInput"] {
+                    recentDevinToolCalls[toolCallID]?["rawInput"] = rawInput
+                }
+            default:
+                break
+            }
+        }
+
         let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
@@ -1232,6 +2154,43 @@ actor ACPAgentSessionController {
             }
             emit(event)
         }
+    }
+
+    /// Replaces the advertised command list for the notification's own session. An update without a
+    /// session ID is ignored; one with a malformed list advertises nothing. Once a session is open, an update
+    /// naming any other session (for example a late one for a session this controller moved off) is
+    /// ignored rather than allowed to replace the open session's list.
+    private func recordAdvertisedCommands(paramsSessionID: String?, update: [String: Any]) {
+        // Without a session ID the update cannot be attributed to any session, so it changes nothing.
+        guard let paramsSessionID, !paramsSessionID.isEmpty else { return }
+        if let sessionID, sessionID != paramsSessionID {
+            return
+        }
+        // A retired controller never advertises again, whatever arrives after it failed.
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+            break
+        }
+        guard let commands = update["availableCommands"] as? [Any] else {
+            advertisedCommandsState.withLock { $0 = AdvertisedCommands(sessionID: paramsSessionID, names: []) }
+            return
+        }
+        var names = Set<String>()
+        for case let command as [String: Any] in commands {
+            guard var name = (command["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                continue
+            }
+            if name.hasPrefix("/") { name.removeFirst() }
+            if !name.isEmpty { names.insert(name) }
+        }
+        let snapshot = AdvertisedCommands(sessionID: paramsSessionID, names: names)
+        advertisedCommandsState.withLock { $0 = snapshot }
+    }
+
+    private func clearAdvertisedCommands() {
+        advertisedCommandsState.withLock { $0 = nil }
     }
 
     private func shouldSuppressACPEvent(_: NormalizedAgentRuntimeEvent) -> Bool {
@@ -1253,6 +2212,17 @@ actor ACPAgentSessionController {
     }
 
     private func handlePermissionRequest(id: JSONRPCID, params: [String: Any]) {
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        default:
+            break
+        }
+        // A duplicate live wire ID is ambiguous even if it would be auto-approved.
+        guard pendingPermissionRequests[id.storageKey] == nil else {
+            handleProtocolViolation("Duplicate active ACP permission request ID")
+            return
+        }
         guard
             let sessionID = params["sessionId"] as? String,
             let toolCall = params["toolCall"] as? [String: Any]
@@ -1261,28 +2231,48 @@ actor ACPAgentSessionController {
         }
 
         let toolCallID = (toolCall["toolCallId"] as? String) ?? UUID().uuidString
-        let toolTitle = (toolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let toolKind = (toolCall["kind"] as? String)?.lowercased()
-        let rawInputJSON = serializeJSON(toolCall["rawInput"])
+        let cachedToolCall = recentDevinToolCalls[toolCallID] ?? [:]
+        var resolvedToolCall = cachedToolCall
+        resolvedToolCall.merge(toolCall) { _, requestValue in requestValue }
+        // Cached tool-call fields are presentation context, never approval authority.
+        // Discard them when the permission request supplies contradictory details.
+        let identityKeys = ["title", "kind", "rawInput", "_meta"]
+        let requestSuppliesIdentity = identityKeys.contains { toolCall[$0] != nil }
+        let identityDiverges = identityKeys.contains { key in
+            guard let requestValue = toolCall[key] else { return false }
+            guard let cachedValue = cachedToolCall[key] else { return true }
+            return serializeJSON(requestValue) != serializeJSON(cachedValue)
+        }
+        if requestSuppliesIdentity, identityDiverges {
+            resolvedToolCall = toolCall
+        }
+        let toolTitle = (resolvedToolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolKind = (resolvedToolCall["kind"] as? String)?.lowercased()
+        let rawInputJSON = serializeJSON(resolvedToolCall["rawInput"])
         let optionDictionaries = params["options"] as? [[String: Any]] ?? []
         let options = optionDictionaries.compactMap { optionDictionary -> PermissionOption? in
             guard
                 let optionID = optionDictionary["optionId"] as? String,
                 let kind = optionDictionary["kind"] as? String
             else { return nil }
-            return PermissionOption(optionID: optionID, kind: kind)
+            return PermissionOption(
+                optionID: optionID,
+                kind: kind,
+                name: optionDictionary["name"] as? String
+            )
         }
 
-        let rawInput = toolCall["rawInput"] as? [String: Any]
-        let autoApprovalPayload = repoPromptPermissionAutoApprovalPayload(
-            toolTitle: toolTitle,
-            toolKind: toolKind,
-            toolCall: toolCall,
-            rawInput: rawInput,
-            options: optionDictionaries
-        )
+        let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
+        let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
+        let sessionApprovalScope: AgentApprovalSessionScope? = if provider.providerID == .grokBuild {
+            normalizedPermissionOptionValue(preferredAllowOptionID(for: options, sessionScoped: true)) == "allow-edits-session"
+                ? .editsSession : .oneTime
+        } else {
+            nil
+        }
+        let approvalID = UUID().uuidString
         let request = AgentApprovalRequest(
-            requestID: .acp(id.displayValue),
+            requestID: .acp(approvalID),
             method: "session/request_permission",
             kind: approvalKind(for: toolKind),
             threadID: sessionID,
@@ -1291,28 +2281,27 @@ actor ACPAgentSessionController {
             reason: toolTitle,
             command: rawInputJSON,
             cwd: sessionConfiguration.workingDirectory,
+            overseerOneTimeAllowAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            plainApproveAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            sessionApprovalScope: sessionApprovalScope,
             details: approvalDetails(
                 toolTitle: toolTitle,
                 toolKind: toolKind,
                 rawInputJSON: rawInputJSON,
-                options: optionDictionaries
+                options: options
             )
         )
 
-        if let autoApproval = autoApprovalSelection(
-            requestToolName: toolTitle,
-            requestPayload: autoApprovalPayload,
-            options: options
-        ) {
-            do {
-                try sendPermissionSelectionResponse(id: id, optionID: autoApproval.optionID)
-                log("Auto-approved ACP permission request for \(toolTitle ?? toolCallID) via option \(autoApproval.optionID) matchSource=\(autoApproval.match.source.rawValue) normalizedTool=\(autoApproval.match.normalizedToolName ?? "nil") serverIdentifier=\(autoApproval.match.serverIdentifier ?? "nil")")
-                return
-            } catch {
-                log("Failed to auto-approve ACP permission request for \(toolTitle ?? toolCallID): \(error.localizedDescription)")
-            }
-        }
-
+        // Supported ACP contracts do not authenticate tool metadata as an invocation
+        // of our injected RepoPrompt server. Names, titles, arguments, and `_meta`
+        // (including Devin's cognition.ai/toolName) therefore require manual approval.
+        // Only the user's explicit full-access setting can select automatically below.
         if let fullAccessOptionID = fullAccessAutoApprovalOptionID(for: options) {
             do {
                 try sendPermissionSelectionResponse(id: id, optionID: fullAccessOptionID)
@@ -1323,11 +2312,12 @@ actor ACPAgentSessionController {
             }
         }
 
-        pendingPermissionRequests[id.displayValue] = PendingPermissionRequest(
+        pendingPermissionRequests[id.storageKey] = PendingPermissionRequest(
             rpcID: id,
             options: options,
             request: request
         )
+        permissionStorageKeyByApprovalID[approvalID] = id.storageKey
         emit(.approvalRequested(request))
     }
 
@@ -1347,6 +2337,28 @@ actor ACPAgentSessionController {
 
         failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
+        state = .failed
+        await clearExpectedAgentPIDIfNeeded()
+        await cleanupLaunchArtifacts()
+        finishEventsIfNeeded()
+    }
+
+    private func handleProcessWaitFailure(_ error: Error) async {
+        guard state != .closing, state != .closed else {
+            finishEventsIfNeeded()
+            return
+        }
+
+        let message = "ACP process termination observation failed: \(error.localizedDescription)"
+        if state == .promptRunning || !didEmitTerminal {
+            emit(.stream(AIStreamResult(type: "error", text: message)))
+            emitTerminal(state: .failed, errorText: message)
+        }
+
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()
@@ -1386,11 +2398,7 @@ actor ACPAgentSessionController {
                 diagnose(.phaseStarted("session/load"))
                 let requestResponse = try await sendRequestResponse(
                     method: "session/load",
-                    params: [
-                        "sessionId": existingSessionID,
-                        "cwd": sessionConfiguration.workingDirectory,
-                        "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
-                    ]
+                    params: sessionOpenParams(existingSessionID: existingSessionID)
                 )
                 let response = requestResponse.result
                 applyOpenedSessionConfiguration(
@@ -1438,10 +2446,7 @@ actor ACPAgentSessionController {
         diagnose(.phaseStarted("session/new"))
         let requestResponse = try await sendRequestResponse(
             method: "session/new",
-            params: [
-                "cwd": sessionConfiguration.workingDirectory,
-                "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
-            ]
+            params: sessionOpenParams()
         )
         let response = requestResponse.result
         guard let sessionID = response["sessionId"] as? String else {
@@ -1468,16 +2473,32 @@ actor ACPAgentSessionController {
         )
     }
 
+    private func sessionOpenParams(existingSessionID: String? = nil) -> [String: Any] {
+        var params: [String: Any] = [
+            "cwd": sessionConfiguration.workingDirectory,
+            "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
+        ]
+        if let existingSessionID {
+            params["sessionId"] = existingSessionID
+        }
+        if !sessionConfiguration.metadata.isEmpty {
+            params["_meta"] = sessionConfiguration.metadata.mapValues { $0.toAny() }
+        }
+        return params
+    }
+
     private func sendRequest(
         method: String,
-        params: [String: Any]
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> [String: Any] {
-        try await sendRequestResponse(method: method, params: params).result
+        try await sendRequestResponse(method: method, params: params, onWritten: onWritten).result
     }
 
     private func sendRequestResponse(
         method: String,
-        params: [String: Any]
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> RequestResponse {
         guard process != nil else { throw ControllerError.processNotRunning }
 
@@ -1498,6 +2519,7 @@ actor ACPAgentSessionController {
                     "method": method,
                     "params": params
                 ])
+                onWritten?()
             } catch {
                 let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
                 pendingRequest?.timeoutTask?.cancel()
@@ -1523,6 +2545,12 @@ actor ACPAgentSessionController {
     }
 
     private func failPendingRequests(with error: Error) {
+        let permissions = pendingPermissionRequests.values
+        pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
+        for permission in permissions {
+            emit(.approvalCancelled(permission.request.requestID))
+        }
         let pending = pendingRequests.values
         pendingRequests.removeAll()
         for pendingRequest in pending {
@@ -1546,6 +2574,8 @@ actor ACPAgentSessionController {
         switch method {
         case "initialize", "authenticate", "session/new", "session/load":
             requestTimeouts.bootstrapSeconds
+        case "cursor/list_available_models", "session/set_config_option", "session/set_model":
+            requestTimeouts.operationalSeconds
         default:
             nil
         }
@@ -1633,6 +2663,56 @@ actor ACPAgentSessionController {
 
     // MARK: - Helpers
 
+    /// A later parameter or mode mutation can invalidate an earlier successful
+    /// selection. Admit the complete effective request using only live session
+    /// authority, immediately before dispatching the prompt.
+    private func validatePromptModelParameterSelections(_ request: ACPRunRequest) throws {
+        guard provider.supportsParameterizedModelPicker,
+              !request.modelParameterSelections.isEmpty
+        else { return }
+        guard sessionModelSnapshotHasLiveAuthority,
+              let models = discoveredSessionModels,
+              let currentModel = models.currentModelRaw,
+              let parameterSet = models.modelParameterSets.first(where: {
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      $0.baseModelRaw,
+                      providerID: provider.providerID
+                  ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      currentModel,
+                      providerID: provider.providerID
+                  )
+              })
+        else {
+            throw ControllerError.requestFailed("Model parameters are unavailable before prompt submission.")
+        }
+        if let requestedModel = normalizedModelString(request.modelString),
+           ACPModelParameterIdentity.canonicalBaseModelRaw(
+               requestedModel,
+               providerID: provider.providerID
+           ) != ACPModelParameterIdentity.canonicalBaseModelRaw(
+               currentModel,
+               providerID: provider.providerID
+           )
+        {
+            throw ControllerError.requestFailed("Model changed before prompt submission. Retry the requested configuration.")
+        }
+        for selection in ACPModelParameterSelection.normalized(request.modelParameterSelections) {
+            guard selection.identity == ACPModelParameterIdentity(
+                providerID: provider.providerID,
+                baseModelRaw: currentModel,
+                kind: selection.kind
+            ),
+                let definition = parameterSet.definition(kind: selection.kind),
+                let choice = definition.choice(matching: selection.valueRaw),
+                definition.currentValueRaw == choice.rawValue
+            else {
+                throw ControllerError.requestFailed(
+                    "\(selection.kind.rawValue.capitalized) selection is no longer current before prompt submission. Retry the requested configuration."
+                )
+            }
+        }
+    }
+
     private func effectivePromptRunRequest(override: ACPRunRequest?) -> ACPRunRequest {
         let request = override ?? runRequest
         let resume = request.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1650,7 +2730,9 @@ actor ACPAgentSessionController {
             attachments: request.attachments,
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
-            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions
+            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
+            launchPermissionMode: request.launchPermissionMode,
+            modelParameterSelections: request.modelParameterSelections
         )
     }
 
@@ -1904,12 +2986,20 @@ actor ACPAgentSessionController {
                 enableDebugLogging: launchConfiguration.enableDebugLogging
             )
         )
-        return result.environment
+        let filtered = await ProviderEnvironmentFiltering.filterACP(
+            result.environment,
+            launchConfiguration: launchConfiguration,
+            for: runRequest.agentKind
+        )
+        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: filtered)
     }
 
     private func beginOpeningSessionConfiguration() {
+        clearAdvertisedCommands()
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -1951,7 +3041,7 @@ actor ACPAgentSessionController {
             sessionModeFailureReason = reason
             diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
         }
-        applyDiscoveredSessionModels(from: response)
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
         lastAppliedConfigurationSequence = inboundSequence
     }
 
@@ -2141,7 +3231,8 @@ actor ACPAgentSessionController {
     private func applyVerifiedConfigOptionsMutationResponse(
         _ response: RequestResponse,
         requiredModeValue: String?,
-        requiredModelValue: String?
+        requiredModelValue: String?,
+        requiredParameter: (configID: String, valueRaw: String)? = nil
     ) async throws {
         guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
             throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
@@ -2163,6 +3254,16 @@ actor ACPAgentSessionController {
         case let .valid(_, models):
             if let requiredModelValue, models.currentModelRaw != requiredModelValue {
                 throw ControllerError.protocolViolation("session/set_config_option response did not confirm requested model '\(requiredModelValue)'")
+            }
+            if let requiredParameter {
+                let definitions = models.modelParameterSets.flatMap(\.parameters)
+                guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                      definition.currentValueRaw == requiredParameter.valueRaw
+                else {
+                    throw ControllerError.protocolViolation(
+                        "session/set_config_option response did not confirm parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                    )
+                }
             }
         case .absent:
             if requiredModelValue != nil || sessionModelConfigOptionID != nil {
@@ -2191,6 +3292,16 @@ actor ACPAgentSessionController {
            discoveredSessionModels?.currentModelRaw != requiredModelValue
         {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(requiredModelValue)'")
+        }
+        if let requiredParameter {
+            let definitions = discoveredSessionModels?.modelParameterSets.flatMap(\.parameters) ?? []
+            guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                  definition.currentValueRaw == requiredParameter.valueRaw
+            else {
+                throw ControllerError.protocolViolation(
+                    "newer ACP configuration state no longer confirms parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                )
+            }
         }
     }
 
@@ -2263,15 +3374,48 @@ actor ACPAgentSessionController {
             diagnose(.info("Invalidated session mode authority after malformed modern snapshot: \(reason)"))
         }
         let response: [String: Any] = ["configOptions": configOptions]
-        applyDiscoveredSessionModels(from: response)
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
         lastAppliedConfigurationSequence = inboundSequence
     }
 
-    private func applyDiscoveredSessionModels(from response: [String: Any]) {
+    private func applyDiscoveredSessionModels(from response: [String: Any], inboundSequence: UInt64) {
+        // A config-only report may update current direct effort authority, but it never
+        // replaces the live direct catalog or the provider-owned advertisement/wire mapping.
+        if let directProvider = provider as? ACPDirectSessionModelProvider,
+           response["models"] == nil,
+           sessionModelDirectSelectionSupported,
+           sessionModelSnapshotHasLiveAuthority
+        {
+            guard let models = discoveredSessionModels,
+                  let configOptions = response["configOptions"] as? [[String: Any]],
+                  let sessionID,
+                  let report = directProvider.parseDirectSessionEffortReport(
+                      from: configOptions, sessionID: sessionID, options: models.options
+                  )
+            else { return }
+            var updated = ACPDiscoveredSessionModels(
+                options: models.options,
+                currentModelRaw: report.baseModelRaw,
+                currentEffortRaw: report.effortRaw,
+                modelParameterSets: models.modelParameterSets,
+                hasModelParameterMetadata: models.hasModelParameterMetadata
+            )
+            updated.currentEffortInboundSequence = inboundSequence
+            discoveredSessionModels = updated
+            publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
+            return
+        }
+
         let parsed: ACPDiscoveredSessionModels?
-        switch parseModernModelSnapshot(from: response) {
+        // ponytail: grok CLI >= 1.0.17 sends `configOptions` next to its legacy `models` block;
+        // only the direct provider parser carries Grok's effort wire values, so let it win and
+        // keep the provider on the direct path when no live snapshot has been established yet.
+        let useDirectParser = provider is ACPDirectSessionModelProvider
+            && (response["models"] != nil || sessionModelDirectSelectionSupported)
+        switch useDirectParser ? .absent : parseModernModelSnapshot(from: response) {
         case let .valid(configID, models):
             sessionModelConfigOptionID = configID
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = nil
             parsed = models
             if response["models"] != nil {
@@ -2280,20 +3424,46 @@ actor ACPAgentSessionController {
         case .absent:
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = nil
-            parsed = nil
-            if response["models"] != nil {
-                diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+            if let directProvider = provider as? ACPDirectSessionModelProvider {
+                switch directProvider.parseDirectSessionModelSnapshot(from: response) {
+                case let .valid(models):
+                    sessionModelDirectSelectionSupported = true
+                    parsed = models
+                case .absent:
+                    // Conforming providers guarantee the direct selection RPC; explicit
+                    // models validate against this snapshot or the warmed registry.
+                    sessionModelDirectSelectionSupported = true
+                    parsed = nil
+                case let .malformed(reason):
+                    sessionModelDirectSelectionSupported = false
+                    sessionModelFailureReason = reason
+                    parsed = nil
+                    diagnose(.info("ACP session advertised malformed provider model metadata: \(reason)"))
+                }
+            } else {
+                sessionModelDirectSelectionSupported = false
+                parsed = nil
+                if response["models"] != nil {
+                    diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+                }
             }
         case let .malformed(reason):
             sessionModelConfigOptionID = nil
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = reason
             parsed = nil
             diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
         }
 
         discoveredSessionModels = parsed
+        sessionModelSnapshotHasLiveAuthority = parsed != nil
         guard let parsed else { return }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(parsed)
+    }
+
+    private func publishDiscoveredSessionModelsIfGloballyAuthoritative(_ models: ACPDiscoveredSessionModels) {
+        guard !provider.supportsParameterizedModelPicker else { return }
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(models, for: provider.providerID)
     }
 
     private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {
@@ -2325,10 +3495,90 @@ actor ACPAgentSessionController {
                 configID: option.id,
                 models: ACPDiscoveredSessionModels(
                     options: options,
-                    currentModelRaw: currentModelRaw
+                    currentModelRaw: currentModelRaw,
+                    modelParameterSets: parseModelParameterSets(
+                        from: configOptions,
+                        baseModelRaw: currentModelRaw
+                    )
                 )
             )
         }
+    }
+
+    private func parseModelParameterSets(
+        from configOptions: [[String: Any]],
+        baseModelRaw: String
+    ) -> [ACPModelParameterSet] {
+        guard provider.supportsParameterizedModelPicker else { return [] }
+        var definitionsByKind: [ACPModelParameterKind: [ACPModelParameterDefinition]] = [:]
+        for rawOption in configOptions {
+            let category = normalizedConfigValue(rawOption["category"] as? String)
+            if category?.caseInsensitiveCompare("model") == .orderedSame
+                || category?.caseInsensitiveCompare("mode") == .orderedSame
+            {
+                continue
+            }
+            guard normalizedConfigValue(rawOption["type"] as? String)?.lowercased() == "select",
+                  let exactID = exactNonEmptyConfigString(rawOption["id"] as? String),
+                  let exactCurrentValue = exactNonEmptyConfigString(rawOption["currentValue"] as? String),
+                  let rawChoices = flattenedConfigOptionChoices(from: rawOption["options"]),
+                  !rawChoices.isEmpty
+            else { continue }
+            let choices = rawChoices.compactMap { rawChoice -> ACPModelParameterChoice? in
+                guard let rawValue = exactNonEmptyConfigString(rawChoice["value"] as? String) else { return nil }
+                let displayName = normalizedConfigValue(
+                    (rawChoice["name"] as? String) ?? (rawChoice["displayName"] as? String)
+                ) ?? rawValue
+                return .init(
+                    rawValue: rawValue,
+                    displayName: displayName,
+                    description: normalizedConfigValue(rawChoice["description"] as? String)
+                )
+            }
+            guard !choices.isEmpty else { continue }
+            let displayName = normalizedConfigValue(
+                (rawOption["name"] as? String) ?? (rawOption["displayName"] as? String)
+            ) ?? exactID
+            let classification = ACPModelParameterClassificationInput(
+                configID: exactID,
+                category: category,
+                displayName: displayName,
+                choices: choices
+            )
+            guard let kind = provider.modelParameterKind(for: classification) else { continue }
+            let prototype = ACPModelParameterDefinition(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: exactCurrentValue
+            )
+            guard let canonicalCurrent = prototype.choice(matching: exactCurrentValue) else { continue }
+            definitionsByKind[kind, default: []].append(.init(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: canonicalCurrent.rawValue
+            ))
+        }
+
+        let definitions = ACPModelParameterKind.allCases.compactMap { kind -> ACPModelParameterDefinition? in
+            let candidates = definitionsByKind[kind] ?? []
+            guard candidates.count == 1 else {
+                if candidates.count > 1 {
+                    diagnose(.info("Ignoring conflicting Cursor \(kind.rawValue) selectors: \(candidates.map(\.configID).joined(separator: ", "))"))
+                }
+                return nil
+            }
+            return candidates[0]
+        }
+        return definitions.isEmpty ? [] : [.init(baseModelRaw: baseModelRaw, parameters: definitions)]
+    }
+
+    private func exactNonEmptyConfigString(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
     }
 
     private func mergeModelOptions(_ rawOptions: [AgentModelOption]) -> [AgentModelOption] {
@@ -2474,20 +3724,51 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func messageStopResult(
+    func messageStopResult(
         from response: [String: Any],
         sessionID: String,
         stopReason: String?
     ) -> AIStreamResult {
-        let usage = response["usage"] as? [String: Any]
+        // Grok Build carries usage under `_meta.usage` with the same field names; top-level
+        // `usage` remains the preferred ACP-standard location.
+        let usage = (response["usage"] as? [String: Any])
+            ?? ((response["_meta"] as? [String: Any])?["usage"] as? [String: Any])
         let inputTokens = intValue(usage?["inputTokens"])
         let outputTokens = intValue(usage?["outputTokens"])
         let cachedReadTokens = intValue(usage?["cachedReadTokens"])
         let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
         let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
-        let contextUsedTokens = hasContextBreakdown
-            ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
-            : nil
+        let contextUsedTokens: Int?
+        let modelContextWindow: Int?
+        if provider.providerID == .grokBuild {
+            let meta = response["_meta"] as? [String: Any]
+            // Grok's totalTokens tracks current conversation state, including a reseed
+            // after compaction. inputTokens can still describe the pre-compaction call.
+            // Only older responses without totalTokens may use last-call input instead;
+            // zero/invalid current-state claims must not resurrect that stale prompt.
+            let contextCount = meta?["totalTokens"] ?? meta?["inputTokens"]
+            if let number = contextCount as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID(),
+               let count = number as? Int, count > 0
+            {
+                contextUsedTokens = count
+            } else {
+                contextUsedTokens = nil
+            }
+            // Grok reports an API routing slug here, which may differ from the catalog
+            // key (including per-effort routing). Prefer a direct match, then THIS
+            // session's confirmed catalog selection, never a global/default guess.
+            let modelOption = discoveredSessionModels?.option(matching: meta?["modelId"] as? String)
+                ?? discoveredSessionModels?.option(matching: discoveredSessionModels?.currentModelRaw)
+            // Zero explicitly withdraws an unresolved capacity. Nil would make no new
+            // window claim and let the estimator retain a different model's old bound.
+            modelContextWindow = modelOption?.contextWindowTokens ?? 0
+        } else {
+            modelContextWindow = nil
+            contextUsedTokens = hasContextBreakdown
+                ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
+                : nil
+        }
         let providerSessionID = providerSessionIdentity.loadSessionID ?? sessionID
         return AIStreamResult(
             type: "message_stop",
@@ -2496,6 +3777,7 @@ actor ACPAgentSessionController {
             completionTokens: outputTokens,
             providerSessionID: providerSessionID,
             stopReason: stopReason,
+            modelContextWindow: modelContextWindow,
             contextUsedTokens: contextUsedTokens
         )
     }
@@ -2553,7 +3835,9 @@ actor ACPAgentSessionController {
         case let value as Int:
             return .int(value)
         case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() { return nil }
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return nil
+            }
             let doubleValue = value.doubleValue
             if floor(doubleValue) == doubleValue {
                 return .int(value.intValue)
@@ -2615,11 +3899,43 @@ actor ACPAgentSessionController {
         }
     }
 
+    private static let invisibleOptionLabelScalars = CharacterSet.whitespacesAndNewlines
+        .union(.controlCharacters)
+
+    /// The line shown for one advertised option: the agent's wording when it gives any,
+    /// otherwise its identifier. Both are agent-authored, so both go through the same
+    /// sanitiser -- routing only the name through it left the identifier able to
+    /// reintroduce the newline this is meant to prevent.
+    private static func optionLabel(name: String?, optionID: String) -> String {
+        displayableOptionLabel(name ?? "")
+            ?? displayableOptionLabel(optionID)
+            ?? ""
+    }
+
+    /// Collapse an agent-authored option string onto one display line, or `nil` when it
+    /// carries nothing visible.
+    ///
+    /// Both the name and the option ID come from the agent, and the caller joins labels
+    /// with a newline, so a value containing one would present a single option as two.
+    /// Emptiness is tested by looking for a visible scalar rather than by trimming the
+    /// invisible ones away: a trailing format character can be load-bearing, and trimming
+    /// them truncates emoji tag sequences such as the subdivision flags.
+    private static func displayableOptionLabel(_ raw: String) -> String? {
+        let collapsed = raw
+            .components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.unicodeScalars.contains(where: { !invisibleOptionLabelScalars.contains($0) })
+        else { return nil }
+        return collapsed
+    }
+
     private func approvalDetails(
         toolTitle: String?,
         toolKind: String?,
         rawInputJSON: String?,
-        options: [[String: Any]]
+        options: [PermissionOption]
     ) -> [AgentApprovalDetail] {
         var details: [AgentApprovalDetail] = []
         if let toolTitle, !toolTitle.isEmpty {
@@ -2631,10 +3947,19 @@ actor ACPAgentSessionController {
         if let rawInputJSON, !rawInputJSON.isEmpty {
             details.append(AgentApprovalDetail(label: "Input", value: rawInputJSON, isCode: true))
         }
-        if !options.isEmpty,
-           let optionsJSON = serializeJSON(options)
-        {
-            details.append(AgentApprovalDetail(label: "Options", value: optionsJSON, isCode: true))
+        // Grok's raw option list does not match the scoped approval actions RPCE offers.
+        guard provider.providerID != .grokBuild else { return details }
+        let optionLabels = options.map {
+            Self.optionLabel(name: $0.name, optionID: $0.optionID)
+        }
+        if !optionLabels.isEmpty {
+            details.append(
+                AgentApprovalDetail(
+                    label: "Options",
+                    value: optionLabels.joined(separator: "\n"),
+                    isCode: false
+                )
+            )
         }
         return details
     }
@@ -2686,23 +4011,73 @@ actor ACPAgentSessionController {
         ])
     }
 
-    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
-        let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
-            genericAllowOptionPreferences(sessionScoped: sessionScoped)
+    /// The option an `.accept`-family decision submits, or nil when the agent offered no
+    /// selectable allow option. The denylist-filtered fallback must stay allow-kind:
+    /// without it, a Devin prompt whose only allow-typed entry is a denylisted
+    /// `switch_*`/`plan_*` would collapse to submitting its `reject_once` (or an empty ID)
+    /// for an accept decision — answering the opposite of what was decided.
+    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String? {
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        // Devin is exact-ID only: broadening options (mode switches, persistent/global or
+        // server-wide grants) are unreachable here, which is why the denylist needs no
+        // `switch_*`/`plan_*`/`_always` pattern rules. Routing Devin through the
+        // kind-preference fallback below would silently loosen this — don't.
+        if provider.providerID == .devin {
+            if sessionScoped, let option = filteredOptions.first(where: { $0.optionID == "allow_session" }) {
+                return option.optionID
+            }
+            return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
         }
-        return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
+        if provider.providerID == .grokBuild {
+            // Grok's only genuine session grant is the exact edit option. All other
+            // approvals must be genuinely one-time, including ID and kind fallbacks.
+            let scopedOptions = filteredOptions.filter { option in
+                (
+                    sessionScoped
+                        && normalizedPermissionOptionValue(option.optionID) == "allow-edits-session"
+                        && normalizedPermissionOptionValue(option.kind) == "allow_always"
+                )
+                    || ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                        options: [(optionID: option.optionID, kind: option.kind)], providerID: .grokBuild
+                    ) != nil
+            }
+            return optionID(for: scopedOptions, preferences: grokBuildAllowOptionPreferences(sessionScoped: sessionScoped))
+        }
+        // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
+        let scopedOptions = sessionScoped ? filteredOptions : filteredOptions.filter {
+            normalizedPermissionOptionValue($0.kind) != "allow_always"
+        }
+        if let preferred = optionID(for: scopedOptions, preferences: genericAllowOptionPreferences(sessionScoped: sessionScoped)) {
+            return preferred
+        }
+        return optionID(
+            for: scopedOptions,
+            preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
+        )
+    }
+
+    private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        let oneTime: [PermissionOptionPreference] = [
+            .optionID("allow-once"),
+            .optionID("once"),
+            .optionID("allow_once"),
+            .kind("allow_once")
+        ]
+        return sessionScoped ? [.optionID("allow-edits-session")] + oneTime : oneTime
     }
 
     private func preferredRejectOptionID(for options: [PermissionOption]) -> String? {
         optionID(for: options, preferences: [
+            .optionID("reject-once"),
             .optionID("reject_once"),
             .optionID("reject"),
             .kind("reject_once"),
             .kind("reject"),
             .optionID("reject_always"),
+            .optionID("reject-always"),
             .kind("reject_always"),
             .optionID("deny_once"),
+            .optionID("deny-once"),
             .optionID("deny"),
             .kind("deny_once"),
             .kind("deny"),
@@ -2715,8 +4090,14 @@ actor ACPAgentSessionController {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
         case .cursor:
-            return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode:
+            // Full access auto-approves each request once; it must not persist a grant.
+            return ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
+            )
+        case .openCode, .grokBuild, .antigravity, .devin:
+            // Grok full access is provider-native (`grok agent --always-approve stdio`) and
+            // Devin's is a launch-time `--permission-mode`; the controller never
+            // auto-selects permission options for either.
             return nil
         }
     }
@@ -2735,90 +4116,17 @@ actor ACPAgentSessionController {
         return [
             .optionID("once"),
             .optionID("allow_once"),
-            .kind("allow_once"),
-            .optionID("always"),
-            .optionID("allow_always"),
-            .kind("allow_always")
+            .kind("allow_once")
         ]
     }
 
-    private func autoApprovalSelection(
-        requestToolName: String?,
-        requestPayload: [String: Any],
-        options: [PermissionOption]
-    ) -> AutoApprovalSelection? {
-        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ), isStrictACPRepoPromptPermissionMatch(
-            match,
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ) else {
-            return nil
+    /// Options that must never be picked by an automatic or fallback selection path.
+    /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
+    /// bare kind match would select it — it is excluded by explicit ID before any matching.
+    private func safePermissionOptionsForAutoSelection(_ options: [PermissionOption]) -> [PermissionOption] {
+        options.filter { option in
+            ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
         }
-
-        let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
-            [
-                .optionID("always"),
-                .optionID("allow_always"),
-                .kind("allow_always"),
-                .optionID("once"),
-                .optionID("allow_once"),
-                .kind("allow_once")
-            ]
-        }
-
-        guard let optionID = optionID(for: options, preferences: preferences) else { return nil }
-        return AutoApprovalSelection(optionID: optionID, match: match)
-    }
-
-    private func isStrictACPRepoPromptPermissionMatch(
-        _ match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch,
-        requestToolName: String?,
-        requestPayload: [String: Any]
-    ) -> Bool {
-        switch match.source {
-        case .serverIdentifier:
-            return true
-        case .topLevelToolName:
-            if let requestToolName, MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(requestToolName) {
-                return true
-            }
-            return MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil
-        case .nestedToolName:
-            return MCPIntegrationHelper.repoPromptPermissionContainsServerPrefixedToolName(in: requestPayload)
-                || MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil
-        }
-    }
-
-    private func repoPromptPermissionAutoApprovalPayload(
-        toolTitle: String?,
-        toolKind: String?,
-        toolCall: [String: Any],
-        rawInput: [String: Any]?,
-        options: [[String: Any]]
-    ) -> [String: Any] {
-        var payload: [String: Any] = [
-            "toolCall": toolCall,
-            "options": options
-        ]
-        if let toolTitle, !toolTitle.isEmpty {
-            payload["title"] = toolTitle
-        }
-        if let toolKind, !toolKind.isEmpty {
-            payload["kind"] = toolKind
-        }
-        if let rawInputValue = toolCall["rawInput"] {
-            payload["rawInput"] = rawInputValue
-        }
-        if let rawInput {
-            for (key, value) in rawInput where payload[key] == nil {
-                payload[key] = value
-            }
-        }
-        return payload
     }
 
     private func serializeJSON(_ value: Any?) -> String? {
@@ -2905,6 +4213,8 @@ actor ACPAgentSessionController {
     private func emitTerminal(state: AgentSessionRunState, errorText: String?) {
         guard !didEmitTerminal else { return }
         didEmitTerminal = true
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
         emit(.terminal(state: state, errorText: errorText))
     }
 
@@ -2951,6 +4261,12 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .grokBuild:
+                "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
+            case .antigravity:
+                "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3468,4 +4784,18 @@ actor ACPAgentSessionController {
     private func diagnose(_ event: DiagnosticEvent) {
         diagnosticSink?(event)
     }
+
+    #if DEBUG
+        /// Test seam for the composed option line, covering the name-then-identifier
+        /// fallback rather than the sanitiser alone.
+        static func test_optionLabel(name: String?, optionID: String) -> String {
+            optionLabel(name: name, optionID: optionID)
+        }
+
+        /// Test seam for approval-card option labelling: collapses an agent-authored
+        /// option string onto one line, or returns nil when nothing visible remains.
+        static func test_displayableOptionLabel(_ raw: String) -> String? {
+            displayableOptionLabel(raw)
+        }
+    #endif
 }

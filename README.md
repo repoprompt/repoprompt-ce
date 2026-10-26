@@ -45,7 +45,9 @@ The launcher requires Python 3, builds RepoPrompt CE through the coordinated
 developer daemon, opens the debug app, and keeps a small terminal window
 available for rebuild, status, and stop controls. It does not provide an
 uncoordinated no-Python fallback because lifecycle actions validate the exact
-debug executable path.
+debug executable path. It preserves an explicit compatible `DEVELOPER_DIR`, or
+selects an installed full Xcode for the launcher process without changing the
+system-wide `xcode-select` setting.
 
 The debug launcher uses an available `Apple Development:` signing identity. If
 your Mac does not have one, run the same debug app from Terminal with explicit
@@ -87,6 +89,9 @@ in Finder. The Finder launcher uses the coordinated developer daemon.
 The installer builds RepoPrompt CE from source and replaces any existing
 `/Applications/RepoPrompt CE.app` using a dedicated self-signed certificate
 trusted only on your Mac. macOS may ask you to approve the certificate.
+It requires a full Xcode installation and selects a compatible installed Xcode
+for the installer process without changing your system-wide `xcode-select`
+setting.
 
 The resulting app is local-only. It is not notarized and should not be copied to
 another Mac or redistributed.
@@ -94,7 +99,11 @@ another Mac or redistributed.
 ### Source-build requirements
 
 - macOS 26 or later
-- Xcode 26, or matching Command Line Tools with the macOS 26 SDK
+- Xcode 26 — full `Xcode.app`, not Command Line Tools alone. RepoPrompt CE and
+  its dependencies use the `@Entry` and `#Preview` Swift macros, whose plugins
+  (`SwiftUIMacros`, `PreviewsMacros`) ship only with `Xcode.app`. Its bundled
+  macOS 26 SDK satisfies the SDK requirement. Run `./Scripts/doctor.sh` to
+  verify your toolchain before building.
 
 ### Develop in Xcode
 
@@ -124,6 +133,7 @@ is unchanged and does not use the generated workspace.
   files, and curate context within a token budget. Long-running MCP calls expose
   [request-scoped progress](docs/mcp-progress.md) when the client supplies a
   progress token.
+- **Context Composer**: Review selected files and codemaps, configure prompt packaging and Git context, and copy a fresh model-ready prompt without leaving Agent Mode.
 - **Agent orchestration**: Run and coordinate CLI-backed coding agents from the
   native macOS app. See [`docs/worktrees.md`](docs/worktrees.md) for app-managed
   worktrees and `.worktreeinclude` local file copying.
@@ -150,6 +160,7 @@ third-party notices in
   checks, source placement, and contribution preflight
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): contribution policy and pull request
   steps
+- [`docs/architecture/context-composer.md`](docs/architecture/context-composer.md): Context Composer architecture, invariants, and state ownership
 - [`docs/architecture/source-layout.md`](docs/architecture/source-layout.md):
   source ownership and placement rules
 - [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 // MARK: - Git Backend
 
@@ -16,6 +17,15 @@ actor GitBackend: VCSBackend {
 
     init(gitService: GitService = GitService()) {
         self.gitService = gitService
+    }
+
+    func invalidateUntrackedStats(at root: URL) async {
+        await gitService.invalidateUntrackedStats(at: root)
+    }
+
+    /// The environment this backend's Git subprocesses inherit.
+    func gitProcessEnvironment() async -> [String: String] {
+        await gitService.preparedProcessEnvironment()
     }
 
     // MARK: - Repository Discovery
@@ -139,12 +149,14 @@ actor GitBackend: VCSBackend {
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         try await gitService.createWorktreeWithResult(
             request: request,
             at: repoURL,
-            initializationContext: initializationContext
+            initializationContext: initializationContext,
+            beforeCommit: beforeCommit
         )
     }
 
@@ -174,6 +186,20 @@ actor GitBackend: VCSBackend {
         try await gitService.applyAndCommitWorktreeMerge(sourceHead: sourceHead, message: message, at: targetRepoURL)
     }
 
+    func applyAndCommitWorktreeMerge(
+        source: GitWorktreeMergeEndpoint,
+        target: GitWorktreeMergeEndpoint,
+        sourceHead: String,
+        message: String
+    ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
+        try await gitService.applyAndCommitWorktreeMerge(
+            sourceEndpoint: source,
+            targetEndpoint: target,
+            sourceHead: sourceHead,
+            message: message
+        )
+    }
+
     func commitWorktreeMerge(message: String, at targetRepoURL: URL) async throws -> String {
         try await gitService.commitWorktreeMerge(message: message, at: targetRepoURL)
     }
@@ -182,8 +208,24 @@ actor GitBackend: VCSBackend {
         try await gitService.continueWorktreeMerge(message: message, at: targetRepoURL)
     }
 
+    func continueWorktreeMerge(
+        source: GitWorktreeMergeEndpoint,
+        target: GitWorktreeMergeEndpoint,
+        message: String
+    ) async throws -> String {
+        try await gitService.continueWorktreeMerge(
+            sourceEndpoint: source,
+            targetEndpoint: target,
+            message: message
+        )
+    }
+
     func abortWorktreeMerge(at targetRepoURL: URL) async throws -> Bool {
         try await gitService.abortWorktreeMerge(at: targetRepoURL)
+    }
+
+    func abortWorktreeMerge(target: GitWorktreeMergeEndpoint) async throws -> Bool {
+        try await gitService.abortWorktreeMerge(targetEndpoint: target)
     }
 
     // MARK: - Remote Operations
@@ -204,12 +246,14 @@ actor GitBackend: VCSBackend {
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool,
+        paths: [String]?,
         at repoURL: URL
     ) async throws -> [VCSUncommittedFile] {
         let files = try await gitService.getChangedFilesStats(
             compare: compare,
             includeUntrackedWhenApplicable: includeUntrackedWhenApplicable,
             detectRenames: detectRenames,
+            paths: paths,
             at: repoURL
         )
         return files.map { file in

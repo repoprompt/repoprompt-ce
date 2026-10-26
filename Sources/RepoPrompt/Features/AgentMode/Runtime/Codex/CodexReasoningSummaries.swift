@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension Notification.Name {
     static let codexReasoningSummariesDidChange = Notification.Name("RepoPrompt.codexReasoningSummariesDidChange")

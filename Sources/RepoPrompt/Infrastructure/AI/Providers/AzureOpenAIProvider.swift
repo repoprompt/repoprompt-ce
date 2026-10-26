@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFoundation
 import SwiftOpenAI
 
 public struct AzureOpenAIConfiguration: Codable, Equatable {
@@ -41,6 +42,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
     public let extraHeaders: [String: String]?
     public let models: [ModelDescriptor]
     public let defaultModelID: String?
+    public let httpCredentialConsentEndpoint: String?
 
     public init(
         baseURL: URL,
@@ -48,7 +50,8 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         apiVersion: String,
         extraHeaders: [String: String]? = nil,
         models: [ModelDescriptor] = [],
-        defaultModelID: String? = nil
+        defaultModelID: String? = nil,
+        httpCredentialConsentEndpoint: String? = nil
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -56,6 +59,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         self.extraHeaders = extraHeaders
         self.models = models
         self.defaultModelID = defaultModelID
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -65,6 +69,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         case extraHeaders
         case models
         case defaultModelID
+        case httpCredentialConsentEndpoint
         case supportsChatCompletions
         case supportsResponses
     }
@@ -83,6 +88,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         extraHeaders = try container.decodeIfPresent([String: String].self, forKey: .extraHeaders)
         models = try container.decodeIfPresent([ModelDescriptor].self, forKey: .models) ?? []
         defaultModelID = try container.decodeIfPresent(String.self, forKey: .defaultModelID)
+        httpCredentialConsentEndpoint = try container.decodeIfPresent(String.self, forKey: .httpCredentialConsentEndpoint)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -93,6 +99,11 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         try container.encodeIfPresent(extraHeaders, forKey: .extraHeaders)
         try container.encode(models, forKey: .models)
         try container.encodeIfPresent(defaultModelID, forKey: .defaultModelID)
+        try container.encodeIfPresent(httpCredentialConsentEndpoint, forKey: .httpCredentialConsentEndpoint)
+    }
+
+    func revokingHTTPConsent() -> AzureOpenAIConfiguration {
+        AzureOpenAIConfiguration(baseURL: baseURL, apiKey: apiKey, apiVersion: apiVersion, extraHeaders: extraHeaders, models: models, defaultModelID: defaultModelID, httpCredentialConsentEndpoint: nil)
     }
 
     var authorization: Authorization {
@@ -170,7 +181,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
             maxTokens: finalMaxTokens
         )
 
-        let response = try await azureService.responseCreate(parameters)
+        let response = try await checkedAzureService().responseCreate(parameters)
         if response.status == .failed {
             let detail = response.error?.message ?? response.incompleteDetails?.reason ?? "Responses API returned a failed status."
             throw AIProviderError.invalidResponse(detail: detail)
@@ -179,11 +190,11 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
     }
 
     func fetchResponse(id: String) async throws -> ResponseModel {
-        try await azureService.responseModel(id: id, parameters: nil)
+        try await checkedAzureService().responseModel(id: id, parameters: nil)
     }
 
     func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = azureService
+        let service = try checkedAzureService()
 
         // Use polling instead of SSE for more reliable background job monitoring
         return AsyncThrowingStream { continuation in
@@ -239,8 +250,8 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
 
                         // Check for terminal states
                         switch response.status {
-                        case .completed:
-                            // Extract the output text from the response
+                        case .completed, .incomplete:
+                            // Extract any available output before reporting the terminal outcome
                             var outputText = ""
                             var reasoningText = ""
                             for item in response.output {
@@ -286,14 +297,16 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
                                 )
                             }
 
+                            let didComplete = response.status == .completed
                             continuation.yield(
                                 AIStreamResult(
-                                    type: "message_stop",
+                                    type: didComplete ? "message_stop" : AIStreamResult.incompleteType,
                                     text: nil,
                                     reasoning: nil,
                                     promptTokens: response.usage?.inputTokens,
                                     completionTokens: response.usage?.outputTokens,
-                                    cost: nil
+                                    cost: nil,
+                                    stopReason: didComplete ? nil : response.incompleteDetails?.reason ?? "unknown"
                                 )
                             )
                             continuation.finish()
@@ -302,10 +315,6 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
                         case .failed:
                             let message = response.error?.message ?? "Background job failed."
                             throw AIProviderError.invalidResponse(detail: message)
-
-                        case .incomplete:
-                            let detail = response.incompleteDetails?.reason ?? "Background job incomplete."
-                            throw AIProviderError.invalidResponse(detail: detail)
 
                         case .cancelled:
                             throw AIProviderError.invalidResponse(detail: "Background job was cancelled.")
@@ -336,7 +345,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
     }
 
     func cancelResponse(id: String) async throws -> ResponseModel {
-        try await azureService.responseCancel(id: id)
+        try await checkedAzureService().responseCancel(id: id)
     }
 }
 
@@ -366,6 +375,11 @@ final class AzureOpenAIProvider: AIProvider {
 
     init(configuration: AzureOpenAIConfiguration) {
         self.configuration = configuration
+    }
+
+    private func checkedAzureService() throws -> OpenAIService {
+        try ProviderEndpointConsent.validate(configuration.baseURL, apiKey: configuration.apiKey, customHeaders: configuration.extraHeaders ?? [:], consentEndpoint: configuration.httpCredentialConsentEndpoint)
+        return azureService
     }
 
     // MARK: - Helpers
@@ -517,6 +531,14 @@ final class AzureOpenAIProvider: AIProvider {
             (.gpt5CodexMed, "medium")
         case .gpt5CodexLow:
             (.gpt5CodexMed, "low")
+        case .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax:
+            (.gpt61Sol, model.defaultReasoningEffort)
+        case .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax:
+            (.gpt6Astra, model.defaultReasoningEffort)
+        case .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh:
+            (.gpt6Luna, model.defaultReasoningEffort)
+        case .gpt6Sol:
+            (.gpt6Sol, "medium")
         default:
             (model, nil)
         }
@@ -537,6 +559,9 @@ final class AzureOpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
         default:
@@ -668,6 +693,7 @@ final class AzureOpenAIProvider: AIProvider {
                 do {
                     var promptTokens: Int?
                     var completionTokens: Int?
+                    var observedCompletionOutcome: AIProviderCompletionOutcome?
 
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -681,6 +707,7 @@ final class AzureOpenAIProvider: AIProvider {
                                 continuation.yield(AIStreamResult(type: "content", text: nil, reasoning: delta.delta, promptTokens: nil, completionTokens: nil))
                             }
                         case let .responseCompleted(completed):
+                            observedCompletionOutcome = .completed
                             if let usage = completed.response.usage {
                                 promptTokens = usage.inputTokens
                                 completionTokens = usage.outputTokens
@@ -689,8 +716,8 @@ final class AzureOpenAIProvider: AIProvider {
                             let message = failed.response.error?.message ?? "Responses API returned a failure."
                             throw AIProviderError.invalidResponse(detail: message)
                         case let .responseIncomplete(incomplete):
-                            let detail = incomplete.response.incompleteDetails?.reason ?? "Responses API marked the response as incomplete."
-                            throw AIProviderError.invalidResponse(detail: detail)
+                            let reason = incomplete.response.incompleteDetails?.reason ?? "unknown"
+                            observedCompletionOutcome = .incomplete(reason: reason)
                         case let .error(errorEvent):
                             throw APIError.requestFailed(description: errorEvent.prettyDescription)
                         default:
@@ -698,7 +725,14 @@ final class AzureOpenAIProvider: AIProvider {
                         }
                     }
 
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    switch observedCompletionOutcome {
+                    case .completed:
+                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    case let .incomplete(reason):
+                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                    case nil:
+                        break
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -710,10 +744,10 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private func performResponseCompletion(parameters: ModelResponseParameter) async throws -> ResponseModel {
-        let response = try await azureService.responseCreate(parameters)
-        guard response.status == .completed else {
+        let response = try await checkedAzureService().responseCreate(parameters)
+        guard response.status == .completed || response.status == .incomplete else {
             let status = response.status?.rawValue ?? "unknown"
-            let detail = response.error?.message ?? response.incompleteDetails?.reason ?? "Response status was '\(status)'"
+            let detail = response.error?.message ?? "Response status was '\(status)'"
             throw AIProviderError.invalidResponse(detail: detail)
         }
         return response
@@ -741,7 +775,7 @@ final class AzureOpenAIProvider: AIProvider {
                     maxTokens: finalMaxTokens,
                     stream: true
                 )
-                let stream = try await azureService.responseCreateStream(parameters)
+                let stream = try await checkedAzureService().responseCreateStream(parameters)
                 return bridgeResponseStream(stream)
             } else {
                 // Use background job + streaming attach for non-streaming Response API models.
@@ -760,7 +794,12 @@ final class AzureOpenAIProvider: AIProvider {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
-                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                switch result.completionOutcome {
+                case .completed:
+                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                case let .incomplete(reason):
+                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                }
                 continuation.finish()
             }
         }
@@ -773,13 +812,14 @@ final class AzureOpenAIProvider: AIProvider {
             reasoningEffort: reasoningEffort,
             maxTokens: finalMaxTokens
         )
-        let stream = try await azureService.startStreamedChat(parameters: parameters)
+        let stream = try await checkedAzureService().startStreamedChat(parameters: parameters)
 
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     var promptTokens: Int?
                     var completionTokens: Int?
+                    var observedCompletionOutcome: AIProviderCompletionOutcome?
 
                     for try await chunk in stream {
                         if Task.isCancelled { break }
@@ -789,8 +829,10 @@ final class AzureOpenAIProvider: AIProvider {
                             completionTokens = usage.completionTokens
                         }
 
-                        let content = chunk.choices?.first?.delta?.content ?? ""
-                        let reasoning = chunk.choices?.first?.delta?.reasoningContent ?? ""
+                        let choice = chunk.choices?.first
+                        let content = choice?.delta?.content ?? ""
+                        let reasoning = choice?.delta?.reasoningContent ?? ""
+                        let finishReason = choice?.finishReason
 
                         if !content.isEmpty || !reasoning.isEmpty {
                             continuation.yield(
@@ -803,9 +845,19 @@ final class AzureOpenAIProvider: AIProvider {
                                 )
                             )
                         }
+                        if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
+                            observedCompletionOutcome = completionOutcome
+                        }
                     }
 
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    switch observedCompletionOutcome {
+                    case .completed:
+                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                    case let .incomplete(reason):
+                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                    case nil:
+                        break
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -841,10 +893,17 @@ final class AzureOpenAIProvider: AIProvider {
                 let promptTokens = response.usage?.inputTokens
                 let completionTokens = response.usage?.outputTokens
 
+                let completionOutcome: AIProviderCompletionOutcome = if response.status == .completed {
+                    .completed
+                } else {
+                    .incomplete(reason: response.incompleteDetails?.reason ?? "unknown")
+                }
+
                 return AICompletionResult(
                     text: text,
                     promptTokens: promptTokens,
-                    completionTokens: completionTokens
+                    completionTokens: completionTokens,
+                    completionOutcome: completionOutcome
                 )
             } catch let error as APIError {
                 throw AIProviderError.apiError(source: error)
@@ -863,13 +922,17 @@ final class AzureOpenAIProvider: AIProvider {
             reasoningEffort: reasoningEffort,
             maxTokens: finalMaxTokens
         )
-        let response = try await azureService.startChat(parameters: parameters)
-        let text = response.choices?.first?.message?.content ?? ""
+        let response = try await checkedAzureService().startChat(parameters: parameters)
+        let choice = response.choices?.first
+        let text = choice?.message?.content ?? ""
+        let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
+            ?? .incomplete(reason: "missing_finish_reason")
 
         return AICompletionResult(
             text: text,
             promptTokens: response.usage?.promptTokens,
-            completionTokens: response.usage?.completionTokens
+            completionTokens: response.usage?.completionTokens,
+            completionOutcome: completionOutcome
         )
     }
 
@@ -988,8 +1051,10 @@ extension AzureOpenAIProvider {
     static func discoverDeployments(
         baseURL: URL,
         apiKey: String,
-        apiVersions: [String]
+        apiVersions: [String],
+        httpCredentialConsentEndpoint: String? = nil
     ) async throws -> [AzureOpenAIConfiguration.ModelDescriptor] {
+        try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
         let orderedVersions = apiVersions.reduce(into: [String]()) { acc, version in
             let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !acc.contains(trimmed) else { return }

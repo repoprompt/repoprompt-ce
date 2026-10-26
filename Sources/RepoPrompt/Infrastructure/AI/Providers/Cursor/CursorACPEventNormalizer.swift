@@ -10,7 +10,7 @@ enum CursorACPEventNormalizer {
         case "tool_call", "tool_call_update":
             guard !shouldSuppressPlaceholderToolEvent(payload) else { return [] }
             return ACPDefaultSessionUpdateNormalizer.normalize(
-                adaptedToolUpdatePayload(payload, sessionUpdate: sessionUpdate),
+                ACPToolUpdateResultAdapter.adaptedTerminalToolUpdatePayload(payload, sessionUpdate: sessionUpdate),
                 providerID: .cursor
             )
         default:
@@ -30,54 +30,6 @@ enum CursorACPEventNormalizer {
         if let rawOutput = payload["rawOutput"], rawOutputIsMeaningful(rawOutput) { return true }
         if let content = payload["content"], valueIsMeaningful(content) { return true }
         return false
-    }
-
-    private static func adaptedToolUpdatePayload(_ payload: [String: Any], sessionUpdate: String) -> [String: Any] {
-        guard sessionUpdate == "tool_call_update",
-              let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?.lowercased(),
-              status == "completed" || status == "failed"
-        else { return payload }
-
-        var adapted = payload
-        let resultPayload = terminalResultPayload(from: payload, status: status)
-        adapted["rawOutput"] = resultPayload
-        if (resultPayload["status"] as? String)?.lowercased() == "failed" {
-            adapted["status"] = "failed"
-        }
-        return adapted
-    }
-
-    private static func terminalResultPayload(from payload: [String: Any], status: String) -> [String: Any] {
-        let failed = status == "failed" || rawOutputIndicatesFailure(payload["rawOutput"])
-        var result: [String: Any] = [
-            "status": failed ? "failed" : "success",
-            "acp_status": status
-        ]
-        if let title = ACPRuntimeEventParsing.firstString(in: payload, keys: ["title"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty
-        {
-            result["title"] = title
-        }
-        if let kind = ACPRuntimeEventParsing.firstString(in: payload, keys: ["kind", "toolKind"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !kind.isEmpty
-        {
-            result["kind"] = kind
-        }
-        if let rawOutput = payload["rawOutput"] {
-            result["rawOutput"] = rawOutput
-            if let rawOutputObject = rawOutput as? [String: Any],
-               let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromRootObject: rawOutputObject)
-            {
-                result["chat_id"] = chatID
-            }
-        }
-        if let content = payload["content"] {
-            result["content"] = content
-        }
-        if let rawInput = payload["rawInput"], valueIsMeaningful(rawInput) {
-            result["rawInput"] = rawInput
-        }
-        return result
     }
 
     private static func rawOutputIsMeaningful(_ value: Any) -> Bool {

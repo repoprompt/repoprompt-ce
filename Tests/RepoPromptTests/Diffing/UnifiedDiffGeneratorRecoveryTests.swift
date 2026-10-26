@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 final class UnifiedDiffGeneratorRecoveryTests: XCTestCase {
@@ -16,6 +17,32 @@ final class UnifiedDiffGeneratorRecoveryTests: XCTestCase {
             filePath: "Repo Root/Sources/Removed File.swift"
         )
         XCTAssertEqual(deleteDiff, "--- a/Repo Root/Sources/Removed File.swift\n+++ /dev/null\n")
+    }
+
+    func testSplitHunksUseTrailingContextStartAfterLongEqualRun() async throws {
+        let unchangedLines = ["line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9"]
+        let diff = try await UnifiedDiffGenerator.build(
+            oldLines: ["line1"] + unchangedLines + ["line10"],
+            newLines: ["LINE1"] + unchangedLines + ["LINE10"],
+            filePath: "Sources/File.swift",
+            context: 2
+        )
+        let expected = """
+        --- a/Sources/File.swift
+        +++ b/Sources/File.swift
+        @@ -1,3 +1,3 @@
+        -line1
+        +LINE1
+         line2
+         line3
+        @@ -8,3 +8,3 @@
+         line8
+         line9
+        -line10
+        +LINE10
+        """ + "\n"
+
+        XCTAssertEqual(diff, expected)
     }
 
     func testBuildFromEditChunksCarriesCumulativeDeltaAcrossSortedHunks() {

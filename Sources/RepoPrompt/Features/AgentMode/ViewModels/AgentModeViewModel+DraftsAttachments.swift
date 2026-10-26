@@ -9,26 +9,210 @@ extension AgentModeViewModel {
         tabID: UUID,
         text: String,
         message: String,
-        strategy: AgentModeRunService.DraftRestorationStrategy
+        strategy: AgentModeRunService.DraftRestorationStrategy,
+        operation: AgentComposerDraftRestorationOperation? = nil
     ) {
-        // Also update session draft so it persists across tab switches
-        storeDraftText(for: tabID, text)
+        // Compose against the session-owned draft now. The per-tab ledger retains
+        // fragments until that tab's composer applies them or loads this snapshot.
+        let eventID = UUID()
+        let restoredText: String
+        let restoredStrategy: AgentModeRunService.DraftRestorationStrategy
+        let baseOperation: AgentComposerDraftRestorationOperation?
+        if case .prependAlways = strategy, operation == nil {
+            let existingDraft = retrieveDraftText(for: tabID)
+            restoredText = AgentComposerDraftRestorationReducer.compose(restoredText: text, above: existingDraft)
+            restoredStrategy = .replaceAlways
+            baseOperation = AgentComposerDraftRestorationOperation(
+                rejectedDraftText: text,
+                draftTextBeforeRestoration: existingDraft,
+                composedDraftText: restoredText,
+                fragments: []
+            )
+        } else {
+            restoredText = text
+            restoredStrategy = strategy
+            baseOperation = operation
+        }
+        let restoredOperation = baseOperation.map { operation in
+            AgentComposerDraftRestorationOperation(
+                rejectedDraftText: operation.rejectedDraftText,
+                draftTextBeforeRestoration: operation.draftTextBeforeRestoration,
+                composedDraftText: operation.composedDraftText,
+                fragments: draftRestorationLedger.append(tabID: tabID, text: operation.rejectedDraftText)
+            )
+        }
+        writeDraftText(for: tabID, restoredText)
         draftRestorationEvent = DraftRestorationEvent(
-            id: UUID(),
+            id: eventID,
             tabID: tabID,
-            text: text,
+            text: restoredText,
             message: message,
-            strategy: strategy
+            strategy: restoredStrategy,
+            operation: restoredOperation
         )
         syncComposerUIState()
     }
 
-    /// Store draft text for a tab
-    func storeDraftText(for tabID: UUID, _ text: String) {
+    /// Restores the full composer state for a manual submission that was
+    /// rejected before provider dispatch: draft text, image attachments,
+    /// tagged-file attachments, and the selected workflow.
+    ///
+    /// Restores never displace newer user choices: attachments and tagged
+    /// files are prepended only when not already pending, and the workflow is
+    /// restored only when the user has not selected another one since the
+    /// rejected submission. The rejected draft text is composed above any
+    /// newer typing here (with `.replaceAlways` delivery) so back-to-back
+    /// rejections each restore exactly once even when restoration events
+    /// coalesce in the UI.
+    func restoreRejectedManualSubmissionComposerState(
+        repromptedText: String? = nil,
+        tabID: UUID,
+        session: TabSession,
+        draftText: String,
+        images: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        selectedWorkflow workflow: AgentWorkflowDefinition?,
+        selectedWorkflowMutationGeneration: UInt64?,
+        message: String
+    ) {
+        var sessionChanged = false
+        if !images.isEmpty {
+            let existingImageIDs = Set(session.pendingImageAttachments.map(\.id))
+            let restoredImages = images.filter { !existingImageIDs.contains($0.id) }
+            if !restoredImages.isEmpty {
+                session.pendingImageAttachments = restoredImages + session.pendingImageAttachments
+                sessionChanged = true
+            }
+        }
+        if !taggedFiles.isEmpty {
+            let existingTaggedPaths = Set(session.pendingTaggedFileAttachments.map(\.relativePath))
+            let restoredTaggedFiles = taggedFiles.filter { !existingTaggedPaths.contains($0.relativePath) }
+            if !restoredTaggedFiles.isEmpty {
+                session.pendingTaggedFileAttachments = restoredTaggedFiles + session.pendingTaggedFileAttachments
+                sessionChanged = true
+            }
+        }
+        if let workflow,
+           let selectedWorkflowMutationGeneration,
+           session.userWorkflowSelectionMutationGeneration == selectedWorkflowMutationGeneration,
+           session.selectedWorkflow == nil
+        {
+            session.selectedWorkflow = workflow
+            if tabID == currentTabID {
+                selectedWorkflow = workflow
+            }
+            sessionChanged = true
+        }
+        if sessionChanged {
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: tabID)
+        }
+        let existingDraft = retrieveDraftText(for: tabID)
+        let composedDraft = AgentComposerDraftRestorationReducer.compose(
+            restoredText: draftText,
+            above: existingDraft
+        )
+        let operation = AgentComposerDraftRestorationOperation(
+            rejectedDraftText: draftText,
+            draftTextBeforeRestoration: existingDraft,
+            composedDraftText: composedDraft,
+            fragments: []
+        )
+        restoreComposerDraft(
+            tabID: tabID,
+            text: composedDraft,
+            message: message,
+            strategy: .replaceAlways,
+            operation: operation
+        )
+        if let repromptedText {
+            repromptUIStore.recoveries[tabID] = .init(
+                text: repromptedText, originalDraft: draftText, reason: message,
+                draftAtInvalidation: retrieveDraftText(for: tabID)
+            )
+        }
+    }
+
+    /// Withdraws a run's initial user turn that a route-verification refusal kept from ever reaching
+    /// the provider, and puts its text back into an empty composer, so a resend leaves no duplicate
+    /// user row. The Claude-native counterpart of Codex's pre-dispatch rejection rollback.
+    ///
+    /// Narrowed to what it can restore losslessly: a plain-text row (no images, tagged files,
+    /// workflow, or cross-session attribution) followed only by error rows, and an empty composer.
+    /// Anything else keeps the row in the transcript for retry, as before.
+    @discardableResult
+    func restoreRouteRefusedUnsentTurn(
+        session: TabSession,
+        userItemID: UUID,
+        message: String
+    ) -> Bool {
+        let tabID = session.tabID
+        guard sessions[tabID] === session,
+              let index = session.items.firstIndex(where: { $0.id == userItemID })
+        else { return false }
+        let item = session.items[index]
+        guard item.kind == .user,
+              session.items[(index + 1)...].allSatisfy({ $0.kind == .error }),
+              !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              item.attachments.isEmpty,
+              item.taggedFileAttachments.isEmpty,
+              item.workflow == nil,
+              item.crossSessionAttribution == nil,
+              retrieveDraftText(for: tabID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        guard session.removeItem(at: index) != nil else { return false }
+        session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == userItemID }
+        session.isDirty = true
+        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .prependAlways)
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+        return true
+    }
+
+    /// Store an editor draft. Only the caller's applied sequence is acknowledged;
+    /// still-pending fragments are composed into storage so a tab switch cannot
+    /// overwrite a recovery that has not reached the editor yet.
+    func storeDraftText(for tabID: UUID, _ text: String, acknowledgingThrough sequence: UInt64 = 0) {
+        draftRestorationLedger.acknowledge(tabID: tabID, through: sequence)
+        let pending = draftRestorationLedger.tabs[tabID]?.pendingFragments ?? []
+        let storedText = pending.reduce(text) { result, fragment in
+            AgentComposerDraftRestorationReducer.compose(restoredText: fragment.text, above: result)
+        }
+        let storedSequence = pending.last?.sequence ?? sequence
+        draftRestorationLedger.markStoredDraft(tabID: tabID, through: storedSequence)
+        writeDraftText(for: tabID, storedText)
+    }
+
+    /// Loading the stored text acknowledges exactly the fragments included in it.
+    func loadDraftSnapshotForComposer(for tabID: UUID) -> AgentComposerDraftSnapshot {
+        let snapshot = AgentComposerDraftSnapshot(
+            text: retrieveDraftText(for: tabID),
+            restorationSequence: draftRestorationLedger.tabs[tabID]?.storedDraftSequence ?? 0
+        )
+        draftRestorationLedger.acknowledge(tabID: tabID, through: snapshot.restorationSequence)
+        return snapshot
+    }
+
+    private func writeDraftText(for tabID: UUID, _ text: String) {
         let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
+        if !repromptUIStore.hasCancelledDraft(tabID: tabID, text: text) {
+            repromptUIStore.clearCancelledDraft(tabID: tabID)
+        }
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
+            if repromptOperation?.sourceTabID == tabID {
+                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            } else if var recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+                      !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
+            {
+                // Editing ends exact-draft authority. Preserve the old alternative without
+                // re-stamping its original/classification onto an unrelated new message.
+                recovery.bypassesPreparation = false
+                recovery.requiresDecision = false
+                repromptUIStore.recoveries[tabID] = recovery
+            }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -37,6 +221,7 @@ extension AgentModeViewModel {
                 tabDraftText[tabID] = text
             }
         }
+        invalidateRepromptIfNeeded()
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)
@@ -59,7 +244,8 @@ extension AgentModeViewModel {
         guard let tabID,
               CodexGoalSupport.isEnabled
         else { return nil }
-        let session = session(for: tabID, createIfNeeded: false)
+        // Presentation reads must not recreate a runtime while its saved carrier is retiring.
+        let session = sessions[tabID]
         let targetAgent = session?.selectedAgent ?? (tabID == currentTabID ? selectedAgent : nil)
         guard targetAgent == .codexExec else { return nil }
         let draftText = draftTextOverride ?? session?.draftText ?? tabDraftText[tabID] ?? ""
@@ -272,6 +458,44 @@ extension AgentModeViewModel {
         guard !attachments.isEmpty else { return }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else { return }
         attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+    }
+
+    /// Local image files this tab's Agent session attached itself — the in-flight turn plus any
+    /// earlier user turns whose copies still exist — restricted to the app-managed attachment
+    /// store. Used as exact-file Oracle image authority; returns nothing unless the tab is still
+    /// bound to `agentSessionID`, so another session's attachments are never authorized.
+    func oracleAuthorizedAttachmentPaths(tabID: UUID, agentSessionID: UUID?) -> [String] {
+        guard let agentSessionID,
+              let session = session(for: tabID, createIfNeeded: false),
+              session.activeAgentSessionID == agentSessionID,
+              let workspaceDirectory = attachmentWorkspaceDirectoryURL()
+        else { return [] }
+        let storagePrefix = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory).path + "/"
+
+        var candidates: [AgentImageAttachment] = []
+        switch session.attachmentTurnState {
+        case .idle:
+            break
+        case let .reserved(_, attachments), let .consumed(_, attachments):
+            candidates.append(contentsOf: attachments)
+        }
+        candidates.append(contentsOf: session.attachmentsPendingProviderConsumptionCleanup)
+        for item in session.items where item.kind == .user {
+            candidates.append(contentsOf: item.attachments)
+        }
+
+        var seen: Set<String> = []
+        var paths: [String] = []
+        for attachment in candidates {
+            guard case let .localFile(path) = attachment.source else { continue }
+            let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+            guard standardized.hasPrefix(storagePrefix),
+                  !standardized.dropFirst(storagePrefix.count).contains("/"),
+                  seen.insert(standardized).inserted
+            else { continue }
+            paths.append(standardized)
+        }
+        return paths
     }
 
     @discardableResult

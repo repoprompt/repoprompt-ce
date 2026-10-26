@@ -431,7 +431,34 @@ final class SlashSkillMentionHelper {
     private var refreshTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
     private var suggestionRequestID: UInt64 = 0
+    private var isProviderConfigured = false
+    private var suggestionsQuery: String?
+    private var highlightWasMoved = false
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
+
+    /// What a `configure` call should do, given the previous configuration state.
+    enum ConfigurationOutcome: Equatable {
+        /// Slash-skill support is off: drop the provider and tear down any live session.
+        case deactivate
+        /// Support is being turned on: adopt the provider and refresh immediately.
+        case activate
+        /// Support was already on: adopt the refreshed provider closure but leave any pending
+        /// typing debounce and live session untouched.
+        case adoptProvider
+    }
+
+    /// SwiftUI re-runs `updateNSView` (and therefore `configure`) on every keystroke, handing over a
+    /// freshly allocated provider closure each time. Only an off/on transition may force a refresh;
+    /// otherwise each keystroke would cancel the typing debounce and issue a redundant suggestions
+    /// request on the main actor.
+    static func configurationOutcome(
+        enabled: Bool,
+        hasSuggestionsProvider: Bool,
+        isProviderConfigured: Bool
+    ) -> ConfigurationOutcome {
+        guard enabled, hasSuggestionsProvider else { return .deactivate }
+        return isProviderConfigured ? .adoptProvider : .activate
+    }
 
     init() {
         overlay.onRowClicked = { [weak self] _, index in
@@ -444,13 +471,29 @@ final class SlashSkillMentionHelper {
         enabled: Bool,
         suggestionsProvider: ((String) async -> [MentionSuggestion])?
     ) {
-        guard enabled, suggestionsProvider != nil else {
+        switch Self.configurationOutcome(
+            enabled: enabled,
+            hasSuggestionsProvider: suggestionsProvider != nil,
+            isProviderConfigured: isProviderConfigured
+        ) {
+        case .deactivate:
+            let hadState = isProviderConfigured
+                || self.suggestionsProvider != nil
+                || triggerRange != nil
+                || refreshTask != nil
+                || suggestionTask != nil
             self.suggestionsProvider = nil
-            dismiss()
-            return
+            isProviderConfigured = false
+            if hadState {
+                dismiss()
+            }
+        case .activate:
+            self.suggestionsProvider = suggestionsProvider
+            isProviderConfigured = true
+            scheduleRefresh(for: textView, immediate: true, enabled: enabled, isActive: true)
+        case .adoptProvider:
+            self.suggestionsProvider = suggestionsProvider
         }
-        self.suggestionsProvider = suggestionsProvider
-        scheduleRefresh(for: textView, immediate: true, enabled: enabled, isActive: true)
     }
 
     func scheduleRefresh(
@@ -480,12 +523,14 @@ final class SlashSkillMentionHelper {
 
         if commandSelector == #selector(NSResponder.moveUp(_:)) {
             guard !suggestions.isEmpty else { return false }
+            freezeExplicitSelection()
             highlightedIndex = (highlightedIndex - 1 + suggestions.count) % suggestions.count
             overlay.moveHighlight(by: -1)
             return true
         }
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             guard !suggestions.isEmpty else { return false }
+            freezeExplicitSelection()
             highlightedIndex = (highlightedIndex + 1) % suggestions.count
             overlay.moveHighlight(by: 1)
             return true
@@ -501,25 +546,79 @@ final class SlashSkillMentionHelper {
                 dismiss()
                 return false
             }
+            guard let trigger = detectTrigger(in: textView) else {
+                dismiss()
+                return false
+            }
+            if trigger.range != triggerRange || trigger.query != suggestionsQuery {
+                // Keep completion usable while the typing debounce is pending. Never accept
+                // a row unrelated to the live token, but do not send a matching partial token.
+                let selectedPath = suggestions.indices.contains(highlightedIndex) ? suggestions[highlightedIndex].relativePath : nil
+                let query = trigger.query.lowercased()
+                suggestions.removeAll { suggestion in
+                    var name = suggestion.relativePath.lowercased()
+                    if name.hasPrefix("skill:"), !query.hasPrefix("skill:") {
+                        name = String(name.dropFirst("skill:".count))
+                    }
+                    return !query.isEmpty && !name.contains(query)
+                }
+                guard !suggestions.isEmpty else {
+                    dismiss()
+                    return false
+                }
+                if highlightWasMoved, let index = suggestions.firstIndex(where: { $0.relativePath == selectedPath }) {
+                    highlightedIndex = index
+                } else {
+                    highlightWasMoved = false
+                    highlightedIndex = suggestions.firstIndex(where: { $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame }) ?? 0
+                }
+                triggerRange = trigger.range
+                suggestionsQuery = trigger.query
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)),
+               let exactIndex = suggestions.firstIndex(where: { $0.submitsOnExactEnter && $0.relativePath.caseInsensitiveCompare(trigger.query) == .orderedSame }),
+               highlightedIndex == exactIndex || !highlightWasMoved
+            {
+                // Let the composer's ordinary Return handler submit the exact typed command.
+                dismiss()
+                return false
+            }
             commitHighlighted(in: textView)
             return true
         }
         return false
     }
 
-    private func selectSuggestion(at index: Int) {
-        guard suggestions.indices.contains(index) else { return }
+    private func freezeExplicitSelection() {
         refreshTask?.cancel()
         refreshTask = nil
         suggestionTask?.cancel()
         suggestionTask = nil
         suggestionRequestID &+= 1
+        highlightWasMoved = true
+    }
+
+    private func selectSuggestion(at index: Int) {
+        guard suggestions.indices.contains(index) else { return }
+        freezeExplicitSelection()
         highlightedIndex = index
     }
 
     #if DEBUG
         var suggestionsForTesting: [MentionSuggestion] {
             suggestions
+        }
+
+        var suggestionTaskForTesting: Task<Void, Never>? {
+            suggestionTask
+        }
+
+        func setSelectionStateForTesting(suggestions: [MentionSuggestion], triggerRange: NSRange, query: String) {
+            self.suggestions = suggestions
+            self.triggerRange = triggerRange
+            suggestionsQuery = query
+            highlightWasMoved = false
+            highlightedIndex = 0
         }
 
         func clickSuggestionForTesting(at index: Int) {
@@ -535,6 +634,8 @@ final class SlashSkillMentionHelper {
         suggestionRequestID &+= 1
         overlay.hide()
         suggestions.removeAll()
+        suggestionsQuery = nil
+        highlightWasMoved = false
         highlightedIndex = 0
         triggerRange = nil
     }
@@ -566,7 +667,6 @@ final class SlashSkillMentionHelper {
         let overlayWasVisible = trigger.overlayWasVisible
         let requestedQuery = trigger.query
         let expectedRange = trigger.range
-        highlightedIndex = 0
         triggerRange = trigger.range
 
         suggestionTask?.cancel()
@@ -589,6 +689,8 @@ final class SlashSkillMentionHelper {
             else { return }
 
             suggestions = freshSuggestions
+            suggestionsQuery = requestedQuery
+            highlightWasMoved = false
             highlightedIndex = 0
             triggerRange = latestTrigger.range
 

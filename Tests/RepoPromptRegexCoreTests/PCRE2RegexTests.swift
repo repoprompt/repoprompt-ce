@@ -1,4 +1,4 @@
-import RepoPromptRegexCore
+@testable import RepoPromptRegexCore
 import XCTest
 
 final class PCRE2RegexTests: XCTestCase {
@@ -62,5 +62,20 @@ final class PCRE2RegexTests: XCTestCase {
 
         XCTAssertTrue(try regex.firstMatch(in: literal) != nil)
         XCTAssertNil(try regex.firstMatch(in: #"left-right"#))
+
+        let mixedEmptyPrefilter = PCRE2LinePrefilter(
+            asciiRequiredAlternatives: ["", "class"],
+            caseInsensitive: true
+        )
+        XCTAssertNil(
+            PCRE2LinePrefilterMatcher(prefilter: mixedEmptyPrefilter),
+            "Unsupported alternatives must disable the prefilter so every line reaches PCRE2."
+        )
+
+        let unsupportedNeedlePrefilter = PCRE2LinePrefilter(
+            asciiRequiredAlternatives: ["class", "cla\u{017F}s"],
+            caseInsensitive: true
+        )
+        XCTAssertNil(PCRE2LinePrefilterMatcher(prefilter: unsupportedNeedlePrefilter))
     }
 }

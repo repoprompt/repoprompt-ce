@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum RecommendationWizardScopePresentation {
     static let mcpPresetsScopeLabel = "MCP Presets: Global settings"

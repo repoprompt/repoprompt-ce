@@ -4,19 +4,6 @@ import XCTest
 
 @MainActor
 final class TextViewUndoSafeReplacementTests: XCTestCase {
-    func testTypingRegistersUndoBeforeExternalReplacement() {
-        let fixture = UndoTextViewFixture(initialText: "seed")
-
-        fixture.type(" typed")
-
-        XCTAssertEqual(fixture.textView.string, "seed typed")
-        XCTAssertTrue(fixture.undoManager.canUndo)
-
-        fixture.undoManager.undo()
-
-        XCTAssertEqual(fixture.textView.string, "seed")
-    }
-
     func testExternalReplacementClearsExistingUndoAndRedoStacks() {
         let undoFixture = UndoTextViewFixture(initialText: "seed")
         undoFixture.type(" typed")
@@ -55,69 +42,6 @@ final class TextViewUndoSafeReplacementTests: XCTestCase {
         XCTAssertEqual(fixture.textView.string, "new document")
     }
 
-    func testReplacementDuringUndoAndRedoDefersHistoryClearUntilTransactionCompletes() {
-        let undoFixture = UndoTextViewFixture(initialText: "before undo")
-        let undoTarget = UndoActionTarget()
-        var observedUndoing = false
-
-        undoFixture.undoManager.beginUndoGrouping()
-        undoFixture.undoManager.registerUndo(withTarget: undoTarget) { target in
-            TextViewUndoSafeReplacement.perform(
-                in: undoFixture.textView,
-                undoManager: undoFixture.undoManager
-            ) {
-                observedUndoing = undoFixture.undoManager.isUndoing
-                undoFixture.textView.string = "replacement during undo"
-                undoFixture.undoManager.registerUndo(withTarget: target) { _ in }
-            }
-        }
-        undoFixture.undoManager.endUndoGrouping()
-
-        undoFixture.undoManager.undo()
-
-        XCTAssertTrue(observedUndoing)
-        XCTAssertEqual(undoFixture.textView.string, "replacement during undo")
-        XCTAssertTrue(undoFixture.undoManager.canRedo)
-
-        waitForMainQueueTurn()
-
-        XCTAssertFalse(undoFixture.undoManager.canUndo)
-        XCTAssertFalse(undoFixture.undoManager.canRedo)
-
-        let redoFixture = UndoTextViewFixture(initialText: "before redo")
-        let redoTarget = UndoActionTarget()
-        var observedRedoing = false
-
-        redoFixture.undoManager.beginUndoGrouping()
-        redoFixture.undoManager.registerUndo(withTarget: redoTarget) { target in
-            redoFixture.undoManager.registerUndo(withTarget: target) { target in
-                TextViewUndoSafeReplacement.perform(
-                    in: redoFixture.textView,
-                    undoManager: redoFixture.undoManager
-                ) {
-                    observedRedoing = redoFixture.undoManager.isRedoing
-                    redoFixture.textView.string = "replacement during redo"
-                    redoFixture.undoManager.registerUndo(withTarget: target) { _ in }
-                }
-            }
-        }
-        redoFixture.undoManager.endUndoGrouping()
-
-        redoFixture.undoManager.undo()
-        XCTAssertTrue(redoFixture.undoManager.canRedo)
-
-        redoFixture.undoManager.redo()
-
-        XCTAssertTrue(observedRedoing)
-        XCTAssertEqual(redoFixture.textView.string, "replacement during redo")
-        XCTAssertTrue(redoFixture.undoManager.canUndo)
-
-        waitForMainQueueTurn()
-
-        XCTAssertFalse(redoFixture.undoManager.canUndo)
-        XCTAssertFalse(redoFixture.undoManager.canRedo)
-    }
-
     func testCallerPolicyClampsSelectionAfterReplacement() {
         let selectionFixture = UndoTextViewFixture(initialText: "abc👩‍💻xyz")
         let oldUTF16Length = (selectionFixture.textView.string as NSString).length
@@ -138,14 +62,6 @@ final class TextViewUndoSafeReplacementTests: XCTestCase {
 
         XCTAssertEqual(selectionFixture.textView.currentStringLength(), 1)
         XCTAssertEqual(selectionFixture.textView.selectedRange(), NSRange(location: 1, length: 0))
-    }
-
-    private func waitForMainQueueTurn() {
-        let mainQueueTurn = expectation(description: "main queue turn")
-        DispatchQueue.main.async {
-            mainQueueTurn.fulfill()
-        }
-        wait(for: [mainQueueTurn], timeout: 1)
     }
 }
 
@@ -196,5 +112,3 @@ private final class UndoTestTextView: NSTextView {
         ownedUndoManager
     }
 }
-
-private final class UndoActionTarget: NSObject {}

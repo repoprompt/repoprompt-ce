@@ -2,7 +2,10 @@ import Foundation
 
 extension AgentModeViewModel {
     func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
-        AgentStatusPillsSnapshot(
+        #if DEBUG
+            test_statusPillsSnapshotBuildCount += 1
+        #endif
+        return AgentStatusPillsSnapshot(
             currentTabID: currentTabID,
             selectedWorkflow: selectedWorkflow,
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
@@ -11,14 +14,28 @@ extension AgentModeViewModel {
             runState: runState,
             autoEditEnabled: autoEditEnabled,
             interviewFirst: interviewFirst,
+            modelRouter: modelRouterPillProps(),
+            autoEffort: autoEffortPillProps(),
             executionLocation: executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID
+            activeRunID: activeSession?.runID,
+            monitor: currentMonitorPillProps(),
+            reprompt: repromptPillProps()
         )
     }
 
     func syncStatusPillsUIState() {
         ui.statusPills.update(makeStatusPillsSnapshot())
+    }
+
+    /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
+    /// The link-projection publisher calls this on every mutation, and most mutations leave the
+    /// pills untouched.
+    func syncStatusPillsUIStateIfMonitorStale() {
+        let published = ui.statusPills.snapshot
+        if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
+            syncStatusPillsUIState()
+        }
     }
 
     /// Persistent projection for the primary execution root. The initial intent
@@ -41,7 +58,7 @@ extension AgentModeViewModel {
                 isEnabled: !busy,
                 isOperationInProgress: busy,
                 requiresActiveRunConfirmation: false,
-                disabledReason: busy ? "Preparing the selected worktree…" : nil
+                disabledReason: session?.pendingHandoff.executionLocationFailure ?? (busy ? "Preparing the selected worktree…" : nil)
             )
         }
 
@@ -113,6 +130,9 @@ extension AgentModeViewModel {
     }
 
     private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {
+        if let failure = session.pendingHandoff.executionLocationFailure {
+            return failure
+        }
         if !session.hasLoadedPersistedState {
             return "Load this thread before changing its execution location."
         }

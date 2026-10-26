@@ -58,7 +58,6 @@ package enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable, Sendable
     case cpp
     case go
     case java
-    case dart
     case typescript
     case tsx
     case php

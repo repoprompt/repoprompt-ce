@@ -1,7 +1,7 @@
 let typeScriptCodeMapQuery = #"""
 ; =============================================================================
 ; TypeScript code-map query  •  v3.0  •  2026-01-29
-; Works with tree-sitter-typescript 0.20.2
+; Works with tree-sitter-typescript 0.23.2
 ;
 ; Updated to use capture names that match CodeMapGenerator routing:
 ;   - @method for class methods (not @function.definition)
@@ -413,8 +413,7 @@ let typeScriptCodeMapQuery = #"""
     (lexical_declaration
         (variable_declarator
             name: (identifier) @variable.global
-            value: (_) @_val))
-    (#not-match? @_val "=>"))
+            value: (_))))
 
 ;; Variable declarations without initializers
 (program
@@ -429,7 +428,6 @@ let typeScriptCodeMapQuery = #"""
         (lexical_declaration
             (variable_declarator
                 name: (identifier) @variable.global
-                value: (_) @_val2))
-        (#not-match? @_val2 "=>")))
+                value: (_)))))
 
 """#

@@ -1,15 +1,15 @@
 # Tree-sitter Attribution Bundle
 
-RepoPrompt CE links the `SwiftTreeSitter` wrapper, the Tree-sitter runtime, and
-Tree-sitter grammar package products through exact, source-preserving SwiftPM
-pins. This directory maps the resolved components to their copied licenses.
+RepoPrompt CE links the `SwiftTreeSitter` wrapper at a fixed remote revision,
+the Tree-sitter runtime, and Tree-sitter grammar package products at exact,
+source-preserving SwiftPM versions. This directory maps the resolved components
+to their copied licenses.
 
 ## Grammar packages
 
 | Grammar | Upstream repository | Exact requirement | Resolved revision | SwiftPM product/modules | License copy |
 | --- | --- | --- | --- | --- | --- |
 | C | <https://github.com/tree-sitter/tree-sitter-c> | `0.24.2` | `b780e47fc780ddc8da13afa35a3f4ed5c157823d` | `TreeSitterC` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
-| Dart | <https://github.com/UserNobody14/tree-sitter-dart> | revision (no releases) | `be07cf7118d3dba06236a3f19541685a68209934` | `TreeSitterDart` | [`LICENSE-tree-sitter-dart.txt`](LICENSE-tree-sitter-dart.txt) |
 | Go | <https://github.com/tree-sitter/tree-sitter-go> | `0.25.0` | `1547678a9da59885853f5f5cc8a99cc203fa2e2c` | `TreeSitterGo` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
 | Java | <https://github.com/tree-sitter/tree-sitter-java> | `0.23.5` | `94703d5a6bed02b98e438d7cad1136c01a60ba2c` | `TreeSitterJava` | [`LICENSE-tree-sitter-java.txt`](LICENSE-tree-sitter-java.txt) |
 | JavaScript | <https://github.com/tree-sitter/tree-sitter-javascript> | `0.25.0` | `44c892e0be055ac465d5eeddae6d3e194424e7de` | `TreeSitterJavaScript` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
@@ -22,7 +22,7 @@ pins. This directory maps the resolved components to their copied licenses.
 | C++ | <https://github.com/tree-sitter/tree-sitter-cpp> | `0.23.4` | `f41e1a044c8a84ea9fa8577fdd2eab92ec96de02` | `TreeSitterCPP` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
 | PHP | <https://github.com/tree-sitter/tree-sitter-php.git> | `0.24.2` | `5b5627faaa290d89eb3d01b9bf47c3bb9e797dea` | `TreeSitterPHP` | [`LICENSE-tree-sitter-php.txt`](LICENSE-tree-sitter-php.txt) |
 
-Dart remains at its canonical maintained revision because the repository publishes no semantic-version releases. SwiftPM accepts Swift's buildable `0.7.3-with-generated-files` companion tag as an exact semantic version; its plain `0.7.3` release omits generated parser sources. The resolved revisions above remain the CodeMap grammar/cache identity inputs.
+SwiftPM accepts Swift's buildable `0.7.3-with-generated-files` companion tag as an exact semantic version; its plain `0.7.3` release omits generated parser sources. The resolved revisions above remain the CodeMap grammar/cache identity inputs.
 
 The C, Go, JavaScript, and C++ snapshots contain identical MIT license text,
 so they intentionally share one copy.
@@ -51,13 +51,13 @@ future upstream graph compiles the scanner objects directly.
 
 ## Swift wrapper, runtime, and ICU subset
 
-`SwiftTreeSitter` 0.10.0 resolves the standalone Tree-sitter 0.25.10 SwiftPM
-package. That runtime includes a small subset of ICU headers and the
-corresponding full ICU notice file.
+The customized `SwiftTreeSitter` fork revision resolves the standalone
+Tree-sitter 0.25.10 SwiftPM package. That runtime includes a small subset of ICU
+headers and the corresponding full ICU notice file.
 
 | Component | Source | Resolved version / revision | License copy |
 | --- | --- | --- | --- |
-| `SwiftTreeSitter` | <https://github.com/ChimeHQ/SwiftTreeSitter.git> | `0.10.0` / `f97df585296977d8fcaf644cbde567151d1367b8` | [`LICENSE-SwiftTreeSitter.txt`](LICENSE-SwiftTreeSitter.txt) |
+| `SwiftTreeSitter` | <https://github.com/repoprompt/swift-tree-sitter.git> | fixed revision `a778ef4fb7f0d3ad00185f42ce83c688373c4361` | [`LICENSE-SwiftTreeSitter.txt`](LICENSE-SwiftTreeSitter.txt) |
 | Tree-sitter runtime | <https://github.com/tree-sitter/tree-sitter> | `0.25.10` / `da6fe9beb4f7f67beb75914ca8e0d48ae48d6406` | [`LICENSE-tree-sitter-runtime.txt`](LICENSE-tree-sitter-runtime.txt) |
 | ICU subset used by the runtime | <https://github.com/unicode-org/icu> | `552b01f61127d30d6589aa4bf99468224979b661` from `ICU_SHA` | [`LICENSE-tree-sitter-runtime-ICU.txt`](LICENSE-tree-sitter-runtime-ICU.txt) |
 

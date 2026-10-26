@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 enum WorkspaceCheckoutSearchIndexRefreshBehavior: Equatable {
     case noLoadedRoot

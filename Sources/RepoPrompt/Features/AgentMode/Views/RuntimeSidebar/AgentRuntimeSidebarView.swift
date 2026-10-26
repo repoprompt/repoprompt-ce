@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 struct AgentRuntimeSidebarView: View {
@@ -110,8 +111,12 @@ struct AgentRuntimeSidebarView: View {
     }
 
     private var headerState: RuntimeSidebarHeaderState {
-        if isContextBuilderRunning { return .init(mode: .contextBuilder) }
-        if isOracleStreaming { return .init(mode: .oracle) }
+        if isContextBuilderRunning {
+            return .init(mode: .contextBuilder)
+        }
+        if isOracleStreaming {
+            return .init(mode: .oracle)
+        }
         return .init(
             mode: .idle(
                 fileCount: runtimeVM.snapshot.selectionFileCount ?? 0,
@@ -212,7 +217,9 @@ struct AgentRuntimeSidebarView: View {
             in: tabChatSessions,
             streamingSessionIDs: oracleViewModel.streamingSessions
         )
-        if resolvedID == selectedOracleSessionID { return }
+        if resolvedID == selectedOracleSessionID {
+            return
+        }
         guard let resolvedID else { return }
         selectedOracleSessionID = resolvedID
     }
@@ -290,26 +297,24 @@ struct AgentRuntimeSidebarView: View {
 
     /// Estimates used tokens from the agent transcript character count when codex usage isn't available.
     private var estimatedUsedTokens: Int? {
-        runtimeVM.snapshot.usedTokens ?? runtimeVM.snapshot.estimatedTranscriptTokens
+        runtimeVM.snapshot.displayUsedTokens
     }
 
     private var contextWindowTokens: Int {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
+    @ViewBuilder
     private var contextUsageSection: some View {
-        Group {
-            if let usedTokens = estimatedUsedTokens {
-                AgentContextIndicator(
-                    contextWindowTokens: contextWindowTokens,
-                    usedTokens: usedTokens,
-                    sourceLabel: runtimeVM.snapshot.usedTokens != nil
-                        ? runtimeVM.snapshot.usageSource.label
-                        : "Estimated",
-                    style: .labeled
-                )
-                .sidebarCard()
-            }
+        if estimatedUsedTokens != nil || runtimeVM.snapshot.awaitingPostCompactionUsage {
+            AgentContextIndicator(
+                contextWindowTokens: contextWindowTokens,
+                usedTokens: estimatedUsedTokens,
+                sourceLabel: runtimeVM.snapshot.displayUsageLabel,
+                awaitingPostCompactionUsage: runtimeVM.snapshot.awaitingPostCompactionUsage,
+                style: .labeled
+            )
+            .sidebarCard()
         }
     }
 

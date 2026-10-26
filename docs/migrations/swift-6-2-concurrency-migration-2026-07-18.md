@@ -111,7 +111,7 @@ The mixed `RepoPromptApp` target should continue to use explicit `@MainActor` de
 - **Outcome:** Resolve diagnostics in coherent, separately reviewable tranches while `RepoPromptApp` stays in Swift 5 mode: concurrency primitives; filesystem/process/networking; persistence/CAS; workspace/indexing; MCP infrastructure; Agent Mode; then remaining feature runtimes.
 - **Invariants:** Actor reentrancy is reviewed at every suspension; blocking I/O stays off Swift executors; immutable snapshots cross to MainActor; continuation/cancellation paths complete exactly once; CAS, Git fencing, seeded replay, bounded work, retry liveness, and projection freshness retain one authority.
 - **Exit gate:** Remaining app diagnostics are limited to inventoried UI/composition/test boundaries. Unknown ownership blocks the tranche rather than being hidden with annotations or a new actor.
-- **Validation:** `make dev-swift-build PRODUCT=RepoPrompt` and the smallest owning suite after each batch, including CodeMap store/coordinator, `WorkspaceFileContextStoreTests`, search/indexing, process, MCP, and Agent Mode lifecycle suites where affected.
+- **Validation:** `make dev-swift-build PRODUCT=RepoPrompt` and the smallest owning suite after each batch, including CodeMap store/coordinator, workspace search/indexing, process, MCP, and Agent Mode lifecycle suites where affected.
 
 ### 7. Finish complete checking for UI, composition, tests, and entry shell
 

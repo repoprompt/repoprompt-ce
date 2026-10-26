@@ -5,7 +5,7 @@ final class CodeMapGoldenTests: XCTestCase {
     func testFixturesMatchGoldenCodeMapDescriptions() throws {
         let groups: [(name: String, relativePaths: [String], maximumCount: Int)] = [
             ("CE/core", CodeMapFixtureRunner.fixtureRelativePaths, 5),
-            ("expanded languages", CodeMapFixtureRunner.expandedLanguageFixtureRelativePaths, 6),
+            ("expanded languages", CodeMapFixtureRunner.expandedLanguageFixtureRelativePaths, 5),
             ("edge fixtures", CodeMapFixtureRunner.edgeFixtureRelativePaths, 3)
         ]
 

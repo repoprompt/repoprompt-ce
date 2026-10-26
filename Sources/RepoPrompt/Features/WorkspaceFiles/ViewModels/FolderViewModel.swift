@@ -1,5 +1,8 @@
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// A folder in the file tree, with subfolders and files.
 /// Keeps a single `children` array, sorted by the last known sort method.
@@ -876,4 +879,16 @@ enum CheckboxState: Equatable {
     case checked
     case unchecked
     case mixed
+}
+
+extension FrozenFolderRecord {
+    init(from vm: FolderViewModel) {
+        self.init(
+            name: vm.name,
+            relativePath: vm.relativePath,
+            fullPath: vm.standardizedFullPath,
+            rootPath: vm.rootPath,
+            displayName: vm.name
+        )
+    }
 }

@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptFoundation
 
 #if DEBUG
     extension ServerNetworkManager {
@@ -52,6 +53,9 @@ import MCP
                 payload["appcast_task_present"] = NSNull()
                 payload["appcast_task_cancelled"] = NSNull()
             }
+
+            let historySnapshot = await MainActor.run { SparkleUpdaterManager.shared?.tipHistoryStore?.debugPublishedSnapshot() }
+            payload["tip_history"] = historySnapshot ?? ["store_present": false]
 
             return debugDiagnosticsResult(payload)
         }
@@ -216,7 +220,7 @@ import MCP
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "sparkle_trigger_passive_check requires allow_destructive=true because it writes the real SparkleLastUpdateCheck on success.")
             }
 
-            guard let manager = SparkleUpdaterManager.shared else {
+            guard let manager = await MainActor.run(body: { SparkleUpdaterManager.shared }) else {
                 return debugDiagnosticsError(op: op, code: "unavailable", message: "SparkleUpdaterManager.shared is not initialized.")
             }
 
