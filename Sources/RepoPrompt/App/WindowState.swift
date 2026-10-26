@@ -1390,6 +1390,16 @@ class WindowState: ObservableObject {
         )
     }
 
+    /// Keyboard actions reuse the titlebar's captured, revalidated targets and confirmation UI.
+    func performAgentChatShortcut(_ action: AgentChatShortcutAction) {
+        guard !isClosing,
+              NSApplication.shared.modalWindow == nil,
+              nsWindow?.attachedSheet == nil,
+              let snapshot = agentChatTitleClusterMenuSnapshot()
+        else { return }
+        action.perform(snapshot: snapshot, actions: agentChatTitleClusterMenuActions())
+    }
+
     func agentChatTitleClusterMenuActions(
         handoffInstructionsProvider: @escaping AgentSessionHandoffInstructionsProvider = {
             GlobalSettingsStore.shared.agentSessionHandoffInstructions()

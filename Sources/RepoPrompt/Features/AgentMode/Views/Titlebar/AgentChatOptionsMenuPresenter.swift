@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 
 struct AgentChatOptionsMenuTarget: Equatable {
     let windowID: Int
@@ -75,6 +76,33 @@ struct AgentChatOptionsMenuSnapshot: Equatable {
     }
 }
 
+enum AgentChatShortcutAction: CaseIterable {
+    case pin, rename, stash, handoff, copySessionID, delete
+
+    var shortcutName: KeyboardShortcuts.Name {
+        switch self {
+        case .pin: .pinAgentSession
+        case .rename: .renameAgentSession
+        case .stash: .stashAgentSession
+        case .handoff: .handoffAgentSession
+        case .copySessionID: .copyAgentSessionID
+        case .delete: .deleteAgentSession
+        }
+    }
+
+    func perform(snapshot: AgentChatOptionsMenuSnapshot, actions: AgentChatOptionsMenuActions) {
+        switch self {
+        case .pin: actions.togglePin(snapshot.target)
+        case .rename: actions.rename(snapshot.target)
+        case .stash: actions.stash(snapshot.target)
+        case .handoff: actions.copyHandoffPrompt(snapshot.target)
+        case .copySessionID:
+            if let target = snapshot.copySessionIDTarget { actions.copySessionID(target) }
+        case .delete: actions.delete(snapshot.target)
+        }
+    }
+}
+
 struct AgentChatOptionsMenuActions {
     let togglePin: (AgentChatOptionsMenuTarget) -> Void
     let rename: (AgentChatOptionsMenuTarget) -> Void
@@ -87,11 +115,12 @@ struct AgentChatOptionsMenuActions {
 private final class AgentChatOptionsMenuItem: NSMenuItem {
     private let handler: () -> Void
 
-    init(title: String, symbolName: String, handler: @escaping () -> Void) {
+    init(title: String, symbolName: String, shortcutName: KeyboardShortcuts.Name, handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(performHandler(_:)), keyEquivalent: "")
         target = self
         image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
+        attributedTitle = NSAttributedString(string: GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title(title, for: shortcutName))
     }
 
     @available(*, unavailable)
@@ -117,27 +146,32 @@ enum AgentChatOptionsMenuPresenter {
         menu.addItem(AgentChatOptionsMenuItem(
             title: snapshot.isPinned ? "Unpin" : "Pin",
             symbolName: snapshot.isPinned ? "pin.slash" : "pin",
+            shortcutName: .pinAgentSession,
             handler: { actions.togglePin(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Rename",
             symbolName: "pencil",
+            shortcutName: .renameAgentSession,
             handler: { actions.rename(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Stash",
             symbolName: "tray.and.arrow.down",
+            shortcutName: .stashAgentSession,
             handler: { actions.stash(target) }
         ))
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Handoff",
             symbolName: "arrow.right.doc.on.clipboard",
+            shortcutName: .handoffAgentSession,
             handler: { actions.copyHandoffPrompt(target) }
         ))
         if let copySessionIDTarget = snapshot.copySessionIDTarget {
             menu.addItem(AgentChatOptionsMenuItem(
                 title: "Copy Session ID",
                 symbolName: "doc.on.doc",
+                shortcutName: .copyAgentSessionID,
                 handler: { actions.copySessionID(copySessionIDTarget) }
             ))
         }
@@ -145,6 +179,7 @@ enum AgentChatOptionsMenuPresenter {
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Delete",
             symbolName: "trash",
+            shortcutName: .deleteAgentSession,
             handler: { actions.delete(target) }
         ))
         return menu

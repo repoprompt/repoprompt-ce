@@ -5,11 +5,44 @@
 //  Created by Eric Provencher on 2025-03-09.
 //
 
+import Foundation
 import KeyboardShortcuts
 
 /// Define your shortcut
 extension KeyboardShortcuts.Name {
     // static let cmdOptionA = Self("cmdOptionA", default: .init(.a, modifiers: [.command, .option]))
+
+    // Application commands: preserve the defaults formerly owned by native menus.
+    static let newWorkspaceWindow = Self("newWorkspaceWindow", default: .init(.n, modifiers: [.command]))
+    static let showAppSettings = Self("showAppSettings", default: .init(.comma, modifiers: [.command]))
+    static let closeAppWindow = Self("closeAppWindow", default: .init(.w, modifiers: [.command, .shift]))
+    static let checkForUpdates = Self("checkForUpdates", default: .init(.u, modifiers: [.command, .option]))
+
+    // Current-session actions. Destructive deletion intentionally requires an opt-in binding.
+    static let pinAgentSession = sessionAction("pinAgentSession", default: .init(.p, modifiers: [.command, .shift]))
+    static let renameAgentSession = sessionAction("renameAgentSession", default: .init(.r, modifiers: [.command, .shift]))
+    static let stashAgentSession = sessionAction("stashAgentSession", default: .init(.e, modifiers: [.command, .shift]))
+    static let handoffAgentSession = sessionAction("handoffAgentSession", default: .init(.h, modifiers: [.command, .shift]))
+    static let copyAgentSessionID = sessionAction("copyAgentSessionID", default: .init(.c, modifiers: [.command, .option]))
+    static let deleteAgentSession = Self("deleteAgentSession")
+
+    /// Preserve upgrade-time custom assignments, including explicitly cleared new actions.
+    /// The pinned library has no public name/existence enumeration API. Its documented-in-source
+    /// UserDefaults prefix is used only for discovery; decoding and writes stay in the library.
+    static func sessionAction(_ rawValue: String, default shortcut: KeyboardShortcuts.Shortcut) -> Self {
+        let prefix = "KeyboardShortcuts_"
+        let stored = UserDefaults.standard.dictionaryRepresentation()
+        let isNew = stored[prefix + rawValue] == nil
+        let occupied = isNew && stored.keys.contains { key in
+            guard key.hasPrefix(prefix),
+                  let name = Self(rawValue: String(key.dropFirst(prefix.count)))
+            else { return false }
+            return name.rawValue != rawValue && KeyboardShortcuts.getShortcut(for: name) == shortcut
+        }
+        let name = Self(rawValue, default: shortcut)
+        if occupied { KeyboardShortcuts.setShortcut(nil, for: name) }
+        return name
+    }
 
     // Switch to presets with Cmd+Option+1..9
     static let switchToPreset1 = Self("swPreset1", default: .init(.one, modifiers: [.command, .option]))
