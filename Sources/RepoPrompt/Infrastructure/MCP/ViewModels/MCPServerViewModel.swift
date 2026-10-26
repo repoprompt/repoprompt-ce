@@ -3536,8 +3536,8 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Called by UI after the alert sheet closes
-    func resolveApproval(allow: Bool, generation: UInt64) async {
-        await service.continuePendingApproval(allow: allow, generation: generation)
+    func resolveApproval(allow: Bool, generation: UInt64, alwaysAllow: Bool = false) async {
+        await service.continuePendingApproval(allow: allow, generation: generation, alwaysAllow: alwaysAllow)
     }
 
     // MARK: - Dashboard Methods

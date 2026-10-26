@@ -1035,15 +1035,21 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var autoStart: Bool?
         package var showModelPresets: Bool?
         package var temporarilyDisablePresets: Bool?
+        /// Opt-in strict MCP connection approval; absent decodes as off ("Always allow").
+        /// Schema-neutral like `notifications`: older readers ignore the key and the
+        /// raw-preserving save path keeps it, so it does not raise `requiredSchemaVersion`.
+        package var strictConnectionApproval: Bool?
 
         package init(
             autoStart: Bool? = nil,
             showModelPresets: Bool? = nil,
-            temporarilyDisablePresets: Bool? = nil
+            temporarilyDisablePresets: Bool? = nil,
+            strictConnectionApproval: Bool? = nil
         ) {
             self.autoStart = autoStart
             self.showModelPresets = showModelPresets
             self.temporarilyDisablePresets = temporarilyDisablePresets
+            self.strictConnectionApproval = strictConnectionApproval
         }
     }
 
