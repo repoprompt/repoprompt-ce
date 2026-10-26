@@ -82,7 +82,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
-            Use `oracle_chat_log` after compaction to recover recent oracle messages.
+            Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(

@@ -49,6 +49,16 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
     }
 
+    func testHeadlessOracleDescriptionsScopeTheRunLimitToAppBackedAgentMode() throws {
+        // Direct-headless Oracle chats are not owned by an Agent run, so the app's current-run limit must stay qualified.
+        for name in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleChatLog] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            let advertised = DirectHeadlessToolAdvertisement.project(definition).description
+            XCTAssertTrue(advertised.contains("In app-backed Agent Mode, "), name)
+            XCTAssertTrue(advertised.contains("The direct headless backend does not apply this run limit."), name)
+        }
+    }
+
     func testCanonicalAgentControlWaitDescriptionsUseConfiguredSubagentWaitPhrase() throws {
         let phrase = MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase
         for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentExplore] {

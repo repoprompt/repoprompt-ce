@@ -1,5 +1,7 @@
 import Foundation
 import OSLog
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 
 extension Notification.Name {
@@ -136,6 +138,98 @@ enum CodexComputerUseWorkflow {
     static let unavailableMessage = "Computer Use requires the installed SkyComputerUseClient companion from Codex or ChatGPT. No companion is available; this turn cannot use computer-use tools."
     static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
     static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
+
+    static let runtimeRequirementMessage = "Computer Use requires an OpenAI-signed Codex runtime in RepoPrompt. The selected executable could not be verified as OpenAI-signed. Companion authentication failures have been reported with re-signed runtimes. Select an OpenAI-signed local Codex executable in Settings → Codex CLI → Advanced, restart RepoPrompt CE, then arm /computer-use again."
+
+    /// Issue #1423 correlates companion authentication failures with re-signing, but
+    /// the runtime versions also differed. Conservatively require the upstream signer;
+    /// this does not establish the companion's private authentication policy.
+    static let openAISigningRequirement = "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
+
+    static func runtimeUnavailableMessage(
+        executableURL: URL,
+        signatureValidator: (URL, String) -> Bool = { RuntimeCodeSigningDetector.validatesStaticCode(at: $0, requirementSource: $1) }
+    ) -> String? {
+        signatureValidator(executableURL, openAISigningRequirement) ? nil : runtimeRequirementMessage
+    }
+
+    static let checkingRuntimeMessage = "Checking the Codex runtime for Computer Use. Wait for the check to finish, then retry."
+
+    @MainActor
+    static var configuredRuntimeUnavailableMessage: String? {
+        admissionPreflight.startIfNeeded()
+        return admissionPreflight.cachedMessage
+    }
+
+    @MainActor
+    static func checkConfiguredRuntimeRequirement() async -> String? {
+        await admissionPreflight.check()
+    }
+
+    @MainActor
+    private static let admissionPreflight = RuntimeAdmissionPreflight()
+
+    /// Match the app-server's captured launch environment, not the GUI process PATH.
+    /// Both the bounded version probe and full static-code verification run off-main.
+    static func preflightRuntimeRequirement(
+        inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil,
+        signatureProbe: @escaping @Sendable (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) }
+    ) async -> String? {
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            inheritedEnvironment: inheritedEnvironment,
+            shellEnvironmentProvider: shellEnvironmentProvider,
+            launchSnapshot: launchSnapshot
+        )
+        guard let runtime = resolution.runtime else { return resolution.userMessage }
+        return await Task.detached(priority: .utility) {
+            signatureProbe(runtime.executableURL.resolvingSymlinksInPath())
+        }.value
+    }
+
+    /// Cache successful admission for the immutable launch selection. Failed checks
+    /// retry only on explicit arming; synchronous UI reads never probe or hash files.
+    /// Spawn independently revalidates the executable even after cached admission.
+    @MainActor
+    final class RuntimeAdmissionPreflight {
+        private let load: () async -> String?
+        private var pending: Task<String?, Never>?
+        private var hasResult = false
+        private var message: String?
+
+        init(load: @escaping () async -> String? = { await CodexComputerUseWorkflow.preflightRuntimeRequirement() }) {
+            self.load = load
+        }
+
+        var cachedMessage: String? {
+            hasResult ? message : checkingRuntimeMessage
+        }
+
+        func startIfNeeded() {
+            guard !hasResult, pending == nil else { return }
+            _ = beginCheck()
+        }
+
+        func check() async -> String? {
+            if hasResult, message == nil { return nil }
+            return await beginCheck().value
+        }
+
+        private func beginCheck() -> Task<String?, Never> {
+            if let pending { return pending }
+            let task = Task {
+                let result = await self.load()
+                // Publish before any waiter resumes and runs synchronous admission.
+                self.message = result
+                self.hasResult = true
+                self.pending = nil
+                return result
+            }
+            pending = task
+            return task
+        }
+    }
 
     @MainActor
     static var isEnabled: Bool {

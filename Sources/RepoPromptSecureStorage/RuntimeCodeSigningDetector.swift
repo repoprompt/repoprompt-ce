@@ -34,8 +34,8 @@ struct RuntimeLocalSigningExpectation: Equatable {
     }
 }
 
-enum RuntimeCodeSigningDetector {
-    static func validatesStaticCode(at executableURL: URL, requirementSource: String) -> Bool {
+package enum RuntimeCodeSigningDetector {
+    package static func validatesStaticCode(at executableURL: URL, requirementSource: String) -> Bool {
         var staticCode: SecStaticCode?
         let createStatus = SecStaticCodeCreateWithPath(executableURL as CFURL, [], &staticCode)
         guard createStatus == errSecSuccess,

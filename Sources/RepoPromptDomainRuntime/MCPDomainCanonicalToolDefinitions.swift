@@ -1539,8 +1539,25 @@ package enum MCPDomainCanonicalToolDefinitions {
             schema["properties"] = .object(properties)
             return MCPDomainToolDefinition(
                 name: definition.name,
-                description: definition.description + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
+                description: definition.description
+                    .replacingOccurrences(
+                        of: "Use `oracle_chat_log` after compaction to recover recent oracle messages.",
+                        with: "Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit."
+                    )
+                    + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
                 inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+        if definition.name == MCPWindowToolName.oracleChatLog {
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description.replacingOccurrences(
+                    of: "Available only during agent mode runs.",
+                    with: "Available only during agent mode runs. In app-backed Agent Mode, only chats created by the current Agent run can be read; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused. The direct headless backend does not apply this run limit."
+                ),
+                inputSchema: definition.inputSchema,
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault
             )

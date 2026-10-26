@@ -1279,8 +1279,8 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         ]))
     }
 
-    func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsUnchanged() {
-        let continuation = "Continue this plan conversation with ask_oracle(chat_id: \"chat-0\", new_chat: false)"
+    func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsContinuationOnly() {
+        let continuation = "Continue this plan conversation with ask_oracle(chat_id: \"chat-0\", new_chat: false). In Agent Mode, continuation requires the run that created this chat; after that run changes, start a new chat instead."
         for count in [nil, 1] as [Int?] {
             XCTAssertEqual(
                 MCPContextBuilderToolProvider.generatedResponseFollowUpHint(modeLabel: "plan", chatID: "chat-0", oracleCount: count),

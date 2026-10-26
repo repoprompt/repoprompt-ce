@@ -1002,7 +1002,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         chatID: String,
         oracleCount: Int?
     ) -> String {
-        let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false)"
+        let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false). In Agent Mode, continuation requires the run that created this chat; after that run changes, start a new chat instead."
         guard let reminder = OracleGroupDeliveryContract.followUpReminder(laneCount: oracleCount ?? 0) else {
             return continuation
         }

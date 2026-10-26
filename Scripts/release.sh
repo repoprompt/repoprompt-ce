@@ -143,7 +143,6 @@ run_preflight() {
     require_file "$CODEX_MANIFEST"
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/LICENSE"
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/NOTICE"
-    require_file "$ROOT_DIR/ThirdPartyLicenses/codex/ZSH-LICENCE"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     require_file "$RUN_WITHOUT_GITHUB_TOKENS"
