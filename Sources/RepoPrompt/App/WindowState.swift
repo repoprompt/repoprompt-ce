@@ -1813,22 +1813,48 @@ class WindowState: ObservableObject {
         completion?()
     }
 
-    private func applyPendingRestoreEntryIfPossible() {
-        guard !isClosing else { return }
-        guard workspaceManager.isInitialized,
-              workspaceManager.hasAcceptedDomainCatalogForRestoration
-        else { return }
-        // The dispatch task owns this acceptance's completion from here on, even if a newer
-        // acceptance arrives before it finishes.
-        guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
+    /// At most one dispatch task is queued; it rechecks readiness when it runs.
+    private var isRestoreDispatchScheduled = false
 
+    private var canDispatchPendingRestoreEntry: Bool {
+        workspaceManager.isInitialized && workspaceManager.hasAcceptedDomainCatalogForRestoration
+    }
+
+    private func applyPendingRestoreEntryIfPossible() {
+        guard !isClosing, restoreLifetime.hasPendingEntry else { return }
+        guard canDispatchPendingRestoreEntry else {
+            releasePendingRestoreCompletionIfCatalogFailed()
+            return
+        }
+        guard !isRestoreDispatchScheduled else { return }
+        isRestoreDispatchScheduled = true
         StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
-            if !self.isClosing {
-                await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            self.isRestoreDispatchScheduled = false
+            // Enqueueing is not dispatch: close, explicit intent, a newer acceptance, or a
+            // reconciliation fence can intervene before this task runs. Recheck readiness and
+            // claim the entry in the same turn; an unready entry stays pending for the next
+            // accepted chooser publication instead of resolving as unavailable.
+            guard !self.isClosing else { return }
+            guard self.canDispatchPendingRestoreEntry else {
+                self.releasePendingRestoreCompletionIfCatalogFailed()
+                return
             }
+            guard let dispatch = self.restoreLifetime.takePendingForDispatch() else { return }
+            await self.restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            // The dispatch owns this acceptance's completion, even if a newer acceptance
+            // arrived while it ran.
             dispatch.completion?()
         }
+    }
+
+    /// A failed catalog may never be accepted, so it must not hold the run-wide restore
+    /// persistence gate. The entry stays pending and protected: session capture keeps the saved
+    /// identity, and a later accepted catalog still dispatches it.
+    private func releasePendingRestoreCompletionIfCatalogFailed() {
+        guard workspaceManager.workspaceChooserPresentation.failure != nil else { return }
+        let completion = restoreLifetime.releasePendingCompletion()
+        completion?()
     }
 
     private func restoreWorkspace(from entry: WindowSessionEntry, acceptanceSequence: UInt64) async {
